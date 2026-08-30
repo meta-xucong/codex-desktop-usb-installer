@@ -26,7 +26,7 @@ size:   802145236
 sha256: ab0feacc74e982742736da4a7f1d2b59e9fabaa3641606545d3064927da02b1e
 ```
 
-拿到完整载荷后，放回上述相对路径，再执行 `tools/verify-payload.ps1` 和 `tools/verify-oneclick-usb.ps1` 即可复核。其他 `release/setup`、`release/usb`、`release/usb-final` 和 `release/upstream` 目录是可重建的重复输出，不进入归档。
+本次内部留档已将该 MSIX 作为 GitHub Release `archive-2026.08.31` 的资产上传，源码仓库仍不包含该大文件。拿到完整载荷后，放回上述相对路径，再执行 `tools/verify-payload.ps1` 和 `tools/verify-oneclick-usb.ps1` 即可复核。其他 `release/setup`、`release/usb`、`release/usb-final` 和 `release/upstream` 目录是可重建的重复输出，不进入归档。
 
 ## 复现与测试
 
