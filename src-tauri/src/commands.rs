@@ -53,6 +53,7 @@ use crate::app::release_install::{
 use crate::app::settings_store::AppSettings as PersistedAppSettings;
 use crate::app::settings_store::{ProxyMode, UpdateSource};
 use crate::app::url_guard::{validate_custom_proxy, validate_custom_source};
+use crate::app::usb_guard::UsbGuardStatus;
 use crate::app::win_update::{
     auto_stage_windows_update_with_install_mode_and_network, cancel_windows_download,
     detect_existing_windows_install_at_path as detect_windows_install_at_path,
@@ -1059,6 +1060,7 @@ pub async fn offline_payload_stage(
     if !matches!(state.target.os, OperatingSystem::Windows) {
         return Err(AppError::UnsupportedPlatform.into());
     }
+    crate::app::usb_guard::require_authorized()?;
     let executable = std::env::current_exe()
         .map_err(|error| AppError::Internal(format!("无法确定安装器路径: {error}")))?;
     let expected_architecture = state.target.arch.as_str().to_string();
@@ -2869,6 +2871,7 @@ pub async fn win_adopt(state: State<'_, ManagerState>) -> Result<WinInstallStatu
     if !matches!(state.target.os, OperatingSystem::Windows) {
         return Err(AppError::UnsupportedPlatform.into());
     }
+    crate::app::usb_guard::require_authorized()?;
     let _op = begin_guard(&state, OperationKind::Adopt)?;
     let settings = windows_domain_settings_for_persisted(&state);
     tauri::async_runtime::spawn_blocking(move || adopt_windows_install(&settings))
@@ -2889,20 +2892,41 @@ pub async fn win_launch_codex(state: State<'_, ManagerState>) -> Result<(), Comm
     if !matches!(state.target.os, OperatingSystem::Windows) {
         return Err(AppError::UnsupportedPlatform.into());
     }
+    crate::app::usb_guard::require_authorized()?;
     let persisted = PersistedAppSettings::load();
+    let before_codex = crate::app::usb_guard::snapshot_processes("Codex.exe");
+    let before_chatgpt = crate::app::usb_guard::snapshot_processes("ChatGPT.exe");
     if persisted.codex_theme.is_some() && state.operations.snapshot().is_none() {
         let themed =
             crate::app::codex_theme::launch_with_active_theme(&state.codex_theme, &persisted)
                 .await?;
         if themed {
+            tauri::async_runtime::spawn_blocking(move || {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                crate::app::usb_guard::register_new_codex_processes(&before_codex, &before_chatgpt);
+            });
             return Ok(());
         }
     }
     let settings = windows_domain_settings_for_persisted(&state);
-    tauri::async_runtime::spawn_blocking(move || crate::app::win_update::launch_codex(&settings))
-        .await
-        .map_err(|e| AppError::Internal(format!("join: {e}")))?
-        .map_err(Into::into)
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = crate::app::win_update::launch_codex(&settings);
+        if result.is_ok() {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            crate::app::usb_guard::register_new_codex_processes(&before_codex, &before_chatgpt);
+        }
+        result
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("join: {e}")))?
+    .map_err(Into::into)
+}
+
+/// Return the latest local USB guard snapshot.  The command is read-only and
+/// intentionally does not attempt to re-enroll or change the current lease.
+#[tauri::command]
+pub fn usb_guard_status() -> UsbGuardStatus {
+    crate::app::usb_guard::current_status()
 }
 
 /// Windows-only: install the bundled Codex Switch configurator and start it.
@@ -2917,6 +2941,7 @@ pub async fn win_launch_codex(state: State<'_, ManagerState>) -> Result<(), Comm
 pub async fn install_and_launch_ccswitch(
     app: AppHandle,
 ) -> Result<CcswitchLaunchReport, CommandError> {
+    crate::app::usb_guard::require_authorized()?;
     tauri::async_runtime::spawn_blocking(move || install_and_launch_ccswitch_impl(&app))
         .await
         .map_err(|e| AppError::Internal(format!("join: {e}")))?
@@ -2939,6 +2964,7 @@ pub async fn win_perform_update(
     if !matches!(state.target.os, OperatingSystem::Windows) {
         return Err(AppError::UnsupportedPlatform.into());
     }
+    crate::app::usb_guard::require_authorized()?;
     if !confirm {
         return Err(
             AppError::Internal("拒绝执行：Windows 更新必须带显式 confirm".to_string()).into(),
@@ -3087,6 +3113,7 @@ pub async fn win_install_historical_release(
     if !matches!(state.target.os, OperatingSystem::Windows) {
         return Err(AppError::UnsupportedPlatform.into());
     }
+    crate::app::usb_guard::require_authorized()?;
     if !confirm {
         return Err(AppError::Internal(
             "拒绝执行：Windows 历史版本安装必须带显式 confirm".to_string(),
@@ -3445,7 +3472,13 @@ pub async fn win_uninstall_bundle(
     let report = tauri::async_runtime::spawn_blocking(move || {
         let codex = uninstall_windows_codex(&settings, confirm, purge_user_data);
         let ccswitch = uninstall_ccswitch_impl(purge_ccswitch_data);
-        combine_bundle_uninstall(codex, ccswitch, purge_user_data, purge_ccswitch_data)
+        // CCSwitch termination uses the active lease's PID list.  Stop and
+        // remove the helper only after that step has had a chance to use it.
+        let guard_notes = crate::app::usb_guard::stop_and_uninstall();
+        let mut report =
+            combine_bundle_uninstall(codex, ccswitch, purge_user_data, purge_ccswitch_data);
+        report.notes.extend(guard_notes);
+        report
     })
     .await
     .map_err(|e| AppError::Internal(format!("join: {e}")))?;

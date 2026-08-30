@@ -2,7 +2,7 @@
 
 审计对象：`D:\AI\AGENT_U盘\codex-desktop-usb-installer`
 
-审计范围：当前离线安装、CCSwitch 集成、卸载流程、发布目录和为下一阶段 U 盘绑定准备的安全边界。此次审计为只读审计，没有实现 U 盘看门狗，也没有修改 Codex 本体。
+审计范围：当前离线安装、CCSwitch 集成、卸载流程、发布目录以及已落地的 P1 U 盘绑定看门狗。审计不修改 Codex MSIX/WindowsApps；只检查本产品管理器和本地辅助进程。
 
 ## 1. 验证结果
 
@@ -12,9 +12,11 @@
 | --- | --- |
 | `npm run check` | 通过 |
 | `npm run lint` | 通过 |
-| `npm run test:offline` | 6/6 通过 |
+| `npm run test:offline` | 7/7 通过（含 U 盘状态卡/倒计时） |
 | `npm run test:offline-bundle` | 通过；覆盖合成 MSIX、清单、哈希和 U 盘布局 |
-| `cargo test --manifest-path src-tauri/Cargo.toml` | 161/161 通过 |
+| `cargo test --manifest-path src-tauri/Cargo.toml` | 168/168 通过 |
+| `cargo check --target x86_64-pc-windows-msvc --features custom-protocol` | 通过 |
+| `npm run build` | 通过 |
 | `git diff --check` | 通过 |
 | 真实 Windows Authenticode、真实 `Add-AppxPackage`、真实拔盘 | 未在本机自动化测试中覆盖 |
 
@@ -22,37 +24,37 @@
 
 ## 2. 发现项
 
-### A-01：当前没有 U 盘绑定和运行期看门狗（高优先级，功能缺口）
+### A-01：本地看门狗已实现；开始菜单直接启动仍是 P2（高优先级残留）
 
-现状：安装器能从 U 盘读取 MSIX，但 Codex 安装后进入 WindowsApps，CCSwitch 进入 `%LOCALAPPDATA%\Programs\CodexSwitch`。没有本地守护进程、硬件指纹或拔盘计时逻辑。
+现状：P1 已增加 `usb_guard.rs`、本地 `CodexUsbGuard.exe`、租约和 5 秒状态机。管理器启动的 Codex/CCSwitch 会登记 PID 并在拔盘后退出。Codex 安装后仍可从开始菜单独立启动；P2 尚未按 AppX 包身份拦截。
 
-影响：拔掉 U 盘不会自动关闭已运行的 Codex/CCSwitch；复制安装器目录后仍可能安装或启动。
+影响：直接开始菜单启动的 Codex 不在 P1 租约范围内；复制到非可移动位置会显示 unsupported，复制到另一 U 盘会因卷序列号/锚点不匹配而进入宽限后退出。
 
-结论：这是下一阶段必须增加的架构能力，不能通过现有 `manifest.json` 或 `SHA256SUMS.txt` 单独解决。
+结论：P1 已解决管理器工作流；P2 仍需独立做 AppX 身份监控并验证误杀边界。
 
-### A-02：CCSwitch 复制前未在 Rust 运行路径中强制校验签名/哈希（中高优先级）
+### A-02：CCSwitch 运行路径仍缺少发行版固定哈希信任根（中高优先级残留）
 
 位置：`src-tauri/src/app/ccswitch.rs` 的 `install_and_launch`、`copy_payload`。
 
-现状：代码会寻找旁边的 `ccswitch\CodexSwitch.exe` 或资源目录，检查“是普通文件”后复制并启动。静态验证脚本会校验文件，但安装器命令本身没有把 `usb-manifest` 的签名或 CCSwitch 哈希作为信任根。
+现状：代码会避免覆盖同哈希的正在使用文件，并写入 `.codex-usb-managed.json`；但尚未把 `usb-manifest.json` 的 CCSwitch 哈希/Authenticode 再次作为 Rust 信任根。正式发行仍必须依靠签名许可证/清单和构建产物签名。
 
-影响：如果攻击者替换 U 盘上的 CCSwitch 文件并绕过脚本，安装器可能执行被替换的 EXE。第一版应至少在 Rust 路径再次校验固定哈希和 Authenticode；正式绑定版本应由签名清单覆盖。
+影响：如果攻击者替换 U 盘上的 CCSwitch 文件并绕过脚本，安装器可能执行被替换的 EXE；这是发行前必须补强的信任链问题。
 
-### A-03：卸载按进程名全局终止 CCSwitch（中高优先级）
+### A-03：卸载已改为租约 PID 终止（已修复）
 
 位置：`src-tauri/src/app/ccswitch.rs` 的 `terminate_running_process`。
 
-现状：使用 `taskkill /IM CodexSwitch.exe /T /F`。这会匹配同名的其他安装实例，而不是只匹配本产品复制到 `%LOCALAPPDATA%\Programs\CodexSwitch` 的进程。
+现状：CCSwitch 启动 PID 写入租约；卸载只读取 `role=ccswitch` 的租约 PID，先优雅关闭再对相同 PID 强制关闭，不再使用全局 `/IM`。
 
-影响：可能误杀用户单独安装的 CCSwitch。绑定版本必须改为记录 PID/进程路径/安装标记，并在路径和文件哈希匹配时才终止。
+影响：P1 已消除主要误杀路径；仍建议在 Windows 实机用“另一个 CCSwitch 同时运行”回归。
 
-### A-04：完整清理会删除共享 CCSwitch 数据目录（中优先级）
+### A-04：共享数据清理增加所有权标记（已修复）
 
 位置：`data_dirs` 和 `uninstall(true)`。
 
-现状：清理路径包含 `%USERPROFILE%\.cc-switch` 和 `com.ccswitch.desktop` WebView 数据，没有区分是否由本安装器创建。
+现状：安装器在本地 CCSwitch 目录写入 `.codex-usb-managed.json`；只有标记存在且用户明确选择清理时，才删除共享数据目录；无标记时保留并在报告中说明。
 
-影响：用户可能在其他位置安装过 CCSwitch，选择清理时其配置也会被删除。UI/文档中“其他位置单独安装的 CCSwitch 不会被删除”与共享数据清理存在边界不一致。
+影响：标记本身属于用户可写文件，不能抵抗本机管理员或逆向修改；它解决的是普通误删而非对抗性安全。
 
 建议：默认保留共享数据；全量清理前显示精确路径，并只删除带有本产品安装标记或由本产品创建的目录。
 
@@ -76,11 +78,11 @@
 - 安装前会将载荷复制到临时目录并再次校验，降低 U 盘读取中断造成的半文件风险。
 - Tauri 发布构建显式使用 `custom-protocol`，避免空白机器回落到 `127.0.0.1` 开发服务器。
 - CCSwitch 安装目录和卸载流程具有幂等性，默认不清除 Codex/CCSwitch 用户数据。
-- 当前回归测试全部通过，说明既有安装器功能没有因本次设计文档而改变。
+- P1 新增纯逻辑指纹、签名许可证、5 秒状态机和前端状态卡测试；Windows MSVC 条件编译通过。
 
-## 4. 审计结论
+## 5. 审计结论
 
-当前版本可以作为“离线 Codex + CCSwitch 安装器”留档，但还不能宣称具备 U 盘授权或防复制能力。下一阶段应优先解决 A-01，再同时修复 A-02、A-03 和 A-04；A-05 是发行前必须完成的信任链补强，A-06 是跨设备验收前置条件。
+当前版本可以作为“离线 Codex + CCSwitch + P1 U 盘绑定看门狗”候选构建，但不应宣称能阻止专业逆向或拦截所有开始菜单启动。A-03/A-04 已修复；A-02（发行哈希/签名信任根）、A-05（签名清单）和 A-06（真实 Windows 拔盘/空白机）仍是发布前工作。
 
 推荐的安全顺序为：
 

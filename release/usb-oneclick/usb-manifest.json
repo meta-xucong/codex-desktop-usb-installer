@@ -5,8 +5,8 @@
   "description": "Offline Codex desktop installation followed by automatic per-user Codex Switch installation and launch.",
   "codexInstaller": {
     "file": "CodexDesktopSetup.exe",
-    "size": 19450880,
-    "sha256": "7cf01db7d88f999399d8c556716ef9cc956a045d51078c6199c95eb54d38dcdb",
+    "size": 19716096,
+    "sha256": "e7c858ea195fbde1f86f8121b193041c3ee7fcaee197c6cfcd3b0b248560fc25",
     "payload": "payload/OpenAI.Codex_x64.msix",
     "payloadSize": 802145236,
     "payloadSha256": "ab0feacc74e982742736da4a7f1d2b59e9fabaa3641606545d3064927da02b1e"
@@ -18,6 +18,15 @@
     "sha256": "75b847ca54d207cbe92866154da8f504c6874f6d253423899c7cddfa5fee0045",
     "embeddedExecutable": "resources/ccswitch/CodexSwitch.exe",
     "localInstallDirectory": "%LOCALAPPDATA%/Programs/CodexSwitch"
+  },
+  "usbGuard": {
+    "helper": "CodexUsbGuard.exe",
+    "localDirectory": "%LOCALAPPDATA%/CodexUsbGuard",
+    "licenseFile": "usb-license.json",
+    "binding": "removable-volume + volume-serial + anchor-sha256 + bundle-relative-path",
+    "pollIntervalMs": 1000,
+    "disconnectGraceMs": 5000,
+    "startMenuInterception": false
   },
   "workflow": [
     "Double-click CodexDesktopSetup.exe with manifest.json and payload/ beside it.",
@@ -31,6 +40,7 @@
   "notes": [
     "The root manifest.json is the Codex installer manifest and must not be replaced by usb-manifest.json.",
     "The CCSwitch copy/launch is best-effort; a missing payload does not roll back a successful Codex installation.",
-    "The first release is an offline MSIX installer plus a per-user CCSwitch copy, not an MSI or self-updating package."
+    "The first release is an offline MSIX installer plus a per-user CCSwitch copy, not an MSI or self-updating package.",
+    "Unsigned development bundles auto-enroll on first run; strict anti-copy releases require a pre-provisioned signed usb-license.json."
   ]
 }

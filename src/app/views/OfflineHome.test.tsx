@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { managerApi } from "../../services/managerApi";
-import type { OfflinePayloadReport, OfflineStageReport } from "../../shared/types";
+import type { OfflinePayloadReport, OfflineStageReport, UsbGuardStatus } from "../../shared/types";
 import { I18nProvider } from "../i18n";
 import { ThemeProvider } from "../theme";
 import { OfflineHome } from "./OfflineHome";
@@ -21,6 +21,7 @@ vi.mock("../../services/managerApi", async (importOriginal) => {
       winInstallHistoricalRelease: vi.fn(),
       winLaunch: vi.fn(),
       installAndLaunchCcswitch: vi.fn(),
+      usbGuardStatus: vi.fn(),
       openLogsDir: vi.fn(),
     },
   };
@@ -64,6 +65,22 @@ const STAGE: OfflineStageReport = {
   payload: PAYLOAD,
 };
 
+const USB_GUARD: UsbGuardStatus = {
+  schemaVersion: 1,
+  status: "authorized",
+  watchdog: "running",
+  removable: true,
+  driveRoot: "F:\\",
+  bundlePath: "F:\\usb-oneclick",
+  bundleRelativePath: "usb-oneclick",
+  signed: false,
+  lastCheckedAtMs: Date.now(),
+  missingSinceMs: null,
+  countdownSeconds: null,
+  managedProcesses: [],
+  message: "U 盘已验证（开发许可证未签名），看门狗运行中",
+};
+
 function renderView() {
   return render(
     <ThemeProvider>
@@ -98,6 +115,7 @@ describe("OfflineHome", () => {
       message: "launched",
     });
     api.openLogsDir.mockResolvedValue();
+    api.usbGuardStatus.mockResolvedValue(USB_GUARD);
   });
 
   it("loads and displays the fixed package evidence", async () => {
@@ -105,6 +123,19 @@ describe("OfflineHome", () => {
     await waitFor(() => expect(screen.getByText("26.602.40724")).toBeInTheDocument());
     expect(screen.getByText("OpenAI.Codex_x64.msix")).toBeInTheDocument();
     expect(screen.getByText("校验通过")).toBeInTheDocument();
+    expect(screen.getByTestId("usb-guard-status")).toHaveTextContent("U 盘绑定已启用");
+  });
+
+  it("shows the unplug grace countdown reported by the helper", async () => {
+    api.usbGuardStatus.mockResolvedValue({
+      ...USB_GUARD,
+      status: "grace",
+      countdownSeconds: 4,
+      message: "暂时未检测到 U 盘，正在等待重新连接",
+    });
+    renderView();
+    await waitFor(() => expect(screen.getByTestId("usb-guard-status")).toHaveTextContent("4s"));
+    expect(screen.getByTestId("usb-guard-status")).toHaveTextContent("正在等待 U 盘重新连接");
   });
 
   it("stages the payload and calls the existing guarded local install", async () => {

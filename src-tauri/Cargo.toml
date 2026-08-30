@@ -32,6 +32,7 @@ codex-mac-engine = { path = "../crates/codex-mac-engine" }
 codex-theme-engine = { path = "../crates/codex-theme-engine" }
 codex-win-engine = { path = "../crates/codex-win-engine" }
 directories = "6.0.0"
+ed25519-dalek = "3"
 fs4 = "1.1"
 log = "0.4"
 reqwest = { version = "0.13.4", default-features = false, features = ["socks", "system-proxy"] }
@@ -49,7 +50,7 @@ thiserror = "2.0"
 tokio = { version = "1", features = ["sync", "time"] }
 url = "2.5"
 uuid = { version = "1", features = ["v4"] }
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_SystemInformation", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_SystemInformation", "Win32_System_WindowsProgramming", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 zip = { version = "8", default-features = false, features = ["deflate"] }
 
 [target.'cfg(unix)'.dependencies]

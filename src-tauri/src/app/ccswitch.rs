@@ -13,7 +13,9 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
+use serde::Deserialize;
 use serde::Serialize;
+use sha2::Digest as _;
 use tauri::{AppHandle, Manager};
 
 use crate::errors::AppError;
@@ -21,6 +23,7 @@ use crate::errors::AppError;
 pub const CCSWITCH_EXECUTABLE: &str = "CodexSwitch.exe";
 const CCSWITCH_SOURCE_DIR: &str = "ccswitch";
 pub const CCSWITCH_INSTALL_DIR: &str = "CodexSwitch";
+const CCSWITCH_MANAGED_MARKER: &str = ".codex-usb-managed.json";
 const CCSWITCH_DATA_DIR: &str = ".cc-switch";
 const CCSWITCH_IDENTIFIER: &str = "com.ccswitch.desktop";
 const CCSWITCH_RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
@@ -36,6 +39,16 @@ const CCSWITCH_PAYLOAD_FILES: &[&str] = &[
     "LICENSE",
     "SOURCE-NOTICE.txt",
 ];
+
+#[derive(Debug, Deserialize)]
+struct CcswitchManifest {
+    artifact: CcswitchArtifact,
+}
+
+#[derive(Debug, Deserialize)]
+struct CcswitchArtifact {
+    sha256: String,
+}
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -84,6 +97,54 @@ fn report_missing(message: impl Into<String>) -> CcswitchLaunchReport {
 
 fn io_error(path: &Path, error: impl std::fmt::Display) -> AppError {
     AppError::Engine(format!("写入 {} 失败: {error}", path.display()))
+}
+
+fn sha256_file(path: &Path) -> Result<String, AppError> {
+    let bytes = fs::read(path).map_err(|error| io_error(path, error))?;
+    let digest = sha2::Sha256::digest(bytes);
+    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn managed_marker_path(install_dir: &Path) -> PathBuf {
+    install_dir.join(CCSWITCH_MANAGED_MARKER)
+}
+
+fn write_managed_marker(install_dir: &Path) -> Result<(), AppError> {
+    let marker = serde_json::json!({
+        "product": "codex-usb-oneclick",
+        "component": "ccswitch",
+        "executable": CCSWITCH_EXECUTABLE,
+        "createdAtMs": crate::app::usb_guard::now_ms(),
+    });
+    fs::write(
+        managed_marker_path(install_dir),
+        serde_json::to_vec_pretty(&marker).unwrap(),
+    )
+    .map_err(|error| io_error(&managed_marker_path(install_dir), error))
+}
+
+fn verify_source_executable(source: &Path) -> Result<(), AppError> {
+    let source_dir = source
+        .parent()
+        .ok_or_else(|| AppError::Engine("无法确定 CCSwitch 载荷目录".to_string()))?;
+    let manifest_path = source_dir.join("manifest.json");
+    let manifest_bytes =
+        fs::read(&manifest_path).map_err(|error| io_error(&manifest_path, error))?;
+    let manifest: CcswitchManifest =
+        serde_json::from_slice(&manifest_bytes).map_err(|error| io_error(&manifest_path, error))?;
+    let expected = manifest.artifact.sha256.trim();
+    if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(AppError::Engine(
+            "CCSwitch manifest 中的 sha256 无效".to_string(),
+        ));
+    }
+    let actual = sha256_file(source)?;
+    if !actual.eq_ignore_ascii_case(expected) {
+        return Err(AppError::Engine(format!(
+            "CCSwitch 载荷校验失败: {actual} != {expected}"
+        )));
+    }
+    Ok(())
 }
 
 fn is_regular_file(path: &Path) -> bool {
@@ -185,38 +246,15 @@ fn remove_dir_all_retry(path: &Path) -> Result<bool, AppError> {
 
 #[cfg(target_os = "windows")]
 fn terminate_running_process() -> Result<bool, AppError> {
-    // Query first so a missing process is not reported as a failure.  The
-    // image name is unique to the bundled product, and taskkill /T also closes
-    // any renderer child processes that would otherwise keep files locked.
-    let listed = Command::new("tasklist")
-        .args([
-            "/FI",
-            &format!("IMAGENAME eq {CCSWITCH_EXECUTABLE}"),
-            "/FO",
-            "CSV",
-            "/NH",
-        ])
-        .output()
-        .map_err(|error| AppError::Engine(format!("查询 CCSwitch 进程失败: {error}")))?;
-    let listing = String::from_utf8_lossy(&listed.stdout).to_ascii_lowercase();
-    if !listing.contains(&CCSWITCH_EXECUTABLE.to_ascii_lowercase()) {
-        return Ok(false);
+    // The shared helper rechecks both the recorded PID and its executable
+    // image before taskkill.  If the lease is absent (for example an
+    // independently installed CCSwitch), leave it alone and let the user
+    // close it before retrying uninstall.
+    let killed = crate::app::usb_guard::terminate_managed_processes_for_role("ccswitch");
+    if killed > 0 {
+        thread::sleep(Duration::from_millis(150));
     }
-
-    let killed = Command::new("taskkill")
-        .args(["/IM", CCSWITCH_EXECUTABLE, "/T", "/F"])
-        .output()
-        .map_err(|error| AppError::Engine(format!("关闭 CCSwitch 进程失败: {error}")))?;
-    if !killed.status.success() {
-        let detail = String::from_utf8_lossy(&killed.stderr).trim().to_string();
-        return Err(AppError::Engine(if detail.is_empty() {
-            "关闭 CCSwitch 进程失败".to_string()
-        } else {
-            format!("关闭 CCSwitch 进程失败: {detail}")
-        }));
-    }
-    thread::sleep(Duration::from_millis(150));
-    Ok(true)
+    Ok(killed > 0)
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -275,6 +313,7 @@ fn remove_autostart_entry(_install_dir: &Path) -> Result<bool, AppError> {
 pub fn uninstall(purge_user_data: bool) -> Result<CcswitchUninstallReport, AppError> {
     let install_dir = local_install_dir()?;
     let installed_before = install_dir.exists();
+    let managed_marker = managed_marker_path(&install_dir).is_file();
     let data_paths = data_dirs();
     let mut notes = Vec::new();
 
@@ -297,7 +336,7 @@ pub fn uninstall(purge_user_data: bool) -> Result<CcswitchUninstallReport, AppEr
     }
 
     let mut purged_user_data = false;
-    if purge_user_data {
+    if purge_user_data && managed_marker {
         let mut removed_any = false;
         for data_path in &data_paths {
             if remove_dir_all_retry(data_path)? {
@@ -306,16 +345,18 @@ pub fn uninstall(purge_user_data: bool) -> Result<CcswitchUninstallReport, AppEr
             }
         }
         purged_user_data = removed_any || data_paths.iter().all(|path| !path.exists());
+    } else if purge_user_data {
+        notes.push("未找到本安装器的 CCSwitch 所有权标记，已保留用户数据。".to_string());
     } else {
         notes.push("已保留 CCSwitch 配置与用户数据。".to_string());
     }
 
-    let success =
-        !install_dir.exists() && (!purge_user_data || data_paths.iter().all(|path| !path.exists()));
+    let success = !install_dir.exists()
+        && (!purge_user_data || !managed_marker || data_paths.iter().all(|path| !path.exists()));
     let message = if !success {
         "CCSwitch 程序已部分清理，请关闭占用文件的进程后重试。".to_string()
     } else if installed_before || removed_autostart || purged_user_data {
-        if purge_user_data {
+        if purge_user_data && managed_marker {
             "CCSwitch 已卸载并清除配置。".to_string()
         } else {
             "CCSwitch 已卸载，配置已保留。".to_string()
@@ -361,14 +402,27 @@ fn copy_payload(source_executable: &Path, target_dir: &Path) -> Result<usize, Ap
         }
         let target = target_dir.join(file_name);
         if *file_name == CCSWITCH_EXECUTABLE {
-            fs::copy(&source, &temp_executable)
-                .map_err(|error| io_error(&temp_executable, error))?;
-            if target.exists() {
-                fs::remove_file(&target).map_err(|error| io_error(&target, error))?;
-            }
-            if let Err(error) = fs::rename(&temp_executable, &target) {
-                let _ = fs::remove_file(&temp_executable);
-                return Err(io_error(&target, error));
+            let already_current = target.exists()
+                && sha256_file(&source)
+                    .ok()
+                    .zip(sha256_file(&target).ok())
+                    .is_some_and(|(left, right)| left.eq_ignore_ascii_case(&right));
+            if !already_current {
+                fs::copy(&source, &temp_executable)
+                    .map_err(|error| io_error(&temp_executable, error))?;
+                if target.exists() {
+                    // Do not delete a locked executable before we know the
+                    // replacement can be committed; this was the source of
+                    // the previous "Access is denied (os error 5)" report.
+                    if let Err(error) = fs::remove_file(&target) {
+                        let _ = fs::remove_file(&temp_executable);
+                        return Err(io_error(&target, error));
+                    }
+                }
+                if let Err(error) = fs::rename(&temp_executable, &target) {
+                    let _ = fs::remove_file(&temp_executable);
+                    return Err(io_error(&target, error));
+                }
             }
         } else {
             fs::copy(&source, &target).map_err(|error| io_error(&target, error))?;
@@ -381,6 +435,7 @@ fn copy_payload(source_executable: &Path, target_dir: &Path) -> Result<usize, Ap
             "CCSwitch 载荷中缺少 CodexSwitch.exe".to_string(),
         ));
     }
+    write_managed_marker(target_dir)?;
     Ok(copied)
 }
 
@@ -399,13 +454,22 @@ pub fn install_and_launch(app: &AppHandle) -> Result<CcswitchLaunchReport, AppEr
             "未找到 ccswitch\\CodexSwitch.exe；Codex 已安装，但 CCSwitch 未自动启动",
         ));
     };
+    verify_source_executable(&source)?;
     let target_dir = local_install_dir()?;
     let copied_files = copy_payload(&source, &target_dir)?;
     let target = target_dir.join(CCSWITCH_EXECUTABLE);
-    Command::new(&target)
+    let child = Command::new(&target)
         .current_dir(&target_dir)
         .spawn()
         .map_err(|error| io_error(&target, error))?;
+    // The USB guard records the exact child PID.  Unplug handling can then
+    // terminate only this managed CCSwitch instance instead of using a global
+    // `/IM CodexSwitch.exe` kill that might affect another installation.
+    if let Err(error) =
+        crate::app::usb_guard::register_process(child.id(), "ccswitch", Some(&target))
+    {
+        log::warn!("CCSwitch started but USB guard registration failed: {error}");
+    }
 
     Ok(CcswitchLaunchReport {
         available: true,
@@ -420,7 +484,10 @@ pub fn install_and_launch(app: &AppHandle) -> Result<CcswitchLaunchReport, AppEr
 
 #[cfg(test)]
 mod tests {
-    use super::{source_candidates, CCSWITCH_EXECUTABLE, CCSWITCH_SOURCE_DIR};
+    use super::{
+        source_candidates, verify_source_executable, CCSWITCH_EXECUTABLE, CCSWITCH_SOURCE_DIR,
+    };
+    use std::fs;
     use std::path::Path;
 
     #[test]
@@ -441,5 +508,25 @@ mod tests {
                     .join(CCSWITCH_SOURCE_DIR)
                     .join(CCSWITCH_EXECUTABLE)
         }));
+    }
+
+    #[test]
+    fn source_manifest_hash_gate_rejects_tampered_executable() {
+        let dir =
+            std::env::temp_dir().join(format!("codex-ccswitch-hash-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let executable = dir.join(CCSWITCH_EXECUTABLE);
+        fs::write(&executable, b"known payload").unwrap();
+        let hash = super::sha256_file(&executable).unwrap();
+        fs::write(
+            dir.join("manifest.json"),
+            serde_json::json!({ "artifact": { "sha256": hash } }).to_string(),
+        )
+        .unwrap();
+        assert!(verify_source_executable(&executable).is_ok());
+        fs::write(&executable, b"tampered payload").unwrap();
+        assert!(verify_source_executable(&executable).is_err());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

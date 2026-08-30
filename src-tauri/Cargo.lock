@@ -543,6 +543,7 @@ dependencies = [
  "codex-theme-engine",
  "codex-win-engine",
  "directories",
+ "ed25519-dalek",
  "fs4",
  "libc",
  "log",

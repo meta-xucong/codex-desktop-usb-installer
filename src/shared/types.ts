@@ -748,6 +748,38 @@ export interface WinInstallStatus {
   status: InstallClass;
 }
 
+/** Local removable-media lease/watchdog status for the fixed USB build. */
+export interface UsbManagedProcess {
+  pid: number;
+  role: string;
+  executable: string | null;
+  startedAtMs: number;
+}
+
+export interface UsbGuardStatus {
+  schemaVersion: number;
+  status:
+    | "authorized"
+    | "grace"
+    | "missing"
+    | "mismatch"
+    | "unsupported"
+    | "disabled"
+    | "stopped"
+    | string;
+  watchdog: "running" | "not-running" | string;
+  removable: boolean;
+  driveRoot: string | null;
+  bundlePath: string | null;
+  bundleRelativePath: string | null;
+  signed: boolean;
+  lastCheckedAtMs: number;
+  missingSinceMs: number | null;
+  countdownSeconds: number | null;
+  managedProcesses: UsbManagedProcess[];
+  message: string;
+}
+
 /** Delivery metadata (optional schemaVersion-2 fields; packer enforces). */
 export interface CodexThemeMeta {
   version: string | null;

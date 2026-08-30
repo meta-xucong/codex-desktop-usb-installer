@@ -5,6 +5,7 @@ import type {
   HistoricalInstallSelection,
   OfflinePayloadReport,
   OfflineStageReport,
+  UsbGuardStatus,
   WinInstallStatus,
 } from "../../shared/types";
 import {
@@ -12,7 +13,7 @@ import {
   type FailureSurface,
 } from "../errorCopy";
 import { Icon, CodexGlyph } from "../icons";
-import { useI18n } from "../i18n";
+import { useI18n, type TFn } from "../i18n";
 import { FailureBanner, Ring, StatusBanner, TopBar } from "../components";
 import { mib } from "../format";
 
@@ -59,6 +60,19 @@ function expectedFromStatus(status: WinInstallStatus | null) {
   };
 }
 
+function usbGuardLabel(status: string, t: TFn): string {
+  switch (status) {
+    case "authorized": return t("offline.usbGuard.authorized");
+    case "grace": return t("offline.usbGuard.grace");
+    case "missing": return t("offline.usbGuard.missing");
+    case "mismatch": return t("offline.usbGuard.mismatch");
+    case "unsupported": return t("offline.usbGuard.unsupported");
+    case "disabled": return t("offline.usbGuard.disabled");
+    case "stopped": return t("offline.usbGuard.stopped");
+    default: return status;
+  }
+}
+
 /**
  * Minimal V1 Windows screen.  It intentionally has no remote catalog or
  * update state machine: the only source is the fixed payload beside the
@@ -76,6 +90,7 @@ export function OfflineHome({
   const [phase, setPhase] = useState<OfflinePhase>("loading");
   const [payload, setPayload] = useState<OfflinePayloadReport | null>(null);
   const [status, setStatus] = useState<WinInstallStatus | null>(null);
+  const [usbGuard, setUsbGuard] = useState<UsbGuardStatus | null>(null);
   const [failure, setFailure] = useState<FailureSurface | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busyAction, setBusyAction] = useState<
@@ -87,12 +102,14 @@ export function OfflineHome({
     setFailure(null);
     setNotice(null);
     try {
-      const [nextPayload, nextStatus] = await Promise.all([
+      const [nextPayload, nextStatus, nextUsbGuard] = await Promise.all([
         managerApi.offlinePayloadProbe(),
         managerApi.winStatus(),
+        managerApi.usbGuardStatus().catch(() => null),
       ]);
       setPayload(nextPayload);
       setStatus(nextStatus);
+      setUsbGuard(nextUsbGuard);
       if (nextStatus.status === "external") {
         setNotice(t("offline.external"));
       } else if (
@@ -122,6 +139,25 @@ export function OfflineHome({
   useEffect(() => {
     void load();
   }, [load]);
+
+  // The helper writes a fresh status roughly once per second. Polling keeps
+  // the visible countdown useful without adding a WebSocket or privileged
+  // background service.
+  useEffect(() => {
+    let active = true;
+    const timer = window.setInterval(() => {
+      void managerApi
+        .usbGuardStatus()
+        .then((next) => {
+          if (active) setUsbGuard(next);
+        })
+        .catch(() => undefined);
+    }, 1_000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, []);
 
   const newerInstalled = useMemo(() => {
     if (!payload || !status?.installed) return false;
@@ -277,6 +313,27 @@ export function OfflineHome({
       <div className="scroll">
         {failure ? <FailureBanner failure={failure} /> : null}
         {notice ? <StatusBanner tone="info">{notice}</StatusBanner> : null}
+        {usbGuard ? (
+          <section
+            className={`usb-guard-status usb-guard-${usbGuard.status}`}
+            data-testid="usb-guard-status"
+          >
+            <div className="usb-guard-status-head">
+              <span className="usb-guard-status-icon"><Icon name={usbGuard.status === "authorized" ? "shield" : "alert"} /></span>
+              <span className="usb-guard-status-title">{usbGuardLabel(usbGuard.status, t)}</span>
+              {usbGuard.countdownSeconds !== null ? (
+                <span className="usb-guard-countdown">{usbGuard.countdownSeconds}s</span>
+              ) : null}
+            </div>
+            <div className="usb-guard-status-message">{usbGuard.message}</div>
+            {usbGuard.driveRoot ? (
+              <div className="usb-guard-status-path">{usbGuard.driveRoot}{usbGuard.bundleRelativePath ? ` · ${usbGuard.bundleRelativePath}` : ""}</div>
+            ) : null}
+            {!usbGuard.signed && usbGuard.status === "authorized" ? (
+              <div className="usb-guard-status-note">{t("offline.usbGuard.unsigned")}</div>
+            ) : null}
+          </section>
+        ) : null}
         <section className="hero" data-testid="offline-hero">
           {phase === "loading" ? (
             <>

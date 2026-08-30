@@ -39,6 +39,7 @@ import type {
   WinUninstallReport,
   WinBundleUninstallReport,
   WinUpdateReport,
+  UsbGuardStatus,
 } from "../shared/types";
 import { DEFAULT_SETTINGS, emptyOperationOutcome } from "../shared/types";
 
@@ -1703,6 +1704,27 @@ export const managerApi = {
       });
     }
     return invoke<CcswitchLaunchReport>("install_and_launch_ccswitch");
+  },
+  /** Read the local USB lease/watchdog snapshot (no mutation). */
+  usbGuardStatus(): Promise<UsbGuardStatus> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({
+        schemaVersion: 1,
+        status: "disabled",
+        watchdog: "not-running",
+        removable: false,
+        driveRoot: null,
+        bundlePath: null,
+        bundleRelativePath: null,
+        signed: false,
+        lastCheckedAtMs: Date.now(),
+        missingSinceMs: null,
+        countdownSeconds: null,
+        managedProcesses: [],
+        message: "browser preview: USB guard is unavailable",
+      });
+    }
+    return invoke<UsbGuardStatus>("usb_guard_status");
   },
 };
 

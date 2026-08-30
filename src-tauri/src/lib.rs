@@ -160,6 +160,7 @@ fn emit_shell_event(app: &tauri::AppHandle, event: &ShellEvent) {
 pub(crate) fn exit_after_confirm(app: &tauri::AppHandle) {
     let _ = codex_mac_engine::cancel_active_download();
     let _ = codex_win_engine::cancel_active_download();
+    crate::app::usb_guard::stop_for_manager();
     app.state::<state::ManagerState>()
         .force_quit
         .store(true, Ordering::SeqCst);
@@ -662,6 +663,13 @@ fn schedule_frontend_ready_fallback(app: tauri::AppHandle, generation: u64) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // The copied local helper must not construct a WebView.  Dispatch before
+    // Tauri initialization so unplug enforcement also works when WebView2 is
+    // unavailable on the target machine.
+    if crate::app::usb_guard::guard_requested() {
+        crate::app::usb_guard::run_guard_cli();
+        return;
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
             log::info!(
@@ -805,6 +813,7 @@ pub fn run() {
             commands::win_pick_existing_install,
             commands::win_adopt_path,
             commands::win_launch_codex,
+            commands::usb_guard_status,
             commands::install_and_launch_ccswitch,
             commands::win_perform_update,
             commands::win_install_historical_release,
@@ -836,6 +845,16 @@ pub fn run() {
                         crate::app::logging::KEEP_LOG_FILES,
                     );
                 });
+            }
+            #[cfg(target_os = "windows")]
+            match crate::app::usb_guard::start_for_manager() {
+                Ok(status) => log::info!(
+                    "USB guard initialized status={} watchdog={} signed={}",
+                    status.status,
+                    status.watchdog,
+                    status.signed
+                ),
+                Err(error) => log::warn!("USB guard initialization skipped error={error}"),
             }
             let operations = app.state::<state::ManagerState>().operations.clone();
             #[cfg(target_os = "windows")]
@@ -966,6 +985,7 @@ pub fn run() {
                     log::info!("menu quit requested id=cam-quit");
                     let policy = quit_policy_for(app);
                     if apply_quit_policy(app, &policy) {
+                        crate::app::usb_guard::stop_for_manager();
                         app.exit(0);
                     }
                 }
@@ -1009,6 +1029,7 @@ pub fn run() {
                 log::info!("window close requested label={}", window.label());
                 let policy = quit_policy_for(app);
                 if apply_quit_policy(app, &policy) {
+                    crate::app::usb_guard::stop_for_manager();
                     app.exit(0);
                 } else {
                     api.prevent_close();
@@ -1025,6 +1046,8 @@ pub fn run() {
                 let policy = quit_policy_for(app);
                 if !apply_quit_policy(app, &policy) {
                     api.prevent_exit();
+                } else {
+                    crate::app::usb_guard::stop_for_manager();
                 }
             }
         });

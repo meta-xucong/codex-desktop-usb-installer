@@ -59,6 +59,15 @@ $usbManifest = [ordered]@{
         embeddedExecutable = "resources/ccswitch/CodexSwitch.exe"
         localInstallDirectory = "%LOCALAPPDATA%/Programs/CodexSwitch"
     }
+    usbGuard = [ordered]@{
+        helper = "CodexUsbGuard.exe"
+        localDirectory = "%LOCALAPPDATA%/CodexUsbGuard"
+        licenseFile = "usb-license.json"
+        binding = "removable-volume + volume-serial + anchor-sha256 + bundle-relative-path"
+        pollIntervalMs = 1000
+        disconnectGraceMs = 5000
+        startMenuInterception = $false
+    }
     workflow = @(
         "Double-click CodexDesktopSetup.exe with manifest.json and payload/ beside it.",
         "The installer validates and installs the offline Codex MSIX.",
@@ -71,7 +80,8 @@ $usbManifest = [ordered]@{
     notes = @(
         "The root manifest.json is the Codex installer manifest and must not be replaced by usb-manifest.json.",
         "The CCSwitch copy/launch is best-effort; a missing payload does not roll back a successful Codex installation.",
-        "The first release is an offline MSIX installer plus a per-user CCSwitch copy, not an MSI or self-updating package."
+        "The first release is an offline MSIX installer plus a per-user CCSwitch copy, not an MSI or self-updating package.",
+        "Unsigned development bundles auto-enroll on first run; strict anti-copy releases require a pre-provisioned signed usb-license.json."
     )
 }
 $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
@@ -87,6 +97,15 @@ Codex U 盘一键安装版（V1）
 `CodexDesktopSetup.exe`：程序会先校验并安装 Codex Desktop，确认安装成功后，
 自动把改造版 Codex Switch 复制到本机并启动。首次打开时会弹出 404TOKEN 配置框，
 用户只需输入自己的 API Key 并点击“保存并启用”。
+
+U 盘绑定（P1）
+----------------
+首次从可移动 U 盘启动时，程序会生成 `usb-license.json`，并在本机用户目录建立
+临时看门狗 `%LOCALAPPDATA%\CodexUsbGuard`。看门狗每秒检查同一 U 盘的卷序列号、
+清单锚点哈希和包内相对路径；拔盘后先显示 5 秒倒计时，再结束本次安装器启动的
+Codex/CCSwitch 进程。完成首次绑定后，复制到 C 盘或另一块 U 盘不会获得授权。当前为
+未签名开发许可证，首次运行前复制品仍可自注册；正式发行必须由离线构建机按 U 盘
+预置签名许可证并关闭无签名自注册。看门狗不拦截用户从开始菜单独立启动的其他 Codex。
 
 必须保持的目录结构
 --------------------
@@ -123,6 +142,7 @@ API Key 和安全边界
 -------------------
 - U 盘包不包含 API Key；必须由用户在 CCSwitch 界面输入。
 - 安装器不会从 GitHub、Microsoft Store 或远程脚本下载组件。
+- 安装器不会创建隐藏常驻服务；看门狗只在管理器打开期间运行，并可通过卸载入口清理。
 - CCSwitch 是基于 GitHub 开源项目 CCSwitch 的第三方改造版，不是 OpenAI 官方发行版。
 - 404TOKEN 是用户提供的第三方 Sub2API 服务，请自行确认账户、计费和数据处理政策。
 

@@ -1,0 +1,40 @@
+{
+  "objective": "按 USB-BINDING-WATCHDOG-DEVELOPMENT.md 在 Codex U 盘安装器中实现本地看门狗、U 盘绑定和 5 秒拔盘退出，并补齐测试与审计",
+  "current_phase": "Complete implementation and verification",
+  "phase_status": "done",
+  "completed_phases": [
+    "Discover project structure",
+    "Implement USB guard core",
+    "Integrate Tauri, process lifecycle, uninstall and UI",
+    "Run tests and repair audit findings",
+    "Build release payload and update audit"
+  ],
+  "next_actions": [
+    "Wait for user Windows USB acceptance test",
+    "Plan P2 AppX package identity monitoring only after P1 acceptance"
+  ],
+  "tests_run": [
+    "cargo test --manifest-path src-tauri/Cargo.toml (168 passed)",
+    "cargo check --target x86_64-pc-windows-msvc --features custom-protocol",
+    "npm run check",
+    "npm run lint",
+    "npm test -- --run src (272 passed)",
+    "npm run build",
+    "npm run test:offline-bundle",
+    "release/usb-oneclick/verify-usb.ps1 -SkipNetwork"
+  ],
+  "known_bugs": [
+    "Physical disk serial/PNP ID is not yet included; rare cloned volume serials need P2/P3 hardening",
+    "Codex launched directly from Start menu is outside the P1 lease",
+    "Full npm test has a host WSL/bash fixture failure in release-workflow"
+  ],
+  "blockers": [],
+  "done_criteria": [
+    "Requested implementation work is complete",
+    "Relevant tests or checks pass",
+    "Progress and verification are recorded"
+  ],
+  "last_verified_at": "2026-08-31T01:30:46+08:00",
+  "created_at": "2026-08-31T00:33:30+08:00",
+  "updated_at": "2026-08-31T01:30:46+08:00"
+}

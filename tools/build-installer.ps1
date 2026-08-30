@@ -35,7 +35,12 @@ try {
     foreach ($fileName in @("CodexSwitch.exe", "providers.json", "manifest.json", "LICENSE", "SOURCE-NOTICE.txt", "verify-product.ps1")) {
         $sourceFile = Join-Path $CcswitchArtifactDir $fileName
         if (Test-Path -LiteralPath $sourceFile -PathType Leaf) {
-            Copy-Item -LiteralPath $sourceFile -Destination (Join-Path $ccswitchResourceDir $fileName) -Force
+            $destinationFile = Join-Path $ccswitchResourceDir $fileName
+            # Allow a checkout's already-staged CCSwitch resource directory to
+            # be used as the artifact source; Copy-Item rejects a self-copy.
+            if ((Resolve-Path -LiteralPath $sourceFile).Path -ne (Resolve-Path -LiteralPath $destinationFile -ErrorAction SilentlyContinue).Path) {
+                Copy-Item -LiteralPath $sourceFile -Destination $destinationFile -Force
+            }
         }
     }
     Write-Output "CCSwitch 资源已暂存：$ccswitchResourceDir"
