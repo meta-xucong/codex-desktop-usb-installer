@@ -167,6 +167,67 @@ export interface LocalReleasePackage {
   packageVersion: string | null;
 }
 
+/** Fixed USB bundle evidence returned by the offline installer commands. */
+export interface OfflinePayloadReport {
+  ready: boolean;
+  manifestPath: string;
+  payloadPath: string;
+  fileName: string;
+  size: number;
+  sha256: string;
+  hashVerified: boolean;
+  packageName: string;
+  packageVersion: string;
+  codexDesktopVersion: string;
+  architecture: "x64" | "arm64" | string;
+  minWindowsBuild: string;
+  appEntry: string | null;
+  appVersionVerified: boolean;
+  releaseTag: string;
+  authenticode: {
+    trusted: boolean;
+    publisherIsOpenai: boolean;
+    status: string;
+    statusMessage: string;
+    subject: string;
+    issuer: string;
+    thumbprint: string;
+  } | null;
+  warning: string | null;
+}
+
+export interface OfflineStageReport {
+  sourcePath: string;
+  stagedPath: string;
+  size: number;
+  sha256: string;
+  payload: OfflinePayloadReport;
+}
+
+/** Result of copying and launching the bundled Codex Switch configurator. */
+export interface CcswitchLaunchReport {
+  available: boolean;
+  installed: boolean;
+  launched: boolean;
+  sourcePath: string | null;
+  installedPath: string | null;
+  copiedFiles: number;
+  message: string;
+}
+
+/** Result of removing the per-user CCSwitch copy installed by the manager. */
+export interface CcswitchUninstallReport {
+  success: boolean;
+  installedBefore: boolean;
+  removedInstall: boolean;
+  removedAutostart: boolean;
+  purgedUserData: boolean;
+  installDir: string;
+  dataDirs: string[];
+  message: string;
+  notes: string[];
+}
+
 export interface HistoricalInstallSelection {
   releaseTag: string;
   version: string;
@@ -509,6 +570,12 @@ export interface MsixSideloadReport {
   installed: InstalledWindowsCodex | null;
   fallbackRecommended: boolean;
   rawError: string | null;
+  /** HRESULT returned by Windows AppX deployment, when present. */
+  hresult?: string | null;
+  /** AppX deployment ActivityId, useful for Get-AppxLog/Event Viewer. */
+  activityId?: string | null;
+  /** Bounded deployment-server log captured for this ActivityId. */
+  deploymentLog?: string | null;
 }
 
 export interface MsixHealthReport {
@@ -630,6 +697,20 @@ export interface WinUninstallReport {
   portable: PortableUninstallReport | null;
   purgedUserData: boolean;
   notes: string[];
+  outcome: OperationOutcome;
+}
+
+/** Combined Windows cleanup used by the fixed USB build. */
+export interface WinBundleUninstallReport {
+  success: boolean;
+  codex: WinUninstallReport | null;
+  codexError: string | null;
+  ccswitch: CcswitchUninstallReport | null;
+  ccswitchError: string | null;
+  message: string;
+  notes: string[];
+  purgedUserData: boolean;
+  purgedCcswitchData: boolean;
   outcome: OperationOutcome;
 }
 

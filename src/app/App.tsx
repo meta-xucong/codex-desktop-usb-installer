@@ -13,6 +13,7 @@ import { About } from "./views/About";
 import { Uninstall } from "./views/Uninstall";
 import { CodexConfig } from "./views/CodexConfig";
 import { CodexThemes } from "./views/CodexThemes";
+import { currentPlatform } from "./platform";
 
 type View = "home" | "settings" | "about" | "uninstall" | "config" | "themes";
 
@@ -33,6 +34,9 @@ function focusPageTarget(root: ParentNode | null) {
 
 function Shell() {
   const [view, setView] = useState<View>("home");
+  const offlineOnly =
+    currentPlatform() === "windows" &&
+    (import.meta.env.MODE === "production" || import.meta.env.VITE_OFFLINE_ONLY === "1");
   // Skip the first paint: NavBar / Home already own initial focus; stealing it
   // on mount is noisier than helpful for keyboard users.
   const skipInitialFocus = useRef(true);
@@ -70,6 +74,7 @@ function Shell() {
           NavBar back path so the two routes feel identical. */}
       <Rail
         section={view === "home" ? "home" : view === "themes" ? "themes" : "settings"}
+        offlineOnly={offlineOnly}
         onNavigate={(section) => {
           const target: View = section;
           if (target === view) return;
@@ -78,7 +83,10 @@ function Shell() {
         }}
       />
       <div data-view="home" style={{ display: view === "home" ? "contents" : "none" }}>
-        <Home onOpenSettings={() => setView("settings")} />
+        <Home
+          onOpenSettings={() => setView("settings")}
+          onOpenUninstall={() => setView("uninstall")}
+        />
       </div>
       {view === "settings" ? (
         <div data-view="settings" style={{ display: "contents" }}>
@@ -88,6 +96,7 @@ function Shell() {
             onOpenUninstall={() => setView("uninstall")}
             onOpenConfig={() => setView("config")}
             onOpenThemes={() => setView("themes")}
+            offlineOnly={offlineOnly}
           />
         </div>
       ) : null}
@@ -103,7 +112,7 @@ function Shell() {
       ) : null}
       {view === "uninstall" ? (
         <div data-view="uninstall" style={{ display: "contents" }}>
-          <Uninstall onBack={() => setView("settings")} />
+          <Uninstall onBack={() => setView("settings")} bundleMode={offlineOnly} />
         </div>
       ) : null}
       {view === "config" ? (

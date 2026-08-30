@@ -41,6 +41,7 @@ import {
 } from "../components";
 import { currentPlatform } from "../platform";
 import { WinHome } from "./WinHome";
+import { OfflineHome } from "./OfflineHome";
 import { mib, fmtDateTime } from "../format";
 import { useHomeMotion } from "../motion";
 import { Sheet } from "../Sheet";
@@ -75,7 +76,10 @@ type MacOrdinaryExpectation = Extract<
 >;
 
 /** Platform dispatcher — the backend command surface differs per OS. */
-export function Home(props: { onOpenSettings: () => void }) {
+export function Home(props: {
+  onOpenSettings: () => void;
+  onOpenUninstall?: () => void;
+}) {
   const [hostArchitecture, setHostArchitecture] = useState<string | null>(null);
   useEffect(() => {
     let active = true;
@@ -91,8 +95,10 @@ export function Home(props: { onOpenSettings: () => void }) {
       active = false;
     };
   }, []);
+  const offlineOnly =
+    import.meta.env.MODE === "production" || import.meta.env.VITE_OFFLINE_ONLY === "1";
   return currentPlatform() === "windows" ? (
-    <WinHome {...props} hostArchitecture={hostArchitecture} />
+    offlineOnly ? <OfflineHome {...props} /> : <WinHome {...props} hostArchitecture={hostArchitecture} />
   ) : (
     <MacHome {...props} hostArchitecture={hostArchitecture} />
   );

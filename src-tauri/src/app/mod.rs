@@ -1,4 +1,5 @@
 pub mod atomic_file;
+pub mod ccswitch;
 pub mod codex_self_update;
 pub mod codex_theme;
 pub mod config_health;
@@ -8,6 +9,7 @@ pub mod install_tx;
 pub mod logging;
 pub mod mac_update;
 pub mod msix_policy_tx;
+pub mod offline_payload;
 pub mod op_phase;
 pub mod operation_outcome;
 pub mod oplock;

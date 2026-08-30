@@ -10,6 +10,10 @@ use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_updater::UpdaterExt;
 
 use crate::app::atomic_file;
+use crate::app::ccswitch::{
+    install_and_launch as install_and_launch_ccswitch_impl, uninstall as uninstall_ccswitch_impl,
+    CcswitchLaunchReport, CcswitchUninstallReport,
+};
 use crate::app::config_health::ConfigHealth;
 use crate::app::diagnostics::Diagnostics;
 use crate::app::disk::available_space;
@@ -25,8 +29,14 @@ use crate::app::mac_update::{
     HistoricalMacEvidence, HistoricalMacExpectation, InstalledCodex, MacInstallStatus,
     MacPerformReport, MacStageReport, MacUninstallReport, MacUpdateReport, PerformExpectation,
 };
+use crate::app::offline_payload::{
+    cleanup_staged_payload, probe_offline_payload, stage_offline_payload, OfflinePayloadReport,
+    OfflineStageReport,
+};
 use crate::app::op_phase::{OperationPhase, QuitPolicy};
-use crate::app::operation_outcome::{AncillaryRetryReport, AncillaryRetryRequest};
+use crate::app::operation_outcome::{
+    AncillaryRetryReport, AncillaryRetryRequest, OperationOutcome, StepOutcome,
+};
 use crate::app::oplock::{
     HistoricalResumeContext, HistoricalResumeExpectation, HistoricalResumeSelection,
     OperationCompletion, OperationError, OperationGuard, OperationKind, OperationManager,
@@ -54,7 +64,7 @@ use crate::app::win_update::{
     win_adopt_path as adopt_windows_path, win_install_status,
     DownloadProgress as WinDownloadProgress, HistoricalWinExpectation, OperationEvidence,
     WinAbortGuard, WinAutoStageReport, WinInstallStatus, WinPerformExpectation, WinPerformReport,
-    WinStageReport, WinUninstallReport, WinUpdateReport,
+    WinStageReport, WinUninstallReport, WinUpdateReport, FIXED_MSIX_INSTALL_MODE,
 };
 use crate::app::window_mode::{self, WindowMode, WindowModeReport};
 use crate::domain::settings::AppSettings as DomainAppSettings;
@@ -1007,6 +1017,77 @@ pub async fn historical_pick_local_package(
     .await
     .map_err(|e| AppError::Internal(format!("join: {e}")))?
     .map_err(Into::into)
+}
+
+/// First-version USB entry point: inspect the fixed manifest and MSIX beside
+/// the running setup executable.  No catalog, GitHub, Store or mirror request
+/// is made.  `package_path` exists only for developer diagnostics and must
+/// still point inside the discovered bundle.
+#[tauri::command]
+pub async fn offline_payload_probe(
+    state: State<'_, ManagerState>,
+    package_path: Option<String>,
+) -> Result<OfflinePayloadReport, CommandError> {
+    if !matches!(state.target.os, OperatingSystem::Windows) {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    let executable = std::env::current_exe()
+        .map_err(|error| AppError::Internal(format!("无法确定安装器路径: {error}")))?;
+    let expected_architecture = state.target.arch.as_str().to_string();
+    let package_path = package_path.map(PathBuf::from);
+    tauri::async_runtime::spawn_blocking(move || {
+        probe_offline_payload(
+            &executable,
+            package_path.as_deref(),
+            Some(expected_architecture.as_str()),
+            true,
+        )
+    })
+    .await
+    .map_err(|error| AppError::Internal(format!("join: {error}")))?
+    .map_err(Into::into)
+}
+
+/// Copy a verified USB MSIX to the local temporary directory.  The subsequent
+/// guarded historical-install command receives this staged path, so the
+/// removable drive is no longer held open during AppX deployment.
+#[tauri::command]
+pub async fn offline_payload_stage(
+    state: State<'_, ManagerState>,
+    package_path: Option<String>,
+) -> Result<OfflineStageReport, CommandError> {
+    if !matches!(state.target.os, OperatingSystem::Windows) {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    let executable = std::env::current_exe()
+        .map_err(|error| AppError::Internal(format!("无法确定安装器路径: {error}")))?;
+    let expected_architecture = state.target.arch.as_str().to_string();
+    let package_path = package_path.map(PathBuf::from);
+    tauri::async_runtime::spawn_blocking(move || {
+        stage_offline_payload(
+            &executable,
+            package_path.as_deref(),
+            Some(expected_architecture.as_str()),
+            true,
+        )
+    })
+    .await
+    .map_err(|error| AppError::Internal(format!("join: {error}")))?
+    .map_err(Into::into)
+}
+
+/// Best-effort cleanup for a staged MSIX after a successful installation.  The
+/// backend validates the path is below `%TEMP%\\CodexDesktopInstaller` before
+/// deleting anything.
+#[tauri::command]
+pub async fn offline_payload_cleanup(staged_path: String) -> Result<(), CommandError> {
+    if !cfg!(target_os = "windows") {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    tauri::async_runtime::spawn_blocking(move || cleanup_staged_payload(Path::new(&staged_path)))
+        .await
+        .map_err(|error| AppError::Internal(format!("join: {error}")))?
+        .map_err(Into::into)
 }
 
 /// macOS-only: detect the installed Codex build, read the Sparkle appcast, and
@@ -2824,6 +2905,24 @@ pub async fn win_launch_codex(state: State<'_, ManagerState>) -> Result<(), Comm
         .map_err(Into::into)
 }
 
+/// Windows-only: install the bundled Codex Switch configurator and start it.
+///
+/// The USB build keeps `ccswitch/CodexSwitch.exe` beside the setup executable;
+/// a packaged Tauri build may instead expose the same directory through its
+/// resource directory.  The helper copies the payload to a per-user local
+/// directory before spawning it, so the configurator remains usable after the
+/// USB drive is removed.  A missing configurator is returned as a non-fatal
+/// report and never rolls back a successful Codex installation.
+#[tauri::command]
+pub async fn install_and_launch_ccswitch(
+    app: AppHandle,
+) -> Result<CcswitchLaunchReport, CommandError> {
+    tauri::async_runtime::spawn_blocking(move || install_and_launch_ccswitch_impl(&app))
+        .await
+        .map_err(|e| AppError::Internal(format!("join: {e}")))?
+        .map_err(Into::into)
+}
+
 /// Windows-only: guarded execution. Requires explicit confirmation, stages and
 /// verifies the MSIX first, then attempts Add-AppxPackage without elevation or
 /// policy changes. Reports portable fallback need transparently.
@@ -2966,7 +3065,9 @@ pub async fn win_perform_update(
 
 /// Windows-only historical/offline MSIX install. Reuses the verified normal
 /// perform tail, whose Add-AppxPackage path explicitly opts into
-/// ForceUpdateFromAnyVersion for real downgrade support.
+/// ForceUpdateFromAnyVersion for real downgrade support. A local USB MSIX may
+/// use the same verified bytes for portable recovery if AppX deployment is
+/// blocked by the target Windows image.
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn win_install_historical_release(
@@ -2981,6 +3082,7 @@ pub async fn win_install_historical_release(
     block_updates: bool,
     install_root: Option<String>,
     expected: HistoricalWinExpectation,
+    force_msix: Option<bool>,
 ) -> Result<WinPerformReport, CommandError> {
     if !matches!(state.target.os, OperatingSystem::Windows) {
         return Err(AppError::UnsupportedPlatform.into());
@@ -3014,7 +3116,14 @@ pub async fn win_install_historical_release(
         None => None,
     };
     let resume_install_root = pending_install_root.clone();
-    let install_mode = windows_install_mode_for_settings();
+    // The offline USB flow must never inherit a previous portable preference
+    // from the full manager. Keep the optional flag at the command boundary
+    // so existing online/historical callers retain their configured route.
+    let install_mode = if force_msix.unwrap_or(false) {
+        FIXED_MSIX_INSTALL_MODE.to_string()
+    } else {
+        windows_install_mode_for_settings()
+    };
     let local_path = local_path.map(PathBuf::from);
     let was_local = local_path.is_some();
     let network = if was_local {
@@ -3196,6 +3305,151 @@ pub async fn win_uninstall(
     .await
     .map_err(|e| AppError::Internal(format!("join: {e}")))?
     .map_err(Into::into)
+}
+
+/// Result of the fixed USB build's combined cleanup.  Codex and CCSwitch are
+/// reported separately so a failed CCSwitch file lock never obscures the fact
+/// that Codex itself was already removed (and vice versa).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WinBundleUninstallReport {
+    pub success: bool,
+    pub codex: Option<WinUninstallReport>,
+    pub codex_error: Option<String>,
+    pub ccswitch: Option<CcswitchUninstallReport>,
+    pub ccswitch_error: Option<String>,
+    pub message: String,
+    pub notes: Vec<String>,
+    pub purged_user_data: bool,
+    pub purged_ccswitch_data: bool,
+    #[serde(default)]
+    pub outcome: OperationOutcome,
+}
+
+fn combine_bundle_uninstall(
+    codex_result: Result<WinUninstallReport, AppError>,
+    ccswitch_result: Result<CcswitchUninstallReport, AppError>,
+    purge_user_data: bool,
+    purge_ccswitch_data: bool,
+) -> WinBundleUninstallReport {
+    let (codex, codex_error) = match codex_result {
+        Ok(report) => (Some(report), None),
+        Err(error) => (None, Some(error.to_string())),
+    };
+    let (ccswitch, ccswitch_error) = match ccswitch_result {
+        Ok(report) => (Some(report), None),
+        Err(error) => (None, Some(error.to_string())),
+    };
+
+    let mut notes = Vec::new();
+    let mut messages = Vec::new();
+    let mut outcome = if let Some(report) = codex.as_ref() {
+        report.outcome.clone()
+    } else {
+        OperationOutcome::primary_failed(
+            "unknown",
+            codex_error
+                .as_deref()
+                .unwrap_or("Codex 卸载失败，无法确认磁盘状态"),
+        )
+    };
+
+    if let Some(report) = codex.as_ref() {
+        messages.push(format!("Codex：{}", report.message));
+        notes.extend(report.notes.iter().map(|note| format!("Codex：{note}")));
+    }
+    if let Some(error) = codex_error.as_deref() {
+        messages.push(format!("Codex 卸载失败：{error}"));
+        notes.push(format!("Codex：{error}"));
+    }
+
+    if let Some(report) = ccswitch.as_ref() {
+        messages.push(format!("CCSwitch：{}", report.message));
+        notes.extend(report.notes.iter().map(|note| format!("CCSwitch：{note}")));
+        if !report.success {
+            let detail = report.message.clone();
+            if outcome.primary_ok {
+                outcome.primary_ok = false;
+                outcome.app_state = "unknown".to_string();
+                outcome.cleanup = StepOutcome::failed(detail.clone());
+            }
+            outcome.push_warning(detail);
+        }
+    }
+    if let Some(error) = ccswitch_error.as_deref() {
+        messages.push(format!("CCSwitch 卸载失败：{error}"));
+        notes.push(format!("CCSwitch：{error}"));
+        if outcome.primary_ok {
+            outcome.primary_ok = false;
+            outcome.app_state = "unknown".to_string();
+            outcome.cleanup = StepOutcome::failed(error);
+        } else {
+            outcome.push_warning(error);
+        }
+    }
+
+    let codex_success = codex.as_ref().is_some_and(|report| report.success);
+    let ccswitch_success = ccswitch.as_ref().is_some_and(|report| report.success);
+    let success = codex_success && ccswitch_success;
+    if messages.is_empty() {
+        messages.push("未检测到 Codex 或 CCSwitch 安装。".to_string());
+    }
+    if !success {
+        messages.push("部分清理未完成；关闭相关进程后可再次执行本操作。".to_string());
+    }
+
+    let purged_codex_data =
+        purge_user_data && codex.as_ref().is_some_and(|report| report.purged_user_data);
+    let purged_ccswitch_data = purge_ccswitch_data
+        && ccswitch
+            .as_ref()
+            .is_some_and(|report| report.purged_user_data);
+
+    WinBundleUninstallReport {
+        success,
+        codex,
+        codex_error,
+        ccswitch,
+        ccswitch_error,
+        message: messages.join("；"),
+        notes,
+        purged_user_data: purged_codex_data,
+        purged_ccswitch_data,
+        outcome,
+    }
+}
+
+/// Windows USB build: remove the manager-owned Codex installation and the
+/// locally copied CCSwitch program in one guarded operation.  Both operations
+/// are idempotent; if one side is already absent, the other side is still
+/// attempted.  User data is retained unless the corresponding purge flag is
+/// explicitly enabled by the UI.
+#[tauri::command]
+pub async fn win_uninstall_bundle(
+    state: State<'_, ManagerState>,
+    confirm: bool,
+    token: OperationToken,
+    purge_user_data: bool,
+    purge_ccswitch_data: bool,
+) -> Result<WinBundleUninstallReport, CommandError> {
+    if !matches!(state.target.os, OperatingSystem::Windows) {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    if !confirm {
+        return Err(
+            AppError::Internal("拒绝执行：Windows 卸载必须带显式 confirm".to_string()).into(),
+        );
+    }
+    let _op = DetachedGuard::validate_with_phase(&state, token, OperationPhase::Committing)?;
+    let settings = windows_domain_settings_for_persisted(&state);
+    let report = tauri::async_runtime::spawn_blocking(move || {
+        let codex = uninstall_windows_codex(&settings, confirm, purge_user_data);
+        let ccswitch = uninstall_ccswitch_impl(purge_ccswitch_data);
+        combine_bundle_uninstall(codex, ccswitch, purge_user_data, purge_ccswitch_data)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("join: {e}")))?;
+    Ok(report)
 }
 
 #[cfg(test)]

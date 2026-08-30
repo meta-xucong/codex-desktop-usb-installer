@@ -46,7 +46,7 @@
     "shortDescription": "Codex App mirror install and update manager.",
     "longDescription": "A manager app for installing and updating mirrored official Codex desktop app packages.",
     "targets": ["nsis", "dmg", "app"],
-    "resources": ["resources/*"],
+    "resources": ["resources/*", "resources/ccswitch/*"],
     "windows": {
       "nsis": {
         "displayLanguageSelector": true,

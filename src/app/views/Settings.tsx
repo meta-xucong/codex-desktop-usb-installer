@@ -116,6 +116,7 @@ export function Settings({
   onOpenUninstall,
   onOpenConfig: _onOpenConfig,
   onOpenThemes,
+  offlineOnly = false,
 }: {
   onBack: () => void;
   onOpenAbout: () => void;
@@ -123,6 +124,8 @@ export function Settings({
   /** Reserved: Codex config is not shippable yet; entry stays disabled. */
   onOpenConfig: () => void;
   onOpenThemes: () => void;
+  /** Hide all remote update/source controls in the fixed USB build. */
+  offlineOnly?: boolean;
 }) {
   const { t, lang, setLang } = useI18n();
   const { mode, setMode } = useTheme();
@@ -351,8 +354,8 @@ export function Settings({
           </div>
         ) : null}
 
-        {/* 更新源 */}
-        <div className="group">
+        {/* 更新源：固定 USB 版本不暴露任何远程来源。 */}
+        {!offlineOnly ? <div className="group">
           <div className="group-h">{t("settings.source.header")}</div>
           {/* Roving-tabindex radiogroup — the child radios carry focus + Tab, so
               the group is correctly non-focusable (WAI-ARIA APG). */}
@@ -430,9 +433,9 @@ export function Settings({
               </div>
             ) : null}
           </div>
-        </div>
+        </div> : null}
 
-        {win ? (
+        {!offlineOnly && win ? (
           <div className="group">
             <div className="group-h">{t("settings.windows.header")}</div>
             {/* Roving-tabindex radiogroup — child radios carry focus + Tab. */}
@@ -519,7 +522,7 @@ export function Settings({
           </div>
         ) : null}
 
-        <div className="group">
+        {!offlineOnly ? <div className="group">
           <div className="group-h">{t("settings.updateReminder.header")}</div>
           <div className="list">
             {skippedUpdate ? (
@@ -548,10 +551,10 @@ export function Settings({
               </div>
             )}
           </div>
-        </div>
+        </div> : null}
 
         {/* 通用 */}
-        <div className="group">
+        {!offlineOnly ? <div className="group">
           <div className="group-h">{t("settings.general.header")}</div>
           <div className="list">
             <div className="row">
@@ -712,7 +715,7 @@ export function Settings({
               />
             </div>
           </div>
-        </div>
+        </div> : null}
 
         {/* 外观 */}
         <div className="group">
@@ -736,19 +739,21 @@ export function Settings({
               <span className="rval">{LANGS.find((l) => l.code === lang)?.native ?? lang}</span>
               <Icon name="chevron" className="chev" />
             </button>
-            <button className="row" onClick={onOpenThemes}>
-              <Icon name="palette" className="ricon" />
-              <span className="rtext">
-                <span className="rtitle">{t("themes.title")}</span>
-                <span className="rsub">{t("themes.settingsSub")}</span>
-              </span>
-              <Icon name="chevron" className="chev" />
-            </button>
+            {!offlineOnly ? (
+              <button className="row" onClick={onOpenThemes}>
+                <Icon name="palette" className="ricon" />
+                <span className="rtext">
+                  <span className="rtitle">{t("themes.title")}</span>
+                  <span className="rsub">{t("themes.settingsSub")}</span>
+                </span>
+                <Icon name="chevron" className="chev" />
+              </button>
+            ) : null}
           </div>
         </div>
 
-        {/* 网络 */}
-        <div className="group">
+        {/* 网络：安装器阶段不需要代理或网络源配置。 */}
+        {!offlineOnly ? <div className="group">
           <div className="group-h">{t("settings.network.header")}</div>
           <div className="list">
             <div className="row" style={{ display: "block" }}>
@@ -801,7 +806,7 @@ export function Settings({
               ) : null}
             </div>
           </div>
-        </div>
+        </div> : null}
 
         {/* 更多 */}
         <div className="group">
@@ -932,7 +937,11 @@ export function Settings({
             <button className="row danger" onClick={onOpenUninstall}>
               <Icon name="trash" className="ricon" />
               <span className="rtext">
-                <span className="rtitle">{t("settings.more.uninstall")}</span>
+                <span className="rtitle">
+                  {offlineOnly && win
+                    ? t("settings.more.uninstallBundle")
+                    : t("settings.more.uninstall")}
+                </span>
               </span>
               <Icon name="chevron" className="chev" />
             </button>

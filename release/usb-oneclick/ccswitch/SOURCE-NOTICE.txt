@@ -1,0 +1,14 @@
+CodexSwitch 验证版来源说明
+==========================
+
+本目录中的 CodexSwitch.exe 基于以下开源项目构建：
+
+- 项目：CC Switch
+- 仓库：https://github.com/farion1231/cc-switch
+- 版本：3.14.1
+- 源码 commit：1d44b1ba41987cddeb8096fadba8190fab465cbb
+- 许可证：见同目录 LICENSE
+
+本验证版只做了 Codex 产品化改造：默认仅展示 Codex、预置 404TOKEN（Sub2API）
+供应商、关闭上游更新源，并保留用户运行时输入 API Key 的配置流程。404TOKEN
+不是 OpenAI 官方服务；本验证包不包含任何 API Key、Cookie 或其他用户凭据。

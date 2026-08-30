@@ -10,6 +10,8 @@ import type {
   StoreMigrationReport,
   CodexThemeSummary,
   CommandError,
+  CcswitchLaunchReport,
+  CcswitchUninstallReport,
   CodexUpdatePlatform,
   ConfigHealth,
   ConfigWhich,
@@ -22,6 +24,8 @@ import type {
   MacPerformReport,
   MacUninstallReport,
   MacUpdateReport,
+  OfflinePayloadReport,
+  OfflineStageReport,
   OperationKind,
   OperationSnapshot,
   OperationCompletion,
@@ -33,6 +37,7 @@ import type {
   WindowMode,
   WindowModeReport,
   WinUninstallReport,
+  WinBundleUninstallReport,
   WinUpdateReport,
 } from "../shared/types";
 import { DEFAULT_SETTINGS, emptyOperationOutcome } from "../shared/types";
@@ -379,6 +384,26 @@ const WIN_FALLBACK_STAGE: WinStageReport = {
   ],
 };
 
+const OFFLINE_FALLBACK_REPORT: OfflinePayloadReport = {
+  ready: true,
+  manifestPath: "C:\\CodexUSB\\manifest.json",
+  payloadPath: "C:\\CodexUSB\\payload\\OpenAI.Codex_x64.msix",
+  fileName: "OpenAI.Codex_x64.msix",
+  size: 566504666,
+  sha256: "6dc2e05ac2b760bbc77ce3f8a992efdb327363512c9c4744b9a146c41bc4d55a",
+  hashVerified: true,
+  packageName: "OpenAI.Codex",
+  packageVersion: "26.602.3474.0",
+  codexDesktopVersion: "26.602.3474",
+  architecture: "x64",
+  minWindowsBuild: "19041",
+  appEntry: "app\\Codex.exe",
+  appVersionVerified: true,
+  releaseTag: "local-signed-26.602.3474",
+  authenticode: null,
+  warning: "浏览器预览使用模拟载荷；桌面版会执行真实签名校验。",
+};
+
 const WIN_FALLBACK_PERFORM: WinPerformReport = {
   success: true,
   action: "msix-sideload",
@@ -446,6 +471,35 @@ const WIN_FALLBACK_UNINSTALL: WinUninstallReport = {
   },
   purgedUserData: false,
   notes: ["User data was preserved."],
+  outcome: emptyOperationOutcome({
+    primaryOk: true,
+    appState: "absent",
+    installClass: "none",
+  }),
+};
+
+const CCSWITCH_FALLBACK_UNINSTALL: CcswitchUninstallReport = {
+  success: true,
+  installedBefore: true,
+  removedInstall: true,
+  removedAutostart: false,
+  purgedUserData: false,
+  installDir: "%LOCALAPPDATA%\\Programs\\CodexSwitch",
+  dataDirs: ["%USERPROFILE%\\.cc-switch"],
+  message: "browser-dev mock: CCSwitch uninstall completed",
+  notes: ["browser-dev mock"],
+};
+
+const WIN_FALLBACK_BUNDLE_UNINSTALL: WinBundleUninstallReport = {
+  success: true,
+  codex: WIN_FALLBACK_UNINSTALL,
+  codexError: null,
+  ccswitch: CCSWITCH_FALLBACK_UNINSTALL,
+  ccswitchError: null,
+  message: "browser-dev mock: Codex and CCSwitch uninstall completed",
+  notes: ["browser-dev mock"],
+  purgedUserData: false,
+  purgedCcswitchData: false,
   outcome: emptyOperationOutcome({
     primaryOk: true,
     appState: "absent",
@@ -827,6 +881,37 @@ export const managerApi = {
       architecture,
     });
   },
+  /** Inspect the fixed manifest/MSIX next to the setup executable. */
+  offlinePayloadProbe(packagePath?: string): Promise<OfflinePayloadReport> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({ ...OFFLINE_FALLBACK_REPORT });
+    }
+    return invoke<OfflinePayloadReport>("offline_payload_probe", {
+      packagePath: packagePath ?? null,
+    });
+  },
+  /** Copy the verified USB payload into the local temporary directory. */
+  offlinePayloadStage(packagePath?: string): Promise<OfflineStageReport> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({
+        sourcePath: OFFLINE_FALLBACK_REPORT.payloadPath,
+        stagedPath: "C:\\Temp\\CodexDesktopInstaller\\26.602.3474\\OpenAI.Codex_x64.msix",
+        size: OFFLINE_FALLBACK_REPORT.size,
+        sha256: OFFLINE_FALLBACK_REPORT.sha256,
+        payload: { ...OFFLINE_FALLBACK_REPORT },
+      });
+    }
+    return invoke<OfflineStageReport>("offline_payload_stage", {
+      packagePath: packagePath ?? null,
+    });
+  },
+  /** Delete a staged payload after a successful install. */
+  offlinePayloadCleanup(stagedPath: string): Promise<void> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve();
+    }
+    return invoke<void>("offline_payload_cleanup", { stagedPath });
+  },
   async macInstallHistoricalRelease(
     selection: HistoricalInstallSelection,
     blockUpdates: boolean,
@@ -871,6 +956,7 @@ export const managerApi = {
     },
     operationToken?: OperationToken,
     installRoot?: string,
+    forceMsix = false,
   ): Promise<WinPerformReport> {
     if (!hasTauriRuntime()) {
       return Promise.resolve({
@@ -890,7 +976,7 @@ export const managerApi = {
       (expected.currentPath
         ? await managerApi.armDestructive("update")
         : await managerApi.beginTrackedOperation("install"));
-    return invoke<WinPerformReport>("win_install_historical_release", {
+    const request = {
       confirm: true,
       token,
       releaseTag: selection.releaseTag,
@@ -900,7 +986,9 @@ export const managerApi = {
       blockUpdates,
       installRoot,
       expected,
-    });
+      ...(forceMsix ? { forceMsix: true } : {}),
+    };
+    return invoke<WinPerformReport>("win_install_historical_release", request);
   },
   macPlanUpdate(simulatedBuild?: number): Promise<MacUpdateReport> {
     if (!hasTauriRuntime()) {
@@ -1512,6 +1600,39 @@ export const managerApi = {
       purgeUserData,
     });
   },
+  /** Windows USB build: remove Codex and the locally copied CCSwitch bundle
+   * in one guarded operation. The two purge flags are intentionally separate
+   * at the command boundary so future UI flows can preserve either data set. */
+  async winUninstallBundle(
+    confirm: boolean,
+    purgeUserData: boolean,
+    purgeCcswitchData: boolean,
+  ): Promise<WinBundleUninstallReport> {
+    if (!hasTauriRuntime()) {
+      if (!confirm) {
+        return Promise.reject(new Error("explicit confirmation is required"));
+      }
+      return Promise.resolve({
+        ...WIN_FALLBACK_BUNDLE_UNINSTALL,
+        purgedUserData: purgeUserData,
+        purgedCcswitchData: purgeCcswitchData,
+        ccswitch: {
+          ...CCSWITCH_FALLBACK_UNINSTALL,
+          purgedUserData: purgeCcswitchData,
+        },
+      });
+    }
+    if (!confirm) {
+      return Promise.reject(new Error("explicit confirmation is required"));
+    }
+    const token = await managerApi.armDestructive("uninstall");
+    return invoke<WinBundleUninstallReport>("win_uninstall_bundle", {
+      confirm,
+      token,
+      purgeUserData,
+      purgeCcswitchData,
+    });
+  },
   winStatus(): Promise<WinInstallStatus> {
     if (!hasTauriRuntime()) {
       return Promise.resolve({
@@ -1567,6 +1688,21 @@ export const managerApi = {
       return Promise.resolve();
     }
     return invoke<void>("win_launch_codex");
+  },
+  /** Copy the bundled Codex Switch configurator to local app data and launch it. */
+  installAndLaunchCcswitch(): Promise<CcswitchLaunchReport> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({
+        available: false,
+        installed: false,
+        launched: false,
+        sourcePath: null,
+        installedPath: null,
+        copiedFiles: 0,
+        message: "browser preview: CCSwitch launch is unavailable",
+      });
+    }
+    return invoke<CcswitchLaunchReport>("install_and_launch_ccswitch");
   },
 };
 

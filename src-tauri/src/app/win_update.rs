@@ -60,6 +60,25 @@ pub enum OperationEvidence {
 pub type EvidenceHook<'a> = dyn Fn(OperationEvidence) + Send + Sync + 'a;
 pub type BeforeWinCommitHook<'a> = dyn Fn() -> Result<(), AppError> + Send + Sync + 'a;
 
+/// Install mode used only by the fixed USB bundle. It is deliberately distinct
+/// from the user-selectable `msix` mode so the offline path cannot silently
+/// inherit the manager's portable preference. A local USB package is granted
+/// an explicit, same-bytes extraction recovery in
+/// `install_windows_historical_release`; this predicate remains strict for
+/// callers that do not provide a verified local package.
+pub const FIXED_MSIX_INSTALL_MODE: &str = "msix-fixed";
+
+fn allows_portable_fallback(install_mode: &str) -> bool {
+    install_mode != FIXED_MSIX_INSTALL_MODE
+}
+
+/// A local, already-verified MSIX is itself a complete ZIP payload.  The USB
+/// path may therefore recover from a blocked AppX service without inheriting
+/// the normal manager's portable preference or accepting a second artifact.
+fn allows_historical_portable_recovery(install_mode: &str, has_local_package: bool) -> bool {
+    allows_portable_fallback(install_mode) || has_local_package
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WinUpdateReport {
@@ -994,13 +1013,18 @@ fn stage_windows_historical_release(
         &capabilities,
         true,
     );
-    // Preserve a managed portable install in-place. Switching it to MSIX would
-    // leave the old portable tree behind after provenance moves to the package.
+    // Preserve a managed portable install in-place for the normal manager. The
+    // fixed USB mode still prefers the signed MSIX path, but a local package is
+    // also a complete portable payload: if AppX deployment is unavailable on a
+    // blank/stripped Windows image, the exact same verified bytes can be
+    // extracted without downloading or trusting another artifact.
     let managed = detect_managed_codex(settings, &ProvenanceStore::load());
+    let fixed_msix = !allows_portable_fallback(install_mode);
     if install_mode == "portable"
-        || managed
-            .as_ref()
-            .is_some_and(|installed| installed.source == "portable")
+        || (!fixed_msix
+            && managed
+                .as_ref()
+                .is_some_and(|installed| installed.source == "portable"))
     {
         plan.route = WinInstallRoute::PortableFallback;
     }
@@ -1021,6 +1045,12 @@ fn stage_windows_historical_release(
         "MSIX Authenticode signature and package identity were verified before installation."
             .to_string(),
     );
+    if is_local && fixed_msix {
+        notes.push(
+            "If Windows blocks AppX deployment, the verified local MSIX can be extracted as an emergency portable install; no network or alternate package is used."
+                .to_string(),
+        );
+    }
     Ok(WinStageReport {
         up_to_date: false,
         route,
@@ -1034,7 +1064,10 @@ fn stage_windows_historical_release(
         identity: Some(identity),
         identity_verified: true,
         install_ready: true,
-        portable_fallback_ready: true,
+        // A fixed USB install has no remote/alternate portable artifact, but
+        // the staged MSIX itself is a ZIP payload and can be used for a safe
+        // local extraction fallback after signature/hash verification.
+        portable_fallback_ready: !fixed_msix || is_local,
         notes,
     })
 }
@@ -1055,8 +1088,10 @@ fn validate_historical_windows_app_version(
 
 /// Verify and install a historical/local GitHub Release MSIX. The normal
 /// Windows tail is reused verbatim, including ForceUpdateFromAnyVersion,
-/// dependency pre-check, health probe, portable fallback, durable rollback and
-/// provenance handling.
+/// dependency pre-check, health probe, durable rollback and provenance
+/// handling. A fixed USB install remains MSIX-first; when its package came
+/// from the USB, a failed AppX deployment may fall back to extracting that
+/// already-verified MSIX locally (never to a remote or unverified artifact).
 #[allow(clippy::too_many_arguments)]
 pub fn install_windows_historical_release(
     resolved: ResolvedReleaseAsset,
@@ -1087,6 +1122,7 @@ pub fn install_windows_historical_release(
     validate_historical_windows_expectation(&expected, initial_status.installed.as_ref())?;
     check_win_update_abort()?;
     set_phase(OperationPhase::Downloading);
+    let local_package_supports_portable_recovery = local_path.is_some();
     let stage = stage_windows_historical_release(
         &resolved,
         local_path,
@@ -1095,6 +1131,8 @@ pub fn install_windows_historical_release(
         progress,
         network,
     )?;
+    let allow_portable_fallback =
+        allows_historical_portable_recovery(install_mode, local_package_supports_portable_recovery);
     set_phase(OperationPhase::Verifying);
     let current_status = win_install_status(settings);
     if current_status.status == "external" {
@@ -1111,6 +1149,7 @@ pub fn install_windows_historical_release(
         evidence,
         policy_transition,
         before_commit,
+        allow_portable_fallback,
     )
 }
 
@@ -1445,6 +1484,7 @@ pub fn perform_windows_update_with_install_mode_network_and_phase(
         evidence,
         None,
         None,
+        true,
     )
 }
 
@@ -1456,6 +1496,7 @@ fn perform_verified_windows_stage_tail(
     evidence: Option<&EvidenceHook<'_>>,
     policy_transition: Option<SelfUpdatePolicyTransition>,
     before_commit: Option<&BeforeWinCommitHook<'_>>,
+    allow_portable_fallback: bool,
 ) -> Result<WinPerformReport, AppError> {
     let set_phase = |p: OperationPhase| {
         if let Some(hook) = phase {
@@ -1501,6 +1542,11 @@ fn perform_verified_windows_stage_tail(
     check_win_update_abort()?;
 
     if stage.route == "portable-fallback" {
+        if !allow_portable_fallback {
+            return Err(AppError::Engine(
+                "离线固定 MSIX 模式不允许切换到便携版".to_string(),
+            ));
+        }
         log::warn!("Windows route changed to portable fallback from_route=msix-sideload to_route=portable-fallback");
         close_existing_codex_before_portable_fallback(settings, current_installed.as_ref())?;
         return install_portable_after_stage(
@@ -1534,7 +1580,7 @@ fn perform_verified_windows_stage_tail(
     // returns `checked = false` and we proceed to the sideload as before, where
     // the post-install health check + transparent fallback remain the backstop.
     let precheck = precheck_msix_dependencies(PathBuf::from(&staged_path).as_path());
-    if precheck.should_route_portable() {
+    if precheck.should_route_portable() && allow_portable_fallback {
         log::warn!("Windows route changed to portable fallback from_route=msix-sideload to_route=portable-fallback");
         // We're switching to portable, but the running build must be stopped first.
         close_existing_codex_before_portable_fallback(settings, current_installed.as_ref())?;
@@ -1662,7 +1708,7 @@ fn perform_verified_windows_stage_tail(
         // first install the portable fallback so the user is never left without
         // a runnable build, then clean up the bad MSIX best-effort.
         let health = verify_msix_health_with_options(was_running);
-        if !health.healthy {
+        if !health.healthy && allow_portable_fallback {
             log::warn!("Windows route changed to portable fallback from_route=msix-sideload to_route=portable-fallback");
             // Activation probe may have started Codex (or left a half-started
             // process). Close it before portable install and Remove-AppxPackage
@@ -1699,6 +1745,12 @@ fn perform_verified_windows_stage_tail(
                 report.outcome.push_warning(warning);
             }
             return Ok(report);
+        }
+        if !health.healthy {
+            return Err(AppError::Engine(format!(
+                "MSIX 离线安装后的健康检查失败，且固定 MSIX 模式不允许便携版回退：{}",
+                health.reason
+            )));
         }
 
         let installed = sideload
@@ -1776,6 +1828,16 @@ fn perform_verified_windows_stage_tail(
         return Ok(report);
     }
 
+    if !allow_portable_fallback {
+        return Err(AppError::Engine(format!(
+            "MSIX 离线安装失败，且固定 MSIX 模式不允许便携版回退：{}",
+            sideload.message
+        )));
+    }
+    // Preserve the original AppX HRESULT/ActivityId if extraction itself also
+    // fails. Without this wrapper the user would only see a filesystem or
+    // process error and lose the actual Windows deployment diagnosis.
+    let sideload_failure = sideload.message.clone();
     let mut report = install_portable_after_stage(
         settings,
         stage,
@@ -1787,7 +1849,13 @@ fn perform_verified_windows_stage_tail(
         evidence,
         policy_transition,
         before_commit,
-    )?;
+    )
+    .map_err(|err| {
+        AppError::Engine(format!(
+            "MSIX 离线安装失败（{}）；同一份 MSIX 的本地便携回退也失败：{}",
+            sideload_failure, err
+        ))
+    })?;
     report.notes.extend(msix_policy_warnings.iter().cloned());
     for warning in msix_policy_warnings {
         report.outcome.push_warning(warning);
@@ -1977,6 +2045,10 @@ fn install_portable_after_stage(
             "MSIX sideload failed without elevation or policy changes: {}",
             sideload.message
         ));
+        notes.push(
+            "已改用同一份通过 SHA-256 与 Authenticode 校验的本地 MSIX 解包安装；未下载或执行其他版本。"
+                .to_string(),
+        );
     }
     notes.extend(portable.notes.clone());
 
@@ -2034,7 +2106,12 @@ fn install_portable_after_stage(
         WinPerformAction::PortableFallback
     };
 
-    let message = portable_install_result_message(&portable.message, &outcome);
+    let base_message = if sideload.is_some() {
+        "Windows 拒绝了 MSIX 部署，已使用同一份已验证 MSIX 完成本地便携安装。"
+    } else {
+        &portable.message
+    };
+    let message = portable_install_result_message(base_message, &outcome);
     let report = WinPerformReport {
         success: true,
         action,
@@ -2490,11 +2567,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        bind_manifest_checksums, check_win_update_abort, detect_existing_windows_install_at_path,
-        detect_managed_codex, outcome_from_portable_uninstall,
-        portable_boundary_mutated_install_root, portable_fallback_needs_msix_cleanup,
-        portable_install_result_message, retry_windows_ancillary_with_detector,
-        validate_historical_windows_app_version, WinAbortGuard, WinInstallStatus, WinPerformAction,
+        allows_historical_portable_recovery, allows_portable_fallback, bind_manifest_checksums,
+        check_win_update_abort, detect_existing_windows_install_at_path, detect_managed_codex,
+        outcome_from_portable_uninstall, portable_boundary_mutated_install_root,
+        portable_fallback_needs_msix_cleanup, portable_install_result_message,
+        retry_windows_ancillary_with_detector, validate_historical_windows_app_version,
+        WinAbortGuard, WinInstallStatus, WinPerformAction, FIXED_MSIX_INSTALL_MODE,
         WIN_UPDATE_ABORT,
     };
     use crate::app::operation_outcome::{recovery, OperationOutcome, StepOutcome};
@@ -2541,6 +2619,26 @@ mod tests {
 
         let unreadable = validate_historical_windows_app_version(None, "26.707.31428").unwrap_err();
         assert!(unreadable.to_string().contains("无法读取"));
+    }
+
+    #[test]
+    fn fixed_msix_mode_disables_portable_fallback() {
+        assert!(!allows_portable_fallback(FIXED_MSIX_INSTALL_MODE));
+        assert!(allows_portable_fallback("msix"));
+        assert!(allows_portable_fallback("portable"));
+    }
+
+    #[test]
+    fn local_fixed_msix_allows_same_bytes_portable_recovery() {
+        assert!(allows_historical_portable_recovery(
+            FIXED_MSIX_INSTALL_MODE,
+            true
+        ));
+        assert!(!allows_historical_portable_recovery(
+            FIXED_MSIX_INSTALL_MODE,
+            false
+        ));
+        assert!(allows_historical_portable_recovery("msix", false));
     }
 
     #[test]

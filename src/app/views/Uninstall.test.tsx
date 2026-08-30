@@ -13,6 +13,7 @@ vi.mock("../../services/managerApi", () => ({
     winStatus: vi.fn(),
     macUninstall: vi.fn(),
     winUninstall: vi.fn(),
+    winUninstallBundle: vi.fn(),
     retryAncillary: vi.fn(),
     armDestructive: vi.fn(() => Promise.resolve("token")),
     openCodexHome: vi.fn(() => Promise.resolve()),
@@ -23,6 +24,7 @@ const macStatus = vi.mocked(managerApi.macStatus);
 const winStatus = vi.mocked(managerApi.winStatus);
 const macUninstall = vi.mocked(managerApi.macUninstall);
 const winUninstall = vi.mocked(managerApi.winUninstall);
+const winUninstallBundle = vi.mocked(managerApi.winUninstallBundle);
 const retryAncillary = vi.mocked(managerApi.retryAncillary);
 const SAFETY_FLOW_LANGS = ["fr", "ar", "es", "zh-TW"] as const satisfies readonly Lang[];
 
@@ -68,6 +70,32 @@ describe("Uninstall", () => {
         installClass: "none",
       }),
     });
+    winUninstallBundle.mockResolvedValue({
+      success: true,
+      codex: null,
+      codexError: null,
+      ccswitch: {
+        success: true,
+        installedBefore: true,
+        removedInstall: true,
+        removedAutostart: false,
+        purgedUserData: false,
+        installDir: "%LOCALAPPDATA%\\Programs\\CodexSwitch",
+        dataDirs: ["%USERPROFILE%\\.cc-switch"],
+        message: "bundle removed",
+        notes: [],
+      },
+      ccswitchError: null,
+      message: "Codex and CCSwitch removed",
+      notes: [],
+      purgedUserData: false,
+      purgedCcswitchData: false,
+      outcome: emptyOperationOutcome({
+        primaryOk: true,
+        appState: "absent",
+        installClass: "none",
+      }),
+    });
     retryAncillary.mockResolvedValue({
       message: "cleanup ok",
       outcome: emptyOperationOutcome({
@@ -92,6 +120,36 @@ describe("Uninstall", () => {
     expect(writeText).toHaveBeenCalledWith("%USERPROFILE%\\.codex");
     expect(screen.getByRole("button", { name: "Path copied" })).toBeInTheDocument();
     writeText.mockRestore();
+  });
+
+  it("runs the combined Windows cleanup and keeps data by default", async () => {
+    const user = userEvent.setup();
+    setPlatform("Win32");
+    render(<I18nProvider><Uninstall onBack={vi.fn()} bundleMode /></I18nProvider>);
+
+    expect(await screen.findByText("CCSwitch program to remove")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Uninstall Codex + CCSwitch" }));
+    expect(screen.getByRole("dialog", { name: "Uninstall Codex + CCSwitch?" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+
+    await waitFor(() => expect(winUninstallBundle).toHaveBeenCalledWith(true, false, false));
+    expect(winUninstall).not.toHaveBeenCalled();
+  });
+
+  it("requires the second confirmation before purging Codex and CCSwitch data", async () => {
+    const user = userEvent.setup();
+    setPlatform("Win32");
+    render(<I18nProvider><Uninstall onBack={vi.fn()} bundleMode /></I18nProvider>);
+
+    await screen.findByText("CCSwitch program to remove");
+    await user.click(screen.getByRole("switch"));
+    await user.click(screen.getByRole("button", { name: "Uninstall Codex + CCSwitch" }));
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+    expect(winUninstallBundle).not.toHaveBeenCalled();
+    expect(screen.getByRole("dialog", { name: "Erase Codex + CCSwitch data?" })).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Erase data & uninstall" }));
+    await waitFor(() => expect(winUninstallBundle).toHaveBeenCalledWith(true, true, true));
   });
 
   it("uninstalls after one confirmation when keeping data", async () => {

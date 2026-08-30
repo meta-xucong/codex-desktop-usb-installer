@@ -57,10 +57,21 @@ function mergeAncillaryRetryOutcome(
   };
 }
 
-export function Uninstall({ onBack }: { onBack: () => void }) {
+const CCSWITCH_INSTALL_DISPLAY = "%LOCALAPPDATA%\\Programs\\CodexSwitch";
+const CCSWITCH_DATA_DISPLAY = "%USERPROFILE%\\.cc-switch";
+
+export function Uninstall({
+  onBack,
+  bundleMode = false,
+}: {
+  onBack: () => void;
+  /** Fixed USB build exposes a combined Codex + CCSwitch cleanup flow. */
+  bundleMode?: boolean;
+}) {
   const { t } = useI18n();
   const platform = currentPlatform();
   const win = platform === "windows";
+  const bundledWindows = win && bundleMode;
   const codexHome = codexHomeDisplay(platform);
   // Default to keeping the user's data (~/.codex on mac, %USERPROFILE%\.codex on
   // Windows). Opting out is deliberate.
@@ -113,7 +124,9 @@ export function Uninstall({ onBack }: { onBack: () => void }) {
       // mac keeps ~/.codex via keepCodexHome; win purges via purgeUserData (the
       // inverse) — both surface the backend message as the source of truth.
       if (win) {
-        const r = await managerApi.winUninstall(true, !keepData);
+        const r = bundledWindows
+          ? await managerApi.winUninstallBundle(true, !keepData, !keepData)
+          : await managerApi.winUninstall(true, !keepData);
         if (r.success && outcomeIsPartial(r.outcome)) {
           setPartialOutcome(r.outcome);
           setDone(t("uninstall.partial.summary"));
@@ -184,20 +197,29 @@ export function Uninstall({ onBack }: { onBack: () => void }) {
     }
   };
 
+  const dataPaths = bundledWindows ? `${codexHome}\n${CCSWITCH_DATA_DISPLAY}` : codexHome;
+
   const copyPath = async () => {
     try {
-      await navigator.clipboard.writeText(codexHome);
+      await navigator.clipboard.writeText(dataPaths);
       setPathCopied(true);
     } catch {
       // Best-effort affordance; the destructive flow itself is unaffected.
     }
   };
 
-  const canUninstall = probe === "managed";
-
+  // The normal manager refuses to remove an external/unknown Codex.  The USB
+  // bundle can still clean its own CCSwitch copy when Codex is absent or
+  // external, so allow the combined action after the probe has settled.
+  const canUninstall = bundledWindows
+    ? probe !== "loading" && probe !== "error"
+    : probe === "managed";
   return (
     <div className="pop">
-      <NavBar title={t("uninstall.heading")} onBack={onBack} />
+      <NavBar
+        title={t(bundledWindows ? "uninstall.bundle.heading" : "uninstall.heading")}
+        onBack={onBack}
+      />
       <div className="scroll view" inert={confirmStep > 0 ? true : undefined}>
         {done ? (
           <>
@@ -207,7 +229,9 @@ export function Uninstall({ onBack }: { onBack: () => void }) {
                 variant={partialOutcome ? "amber" : "success"}
                 className="pop"
               />
-              <div className="headline">{t("uninstall.heading")}</div>
+              <div className="headline">
+                {t(bundledWindows ? "uninstall.bundle.heading" : "uninstall.heading")}
+              </div>
               <div className="desc">{done}</div>
             </section>
             {doneDetail ? (
@@ -269,9 +293,11 @@ export function Uninstall({ onBack }: { onBack: () => void }) {
             <section className="hero" style={{ marginTop: 8 }}>
               <Ring icon="trash" variant="danger" />
               <div className="headline" style={{ fontSize: 18 }}>
-                {t("uninstall.heading")}
+                {t(bundledWindows ? "uninstall.bundle.heading" : "uninstall.heading")}
               </div>
-              <div className="desc">{t("uninstall.warn")}</div>
+              <div className="desc">
+                {t(bundledWindows ? "uninstall.bundle.warn" : "uninstall.warn")}
+              </div>
             </section>
 
             {probe === "loading" ? (
@@ -305,7 +331,14 @@ export function Uninstall({ onBack }: { onBack: () => void }) {
               <div className="row">
                 <span className="rtext">
                   <span className="rtitle" id={keepDataTitleId}>{t("uninstall.keepData")}</span>
-                  <span className="rsub">{t("uninstall.keepDataNote", { path: codexHome })}</span>
+                  <span className="rsub">
+                    {t(
+                      bundledWindows ? "uninstall.bundle.keepDataNote" : "uninstall.keepDataNote",
+                      bundledWindows
+                        ? { codexPath: codexHome, ccswitchPath: CCSWITCH_DATA_DISPLAY }
+                        : { path: codexHome },
+                    )}
+                  </span>
                 </span>
                 <Toggle
                   ariaLabelledBy={keepDataTitleId}
@@ -316,13 +349,32 @@ export function Uninstall({ onBack }: { onBack: () => void }) {
               </div>
             </div>
 
-            {probe === "managed" ? (
+            {bundledWindows ? (
+              <div className="list">
+                <div className="row data-path-row">
+                  <span className="rtext">
+                    <span className="rtitle">{t("uninstall.bundle.programPath")}</span>
+                    <span className="rsub mono path">{CCSWITCH_INSTALL_DISPLAY}</span>
+                    <span className="rsub">{t("uninstall.bundle.programAffects")}</span>
+                  </span>
+                </div>
+              </div>
+            ) : null}
+
+            {probe === "managed" || bundledWindows ? (
               <div className="list">
                 <div className={`row data-path-row${keepData ? "" : " danger"}`}>
                   <span className="rtext">
-                    <span className="rtitle">{t("uninstall.dataPath")}</span>
+                    <span className="rtitle">
+                      {t(bundledWindows ? "uninstall.bundle.dataPath" : "uninstall.dataPath")}
+                    </span>
                     <span className="rsub mono path">{codexHome}</span>
-                    <span className="rsub">{t("uninstall.dataAffects")}</span>
+                    {bundledWindows ? (
+                      <span className="rsub mono path">{CCSWITCH_DATA_DISPLAY}</span>
+                    ) : null}
+                    <span className="rsub">
+                      {t(bundledWindows ? "uninstall.bundle.dataAffects" : "uninstall.dataAffects")}
+                    </span>
                   </span>
                   <div className="install-root-actions">
                     <button className="mini-action" onClick={copyPath}>
@@ -352,7 +404,9 @@ export function Uninstall({ onBack }: { onBack: () => void }) {
                 disabled={busy || !canUninstall}
               >
                 <Icon name="trash" />
-                {busy ? t("uninstall.working") : t("uninstall.confirm")}
+                {busy
+                  ? t("uninstall.working")
+                  : t(bundledWindows ? "uninstall.bundle.confirm" : "uninstall.confirm")}
               </button>
               <button className="btn ghost" onClick={onBack} disabled={busy}>
                 {t("uninstall.cancel")}
@@ -370,11 +424,20 @@ export function Uninstall({ onBack }: { onBack: () => void }) {
         initialFocus="dismiss"
       >
         <Ring icon="trash" variant="danger" />
-        <h3 id={confirm1TitleId}>{t("uninstall.confirm1.title")}</h3>
+        <h3 id={confirm1TitleId}>
+          {t(bundledWindows ? "uninstall.bundle.confirm1.title" : "uninstall.confirm1.title")}
+        </h3>
         <p id={confirm1BodyId}>
-          {keepData
-            ? t("uninstall.confirm1.bodyKeep", { path: codexHome })
-            : t("uninstall.confirm1.bodyPurge")}
+          {bundledWindows
+            ? keepData
+              ? t("uninstall.bundle.confirm1.bodyKeep", {
+                  codexPath: codexHome,
+                  ccswitchPath: CCSWITCH_DATA_DISPLAY,
+                })
+              : t("uninstall.bundle.confirm1.bodyPurge")
+            : keepData
+              ? t("uninstall.confirm1.bodyKeep", { path: codexHome })
+              : t("uninstall.confirm1.bodyPurge")}
         </p>
         <div className="row2 sheet-actions">
           <button className="btn ghost" onClick={() => setConfirmStep(0)}>
@@ -394,14 +457,23 @@ export function Uninstall({ onBack }: { onBack: () => void }) {
         initialFocus="dismiss"
       >
         <Ring icon="trash" variant="danger" />
-        <h3 id={confirm2TitleId}>{t("uninstall.confirm2.title")}</h3>
-        <p id={confirm2BodyId}>{t("uninstall.confirm2.body", { path: codexHome })}</p>
+        <h3 id={confirm2TitleId}>
+          {t(bundledWindows ? "uninstall.bundle.confirm2.title" : "uninstall.confirm2.title")}
+        </h3>
+        <p id={confirm2BodyId}>
+          {t(
+            bundledWindows ? "uninstall.bundle.confirm2.body" : "uninstall.confirm2.body",
+            bundledWindows
+              ? { codexPath: codexHome, ccswitchPath: CCSWITCH_DATA_DISPLAY }
+              : { path: codexHome },
+          )}
+        </p>
         <div className="row2 sheet-actions">
           <button className="btn ghost" onClick={() => setConfirmStep(0)}>
             {t("uninstall.cancel")}
           </button>
           <button className="btn danger" onClick={() => void run()}>
-            {t("uninstall.purgeConfirm")}
+            {t(bundledWindows ? "uninstall.bundle.purgeConfirm" : "uninstall.purgeConfirm")}
           </button>
         </div>
       </Sheet>

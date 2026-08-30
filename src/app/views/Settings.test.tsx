@@ -64,7 +64,7 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
-function renderSettings() {
+function renderSettings(offlineOnly = false) {
   return render(
     <ThemeProvider>
       <I18nProvider>
@@ -74,6 +74,7 @@ function renderSettings() {
           onOpenUninstall={vi.fn()}
           onOpenConfig={vi.fn()}
           onOpenThemes={vi.fn()}
+          offlineOnly={offlineOnly}
         />
       </I18nProvider>
     </ThemeProvider>,
@@ -236,6 +237,19 @@ describe("Settings runtime contract", () => {
     const config = screen.getByRole("button", { name: /Codex 配置管理/ });
     expect(config).toBeDisabled();
     expect(screen.getByText("当前版本尚未提供")).toBeInTheDocument();
+  });
+
+  it("hides remote update, source, proxy, and theme controls in the USB build", async () => {
+    api.getSettings.mockResolvedValue(settings());
+    renderSettings(true);
+    await waitFor(() => expect(screen.queryByText("正在加载设置…")).not.toBeInTheDocument());
+
+    expect(screen.queryByRole("radiogroup", { name: "更新源" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("radiogroup", { name: "代理" })).not.toBeInTheDocument();
+    expect(screen.queryByText("更新提醒")).not.toBeInTheDocument();
+    expect(screen.queryByText(/自动检查更新/)).not.toBeInTheDocument();
+    expect(screen.queryByText("皮肤")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "关于" })).toBeInTheDocument();
   });
 
   it("keeps repair actions collapsed under More until requested", async () => {

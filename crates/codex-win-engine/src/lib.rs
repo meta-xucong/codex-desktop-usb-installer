@@ -47,8 +47,9 @@ pub use download::{
 pub use manifest::{parse_manifest, WindowsRelease};
 pub use msix::{
     canonical_codex_package_moniker, framework_dependencies, is_framework_dependency,
-    parse_appx_manifest_dependencies, parse_appx_manifest_xml, read_msix_dependencies,
-    read_msix_identity, validate_codex_identity, MsixIdentity, MsixPackageDependency,
+    parse_appx_application_executable, parse_appx_manifest_dependencies, parse_appx_manifest_xml,
+    read_msix_dependencies, read_msix_identity, validate_codex_identity, MsixIdentity,
+    MsixPackageDependency,
 };
 pub use network::NetworkConfig;
 pub use plan::{plan_update, WinInstallRoute, WindowsUpdatePlan};

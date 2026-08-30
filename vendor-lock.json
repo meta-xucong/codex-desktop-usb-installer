@@ -1,0 +1,39 @@
+{
+  "product": {
+    "name": "Codex Desktop USB Installer",
+    "version": "0.1.0",
+    "status": "internal-poc"
+  },
+  "upstream": {
+    "repository": "https://github.com/Wangnov/Codex-App-Manager",
+    "ref": "2742ac99c49c18b8a92949c760677b67bb937cb5",
+    "license": "MIT",
+    "role": "Tauri shell, Windows MSIX engine and guarded install path"
+  },
+  "references": [
+    {
+      "repository": "https://github.com/izmppj740/codex-offline-windows",
+      "ref": "8bd64a35ff9c999299ee9c8b073bd4e438382efe",
+      "role": "NSIS page flow and offline layout reference"
+    },
+    {
+      "repository": "https://github.com/puppnn/codex-installer",
+      "ref": "f3e5f3e22f0c8806d6c8c06722ad5f262a103697",
+      "role": "Windows resolver and dependency error handling reference"
+    },
+    {
+      "repository": "https://github.com/vaportail/codex-windows-updater",
+      "ref": null,
+      "role": "Not included in the V1 runtime; retained as a review reference"
+    }
+  ],
+  "codexDesktop": {
+    "packageName": "OpenAI.Codex",
+    "architecture": "x64",
+    "version": "<fixed-version>",
+    "file": "payload/OpenAI.Codex_x64.msix",
+    "sha256": "<sha256>",
+    "sourceRepository": "https://github.com/wangzhen3691/codex-app",
+    "minimumWindowsBuild": "19041"
+  }
+}

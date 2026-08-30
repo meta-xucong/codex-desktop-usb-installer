@@ -116,7 +116,8 @@ fn write_snapshot_with_tx(
             &codex_theme_engine::native::snapshot_plan(snapshot),
         )
         .map_err(|e| AppError::Engine(e.to_string()))?;
-        tx.stage(&planned).map_err(|e| AppError::Engine(e.to_string()))?;
+        tx.stage(&planned)
+            .map_err(|e| AppError::Engine(e.to_string()))?;
         codex_theme_engine::native::write_config_atomic(&paths, &planned)
             .map_err(|e| AppError::Engine(e.to_string()))?;
         let on_disk = std::fs::read_to_string(&paths.config)
@@ -207,13 +208,14 @@ fn theme_supported() -> bool {
 /// between detection and launch.
 #[cfg(target_os = "windows")]
 fn codex_version_hint() -> Option<String> {
-    installed_windows_codex().ok().map(|installed| installed.version)
+    installed_windows_codex()
+        .ok()
+        .map(|installed| installed.version)
 }
 
 #[cfg(target_os = "macos")]
 fn codex_version_hint() -> Option<String> {
-    crate::app::mac_update::detect_managed_installed()
-        .map(|installed| installed.short_version)
+    crate::app::mac_update::detect_managed_installed().map(|installed| installed.short_version)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -273,9 +275,9 @@ fn move_dir(src: &Path, dst: &Path) -> Result<(), AppError> {
         }
         Ok(())
     }
-    copy_tree(src, dst).map_err(|e| AppError::Internal(format!("迁移 {} 失败: {e}", src.display())))?;
-    std::fs::remove_dir_all(src)
-        .map_err(|e| AppError::Internal(format!("清理旧目录失败: {e}")))?;
+    copy_tree(src, dst)
+        .map_err(|e| AppError::Internal(format!("迁移 {} 失败: {e}", src.display())))?;
+    std::fs::remove_dir_all(src).map_err(|e| AppError::Internal(format!("清理旧目录失败: {e}")))?;
     Ok(())
 }
 
@@ -360,8 +362,7 @@ pub fn delete_store_skin(settings: &AppSettings, skin_id: &str) -> Result<(), Ap
             "{skin_id} 不是有效皮肤目录，拒绝删除"
         )));
     }
-    std::fs::remove_dir_all(&dir)
-        .map_err(|e| AppError::Internal(format!("删除皮肤失败: {e}")))?;
+    std::fs::remove_dir_all(&dir).map_err(|e| AppError::Internal(format!("删除皮肤失败: {e}")))?;
     log::info!("deleted store skin id={skin_id}");
     Ok(())
 }
@@ -507,16 +508,24 @@ pub fn merged_theme_list(settings: &AppSettings) -> Vec<ThemeListEntry> {
         .map(str::trim)
         .filter(|d| !d.is_empty())
     {
-        entries.extend(list_themes(Path::new(dir)).into_iter().map(|summary| ThemeListEntry {
-            summary,
-            origin: ThemeOrigin::Dev,
-        }));
+        entries.extend(
+            list_themes(Path::new(dir))
+                .into_iter()
+                .map(|summary| ThemeListEntry {
+                    summary,
+                    origin: ThemeOrigin::Dev,
+                }),
+        );
     }
     if let Ok(store) = store_dir(settings) {
-        entries.extend(list_themes(&store).into_iter().map(|summary| ThemeListEntry {
-            summary,
-            origin: ThemeOrigin::Store,
-        }));
+        entries.extend(
+            list_themes(&store)
+                .into_iter()
+                .map(|summary| ThemeListEntry {
+                    summary,
+                    origin: ThemeOrigin::Store,
+                }),
+        );
     }
     entries
 }
@@ -746,16 +755,16 @@ fn preview_cache_path(url: &str, version: &str) -> Option<PathBuf> {
             }
         })
         .collect();
-    let vsafe = if vsafe.is_empty() { "v".to_string() } else { vsafe };
-    Some(
-        paths::cache_dir()?
-            .join("catalog-previews")
-            .join(format!(
-                "{:016x}-{}.webp",
-                crate::app::staging::fnv1a64(url.as_bytes()),
-                vsafe
-            )),
-    )
+    let vsafe = if vsafe.is_empty() {
+        "v".to_string()
+    } else {
+        vsafe
+    };
+    Some(paths::cache_dir()?.join("catalog-previews").join(format!(
+        "{:016x}-{}.webp",
+        crate::app::staging::fnv1a64(url.as_bytes()),
+        vsafe
+    )))
 }
 
 /// Cheap structural check that bytes look like a WebP (RIFF container + WEBP
@@ -823,7 +832,9 @@ pub fn catalog_preview_data_url(preview_rel: &str, version: &str) -> Result<Stri
 
 /// Download + sha256-gate + install one catalog skin. Returns the installed
 /// summary (the importer re-validates everything structurally).
-pub fn install_from_catalog(skin_id: &str) -> Result<codex_theme_engine::theme::ThemeSummary, AppError> {
+pub fn install_from_catalog(
+    skin_id: &str,
+) -> Result<codex_theme_engine::theme::ThemeSummary, AppError> {
     use sha2::Digest as _;
     let skin = fetch_catalog()?
         .into_iter()
@@ -1154,7 +1165,8 @@ impl ThemeService {
                     handle
                         .send(Some(dir.clone()))
                         .map_err(|_| AppError::Internal("主题守护未运行".to_string()))?;
-                    self.wait_daemon_theme(&theme_id, Duration::from_secs(30)).await?;
+                    self.wait_daemon_theme(&theme_id, Duration::from_secs(30))
+                        .await?;
                     remove_stash(); // applied == kept: the try-on stash is consumed
                     return Ok(());
                 }
@@ -1207,9 +1219,7 @@ impl ThemeService {
         let deadline = tokio::time::Instant::now() + CDP_WAIT;
         while !codex_theme_engine::cdp::cdp_http_ready(THEME_CDP_PORT).await {
             if tokio::time::Instant::now() >= deadline {
-                return Err(AppError::Engine(
-                    "Codex 已启动但调试端口未就绪".to_string(),
-                ));
+                return Err(AppError::Engine("Codex 已启动但调试端口未就绪".to_string()));
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
@@ -1233,7 +1243,8 @@ impl ThemeService {
             .send(Some(dir))
             .map_err(|_| AppError::Internal("主题守护未运行".to_string()))?;
         if matches!(sync, NativeSync::HotThenFile) {
-            self.wait_daemon_theme(&theme_id, Duration::from_secs(30)).await?;
+            self.wait_daemon_theme(&theme_id, Duration::from_secs(30))
+                .await?;
             remove_stash();
         }
         Ok(())
@@ -1257,8 +1268,8 @@ impl ThemeService {
         let id = theme_id.to_string();
 
         // Blocking half: quit, settle, write-under-transaction, relaunch.
-        let mut tx = tauri::async_runtime::spawn_blocking(
-            move || -> Result<NativeTransaction, AppError> {
+        let mut tx =
+            tauri::async_runtime::spawn_blocking(move || -> Result<NativeTransaction, AppError> {
                 let installed = installed_codex_path()?;
                 let was_running = codex_running();
                 quit_codex(&installed)?;
@@ -1286,7 +1297,8 @@ impl ThemeService {
                         &codex_theme_engine::native::apply_plan(&native_clone),
                     )
                     .map_err(|e| AppError::Engine(e.to_string()))?;
-                    tx.stage(&planned).map_err(|e| AppError::Engine(e.to_string()))?;
+                    tx.stage(&planned)
+                        .map_err(|e| AppError::Engine(e.to_string()))?;
                     codex_theme_engine::native::write_config_atomic(&paths, &planned)
                         .map_err(|e| AppError::Engine(e.to_string()))?;
                     let on_disk = std::fs::read_to_string(&paths.config)
@@ -1313,19 +1325,16 @@ impl ThemeService {
                         Err(error)
                     }
                 }
-            },
-        )
-        .await
-        .map_err(|e| AppError::Internal(format!("主题应用任务失败: {e}")))??;
+            })
+            .await
+            .map_err(|e| AppError::Internal(format!("主题应用任务失败: {e}")))??;
 
         // Async half: CDP ready → inject → daemon confirmation → commit.
         let post_launch: Result<(), AppError> = async {
             let deadline = tokio::time::Instant::now() + CDP_WAIT;
             while !codex_theme_engine::cdp::cdp_http_ready(THEME_CDP_PORT).await {
                 if tokio::time::Instant::now() >= deadline {
-                    return Err(AppError::Engine(
-                        "Codex 已启动但调试端口未就绪".to_string(),
-                    ));
+                    return Err(AppError::Engine("Codex 已启动但调试端口未就绪".to_string()));
                 }
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
@@ -1333,7 +1342,8 @@ impl ThemeService {
             handle
                 .send(Some(dir.to_path_buf()))
                 .map_err(|_| AppError::Internal("主题守护未运行".to_string()))?;
-            self.wait_daemon_theme(theme_id, Duration::from_secs(30)).await?;
+            self.wait_daemon_theme(theme_id, Duration::from_secs(30))
+                .await?;
             Ok(())
         }
         .await;
@@ -1417,7 +1427,8 @@ impl ThemeService {
                 let planned = codex_theme_engine::native::planned_restore_text(&paths, &current)
                     .map_err(|e| AppError::Engine(e.to_string()))?
                     .ok_or_else(|| AppError::Engine("原生备份缺失".to_string()))?;
-                tx.stage(&planned).map_err(|e| AppError::Engine(e.to_string()))?;
+                tx.stage(&planned)
+                    .map_err(|e| AppError::Engine(e.to_string()))?;
                 codex_theme_engine::native::write_config_atomic(&paths, &planned)
                     .map_err(|e| AppError::Engine(e.to_string()))?;
                 let on_disk = std::fs::read_to_string(&paths.config)
@@ -1513,8 +1524,7 @@ fn launch_codex_plain() -> Result<(), AppError> {
 #[cfg(target_os = "windows")]
 fn windows_domain_settings() -> crate::domain::settings::AppSettings {
     let saved = AppSettings::load();
-    let mut settings =
-        crate::domain::settings::AppSettings::new(String::new(), saved.install_root);
+    let mut settings = crate::domain::settings::AppSettings::new(String::new(), saved.install_root);
     settings.disable_codex_self_updates = saved.disable_codex_self_updates;
     settings
 }
@@ -1707,7 +1717,10 @@ mod delete_store_skin_tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
         let err = delete_store_skin(&settings_with_store(&store), "linky").unwrap_err();
-        assert!(matches!(err, AppError::Engine(_)), "a symlink must be refused");
+        assert!(
+            matches!(err, AppError::Engine(_)),
+            "a symlink must be refused"
+        );
         assert!(
             std::fs::symlink_metadata(&link)
                 .unwrap()

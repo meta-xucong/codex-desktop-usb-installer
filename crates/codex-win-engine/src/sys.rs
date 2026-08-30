@@ -107,6 +107,20 @@ pub struct MsixSideloadReport {
     pub installed: Option<InstalledWindowsCodex>,
     pub fallback_recommended: bool,
     pub raw_error: Option<String>,
+    /// HRESULT parsed from the AppX deployment exception, when Windows
+    /// included one in the error text.  Keeping this separate from `message`
+    /// lets the UI/logging layer classify the failure without scraping prose.
+    #[serde(default)]
+    pub hresult: Option<String>,
+    /// ActivityId emitted by AppX deployment.  `Get-AppxLog -ActivityId` can
+    /// use it to retrieve the server-side reason on the target machine.
+    #[serde(default)]
+    pub activity_id: Option<String>,
+    /// Bounded `Get-AppxLog` output captured at the failure boundary.  This is
+    /// deliberately optional because older/stripped Windows images may not
+    /// expose the cmdlet at all.
+    #[serde(default)]
+    pub deployment_log: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1028,11 +1042,51 @@ try {{
     }} else {{ $null }}
   }} | ConvertTo-Json -Compress -Depth 4
 }} catch {{
+  # Add-AppxPackage often reports only a generic message while the actionable
+  # deployment reason is stored under an ActivityId.  Capture both without
+  # making the install depend on Get-AppxLog (it is absent on some stripped
+  # Windows images and on our constrained test host).
+  $rawMessage = [string]$_.Exception.Message
+  $rawError = [string]$_
+  $hresult = $null
+  if ($rawError -match '(?i)(0x[0-9a-f]{{8}})') {{
+    $hresult = $Matches[1].ToUpperInvariant()
+  }}
+  $activityId = $null
+  if ($rawError -match '(?i)(?:Activity(?:Id| ID)|ActivityID)[^0-9a-f]*([0-9a-f]{{8}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}})') {{
+    $activityId = $Matches[1]
+  }}
+  $deploymentLog = $null
+  try {{
+    if ($activityId -and (Get-Command Get-AppxLog -ErrorAction SilentlyContinue)) {{
+      $events = @(Get-AppxLog -ActivityId $activityId -ErrorAction SilentlyContinue | Select-Object -Last 8)
+      $lines = @()
+      foreach ($event in $events) {{
+        $line = [string]$event.Message
+        if ($event.Id) {{ $line = "id=$($event.Id) $line" }}
+        if ($event.TimeCreated) {{ $line = "$($event.TimeCreated) $line" }}
+        if ($line) {{ $lines += $line }}
+      }}
+      $deploymentLog = $lines -join "`n"
+      if ($deploymentLog.Length -gt 6000) {{
+        $deploymentLog = $deploymentLog.Substring(0, 6000)
+      }}
+    }}
+  }} catch {{
+    # Diagnostics must never turn a deployment failure into a script failure.
+  }}
+  $details = @($rawMessage)
+  if ($hresult) {{ $details += "HRESULT=$hresult" }}
+  if ($activityId) {{ $details += "ActivityId=$activityId" }}
+  if ($deploymentLog) {{ $details += "AppX deployment log:`n$deploymentLog" }}
   @{{
     success = $false
-    message = [string]$_.Exception.Message
+    message = ($details -join "`n")
     fallbackRecommended = $true
-    rawError = [string]$_
+    rawError = $rawError
+    hresult = $hresult
+    activityId = $activityId
+    deploymentLog = $deploymentLog
     installed = $null
   }} | ConvertTo-Json -Compress -Depth 4
 }}
@@ -1110,6 +1164,9 @@ pub fn install_msix_sideload(
         installed: None,
         fallback_recommended: true,
         raw_error: None,
+        hresult: None,
+        activity_id: None,
+        deployment_log: None,
     })
 }
 
@@ -2551,6 +2608,8 @@ function Get-AppxPackage {
     #[test]
     fn constrained_language_msix_install_script_preserves_json_contract() {
         let production = install_msix_script(std::path::Path::new(r"C:\staging\Codex.msix"));
+        assert!(production.contains("Get-AppxLog"));
+        assert!(production.contains("ActivityId"));
         let script = format!("{}\n{}", CONSTRAINED_APPX_MOCKS, production);
         let json = run_powershell_json(&script).expect("run constrained-language MSIX install");
         let report: MsixSideloadReport =
@@ -2563,6 +2622,49 @@ function Get-AppxPackage {
             installed.package_family_name.as_deref(),
             Some("OpenAI.Codex_2p2nqsd0c76g0")
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn msix_install_script_exposes_hresult_and_activity_id_on_failure() {
+        let production = install_msix_script(std::path::Path::new(r"C:\staging\Codex.msix"));
+        let mocks = r#"
+function Add-AppxPackage {
+  param($LiteralPath, $Path, $ForceUpdateFromAnyVersion, $ErrorAction)
+  throw 'Deployment failed with HRESULT: 0x80073CF0 ActivityId {9afe3240-101d-0002-37b9-8aa11d10dd01}'
+}
+"#;
+        let json = run_powershell_json(&format!("{}\n{}", mocks, production))
+            .expect("run failing MSIX mock");
+        let report: MsixSideloadReport =
+            serde_json::from_str(&json).expect("parse failing MSIX report");
+        assert!(!report.success);
+        assert_eq!(report.hresult.as_deref(), Some("0X80073CF0"));
+        assert_eq!(
+            report.activity_id.as_deref(),
+            Some("9afe3240-101d-0002-37b9-8aa11d10dd01")
+        );
+        assert!(report.message.contains("HRESULT=0X80073CF0"));
+        assert!(report
+            .message
+            .contains("ActivityId=9afe3240-101d-0002-37b9-8aa11d10dd01"));
+    }
+
+    #[test]
+    fn msix_sideload_report_defaults_optional_diagnostics_for_old_json() {
+        let report: super::MsixSideloadReport = serde_json::from_str(
+            r#"{
+                "success": false,
+                "message": "deployment failed",
+                "installed": null,
+                "fallbackRecommended": true,
+                "rawError": "deployment failed"
+            }"#,
+        )
+        .expect("old MSIX report shape remains readable");
+        assert!(report.hresult.is_none());
+        assert!(report.activity_id.is_none());
+        assert!(report.deployment_log.is_none());
     }
 
     #[cfg(windows)]

@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "product": "codex-usb-oneclick",
+  "status": "oneclick",
+  "description": "Offline Codex desktop installation followed by automatic per-user Codex Switch installation and launch.",
+  "codexInstaller": {
+    "file": "CodexDesktopSetup.exe",
+    "size": 19450880,
+    "sha256": "7cf01db7d88f999399d8c556716ef9cc956a045d51078c6199c95eb54d38dcdb",
+    "payload": "payload/OpenAI.Codex_x64.msix",
+    "payloadSize": 802145236,
+    "payloadSha256": "ab0feacc74e982742736da4a7f1d2b59e9fabaa3641606545d3064927da02b1e"
+  },
+  "ccswitch": {
+    "directory": "ccswitch",
+    "executable": "ccswitch/CodexSwitch.exe",
+    "size": 28693504,
+    "sha256": "75b847ca54d207cbe92866154da8f504c6874f6d253423899c7cddfa5fee0045",
+    "embeddedExecutable": "resources/ccswitch/CodexSwitch.exe",
+    "localInstallDirectory": "%LOCALAPPDATA%/Programs/CodexSwitch"
+  },
+  "workflow": [
+    "Double-click CodexDesktopSetup.exe with manifest.json and payload/ beside it.",
+    "The installer validates and installs the offline Codex MSIX.",
+    "After Codex is confirmed, it copies ccswitch/* to %LOCALAPPDATA%/Programs/CodexSwitch and launches CodexSwitch.exe.",
+    "On first launch Codex Switch opens the 404TOKEN setup dialog; enter the user's API Key and click Save and enable. No key is included in this bundle.",
+    "The installed screen and Settings provide Uninstall Codex + CCSwitch; the default keeps %USERPROFILE%/.codex and %USERPROFILE%/.cc-switch, while the explicit purge option removes both."
+  ],
+  "secretsIncluded": false,
+  "automaticPostInstallLaunch": true,
+  "notes": [
+    "The root manifest.json is the Codex installer manifest and must not be replaced by usb-manifest.json.",
+    "The CCSwitch copy/launch is best-effort; a missing payload does not roll back a successful Codex installation.",
+    "The first release is an offline MSIX installer plus a per-user CCSwitch copy, not an MSI or self-updating package."
+  ]
+}

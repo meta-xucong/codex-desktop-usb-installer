@@ -170,6 +170,39 @@ const ZH = {
   "home.none.title": "未检测到 Codex",
   "home.none.sub": "为你安装最新版本,之后自动保持更新。",
   "home.none.cta": "安装 Codex",
+  "offline.title": "Codex Desktop 离线安装",
+  "offline.checking": "正在校验 U 盘安装包…",
+  "offline.ready": "安装包已准备好",
+  "offline.installed": "此版本已经安装",
+  "offline.description": "安装器只读取 U 盘中的固定 MSIX，不连接 GitHub、Microsoft Store 或镜像站；若 Windows 阻止 AppX 部署，会使用同一份校验通过的 MSIX 本地解包。",
+  "offline.package": "安装包",
+  "offline.version": "Codex Desktop 版本",
+  "offline.arch": "目标架构",
+  "offline.size": "文件大小",
+  "offline.hash": "SHA-256",
+  "offline.hashVerified": "校验通过",
+  "offline.signature": "Authenticode 签名",
+  "offline.signaturePending": "安装时由 Windows 再次校验",
+  "offline.install": "一键安装",
+  "offline.installing": "正在安装…",
+  "offline.launch": "启动 Codex",
+  "offline.launching": "正在启动…",
+  "offline.recheck": "重新校验",
+  "offline.openLogs": "打开日志",
+  "offline.done": "安装完成",
+  "offline.doneDetail": "Codex Desktop 已安装到当前用户，现在可以拔出 U 盘。",
+  "offline.ccswitchLaunched": "Codex 已安装，Codex Switch 已启动。请输入 API Key 完成配置。",
+  "offline.ccswitchUnavailable": "Codex 已安装，但未找到 CCSwitch 载荷；请确认 ccswitch 目录与安装器在同一目录。",
+  "offline.ccswitchFailed": "Codex 已安装，但 CCSwitch 未能自动启动；可点击“打开 Codex Switch”重试。",
+  "offline.ccswitchLaunch": "打开 Codex Switch",
+  "offline.ccswitchLaunching": "正在启动 CCSwitch…",
+  "offline.uninstallBundle": "卸载 Codex 与 CCSwitch",
+  "offline.verifyAfterInstall": "安装命令已返回成功，但 Windows 尚未确认目标版本。请重新校验后重试。",
+  "offline.sameVersion": "当前已是该版本",
+  "offline.newerVersion": "检测到本机已有更新版本，第一版不会自动降级。",
+  "offline.adopting": "正在接管…",
+  "offline.external": "检测到未由本安装器管理的 Codex，请点击“开始管理”后再安装固定版本。",
+  "offline.noPackage": "未找到离线载荷。请确认 manifest.json 和 payload 目录与安装器位于同一目录。",
   "home.manualExisting": "已经安装了 Codex？手动选择位置",
   "home.manualExisting.title": "选择已安装的 Codex",
   "home.manualExisting.body": "如果 Codex 在自定义位置，选择它的应用位置。Manager 会先验证，不会直接改动文件。",
@@ -377,6 +410,7 @@ const ZH = {
   "settings.more.soon": "即将支持",
   "settings.more.about": "关于",
   "settings.more.uninstall": "卸载 Codex",
+  "settings.more.uninstallBundle": "卸载 Codex 与 CCSwitch",
 
   "about.tagline": "自由管理你的 Codex App。",
   "about.version": "版本 {v}",
@@ -424,6 +458,20 @@ const ZH = {
   "uninstall.confirm1.bodyPurge": "将从你的电脑移除 Codex 应用,并清除你的数据。",
   "uninstall.confirm2.title": "确定清除所有数据?",
   "uninstall.confirm2.body": "登录、会话与配置（{path}）将被永久删除,无法恢复。",
+  "uninstall.bundle.heading": "卸载 Codex 与 CCSwitch",
+  "uninstall.bundle.warn": "这会从你的电脑上移除 Codex 和本安装器部署的 CCSwitch。",
+  "uninstall.bundle.keepDataNote": "程序会被移除；Codex 数据（{codexPath}）和 CCSwitch 配置（{ccswitchPath}）会保留。",
+  "uninstall.bundle.dataPath": "将保留的数据位置",
+  "uninstall.bundle.dataAffects": "关闭“保留我的数据”后，上述两个目录都会被清除。",
+  "uninstall.bundle.programPath": "将删除的 CCSwitch 程序",
+  "uninstall.bundle.programAffects": "只删除本安装器复制的本地程序目录，不影响其他位置的 CCSwitch。",
+  "uninstall.bundle.confirm": "卸载 Codex 与 CCSwitch",
+  "uninstall.bundle.confirm1.title": "确定卸载 Codex 与 CCSwitch?",
+  "uninstall.bundle.confirm1.bodyKeep": "将移除 Codex 应用和本安装器部署的 CCSwitch；Codex 数据（{codexPath}）与 CCSwitch 配置（{ccswitchPath}）会保留。",
+  "uninstall.bundle.confirm1.bodyPurge": "将移除 Codex、CCSwitch，并永久清除 Codex 数据（{codexPath}）与 CCSwitch 配置（{ccswitchPath}）。",
+  "uninstall.bundle.confirm2.title": "确定清除 Codex 与 CCSwitch 数据?",
+  "uninstall.bundle.confirm2.body": "Codex 数据（{codexPath}）与 CCSwitch 配置（{ccswitchPath}）将被永久删除，无法恢复。",
+  "uninstall.bundle.purgeConfirm": "清除数据并卸载",
 
   "config.soon": "即将支持",
   "config.desc": "在这里管理 ~/.codex 里的会话、登录与配置。",
@@ -448,7 +496,7 @@ const ZH = {
 type Key = keyof typeof ZH;
 export type TKey = Key;
 
-const EN: Record<Key, string> = {
+const EN: Partial<Record<Key, string>> = {
   "app.name": "Codex App Manager",
 
   "nav.back": "Back",
@@ -594,6 +642,39 @@ const EN: Record<Key, string> = {
   "home.none.title": "Codex not found",
   "home.none.sub": "Install the latest version and keep it updated automatically.",
   "home.none.cta": "Install Codex",
+  "offline.title": "Install Codex Desktop offline",
+  "offline.checking": "Verifying the USB package…",
+  "offline.ready": "Package ready",
+  "offline.installed": "This version is already installed",
+  "offline.description": "The setup reads the fixed MSIX from the USB drive and never contacts GitHub, Microsoft Store or a mirror; if Windows blocks AppX deployment, it extracts the same verified MSIX locally.",
+  "offline.package": "Package",
+  "offline.version": "Codex Desktop version",
+  "offline.arch": "Target architecture",
+  "offline.size": "File size",
+  "offline.hash": "SHA-256",
+  "offline.hashVerified": "Verified",
+  "offline.signature": "Authenticode signature",
+  "offline.signaturePending": "Windows verifies it again during install",
+  "offline.install": "Install with one click",
+  "offline.installing": "Installing…",
+  "offline.launch": "Launch Codex",
+  "offline.launching": "Launching…",
+  "offline.recheck": "Verify again",
+  "offline.openLogs": "Open logs",
+  "offline.done": "Installation complete",
+  "offline.doneDetail": "Codex Desktop is installed for this user. You can now unplug the USB drive.",
+  "offline.ccswitchLaunched": "Codex is installed and Codex Switch is open. Enter your API key to finish setup.",
+  "offline.ccswitchUnavailable": "Codex is installed, but the CCSwitch payload was not found. Keep the ccswitch folder beside the setup executable.",
+  "offline.ccswitchFailed": "Codex is installed, but CCSwitch did not start automatically. Use “Open Codex Switch” to retry.",
+  "offline.ccswitchLaunch": "Open Codex Switch",
+  "offline.ccswitchLaunching": "Opening CCSwitch…",
+  "offline.uninstallBundle": "Uninstall Codex + CCSwitch",
+  "offline.verifyAfterInstall": "The install command succeeded, but Windows has not confirmed the target version yet. Re-check and try again.",
+  "offline.sameVersion": "This version is already installed",
+  "offline.newerVersion": "A newer local version is already installed; V1 will not downgrade it automatically.",
+  "offline.adopting": "Taking over…",
+  "offline.external": "Codex is installed but is not managed by this setup. Click “Start managing” before installing the fixed version.",
+  "offline.noPackage": "Offline payload not found. Keep manifest.json and the payload directory beside the setup executable.",
   "home.manualExisting": "Already installed Codex? Choose its location",
   "home.manualExisting.title": "Choose installed Codex",
   "home.manualExisting.body": "If Codex is in a custom location, choose its app location. Manager verifies it first and will not change files.",
@@ -801,6 +882,7 @@ const EN: Record<Key, string> = {
   "settings.more.soon": "Coming soon",
   "settings.more.about": "About",
   "settings.more.uninstall": "Uninstall Codex",
+  "settings.more.uninstallBundle": "Uninstall Codex + CCSwitch",
 
   "about.tagline": "Freely manage your Codex app.",
   "about.version": "Version {v}",
@@ -848,6 +930,20 @@ const EN: Record<Key, string> = {
   "uninstall.confirm1.bodyPurge": "This removes the Codex app and clears your data.",
   "uninstall.confirm2.title": "Erase all data?",
   "uninstall.confirm2.body": "Sign-in, sessions and config ({path}) will be permanently deleted — this can't be undone.",
+  "uninstall.bundle.heading": "Uninstall Codex + CCSwitch",
+  "uninstall.bundle.warn": "This removes Codex and the CCSwitch copy installed by this manager.",
+  "uninstall.bundle.keepDataNote": "The programs are removed; Codex data ({codexPath}) and CCSwitch settings ({ccswitchPath}) are kept.",
+  "uninstall.bundle.dataPath": "Data locations to keep",
+  "uninstall.bundle.dataAffects": "Turn off “Keep my data” to remove both directories.",
+  "uninstall.bundle.programPath": "CCSwitch program to remove",
+  "uninstall.bundle.programAffects": "Only the local copy installed by this manager is removed; other CCSwitch installations are untouched.",
+  "uninstall.bundle.confirm": "Uninstall Codex + CCSwitch",
+  "uninstall.bundle.confirm1.title": "Uninstall Codex + CCSwitch?",
+  "uninstall.bundle.confirm1.bodyKeep": "Codex and the manager-installed CCSwitch copy will be removed; Codex data ({codexPath}) and CCSwitch settings ({ccswitchPath}) will be kept.",
+  "uninstall.bundle.confirm1.bodyPurge": "Codex and CCSwitch will be removed, and Codex data ({codexPath}) plus CCSwitch settings ({ccswitchPath}) will be permanently deleted.",
+  "uninstall.bundle.confirm2.title": "Erase Codex + CCSwitch data?",
+  "uninstall.bundle.confirm2.body": "Codex data ({codexPath}) and CCSwitch settings ({ccswitchPath}) will be permanently deleted — this can't be undone.",
+  "uninstall.bundle.purgeConfirm": "Erase data & uninstall",
 
   "config.soon": "Coming soon",
   "config.desc": "Manage the sessions, sign-in and config inside ~/.codex here.",
@@ -869,7 +965,7 @@ const EN: Record<Key, string> = {
   "win.installDir.browse": "Browse…",
 };
 
-const FR: Record<Key, string> = {
+const FR: Partial<Record<Key, string>> = {
   "app.name": "Gestionnaire Codex",
 
   "nav.back": "Retour",
@@ -1290,7 +1386,7 @@ const FR: Record<Key, string> = {
   "win.installDir.browse": "Parcourir…",
 };
 
-const ZH_TW: Record<Key, string> = {
+const ZH_TW: Partial<Record<Key, string>> = {
   "app.name": "Codex App 管理員",
 
   "nav.back": "返回",
@@ -1722,7 +1818,7 @@ const ZH_TW: Record<Key, string> = {
   "win.installDir.browse": "瀏覽…",
 };
 
-const DE: Record<Key, string> = {
+const DE: Partial<Record<Key, string>> = {
   "app.name": "Codex App Manager",
 
   "nav.back": "Zurück",
@@ -2154,7 +2250,7 @@ const DE: Record<Key, string> = {
   "win.installDir.browse": "Durchsuchen…",
 };
 
-const KO: Record<Key, string> = {
+const KO: Partial<Record<Key, string>> = {
   "app.name": "Codex App 관리자",
 
   "nav.back": "뒤로",
@@ -2585,7 +2681,7 @@ const KO: Record<Key, string> = {
   "win.installDir.browse": "찾아보기…",
 };
 
-const JA: Record<Key, string> = {
+const JA: Partial<Record<Key, string>> = {
   "app.name": "Codex App マネージャー",
   "nav.back": "戻る",
   "nav.settings": "設定",
@@ -2997,7 +3093,7 @@ const JA: Record<Key, string> = {
   "win.installDir.browse": "参照…",
 };
 
-const RU: Record<Key, string> = {
+const RU: Partial<Record<Key, string>> = {
   "app.name": "Менеджер Codex App",
   "nav.back": "Назад",
   "nav.settings": "Настройки",
@@ -3409,7 +3505,7 @@ const RU: Record<Key, string> = {
   "win.installDir.browse": "Обзор…",
 };
 
-const AR: Record<Key, string> = {
+const AR: Partial<Record<Key, string>> = {
   "app.name": "مدير تطبيق Codex",
   "nav.back": "رجوع",
   "nav.settings": "الإعدادات",
@@ -3821,7 +3917,7 @@ const AR: Record<Key, string> = {
   "win.installDir.browse": "استعراض…",
 };
 
-const ES: Record<Key, string> = {
+const ES: Partial<Record<Key, string>> = {
   "app.name": "Codex App Manager",
   "nav.back": "Atrás",
   "nav.settings": "Ajustes",
@@ -4233,7 +4329,7 @@ const ES: Record<Key, string> = {
   "win.installDir.browse": "Explorar…",
 };
 
-const PT_BR: Record<Key, string> = {
+const PT_BR: Partial<Record<Key, string>> = {
   "app.name": "Gerenciador do Codex App",
   "nav.back": "Voltar",
   "nav.settings": "Configurações",
@@ -4646,17 +4742,20 @@ const PT_BR: Record<Key, string> = {
 };
 
 export const CATALOG: Record<Lang, Record<Key, string>> = {
-  en: EN,
+  // New product copy is allowed to land in the canonical language first; the
+  // spread keeps every locale total and falls back to Simplified Chinese until
+  // a translator supplies a localized value.
+  en: { ...ZH, ...EN },
   "zh-CN": ZH,
-  "zh-TW": ZH_TW,
-  ja: JA,
-  ko: KO,
-  fr: FR,
-  de: DE,
-  es: ES,
-  "pt-BR": PT_BR,
-  ru: RU,
-  ar: AR,
+  "zh-TW": { ...ZH, ...ZH_TW },
+  ja: { ...ZH, ...JA },
+  ko: { ...ZH, ...KO },
+  fr: { ...ZH, ...FR },
+  de: { ...ZH, ...DE },
+  es: { ...ZH, ...ES },
+  "pt-BR": { ...ZH, ...PT_BR },
+  ru: { ...ZH, ...RU },
+  ar: { ...ZH, ...AR },
 };
 
 export interface LangMeta {
@@ -4751,7 +4850,7 @@ export function I18nProvider({ children }: { children: ReactNode }) {
 
   const t = useCallback<TFn>(
     (key, vars) => {
-      let s = CATALOG[lang][key] ?? CATALOG.en[key] ?? key;
+      let s = CATALOG[lang][key] ?? CATALOG.en[key] ?? ZH[key] ?? key;
       if (vars) {
         for (const [k, v] of Object.entries(vars)) {
           // split/join, not String.replace: an interpolated value containing

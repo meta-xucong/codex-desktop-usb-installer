@@ -16,3 +16,19 @@ src-tauri/gen/schemas/
 # Vendored Sparkle BinaryDelta helper (macOS delta updates) — fetched by
 # scripts/vendor-binary-delta.sh, not committed (~1.4 MB universal binary).
 src-tauri/resources/BinaryDelta
+
+# Release payloads are archived separately from Git history.  The Codex MSIX
+# is ~802 MB and GitHub rejects regular Git blobs over 100 MB.  Keep the
+# generated wrapper/metadata available for local USB builds, but never add the
+# large signed payload to commits by accident.
+release/**/payload/*.msix
+release/upstream/*.Msix
+release/upstream/*.msix
+
+# Only the recommended one-click layout is kept as a lightweight build
+# snapshot.  Other generated layouts are reproducible and contain duplicate
+# executables, so leave them out of the archive.
+release/setup/
+release/usb/
+release/usb-final/
+release/upstream/

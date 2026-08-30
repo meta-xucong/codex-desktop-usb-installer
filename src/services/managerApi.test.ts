@@ -230,6 +230,25 @@ describe("diagnostics API", () => {
 });
 
 describe("Windows perform API", () => {
+  it("invokes the guarded combined Codex + CCSwitch uninstall", async () => {
+    window.__TAURI_INTERNALS__ = {};
+    invokeMock.mockResolvedValueOnce("bundle-uninstall-token").mockResolvedValueOnce({
+      success: true,
+    });
+
+    await managerApi.winUninstallBundle(true, false, false);
+
+    expect(invokeMock).toHaveBeenNthCalledWith(1, "arm_destructive", {
+      kind: "uninstall",
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(2, "win_uninstall_bundle", {
+      confirm: true,
+      token: "bundle-uninstall-token",
+      purgeUserData: false,
+      purgeCcswitchData: false,
+    });
+  });
+
   it("sends the renderer resume mode and one-shot install root to the backend", async () => {
     window.__TAURI_INTERNALS__ = {};
     invokeMock.mockResolvedValue({ success: true });
@@ -258,6 +277,42 @@ describe("Windows perform API", () => {
         route: "msix-sideload",
       },
       resumeKind: "install",
+    });
+  });
+
+  it("marks the offline install as MSIX-only without changing normal callers", async () => {
+    window.__TAURI_INTERNALS__ = {};
+    invokeMock.mockResolvedValue({ success: true });
+
+    await managerApi.winInstallHistoricalRelease(
+      {
+        releaseTag: "local-signed-26.602.40724",
+        version: "26.602.40724",
+        assetName: "OpenAI.Codex_x64.msix",
+        architecture: "x64",
+        format: "msix",
+        packageVersion: "26.602.3474.0",
+        localPath: "C:\\Temp\\CodexDesktopInstaller\\OpenAI.Codex_x64.msix",
+        localFileName: "OpenAI.Codex_x64.msix",
+      },
+      true,
+      { currentPath: null, currentVersion: null, currentSource: null },
+      "offline-token",
+      undefined,
+      true,
+    );
+
+    expect(invokeMock).toHaveBeenCalledWith("win_install_historical_release", {
+      confirm: true,
+      token: "offline-token",
+      releaseTag: "local-signed-26.602.40724",
+      assetName: "OpenAI.Codex_x64.msix",
+      localPath: "C:\\Temp\\CodexDesktopInstaller\\OpenAI.Codex_x64.msix",
+      architecture: "x64",
+      blockUpdates: true,
+      installRoot: undefined,
+      expected: { currentPath: null, currentVersion: null, currentSource: null },
+      forceMsix: true,
     });
   });
 });

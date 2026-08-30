@@ -7,9 +7,16 @@ import { useI18n } from "../i18n";
 import { NavBar, Ring } from "../components";
 import { formatDiagnostics } from "../diagnostics";
 import { Sheet } from "../Sheet";
+import { currentPlatform } from "../platform";
 
 const APP_VERSION = import.meta.env.VITE_APP_VERSION ?? "0.0.0";
 const REPO_URL = "https://github.com/Wangnov/Codex-App-Manager";
+// The USB build is intentionally self-contained.  Keep the manager updater
+// out of that build so opening About cannot trigger a network request or offer
+// an online replacement for the fixed USB payload.
+const OFFLINE_ONLY =
+  currentPlatform() === "windows" &&
+  (import.meta.env.MODE === "production" || import.meta.env.VITE_OFFLINE_ONLY === "1");
 
 export function About({ onBack }: { onBack: () => void }) {
   const { t } = useI18n();
@@ -26,6 +33,7 @@ export function About({ onBack }: { onBack: () => void }) {
   }, [mgrBusy, pendingUpdate]);
 
   const checkManager = useCallback(async () => {
+    if (OFFLINE_ONLY) return;
     setMgrBusy(true);
     setMgrMsg(null);
     if (pendingUpdate) {
@@ -104,14 +112,16 @@ export function About({ onBack }: { onBack: () => void }) {
         </section>
 
         <div className="list">
-          <button className="row" onClick={checkManager} disabled={mgrBusy}>
-            <Icon name="refresh" className="ricon" />
-            <span className="rtext">
-              <span className="rtitle">{t("about.checkManager")}</span>
-              {mgrMsg ? <span className="rsub">{mgrMsg}</span> : null}
-            </span>
-            <span className="rval">{mgrBusy ? t("about.mgrChecking") : ""}</span>
-          </button>
+          {!OFFLINE_ONLY ? (
+            <button className="row" onClick={checkManager} disabled={mgrBusy}>
+              <Icon name="refresh" className="ricon" />
+              <span className="rtext">
+                <span className="rtitle">{t("about.checkManager")}</span>
+                {mgrMsg ? <span className="rsub">{mgrMsg}</span> : null}
+              </span>
+              <span className="rval">{mgrBusy ? t("about.mgrChecking") : ""}</span>
+            </button>
+          ) : null}
           <button className="row" onClick={() => void managerApi.openUrl(REPO_URL)}>
             <Icon name="message" className="ricon" />
             <span className="rtext">

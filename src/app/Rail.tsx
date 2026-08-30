@@ -17,9 +17,12 @@ export type RailSection = "home" | "themes" | "settings";
 export function Rail({
   section,
   onNavigate,
+  offlineOnly = false,
 }: {
   section: RailSection;
   onNavigate: (section: RailSection) => void;
+  /** Hide the remote theme store in the fixed USB build. */
+  offlineOnly?: boolean;
 }) {
   const { t } = useI18n();
   const windowMode = useWindowModeOptional();
@@ -32,7 +35,9 @@ export function Rail({
 
   const items: Array<{ key: RailSection; icon: IconName; label: string }> = [
     { key: "home", icon: "house", label: t("rail.home") },
-    { key: "themes", icon: "palette", label: t("themes.title") },
+    ...(!offlineOnly
+      ? [{ key: "themes" as const, icon: "palette" as const, label: t("themes.title") }]
+      : []),
     { key: "settings", icon: "gear", label: t("nav.settings") },
   ];
 
