@@ -210,6 +210,9 @@ MSIX 会出现在开始菜单，因此第一版若要求“没有 U 盘绝对不
 - 覆盖重启、睡眠唤醒、用户切换和盘符变化；
 - 做误杀回归。
 
+P2 的详细数据模型、Windows API、看门狗生命周期、测试矩阵和分阶段改造清单见
+[`APPX-PROCESS-GUARD-DEVELOPMENT.md`](APPX-PROCESS-GUARD-DEVELOPMENT.md)。
+
 ### P3：发行加固
 
 - 对看门狗和启动器做 Authenticode 签名；

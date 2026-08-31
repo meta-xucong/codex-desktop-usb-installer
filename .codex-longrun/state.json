@@ -1,6 +1,6 @@
 {
-  "objective": "按 USB-BINDING-WATCHDOG-DEVELOPMENT.md 在 Codex U 盘安装器中实现本地看门狗、U 盘绑定和 5 秒拔盘退出，并补齐测试与审计",
-  "current_phase": "Complete implementation and verification",
+  "objective": "按 USB-BINDING-WATCHDOG-DEVELOPMENT.md 完成 P1 U 盘看门狗，并形成 AppX 身份 + 路径 + PID + 创建时间的 P2 改造基线",
+  "current_phase": "P2 design document complete; P1 implementation verified",
   "phase_status": "done",
   "completed_phases": [
     "Discover project structure",
@@ -11,7 +11,7 @@
   ],
   "next_actions": [
     "Wait for user Windows USB acceptance test",
-    "Plan P2 AppX package identity monitoring only after P1 acceptance"
+    "Implement P2 only after approving APPX-PROCESS-GUARD-DEVELOPMENT.md"
   ],
   "tests_run": [
     "cargo test --manifest-path src-tauri/Cargo.toml (168 passed)",
@@ -34,7 +34,7 @@
     "Relevant tests or checks pass",
     "Progress and verification are recorded"
   ],
-  "last_verified_at": "2026-08-31T01:30:46+08:00",
+  "last_verified_at": "2026-08-31T01:35:00+08:00",
   "created_at": "2026-08-31T00:33:30+08:00",
-  "updated_at": "2026-08-31T01:30:46+08:00"
+  "updated_at": "2026-08-31T01:35:00+08:00"
 }
