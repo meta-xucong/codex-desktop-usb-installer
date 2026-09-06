@@ -248,9 +248,12 @@ impl Entry {
                 if !length.is_multiple_of(2) || offset + header + length > bytes.len() {
                     return Err("目录枚举名称超界".into());
                 }
-                let units = bytes[offset + header..offset + header + length]
-                    .chunks_exact(2)
-                    .map(|pair| u16::from_ne_bytes([pair[0], pair[1]]))
+                let (filename_units, remainder) =
+                    bytes[offset + header..offset + header + length].as_chunks::<2>();
+                debug_assert!(remainder.is_empty());
+                let units = filename_units
+                    .iter()
+                    .map(|pair| u16::from_ne_bytes(*pair))
                     .collect::<Vec<_>>();
                 if units != [46] && units != [46, 46] {
                     names.push(OsString::from_wide(&units));
