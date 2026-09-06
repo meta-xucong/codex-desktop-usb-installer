@@ -121,6 +121,7 @@ fn validate_scope(bundle: &Path) -> Result<(), String> {
 struct Pin {
     path: PathBuf,
     file: File,
+    #[cfg_attr(not(windows), allow(dead_code))]
     readonly: bool,
     directory: bool,
 }

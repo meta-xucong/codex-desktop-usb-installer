@@ -15,6 +15,10 @@
 //! verified before a lease is created.  No API key or private signing key is
 //! ever written to the USB or local guard directory.
 
+// The public non-Windows stubs keep cross-platform manager builds possible;
+// the lease helper, process matching and removable-media scanner run on Windows.
+#![cfg_attr(not(target_os = "windows"), allow(dead_code))]
+
 #[cfg(target_os = "windows")]
 use std::fs::OpenOptions;
 use std::fs::{self, File};
@@ -1477,93 +1481,88 @@ pub fn stop_and_uninstall() -> Vec<String> {
 /// Headless entry point used by the copied local helper.  It deliberately
 /// keeps the lease under the user profile so deleting/copying the USB tree
 /// cannot create a second valid lease.
+#[cfg(not(target_os = "windows"))]
+pub fn run_guard_cli() {}
+
+#[cfg(target_os = "windows")]
 pub fn run_guard_cli() {
-    #[cfg(not(target_os = "windows"))]
-    {
+    let args = std::env::args().collect::<Vec<_>>();
+    let lease_override = args
+        .windows(2)
+        .find(|pair| pair[0] == "--lease-file")
+        .map(|pair| PathBuf::from(&pair[1]));
+    let Some(lease_file) = lease_override.or_else(|| lease_path().ok()) else {
         return;
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let args = std::env::args().collect::<Vec<_>>();
-        let lease_override = args
-            .windows(2)
-            .find(|pair| pair[0] == "--lease-file")
-            .map(|pair| PathBuf::from(&pair[1]));
-        let Some(lease_file) = lease_override.or_else(|| lease_path().ok()) else {
-            return;
-        };
-        let Ok(lock) = acquire_guard_lock() else {
-            return;
-        };
-        let _lock = lock;
-        let mut missing_since: Option<std::time::Instant> = None;
-        while let Some(lease) = read_json::<UsbLease>(&lease_file) {
-            if lease.schema_version != LEASE_SCHEMA_VERSION || lease.product != PRODUCT_ID {
-                break;
-            }
-            let present = scan_removable_for(&lease.fingerprint);
-            let now = now_ms();
-            if let Some(observation) = present {
-                missing_since = None;
-                let mut status = base_status("authorized", "running");
-                status.removable = true;
-                status.drive_root = observation.drive_root;
-                status.bundle_path = Some(observation.bundle_path);
-                status.bundle_relative_path = Some(lease.fingerprint.bundle_relative_path.clone());
-                status.signed = read_json::<UsbLicense>(
-                    &PathBuf::from(status.bundle_path.as_deref().unwrap_or(&lease.bundle_path))
-                        .join(LICENSE_FILE_NAME),
-                )
-                .and_then(|license| license.signature)
-                .is_some();
-                status.last_checked_at_ms = now;
-                status.managed_processes = lease.managed_processes.clone();
-                let _ = write_json_atomic(
-                    &status_path().unwrap_or_else(|_| lease_file.with_file_name(STATUS_FILE_NAME)),
-                    &status,
-                );
-            } else {
-                let since = missing_since.get_or_insert_with(std::time::Instant::now);
-                let elapsed = since.elapsed();
-                let remaining = Duration::from_millis(DISCONNECT_GRACE_MS).saturating_sub(elapsed);
-                if elapsed >= Duration::from_millis(DISCONNECT_GRACE_MS) {
-                    let terminated = terminate_managed_processes(&lease);
-                    let mut status = base_status("missing", "not-running");
-                    status.last_checked_at_ms = now;
-                    status.missing_since_ms = Some(now.saturating_sub(elapsed.as_millis() as u64));
-                    status.countdown_seconds = Some(0);
-                    status.bundle_path = Some(lease.bundle_path.clone());
-                    status.bundle_relative_path =
-                        Some(lease.fingerprint.bundle_relative_path.clone());
-                    status.managed_processes = lease.managed_processes.clone();
-                    status.message = format!(
-                        "{}（已结束 {terminated} 个受保护进程）",
-                        status_message("missing")
-                    );
-                    let _ = write_json_atomic(
-                        &status_path()
-                            .unwrap_or_else(|_| lease_file.with_file_name(STATUS_FILE_NAME)),
-                        &status,
-                    );
-                    let _ = fs::remove_file(&lease_file);
-                    let _ = fs::remove_file(atomic_file::backup_path(&lease_file));
-                    break;
-                }
-                let mut status = base_status("grace", "running");
+    };
+    let Ok(lock) = acquire_guard_lock() else {
+        return;
+    };
+    let _lock = lock;
+    let mut missing_since: Option<std::time::Instant> = None;
+    while let Some(lease) = read_json::<UsbLease>(&lease_file) {
+        if lease.schema_version != LEASE_SCHEMA_VERSION || lease.product != PRODUCT_ID {
+            break;
+        }
+        let present = scan_removable_for(&lease.fingerprint);
+        let now = now_ms();
+        if let Some(observation) = present {
+            missing_since = None;
+            let mut status = base_status("authorized", "running");
+            status.removable = true;
+            status.drive_root = observation.drive_root;
+            status.bundle_path = Some(observation.bundle_path);
+            status.bundle_relative_path = Some(lease.fingerprint.bundle_relative_path.clone());
+            status.signed = read_json::<UsbLicense>(
+                &PathBuf::from(status.bundle_path.as_deref().unwrap_or(&lease.bundle_path))
+                    .join(LICENSE_FILE_NAME),
+            )
+            .and_then(|license| license.signature)
+            .is_some();
+            status.last_checked_at_ms = now;
+            status.managed_processes = lease.managed_processes.clone();
+            let _ = write_json_atomic(
+                &status_path().unwrap_or_else(|_| lease_file.with_file_name(STATUS_FILE_NAME)),
+                &status,
+            );
+        } else {
+            let since = missing_since.get_or_insert_with(std::time::Instant::now);
+            let elapsed = since.elapsed();
+            let remaining = Duration::from_millis(DISCONNECT_GRACE_MS).saturating_sub(elapsed);
+            if elapsed >= Duration::from_millis(DISCONNECT_GRACE_MS) {
+                let terminated = terminate_managed_processes(&lease);
+                let mut status = base_status("missing", "not-running");
                 status.last_checked_at_ms = now;
                 status.missing_since_ms = Some(now.saturating_sub(elapsed.as_millis() as u64));
-                status.countdown_seconds =
-                    Some((remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0)).max(1));
+                status.countdown_seconds = Some(0);
                 status.bundle_path = Some(lease.bundle_path.clone());
                 status.bundle_relative_path = Some(lease.fingerprint.bundle_relative_path.clone());
                 status.managed_processes = lease.managed_processes.clone();
+                status.message = format!(
+                    "{}（已结束 {terminated} 个受保护进程）",
+                    status_message("missing")
+                );
                 let _ = write_json_atomic(
                     &status_path().unwrap_or_else(|_| lease_file.with_file_name(STATUS_FILE_NAME)),
                     &status,
                 );
+                let _ = fs::remove_file(&lease_file);
+                let _ = fs::remove_file(atomic_file::backup_path(&lease_file));
+                break;
             }
-            std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
+            let mut status = base_status("grace", "running");
+            status.last_checked_at_ms = now;
+            status.missing_since_ms = Some(now.saturating_sub(elapsed.as_millis() as u64));
+            status.countdown_seconds =
+                Some((remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0)).max(1));
+            status.bundle_path = Some(lease.bundle_path.clone());
+            status.bundle_relative_path = Some(lease.fingerprint.bundle_relative_path.clone());
+            status.managed_processes = lease.managed_processes.clone();
+            let _ = write_json_atomic(
+                &status_path().unwrap_or_else(|_| lease_file.with_file_name(STATUS_FILE_NAME)),
+                &status,
+            );
         }
+        std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
     }
 }
 

@@ -35,6 +35,7 @@ use serde::{Deserialize, Serialize};
 use crate::app::atomic_file;
 use crate::errors::AppError;
 
+#[cfg(target_os = "windows")]
 const POLICY_SUBKEY: &str = r"Software\Policies\Microsoft\Windows\Appx";
 const POLICY_VALUE: &str = "RestrictAppDataToSystemVolume";
 const JOURNAL_DIR: &str = "CodexUsbAppx";
@@ -876,6 +877,7 @@ pub fn filesystem_volume_guid(volume_root: &Path) -> Result<String, AppError> {
     }
 }
 
+#[cfg(any(target_os = "windows", test))]
 fn validate_filesystem_volume_guid(value: &str) -> Result<(), AppError> {
     let guid = value
         .strip_prefix(r"\\?\Volume{")
@@ -1030,6 +1032,7 @@ pub fn ensure_appx_volume_registered(_volume_root: &Path) -> Result<(), AppError
     Err(AppError::UnsupportedPlatform)
 }
 
+#[cfg(any(target_os = "windows", test))]
 fn validate_external_deployment_policy(value: Option<u32>) -> Result<(), AppError> {
     match value {
         None | Some(0) => Ok(()),
@@ -1483,6 +1486,7 @@ fn system_package_entry_audit_script(full_name: Option<&str>) -> Result<String, 
     ))
 }
 
+#[cfg(any(target_os = "windows", test))]
 fn pending_system_package_entry(audit: &serde_json::Value) -> Result<Option<String>, AppError> {
     let status = audit.get("status").and_then(|v| v.as_str());
     let message = audit

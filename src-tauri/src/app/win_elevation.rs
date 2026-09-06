@@ -112,7 +112,7 @@ pub fn should_relaunch_usb_manager(
 pub fn maybe_relaunch_usb_manager() -> Result<ElevationAction, String> {
     #[cfg(not(target_os = "windows"))]
     {
-        return Ok(ElevationAction::Continue);
+        Ok(ElevationAction::Continue)
     }
 
     #[cfg(target_os = "windows")]

@@ -28,11 +28,13 @@ pub const WEBVIEW2_INSTALLER_FILE_NAME: &str = "MicrosoftEdgeWebView2RuntimeInst
 pub const WEBVIEW2_INSTALLER_SHA256: &str =
     "1F4638309F3D82C31A3028C3CF7D75998F58E4D1407380F5CB8A8E9172CAF17D";
 const VC_INSTALL_TIMEOUT: Duration = Duration::from_secs(300);
+#[cfg(target_os = "windows")]
 const WEBVIEW2_INSTALL_TIMEOUT: Duration = Duration::from_secs(600);
 
 const REQUIRED_DLLS: &[&str] = &["VCRUNTIME140.dll", "VCRUNTIME140_1.dll", "MSVCP140.dll"];
 const ACCEPTED_INSTALL_EXIT_CODES: &[i32] = &[0, 1638, 1641, 3010];
 const MSI_BUSY_EXIT_CODE: i32 = 1618;
+#[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// A structured, non-secret status used by the native callers and tests.  The
@@ -234,6 +236,7 @@ fn run_installer(
     }
 }
 
+#[cfg(any(target_os = "windows", test))]
 fn poll_installer_exit(
     mut poll: impl FnMut() -> std::io::Result<Option<i32>>,
     label: &str,
@@ -343,6 +346,7 @@ fn webview2_version() -> Option<String> {
     (result.is_ok() && usable_webview2_version(&value)).then_some(value)
 }
 
+#[cfg(any(target_os = "windows", test))]
 fn usable_webview2_version(version: &str) -> bool {
     // The native browser-accelerator safety gate needs Settings3. Runtime
     // 109 is a conservative baseline covering that interface on Win10+.

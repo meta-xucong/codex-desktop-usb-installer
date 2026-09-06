@@ -2,6 +2,10 @@
 //! No caller-provided deletion paths are accepted. The plan records identity only;
 //! deletion targets are reconstructed from Windows known folders in both processes.
 
+// The public non-Windows stubs keep the manager API portable; the recovery,
+// finalizer and identity-pinning implementation is deliberately Windows-only.
+#![cfg_attr(not(windows), allow(dead_code))]
+
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};

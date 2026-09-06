@@ -32,7 +32,9 @@ const CCSWITCH_MANAGED_MARKER: &str = ".codex-usb-managed.json";
 const CCSWITCH_USB_MARKER: &str = "ccswitch-usb-managed.json";
 const CCSWITCH_DATA_DIR: &str = ".cc-switch";
 const CCSWITCH_IDENTIFIER: &str = "com.ccswitch.desktop";
+#[cfg(target_os = "windows")]
 const CCSWITCH_RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+#[cfg(target_os = "windows")]
 const CCSWITCH_RUN_VALUE: &str = "CC Switch";
 const WEBVIEW2_ARGUMENTS_ENV: &str = "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS";
 const WEBVIEW2_DISABLE_GPU_ARG: &str = "--disable-gpu";
@@ -620,6 +622,7 @@ fn remove_autostart_entry_for_paths(paths: &[&Path]) -> Result<bool, AppError> {
     Ok(true)
 }
 
+#[cfg(any(target_os = "windows", test))]
 fn autostart_targets(command: &str, executable: &str) -> bool {
     let normalized = command.trim().to_ascii_lowercase().replace('/', "\\");
     let expected = executable.to_ascii_lowercase().replace('/', "\\");
