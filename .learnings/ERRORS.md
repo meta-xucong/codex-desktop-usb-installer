@@ -104,6 +104,31 @@ exec cell 41568 not found
 
 ---
 
+## [ERR-20260906-016] malformed-log-filter-regex
+
+**Logged**: 2026-09-06T15:28:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: diagnostics
+
+### Summary
+A JavaScript regex used only to filter downloaded CI log lines over-escaped a slash, so the wrapper failed before calling GitHub.
+
+### Error
+```
+SyntaxError: Invalid regular expression flags
+```
+
+### Context
+- No command ran and no local or remote state changed.
+- The GitHub job itself continued unaffected.
+
+### Resolution
+- **Resolved**: 2026-09-06T15:29:00+08:00
+- **Notes**: Replaced the regex with explicit lowercase substring checks, then retrieved the complete failing job tail.
+
+---
+
 ## [ERR-20260906-011] validation-command-used-wrong-cargo-manifest
 
 **Logged**: 2026-09-06T14:55:00+08:00

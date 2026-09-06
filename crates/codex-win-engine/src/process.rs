@@ -166,6 +166,7 @@ pub(crate) fn curl_exe() -> PathBuf {
 
 /// Terminate a child and, on Windows, its process tree (PowerShell nests work).
 fn terminate_tree(child: &mut Child) {
+    #[cfg(windows)]
     let pid = child.id();
     let _ = child.kill();
     #[cfg(windows)]
