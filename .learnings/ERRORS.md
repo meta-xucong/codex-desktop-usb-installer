@@ -25,6 +25,34 @@ SyntaxError: Unexpected token '?'
 
 ---
 
+## [ERR-20260906-013] package-lock-powershell-empty-key
+
+**Logged**: 2026-09-06T10:15:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: diagnostics
+
+### Summary
+A read-only PowerShell inspection of `package-lock.json` failed because `ConvertFrom-Json` tried to materialize an object containing an empty property name.
+
+### Error
+```
+ConvertFrom-Json: The provided JSON includes a property whose name is an empty string.
+```
+
+### Context
+- npm lockfiles can contain package-map keys that PowerShell's default object conversion cannot represent safely.
+- The command was diagnostic only and made no filesystem changes.
+
+### Suggested Fix
+Inspect npm lockfiles with Node.js, or use `ConvertFrom-Json -AsHashTable` on supported PowerShell versions.
+
+### Resolution
+- **Resolved**: 2026-09-06T10:16:00+08:00
+- **Notes**: Re-ran the inspection with Node.js and confirmed `browserslist` was updated from 4.28.6 to 4.28.9.
+
+---
+
 ## [ERR-20260906-011] validation-command-used-wrong-cargo-manifest
 
 **Logged**: 2026-09-06T14:55:00+08:00
