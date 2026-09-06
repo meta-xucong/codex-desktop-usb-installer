@@ -1,7 +1,7 @@
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 #[cfg(windows)]
 use std::path::PathBuf;
-use serde::{Deserialize, Serialize};
 
 #[cfg(windows)]
 use crate::process::{hidden_command, run_capturing, RunLimits};
@@ -9,8 +9,7 @@ use crate::EngineError;
 
 // The mirror currently serves Store-re-signed MSIX packages; add a separate
 // exact direct-signing anchor here if the Windows source changes in the future.
-pub const OPENAI_MARKETPLACE_PUBLISHER_SUBJECT: &str =
-    "cn=50bdfd77-8903-4850-9ffe-6e8522f64d5b";
+pub const OPENAI_MARKETPLACE_PUBLISHER_SUBJECT: &str = "cn=50bdfd77-8903-4850-9ffe-6e8522f64d5b";
 #[cfg(any(windows, test))]
 const MICROSOFT_MARKETPLACE_ISSUER_CN_PREFIX: &str = "cn=microsoft marketplace ca";
 #[cfg(any(windows, test))]
@@ -143,7 +142,7 @@ pub fn verify_openai_authenticode(path: &Path) -> Result<AuthenticodeReport, Eng
 
     let mut command = hidden_command(powershell_exe());
     command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
-    let output = run_capturing(command, RunLimits::probe(), None).map_err(|e| {
+    let output = run_capturing(command, RunLimits::authenticode(), None).map_err(|e| {
         EngineError::Authenticode(format!("Get-AuthenticodeSignature: {}", e.message()))
     })?;
 

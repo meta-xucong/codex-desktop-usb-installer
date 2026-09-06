@@ -326,9 +326,7 @@ fn quarantine_flags_indicate_translocation(value: &str) -> bool {
     const QTN_FLAG_DO_NOT_TRANSLOCATE: u32 = 0x0100;
     let flags_hex = value.split(';').next().unwrap_or("").trim();
     match u32::from_str_radix(flags_hex, 16) {
-        Ok(flags) => {
-            flags & QTN_FLAG_TRANSLOCATE != 0 && flags & QTN_FLAG_DO_NOT_TRANSLOCATE == 0
-        }
+        Ok(flags) => flags & QTN_FLAG_TRANSLOCATE != 0 && flags & QTN_FLAG_DO_NOT_TRANSLOCATE == 0,
         Err(_) => true,
     }
 }
@@ -472,7 +470,10 @@ mod tests {
             installed_codex_build_at_path(&renamed),
             Some((renamed.clone(), 5059))
         );
-        assert_eq!(read_bundle_identifier(&renamed).as_deref(), Some(CODEX_BUNDLE_ID));
+        assert_eq!(
+            read_bundle_identifier(&renamed).as_deref(),
+            Some(CODEX_BUNDLE_ID)
+        );
 
         let _ = fs::remove_dir_all(&root);
     }

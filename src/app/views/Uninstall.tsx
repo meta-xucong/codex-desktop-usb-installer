@@ -3,7 +3,7 @@ import { useCallback, useEffect, useId, useState } from "react";
 import { managerApi } from "../../services/managerApi";
 import type { InstallProbeState, OperationOutcome } from "../../shared/types";
 import { outcomeIsPartial } from "../../shared/types";
-import { userErrorMessage } from "../errorCopy";
+import { resolveFailure } from "../errorCopy";
 import { Icon } from "../icons";
 import { useI18n } from "../i18n";
 import { NavBar, Ring, Toggle, StatusBanner } from "../components";
@@ -20,6 +20,13 @@ function hasTauriRuntime(): boolean {
 
 const PROVENANCE_RECOVERY_ACTIONS = new Set(["record_provenance", "clear_provenance"]);
 const CLEANUP_RECOVERY_ACTIONS = new Set(["cleanup_metadata", "purge_user_data"]);
+const TERMINAL_STEP_STATES = new Set(["ok", "skipped", "not_applicable"]);
+
+function outcomeNeedsAttention(outcome: OperationOutcome): boolean {
+  return !outcome.primaryOk || outcomeIsPartial(outcome) || outcome.recoveryActions.length > 0 ||
+    !TERMINAL_STEP_STATES.has(outcome.provenance.state) ||
+    !TERMINAL_STEP_STATES.has(outcome.cleanup.state);
+}
 
 /** Merge a scoped ancillary retry back into the original partial outcome.
  * The backend reports only the actions attempted in this request; actions the
@@ -33,8 +40,9 @@ function mergeAncillaryRetryOutcome(
   const attemptedSet = new Set(attempted);
   const unattempted = previous.recoveryActions.filter((action) => !attemptedSet.has(action));
   const failedAttempted = attempted.filter((action) => {
-    if (PROVENANCE_RECOVERY_ACTIONS.has(action)) return retried.provenance.state === "failed";
-    if (CLEANUP_RECOVERY_ACTIONS.has(action)) return retried.cleanup.state === "failed";
+    if (!retried.primaryOk) return true;
+    if (PROVENANCE_RECOVERY_ACTIONS.has(action)) return !TERMINAL_STEP_STATES.has(retried.provenance.state);
+    if (CLEANUP_RECOVERY_ACTIONS.has(action)) return !TERMINAL_STEP_STATES.has(retried.cleanup.state);
     return false;
   });
   const recoveryActions = [
@@ -59,6 +67,23 @@ function mergeAncillaryRetryOutcome(
 
 const CCSWITCH_INSTALL_DISPLAY = "%LOCALAPPDATA%\\Programs\\CodexSwitch";
 const CCSWITCH_DATA_DISPLAY = "%USERPROFILE%\\.cc-switch";
+// Mirrors the existing Windows purge lists; these are display strings only,
+// not new cleanup targets or ownership-based authorization to erase data.
+const CODEX_WINDOWS_DATA_PATHS = [
+  "%USERPROFILE%\\.codex",
+  "%LOCALAPPDATA%\\Packages\\OpenAI.Codex_2p2nqsd0c76g0",
+  "%LOCALAPPDATA%\\OpenAI\\Codex",
+  "%LOCALAPPDATA%\\Codex\\Logs",
+  "%APPDATA%\\OpenAI\\Codex",
+  "%APPDATA%\\Codex",
+  "%LOCALAPPDATA%\\CodexAppxDataBackups\\OpenAI.Codex_2p2nqsd0c76g0",
+].join("\n");
+const CCSWITCH_DATA_PATHS = [
+  CCSWITCH_DATA_DISPLAY,
+  "%LOCALAPPDATA%\\com.ccswitch.desktop",
+  "%APPDATA%\\com.ccswitch.desktop",
+].join("\n");
+const DATA_PATH_STYLE = { whiteSpace: "pre-wrap", overflowWrap: "anywhere", display: "block", textAlign: "start" } as const;
 
 export function Uninstall({
   onBack,
@@ -76,10 +101,16 @@ export function Uninstall({
   // Default to keeping the user's data (~/.codex on mac, %USERPROFILE%\.codex on
   // Windows). Opting out is deliberate.
   const [keepData, setKeepData] = useState(true);
+  const [purgeCodexData, setPurgeCodexData] = useState(false);
+  const [purgeCcswitchData, setPurgeCcswitchData] = useState(false);
+  const [removeUsbMedia, setRemoveUsbMedia] = useState(false);
+  const [cleanupPending, setCleanupPending] = useState(false);
+  const [needsFinalCleanup, setNeedsFinalCleanup] = useState(false);
   const [busy, setBusy] = useState(false);
   const [done, setDone] = useState<string | null>(null);
   const [doneDetail, setDoneDetail] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [errorDetail, setErrorDetail] = useState<string | null>(null);
   const [pathCopied, setPathCopied] = useState(false);
   // Install probe: Loading / Managed / External / None / Error — never treat a
   // status-query failure as "external".
@@ -97,6 +128,9 @@ export function Uninstall({
   const purgeRetryTitleId = useId();
   const purgeRetryBodyId = useId();
   const keepDataTitleId = useId();
+  const purgeCodexTitleId = useId();
+  const purgeCcswitchTitleId = useId();
+  const removeMediaTitleId = useId();
 
   const refreshProbe = useCallback(async () => {
     setProbe("loading");
@@ -117,24 +151,38 @@ export function Uninstall({
   const run = async () => {
     setConfirmStep(0);
     setBusy(true);
+    setDone(null);
     setError(null);
+    setErrorDetail(null);
     setPartialOutcome(null);
+    setNeedsFinalCleanup(false);
     setDoneDetail(null);
     try {
       // mac keeps ~/.codex via keepCodexHome; win purges via purgeUserData (the
       // inverse) — both surface the backend message as the source of truth.
       if (win) {
         const r = bundledWindows
-          ? await managerApi.winUninstallBundle(true, !keepData, !keepData)
+          ? await managerApi.winUninstallBundle(true, purgeCodexData, purgeCcswitchData, removeUsbMedia)
           : await managerApi.winUninstall(true, !keepData);
-        if (r.success && outcomeIsPartial(r.outcome)) {
+        if (!r.success || !r.outcome.primaryOk) {
+          setError(t("uninstall.failed"));
+          setErrorDetail([
+            r.message, ...(r.notes ?? []), r.outcome.cleanup.detail, r.outcome.provenance.detail,
+            ...r.outcome.warnings, ...("codexError" in r ? [r.codexError, r.ccswitchError] : []),
+          ].filter(Boolean).join("\n"));
+          return;
+        }
+        if ("cleanupPending" in r && r.cleanupPending && !outcomeIsPartial(r.outcome) && r.outcome.recoveryActions.length === 0) {
+          setCleanupPending(true);
+          setDone(t("uninstall.bundle.exiting"));
+          setDoneDetail(`${r.message}\n${"cleanupReportPath" in r ? r.cleanupReportPath ?? "" : ""}`);
+          return;
+        }
+        if (outcomeNeedsAttention(r.outcome)) {
+          setNeedsFinalCleanup(bundledWindows);
           setPartialOutcome(r.outcome);
           setDone(t("uninstall.partial.summary"));
           setDoneDetail(r.message);
-          return;
-        }
-        if (!r.success) {
-          setError(r.message);
           return;
         }
         setDone(r.message);
@@ -153,7 +201,9 @@ export function Uninstall({
         setDone(r.message);
       }
     } catch (cause) {
-      setError(userErrorMessage(cause, t));
+      const failure = resolveFailure(cause, t);
+      setError(failure.message);
+      setErrorDetail(failure.detail);
     } finally {
       setBusy(false);
     }
@@ -163,6 +213,7 @@ export function Uninstall({
     setConfirmStep(0);
     setRetryBusy(true);
     setError(null);
+    setErrorDetail(null);
     try {
       const report = await managerApi.retryAncillary({
         actions,
@@ -172,16 +223,19 @@ export function Uninstall({
       const mergedOutcome = partialOutcome
         ? mergeAncillaryRetryOutcome(partialOutcome, actions, report.outcome)
         : report.outcome;
-      if (mergedOutcome.recoveryActions.length > 0 || outcomeIsPartial(mergedOutcome)) {
+      if (outcomeNeedsAttention(mergedOutcome)) {
         setDone(t("uninstall.partial.retryPending"));
         setPartialOutcome(mergedOutcome);
       } else {
-        setDone(t("uninstall.partial.retryDone"));
+        setDone(t(bundledWindows ? "uninstall.bundle.retryContinue" : "uninstall.partial.retryDone"));
+        setNeedsFinalCleanup(bundledWindows);
         setPartialOutcome(null);
       }
       setDoneDetail(report.message);
     } catch (cause) {
-      setError(userErrorMessage(cause, t));
+      const failure = resolveFailure(cause, t);
+      setError(failure.message);
+      setErrorDetail(failure.detail);
     } finally {
       setRetryBusy(false);
     }
@@ -190,14 +244,38 @@ export function Uninstall({
   // First confirm → run when keeping data; otherwise escalate to a second,
   // explicit data-erasure confirm before doing anything destructive.
   const onFirstConfirm = () => {
-    if (keepData) {
+    if (bundledWindows ? !purgeCodexData && !purgeCcswitchData && !removeUsbMedia : keepData) {
       void run();
     } else {
       setConfirmStep(2);
     }
   };
 
-  const dataPaths = bundledWindows ? `${codexHome}\n${CCSWITCH_DATA_DISPLAY}` : codexHome;
+  const dataPaths = codexHome;
+  const selectedSharedData = purgeCodexData || purgeCcswitchData;
+  const bundleSelection = (
+    <div>
+      <p><strong>{t(purgeCodexData ? "uninstall.bundle.codexErase" : "uninstall.bundle.codexKeep")}</strong>
+        <span className="rsub mono path" style={DATA_PATH_STYLE}>{CODEX_WINDOWS_DATA_PATHS}</span>
+        {!purgeCodexData ? <span className="rsub">{t("uninstall.bundle.codexKeepNote")}</span> : null}
+      </p>
+      <p><strong>{t(purgeCcswitchData ? "uninstall.bundle.ccswitchErase" : "uninstall.bundle.ccswitchKeep")}</strong>
+        <span className="rsub mono path" style={DATA_PATH_STYLE}>{CCSWITCH_DATA_PATHS}</span>
+      </p>
+      <p>{t(removeUsbMedia ? "uninstall.bundle.mediaEraseConfirm" : "uninstall.bundle.mediaKeep")}</p>
+    </div>
+  );
+  const errorBanner = error ? (
+    <>
+      <StatusBanner tone="err">{error}</StatusBanner>
+      {errorDetail ? (
+        <details className="manual-existing-meta">
+          <summary>{t("home.error.details")}</summary>
+          <pre className="errdetails">{errorDetail}</pre>
+        </details>
+      ) : null}
+    </>
+  ) : null;
 
   const copyPath = async () => {
     try {
@@ -219,14 +297,15 @@ export function Uninstall({
       <NavBar
         title={t(bundledWindows ? "uninstall.bundle.heading" : "uninstall.heading")}
         onBack={onBack}
+        disableBack={busy || retryBusy || cleanupPending}
       />
       <div className="scroll view" inert={confirmStep > 0 ? true : undefined}>
         {done ? (
           <>
             <section className="hero" style={{ marginTop: 16 }}>
               <Ring
-                icon={partialOutcome ? "alert" : "check"}
-                variant={partialOutcome ? "amber" : "success"}
+                icon={cleanupPending ? "loader" : partialOutcome || needsFinalCleanup ? "alert" : "check"}
+                variant={cleanupPending || partialOutcome || needsFinalCleanup ? "amber" : "success"}
                 className="pop"
               />
               <div className="headline">
@@ -283,8 +362,14 @@ export function Uninstall({
                 </div>
               </>
             ) : null}
-            {error ? <StatusBanner tone="err">{error}</StatusBanner> : null}
-            <button className="btn ghost big" onClick={onBack}>
+            {errorBanner}
+            {needsFinalCleanup ? (
+              <button className="btn big" disabled={busy || retryBusy}
+                onClick={() => setConfirmStep(1)}>
+                {t("uninstall.bundle.continueFinalCleanup")}
+              </button>
+            ) : null}
+            <button className="btn ghost big" onClick={onBack} disabled={busy || retryBusy || cleanupPending}>
               {t("nav.back")}
             </button>
           </>
@@ -324,20 +409,25 @@ export function Uninstall({
             ) : null}
 
             {probe === "external" ? (
-              <StatusBanner tone="info">{t("uninstall.needAdopt")}</StatusBanner>
+              <StatusBanner tone="info">
+                {t(bundledWindows ? "uninstall.bundle.external" : "uninstall.needAdopt")}
+              </StatusBanner>
             ) : null}
 
             <div className="list">
-              <div className="row">
+              {bundledWindows ? (
+                <div className="row">
+                  <span className="rtext">
+                    <span className="rtitle">{t("uninstall.bundle.cleanupScope")}</span>
+                    <span className="rsub">{t("uninstall.bundle.cleanupNote")}</span>
+                  </span>
+                </div>
+              ) : null}
+              {!bundledWindows ? <div className="row">
                 <span className="rtext">
                   <span className="rtitle" id={keepDataTitleId}>{t("uninstall.keepData")}</span>
                   <span className="rsub">
-                    {t(
-                      bundledWindows ? "uninstall.bundle.keepDataNote" : "uninstall.keepDataNote",
-                      bundledWindows
-                        ? { codexPath: codexHome, ccswitchPath: CCSWITCH_DATA_DISPLAY }
-                        : { path: codexHome },
-                    )}
+                    {t("uninstall.keepDataNote", { path: codexHome })}
                   </span>
                 </span>
                 <Toggle
@@ -346,7 +436,7 @@ export function Uninstall({
                   onChange={setKeepData}
                   disabled={busy || !canUninstall}
                 />
-              </div>
+              </div> : null}
             </div>
 
             {bundledWindows ? (
@@ -361,19 +451,43 @@ export function Uninstall({
               </div>
             ) : null}
 
-            {probe === "managed" || bundledWindows ? (
+            {bundledWindows ? (
+              <details className="manual-existing-meta">
+                <summary>{t("uninstall.bundle.advanced")}</summary>
+                <p>{t("uninstall.bundle.sharedRisk")}</p>
+                <div className="list">
+                  <div className={`row data-path-row${purgeCodexData ? " danger" : ""}`}>
+                    <span className="rtext">
+                      <span className="rtitle" id={purgeCodexTitleId}>{t("uninstall.bundle.purgeCodex")}</span>
+                      <span className="rsub">{t("uninstall.bundle.codexRisk")}</span>
+                      <span className="rsub mono path" style={DATA_PATH_STYLE}>{CODEX_WINDOWS_DATA_PATHS}</span>
+                    </span>
+                    <Toggle ariaLabelledBy={purgeCodexTitleId} checked={purgeCodexData}
+                      onChange={setPurgeCodexData} disabled={busy || !canUninstall} />
+                  </div>
+                  <div className={`row data-path-row${purgeCcswitchData ? " danger" : ""}`}>
+                    <span className="rtext">
+                      <span className="rtitle" id={purgeCcswitchTitleId}>{t("uninstall.bundle.purgeCcswitch")}</span>
+                      <span className="rsub">{t("uninstall.bundle.ccswitchRisk")}</span>
+                      <span className="rsub mono path" style={DATA_PATH_STYLE}>{CCSWITCH_DATA_PATHS}</span>
+                    </span>
+                    <Toggle ariaLabelledBy={purgeCcswitchTitleId} checked={purgeCcswitchData}
+                      onChange={setPurgeCcswitchData} disabled={busy || !canUninstall} />
+                  </div>
+                </div>
+              </details>
+            ) : null}
+
+            {probe === "managed" && !bundledWindows ? (
               <div className="list">
                 <div className={`row data-path-row${keepData ? "" : " danger"}`}>
                   <span className="rtext">
                     <span className="rtitle">
-                      {t(bundledWindows ? "uninstall.bundle.dataPath" : "uninstall.dataPath")}
+                      {t("uninstall.dataPath")}
                     </span>
                     <span className="rsub mono path">{codexHome}</span>
-                    {bundledWindows ? (
-                      <span className="rsub mono path">{CCSWITCH_DATA_DISPLAY}</span>
-                    ) : null}
                     <span className="rsub">
-                      {t(bundledWindows ? "uninstall.bundle.dataAffects" : "uninstall.dataAffects")}
+                      {t("uninstall.dataAffects")}
                     </span>
                   </span>
                   <div className="install-root-actions">
@@ -395,7 +509,19 @@ export function Uninstall({
               </div>
             ) : null}
 
-            {error ? <StatusBanner tone="err">{error}</StatusBanner> : null}
+            {bundledWindows ? (
+              <div className="list">
+                <div className="row">
+                  <span className="rtext">
+                    <span className="rtitle" id={removeMediaTitleId}>{t("uninstall.bundle.removeMedia")}</span>
+                    <span className="rsub">{t("uninstall.bundle.removeMediaNote")}</span>
+                  </span>
+                  <Toggle checked={removeUsbMedia} onChange={setRemoveUsbMedia}
+                    ariaLabelledBy={removeMediaTitleId} disabled={busy || !canUninstall} />
+                </div>
+              </div>
+            ) : null}
+            {errorBanner}
 
             <div className="actions">
               <button
@@ -429,21 +555,17 @@ export function Uninstall({
         </h3>
         <p id={confirm1BodyId}>
           {bundledWindows
-            ? keepData
-              ? t("uninstall.bundle.confirm1.bodyKeep", {
-                  codexPath: codexHome,
-                  ccswitchPath: CCSWITCH_DATA_DISPLAY,
-                })
-              : t("uninstall.bundle.confirm1.bodyPurge")
+            ? t("uninstall.bundle.confirm1.scope")
             : keepData
               ? t("uninstall.confirm1.bodyKeep", { path: codexHome })
               : t("uninstall.confirm1.bodyPurge")}
         </p>
+        {bundledWindows ? bundleSelection : null}
         <div className="row2 sheet-actions">
           <button className="btn ghost" onClick={() => setConfirmStep(0)}>
             {t("uninstall.cancel")}
           </button>
-          <button className="btn danger" onClick={onFirstConfirm}>
+          <button className="btn danger" onClick={onFirstConfirm} disabled={confirmStep !== 1 || busy || retryBusy}>
             {t("uninstall.continue")}
           </button>
         </div>
@@ -458,22 +580,20 @@ export function Uninstall({
       >
         <Ring icon="trash" variant="danger" />
         <h3 id={confirm2TitleId}>
-          {t(bundledWindows ? "uninstall.bundle.confirm2.title" : "uninstall.confirm2.title")}
+          {t(bundledWindows && !selectedSharedData && removeUsbMedia ? "uninstall.bundle.mediaConfirmTitle" : bundledWindows ? "uninstall.bundle.confirm2.title" : "uninstall.confirm2.title")}
         </h3>
         <p id={confirm2BodyId}>
-          {t(
-            bundledWindows ? "uninstall.bundle.confirm2.body" : "uninstall.confirm2.body",
-            bundledWindows
-              ? { codexPath: codexHome, ccswitchPath: CCSWITCH_DATA_DISPLAY }
-              : { path: codexHome },
-          )}
+          {bundledWindows
+            ? t(selectedSharedData ? "uninstall.bundle.confirm2.selected" : "uninstall.bundle.mediaOnlyConfirm")
+            : t("uninstall.confirm2.body", { path: codexHome })}
         </p>
+        {bundledWindows ? bundleSelection : null}
         <div className="row2 sheet-actions">
           <button className="btn ghost" onClick={() => setConfirmStep(0)}>
             {t("uninstall.cancel")}
           </button>
-          <button className="btn danger" onClick={() => void run()}>
-            {t(bundledWindows ? "uninstall.bundle.purgeConfirm" : "uninstall.purgeConfirm")}
+          <button className="btn danger" onClick={() => void run()} disabled={confirmStep !== 2 || busy || retryBusy}>
+            {t(bundledWindows && !selectedSharedData && removeUsbMedia ? "uninstall.bundle.mediaConfirmButton" : bundledWindows ? "uninstall.bundle.purgeConfirm" : "uninstall.purgeConfirm")}
           </button>
         </div>
       </Sheet>
@@ -487,15 +607,22 @@ export function Uninstall({
         initialFocus="dismiss"
       >
         <Ring icon="trash" variant="danger" />
-        <h3 id={purgeRetryTitleId}>{t("uninstall.confirm2.title")}</h3>
-        <p id={purgeRetryBodyId}>{t("uninstall.confirm2.body", { path: codexHome })}</p>
-        <div className="row2">
+        <h3 id={purgeRetryTitleId}>{t(win ? "uninstall.bundle.retryPurgeTitle" : "uninstall.confirm2.title")}</h3>
+        <p id={purgeRetryBodyId}>{t(win ? "uninstall.bundle.codexRisk" : "uninstall.confirm2.body", { path: codexHome })}</p>
+        {win ? (
+          <>
+            <p className="mono path" style={DATA_PATH_STYLE}>{CODEX_WINDOWS_DATA_PATHS}</p>
+            <p>{t("uninstall.bundle.retryPurgeScope")}</p>
+          </>
+        ) : null}
+        <div className="row2 sheet-actions">
           <button className="btn ghost" onClick={() => setConfirmStep(0)}>
             {t("uninstall.cancel")}
           </button>
           <button
             className="btn danger"
             onClick={() => void retryActions(["purge_user_data"])}
+            disabled={confirmStep !== 3 || busy || retryBusy}
           >
             {t("uninstall.partial.retryPurge")}
           </button>

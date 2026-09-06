@@ -16,8 +16,21 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Default wall-clock budget for a short PowerShell / curl-text probe.
 pub const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(45);
+/// Dedicated budget for Authenticode verification of the large offline MSIX.
+///
+/// `Get-AuthenticodeSignature` reads the complete package and can also trigger
+/// Defender/certificate-chain work.  A removable-volume package can therefore
+/// legitimately take much longer than a normal text probe.  Keep this bounded
+/// (rather than disabling the deadline), but do not reuse the 45-second probe
+/// budget that is appropriate for small commands.
+pub const AUTHENTICODE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// Longer budget for Add-AppxPackage / Remove-AppxPackage.
 pub const INSTALL_TIMEOUT: Duration = Duration::from_secs(180);
+/// USB AppX deployment can spend several minutes writing an 800 MB package to
+/// a removable NTFS volume while Defender scans both sides of the copy. Keep
+/// the normal install budget unchanged, but give the explicit USB route a
+/// bounded budget that does not turn slow media into a false failure.
+pub const USB_INSTALL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// Upper bound for the one-shot UAC recovery used only when Windows Update owns
 /// an active deployment of the exact package we already downloaded locally.
 pub const APPX_RECOVERY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -32,7 +45,7 @@ pub const PORTABLE_LIVENESS_WINDOW: Duration = Duration::from_secs(3);
 /// portable liveness window so both routes reject the same class of crash-loops.
 pub const MSIX_LIVENESS_WINDOW_SECS: u64 = PORTABLE_LIVENESS_WINDOW.as_secs();
 /// Outer budget to wait for a cold-started MSIX process to *appear* after
-/// `Start-Process shell:AppsFolder\…`. Cold machines / AppX service warm-up can
+/// `explorer.exe shell:AppsFolder\…`. Cold machines / AppX service warm-up can
 /// take well over 10s; too short a window causes false portable fallbacks.
 pub const MSIX_ACTIVATION_WINDOW_SECS: u64 = 30;
 
@@ -63,8 +76,16 @@ impl RunLimits {
         Self::total(DEFAULT_PROBE_TIMEOUT)
     }
 
+    pub fn authenticode() -> Self {
+        Self::total(AUTHENTICODE_TIMEOUT)
+    }
+
     pub fn install() -> Self {
         Self::total(INSTALL_TIMEOUT)
+    }
+
+    pub fn usb_install() -> Self {
+        Self::total(USB_INSTALL_TIMEOUT)
     }
 
     pub fn appx_recovery() -> Self {
@@ -179,11 +200,7 @@ pub fn run_capturing(
         .spawn()
         .map_err(|e| RunError::Spawn(e.to_string()))?;
     wait_child(
-        &mut child,
-        limits,
-        cancel,
-        /*progress*/ None,
-        /*on_progress*/ None,
+        &mut child, limits, cancel, /*progress*/ None, /*on_progress*/ None,
     )?;
     child
         .wait_with_output()
@@ -325,6 +342,21 @@ pub fn spawn_and_require_liveness(
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn authenticode_limits_are_longer_than_short_probe() {
+        assert!(AUTHENTICODE_TIMEOUT > DEFAULT_PROBE_TIMEOUT);
+        assert_eq!(RunLimits::authenticode().total, AUTHENTICODE_TIMEOUT);
+        assert_eq!(RunLimits::authenticode().stall, None);
+    }
+
+    #[test]
+    fn usb_install_limits_allow_slow_removable_media_without_being_unbounded() {
+        assert!(USB_INSTALL_TIMEOUT > INSTALL_TIMEOUT);
+        assert!(USB_INSTALL_TIMEOUT <= Duration::from_secs(15 * 60));
+        assert_eq!(RunLimits::usb_install().total, USB_INSTALL_TIMEOUT);
+        assert_eq!(RunLimits::usb_install().stall, None);
+    }
 
     fn sleep_command(secs: u64) -> Command {
         #[cfg(windows)]
@@ -483,11 +515,8 @@ mod tests {
 
     #[test]
     fn immediate_exit_liveness_detected() {
-        let result = spawn_and_require_liveness(
-            immediate_exit_command(7),
-            Duration::from_secs(2),
-        )
-        .expect("spawn");
+        let result = spawn_and_require_liveness(immediate_exit_command(7), Duration::from_secs(2))
+            .expect("spawn");
         match result {
             LivenessResult::ExitedEarly { code } => {
                 assert_eq!(code, Some(7));
@@ -501,8 +530,8 @@ mod tests {
 
     #[test]
     fn surviving_child_reported_alive() {
-        let result =
-            spawn_and_require_liveness(sleep_command(30), Duration::from_millis(400)).expect("spawn");
+        let result = spawn_and_require_liveness(sleep_command(30), Duration::from_millis(400))
+            .expect("spawn");
         match result {
             LivenessResult::Survived { mut child } => {
                 terminate_tree(&mut child);

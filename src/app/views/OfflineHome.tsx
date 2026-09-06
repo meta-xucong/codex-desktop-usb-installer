@@ -52,12 +52,31 @@ function selectionFromStage(stage: OfflineStageReport): HistoricalInstallSelecti
 }
 
 function expectedFromStatus(status: WinInstallStatus | null) {
-  const installed = status?.status === "managed" ? status.installed : null;
+  // The USB installer can migrate an existing external MSIX registration to
+  // the guarded portable program tree. Preserve the fresh snapshot for the backend's
+  // TOCTOU check instead of turning an external package into an artificial
+  // "nothing installed" expectation.
+  const installed = status?.installed ?? null;
   return {
     currentPath: installed?.path ?? null,
     currentVersion: installed?.version ?? null,
     currentSource: installed?.source ?? null,
   };
+}
+
+function canMigrateExternalMsix(status: WinInstallStatus | null): boolean {
+  return status?.status === "external" && status.installed?.source === "msix";
+}
+
+function programIsOnCurrentUsb(
+  status: WinInstallStatus | null,
+  guard: UsbGuardStatus | null,
+): boolean {
+  const installPath = status?.installed?.path;
+  const bundlePath = guard?.bundlePath;
+  if (!installPath || !bundlePath || status?.installed?.source !== "portable") return false;
+  const normalize = (value: string) => value.replace(/\//g, "\\").replace(/[\\]+$/, "").toLowerCase();
+  return normalize(installPath) === `${normalize(bundlePath)}\\apps\\codex`;
 }
 
 function usbGuardLabel(status: string, t: TFn): string {
@@ -74,9 +93,9 @@ function usbGuardLabel(status: string, t: TFn): string {
 }
 
 /**
- * Minimal V1 Windows screen.  It intentionally has no remote catalog or
- * update state machine: the only source is the fixed payload beside the
- * executable, while the existing guarded MSIX install command remains the
+ * Minimal USB portable Windows screen. It intentionally has no remote
+ * catalog or update state machine: the only source is the fixed payload beside
+ * the executable, while the guarded USB portable install command remains the
  * single mutation path.
  */
 export function OfflineHome({
@@ -93,6 +112,7 @@ export function OfflineHome({
   const [usbGuard, setUsbGuard] = useState<UsbGuardStatus | null>(null);
   const [failure, setFailure] = useState<FailureSurface | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [installationDetail, setInstallationDetail] = useState<string | null>(null);
   const [busyAction, setBusyAction] = useState<
     "install" | "launch" | "ccswitch" | "logs" | "adopt" | null
   >(null);
@@ -101,6 +121,7 @@ export function OfflineHome({
     setPhase("loading");
     setFailure(null);
     setNotice(null);
+    setInstallationDetail(null);
     try {
       const [nextPayload, nextStatus, nextUsbGuard] = await Promise.all([
         managerApi.offlinePayloadProbe(),
@@ -110,7 +131,12 @@ export function OfflineHome({
       setPayload(nextPayload);
       setStatus(nextStatus);
       setUsbGuard(nextUsbGuard);
-      if (nextStatus.status === "external") {
+      const migratableExternalMsix = canMigrateExternalMsix(nextStatus);
+      if (nextStatus.recoveryPending) {
+        setNotice(t("offline.recoveryPending"));
+      } else if (migratableExternalMsix) {
+        setNotice(t("offline.externalMsix"));
+      } else if (nextStatus.status === "external") {
         setNotice(t("offline.external"));
       } else if (
         nextStatus.installed &&
@@ -119,10 +145,16 @@ export function OfflineHome({
         setNotice(t("offline.newerVersion"));
       }
       const installed = nextStatus.installed;
+      const sameVersion = Boolean(
+        installed &&
+          compareVersions(installed.version, nextPayload.codexDesktopVersion) === 0,
+      );
       if (
         installed &&
         nextStatus.status === "managed" &&
-        compareVersions(installed.version, nextPayload.codexDesktopVersion) === 0
+        !nextStatus.recoveryPending &&
+        sameVersion &&
+        programIsOnCurrentUsb(nextStatus, nextUsbGuard)
       ) {
         setPhase("installed");
       } else {
@@ -174,30 +206,40 @@ export function OfflineHome({
     setPhase("staging");
     setFailure(null);
     setNotice(null);
+    setInstallationDetail(null);
     let stage: OfflineStageReport | null = null;
+    let pendingRecovery = false;
     try {
       stage = await managerApi.offlinePayloadStage();
       setPhase("installing");
       const current = await managerApi.winStatus();
-      if (current.status === "external") {
+      if (current.status === "external" && !canMigrateExternalMsix(current)) {
         throw new Error(t("offline.external"));
       }
       const result = await managerApi.winInstallHistoricalRelease(
         selectionFromStage(stage),
-        // Keep the shipped desktop build fixed for V1.  This only disables
-        // Codex's own background self-update flag; it does not patch binaries
-        // or block the network needed later for sign-in/model requests.
+        // Keep the shipped desktop build fixed for the USB edition. The backend
+        // extracts the verified program tree below this bundle while the normal
+        // user profile on the local system keeps mutable data.
         true,
         expectedFromStatus(current),
         undefined,
         undefined,
         true,
+        true,
       );
       if (!result.success) {
         throw new Error(result.message || t("error.install"));
       }
-      await managerApi.offlinePayloadCleanup(stage.stagedPath).catch(() => undefined);
+      // Preserve the recovery/backup locations even when the subsequent
+      // configurator succeeds. A CCSwitch notice must not hide this evidence.
+      setInstallationDetail(result.message);
       const installed = await managerApi.winStatus();
+      if (installed.recoveryPending) {
+        pendingRecovery = true;
+        setStatus(installed);
+        throw new Error(t("offline.recoveryPending"));
+      }
       if (
         installed.status !== "managed" ||
         !installed.installed ||
@@ -205,6 +247,16 @@ export function OfflineHome({
       ) {
         throw new Error(t("offline.verifyAfterInstall"));
       }
+      const verifiedUsbGuard = await managerApi.usbGuardStatus().catch(() => usbGuard);
+      if (!programIsOnCurrentUsb(installed, verifiedUsbGuard)) {
+        const installPath = installed.installed.path || "未知";
+        const bundlePath = verifiedUsbGuard?.bundlePath || "未知";
+        throw new Error(`无法确认 Codex 程序位于当前 U 盘套件（程序 ${installPath}，套件 ${bundlePath}），已保留暂存文件，请查看日志后重试`);
+      }
+      setUsbGuard(verifiedUsbGuard);
+      // Keep diagnostic staging until all installed-state/placement checks
+      // pass. A verification failure must not claim a deleted file was kept.
+      await managerApi.offlinePayloadCleanup(stage.stagedPath).catch(() => undefined);
       // Codex is now confirmed on disk.  Hand off to the bundled CCSwitch
       // configurator; a missing/failed configurator must not turn a successful
       // Codex installation into a failure, so it is shown as a notice instead.
@@ -228,13 +280,15 @@ export function OfflineHome({
     } catch (cause) {
       setPhase("ready");
       setFailure(resolveFailure(cause, t));
-      if (stage) {
+      if (pendingRecovery) {
+        setNotice(t("offline.recoveryPending"));
+      } else if (stage) {
         setNotice("暂存文件已保留，便于查看日志和重试。");
       }
     } finally {
       setBusyAction(null);
     }
-  }, [busyAction, newerInstalled, payload, t]);
+  }, [busyAction, newerInstalled, payload, t, usbGuard]);
 
   const launchCcswitch = useCallback(async () => {
     if (busyAction) return;
@@ -313,6 +367,14 @@ export function OfflineHome({
       <div className="scroll">
         {failure ? <FailureBanner failure={failure} /> : null}
         {notice ? <StatusBanner tone="info">{notice}</StatusBanner> : null}
+        {installationDetail ? (
+          <StatusBanner tone="info">
+            <details>
+              <summary>{t("offline.installDetails")}</summary>
+              <div style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{installationDetail}</div>
+            </details>
+          </StatusBanner>
+        ) : null}
         {usbGuard ? (
           <section
             className={`usb-guard-status usb-guard-${usbGuard.status}`}
@@ -343,7 +405,7 @@ export function OfflineHome({
           ) : phase === "error" ? (
             <>
               <Ring icon="alert" variant="danger" />
-              <div className="headline">{t("offline.noPackage")}</div>
+              <div className="headline">{t("offline.checkFailed")}</div>
             </>
           ) : phase === "installed" ? (
             <>
@@ -351,7 +413,7 @@ export function OfflineHome({
               <div className="headline">{t("offline.installed")}</div>
               <div className="microcue"><Icon name="shield" />{t("offline.hashVerified")}</div>
             </>
-          ) : status?.status === "external" ? (
+          ) : status?.status === "external" && !canMigrateExternalMsix(status) ? (
             <>
               <Ring icon="shield" variant="amber" />
               <div className="headline">{t("home.external.title")}</div>
@@ -414,13 +476,17 @@ export function OfflineHome({
                 {busyAction === "ccswitch" ? t("offline.ccswitchLaunching") : t("offline.ccswitchLaunch")}
               </button>
               <button className="btn ghost" onClick={() => void load()} disabled={disabled}><Icon name="refresh" />{t("offline.recheck")}</button>
+              <button className="btn ghost" onClick={() => void install()} disabled={disabled}>
+                <Icon name="refresh" />{t("offline.repair")}
+              </button>
+              <div className="desc">{t("offline.repairHint")}</div>
               {onOpenUninstall ? (
                 <button className="btn ghost danger" onClick={onOpenUninstall} disabled={disabled}>
                   <Icon name="trash" />{t("offline.uninstallBundle")}
                 </button>
               ) : null}
             </>
-          ) : status?.status === "external" ? (
+          ) : status?.status === "external" && !canMigrateExternalMsix(status) ? (
             <>
               <button className="btn primary big" onClick={() => void adopt()} disabled={disabled}>
                 {busyAction === "adopt" ? <Icon name="loader" className="spinicon" /> : <Icon name="shield" />}
@@ -432,11 +498,16 @@ export function OfflineHome({
             <>
               <button className="btn primary big" onClick={() => void install()} disabled={disabled || newerInstalled}>
                 {busyAction === "install" ? <Icon name="loader" className="spinicon" /> : <Icon name="download" />}
-                {busyAction === "install" ? t("offline.installing") : t("offline.install")}
+                {busyAction === "install" ? t("offline.installing") : status?.recoveryPending ? t("offline.resumeInstall") : t("offline.install")}
               </button>
               <button className="btn ghost" onClick={() => void load()} disabled={disabled}><Icon name="refresh" />{t("offline.recheck")}</button>
             </>
           )}
+          {phase !== "installed" && onOpenUninstall ? (
+            <button className="btn ghost danger" onClick={onOpenUninstall} disabled={disabled}>
+              <Icon name="trash" />{t("offline.uninstallBundle")}
+            </button>
+          ) : null}
           <button className="btn ghost" onClick={() => void openLogs()} disabled={disabled}>
             {busyAction === "logs" ? <Icon name="loader" className="spinicon" /> : <Icon name="folder" />}
             {t("offline.openLogs")}
@@ -446,6 +517,12 @@ export function OfflineHome({
         {installed ? (
           <div className="foot">
             {installed.path}
+            {installed.packageVolume ? (
+              <>
+                <span>·</span>
+                <span title="AppX package volume">AppX {installed.packageVolume}</span>
+              </>
+            ) : null}
             <span>·</span>
             <button className="gobtn" onClick={onOpenSettings}>{t("nav.settings")}</button>
           </div>

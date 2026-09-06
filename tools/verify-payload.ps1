@@ -1,10 +1,18 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
-    [string]$BundlePath = (Join-Path $PSScriptRoot "..\release\usb"),
+    [string]$BundlePath = "",
     [switch]$SkipSignature
 )
 
 $ErrorActionPreference = "Stop"
+if ([string]::IsNullOrWhiteSpace($BundlePath)) {
+    $repoCandidate = Join-Path $PSScriptRoot "..\release\usb"
+    $BundlePath = if (Test-Path -LiteralPath $repoCandidate -PathType Container) {
+        $repoCandidate
+    } else {
+        $PSScriptRoot
+    }
+}
 
 function Read-MsixManifest {
     param([string]$Path)
@@ -22,7 +30,8 @@ function Read-MsixManifest {
 $root = (Resolve-Path -LiteralPath $BundlePath).Path
 $manifestPath = Join-Path $root "manifest.json"
 if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { throw "未找到 $manifestPath" }
-$manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+$utf8 = [System.Text.UTF8Encoding]::new($false, $true)
+$manifest = [System.IO.File]::ReadAllText($manifestPath, $utf8) | ConvertFrom-Json
 if ($manifest.packageName -ne "OpenAI.Codex") { throw "manifest.packageName 必须为 OpenAI.Codex" }
 if ($manifest.architecture -notin @("x64", "arm64")) { throw "manifest.architecture 无效" }
 

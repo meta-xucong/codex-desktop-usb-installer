@@ -246,6 +246,7 @@ describe("Windows perform API", () => {
       token: "bundle-uninstall-token",
       purgeUserData: false,
       purgeCcswitchData: false,
+      removeUsbMedia: false,
     });
   });
 
@@ -280,7 +281,7 @@ describe("Windows perform API", () => {
     });
   });
 
-  it("marks the offline install as MSIX-only without changing normal callers", async () => {
+  it("marks the offline install as USB AppXVolume-only without changing normal callers", async () => {
     window.__TAURI_INTERNALS__ = {};
     invokeMock.mockResolvedValue({ success: true });
 
@@ -300,6 +301,7 @@ describe("Windows perform API", () => {
       "offline-token",
       undefined,
       true,
+      true,
     );
 
     expect(invokeMock).toHaveBeenCalledWith("win_install_historical_release", {
@@ -313,6 +315,7 @@ describe("Windows perform API", () => {
       installRoot: undefined,
       expected: { currentPath: null, currentVersion: null, currentSource: null },
       forceMsix: true,
+      installToUsb: true,
     });
   });
 });

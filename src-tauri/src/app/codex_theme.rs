@@ -1578,14 +1578,34 @@ fn launch_codex_with_cdp(
         "launching Windows Codex with CDP port={port} path={}",
         installed.display()
     );
-    codex_win_engine::launch_codex_with_options(
+    let usb_mode = crate::app::usb_guard::guard_required();
+    let launch_policy = if usb_mode {
+        if crate::app::win_update::usb_no_sandbox_compatibility_known(&detected.version) {
+            codex_win_engine::PortableLaunchPolicy::UsbCompatibleNoSandbox
+        } else {
+            codex_win_engine::PortableLaunchPolicy::UsbCompatible
+        }
+    } else {
+        codex_win_engine::PortableLaunchPolicy::Standard
+    };
+    let report = codex_win_engine::launch_codex_with_options(
         &detected,
         codex_win_engine::LaunchOptions {
-            disable_codex_self_updates: disable_self_updates,
+            disable_codex_self_updates: disable_self_updates || usb_mode,
             remote_debugging_port: Some(port),
+            codex_home: if usb_mode {
+                Some(crate::app::usb_guard::local_data_paths()?.codex_home)
+            } else {
+                None
+            },
+            portable_launch_policy: launch_policy,
         },
     )
-    .map_err(|e| AppError::Engine(format!("以调试模式打开 Codex 失败: {e}")))
+    .map_err(|e| AppError::Engine(format!("以调试模式打开 Codex 失败: {e}")))?;
+    if usb_mode && report.no_sandbox {
+        crate::app::win_update::remember_usb_no_sandbox_compatibility(&detected.version);
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]

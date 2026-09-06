@@ -16,9 +16,10 @@
 //! ever written to the USB or local guard directory.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD as B64;
@@ -34,6 +35,9 @@ use crate::errors::AppError;
 pub const GUARD_ARG: &str = "--codex-usb-guard";
 pub const GUARD_EXE_NAME: &str = "CodexUsbGuard.exe";
 pub const GUARD_DIR_NAME: &str = "CodexUsbGuard";
+pub const USB_APPS_DIR_NAME: &str = "apps";
+pub const USB_CODEX_DIR_NAME: &str = "Codex";
+pub const USB_CONTENT_DIR_NAME: &str = "content";
 pub const LICENSE_FILE_NAME: &str = "usb-license.json";
 pub const LEASE_FILE_NAME: &str = "lease.json";
 pub const STATUS_FILE_NAME: &str = "status.json";
@@ -44,6 +48,14 @@ pub const DISCONNECT_GRACE_MS: u64 = 5_000;
 const LICENSE_SCHEMA_VERSION: u32 = 1;
 const LEASE_SCHEMA_VERSION: u32 = 1;
 const STATUS_SCHEMA_VERSION: u32 = 1;
+static SUPPRESS_STATUS_AFTER_UNINSTALL: AtomicBool = AtomicBool::new(false);
+
+/// Called only after the detached cleanup hand-off is accepted. Normal exit
+/// callbacks must not recreate the very directory that the helper removes.
+pub fn suppress_status_for_uninstall() {
+    SUPPRESS_STATUS_AFTER_UNINSTALL.store(true, Ordering::SeqCst);
+    remove_lease();
+}
 
 /// Public fingerprint fields are deliberately small and stable.  A drive
 /// letter is not part of the identity, so a Windows letter reassignment does
@@ -129,6 +141,16 @@ pub struct UsbObservation {
     pub fingerprint: Option<UsbFingerprint>,
 }
 
+/// Local data paths used by the USB portable edition. Program and managed
+/// content live on the removable bundle; account, session, cache and Electron
+/// profile data remain in the user's ordinary Windows profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsbLocalDataPaths {
+    pub codex_home: PathBuf,
+    pub roaming_app_data: PathBuf,
+    pub local_app_data: PathBuf,
+}
+
 fn engine(message: impl Into<String>) -> AppError {
     AppError::Engine(format!("USB 看门狗：{}", message.into()))
 }
@@ -146,18 +168,95 @@ pub fn now_ms() -> u64 {
 /// a removable volume.
 pub fn normalize_drive_root(input: &str) -> Option<String> {
     let raw = input.trim().replace('/', "\\");
+    // `std::fs::canonicalize` returns verbatim DOS paths on Windows. Treat
+    // `\\?\C:\...` / `\\.\C:\...` as the same local volume, while still
+    // rejecting verbatim UNC and volume-GUID namespaces.
+    let raw = raw
+        .strip_prefix(r"\\?\")
+        .or_else(|| raw.strip_prefix(r"\\.\"))
+        .unwrap_or(&raw);
     let bytes = raw.as_bytes();
-    if bytes.len() < 2 || bytes[1] != b':' || !bytes[0].is_ascii_alphabetic() {
+    if bytes.len() < 3 || bytes[1] != b':' || bytes[2] != b'\\' || !bytes[0].is_ascii_alphabetic() {
         return None;
     }
     Some(format!("{}:\\", (bytes[0] as char).to_ascii_uppercase()))
+}
+
+/// Normalize an absolute local DOS path without using its text representation
+/// as an authorization identity.  Existing paths are canonicalized by the
+/// caller first; this final lexical pass removes verbatim prefixes, repeated
+/// separators and `.` while rejecting drive-relative paths and `..` escapes.
+fn normalize_bundle_path(input: &str) -> Option<String> {
+    let raw = input.trim().replace('/', "\\");
+    let raw = raw
+        .strip_prefix(r"\\?\")
+        .or_else(|| raw.strip_prefix(r"\\.\"))
+        .unwrap_or(&raw);
+    let root = normalize_drive_root(raw)?;
+    let mut parts = Vec::new();
+    for part in raw[3..].split('\\') {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if part == ".." || part.contains(':') || part.contains('\0') {
+            return None;
+        }
+        parts.push(part);
+    }
+    if parts.is_empty() {
+        Some(root)
+    } else {
+        Some(format!("{root}{}", parts.join("\\")))
+    }
+}
+
+/// Build the bundle path found on a scanned drive from validated components.
+/// `drive_root` already owns the one separator after `X:`; the relative path
+/// must never add another one by raw string concatenation.
+fn bundle_path_on_drive(drive_root: &str, relative: &str) -> Option<String> {
+    let root = normalize_drive_root(drive_root)?;
+    let candidate = format!("{root}{}", relative.replace('/', "\\"));
+    normalize_bundle_path(&candidate)
+}
+
+fn observed_drive_root(path: &Path) -> Result<String, AppError> {
+    // The final leaf (notably `~/.codex`) may not exist on a clean machine.
+    // Resolve the nearest existing ancestor so a redirected/junction-backed
+    // profile cannot masquerade as a C: path while physically landing on USB.
+    let mut candidate = Some(path);
+    while let Some(current) = candidate {
+        match fs::canonicalize(current) {
+            Ok(resolved) => {
+                return normalize_drive_root(&resolved.to_string_lossy()).ok_or_else(|| {
+                    engine(format!(
+                        "本机数据目录解析后不是本地 Windows 盘路径：{} -> {}",
+                        path.display(),
+                        resolved.display()
+                    ))
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                candidate = current.parent();
+            }
+            Err(error) => {
+                return Err(engine(format!(
+                    "无法核验本机数据目录的真实位置 {}：{error}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Err(engine(format!(
+        "本机数据目录没有可核验的现有父目录：{}",
+        path.display()
+    )))
 }
 
 /// Return a lower-case, slash-separated path below a volume root.  It is
 /// intentionally independent of the host OS so the identity remains stable
 /// in tests running on Linux/macOS.
 pub fn bundle_relative_path(bundle_path: &str, drive_root: &str) -> Option<String> {
-    let path = bundle_path.trim().replace('/', "\\");
+    let path = normalize_bundle_path(bundle_path)?;
     let root = normalize_drive_root(drive_root)?;
     let path_lower = path.to_ascii_lowercase();
     let root_lower = root.to_ascii_lowercase();
@@ -183,6 +282,49 @@ pub fn fingerprints_match(expected: &UsbFingerprint, actual: &UsbFingerprint) ->
         && expected
             .bundle_relative_path
             .eq_ignore_ascii_case(&actual.bundle_relative_path)
+}
+
+fn fingerprint_excerpt(value: &str) -> String {
+    value.chars().take(12).collect()
+}
+
+/// Validate the current physical observation against the manager-owned lease.
+/// Full paths are deliberately diagnostic-only: Windows can represent one
+/// object as `D:\foo`, `D:\\foo`, `\\?\D:\foo`, different case, or an 8.3
+/// spelling.  The stable volume serial + bundle-relative path + anchor digest
+/// is the authorization identity.
+fn validate_lease_observation(
+    lease: &UsbLease,
+    observation: &UsbObservation,
+    owner_pid: u32,
+) -> Result<(), AppError> {
+    if lease.schema_version != LEASE_SCHEMA_VERSION || lease.product != PRODUCT_ID {
+        return Err(engine("U 盘租约版本或产品标识不匹配"));
+    }
+    if lease.owner_pid != owner_pid {
+        return Err(engine(format!(
+            "U 盘租约不属于当前安装器进程（leasePid={} currentPid={owner_pid}）",
+            lease.owner_pid
+        )));
+    }
+    let actual = observation
+        .fingerprint
+        .as_ref()
+        .ok_or_else(|| engine("当前安装器目录不在可移动 U 盘上"))?;
+    if !fingerprints_match(&lease.fingerprint, actual) {
+        return Err(engine(format!(
+            "当前安装器与租约的 U 盘指纹不一致（currentPath={} leasePath={} currentSerial={} leaseSerial={} currentRelative={} leaseRelative={} currentAnchor={} leaseAnchor={}）",
+            observation.bundle_path,
+            lease.bundle_path,
+            actual.volume_serial,
+            lease.fingerprint.volume_serial,
+            actual.bundle_relative_path,
+            lease.fingerprint.bundle_relative_path,
+            fingerprint_excerpt(&actual.anchor_sha256),
+            fingerprint_excerpt(&lease.fingerprint.anchor_sha256),
+        )));
+    }
+    Ok(())
 }
 
 /// Pure disconnect state transition used by the helper and unit-tested without
@@ -349,6 +491,37 @@ fn bundle_root_for_executable(executable: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Return the exact fixed-bundle directory containing the running manager.
+/// No renderer-supplied path participates in this decision.
+pub fn current_bundle_root() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        return std::env::current_exe()
+            .ok()
+            .and_then(|path| bundle_root_for_executable(&path));
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        None
+    }
+}
+
+pub fn usb_codex_root(bundle_root: &Path) -> PathBuf {
+    bundle_root.join(USB_APPS_DIR_NAME).join(USB_CODEX_DIR_NAME)
+}
+
+pub fn usb_content_root(bundle_root: &Path) -> PathBuf {
+    bundle_root.join(USB_CONTENT_DIR_NAME)
+}
+
+pub fn current_usb_codex_root() -> Option<PathBuf> {
+    current_bundle_root().map(|root| usb_codex_root(&root))
+}
+
+pub fn current_usb_content_root() -> Option<PathBuf> {
+    current_bundle_root().map(|root| usb_content_root(&root))
+}
+
 fn license_path(bundle_root: &Path) -> PathBuf {
     bundle_root.join(LICENSE_FILE_NAME)
 }
@@ -381,7 +554,9 @@ fn local_guard_dir() -> Result<PathBuf, AppError> {
 }
 
 fn guard_path(name: &str) -> Result<PathBuf, AppError> {
-    Ok(local_guard_dir()?.join(name))
+    let path = local_guard_dir()?.join(name);
+    codex_win_engine::validate_cleanup_path(&path).map_err(|error| engine(error.to_string()))?;
+    Ok(path)
 }
 
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), AppError> {
@@ -473,6 +648,199 @@ pub fn guard_required() -> bool {
     }
 }
 
+/// Return the observed physical drive root containing the running USB bundle.
+/// It is derived from the current executable and canonicalized through the
+/// same observation path as the lease, never from renderer-supplied text.
+pub fn current_bundle_volume_root() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        let bundle_root = current_bundle_root()?;
+        let observation = observe_bundle(&bundle_root).ok()?;
+        let root = observation.drive_root?;
+        return Some(PathBuf::from(root));
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        None
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn path_has_reparse_point(path: &Path) -> Result<bool, AppError> {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(engine(format!(
+            "读取 U 盘程序目录属性失败 {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn path_has_reparse_point(_path: &Path) -> Result<bool, AppError> {
+    Ok(false)
+}
+
+/// Re-observe and authorize the exact physical bundle owned by this manager
+/// session.  Callers that hand work to a detached helper must persist this
+/// fingerprint; a renderer path or a drive letter is not an authorization
+/// token.
+pub fn authorized_bundle_identity() -> Result<(PathBuf, UsbFingerprint), AppError> {
+    require_authorized()?;
+    let bundle_candidate =
+        current_bundle_root().ok_or_else(|| engine("无法确定当前 U 盘套件目录"))?;
+    // Re-observe the running bundle at the mutating boundary.  Do not trust
+    // `status.json`'s renderer-oriented path snapshot: the watchdog may have
+    // rediscovered the same volume using another valid Windows path spelling.
+    let observation = observe_bundle(&bundle_candidate)?;
+    let lease = read_lease().ok_or_else(|| engine("当前没有有效的 U 盘租约"))?;
+    validate_lease_observation(&lease, &observation, std::process::id())?;
+    let current_fingerprint = observation
+        .fingerprint
+        .as_ref()
+        .ok_or_else(|| engine("当前安装器目录不在可移动 U 盘上"))?;
+    let bundle = PathBuf::from(&observation.bundle_path);
+    let license = read_license(&bundle)?.ok_or_else(|| engine("当前 U 盘缺少许可证"))?;
+    validate_license(&license, current_fingerprint)?;
+    if !fingerprints_match(&license.fingerprint, &lease.fingerprint) {
+        return Err(engine(format!(
+            "当前许可证与本会话租约不一致（currentPath={} leasePath={}）",
+            observation.bundle_path, lease.bundle_path
+        )));
+    }
+    log::debug!(
+        "USB install destination authorized by fingerprint current_path={} lease_path={} serial={} relative={} anchor={}",
+        observation.bundle_path,
+        lease.bundle_path,
+        current_fingerprint.volume_serial,
+        current_fingerprint.bundle_relative_path,
+        fingerprint_excerpt(&current_fingerprint.anchor_sha256)
+    );
+    Ok((bundle, current_fingerprint.clone()))
+}
+
+/// Resolve and authorize the only install destination permitted to the fixed
+/// USB product. Existing `apps`/`Codex` reparse points are rejected so a copied
+/// or tampered bundle cannot redirect the payload onto C: or another volume.
+pub fn authorized_usb_codex_root() -> Result<PathBuf, AppError> {
+    let (bundle, _) = authorized_bundle_identity()?;
+    let apps = bundle.join(USB_APPS_DIR_NAME);
+    let codex = usb_codex_root(&bundle);
+    for candidate in [&apps, &codex] {
+        if path_has_reparse_point(candidate)? {
+            return Err(engine(format!(
+                "U 盘程序目录不能是 Junction/符号链接：{}",
+                candidate.display()
+            )));
+        }
+    }
+    Ok(codex)
+}
+
+fn required_profile_path(name: &str) -> Result<PathBuf, AppError> {
+    let value = std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| engine(format!("Windows 用户环境缺少 {name}")))?;
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return Err(engine(format!("Windows 用户环境 {name} 不是绝对路径")));
+    }
+    Ok(path)
+}
+
+/// Validate that all mutable Codex state stays outside the removable product
+/// volume. This is an observed boundary, not an AppX policy assumption.
+pub fn local_data_paths() -> Result<UsbLocalDataPaths, AppError> {
+    let user_profile = required_profile_path("USERPROFILE")?;
+    let roaming_app_data = required_profile_path("APPDATA")?;
+    let local_app_data = required_profile_path("LOCALAPPDATA")?;
+    let codex_home = user_profile.join(".codex");
+    let usb_root = current_bundle_volume_root()
+        .and_then(|root| normalize_drive_root(&root.to_string_lossy()))
+        .ok_or_else(|| engine("无法确定当前 U 盘卷，不能核验本地数据边界"))?;
+    for (label, path) in [
+        ("CODEX_HOME", &codex_home),
+        ("APPDATA", &roaming_app_data),
+        ("LOCALAPPDATA", &local_app_data),
+    ] {
+        let declared_root = normalize_drive_root(&path.to_string_lossy()).ok_or_else(|| {
+            engine(format!(
+                "{label} 不是本地 Windows 盘路径：{}",
+                path.display()
+            ))
+        })?;
+        let observed_root = observed_drive_root(path)?;
+        if declared_root.eq_ignore_ascii_case(&usb_root)
+            || observed_root.eq_ignore_ascii_case(&usb_root)
+        {
+            return Err(engine(format!(
+                "{label} 当前声明或解析后指向产品 U 盘（{}，实际卷 {}），无法保证程序/数据分离",
+                path.display(),
+                observed_root
+            )));
+        }
+    }
+    Ok(UsbLocalDataPaths {
+        codex_home,
+        roaming_app_data,
+        local_app_data,
+    })
+}
+
+/// Re-check the physical USB identity at a privileged-operation boundary.
+///
+/// `require_authorized()` is intentionally a cheap status-file check for the
+/// command boundary.  A UAC prompt can remain open long enough for a user to
+/// remove the drive, reassign its letter, or insert another removable disk.
+/// Before a machine-level AppX-volume write we therefore resolve the current
+/// lease fingerprint against the live removable volumes again and require the
+/// requested root to be the same physical volume.  This keeps an elevated
+/// helper from registering a different disk that happens to reuse the old
+/// drive letter.
+#[cfg(target_os = "windows")]
+pub fn verify_authorized_volume_root(volume_root: &Path) -> Result<(), AppError> {
+    let expected_root = normalize_drive_root(&volume_root.to_string_lossy())
+        .ok_or_else(|| engine("AppX 目标卷不是本地盘根路径"))?;
+    let status = current_status();
+    if status.status != "authorized" || status.watchdog != "running" {
+        return Err(engine(format!(
+            "U 盘看门狗状态已变化（status={} watchdog={}），拒绝执行管理员卷操作",
+            status.status, status.watchdog
+        )));
+    }
+    let Some(lease) = read_lease() else {
+        return Err(engine("当前没有有效的 U 盘租约，拒绝执行管理员卷操作"));
+    };
+    if lease.schema_version != LEASE_SCHEMA_VERSION || lease.product != PRODUCT_ID {
+        return Err(engine("U 盘租约版本或产品标识不匹配，拒绝执行管理员卷操作"));
+    }
+    if lease.owner_pid != std::process::id() {
+        return Err(engine("U 盘租约不属于当前安装器进程，拒绝执行管理员卷操作"));
+    }
+    let Some(observation) = scan_removable_for(&lease.fingerprint) else {
+        return Err(engine("授权 U 盘在提权前未能重新验证，可能已拔出或被替换"));
+    };
+    let actual_root = observation
+        .drive_root
+        .as_deref()
+        .and_then(normalize_drive_root)
+        .ok_or_else(|| engine("无法确定已验证 U 盘的实际盘符"))?;
+    if actual_root != expected_root {
+        return Err(engine(format!(
+            "U 盘盘符在提权前发生变化（请求 {expected_root}，当前 {actual_root}），请重新启动安装器"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn verify_authorized_volume_root(_volume_root: &Path) -> Result<(), AppError> {
+    Err(AppError::UnsupportedPlatform)
+}
+
 pub fn require_authorized() -> Result<(), AppError> {
     if !guard_required() {
         return Ok(());
@@ -488,6 +856,9 @@ pub fn require_authorized() -> Result<(), AppError> {
 }
 
 pub fn write_status(status: &UsbGuardStatus) -> Result<(), AppError> {
+    if SUPPRESS_STATUS_AFTER_UNINSTALL.load(Ordering::SeqCst) {
+        return Ok(());
+    }
     write_json_atomic(&status_path()?, status)
 }
 
@@ -725,7 +1096,23 @@ fn observe_windows_bundle(bundle_root: &Path) -> Result<UsbObservation, AppError
     use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetVolumeInformationW};
     use windows_sys::Win32::System::WindowsProgramming::DRIVE_REMOVABLE;
 
-    let path = bundle_root.to_string_lossy().replace('/', "\\");
+    // `canonicalize` resolves 8.3 spellings and directory reparse points;
+    // `normalize_bundle_path` then converts the verbatim result (`\\?\D:\...`)
+    // to one stable DOS form for status/log output. Authorization itself still
+    // uses the fingerprint below, never this string.
+    let resolved = fs::canonicalize(bundle_root).map_err(|error| {
+        engine(format!(
+            "无法解析 U 盘套件真实路径 {}: {error}",
+            bundle_root.display()
+        ))
+    })?;
+    let path = normalize_bundle_path(&resolved.to_string_lossy()).ok_or_else(|| {
+        engine(format!(
+            "U 盘套件解析后不是本地 Windows 绝对路径: {}",
+            resolved.display()
+        ))
+    })?;
+    let normalized_bundle_root = PathBuf::from(&path);
     let drive_root = normalize_drive_root(&path)
         .ok_or_else(|| engine(format!("无法从路径识别 Windows 卷: {path}")))?;
     let root_wide = wide(&drive_root);
@@ -766,7 +1153,7 @@ fn observe_windows_bundle(bundle_root: &Path) -> Result<UsbObservation, AppError
         bundle_relative_path(&path, &drive_root).ok_or_else(|| engine("U 盘目录不在卷根路径下"))?;
     let fingerprint = UsbFingerprint {
         volume_serial: serial,
-        anchor_sha256: anchor_sha256(bundle_root)?,
+        anchor_sha256: anchor_sha256(&normalized_bundle_root)?,
         bundle_relative_path: relative,
     };
     Ok(UsbObservation {
@@ -790,12 +1177,7 @@ pub fn observe_bundle(bundle_root: &Path) -> Result<UsbObservation, AppError> {
 fn scan_removable_for(expected: &UsbFingerprint) -> Option<UsbObservation> {
     for letter in b'A'..=b'Z' {
         let root = format!("{}:\\", letter as char);
-        let relative = if expected.bundle_relative_path.is_empty() {
-            String::new()
-        } else {
-            format!("\\{}", expected.bundle_relative_path.replace('/', "\\"))
-        };
-        let candidate = PathBuf::from(format!("{root}{relative}"));
+        let candidate = PathBuf::from(bundle_path_on_drive(&root, &expected.bundle_relative_path)?);
         if let Ok(observation) = observe_windows_bundle(&candidate) {
             if observation
                 .fingerprint
@@ -814,23 +1196,114 @@ fn scan_removable_for(_expected: &UsbFingerprint) -> Option<UsbObservation> {
     None
 }
 
+fn file_sha256(path: &Path) -> Result<[u8; 32], AppError> {
+    let mut file = File::open(path)
+        .map_err(|error| engine(format!("读取看门狗程序失败 {}: {error}", path.display())))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| engine(format!("校验看门狗程序失败 {}: {error}", path.display())))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn guard_binary_is_current(source: &Path, target: &Path) -> Result<bool, AppError> {
+    if !target.is_file() {
+        return Ok(false);
+    }
+    let source_len = fs::metadata(source)
+        .map_err(|error| engine(format!("读取当前安装器信息失败: {error}")))?
+        .len();
+    let target_len = fs::metadata(target)
+        .map_err(|error| engine(format!("读取本地看门狗信息失败: {error}")))?
+        .len();
+    if source_len != target_len {
+        return Ok(false);
+    }
+    Ok(file_sha256(source)? == file_sha256(target)?)
+}
+
+#[cfg(target_os = "windows")]
+fn stop_previous_guard_for_refresh() -> Result<(), AppError> {
+    remove_lease();
+    let path = lock_path()?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let owner = fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok());
+        match owner {
+            Some(pid) if process_matches(pid, None) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(engine(format!(
+                        "旧版看门狗进程 {pid} 未在 5 秒内退出，无法安全刷新本地组件"
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            _ => {
+                if let Err(error) = fs::remove_file(&path) {
+                    if error.kind() != io::ErrorKind::NotFound {
+                        return Err(engine(format!("清理旧版看门狗锁失败: {error}")));
+                    }
+                }
+                return Ok(());
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn stop_previous_guard_for_refresh() -> Result<(), AppError> {
+    Ok(())
+}
+
 fn ensure_local_guard_binary(current_exe: &Path) -> Result<PathBuf, AppError> {
     let dir = local_guard_dir()?;
     fs::create_dir_all(&dir).map_err(|error| engine(format!("创建本地看门狗目录失败: {error}")))?;
     let target = dir.join(GUARD_EXE_NAME);
-    if target != current_exe && !target.exists() {
-        let temp = dir.join(format!("{GUARD_EXE_NAME}.tmp-{}", std::process::id()));
-        fs::copy(current_exe, &temp)
-            .map_err(|error| engine(format!("复制本地看门狗失败: {error}")))?;
-        if let Err(error) = fs::rename(&temp, &target) {
-            let _ = fs::remove_file(&temp);
-            return Err(engine(format!("安装本地看门狗失败: {error}")));
-        }
-    }
-    if target.exists() {
+    if codex_win_engine::same_windows_path(&target, current_exe) {
         return Ok(target);
     }
-    Err(engine("本地看门狗可执行文件不存在"))
+    if guard_binary_is_current(current_exe, &target)? {
+        return Ok(target);
+    }
+
+    // The helper is a local copy of the manager executable. Earlier builds
+    // only copied it when missing, so a machine could keep running stale lease
+    // and path-normalization code forever after the USB bundle was upgraded.
+    // Stop that exact old helper before replacing its image, then verify the
+    // new bytes before issuing a fresh lease.
+    stop_previous_guard_for_refresh()?;
+    let temp = dir.join(format!(
+        "{GUARD_EXE_NAME}.tmp-{}-{}",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    fs::copy(current_exe, &temp)
+        .map_err(|error| engine(format!("复制新版本地看门狗失败: {error}")))?;
+    if file_sha256(current_exe)? != file_sha256(&temp)? {
+        let _ = fs::remove_file(&temp);
+        return Err(engine("新版本地看门狗复制后校验不一致"));
+    }
+    if target.exists() {
+        fs::remove_file(&target)
+            .map_err(|error| engine(format!("替换旧版本地看门狗失败: {error}")))?;
+    }
+    if let Err(error) = fs::rename(&temp, &target) {
+        let _ = fs::remove_file(&temp);
+        return Err(engine(format!("安装新版本地看门狗失败: {error}")));
+    }
+    if !guard_binary_is_current(current_exe, &target)? {
+        return Err(engine("本地看门狗更新后的完整性校验失败"));
+    }
+    Ok(target)
 }
 
 #[cfg(target_os = "windows")]
@@ -869,8 +1342,9 @@ pub fn start_for_manager() -> Result<UsbGuardStatus, AppError> {
         write_status(&status)?;
         return Ok(status);
     };
+    let observed_bundle_root = PathBuf::from(&observation.bundle_path);
 
-    let existing_license = match read_license(&bundle_root) {
+    let existing_license = match read_license(&observed_bundle_root) {
         Ok(value) => value,
         Err(error) => {
             let mut status = base_status("mismatch", "not-running");
@@ -899,7 +1373,7 @@ pub fn start_for_manager() -> Result<UsbGuardStatus, AppError> {
         },
         None => {
             let license = new_unsigned_license(fingerprint.clone());
-            write_license(&bundle_root, &license)?;
+            write_license(&observed_bundle_root, &license)?;
             log::warn!(
                 "USB license auto-enrolled as unsigned; sign release bundles before shipping"
             );
@@ -922,8 +1396,11 @@ pub fn start_for_manager() -> Result<UsbGuardStatus, AppError> {
         }],
         issued_at: now_ms().to_string(),
     };
-    write_lease(&lease)?;
+    // Refresh the local helper before creating the new lease. A stale helper
+    // must never see and retain a newly-issued lease while we are trying to
+    // replace its executable.
     let local_binary = ensure_local_guard_binary(&executable)?;
+    write_lease(&lease)?;
     let lease_file = lease_path()?;
     let spawn_result = spawn_guard(&local_binary, &lease_file);
     let mut status = base_status(
@@ -970,6 +1447,10 @@ pub fn stop_and_uninstall() -> Vec<String> {
     stop_for_manager();
     let mut notes = Vec::new();
     if let Ok(dir) = local_guard_dir() {
+        if let Err(error) = codex_win_engine::validate_cleanup_path(&dir) {
+            notes.push(format!("本地 U 盘看门狗目录清理失败：{error}"));
+            return notes;
+        }
         // The helper may be between its one-second polling ticks after the
         // lease is removed.  Give it a few seconds to observe the clean stop
         // before declaring the local executable locked.
@@ -1028,7 +1509,8 @@ pub fn run_guard_cli() {
                 status.bundle_path = Some(observation.bundle_path);
                 status.bundle_relative_path = Some(lease.fingerprint.bundle_relative_path.clone());
                 status.signed = read_json::<UsbLicense>(
-                    &PathBuf::from(&lease.bundle_path).join(LICENSE_FILE_NAME),
+                    &PathBuf::from(status.bundle_path.as_deref().unwrap_or(&lease.bundle_path))
+                        .join(LICENSE_FILE_NAME),
                 )
                 .and_then(|license| license.signature)
                 .is_some();
@@ -1139,7 +1621,55 @@ mod tests {
             Some("F:\\".to_string())
         );
         assert_eq!(normalize_drive_root("\\\\server\\share"), None);
+        assert_eq!(
+            normalize_drive_root(r"\\?\c:\Users\someone\.codex"),
+            Some("C:\\".to_string())
+        );
+        assert_eq!(
+            normalize_drive_root(r"\\.\D:\portable\Codex"),
+            Some("D:\\".to_string())
+        );
+        assert_eq!(normalize_drive_root(r"\\?\UNC\server\share"), None);
+        assert_eq!(
+            normalize_drive_root(r"\\?\Volume{11111111-1111-1111-1111-111111111111}\"),
+            None
+        );
         assert_eq!(normalize_drive_root("relative\\setup.exe"), None);
+        assert_eq!(normalize_drive_root("D:relative\\setup.exe"), None);
+    }
+
+    #[test]
+    fn normalizes_equivalent_bundle_path_spellings() {
+        let expected = r"D:\usb-oneclick\payload";
+        assert_eq!(normalize_bundle_path(expected).as_deref(), Some(expected));
+        assert_eq!(
+            normalize_bundle_path(r"d:\\usb-oneclick\.\payload\").as_deref(),
+            Some(r"D:\usb-oneclick\payload")
+        );
+        assert_eq!(
+            normalize_bundle_path(r"\\?\D:\usb-oneclick\payload").as_deref(),
+            Some(expected)
+        );
+        assert_eq!(
+            normalize_bundle_path(r"\\.\d:\usb-oneclick\payload").as_deref(),
+            Some(expected)
+        );
+        assert_eq!(normalize_bundle_path(r"D:\usb\..\other"), None);
+        assert_eq!(normalize_bundle_path(r"D:usb-oneclick"), None);
+        assert_eq!(normalize_bundle_path(r"\\server\share\bundle"), None);
+    }
+
+    #[test]
+    fn scanned_bundle_path_has_exactly_one_root_separator() {
+        assert_eq!(
+            bundle_path_on_drive(r"D:\", "usb-oneclick-v0.5.20-final").as_deref(),
+            Some(r"D:\usb-oneclick-v0.5.20-final")
+        );
+        assert_eq!(
+            bundle_path_on_drive(r"d:\", r"\usb-oneclick\payload").as_deref(),
+            Some(r"D:\usb-oneclick\payload")
+        );
+        assert_eq!(bundle_path_on_drive(r"D:\", r"usb\..\other"), None);
     }
 
     #[test]
@@ -1170,6 +1700,47 @@ mod tests {
         };
         assert!(fingerprints_match(&expected, &same));
         assert!(!fingerprints_match(&expected, &copied));
+    }
+
+    #[test]
+    fn lease_authorization_uses_fingerprint_not_full_path_text() {
+        let fingerprint = UsbFingerprint {
+            volume_serial: 42,
+            anchor_sha256: "a".repeat(64),
+            bundle_relative_path: "usb-oneclick-v0.5.20-final".to_string(),
+        };
+        let lease = UsbLease {
+            schema_version: LEASE_SCHEMA_VERSION,
+            product: PRODUCT_ID.to_string(),
+            lease_id: "lease".to_string(),
+            bundle_path: r"D:\usb-oneclick-v0.5.20-final".to_string(),
+            fingerprint: fingerprint.clone(),
+            owner_pid: 77,
+            managed_processes: Vec::new(),
+            issued_at: "now".to_string(),
+        };
+        let same_object_different_text = UsbObservation {
+            removable: true,
+            drive_root: Some(r"D:\".to_string()),
+            bundle_path: r"D:\\usb-oneclick-v0.5.20-final".to_string(),
+            fingerprint: Some(UsbFingerprint {
+                anchor_sha256: fingerprint.anchor_sha256.to_uppercase(),
+                ..fingerprint.clone()
+            }),
+        };
+        assert!(validate_lease_observation(&lease, &same_object_different_text, 77).is_ok());
+
+        let mut wrong_folder = same_object_different_text.clone();
+        wrong_folder
+            .fingerprint
+            .as_mut()
+            .unwrap()
+            .bundle_relative_path = "copied-folder".to_string();
+        let error = validate_lease_observation(&lease, &wrong_folder, 77).unwrap_err();
+        let detail = error.to_string();
+        assert!(detail.contains("currentRelative=copied-folder"));
+        assert!(detail.contains("leaseRelative=usb-oneclick-v0.5.20-final"));
+        assert!(validate_lease_observation(&lease, &same_object_different_text, 78).is_err());
     }
 
     #[test]
@@ -1211,5 +1782,21 @@ mod tests {
             Some("codexswitch.exe".to_string())
         );
         assert!(executable_name("Codex.exe").is_some());
+    }
+
+    #[test]
+    fn local_guard_refresh_compares_content_not_presence() {
+        let root =
+            std::env::temp_dir().join(format!("codex-usb-guard-refresh-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.exe");
+        let target = root.join("target.exe");
+        fs::write(&source, b"new-manager-binary").unwrap();
+        assert!(!guard_binary_is_current(&source, &target).unwrap());
+        fs::write(&target, b"old-manager-binary").unwrap();
+        assert!(!guard_binary_is_current(&source, &target).unwrap());
+        fs::write(&target, b"new-manager-binary").unwrap();
+        assert!(guard_binary_is_current(&source, &target).unwrap());
+        fs::remove_dir_all(root).unwrap();
     }
 }

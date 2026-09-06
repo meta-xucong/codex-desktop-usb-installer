@@ -94,11 +94,16 @@ impl MsixPolicyJournal {
     }
 
     fn load(path: &Path) -> Result<Self, AppError> {
+        codex_win_engine::validate_cleanup_path(path)
+            .map_err(|e| AppError::Engine(e.to_string()))?;
         let bytes = fs::read(path)
             .map_err(|e| AppError::Internal(format!("读取 MSIX 策略事务失败: {e}")))?;
         let journal: Self = serde_json::from_slice(&bytes)
             .map_err(|e| AppError::Internal(format!("解析 MSIX 策略事务失败: {e}")))?;
-        if journal.schema_version != SCHEMA_VERSION {
+        if journal.schema_version != SCHEMA_VERSION
+            || uuid::Uuid::parse_str(&journal.id).is_err()
+            || path.file_stem().and_then(|stem| stem.to_str()) != Some(journal.id.as_str())
+        {
             return Err(AppError::Internal(format!(
                 "不支持的 MSIX 策略事务版本 {}",
                 journal.schema_version
@@ -149,6 +154,56 @@ impl MsixPolicyJournal {
         }
         warnings
     }
+}
+
+/// An uninstall must not leave an old startup policy transaction that could
+/// recreate settings/environment on the next run. This function discards only
+/// validated self-update intents after package absence is confirmed; it never
+/// guesses or changes HKLM sideload policies. Restore the separate environment
+/// journal with `codex_self_update::cleanup_for_uninstall` first.
+pub fn clear_pending_after_uninstall() -> Result<usize, AppError> {
+    let Some(dir) = journal_dir() else {
+        return Err(AppError::Internal("无法定位 MSIX 策略事务目录".into()));
+    };
+    let journals = scan_uninstall_journals(&dir)?;
+    if journals.is_empty() {
+        return Ok(0);
+    }
+    if codex_win_engine::registered_msix_package_full_name()
+        .map_err(|e| AppError::Engine(e.to_string()))?
+        .is_some()
+    {
+        return Err(AppError::Engine(
+            "Codex 包仍已注册，保留 MSIX 策略事务".into(),
+        ));
+    }
+    let count = journals.len();
+    for journal in journals {
+        journal.remove_checked()?;
+    }
+    Ok(count)
+}
+
+fn scan_uninstall_journals(dir: &Path) -> Result<Vec<MsixPolicyJournal>, AppError> {
+    codex_win_engine::validate_cleanup_path(&dir).map_err(|e| AppError::Engine(e.to_string()))?;
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(error) => return Err(AppError::Engine(format!("无法扫描 MSIX 策略事务：{error}"))),
+    };
+    let mut journals = Vec::new();
+    for entry in entries {
+        let path = entry.map_err(|e| AppError::Engine(e.to_string()))?.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("json") {
+            journals.push(MsixPolicyJournal::load(&path)?);
+        } else {
+            return Err(AppError::Engine(format!(
+                "MSIX 策略目录存在备份或未知恢复材料，保留并停止清理：{}",
+                path.display()
+            )));
+        }
+    }
+    Ok(journals)
 }
 
 fn pending_journal_exists() -> bool {
@@ -291,5 +346,26 @@ mod tests {
             target
         ));
         assert!(!target_landed(None, target));
+    }
+
+    #[test]
+    fn uninstall_does_not_discard_backup_only_or_path_injected_journal() {
+        let dir =
+            std::env::temp_dir().join(format!("codex-msix-journal-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let backup = dir.join(format!("{id}.json.bak"));
+        std::fs::write(&backup, b"backup only").unwrap();
+        assert!(super::scan_uninstall_journals(&dir).is_err());
+        assert!(backup.exists());
+        std::fs::remove_file(backup).unwrap();
+        let path = dir.join(format!("{id}.json"));
+        std::fs::write(&path, serde_json::json!({
+            "schemaVersion":1,"id":"../escape","targetPackageFullName":"OpenAI.Codex_1_x64__2p2nqsd0c76g0",
+            "transition":{"previousDisabled":false,"requestedDisabled":true},"startedUnix":1
+        }).to_string()).unwrap();
+        assert!(super::scan_uninstall_journals(&dir).is_err());
+        assert!(path.exists());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

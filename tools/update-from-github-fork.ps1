@@ -1,12 +1,12 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [ValidateSet("x64", "arm64")]
     [string]$Architecture = "x64",
     [string]$Repository = "meta-xucong/codex-app-mirror",
     [string]$ReleaseTag,
-    [string]$DownloadDir = (Join-Path $PSScriptRoot "..\release\upstream"),
-    [string]$BundleDir = (Join-Path $PSScriptRoot "..\release\usb"),
-    [string]$OutputDir = (Join-Path $PSScriptRoot "..\release\usb-final"),
+    [string]$DownloadDir = "",
+    [string]$BundleDir = "",
+    [string]$OutputDir = "",
     [switch]$ForceDownload,
     [switch]$SkipLayout
 )
@@ -43,6 +43,9 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+if ([string]::IsNullOrWhiteSpace($DownloadDir)) { $DownloadDir = Join-Path $repoRoot "release\upstream" }
+if ([string]::IsNullOrWhiteSpace($BundleDir)) { $BundleDir = Join-Path $repoRoot "release\usb" }
+if ([string]::IsNullOrWhiteSpace($OutputDir)) { $OutputDir = Join-Path $repoRoot "release\usb-final" }
 $downloadRoot = (New-Item -ItemType Directory -Force -Path $DownloadDir).FullName
 
 if ([string]::IsNullOrWhiteSpace($ReleaseTag)) {
@@ -137,7 +140,7 @@ if ($LASTEXITCODE -ne 0) { throw "verify-payload.ps1 执行失败。" }
 
 if (-not $SkipLayout) {
     $layoutScript = Join-Path $PSScriptRoot "build-usb-layout.ps1"
-    $installerPath = Join-Path $repoRoot "release\setup\CodexDesktopSetup.exe"
+    $installerPath = Join-Path $repoRoot "release\setup\CodexUsbLauncher.exe"
     & pwsh -NoProfile -File $layoutScript `
         -InstallerPath $installerPath `
         -BundlePath $BundleDir `

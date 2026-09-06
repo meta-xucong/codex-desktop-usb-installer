@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
     [string]$SourcePath,
@@ -8,11 +8,12 @@ param(
     [ValidateSet("x64", "arm64")]
     [string]$Architecture = "x64",
     [string]$PackageVersion,
-    [string]$OutputDir = (Join-Path $PSScriptRoot "..\release\usb"),
+    [string]$OutputDir = "",
     [switch]$SkipSignature
 )
 
 $ErrorActionPreference = "Stop"
+if ([string]::IsNullOrWhiteSpace($OutputDir)) { $OutputDir = Join-Path $PSScriptRoot "..\release\usb" }
 
 function Read-MsixIdentity {
     param([string]$Path)

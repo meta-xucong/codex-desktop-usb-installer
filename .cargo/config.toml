@@ -1,0 +1,8 @@
+# The Windows USB entry point must start on a blank machine before it can
+# install any optional runtime prerequisites.  Link the Rust/Tauri manager
+# against the static MSVC CRT so the entry itself does not require
+# VCRUNTIME140.dll to be present at process start.  CCSwitch remains a
+# separately-built executable and is covered by the bundled VC redist
+# preflight in src-tauri/src/app/runtime.rs.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

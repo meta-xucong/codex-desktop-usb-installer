@@ -187,8 +187,8 @@ struct JsOutcome {
 
 async fn run_js(session: &CdpSession, expression: &str, what: &str) -> Result<JsOutcome> {
     let value = session.evaluate(expression).await?;
-    let outcome: JsOutcome = serde_json::from_value(value)
-        .map_err(|e| err(format!("{what}: 结果解析失败: {e}")))?;
+    let outcome: JsOutcome =
+        serde_json::from_value(value).map_err(|e| err(format!("{what}: 结果解析失败: {e}")))?;
     if !outcome.ok {
         return Err(err(format!(
             "hot-import-unsupported: {what}: {}",
@@ -261,8 +261,8 @@ pub async fn write_values(
         .iter()
         .map(|(key, value)| serde_json::json!([key, value]))
         .collect();
-    let payload_json = serde_json::to_string(&payload)
-        .map_err(|e| err(format!("写入负载序列化失败: {e}")))?;
+    let payload_json =
+        serde_json::to_string(&payload).map_err(|e| err(format!("写入负载序列化失败: {e}")))?;
     let expression = format!(
         r#"(async () => {{
   const api = window.__camThemeSettingsV1;
@@ -278,7 +278,9 @@ pub async fn write_values(
   return {{ ok: true }};
 }})()"#
     );
-    run_js(session, &expression, "写入外观设置").await.map(|_| ())
+    run_js(session, &expression, "写入外观设置")
+        .await
+        .map(|_| ())
 }
 
 /// The write set for a typed theme: both ChromeThemes, both code theme ids

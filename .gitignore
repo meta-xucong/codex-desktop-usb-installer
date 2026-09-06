@@ -25,6 +25,11 @@ release/**/payload/*.msix
 release/upstream/*.Msix
 release/upstream/*.msix
 
+# Complete WebView2 standalone runtime is >100 MB; distribute with the USB
+# artifact, not as a Git blob. Source URL and SHA-256 are pinned in code/tools.
+src-tauri/resources/prerequisites/MicrosoftEdgeWebView2RuntimeInstallerX64.exe
+release/**/resources/prerequisites/MicrosoftEdgeWebView2RuntimeInstallerX64.exe
+
 # Only the recommended one-click layout is kept as a lightweight build
 # snapshot.  Other generated layouts are reproducible and contain duplicate
 # executables, so leave them out of the archive.
@@ -32,3 +37,14 @@ release/setup/
 release/usb/
 release/usb-final/
 release/upstream/
+
+# Versioned USB kits are generated release artifacts (roughly 1.1 GB each).
+# Publish a chosen final kit as a GitHub Release asset; never commit its
+# duplicated executables, signed MSIX, or offline runtimes to Git history.
+release/usb-oneclick-v*/
+
+# Local validation snapshots and third-party offline prerequisite binaries are
+# reproducible inputs, not source. Their expected hashes/signers are release
+# gates in tools/build-installer.ps1.
+.codex-audit/
+src-tauri/resources/prerequisites/*.exe

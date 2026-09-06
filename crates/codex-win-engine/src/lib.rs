@@ -8,7 +8,9 @@
 //! Safety posture:
 //!   - keep normal installs unelevated; request one-shot UAC only to release an
 //!     exact SYSTEM Windows Update transaction blocking a verified local MSIX;
-//!   - do not change machine policy or trust stores;
+//!   - normal installs do not change machine policy or trust stores; the
+//!     explicit USB AppX-volume edition may opt into the documented Windows
+//!     data-volume policy through the Tauri layer;
 //!   - treat OpenAI Authenticode as the Windows trust anchor;
 //!   - fall back to portable only when the MSIX route is unavailable or fails.
 
@@ -56,20 +58,31 @@ pub use plan::{plan_update, WinInstallRoute, WindowsUpdatePlan};
 pub use portable::{
     cleanup_portable_metadata, close_codex_gracefully_for_root, codex_running_for_root,
     inject_portable_fault, install_portable_from_msix, install_portable_from_msix_with_observer,
-    installed_app_exe, purge_codex_user_data, remove_directory_all_with_retry,
-    rename_directory_with_retry, uninstall_portable, PortableBoundary, PortableFault,
+    install_portable_from_msix_with_observer_options, installed_app_exe, purge_codex_user_data,
+    remove_directory_all_with_retry, rename_directory_with_retry, uninstall_portable,
+    validate_cleanup_path, PortableBoundary, PortableFault, PortableInstallOptions,
     PortableInstallReport, PortableUninstallReport,
 };
 pub use sys::{
     close_msix_codex_processes, detect_installed_codex, detect_portable_install, fetch_text,
     fetch_text_with_network, launch_codex, launch_codex_with_options, probe_capabilities,
-    registered_msix_package_full_name, remove_msix_package, InstalledWindowsCodex, LaunchOptions,
-    MsixRemoveReport,
+    probe_msix_machine_state, registered_msix_package_full_name,
+    remove_exact_msix_machine_orphan_with_volume, remove_msix_package,
+    remove_msix_package_with_options, remove_msix_package_with_volume, CodexLaunchReport,
+    InstalledWindowsCodex, LaunchOptions, MsixMachineStateReport, MsixRemoveReport,
+    PortableLaunchPolicy,
 };
 pub use sys::{
-    install_msix_sideload, install_msix_sideload_with_observer, precheck_msix_dependencies,
-    verify_msix_health, verify_msix_health_with_options, MsixDependencyPrecheck, MsixHealthReport,
-    MsixSideloadReport,
+    install_msix_sideload, install_msix_sideload_with_observer,
+    install_msix_to_volume_with_observer, precheck_msix_dependencies, verify_msix_health,
+    verify_msix_health_with_options, MsixDependencyPrecheck, MsixHealthReport, MsixSideloadReport,
+};
+/// Close processes whose executable image is physically under an exact
+/// manager-owned root. Used for CCSwitch as well as Codex; no process-name-only
+/// termination is exposed to callers.
+pub use windows_process::{
+    close_processes_for_root, processes_running_for_root, wait_for_usable_window_for_root,
+    UsableWindowReport,
 };
 // Failure-kind constants for structured MSIX health outcomes.
 pub use sys::msix_failure;

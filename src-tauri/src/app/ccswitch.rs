@@ -1,11 +1,13 @@
 //! Product configurator hand-off for the Codex USB installer.
 //!
 //! The Codex installer itself is intentionally kept separate from the
-//! CCSwitch product binary.  Once Codex has been verified, this module copies
-//! the CCSwitch payload from the USB bundle (or a Tauri resource bundle) into
-//! a per-user, non-removable location and starts it.  The copy is best-effort
-//! from the installer's point of view: a missing CCSwitch payload must never
-//! turn an otherwise successful Codex installation into a failure.
+//! CCSwitch product binary.  The normal manager edition copies the verified
+//! payload into a per-user, non-removable location.  The USB edition starts
+//! the verified executable directly from the removable bundle, so removing
+//! the USB also removes the program bytes needed for a new launch.  CCSwitch's
+//! own settings/database continue to use its ordinary Windows user-profile
+//! locations; the manager never redirects those to the USB or stores an API
+//! key in the bundle.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -24,10 +26,16 @@ pub const CCSWITCH_EXECUTABLE: &str = "CodexSwitch.exe";
 const CCSWITCH_SOURCE_DIR: &str = "ccswitch";
 pub const CCSWITCH_INSTALL_DIR: &str = "CodexSwitch";
 const CCSWITCH_MANAGED_MARKER: &str = ".codex-usb-managed.json";
+/// USB mode does not create a local program directory, so ownership is kept
+/// in the manager data directory instead.  This lets a later explicit purge
+/// remove CCSwitch data even after the USB executable has been unplugged.
+const CCSWITCH_USB_MARKER: &str = "ccswitch-usb-managed.json";
 const CCSWITCH_DATA_DIR: &str = ".cc-switch";
 const CCSWITCH_IDENTIFIER: &str = "com.ccswitch.desktop";
 const CCSWITCH_RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 const CCSWITCH_RUN_VALUE: &str = "CC Switch";
+const WEBVIEW2_ARGUMENTS_ENV: &str = "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS";
+const WEBVIEW2_DISABLE_GPU_ARG: &str = "--disable-gpu";
 
 /// Files copied when they exist beside the product executable.  Only the EXE
 /// is required at runtime; the catalog and notices make the local install
@@ -55,13 +63,29 @@ struct CcswitchArtifact {
 pub struct CcswitchLaunchReport {
     /// Whether a CCSwitch executable was found in the installer bundle.
     pub available: bool,
-    /// Whether the payload was copied to the local per-user directory.
+    /// Whether the payload is available in the selected launch mode. In USB
+    /// mode this is true even though no local copy is created.
     pub installed: bool,
     /// Whether the local executable was successfully spawned.
     pub launched: bool,
     pub source_path: Option<String>,
     pub installed_path: Option<String>,
     pub copied_files: usize,
+    /// `usb` means the source executable itself remains on the removable
+    /// bundle; `local` means the normal per-user copy was launched.
+    #[serde(default)]
+    pub launch_mode: String,
+    /// Human-facing data scope. CCSwitch stores settings in the current user's
+    /// profile in both modes.
+    #[serde(default)]
+    pub data_scope: String,
+    /// Process creation is not enough for a GUI hand-off. This becomes true
+    /// only after a sizeable top-level window under the exact CCSwitch program
+    /// root has been restored and presented.
+    #[serde(default)]
+    pub usable_window_confirmed: bool,
+    #[serde(default)]
+    pub graphics_mode: String,
     pub message: String,
 }
 
@@ -91,7 +115,26 @@ fn report_missing(message: impl Into<String>) -> CcswitchLaunchReport {
         source_path: None,
         installed_path: None,
         copied_files: 0,
+        launch_mode: "none".to_string(),
+        data_scope: "unknown".to_string(),
+        usable_window_confirmed: false,
+        graphics_mode: "unknown".to_string(),
         message: message.into(),
+    }
+}
+
+fn webview2_software_rendering_arguments(existing: Option<&str>) -> String {
+    let existing = existing.unwrap_or_default().trim();
+    if existing
+        .split_ascii_whitespace()
+        .any(|argument| argument.eq_ignore_ascii_case(WEBVIEW2_DISABLE_GPU_ARG))
+    {
+        return existing.to_string();
+    }
+    if existing.is_empty() {
+        WEBVIEW2_DISABLE_GPU_ARG.to_string()
+    } else {
+        format!("{existing} {WEBVIEW2_DISABLE_GPU_ARG}")
     }
 }
 
@@ -107,6 +150,101 @@ fn sha256_file(path: &Path) -> Result<String, AppError> {
 
 fn managed_marker_path(install_dir: &Path) -> PathBuf {
     install_dir.join(CCSWITCH_MANAGED_MARKER)
+}
+
+fn local_install_is_managed(install_dir: &Path) -> bool {
+    if codex_win_engine::validate_cleanup_path(install_dir).is_err() {
+        return false;
+    }
+    let Ok(install_metadata) = fs::symlink_metadata(install_dir) else {
+        return false;
+    };
+    if !install_metadata.is_dir() || install_metadata.file_type().is_symlink() {
+        return false;
+    }
+    let marker = managed_marker_path(install_dir);
+    if !is_regular_file(&marker) {
+        return false;
+    }
+    let Ok(bytes) = fs::read(marker) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    value.get("product").and_then(|v| v.as_str()) == Some("codex-usb-oneclick")
+        && value.get("component").and_then(|v| v.as_str()) == Some("ccswitch")
+        && value.get("executable").and_then(|v| v.as_str()) == Some(CCSWITCH_EXECUTABLE)
+}
+
+fn usb_marker_path() -> Result<PathBuf, AppError> {
+    crate::app::paths::data_dir()
+        .map(|dir| dir.join(CCSWITCH_USB_MARKER))
+        .ok_or_else(|| AppError::Engine("无法确定 CCSwitch USB 所有权记录目录".to_string()))
+}
+
+fn write_usb_managed_marker(source: &Path) -> Result<(), AppError> {
+    let path = usb_marker_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| io_error(parent, error))?;
+    }
+    let marker = serde_json::json!({
+        "product": "codex-usb-oneclick",
+        "component": "ccswitch",
+        "launchMode": "usb",
+        "sourcePath": source.to_string_lossy(),
+        "createdAtMs": crate::app::usb_guard::now_ms(),
+    });
+    let bytes = serde_json::to_vec_pretty(&marker).map_err(|error| {
+        AppError::Engine(format!("序列化 CCSwitch USB 所有权记录失败: {error}"))
+    })?;
+    crate::app::atomic_file::write_atomic(&path, &bytes)
+        .map_err(|error| AppError::Engine(format!("写入 CCSwitch USB 所有权记录失败: {error}")))
+}
+
+fn read_usb_managed_source() -> Option<PathBuf> {
+    let path = usb_marker_path().ok()?;
+    codex_win_engine::validate_cleanup_path(&path).ok()?;
+    let bytes = fs::read(path).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    if value.get("product").and_then(|v| v.as_str()) != Some("codex-usb-oneclick")
+        || value.get("component").and_then(|v| v.as_str()) != Some("ccswitch")
+        || value.get("launchMode").and_then(|v| v.as_str()) != Some("usb")
+    {
+        return None;
+    }
+    let source = value.get("sourcePath").and_then(|v| v.as_str())?.trim();
+    if source.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(source);
+    // The marker is user-writable state, not an authorization token.  Accept
+    // only the exact executable name and a non-root parent so a corrupted
+    // marker can never broaden the process-close scan to an entire drive.
+    let valid_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case(CCSWITCH_EXECUTABLE));
+    let valid_parent = path.parent().is_some_and(|parent| {
+        parent.parent().is_some()
+            && parent
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case(CCSWITCH_SOURCE_DIR))
+    });
+    (path.is_absolute()
+        && valid_name
+        && valid_parent
+        && codex_win_engine::validate_cleanup_path(&path).is_ok())
+    .then_some(path)
+}
+
+fn remove_usb_managed_marker() -> Result<bool, AppError> {
+    let path = usb_marker_path()?;
+    let removed = remove_path_retry(&path)?;
+    let backup = crate::app::atomic_file::backup_path(&path);
+    let _ = remove_path_retry(&backup)?;
+    Ok(removed)
 }
 
 fn write_managed_marker(install_dir: &Path) -> Result<(), AppError> {
@@ -220,90 +358,287 @@ fn data_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-fn remove_dir_all_retry(path: &Path) -> Result<bool, AppError> {
-    if !path.exists() {
-        return Ok(false);
+fn existence_from_probe(probe: std::io::Result<()>) -> std::io::Result<bool> {
+    match probe {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
     }
+}
 
+fn path_exists_checked(path: &Path) -> Result<bool, AppError> {
+    existence_from_probe(fs::symlink_metadata(path).map(|_| ()))
+        .map_err(|error| io_error(path, error))
+}
+
+fn paths_absent(paths: &[PathBuf]) -> Result<bool, AppError> {
+    for path in paths {
+        if path_exists_checked(path)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn remove_path_retry(path: &Path) -> Result<bool, AppError> {
     let mut last_error = None;
-    for attempt in 0..3 {
-        match fs::remove_dir_all(path) {
-            Ok(()) => return Ok(true),
-            Err(error) => {
-                last_error = Some(error);
-                if attempt < 2 {
-                    thread::sleep(Duration::from_millis(250));
+    // CCSwitch/WebView can release a handle shortly after its process exits.
+    // Give Windows a bounded 10-second window rather than failing after the
+    // old 750 ms budget and leaving a false "partially uninstalled" result.
+    for attempt in 0..40 {
+        codex_win_engine::validate_cleanup_path(path)
+            .map_err(|error| AppError::Engine(error.to_string()))?;
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(attempt > 0),
+            Err(error) => return Err(io_error(path, error)),
+        };
+        let result = if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            fs::remove_file(path)
+        } else {
+            fs::remove_dir_all(path)
+        };
+        match result {
+            Ok(()) => {
+                // Removal returning Ok does not prove postcondition: only an
+                // explicit NotFound probe confirms absence. AccessDenied and
+                // other lookup errors must never turn into successful cleanup.
+                if path_exists_checked(path)? {
+                    last_error = Some(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "path still exists after removal",
+                    ));
+                } else {
+                    return Ok(true);
                 }
             }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Another cleanup attempt may have won the race. Verify the
+                // same path rather than treating that benign race as a hard
+                // failure.
+                match fs::symlink_metadata(path) {
+                    Err(check) if check.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+                    Err(check) => return Err(io_error(path, check)),
+                    Ok(_) => {}
+                }
+                last_error = Some(error);
+            }
+            Err(error) => {
+                let transient = matches!(error.raw_os_error(), Some(5 | 32 | 33))
+                    || matches!(
+                        error.kind(),
+                        std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                    );
+                last_error = Some(error);
+                if !transient {
+                    return Err(io_error(
+                        path,
+                        last_error
+                            .as_ref()
+                            .expect("remove_path_retry must retain non-transient error"),
+                    ));
+                }
+            }
+        }
+        if attempt < 39 {
+            thread::sleep(Duration::from_millis(250));
         }
     }
 
     Err(io_error(
         path,
-        last_error.expect("remove_dir_all must record its last error"),
+        last_error.expect("remove_path_retry must record its last error"),
     ))
 }
 
 #[cfg(target_os = "windows")]
-fn terminate_running_process() -> Result<bool, AppError> {
-    // The shared helper rechecks both the recorded PID and its executable
-    // image before taskkill.  If the lease is absent (for example an
-    // independently installed CCSwitch), leave it alone and let the user
-    // close it before retrying uninstall.
-    let killed = crate::app::usb_guard::terminate_managed_processes_for_role("ccswitch");
-    if killed > 0 {
+fn terminate_running_process(local_install_owned: bool) -> Result<bool, AppError> {
+    // Prefer the USB lease's exact PID + image check.  Normal (non-USB)
+    // launches have no lease, so also scan the two paths this product can own
+    // and close only processes whose executable image is physically beneath
+    // one of those roots.  This avoids a global `/IM CodexSwitch.exe` kill that
+    // could touch an unrelated CCSwitch installation while still allowing the
+    // uninstall button to work after a lease write failed or an old build was
+    // used.
+    let mut closed = crate::app::usb_guard::terminate_managed_processes_for_role("ccswitch") > 0;
+    let mut roots = Vec::new();
+    if local_install_owned {
+        roots.push(local_install_dir()?);
+    }
+    if let Some(source) = read_usb_managed_source() {
+        if let Some(parent) = source.parent() {
+            roots.push(parent.to_path_buf());
+        }
+    }
+    roots.sort();
+    roots.dedup();
+    for root in roots {
+        match codex_win_engine::processes_running_for_root(&root) {
+            Ok(true) => {
+                codex_win_engine::close_processes_for_root(10, &root)
+                    .map_err(|error| AppError::Engine(error.to_string()))?;
+                closed = true;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                return Err(AppError::Engine(format!(
+                    "无法检查 CCSwitch 进程（{}）：{error}",
+                    root.display()
+                )))
+            }
+        }
+    }
+    if closed {
         thread::sleep(Duration::from_millis(150));
     }
-    Ok(killed > 0)
+    Ok(closed)
 }
 
 #[cfg(not(target_os = "windows"))]
-fn terminate_running_process() -> Result<bool, AppError> {
+fn terminate_running_process(_local_install_owned: bool) -> Result<bool, AppError> {
     Ok(false)
 }
 
 #[cfg(target_os = "windows")]
-fn remove_autostart_entry(install_dir: &Path) -> Result<bool, AppError> {
-    let queried = Command::new("reg")
-        .args(["query", CCSWITCH_RUN_KEY, "/v", CCSWITCH_RUN_VALUE])
-        .output()
-        .map_err(|error| AppError::Engine(format!("查询 CCSwitch 开机启动项失败: {error}")))?;
-    if !queried.status.success() {
+fn remove_autostart_entry_for_paths(paths: &[&Path]) -> Result<bool, AppError> {
+    use windows_sys::Win32::System::Registry::*;
+    struct Key(HKEY);
+    impl Drop for Key {
+        fn drop(&mut self) {
+            unsafe {
+                RegCloseKey(self.0);
+            }
+        }
+    }
+    fn failure(status: u32) -> AppError {
+        AppError::Engine(format!("CCSwitch 启动项注册表操作失败（Win32 {status}）"))
+    }
+    fn open(access: u32) -> Result<Option<Key>, AppError> {
+        let path: Vec<u16> = CCSWITCH_RUN_KEY
+            .trim_start_matches("HKCU\\")
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut key = std::ptr::null_mut();
+        let status =
+            unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, path.as_ptr(), 0, access, &mut key) };
+        if status == 2 {
+            return Ok(None);
+        }
+        if status != 0 {
+            return Err(failure(status));
+        }
+        Ok(Some(Key(key)))
+    }
+    fn query(key: &Key, name: &[u16]) -> Result<Option<String>, AppError> {
+        let (mut kind, mut size) = (0, 0);
+        let status = unsafe {
+            RegQueryValueExW(
+                key.0,
+                name.as_ptr(),
+                std::ptr::null(),
+                &mut kind,
+                std::ptr::null_mut(),
+                &mut size,
+            )
+        };
+        if status == 2 {
+            return Ok(None);
+        }
+        if status != 0 {
+            return Err(failure(status));
+        }
+        if kind != REG_SZ || size > 65536 || size % 2 != 0 {
+            return Err(AppError::Engine(
+                "CCSwitch 启动项不是正常 REG_SZ，保留该值".into(),
+            ));
+        }
+        let mut value = vec![0u16; size as usize / 2];
+        let status = unsafe {
+            RegQueryValueExW(
+                key.0,
+                name.as_ptr(),
+                std::ptr::null(),
+                &mut kind,
+                value.as_mut_ptr().cast(),
+                &mut size,
+            )
+        };
+        if status != 0 {
+            return Err(failure(status));
+        }
+        value.truncate(size as usize / 2);
+        if kind != REG_SZ || size % 2 != 0 {
+            return Err(AppError::Engine(
+                "读取期间 CCSwitch 启动项类型发生变化，已保留".into(),
+            ));
+        }
+        while value.last() == Some(&0) {
+            value.pop();
+        }
+        String::from_utf16(&value)
+            .map(Some)
+            .map_err(|e| AppError::Engine(format!("CCSwitch 启动项编码无效：{e}")))
+    }
+    let Some(key) = open(KEY_QUERY_VALUE)? else {
+        return Ok(false);
+    };
+    let name: Vec<u16> = CCSWITCH_RUN_VALUE
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let Some(value) = query(&key, &name)? else {
+        return Ok(false);
+    };
+    let expected = paths
+        .iter()
+        .map(|path| {
+            path.join(CCSWITCH_EXECUTABLE)
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .replace('/', "\\")
+        })
+        .filter(|path| !path.is_empty())
+        .collect::<Vec<_>>();
+    if !expected.iter().any(|path| autostart_targets(&value, path)) {
         return Ok(false);
     }
-
-    // Only remove the value when it points at the copy managed by this
-    // installer.  A separately installed CCSwitch at another path is outside
-    // this product's scope and must not be touched.
-    let value = String::from_utf8_lossy(&queried.stdout)
-        .to_ascii_lowercase()
-        .replace('/', "\\");
-    let expected = install_dir
-        .join(CCSWITCH_EXECUTABLE)
-        .to_string_lossy()
-        .to_ascii_lowercase()
-        .replace('/', "\\");
-    if !value.contains(&expected) {
+    let Some(write_key) = open(KEY_SET_VALUE | KEY_QUERY_VALUE)? else {
         return Ok(false);
+    };
+    if query(&write_key, &name)?.as_deref() != Some(value.as_str()) {
+        return Err(AppError::Engine(
+            "CCSwitch 启动项已发生外部变化，保留新值".into(),
+        ));
     }
-
-    let deleted = Command::new("reg")
-        .args(["delete", CCSWITCH_RUN_KEY, "/v", CCSWITCH_RUN_VALUE, "/f"])
-        .output()
-        .map_err(|error| AppError::Engine(format!("删除 CCSwitch 开机启动项失败: {error}")))?;
-    if !deleted.status.success() {
-        let detail = String::from_utf8_lossy(&deleted.stderr).trim().to_string();
-        return Err(AppError::Engine(if detail.is_empty() {
-            "删除 CCSwitch 开机启动项失败".to_string()
-        } else {
-            format!("删除 CCSwitch 开机启动项失败: {detail}")
-        }));
+    let status = unsafe { RegDeleteValueW(write_key.0, name.as_ptr()) };
+    if status != 0 && status != 2 {
+        return Err(failure(status));
+    }
+    if query(&write_key, &name)?.is_some() {
+        return Err(AppError::Engine(
+            "CCSwitch 启动项删除后仍存在，请关闭其他配置程序后重试".into(),
+        ));
     }
     Ok(true)
 }
 
+fn autostart_targets(command: &str, executable: &str) -> bool {
+    let normalized = command.trim().to_ascii_lowercase().replace('/', "\\");
+    let expected = executable.to_ascii_lowercase().replace('/', "\\");
+    if let Some(quoted) = normalized.strip_prefix('"') {
+        return quoted.split_once('"').is_some_and(|(path, tail)| {
+            path == expected && (tail.is_empty() || tail.starts_with(char::is_whitespace))
+        });
+    }
+    normalized == expected
+        || normalized
+            .strip_prefix(&expected)
+            .is_some_and(|tail| tail.starts_with(char::is_whitespace))
+}
+
 #[cfg(not(target_os = "windows"))]
-fn remove_autostart_entry(_install_dir: &Path) -> Result<bool, AppError> {
+fn remove_autostart_entry_for_paths(_paths: &[&Path]) -> Result<bool, AppError> {
     Ok(false)
 }
 
@@ -312,22 +647,48 @@ fn remove_autostart_entry(_install_dir: &Path) -> Result<bool, AppError> {
 /// the responsibility of the Codex uninstall engine.
 pub fn uninstall(purge_user_data: bool) -> Result<CcswitchUninstallReport, AppError> {
     let install_dir = local_install_dir()?;
-    let installed_before = install_dir.exists();
-    let managed_marker = managed_marker_path(&install_dir).is_file();
+    let usb_source = read_usb_managed_source();
+    let local_install_present = path_exists_checked(&install_dir)?;
+    let installed_before = local_install_present || usb_source.is_some();
+    let managed_marker = local_install_is_managed(&install_dir);
+    let owned_by_bundle = managed_marker || usb_source.is_some();
     let data_paths = data_dirs();
     let mut notes = Vec::new();
 
-    let terminated = terminate_running_process()?;
+    // A default path is not ownership proof: a user may have installed an
+    // unrelated CCSwitch at the same location.  Only close/remove the local
+    // tree when this product's marker is present; USB mode has its separate
+    // validated source marker and exact-root scan.
+    let terminated = terminate_running_process(managed_marker)?;
     if terminated {
         notes.push("已关闭正在运行的 CCSwitch 进程。".to_string());
     }
 
-    let removed_autostart = remove_autostart_entry(&install_dir)?;
+    let mut autostart_roots = Vec::new();
+    if managed_marker {
+        autostart_roots.push(install_dir.as_path());
+    }
+    if let Some(source) = usb_source.as_deref() {
+        if let Some(parent) = source.parent() {
+            autostart_roots.push(parent);
+        }
+    }
+    let removed_autostart = remove_autostart_entry_for_paths(&autostart_roots)?;
     if removed_autostart {
         notes.push("已移除 CCSwitch 开机启动项。".to_string());
     }
 
-    let removed_install = remove_dir_all_retry(&install_dir)?;
+    let removed_install = if managed_marker {
+        remove_path_retry(&install_dir)?
+    } else {
+        false
+    };
+    if local_install_present && !managed_marker {
+        notes.push(format!(
+            "检测到 {}，但缺少本产品所有权标记；为避免删除其他安装，已保留该目录。",
+            install_dir.display()
+        ));
+    }
     if removed_install {
         notes.push(format!(
             "已删除 CCSwitch 程序目录：{}",
@@ -336,27 +697,44 @@ pub fn uninstall(purge_user_data: bool) -> Result<CcswitchUninstallReport, AppEr
     }
 
     let mut purged_user_data = false;
-    if purge_user_data && managed_marker {
+    if purge_user_data {
         let mut removed_any = false;
         for data_path in &data_paths {
-            if remove_dir_all_retry(data_path)? {
+            if remove_path_retry(data_path)? {
                 removed_any = true;
                 notes.push(format!("已删除 CCSwitch 数据目录：{}", data_path.display()));
             }
         }
-        purged_user_data = removed_any || data_paths.iter().all(|path| !path.exists());
-    } else if purge_user_data {
-        notes.push("未找到本安装器的 CCSwitch 所有权标记，已保留用户数据。".to_string());
+        purged_user_data = removed_any || paths_absent(&data_paths)?;
+        if !owned_by_bundle {
+            notes.push(
+                "未找到 CCSwitch 所有权标记；因你明确选择了清除数据，仍按联合卸载确认清理已知用户目录。"
+                    .to_string(),
+            );
+        }
     } else {
         notes.push("已保留 CCSwitch 配置与用户数据。".to_string());
     }
 
-    let success = !install_dir.exists()
-        && (!purge_user_data || !managed_marker || data_paths.iter().all(|path| !path.exists()));
+    // The marker is operational metadata, not user data.  Remove it on every
+    // completed uninstall so a stale USB session cannot make the next launch
+    // look installed.  If data purge failed, retain it as a retry signal.
+    let marker_removed = if !purge_user_data || paths_absent(&data_paths)? {
+        remove_usb_managed_marker()?
+    } else {
+        false
+    };
+    if marker_removed {
+        notes.push("已清除 CCSwitch USB 所有权记录。".to_string());
+    }
+    let local_install_absent = !path_exists_checked(&install_dir)?;
+    let data_absent = paths_absent(&data_paths)?;
+    let marker_absent = !path_exists_checked(&usb_marker_path()?)?;
+    let success = local_install_absent && (!purge_user_data || data_absent) && marker_absent;
     let message = if !success {
         "CCSwitch 程序已部分清理，请关闭占用文件的进程后重试。".to_string()
     } else if installed_before || removed_autostart || purged_user_data {
-        if purge_user_data && managed_marker {
+        if purge_user_data {
             "CCSwitch 已卸载并清除配置。".to_string()
         } else {
             "CCSwitch 已卸载，配置已保留。".to_string()
@@ -439,8 +817,10 @@ fn copy_payload(source_executable: &Path, target_dir: &Path) -> Result<usize, Ap
     Ok(copied)
 }
 
-/// Copy CCSwitch locally and launch it.  A missing source is represented as a
-/// non-fatal report so the caller can still mark Codex installation complete.
+/// Verify CCSwitch and launch it. In the fixed USB layout the executable is
+/// deliberately *not* copied to C:; only the app's normal user-profile data
+/// remains local. A missing source is represented as a non-fatal report so the
+/// caller can still mark Codex installation complete.
 pub fn install_and_launch(app: &AppHandle) -> Result<CcswitchLaunchReport, AppError> {
     if !cfg!(target_os = "windows") {
         return Ok(report_missing("当前平台不支持自动启动 Windows CCSwitch"));
@@ -455,11 +835,52 @@ pub fn install_and_launch(app: &AppHandle) -> Result<CcswitchLaunchReport, AppEr
         ));
     };
     verify_source_executable(&source)?;
-    let target_dir = local_install_dir()?;
-    let copied_files = copy_payload(&source, &target_dir)?;
-    let target = target_dir.join(CCSWITCH_EXECUTABLE);
+    let runtime =
+        crate::app::runtime::ensure_bundled_vc_runtime(&executable, resource_dir.as_deref())?;
+    if !runtime.ready {
+        return Err(AppError::Engine(runtime.message));
+    }
+    let usb_mode = crate::app::usb_guard::guard_required();
+    let (target, working_dir, copied_files, installed, launch_mode) = if usb_mode {
+        let target_dir = source
+            .parent()
+            .ok_or_else(|| AppError::Engine("无法确定 USB CCSwitch 工作目录".to_string()))?;
+        (source.clone(), target_dir.to_path_buf(), 0, true, "usb")
+    } else {
+        let target_dir = local_install_dir()?;
+        let copied_files = copy_payload(&source, &target_dir)?;
+        (
+            target_dir.join(CCSWITCH_EXECUTABLE),
+            target_dir,
+            copied_files,
+            true,
+            "local",
+        )
+    };
+    if usb_mode {
+        // USB mode has no local executable directory in which to place the
+        // normal ownership marker.  Persist a small, non-secret marker beside
+        // the manager settings so the combined uninstaller can identify and
+        // clean this product's CCSwitch profile on a later run.
+        if let Err(error) = write_usb_managed_marker(&source) {
+            log::warn!("CCSwitch launched from USB but ownership marker was not written: {error}");
+        }
+    }
+    let inherited_webview2_arguments = std::env::var(WEBVIEW2_ARGUMENTS_ENV).ok();
+    let webview2_arguments =
+        webview2_software_rendering_arguments(inherited_webview2_arguments.as_deref());
     let child = Command::new(&target)
-        .current_dir(&target_dir)
+        .current_dir(&working_dir)
+        // This marker is informational for the product build and is ignored
+        // by CCSwitch itself; it avoids inventing an unsupported CLI flag for
+        // its data directory. Tauri/Windows continue to resolve app data from
+        // the user's profile, not from the removable working directory.
+        .env("CODEX_USB_CCSWITCH_MODE", launch_mode)
+        // The target-machine report proved that this WebView2 renderer stalls
+        // with hardware acceleration on Windows 10/Intel graphics. Keep the
+        // workaround scoped to this child instead of changing a machine/user
+        // environment variable used by unrelated WebView2 applications.
+        .env(WEBVIEW2_ARGUMENTS_ENV, &webview2_arguments)
         .spawn()
         .map_err(|error| io_error(&target, error))?;
     // The USB guard records the exact child PID.  Unplug handling can then
@@ -471,21 +892,86 @@ pub fn install_and_launch(app: &AppHandle) -> Result<CcswitchLaunchReport, AppEr
         log::warn!("CCSwitch started but USB guard registration failed: {error}");
     }
 
+    let window =
+        codex_win_engine::wait_for_usable_window_for_root(&working_dir, Duration::from_secs(20))
+            .map_err(|error| AppError::Engine(format!("检查 CCSwitch 窗口失败：{error}")))?;
+    let Some(window) = window else {
+        // Do not leave a headless single-instance process behind: the next
+        // launch would merely signal that incompatible instance and could not
+        // apply the child-scoped WebView2 compatibility environment.
+        if codex_win_engine::processes_running_for_root(&working_dir).unwrap_or(false) {
+            let _ = codex_win_engine::close_processes_for_root(5, &working_dir);
+        }
+        return Err(AppError::Engine(
+            "CCSwitch 已启动但 20 秒内没有出现可操作窗口；已关闭本次隐藏进程，请查看日志"
+                .to_string(),
+        ));
+    };
+
+    // As with Electron, an HWND can exist briefly before the WebView renderer
+    // fatally exits. Do not turn that transient window into a false success.
+    std::thread::sleep(Duration::from_secs(2));
+    let stable_window =
+        codex_win_engine::wait_for_usable_window_for_root(&working_dir, Duration::ZERO)
+            .map_err(|error| AppError::Engine(format!("复核 CCSwitch 窗口失败：{error}")))?;
+    let Some(stable_window) = stable_window else {
+        if codex_win_engine::processes_running_for_root(&working_dir).unwrap_or(false) {
+            let _ = codex_win_engine::close_processes_for_root(5, &working_dir);
+        }
+        return Err(AppError::Engine(
+            "CCSwitch 窗口出现后未能稳定保留；已关闭本次异常进程，请查看日志".to_string(),
+        ));
+    };
+
+    // Explicit configuration hand-off: put the manager out of the way, then
+    // re-assert the verified CCSwitch window at the top. SetForegroundWindow
+    // can be policy-limited, but minimizing the launching foreground process
+    // plus HWND_TOP makes the configurator visible without making it permanently
+    // always-on-top.
+    if let Some(manager_window) = app.get_webview_window("main") {
+        if let Err(error) = manager_window.minimize() {
+            log::warn!("CCSwitch is ready but manager window could not minimize: {error}");
+        }
+    }
+    let focused = codex_win_engine::wait_for_usable_window_for_root(&working_dir, Duration::ZERO)
+        .ok()
+        .flatten()
+        .unwrap_or(stable_window);
+    log::info!(
+        "CCSwitch usable window confirmed pid={} size={}x{} initially_visible={} foreground_accepted={} webview2_args={}",
+        focused.pid,
+        focused.width,
+        focused.height,
+        window.was_visible,
+        focused.foreground_accepted,
+        webview2_arguments
+    );
+
     Ok(CcswitchLaunchReport {
         available: true,
-        installed: true,
+        installed,
         launched: true,
         source_path: Some(source.to_string_lossy().into_owned()),
         installed_path: Some(target.to_string_lossy().into_owned()),
         copied_files,
-        message: "Codex Switch 已复制到本机并启动，请输入 API Key 完成配置".to_string(),
+        launch_mode: launch_mode.to_string(),
+        data_scope: "user-profile".to_string(),
+        usable_window_confirmed: true,
+        graphics_mode: "software-rendering".to_string(),
+        message: if usb_mode {
+            "Codex Switch 已从 U 盘启动并显示配置窗口；配置保存在本机用户目录，请输入 API Key 完成配置".to_string()
+        } else {
+            "Codex Switch 已复制到本机、启动并显示配置窗口，请输入 API Key 完成配置".to_string()
+        },
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        source_candidates, verify_source_executable, CCSWITCH_EXECUTABLE, CCSWITCH_SOURCE_DIR,
+        autostart_targets, local_install_is_managed, source_candidates, verify_source_executable,
+        webview2_software_rendering_arguments, CCSWITCH_EXECUTABLE, CCSWITCH_MANAGED_MARKER,
+        CCSWITCH_SOURCE_DIR,
     };
     use std::fs;
     use std::path::Path;
@@ -511,6 +997,19 @@ mod tests {
     }
 
     #[test]
+    fn webview2_software_rendering_is_scoped_and_idempotent() {
+        assert_eq!(webview2_software_rendering_arguments(None), "--disable-gpu");
+        assert_eq!(
+            webview2_software_rendering_arguments(Some("--enable-logging")),
+            "--enable-logging --disable-gpu"
+        );
+        assert_eq!(
+            webview2_software_rendering_arguments(Some("--DISABLE-GPU --enable-logging")),
+            "--DISABLE-GPU --enable-logging"
+        );
+    }
+
+    #[test]
     fn source_manifest_hash_gate_rejects_tampered_executable() {
         let dir =
             std::env::temp_dir().join(format!("codex-ccswitch-hash-test-{}", std::process::id()));
@@ -528,5 +1027,64 @@ mod tests {
         fs::write(&executable, b"tampered payload").unwrap();
         assert!(verify_source_executable(&executable).is_err());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn local_ccswitch_cleanup_requires_a_valid_ownership_marker() {
+        let dir =
+            std::env::temp_dir().join(format!("codex-ccswitch-marker-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        assert!(!local_install_is_managed(&dir));
+
+        fs::write(
+            dir.join(CCSWITCH_MANAGED_MARKER),
+            serde_json::json!({
+                "product": "codex-usb-oneclick",
+                "component": "ccswitch",
+                "executable": CCSWITCH_EXECUTABLE,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(local_install_is_managed(&dir));
+
+        fs::write(
+            dir.join(CCSWITCH_MANAGED_MARKER),
+            serde_json::json!({
+                "product": "other-installer",
+                "component": "ccswitch",
+                "executable": CCSWITCH_EXECUTABLE,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(!local_install_is_managed(&dir));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn autostart_cleanup_matches_executable_not_substring() {
+        let path = r"C:\Program Files\CodexSwitch\CodexSwitch.exe";
+        assert!(autostart_targets(&format!("\"{path}\" --minimized"), path));
+        assert!(!autostart_targets(&format!("\"{path}.other.exe\""), path));
+        assert!(!autostart_targets(&format!("cmd.exe /c \"{path}\""), path));
+        assert!(!autostart_targets(&format!("\"{path}\"injected"), path));
+    }
+
+    #[test]
+    fn removal_postcondition_requires_not_found_not_probe_failure() {
+        use std::io::{Error, ErrorKind};
+
+        assert!(super::existence_from_probe(Ok(())).unwrap());
+        assert!(!super::existence_from_probe(Err(Error::from(ErrorKind::NotFound))).unwrap());
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::Interrupted,
+            ErrorKind::Other,
+        ] {
+            let error = super::existence_from_probe(Err(Error::from(kind))).unwrap_err();
+            assert_eq!(error.kind(), kind);
+        }
     }
 }
