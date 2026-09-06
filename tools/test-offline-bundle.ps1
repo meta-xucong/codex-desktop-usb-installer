@@ -1,11 +1,12 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
-    [string]$InstallerPath = (Join-Path $PSScriptRoot "..\release\setup\CodexDesktopSetup.exe"),
+    [string]$InstallerPath = "",
     [switch]$KeepArtifacts
 )
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+if ([string]::IsNullOrWhiteSpace($InstallerPath)) { $InstallerPath = Join-Path $PSScriptRoot "..\release\setup\CodexDesktopSetup.exe" }
 
 function Assert-Condition {
     param(
@@ -21,6 +22,10 @@ function New-FakeMsix {
         [string]$Path
     )
 
+    # Windows PowerShell 5.1 does not always load the enum assembly when only
+    # the FileSystem facade is requested; load both pieces explicitly so the
+    # synthetic MSIX fixture works on a stock Windows installation.
+    Add-Type -AssemblyName System.IO.Compression
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $archive = [System.IO.Compression.ZipFile]::Open(
         $Path,
@@ -113,14 +118,23 @@ try {
 
     $requiredFiles = @(
         "CodexDesktopSetup.exe",
+        "CodexAppManager.exe",
         "manifest.json",
         "SHA256SUMS.txt",
-        "payload/OpenAI.Codex_x64.msix"
+        "payload/OpenAI.Codex_x64.msix",
+        "apps/README.txt",
+        "content/README.txt",
+        "content/skills/README.txt",
+        "content/mcp/README.txt",
+        "resources/prerequisites/vc_redist.x64.exe",
+        "resources/prerequisites/MicrosoftEdgeWebView2RuntimeInstallerX64.exe"
     )
     foreach ($relativePath in $requiredFiles) {
         $candidate = Join-Path $outputDir ($relativePath.Replace('/', '\'))
         Assert-Condition (Test-Path -LiteralPath $candidate -PathType Leaf) "U 盘目录缺少 $relativePath"
     }
+    Assert-Condition (-not (Test-Path -LiteralPath (Join-Path $outputDir "WindowsApps"))) "便携布局不得预建 WindowsApps"
+    Assert-Condition (-not (Test-Path -LiteralPath (Join-Path $outputDir "WpSystem"))) "便携布局不得预建 WpSystem"
 
     $manifest = Get-Content -LiteralPath (Join-Path $outputDir "manifest.json") -Raw | ConvertFrom-Json
     Assert-Condition ($manifest.productVersion -eq "0.1.0") "输出 manifest 的 productVersion 不正确"
@@ -153,7 +167,7 @@ try {
         installer = $installer
         outputFiles = @(Get-ChildItem -LiteralPath $outputDir -File -Recurse).Count
         checksumEntries = $sums.Count
-        note = "已覆盖合成 MSIX 的收集、清单、SHA-256、U 盘布局和逐文件复核；未覆盖真实 Authenticode 与 Add-AppxPackage。"
+        note = "已覆盖合成 MSIX 的收集、清单、SHA-256、U 盘程序/内容布局和逐文件复核；确认不预建 WindowsApps/WpSystem。未覆盖真实 Authenticode 与便携 Codex 启动。"
     }
     if ($KeepArtifacts) { $result.savedOutput = $savedPath }
     $result | ConvertTo-Json -Depth 4

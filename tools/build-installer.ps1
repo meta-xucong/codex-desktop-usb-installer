@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$Target = "x86_64-pc-windows-msvc",
     [string]$CcswitchArtifactDir = "",
@@ -17,6 +17,35 @@ try {
     }
     $ccswitchSource = Join-Path $CcswitchArtifactDir "CodexSwitch.exe"
     $ccswitchResourceDir = Join-Path $repo "src-tauri\resources\ccswitch"
+    $vcRedistPath = Join-Path $repo "src-tauri\resources\prerequisites\vc_redist.x64.exe"
+    $vcRedistExpectedSha256 = "843068991DAAA1F73AD9F6239BCE4D0F6A07A51F18C37EA2A867E9BECA71295C"
+    if (-not (Test-Path -LiteralPath $vcRedistPath -PathType Leaf)) {
+        throw "未找到离线 VC++ x64 运行库：$vcRedistPath。请将未修改的 Microsoft vc_redist.x64.exe 放入该目录。"
+    }
+    $vcRedistHash = (Get-FileHash -LiteralPath $vcRedistPath -Algorithm SHA256).Hash
+    if ($vcRedistHash -ine $vcRedistExpectedSha256) {
+        throw "VC++ x64 运行库哈希不匹配：$vcRedistHash != $vcRedistExpectedSha256"
+    }
+    $vcRedistSignature = Get-AuthenticodeSignature -LiteralPath $vcRedistPath
+    if ($vcRedistSignature.Status -ne "Valid" -or
+        $vcRedistSignature.SignerCertificate.Subject -notmatch "Microsoft Corporation") {
+        throw "VC++ x64 运行库必须保持 Microsoft Authenticode 有效签名；当前状态=$($vcRedistSignature.Status)，签名者=$($vcRedistSignature.SignerCertificate.Subject)"
+    }
+    Write-Output "VC++ x64 离线运行库已校验：SHA256=$vcRedistExpectedSha256，签名者为 Microsoft Corporation"
+    # The raw USB manager skips NSIS, so no online WebView2 bootstrapper will
+    # ever run. Ship and verify the full Evergreen standalone x64 installer.
+    $webView2Path = Join-Path $repo "src-tauri\resources\prerequisites\MicrosoftEdgeWebView2RuntimeInstallerX64.exe"
+    $webView2ExpectedSha256 = "1F4638309F3D82C31A3028C3CF7D75998F58E4D1407380F5CB8A8E9172CAF17D"
+    if (-not (Test-Path -LiteralPath $webView2Path -PathType Leaf)) {
+        throw "缺少 WebView2 x64 完整离线安装包：$webView2Path（不要使用约 2 MB 的在线 Bootstrapper）"
+    }
+    $webView2Hash = (Get-FileHash -LiteralPath $webView2Path -Algorithm SHA256).Hash
+    if ($webView2Hash -ine $webView2ExpectedSha256) { throw "WebView2 离线安装包哈希不匹配：$webView2Hash" }
+    $webView2Signature = Get-AuthenticodeSignature -LiteralPath $webView2Path
+    if ($webView2Signature.Status -ne "Valid" -or $webView2Signature.SignerCertificate.Subject -notmatch "Microsoft Corporation") {
+        throw "WebView2 离线安装包必须保持 Microsoft 有效签名：$($webView2Signature.Status)"
+    }
+    Write-Output "WebView2 x64 完整离线安装包已通过哈希和 Microsoft 签名校验"
     if (-not (Test-Path -LiteralPath $ccswitchSource -PathType Leaf)) {
         throw "未找到 CodexSwitch.exe：$ccswitchSource。请先构建 CCSwitch 产品版，或通过 -CcswitchArtifactDir 指定产物目录。"
     }
@@ -71,25 +100,115 @@ try {
     # Windows screen, while the runtime dispatcher still keeps macOS online.
     & npm.cmd run build
     if ($LASTEXITCODE -ne 0) { throw "前端生产构建失败" }
-    # Build the Tauri application binary itself.  The USB entry must remain
+    # Build the Tauri application binary itself.  The USB manager is built as a
+    # separate requireAdministrator artifact.  The ordinary source build keeps
+    # CODEX_USB_MANAGER unset and therefore remains asInvoker for installed use.
     # next to manifest.json/payload at runtime; a normal NSIS setup EXE would
     # move the running process into Program Files before our offline probe.
     # `custom-protocol` is required for an offline release.  Without it,
     # Tauri deliberately keeps `cfg(dev)` enabled and opens build.devUrl
     # (127.0.0.1:1420), which only exists while `tauri dev` is running.
-    & cargo.exe build --release --features custom-protocol --manifest-path src-tauri\Cargo.toml --target $Target
-    if ($LASTEXITCODE -ne 0) { throw "Tauri 应用二进制构建失败" }
+    $previousUsbManagerFlag = $env:CODEX_USB_MANAGER
+    try {
+        $env:CODEX_USB_MANAGER = "1"
+        & cargo.exe build --release --features custom-protocol --manifest-path src-tauri\Cargo.toml --target $Target
+        if ($LASTEXITCODE -ne 0) { throw "Tauri USB 管理器构建失败" }
+    } finally {
+        if ($null -eq $previousUsbManagerFlag) {
+            Remove-Item Env:CODEX_USB_MANAGER -ErrorAction SilentlyContinue
+        } else {
+            $env:CODEX_USB_MANAGER = $previousUsbManagerFlag
+        }
+    }
     $releaseDir = Join-Path $repo "src-tauri\target\$Target\release"
     $binary = Join-Path $releaseDir "codex-app-manager.exe"
     if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
         throw "未找到 Tauri 应用二进制：$binary"
     }
     $setupDir = (New-Item -ItemType Directory -Force -Path (Join-Path $repo "release\setup")).FullName
-    Copy-Item -LiteralPath $binary -Destination (Join-Path $setupDir "CodexDesktopSetup.exe") -Force
-    $resources = Join-Path $releaseDir "resources"
-    if (Test-Path -LiteralPath $resources -PathType Container) {
-        Copy-Item -LiteralPath $resources -Destination $setupDir -Recurse -Force
+    # The copied manager is the USB-specific requireAdministrator build.  The
+    # tiny launcher remains the friendly entry point, but a direct/legacy launch
+    # cannot accidentally run AppX operations with a filtered token.
+    $managerForUsb = Join-Path $setupDir "CodexAppManager.exe"
+    Copy-Item -LiteralPath $binary -Destination $managerForUsb -Force
+    $launcherVerifier = Join-Path $repo "tools\verify-usb-launcher.ps1"
+    if (-not (Test-Path -LiteralPath $launcherVerifier -PathType Leaf)) {
+        throw "缺少 USB 入口/管理器清单验证脚本：$launcherVerifier"
     }
-    Write-Output "U 盘入口产物：$(Join-Path $setupDir 'CodexDesktopSetup.exe')"
+    # Tauri embeds its own RT_MANIFEST resource, so the linker cannot replace
+    # its requestedExecutionLevel.  Patch only this copied USB artifact with
+    # the Windows SDK manifest tool; the release source binary remains the
+    # ordinary asInvoker manager used by local/installed launches.  Fail
+    # closed when the SDK is unavailable instead of shipping a manager whose
+    # elevation status is ambiguous.
+    $managerManifest = Join-Path $repo "tools\codex-usb-launcher\usb-launcher.manifest"
+    if (-not (Test-Path -LiteralPath $managerManifest -PathType Leaf)) {
+        throw "缺少 USB requireAdministrator 清单：$managerManifest"
+    }
+    $programFilesX86 = [Environment]::GetEnvironmentVariable("ProgramFiles(x86)")
+    $programFiles = [Environment]::GetEnvironmentVariable("ProgramFiles")
+    $windowsKitRoots = @(
+        $(if (-not [string]::IsNullOrWhiteSpace($programFilesX86)) { Join-Path $programFilesX86 "Windows Kits\10\bin" }),
+        $(if (-not [string]::IsNullOrWhiteSpace($programFiles)) { Join-Path $programFiles "Windows Kits\10\bin" })
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and (Test-Path -LiteralPath $_) }
+    $mtCandidates = foreach ($kitRoot in $windowsKitRoots) {
+        Get-ChildItem -LiteralPath $kitRoot -Recurse -Filter "mt.exe" -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match "\\x64\\mt\.exe$" }
+    }
+    $mt = $mtCandidates | Sort-Object FullName -Descending | Select-Object -First 1
+    if ($null -eq $mt) {
+        throw "未找到 Windows SDK mt.exe（需要 Windows Kits\\10\\bin\\<version>\\x64\\mt.exe）"
+    }
+    # Copying a freshly linked PE can briefly trigger an on-access scanner.
+    # `mt.exe` then reports access denied even though the file ACL is writable;
+    # retry only this idempotent resource update with a short bounded delay.
+    $managerManifestWritten = $false
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        & $mt.FullName -manifest $managerManifest ("-outputresource:{0};#1" -f $managerForUsb)
+        if ($LASTEXITCODE -eq 0) {
+            $managerManifestWritten = $true
+            break
+        }
+        if ($attempt -lt 5) {
+            Write-Warning "mt.exe 暂时无法写入 USB 管理器（尝试 $attempt/5），稍后重试"
+            Start-Sleep -Milliseconds (500 * $attempt)
+        }
+    }
+    if (-not $managerManifestWritten) {
+        throw "无法把 requireAdministrator 清单写入 USB 管理器：$managerForUsb"
+    }
+    Write-Output "已为 USB 管理器写入 requireAdministrator 清单：$managerForUsb（$($mt.FullName)）"
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $launcherVerifier -Path $managerForUsb -ExpectedLevel requireAdministrator
+    if ($LASTEXITCODE -ne 0) { throw "USB 管理器的嵌入式 requireAdministrator 清单验证失败" }
+    $launcherProject = Join-Path $repo "tools\codex-usb-launcher\Cargo.toml"
+    $launcherBinary = Join-Path $repo "tools\codex-usb-launcher\target\$Target\release\codex-usb-launcher.exe"
+    & cargo.exe build --release --manifest-path $launcherProject --target $Target
+    if ($LASTEXITCODE -ne 0) { throw "USB 管理员入口构建失败" }
+    if (-not (Test-Path -LiteralPath $launcherBinary -PathType Leaf)) {
+        throw "未找到 USB 管理员入口：$launcherBinary"
+    }
+    $usbLauncher = Join-Path $setupDir "CodexUsbLauncher.exe"
+    Copy-Item -LiteralPath $launcherBinary -Destination $usbLauncher -Force
+    # Verify the actual copied artifact, not only the Cargo source manifest.
+    # This catches linker/resource regressions where a future build silently
+    # falls back to the default asInvoker manifest.
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $launcherVerifier -Path $usbLauncher
+    if ($LASTEXITCODE -ne 0) { throw "USB 管理员入口的嵌入式 requireAdministrator 清单验证失败" }
+    # Keep the user-facing historical name aligned with the actual USB entry.
+    # The normal Tauri manager is available separately as CodexAppManager.exe;
+    # no asInvoker binary is published under the misleading setup name.
+    Copy-Item -LiteralPath $usbLauncher -Destination (Join-Path $setupDir "CodexDesktopSetup.exe") -Force
+    # cargo build does not guarantee a fresh target/release/resources copy.
+    # Stage from the verified source resources and copy contents explicitly;
+    # repeated builds must not nest resources/resources or retain old payloads.
+    $resourceRoot = Join-Path $repo "src-tauri\resources"
+    $setupResourceRoot = Join-Path $setupDir "resources"
+    New-Item -ItemType Directory -Path $setupResourceRoot -Force | Out-Null
+    Get-ChildItem -LiteralPath $resourceRoot | ForEach-Object {
+        Copy-Item -LiteralPath $_.FullName -Destination $setupResourceRoot -Recurse -Force
+    }
+    Write-Output "USB 入口产物：$(Join-Path $setupDir 'CodexDesktopSetup.exe')（requireAdministrator 清单）"
+    Write-Output "USB 入口别名：$usbLauncher"
+    Write-Output "USB 管理器本体：$managerForUsb（requireAdministrator，入口启动或直接启动均安全）"
 }
 finally { Pop-Location }

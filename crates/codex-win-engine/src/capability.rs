@@ -89,16 +89,15 @@ impl WinCapabilityReport {
             || msix_deployment.state == CapabilityState::Unavailable;
         let recommendation = if msix_blocked {
             if msix_deployment.state == CapabilityState::Unavailable {
-                // The deployment runtime itself is broken — the exact 0x80040154
-                // case. Sideloading cannot possibly succeed, so go straight to
-                // portable instead of letting the user hit a failed MSIX attempt.
+                // A recommendation is not permission to change installation
+                // mode: fixed-MSIX USB bundles must still stop on this failure.
                 notes.push(
-                    "MSIX deployment is broken on this machine (the PackageManager COM class is not registered, e.g. 0x80040154); using the portable build."
+                    "MSIX deployment runtime activation failed (for example, 0x80040154). A portable build is an option only when the selected installation mode permits it; fixed-MSIX USB installation cannot fall back."
                         .to_string(),
                 );
             } else {
                 notes.push(
-                    "MSIX sideloading appears blocked; use the portable fallback when available."
+                    "MSIX sideloading appears blocked; a portable fallback is only a recommendation for modes that explicitly permit it."
                         .to_string(),
                 );
             }
@@ -106,7 +105,7 @@ impl WinCapabilityReport {
         } else {
             if sideload_policy.state == CapabilityState::Unknown {
                 notes.push(
-                    "Sideload policy is not explicitly enabled; installation may still succeed on modern Windows and will fall back if it fails."
+                    "Sideload policy is not conclusively known; see the probe detail for an unconfigured value or a read error. This is not evidence that developer mode is required or that USB deployment is blocked. Installation mode controls whether any fallback is permitted."
                         .to_string(),
                 );
             }
@@ -116,13 +115,15 @@ impl WinCapabilityReport {
         let appx_service_state = appx_service.state.as_str();
         let sideload_policy_state = sideload_policy.state.as_str();
         let msix_deployment_state = msix_deployment.state.as_str();
-        let developer_mode = "unknown";
         let metered = metered_network.state.as_str();
         log::info!(
-            "Windows capability probe result add_appx={add_appx} appx_service={appx_service_state} sideload_policy={sideload_policy_state} msix_deployment={msix_deployment_state} developer_mode={developer_mode} metered={metered}"
+            "Windows capability probe result add_appx={add_appx} appx_service={appx_service_state} sideload_policy={sideload_policy_state} msix_deployment={msix_deployment_state} metered={metered}"
         );
         if recommendation == SideloadRecommendation::PortableFallback {
-            let reason = notes.last().map(String::as_str).unwrap_or("MSIX sideload blocked");
+            let reason = notes
+                .last()
+                .map(String::as_str)
+                .unwrap_or("MSIX sideload blocked");
             log::warn!("MSIX sideload blocked; recommending portable fallback reason={reason}");
         }
 
@@ -167,6 +168,11 @@ mod tests {
             vec![],
         );
         assert_eq!(report.recommendation, SideloadRecommendation::MsixPreferred);
+        assert!(report.notes.iter().any(|note| note.contains("read error")));
+        assert!(!report
+            .notes
+            .iter()
+            .any(|note| note.contains("will fall back")));
     }
 
     #[test]
@@ -206,5 +212,9 @@ mod tests {
             SideloadRecommendation::PortableFallback
         );
         assert!(report.notes.iter().any(|note| note.contains("0x80040154")));
+        assert!(report
+            .notes
+            .iter()
+            .any(|note| note.contains("fixed-MSIX USB installation cannot fall back")));
     }
 }

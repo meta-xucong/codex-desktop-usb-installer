@@ -1,136 +1,179 @@
-# Codex Desktop USB Installer（第一版实现）
+# Codex Desktop USB Installer（程序在 U 盘、数据在本机）
 
-这是基于 `Codex App Manager` Windows/MSIX 安装能力的第一版离线产品层。正式构建时，安装器和固定版本 MSIX 放在同一个 USB bundle 中：
+> 当前版本：v0.5.24。程序/数据分离见
+> [v0.5.20 审计](docs/releases/v0.5.20-usb-program-local-data-audit.md)，租约路径修复见
+> [v0.5.21 审计](docs/releases/v0.5.21-usb-lease-path-audit.md)，启动兼容与窗口验收见
+> [v0.5.24 审计](docs/releases/v0.5.24-usb-license-finalizer-audit.md)。
+
+这是面向 Windows 小白用户的一键离线套件。用户双击 U 盘中的
+`CodexDesktopSetup.exe`，确认一次标准 UAC 后，由管理器完成载荷核验、Codex
+便携程序安装、依赖检查和 Codex Switch 启动。
+
+## 当前架构
+
+v0.5.20+ 不再把 Codex 注册为 U 盘 AppX 包，也不再依赖 Windows 的外部
+`AppXVolume`。固定 MSIX 仍是受信载荷容器，但安装时按 ZIP/MSIX 结构安全解包：
 
 ```text
-CodexDesktopSetup.exe
-manifest.json
-SHA256SUMS.txt
-payload/OpenAI.Codex_x64.msix
-ccswitch/CodexSwitch.exe
-resources/ccswitch/CodexSwitch.exe
+<USB bundle>/
+├─ CodexDesktopSetup.exe          唯一建议入口
+├─ CodexAppManager.exe            管理器本体
+├─ manifest.json
+├─ usb-manifest.json
+├─ SHA256SUMS.txt
+├─ payload/OpenAI.Codex_x64.msix  固定、验签的离线载荷
+├─ apps/
+│  └─ Codex/                      安装后生成；只放 Codex 程序文件
+├─ content/
+│  ├─ skills/                     预装 Skill 载荷边界
+│  └─ mcp/                        预装 MCP 程序/静态资源边界
+├─ ccswitch/CodexSwitch.exe
+└─ resources/prerequisites/
+   ├─ vc_redist.x64.exe
+   └─ MicrosoftEdgeWebView2RuntimeInstallerX64.exe
 ```
 
-生产模式启动后只读取安装器目录下的 `manifest.json` 和 `payload/*.msix`，不会访问 GitHub、Microsoft Store、镜像站或动态 Release API。流程为：
+数据边界：
 
-1. 读取并校验 manifest 路径、版本、架构、最低 Windows Build；
-2. 校验 MSIX 文件大小和 SHA-256；
-3. 读取 `AppxManifest.xml`，验证 `OpenAI.Codex` 身份、包版本、架构和桌面入口；
-4. 在 Windows 上验证 OpenAI Marketplace Authenticode；
-5. 将 MSIX 复制到 `%TEMP%\\CodexDesktopInstaller\\<version>` 并再次校验；
-6. 优先调用现有受保护的 `Add-AppxPackage` 安装路径；
-7. 如果 Windows AppX 服务/策略阻断部署，则从同一份已校验的 MSIX 解包到本地便携目录，
-   不下载、不替换为其他版本；
-8. 安装成功后通过系统注册信息或便携入口启动 Codex，清理暂存文件。
-9. Codex 版本确认成功后，自动寻找 `ccswitch/CodexSwitch.exe` 或
-   `resources/ccswitch/CodexSwitch.exe`，复制到
-   `%LOCALAPPDATA%\\Programs\\CodexSwitch` 并启动本机副本。CCSwitch 失败不会回滚
-   已成功的 Codex 安装，安装完成页提供“打开 Codex Switch”重试按钮。
+| 内容 | 位置 |
+| --- | --- |
+| Codex 程序 | `<USB bundle>\apps\Codex` |
+| Codex CLI/账号/配置状态 | `%USERPROFILE%\.codex` |
+| 桌面端漫游数据 | `%APPDATA%\Codex` |
+| 桌面端本地缓存/日志 | `%LOCALAPPDATA%\Codex` |
+| Codex Switch 程序 | U 盘 `ccswitch` |
+| Codex Switch 用户配置 | 应用定义的本机用户目录 |
+| Skill 载荷（后续导入） | U 盘 `content\skills` |
+| MCP 可执行文件/静态资源（后续导入） | U 盘 `content\mcp` |
+| MCP/Codex 配置与密钥 | 本机 `%USERPROFILE%\.codex\config.toml` 等用户目录 |
 
-## 从 GitHub Fork 更新固定载荷
+“数据在本机”按 Windows 用户实际配置判断，通常就是 C 盘。安装前同时核验环境变量
+声明盘符和目录解析后的真实盘符；若用户配置目录或其父级 Junction 实际落在产品 U
+盘，安装会停止，不能把“看起来是 C 盘”误报为数据分离成功。
 
-已配置的上游 Fork 为 `meta-xucong/codex-app-mirror`，其 GitHub Actions 每 3 小时检查
-`Wangnov/codex-app-mirror`，并同步最新稳定版 Windows x64 MSIX 到 Fork Release。安装器
-构建机只需登录 GitHub CLI，即可自动下载固定 Release、读取版本清单、校验 MSIX 签名，
-再生成离线 U 盘目录：
+## 为什么废弃 USB AppXVolume 路线
+
+目标机已经证明：即使请求系统数据卷，Windows 10 仍可能把打包应用数据物化为
+`%LOCALAPPDATA%\Packages\OpenAI.Codex_*` 到 `<USB>\WpSystem\...` 的 Junction。
+因此“策略已写入”“注册 API 已完成”和“数据尚未创建”都不能证明数据最终在 C 盘。
+
+v0.5.20+ 从结构上消除这类不确定性：生产安装路线不调用
+`Add-AppxPackage`、`StagePackageAsync`、`RegisterPackageAsync`、`Add-AppxVolume` 或
+`Move-AppxPackage`，也不创建 `WindowsApps`、`WpSystem` 或跨卷包数据 Junction。
+旧 AppX 代码仅保留用于识别和清理早期版本遗留状态，不是新装路径。
+
+## 安装流程
+
+1. `CodexDesktopSetup.exe` 通过内嵌 `requireAdministrator` 清单请求标准 UAC，并启动同目录管理器。
+2. 核验 U 盘身份、授权锚点、固定 manifest、MSIX 大小、SHA-256、包身份、x64 架构和桌面入口。
+3. 将 MSIX 复制到本机临时目录后，以独立长时限完成 Authenticode 校验，避免慢 U 盘导致误超时。
+4. 核验目标必须是当前已授权 U 盘的精确 `apps\Codex`，拒绝 Junction、符号链接、UNC、相对路径和持久化的旧 C 盘路径。
+5. 核验 `%USERPROFILE%`、`%APPDATA%`、`%LOCALAPPDATA%` 的声明位置与真实解析位置均不在产品 U 盘。
+6. 在 `apps` 下建立同卷暂存目录，逐项安全解包；拒绝绝对路径、`..`、链接类条目和越界写入，并复核写入字节数。
+7. 事务性把旧程序树改名为 rollback，再将新树原子改名为 `apps\Codex`；入口和 manifest 后置条件失败时恢复旧树。
+8. USB 模式不创建 Codex 直接开始菜单入口，也不在 API 配置完成前启动 Codex，避免绕过看门狗。
+9. 检查 WebView2 与 VC++ x64 运行库；只运行 U 盘内哈希固定、微软签名的完整离线安装器，不手工复制 DLL。
+10. 以仅作用于子进程的软件渲染参数从 U 盘启动 Codex Switch；只有检测到尺寸正常的
+    可操作窗口并将其恢复到屏幕内、前置显示后才报告成功，再引导用户填写 API Key。
+    密钥不预置在发行包中。
+
+## 启动与 U 盘约束
+
+安装完成后仍从 `CodexDesktopSetup.exe` 进入。管理器只会启动当前授权 U 盘中精确
+`apps\Codex` 下的程序，并显式传入本机 `%USERPROFILE%\.codex` 作为 `CODEX_HOME`。
+拔出 U 盘后，看门狗按既有五秒宽限终止本产品启动的 Codex/CCSwitch 进程。
+
+USB 启动会先使用 `--disable-gpu` 软件渲染，并等待可操作窗口稳定存在；仅当该安全模式
+仍无法显示窗口时，才自动清理本次失败进程并以目标机已经验证可用的
+`--disable-gpu --no-sandbox` 重试。成功的兼容选择只按当前 Codex 版本记录在本机，升级
+Codex 后会重新从安全模式探测。`--no-sandbox` 会降低 Chromium 子进程隔离强度，因此
+不是全局设置，也不会用于其他 Codex 或浏览器进程。
+
+每次启动管理器还会核对本机看门狗副本与 U 盘当前版本；不一致时先让旧 helper 正常
+退出，再做哈希校验后的原子刷新，避免升级后继续运行旧版路径/租约逻辑。
+
+不创建直接 Codex 快捷方式是有意设计：快捷方式指向 `Codex.exe` 会绕过 U 盘租约。
+发行包复制到另一位置后，卷序列号、锚点哈希和 bundle 相对路径不匹配时不能获得租约。
+
+## Skill 与 MCP 边界
+
+v0.5.20+ 先固化目录与安全约束，尚未声称自动导入 Skill/MCP：
+
+- Skill 的程序和说明文件可预置到 `content\skills\<skill>`。下一阶段导入器可在 Codex
+  支持的发现目录创建指向 U 盘的目录链接，使载荷仍留在 U 盘。
+- MCP 的可执行文件和只读资源可预置到 `content\mcp`；Codex 的 MCP 配置仍写入本机
+  `~/.codex/config.toml`，并在盘符变化时由管理器更新绝对路径。
+- API Key、OAuth token、登录状态和用户会话不得写进 `content`，也不得加入发行校验清单。
+
+## 卸载
+
+普通卸载：
+
+- 关闭并移除当前 bundle 的 `apps\Codex`；
+- 清理本产品管理器/看门狗/CCSwitch 的受管组件；
+- 默认保留 `%USERPROFILE%\.codex`、`%APPDATA%\Codex` 和
+  `%LOCALAPPDATA%\Codex`，避免误删官方 Codex/CLI 共用数据；
+- 可识别并通过 Windows 支持的 API 清理早期版本遗留的精确 OpenAI.Codex AppX 状态，
+  但不会接管 `WindowsApps` ACL 或编辑私有包数据库。
+
+高级“清除个人数据”是独立、默认关闭的破坏性选项，会明确列出路径并再次确认。
+“同时删除 U 盘安装介质”先允许精确的 `apps\Codex` 作为待卸载运行目录；主卸载完成后
+重新执行严格清单核验。管理器自己生成的 `usb-license.json` 及原子 `.bak` 被建模为
+“有类型的可变身份元数据”，而不是不可变发行文件：卸载前从当前进程持有的租约捕获
+完整 U 盘指纹，二阶段再核对卷身份、发行清单哈希、许可证字节和完整许可证身份，最后
+才删除许可证与重试入口。清理直接使用受限文件句柄，不依赖可移动盘回收站。
+
+只有运行目录已消失、以上证据仍一致且没有未知文件时才删除介质。未知 Skill/MCP、
+用户文件、伪造/损坏/错指纹许可证都会逐项列在卸载报告中并被保留，不会静默删除。
+
+## 构建
+
+先准备固定的真实 x64 MSIX：
+
+```powershell
+pwsh .\tools\collect-payload.ps1 `
+  -SourcePath D:\input\OpenAI.Codex.msix `
+  -CodexDesktopVersion 26.825.41651
+pwsh .\tools\verify-payload.ps1 -BundlePath .\release\usb
+```
+
+也可从已配置的 GitHub Fork 更新固定载荷：
 
 ```powershell
 gh auth status
 npm run offline:update-fork
 ```
 
-也可以固定某个 Release，便于复现构建：
-
-```powershell
-pwsh .\tools\update-from-github-fork.ps1 `
-  -Repository meta-xucong/codex-app-mirror `
-  -ReleaseTag codex-app-26.825.41651
-```
-
-脚本默认使用 x64；ARM64 构建机可以添加 `-Architecture arm64`。正式流程不使用
-`-SkipSignature`，下载目录中的 MSIX 必须通过 Authenticode、身份、架构、版本和 SHA-256
-校验。
-
-## 手工构建固定载荷
-
-如果不使用 GitHub CLI，也可以手工提供一个真实 MSIX：
-
-```powershell
-pwsh .\tools\collect-payload.ps1 `
-  -SourcePath D:\input\OpenAI.Codex.msix `
-  -CodexDesktopVersion 26.602.40724
-pwsh .\tools\verify-payload.ps1 -BundlePath .\release\usb
-```
-
-`-SkipSignature` 只用于本地合成 fixture 测试，不能用于正式包。
-
-## 构建和生成 U 盘目录
+构建入口与最终目录：
 
 ```powershell
 pwsh .\tools\build-installer.ps1
-pwsh .\tools\build-usb-layout.ps1 `
-  -InstallerPath .\release\setup\CodexDesktopSetup.exe `
-  -BundlePath .\release\usb
-# 生成 Codex + CCSwitch 一键验证目录
-pwsh .\tools\build-oneclick-usb-layout.ps1 -SkipSignature
-pwsh .\release\usb-oneclick\verify-usb.ps1 -SkipNetwork
+pwsh .\tools\build-oneclick-usb-layout.ps1 `
+  -OutputPath .\release\usb-oneclick-v0.5.24-final
+pwsh .\tools\verify-oneclick-usb.ps1 `
+  -BundlePath .\release\usb-oneclick-v0.5.24-final `
+  -SkipNetwork
 ```
 
-`build-installer.ps1` 生成的是可直接从 U 盘运行的 Tauri 应用 EXE，不是
-NSIS 的二级 `*-setup.exe`。这样运行时的 `current_exe()` 仍位于 U 盘，才能
-发现旁边的 `manifest.json` 和 `payload`；Tauri `resources` 目录会一并复制。
-脚本会以 `--features custom-protocol` 构建发布二进制，把 `dist` 内嵌进 EXE；
-如果省略该特性，Tauri 会回到 `devUrl`（默认 `127.0.0.1:1420`），在没有开发服务器
-的 U 盘电脑上会出现 `ERR_CONNECTION_REFUSED`。
+正式发布不能使用 `-SkipSignature`。`-SkipSignature` 仅允许合成 MSIX 测试夹具。
 
-第一版保留上游 Tauri 窗口样式，但生产构建在 Windows 上进入离线主页；在线目录、自动更新、API、Skill、MCP 和拔盘退出均未启用。离线入口使用固定 `msix-fixed` 路径，始终优先安装 MSIX；只有本地 MSIX 已通过校验而 Windows 拒绝 AppX 部署时，才启用同一文件的本地解包应急路径。
-
-`release\\usb-oneclick` 是当前推荐的交付目录。它的入口 EXE 内置“Codex 安装成功后
-启动 CCSwitch”的状态机，但 802 MB 的 MSIX 仍作为 `payload` 放在 EXE 旁边，避免
-把超大载荷复制到进程资源或触发 Windows 更新引擎的离线载荷错误。`manifest.json`
-始终是 Codex 安装器清单；联合包信息单独放在 `usb-manifest.json`。
-
-### 一键卸载 Codex 与 CCSwitch
-
-离线版在 Codex 已安装页面提供“卸载 Codex 与 CCSwitch”入口；“设置 → 更多”中也有
-同名入口。它会先关闭 `CodexSwitch.exe` 及其子进程，移除本安装器复制到
-`%LOCALAPPDATA%\\Programs\\CodexSwitch` 的程序、匹配的开机启动项，再调用现有受保护
-的 Codex 卸载流程。默认保留 `%USERPROFILE%\\.codex` 和 `%USERPROFILE%\\.cc-switch`，
-因此不会误删登录、会话和供应商配置；关闭“保留我的数据”并完成第二次确认后，才会
-清除这两个目录以及 CCSwitch 的 Tauri WebView 缓存。清理步骤可重复执行，遇到进程锁定
-时关闭托盘程序后重新进入该页面即可重试。其他位置单独安装的 CCSwitch 不会被删除。
-
-MSIX 部署失败报告会附带 Windows HRESULT、ActivityId 和有限长度的 `Get-AppxLog` 内容，
-可在“打开日志”或错误详情中复制给维护人员。安装器不会自动修改
-`AllowAllTrustedApps`、证书信任库或企业策略；如果连本地解包也失败，应根据这些诊断修复系统，
-或改用受支持的 Windows 版本。
-
-## 测试
+## 验证
 
 ```powershell
-npm ci
 npm run check
-npm test -- --run src
 npm run test:offline
-npm run test:offline-bundle
+npm test
 cargo test --manifest-path .\src-tauri\Cargo.toml
-# 发布特性编译检查（与 U 盘 EXE 相同的 Cargo 特性）
-cargo test --features custom-protocol --manifest-path .\src-tauri\Cargo.toml --target x86_64-pc-windows-msvc
+pwsh .\tools\test-offline-bundle.ps1
 ```
 
-Rust 离线模块的测试使用合成 MSIX ZIP，覆盖 manifest 路径穿越、身份/入口、哈希校验、暂存后二次校验和 Windows Build 解析；不会调用真实 `Add-AppxPackage`。真实安装必须在断网 Windows 10/11 x64 虚拟机中完成验收。
+开发机自动测试不会执行真实 AppX 安装/卸载、HKLM 写入或修改
+`C:\Program Files\WindowsApps`。最终仍需在目标 Windows 10/11 空白机验证：程序目录位于
+U 盘、首次运行后本机用户数据产生在正常配置目录、U 盘根没有 `WindowsApps/WpSystem`、
+拔盘五秒终止、重插后历史数据仍可用，以及普通/彻底卸载的终态。
 
-`npm run test:offline-bundle` 会生成一个仅用于测试的无签名合成 MSIX，完整跑通
-`collect-payload.ps1`、`verify-payload.ps1`、`build-usb-layout.ps1`，并逐文件复核最终
-U 盘目录的 `SHA256SUMS.txt`。该测试产物不会写入 `release\usb-final`，也不能拿来安装
-或对外发行；正式构建必须替换为已获授权且 Authenticode 有效的 Codex Desktop MSIX。
+## 历史资料
 
-仓库完整 `npm test` 还包含上游 release/WSL fixture；在没有可用 WSL `/bin/bash`
-的构建机上，这部分会因环境超时，不影响上述产品源码测试。需要完整回归时请先准备
-WSL，再执行 `npm test`。
-
-本机本次回归记录见 `TEST-REPORT.offline.md`。
-
-## 合规边界
-
-本仓库只提供安装器代码。Codex Desktop MSIX、商标、签名和再分发权不由 MIT 许可覆盖。当前产物仅用于内部技术验证，正式商业发行前必须取得相应授权并对安装器 EXE 做 Authenticode 签名。
+v0.5.19 及以前的 AppXVolume、跨卷数据恢复、孤儿包和 Junction 审计保留在
+`docs/releases/` 与 `docs/USB-APPXVOLUME-PORTABLE-*.md`，仅用于迁移、卸载兼容和问题
+溯源，不再代表当前安装路线。

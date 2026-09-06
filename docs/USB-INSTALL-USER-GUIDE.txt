@@ -1,0 +1,145 @@
+Codex U 盘版 v0.5.24 — 使用说明
+================================
+
+一、该运行哪个文件
+------------------
+
+请双击 U 盘根目录的：CodexDesktopSetup.exe
+
+看到 Windows 用户账户控制（UAC）时点击“是”。
+不要直接运行 CodexAppManager.exe，也不要直接打开 apps\Codex 里的 Codex.exe；
+这些入口可能绕过正常的一键流程或 U 盘授权检查。
+
+
+二、这一版把什么放在哪里
+------------------------
+
+U 盘：
+
+  apps\Codex                 Codex 程序本体（安装后生成）
+  content\skills             预装 Skill 载荷目录（当前仅预留）
+  content\mcp                预装 MCP 程序/资源目录（当前仅预留）
+  ccswitch                   Codex Switch 程序
+  payload                    经校验的离线 MSIX 原始载荷
+
+本机用户目录（通常在 C 盘）：
+
+  %USERPROFILE%\.codex       Codex 配置、账号/会话及 CLI 共用状态
+  %APPDATA%\Codex            桌面端漫游数据
+  %LOCALAPPDATA%\Codex       桌面端本地缓存和日志
+
+本版不会在 U 盘创建 WindowsApps、WpSystem，也不会把 Codex 用户数据通过
+Junction 链接到 U 盘。若本机账户主动把用户配置目录重定向到了这只 U 盘，安装器
+会停止并提示，避免误报为“数据在本机”。
+
+
+三、第一次安装
+--------------
+
+1. 将完整发行文件夹复制到 U 盘；不要只复制 EXE。
+2. 双击 CodexDesktopSetup.exe。
+3. 在 UAC 窗口点击“是”。
+4. 等待载荷校验和安装完成。大 MSIX 的签名校验可能需要数分钟，请勿拔盘。
+5. 管理器会自动打开 Codex Switch。
+6. 在 404TOKEN 配置中填写用户自己的 API Key，保存并启用。
+7. 返回管理器启动 Codex。
+
+管理器会自动为 Codex Switch 使用软件渲染、恢复并前置真正的主窗口。启动 Codex 时
+也会先尝试软件渲染；若目标电脑的 Chromium 沙箱与显卡驱动冲突，会自动清理失败
+进程并完成一次兼容重试，不需要用户手工添加启动参数。
+
+安装器会自动检测 WebView2 和 VC++ x64 运行库。缺失时只使用 U 盘中已固定哈希、
+微软签名的完整离线安装包补齐；不会下载 DLL，也不会关闭杀毒软件。
+
+
+四、日常使用
+------------
+
+每次都从 U 盘根目录的 CodexDesktopSetup.exe 进入。
+
+使用过程中保持 U 盘连接。拔掉 U 盘后有约 5 秒宽限，管理器会结束本产品启动的
+Codex 和 Codex Switch。重新插回同一只授权 U 盘后可以再次打开；历史配置和数据仍
+从本机用户目录读取。
+
+不要移动或改名以下内容：
+
+  CodexDesktopSetup.exe
+  CodexAppManager.exe
+  manifest.json
+  usb-manifest.json
+  SHA256SUMS.txt
+  payload、apps、content、ccswitch、resources 文件夹
+
+不要手工修改 WindowsApps、WpSystem、PackageRepository 或相关 ACL。v0.5.20+ 新装
+路线不使用它们；若旧版本留下 AppX 状态，应由管理器的兼容清理流程处理。
+
+
+五、Skill 和 MCP
+----------------
+
+v0.5.20+ 已建立 content\skills 与 content\mcp 的目录和安全边界，但本版暂未实现
+自动导入按钮。不要把 API Key、OAuth token 或登录凭证放入这两个目录。
+
+后续版本会让 Skill 载荷继续留在 U 盘，通过 Codex 支持的发现入口引用；MCP 程序
+可以留在 U 盘，但 MCP 配置和密钥仍写在本机 %USERPROFILE%\.codex\config.toml。
+
+
+六、卸载
+--------
+
+在管理器中选择“卸载 Codex + Codex Switch”。
+
+普通卸载会删除 U 盘 apps\Codex 和本产品受管组件，但默认保留本机 Codex 数据。
+这是为了避免删除官方 Codex 或 Codex CLI 也在使用的配置和登录信息。
+
+如果明确选择“清除 Codex 个人数据”，界面会列出本机路径并要求再次确认。该操作
+不可恢复，也可能影响同一 Windows 账户下的官方 Codex/CLI。
+
+如果同时选择“删除 U 盘安装介质”，管理器会先卸载 apps\Codex，再严格复核发行包
+哈希。存在未知文件、用户自行加入的 Skill/MCP 或文件被修改时，会保留介质并报告，
+不会静默删除用户内容。
+
+usb-license.json 是管理器为当前物理 U 盘生成的可变身份文件，不属于不可变发行哈希
+清单。卸载器会在看门狗停止前取得当前租约指纹，二阶段再复核卷身份、发行清单、
+许可证及其原子备份均未变化，最后才直接删除许可证和卸载入口；不依赖 U 盘回收站。
+名称相同但内容、产品、指纹或签名不匹配的文件不会被删除。若存在其他未知项目，
+卸载报告会逐项列出并保留介质，便于用户先自行移走文件后重试。
+
+
+七、常见提示
+------------
+
+“权限不足”
+  请确认启动的是 CodexDesktopSetup.exe，并在 UAC 中点“是”。标准用户需要输入
+  管理员凭据。企业 WDAC/AppLocker/组策略阻止时，产品不能绕过，需要管理员处理。
+
+“载荷校验超时或失败”
+  不要拔盘。换到健康的 USB 端口重试；若哈希失败，请重新完整复制发行目录。
+
+“用户数据目录指向 U 盘”
+  本机 USERPROFILE、APPDATA 或 LOCALAPPDATA 被重定向到产品 U 盘。请恢复正常的
+  Windows 用户目录后再装；安装器不会在这种状态下继续。
+
+“安装成功但找不到开始菜单 Codex”
+  这是当前设计。直接 Codex 快捷方式会绕过 U 盘授权，请从
+  CodexDesktopSetup.exe 启动。
+
+“点启动后短暂等待”
+  管理器正在确认 Codex 是否出现稳定、可操作的窗口；只有进程但没有窗口不会被误报
+  为成功。首次在不兼容显卡环境上可能自动进行第二次兼容启动，后续同一 Codex 版本
+  会复用已验证的模式。
+
+“U 盘根出现 WindowsApps 或 WpSystem”
+  它们不是 v0.5.20+ 新装路线应产生的内容，通常是旧版残留。先保存日志，通过管理器
+  的卸载/兼容清理处理，不要手工夺权或强删。
+
+
+八、反馈安装失败时请保留
+------------------------
+
+  %LOCALAPPDATA%\io.github.wangnov.codexappmanager\logs\codex-app-manager.log
+  %LOCALAPPDATA%\CodexUsbGuard\status.json
+  界面“展开详情”里的完整文字
+  U 盘根目录的 manifest.json、usb-manifest.json（不要发送 API Key）
+
+请同时说明 Windows 版本、U 盘盘符、是否点击了 UAC“是”、安装前是否运行过旧版。

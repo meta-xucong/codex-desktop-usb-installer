@@ -9,6 +9,7 @@
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+#[cfg(windows)]
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
@@ -83,6 +84,17 @@ pub struct OfflineStageReport {
     pub size: u64,
     pub sha256: String,
     pub payload: OfflinePayloadReport,
+}
+
+/// Machine-level cleanup authority derived from one exact, locally present
+/// and Authenticode-verified offline MSIX.  Keep the path beside the FullName:
+/// a damaged staged record may need the same signed bytes re-staged before the
+/// documented AppX removal API can retire it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanupPackageClaim {
+    pub package_full_name: String,
+    pub payload_path: PathBuf,
+    pub payload_sha256: String,
 }
 
 #[derive(Debug, Clone)]
@@ -209,7 +221,30 @@ pub fn parse_manifest_json(text: &str) -> Result<OfflinePayloadManifest, AppErro
 }
 
 fn path_text(path: &Path) -> String {
-    path.to_string_lossy().into_owned()
+    let value = path.to_string_lossy().into_owned();
+    #[cfg(windows)]
+    {
+        // `canonicalize()` returns an extended Win32 path on Windows
+        // (`\\?\C:\...`).  Keep paths crossing the PowerShell/AppX boundary
+        // in the ordinary drive/UNC spelling: several AppX cmdlet and .NET
+        // Framework versions parse the extended spelling as a malformed URI.
+        if value
+            .get(..8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(r"\\?\UNC\"))
+        {
+            return format!(r"\\{}", &value[8..]);
+        }
+        if value
+            .get(..4)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(r"\\?\"))
+            || value
+                .get(..4)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(r"\??\"))
+        {
+            return value[4..].to_string();
+        }
+    }
+    value
 }
 
 fn path_is_within(root: &Path, candidate: &Path) -> bool {
@@ -384,7 +419,7 @@ pub fn parse_windows_build_number(output: &str) -> Option<u32> {
         .split(|character: char| !character.is_ascii_digit())
         .filter(|part| !part.is_empty())
         .filter_map(|part| part.parse::<u32>().ok())
-        .last()
+        .next_back()
 }
 
 #[cfg(windows)]
@@ -436,9 +471,104 @@ fn validate_windows_requirement(min_build: &str) -> Result<Option<u32>, AppError
     }
 }
 
-/// Verify the bundle.  `enforce_authenticode` is true only for the Windows
-/// production command; tests may pass false to exercise the ZIP/manifest path
-/// with a synthetic unsigned fixture.
+/// Derive the one exact package FullName that the current USB kit is allowed
+/// to treat as its own staged-only cleanup candidate. The Authenticode
+/// signature is the trust anchor: `AppxManifest.xml` and the adjacent JSON
+/// manifest alone are both writable USB files and must not authorize a
+/// machine-wide Remove-AppxPackage operation. The elevated cleanup separately
+/// requires the Windows-owned package to have the exact official PFN/FullName,
+/// expected target path, no installed users and no provisioned record.
+pub fn cleanup_package_claim(executable: &Path) -> Result<CleanupPackageClaim, AppError> {
+    // Copy first and verify both the manifest SHA-256 and Authenticode on the
+    // local immutable staging slot. Passing the writable USB source path to a
+    // later PackageManager call would leave a replacement race between trust
+    // verification and orphan rehydration.
+    let staged = stage_offline_payload(executable, None, Some("x64"), true)?;
+    let payload_path = PathBuf::from(&staged.staged_path);
+    let identity = codex_win_engine::read_msix_identity(&payload_path)
+        .map_err(|error| engine_error(format!("读取卸载暂存载荷身份失败: {error}")))?;
+    codex_win_engine::validate_codex_identity(
+        &identity,
+        &staged.payload.package_version,
+        Some(staged.payload.architecture.as_str()),
+    )
+    .map_err(|error| engine_error(format!("卸载暂存载荷身份校验失败: {error}")))?;
+    let package_full_name = codex_win_engine::canonical_codex_package_moniker(&identity)
+        .map_err(|error| engine_error(format!("生成卸载包身份失败: {error}")))?;
+    Ok(CleanupPackageClaim {
+        package_full_name,
+        payload_path,
+        payload_sha256: staged.sha256,
+    })
+}
+
+#[cfg(test)]
+fn cleanup_package_claim_with_verifier(
+    executable: &Path,
+    verify_signature: impl FnOnce(&Path) -> Result<(), AppError>,
+) -> Result<CleanupPackageClaim, AppError> {
+    let bundle = discover_bundle(executable, None)?;
+    validate_manifest(&bundle.manifest)?;
+    let metadata = fs::metadata(&bundle.payload_path)
+        .map_err(|error| engine_error(format!("读取卸载载荷信息失败: {error}")))?;
+    if !metadata.is_file() || metadata.len() != bundle.manifest.payload.size {
+        return Err(engine_error(
+            "卸载载荷大小与清单不一致；不授权清理 staged 包",
+        ));
+    }
+    let payload_sha256 = codex_win_engine::sha256_file(&bundle.payload_path)
+        .map_err(|error| engine_error(format!("计算卸载载荷 SHA-256 失败: {error}")))?;
+    if !payload_sha256.eq_ignore_ascii_case(bundle.manifest.payload.sha256.trim()) {
+        return Err(engine_error(
+            "卸载载荷 SHA-256 与清单不一致；不授权清理 staged 包",
+        ));
+    }
+    verify_signature(&bundle.payload_path)?;
+    let identity = codex_win_engine::read_msix_identity(&bundle.payload_path)
+        .map_err(|error| engine_error(format!("读取卸载载荷身份失败: {error}")))?;
+    if !identity
+        .publisher
+        .eq_ignore_ascii_case(codex_win_engine::OPENAI_MARKETPLACE_PUBLISHER_SUBJECT)
+    {
+        return Err(engine_error(format!(
+            "卸载载荷发布者不匹配；不授权清理 staged 包: {}",
+            identity.publisher
+        )));
+    }
+    if identity
+        .resource_id
+        .as_deref()
+        .is_some_and(|value| !value.is_empty())
+    {
+        return Err(engine_error(
+            "卸载载荷不是 Codex 主包；不授权清理 staged 包",
+        ));
+    }
+    let expected_version = bundle
+        .manifest
+        .package_version
+        .as_deref()
+        .unwrap_or(identity.version.as_str());
+    codex_win_engine::validate_codex_identity(
+        &identity,
+        expected_version,
+        Some(bundle.manifest.architecture.as_str()),
+    )
+    .map_err(|error| engine_error(format!("卸载载荷身份校验失败: {error}")))?;
+    let package_full_name = codex_win_engine::canonical_codex_package_moniker(&identity)
+        .map_err(|error| engine_error(format!("生成卸载包身份失败: {error}")))?;
+    Ok(CleanupPackageClaim {
+        package_full_name,
+        payload_path: bundle.payload_path,
+        payload_sha256,
+    })
+}
+
+/// Verify the bundle's manifest, hash, identity and application metadata.
+/// When `enforce_authenticode` is true, also verify the source file's
+/// Authenticode signature.  The production USB preflight passes false so a
+/// slow removable-volume signature scan cannot trip the short UI probe; the
+/// production staging path verifies the local copy instead.
 pub fn probe_offline_payload(
     executable: &Path,
     package_override: Option<&Path>,
@@ -497,16 +627,21 @@ pub fn probe_offline_payload(
     }
 
     #[cfg(windows)]
-    let authenticode = {
+    let authenticode = if enforce_authenticode {
         let report = codex_win_engine::verify_openai_authenticode(&bundle.payload_path)
             .map_err(|error| engine_error(format!("Authenticode 校验失败: {error}")))?;
-        if enforce_authenticode && !report.is_valid_openai() {
+        if !report.is_valid_openai() {
             return Err(engine_error(format!(
                 "Authenticode 校验失败：status={} subject={}",
                 report.status, report.subject
             )));
         }
         Some(report)
+    } else {
+        // The initial USB preflight deliberately avoids scanning the large
+        // removable-volume file.  The install-stage path verifies the copied
+        // local file before handing it to Add-AppxPackage.
+        None
     };
     #[cfg(not(windows))]
     let authenticode = {
@@ -608,29 +743,73 @@ fn secure_stage_directory(version: &str) -> Result<PathBuf, AppError> {
     Ok(canonical)
 }
 
+/// Verify an MSIX after it has been copied to the local temporary directory.
+///
+/// The source lives on a removable volume and a PowerShell Authenticode probe
+/// reads the complete package.  Keeping this operation after the copy avoids
+/// combining slow USB I/O, Defender scanning and certificate-chain work under
+/// the short UI preflight deadline.  The hash is checked before this function
+/// is called, so the verified local bytes still correspond to the manifest.
+fn verify_staged_authenticode(
+    path: &Path,
+    enforce_authenticode: bool,
+) -> Result<Option<codex_win_engine::AuthenticodeReport>, AppError> {
+    #[cfg(windows)]
+    {
+        if !enforce_authenticode {
+            return Ok(None);
+        }
+        let report = codex_win_engine::verify_openai_authenticode(path)
+            .map_err(|error| engine_error(format!("Authenticode 校验失败: {error}")))?;
+        if !report.is_valid_openai() {
+            return Err(engine_error(format!(
+                "Authenticode 校验失败：status={} subject={}",
+                report.status, report.subject
+            )));
+        }
+        Ok(Some(report))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (path, enforce_authenticode);
+        Ok(None)
+    }
+}
+
 pub fn stage_offline_payload(
     executable: &Path,
     package_override: Option<&Path>,
     expected_architecture: Option<&str>,
     enforce_authenticode: bool,
 ) -> Result<OfflineStageReport, AppError> {
-    let payload = probe_offline_payload(
-        executable,
-        package_override,
-        expected_architecture,
-        enforce_authenticode,
-    )?;
+    // Do not verify Authenticode on the removable source.  The full package is
+    // copied and hash-checked first; the trust gate runs on the local copy
+    // below with the dedicated long Authenticode deadline.
+    let mut payload =
+        probe_offline_payload(executable, package_override, expected_architecture, false)?;
     let stage_root = secure_stage_directory(&payload.codex_desktop_version)?;
-    let required = payload.size.saturating_add(payload.size / 2);
-    if let Some(free) = available_space(&stage_root)? {
-        if free < required {
-            return Err(engine_error(format!(
-                "临时磁盘空间不足：需要至少 {} 字节，可用 {} 字节",
-                required, free
-            )));
-        }
+    let destination = copy_or_reuse_staged_payload(&payload, &stage_root, available_space)?;
+    let staged_hash = codex_win_engine::sha256_file(&destination)
+        .map_err(|error| engine_error(format!("再次计算暂存 MSIX SHA-256 失败: {error}")))?;
+    if !staged_hash.eq_ignore_ascii_case(&payload.sha256) {
+        return Err(engine_error("暂存 MSIX 二次校验失败，拒绝安装"));
     }
-    let destination = stage_root.join(&payload.file_name);
+    payload.authenticode = verify_staged_authenticode(&destination, enforce_authenticode)?;
+    Ok(OfflineStageReport {
+        source_path: payload.payload_path.clone(),
+        staged_path: path_text(&destination),
+        size: payload.size,
+        sha256: staged_hash,
+        payload,
+    })
+}
+
+fn copy_or_reuse_staged_payload(
+    payload: &OfflinePayloadReport,
+    stage_root: &Path,
+    free_space: impl Fn(&Path) -> Result<Option<u64>, AppError>,
+) -> Result<PathBuf, AppError> {
+    let mut destination = stage_root.join(&payload.file_name);
     let destination_parent = destination
         .parent()
         .ok_or_else(|| engine_error("暂存目标路径无效"))?
@@ -646,33 +825,137 @@ pub fn stage_offline_payload(
         Ok(metadata) if metadata.file_type().is_symlink() => {
             return Err(engine_error("暂存目标不能是符号链接"));
         }
-        Ok(_) => {}
+        Ok(metadata) => {
+            // A retry may find the exact verified bytes still held open by
+            // Windows. Reuse them without requesting write/delete access or
+            // demanding enough free space for a redundant second copy.
+            if metadata.is_file()
+                && metadata.len() == payload.size
+                && codex_win_engine::sha256_file(&destination)
+                    .is_ok_and(|hash| hash.eq_ignore_ascii_case(&payload.sha256))
+            {
+                return Ok(destination);
+            }
+            // Preserve an invalid/locked/readonly earlier attempt for diagnosis.
+            // Never delete it or inherit its attributes into the new attempt.
+            if !valid_sha256(&payload.sha256) {
+                return Err(engine_error("重试缓存 SHA-256 无效"));
+            }
+            let base = stage_root
+                .parent()
+                .ok_or_else(|| engine_error("暂存根目录无效"))?;
+            // A stable hash slot lets the next attempt reuse this fallback.
+            // Otherwise a permanently locked legacy slot creates another
+            // 800 MB copy on every deployment retry until the disk fills.
+            let cache_root = base.join(format!("cache-{}", payload.sha256.to_ascii_lowercase()));
+            match fs::create_dir(&cache_root) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let meta = fs::symlink_metadata(&cache_root)
+                        .map_err(|e| engine_error(format!("读取缓存目录失败: {e}")))?;
+                    if !meta.is_dir()
+                        || meta.file_type().is_symlink()
+                        || !cache_root.canonicalize().ok().is_some_and(|canonical| {
+                            path_text(&canonical).eq_ignore_ascii_case(&path_text(&cache_root))
+                        })
+                    {
+                        return Err(engine_error("重试缓存目录不是原位置的普通目录"));
+                    }
+                }
+                Err(error) => return Err(engine_error(format!("创建重试缓存目录失败: {error}"))),
+            }
+            destination = cache_root.join(&payload.file_name);
+            match fs::symlink_metadata(&destination) {
+                Ok(meta) => {
+                    if meta.file_type().is_symlink() {
+                        return Err(engine_error("重试缓存不能是符号链接"));
+                    }
+                    if meta.is_file()
+                        && meta.len() == payload.size
+                        && codex_win_engine::sha256_file(&destination)
+                            .is_ok_and(|hash| hash.eq_ignore_ascii_case(&payload.sha256))
+                    {
+                        return Ok(destination);
+                    }
+                    let retry_root = base.join(format!("retry-{}", uuid::Uuid::new_v4().simple()));
+                    fs::create_dir(&retry_root)
+                        .map_err(|e| engine_error(format!("创建隔离暂存目录失败: {e}")))?;
+                    destination = retry_root.join(&payload.file_name);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(engine_error(format!("读取重试缓存失败: {error}"))),
+            }
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
             return Err(engine_error(format!("读取旧暂存 MSIX 信息失败: {error}")));
         }
     }
-    let destination_canonical = destination.canonicalize().ok();
-    if destination_canonical.as_ref() != Some(&source_canonical) {
-        if destination.exists() {
-            fs::remove_file(&destination)
-                .map_err(|error| engine_error(format!("清理旧暂存 MSIX 失败: {error}")))?;
+    let required = payload.size.saturating_add(payload.size / 2);
+    if let Some(free) = free_space(stage_root)? {
+        if free < required {
+            return Err(engine_error(format!(
+                "临时磁盘空间不足：需要至少 {required} 字节，可用 {free} 字节"
+            )));
         }
-        fs::copy(&source_canonical, &destination)
-            .map_err(|error| engine_error(format!("复制 MSIX 到本地暂存目录失败: {error}")))?;
     }
-    let staged_hash = codex_win_engine::sha256_file(&destination)
-        .map_err(|error| engine_error(format!("再次计算暂存 MSIX SHA-256 失败: {error}")))?;
-    if !staged_hash.eq_ignore_ascii_case(&payload.sha256) {
-        return Err(engine_error("暂存 MSIX 二次校验失败，拒绝安装"));
+    let mut source = File::open(&source_canonical)
+        .map_err(|error| engine_error(format!("打开源 MSIX 失败: {error}")))?;
+    let mut target = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&destination)
+        .map_err(|error| engine_error(format!("创建新暂存 MSIX 失败: {error}")))?;
+    let copied = std::io::copy(&mut source, &mut target)
+        .map_err(|error| engine_error(format!("复制 MSIX 到本地暂存目录失败: {error}")))?;
+    target
+        .sync_all()
+        .map_err(|error| engine_error(format!("写入暂存 MSIX 未完成: {error}")))?;
+    if copied != payload.size {
+        return Err(engine_error("源 MSIX 大小在复制过程中改变，拒绝安装"));
     }
-    Ok(OfflineStageReport {
-        source_path: payload.payload_path.clone(),
-        staged_path: path_text(&destination),
-        size: payload.size,
-        sha256: staged_hash,
-        payload,
-    })
+    Ok(destination)
+}
+
+fn deployment_space_required(unpacked_bytes: u64, entries: u64) -> Result<u64, AppError> {
+    // The compressed MSIX size understates the actual package footprint.
+    // Include per-file allocation/metadata slack plus a bounded working margin.
+    unpacked_bytes
+        .checked_add(
+            entries
+                .checked_mul(4096)
+                .ok_or_else(|| engine_error("MSIX 文件数溢出"))?,
+        )
+        .and_then(|bytes| bytes.checked_add(512 * 1024 * 1024))
+        .ok_or_else(|| engine_error("MSIX 展开大小溢出"))
+}
+
+/// Read only the verified ZIP directory; never unpack or alter the signed MSIX.
+/// Check the actual target, before policy changes or stopping existing apps.
+pub fn validate_usb_deployment_space(payload: &Path, target: &Path) -> Result<(), AppError> {
+    let file = File::open(payload)
+        .map_err(|error| engine_error(format!("读取 MSIX 展开大小失败：{error}")))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|error| engine_error(format!("读取 MSIX 目录失败：{error}")))?;
+    let mut unpacked = 0u64;
+    for index in 0..archive.len() {
+        let entry = archive
+            .by_index(index)
+            .map_err(|error| engine_error(format!("读取 MSIX 文件大小失败：{error}")))?;
+        unpacked = unpacked
+            .checked_add(entry.size())
+            .ok_or_else(|| engine_error("MSIX 展开大小溢出"))?;
+    }
+    let required = deployment_space_required(unpacked, archive.len() as u64)?;
+    if let Some(free) = available_space(target)? {
+        if free < required {
+            return Err(engine_error(format!(
+                "目标 U 盘磁盘空间不足：{} 需要至少 {} MiB（按 MSIX 展开大小计算），可用 {} MiB；未修改现有安装",
+                target.display(), required.div_ceil(1024 * 1024), free / (1024 * 1024)
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Remove only a file created beneath `%TEMP%\CodexDesktopInstaller`.  This
@@ -747,6 +1030,17 @@ pub fn local_selection(report: &OfflinePayloadReport) -> Result<LocalReleasePack
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usb_space_uses_uncompressed_bytes_and_detects_overflow() {
+        let gib = 1024 * 1024 * 1024;
+        assert_eq!(
+            deployment_space_required(2 * gib, 100).unwrap(),
+            2 * gib + 100 * 4096 + 512 * 1024 * 1024
+        );
+        assert!(deployment_space_required(u64::MAX, 1).is_err());
+        assert!(deployment_space_required(1, u64::MAX).is_err());
+    }
     use std::io::Write;
 
     fn test_root(label: &str) -> PathBuf {
@@ -758,20 +1052,26 @@ mod tests {
         root
     }
 
-    fn write_fake_msix(path: &Path) {
+    fn write_fake_msix_with_publisher(path: &Path, publisher: &str) {
         let file = File::create(path).unwrap();
         let mut writer = zip::ZipWriter::new(file);
         let options = zip::write::SimpleFileOptions::default();
         writer.start_file("AppxManifest.xml", options).unwrap();
-        writer
-            .write_all(
-                br#"<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10">
-  <Identity Name="OpenAI.Codex" Publisher="CN=OpenAI" Version="26.602.3474.0" ProcessorArchitecture="x64" />
+        let manifest = format!(
+            r#"<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10">
+  <Identity Name="OpenAI.Codex" Publisher="{publisher}" Version="26.602.3474.0" ProcessorArchitecture="x64" />
   <Applications><Application Id="App" Executable="app/Codex.exe" EntryPoint="Windows.FullTrustApplication" /></Applications>
-</Package>"#,
-            )
-            .unwrap();
+</Package>"#
+        );
+        writer.write_all(manifest.as_bytes()).unwrap();
         writer.finish().unwrap();
+    }
+
+    fn write_fake_msix(path: &Path) {
+        write_fake_msix_with_publisher(
+            path,
+            codex_win_engine::OPENAI_MARKETPLACE_PUBLISHER_SUBJECT,
+        );
     }
 
     fn fixture_manifest(msix: &Path) -> OfflinePayloadManifest {
@@ -840,7 +1140,58 @@ mod tests {
         assert_eq!(report.package_version, "26.602.3474.0");
         assert_eq!(report.app_entry.as_deref(), Some("app/Codex.exe"));
         assert!(!report.app_version_verified);
+        assert!(
+            report.authenticode.is_none(),
+            "quick preflight must defer the expensive signature scan"
+        );
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cleanup_claim_requires_the_exact_main_package_publisher_and_identity() {
+        let root = test_root("cleanup-claim");
+        let payload = root.join("payload");
+        fs::create_dir_all(&payload).unwrap();
+        let msix = payload.join("OpenAI.Codex_x64.msix");
+        write_fake_msix(&msix);
+        let manifest = fixture_manifest(&msix);
+        fs::write(
+            root.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let executable = root.join("CodexAppManager.exe");
+        fs::write(&executable, b"fixture").unwrap();
+        let claim = cleanup_package_claim_with_verifier(&executable, |_| Ok(())).unwrap();
+        assert_eq!(
+            claim.package_full_name,
+            "OpenAI.Codex_26.602.3474.0_x64__2p2nqsd0c76g0"
+        );
+        assert_eq!(claim.payload_path, msix.canonicalize().unwrap());
+        assert_eq!(claim.payload_sha256, manifest.payload.sha256);
+
+        let denied = cleanup_package_claim_with_verifier(&executable, |_| {
+            Err(engine_error("fixture signature rejected"))
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(denied.contains("fixture signature rejected"));
+
+        write_fake_msix_with_publisher(&msix, "CN=not-openai");
+        let mut altered = fixture_manifest(&msix);
+        // Keep the small manifest internally coherent so rejection is caused
+        // by the publisher boundary, not a stale size field.
+        altered.payload.size = fs::metadata(&msix).unwrap().len();
+        fs::write(
+            root.join("manifest.json"),
+            serde_json::to_vec_pretty(&altered).unwrap(),
+        )
+        .unwrap();
+        assert!(cleanup_package_claim_with_verifier(&executable, |_| Ok(()))
+            .unwrap_err()
+            .to_string()
+            .contains("发布者不匹配"));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -863,6 +1214,7 @@ mod tests {
         let staged = stage_offline_payload(&executable, None, Some("x64"), false).unwrap();
         assert!(Path::new(&staged.staged_path).is_file());
         assert_eq!(staged.sha256, manifest.payload.sha256);
+        assert!(staged.payload.authenticode.is_none());
         cleanup_staged_payload(Path::new(&staged.staged_path)).unwrap();
         let _ = fs::remove_dir_all(root);
     }
@@ -872,5 +1224,125 @@ mod tests {
         assert_eq!(parse_windows_build_number("10.0.19045\r\n"), Some(19045));
         assert_eq!(parse_windows_build_number("Build: 22631"), Some(22631));
         assert_eq!(parse_windows_build_number("unknown"), None);
+    }
+
+    #[test]
+    #[allow(clippy::permissions_set_readonly_false)]
+    fn staging_reuses_valid_bytes_even_when_locked_and_disk_is_full() {
+        let root = test_root("stage-reuse");
+        let source_dir = root.join("payload");
+        fs::create_dir_all(&source_dir).unwrap();
+        let source = source_dir.join("OpenAI.Codex_x64.msix");
+        write_fake_msix(&source);
+        fs::write(
+            root.join("manifest.json"),
+            serde_json::to_vec(&fixture_manifest(&source)).unwrap(),
+        )
+        .unwrap();
+        let executable = root.join("CodexDesktopSetup.exe");
+        fs::write(&executable, "fixture").unwrap();
+        let payload = probe_offline_payload(&executable, None, Some("x64"), false).unwrap();
+        let stage_root = root.join("stage");
+        fs::create_dir(&stage_root).unwrap();
+        let stage_root = stage_root.canonicalize().unwrap();
+        let staged =
+            copy_or_reuse_staged_payload(&payload, &stage_root, |_| Ok(Some(u64::MAX))).unwrap();
+        #[cfg(windows)]
+        let locked = {
+            use std::os::windows::fs::OpenOptionsExt;
+            let mut permissions = fs::metadata(&staged).unwrap().permissions();
+            permissions.set_readonly(true);
+            fs::set_permissions(&staged, permissions).unwrap();
+            fs::OpenOptions::new()
+                .read(true)
+                .share_mode(1)
+                .open(&staged)
+                .unwrap()
+        };
+        let reused = copy_or_reuse_staged_payload(&payload, &stage_root, |_| {
+            panic!("a validated cache requires no additional copy space")
+        })
+        .unwrap();
+        assert_eq!(reused, staged);
+        assert_eq!(
+            codex_win_engine::sha256_file(&reused).unwrap(),
+            payload.sha256
+        );
+        #[cfg(windows)]
+        {
+            drop(locked);
+            let mut permissions = fs::metadata(&staged).unwrap().permissions();
+            permissions.set_readonly(false);
+            fs::set_permissions(&staged, permissions).unwrap();
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[allow(clippy::permissions_set_readonly_false)]
+    fn staging_preserves_broken_locked_attempt_and_does_not_inherit_readonly() {
+        let root = test_root("stage-broken");
+        let source_dir = root.join("payload");
+        fs::create_dir_all(&source_dir).unwrap();
+        let source = source_dir.join("OpenAI.Codex_x64.msix");
+        write_fake_msix(&source);
+        fs::write(
+            root.join("manifest.json"),
+            serde_json::to_vec(&fixture_manifest(&source)).unwrap(),
+        )
+        .unwrap();
+        let executable = root.join("CodexDesktopSetup.exe");
+        fs::write(&executable, "fixture").unwrap();
+        let payload = probe_offline_payload(&executable, None, Some("x64"), false).unwrap();
+        let stage_root = root.join("stage");
+        fs::create_dir(&stage_root).unwrap();
+        let stage_root = stage_root.canonicalize().unwrap();
+        let broken = stage_root.join(&payload.file_name);
+        fs::write(&broken, "incomplete previous attempt").unwrap();
+        #[cfg(windows)]
+        let locked = {
+            use std::os::windows::fs::OpenOptionsExt;
+            for path in [&source, &broken] {
+                let mut permissions = fs::metadata(path).unwrap().permissions();
+                permissions.set_readonly(true);
+                fs::set_permissions(path, permissions).unwrap();
+            }
+            fs::OpenOptions::new()
+                .read(true)
+                .share_mode(1)
+                .open(&broken)
+                .unwrap()
+        };
+        assert!(copy_or_reuse_staged_payload(&payload, &stage_root, |_| Ok(Some(0))).is_err());
+        let staged =
+            copy_or_reuse_staged_payload(&payload, &stage_root, |_| Ok(Some(u64::MAX))).unwrap();
+        assert_ne!(staged, broken);
+        assert_eq!(staged.parent().unwrap().parent(), stage_root.parent());
+        assert_eq!(
+            fs::read_to_string(&broken).unwrap(),
+            "incomplete previous attempt"
+        );
+        assert_eq!(
+            codex_win_engine::sha256_file(&staged).unwrap(),
+            payload.sha256
+        );
+        assert_eq!(
+            copy_or_reuse_staged_payload(&payload, &stage_root, |_| {
+                panic!("repeat fallback must reuse verified cache without another copy")
+            })
+            .unwrap(),
+            staged
+        );
+        assert!(!fs::metadata(&staged).unwrap().permissions().readonly());
+        #[cfg(windows)]
+        {
+            drop(locked);
+            for path in [&source, &broken] {
+                let mut permissions = fs::metadata(path).unwrap().permissions();
+                permissions.set_readonly(false);
+                fs::set_permissions(path, permissions).unwrap();
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 }

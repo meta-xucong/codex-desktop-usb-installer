@@ -103,6 +103,7 @@ pub fn classify(message: &str) -> ErrorKind {
         || m.contains("operation not permitted")
         || m.contains("administrator approval is required")
         || m.contains("operation was canceled by the user")
+        || (m.contains("uac") && m.contains("取消"))
         || m.contains("eacces")
         || m.contains("拒绝访问")
     {
@@ -155,6 +156,7 @@ pub fn classify(message: &str) -> ErrorKind {
         || m.contains("timeout")
         || m.contains("stalled")
         || m.contains("exceeded total deadline")
+        || m.contains("超时")
     {
         return ErrorKind::Timeout;
     }
@@ -308,6 +310,11 @@ mod tests {
             classify(
                 "install error: administrator approval is required to release only that transaction"
             ),
+            ErrorKind::Permission
+        );
+        assert_eq!(classify("管理员 USB AppX 卷注册超时"), ErrorKind::Timeout);
+        assert_eq!(
+            classify("管理员操作失败：可能是用户取消了 UAC 授权"),
             ErrorKind::Permission
         );
     }

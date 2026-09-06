@@ -1,4 +1,8 @@
-# 当前 Codex U 盘项目审计报告
+# 历史审计报告（已被 USB AppXVolume 方案取代）
+
+> 本文只记录旧版 manager-only 看门狗的审计结果。它不再定义当前实现，也不再把
+> AppX 身份 + PID + 创建时间的长期开始菜单拦截列为下一阶段要求。当前审计请看
+> [USB-APPXVOLUME-PORTABLE-AUDIT.md](./USB-APPXVOLUME-PORTABLE-AUDIT.md)。
 
 审计对象：`D:\AI\AGENT_U盘\codex-desktop-usb-installer`
 

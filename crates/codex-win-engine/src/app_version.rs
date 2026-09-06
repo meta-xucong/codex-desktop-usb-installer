@@ -197,6 +197,12 @@ fn read_package_json_from_asar_reader<R: Read + Seek>(reader: R) -> Option<Packa
     let entry = find_asar_entry(&header, &["package.json"])?;
     let offset = asar_entry_offset(entry)?;
     let size = asar_entry_size(entry)?;
+    // Installed trees can be left truncated/corrupted by a failed copy. Do not
+    // let an untrusted header request an allocation that aborts the installer
+    // during its read-only status probe. Match the MSIX streaming reader bound.
+    if size == 0 || size > MAX_PACKAGE_JSON_BYTES {
+        return None;
+    }
     let absolute_offset = data_offset.checked_add(offset)?;
     file.seek(SeekFrom::Start(absolute_offset)).ok()?;
     let mut bytes = vec![0; size.try_into().ok()?];
@@ -266,6 +272,20 @@ fn asar_entry_size(entry: &Value) -> Option<u64> {
 mod tests {
     use super::*;
     use zip::write::SimpleFileOptions;
+
+    #[test]
+    fn corrupted_installed_asar_cannot_request_unbounded_allocation() {
+        use std::io::Cursor;
+        for size in [0, MAX_PACKAGE_JSON_BYTES + 1, u64::MAX] {
+            let header =
+                format!(r#"{{"files":{{"package.json":{{"offset":"0","size":{size}}}}}}}"#);
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&4u32.to_le_bytes());
+            bytes.extend_from_slice(&(header.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(header.as_bytes());
+            assert!(read_package_json_from_asar_reader(Cursor::new(bytes)).is_none());
+        }
+    }
 
     #[test]
     fn reads_root_package_json_version_from_asar() {

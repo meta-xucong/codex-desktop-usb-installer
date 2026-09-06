@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$ArtifactDir = $PSScriptRoot,
     [string]$ApiKey,
@@ -23,8 +23,12 @@ Assert-Condition (Test-Path -LiteralPath $exePath) "缺少 CodexSwitch.exe"
 Assert-Condition (Test-Path -LiteralPath $manifestPath) "缺少 manifest.json"
 Assert-Condition (Test-Path -LiteralPath $catalogPath) "缺少 providers.json"
 
-$manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
-$catalog = Get-Content -LiteralPath $catalogPath -Raw | ConvertFrom-Json
+ # Windows PowerShell 5.1's Get-Content uses the active ANSI code page for
+ # UTF-8 files without a BOM. Read release metadata explicitly as UTF-8 so a
+ # Chinese provider name cannot corrupt JSON parsing on a blank machine.
+ $utf8 = [System.Text.UTF8Encoding]::new($false, $true)
+ $manifest = [System.IO.File]::ReadAllText($manifestPath, $utf8) | ConvertFrom-Json
+ $catalog = [System.IO.File]::ReadAllText($catalogPath, $utf8) | ConvertFrom-Json
 $provider = @($catalog.providers) | Where-Object { $_.id -eq "404token-sub2api" } | Select-Object -First 1
 
 Assert-Condition ($null -ne $provider) "providers.json 中缺少 404token-sub2api"

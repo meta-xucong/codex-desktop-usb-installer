@@ -167,7 +167,7 @@ export interface LocalReleasePackage {
   packageVersion: string | null;
 }
 
-/** Fixed USB bundle evidence returned by the offline installer commands. */
+/** USB bundle evidence returned by the offline installer commands. */
 export interface OfflinePayloadReport {
   ready: boolean;
   manifestPath: string;
@@ -204,7 +204,7 @@ export interface OfflineStageReport {
   payload: OfflinePayloadReport;
 }
 
-/** Result of copying and launching the bundled Codex Switch configurator. */
+/** Result of validating and launching the bundled Codex Switch configurator. */
 export interface CcswitchLaunchReport {
   available: boolean;
   installed: boolean;
@@ -212,6 +212,14 @@ export interface CcswitchLaunchReport {
   sourcePath: string | null;
   installedPath: string | null;
   copiedFiles: number;
+  /** `usb` launches directly from the removable bundle; `local` copies to C:. */
+  launchMode?: "usb" | "local" | "none" | string;
+  /** CCSwitch keeps its settings in the current user's profile. */
+  dataScope?: string;
+  /** True only after a sizeable product window was observed and presented. */
+  usableWindowConfirmed?: boolean;
+  /** USB Windows builds use child-scoped WebView2 software rendering. */
+  graphicsMode?: "software-rendering" | "unknown" | string;
   message: string;
 }
 
@@ -464,6 +472,8 @@ export interface InstalledWindowsCodex {
   arch: string | null;
   source: "msix" | "portable" | string;
   packageFamilyName: string | null;
+  /** Registered AppX volume root, e.g. `F:\\` for the USB edition. */
+  packageVolume?: string | null;
   /** Install-dir / executable mtime as a Unix timestamp (seconds). */
   installedAt?: number | null;
 }
@@ -700,7 +710,7 @@ export interface WinUninstallReport {
   outcome: OperationOutcome;
 }
 
-/** Combined Windows cleanup used by the fixed USB build. */
+/** Combined Windows cleanup used by the USB build. */
 export interface WinBundleUninstallReport {
   success: boolean;
   codex: WinUninstallReport | null;
@@ -711,6 +721,9 @@ export interface WinBundleUninstallReport {
   notes: string[];
   purgedUserData: boolean;
   purgedCcswitchData: boolean;
+  /** Phase 1 finished; no final filesystem success is claimed before exit. */
+  cleanupPending?: boolean;
+  cleanupReportPath?: string | null;
   outcome: OperationOutcome;
 }
 
@@ -746,9 +759,11 @@ export function outcomeIsPartial(
 export interface WinInstallStatus {
   installed: InstalledWindowsCodex | null;
   status: InstallClass;
+  /** Older managers omit this field; current USB builds always report it. */
+  recoveryPending?: boolean;
 }
 
-/** Local removable-media lease/watchdog status for the fixed USB build. */
+/** Local removable-media lease/watchdog status for the USB build. */
 export interface UsbManagedProcess {
   pid: number;
   role: string;

@@ -663,6 +663,14 @@ fn schedule_frontend_ready_fallback(app: tauri::AppHandle, generation: u64) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Final uninstall must run without creating a new WebView, log directory,
+    // guard lease or settings lock in the directories it is about to remove.
+    if let Some(exit_code) = crate::app::uninstall_cleanup::maybe_run_cleanup_helper() {
+        // This process is a disposable native helper. Exit immediately so the
+        // finalizer can remove its mapped image; failures must be observable as
+        // non-zero rather than the old contradictory "exit code: 0".
+        std::process::exit(exit_code);
+    }
     // The copied local helper must not construct a WebView.  Dispatch before
     // Tauri initialization so unplug enforcement also works when WebView2 is
     // unavailable on the target machine.
@@ -670,8 +678,73 @@ pub fn run() {
         crate::app::usb_guard::run_guard_cli();
         return;
     }
-    tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
+    #[cfg(target_os = "windows")]
+    match crate::app::win_elevation::maybe_relaunch_usb_manager() {
+        Ok(crate::app::win_elevation::ElevationAction::Continue) => {}
+        Ok(crate::app::win_elevation::ElevationAction::Relaunched) => return,
+        Err(error) => {
+            eprintln!("USB manager elevation failed: {error}");
+            return;
+        }
+    }
+    // Retain this guard until the Tauri event loop returns. The normal
+    // operation.lock covers later mutations, but runtime prerequisites below
+    // execute before ManagerState exists and need startup-level exclusion.
+    #[cfg(target_os = "windows")]
+    let _usb_instance_guard = match crate::app::win_elevation::acquire_usb_manager_instance() {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("USB manager session lock failed: {error}");
+            crate::app::runtime::show_startup_error(&error);
+            return;
+        }
+    };
+    #[cfg(target_os = "windows")]
+    if let Ok(executable) = std::env::current_exe() {
+        // Raw USB EXEs bypass the normal NSIS prerequisite installer. Check
+        // WebView2 BEFORE creating Tauri; otherwise a clean Win10 machine has
+        // no UI in which to show a useful failure. Both installers are offline
+        // and hash-pinned; native dialogs still work without a browser runtime.
+        if let Err(error) = crate::app::runtime::ensure_bundled_webview2_runtime(&executable, None)
+        {
+            eprintln!("WebView2 runtime preflight failed: {error}");
+            crate::app::runtime::show_startup_error(&error.to_string());
+            return;
+        }
+        match crate::app::runtime::ensure_bundled_vc_runtime(&executable, None) {
+            Ok(status) if !status.ready && crate::app::usb_guard::guard_required() => {
+                crate::app::runtime::show_startup_error(&status.message);
+                return;
+            }
+            Ok(status) => eprintln!("VC runtime preflight: {}", status.message),
+            Err(error) => {
+                eprintln!("VC runtime preflight failed: {error}");
+                crate::app::runtime::show_startup_error(&error.to_string());
+                return;
+            }
+        }
+    }
+    // A USB launch has already crossed the Windows UAC boundary above.  Do not
+    // install the normal identifier-wide single-instance mutex in that mode:
+    // an older medium-integrity manager (for example one left open by a failed
+    // uninstall) would otherwise win the mutex, receive the activation message,
+    // and leave the new full-administrator process dead before `setup()` runs.  The
+    // USB manager uses its separate full-admin singleton acquired above;
+    // normal installed launches retain the usual single-instance behavior.
+    #[cfg(target_os = "windows")]
+    let usb_elevated_session = crate::app::usb_guard::guard_required()
+        && crate::app::win_elevation::current_process_is_elevated().unwrap_or(false);
+    #[cfg(not(target_os = "windows"))]
+    let usb_elevated_session = false;
+    if usb_elevated_session {
+        eprintln!(
+            "USB manager is running with a full administrator token; isolating it from the normal single-instance mutex"
+        );
+    }
+
+    let mut builder = tauri::Builder::default();
+    if !usb_elevated_session {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
             log::info!(
                 "single-instance activation requested args_count={} cwd_present={}",
                 args.len(),
@@ -687,9 +760,7 @@ pub fn run() {
                 .webview_safe_to_show
                 .load(Ordering::SeqCst)
             {
-                log::info!(
-                    "single-instance activation queued WebView2 safety gate incomplete"
-                );
+                log::info!("single-instance activation queued WebView2 safety gate incomplete");
                 request_main_window_attention(app, "single-instance-webview-gated");
                 return;
             }
@@ -699,7 +770,9 @@ pub fn run() {
                 log::info!("single-instance activation queued frontend_ready=false");
                 request_main_window_attention(app, "single-instance-queued");
             }
-        }))
+        }));
+    }
+    builder
         .plugin(
             tauri_plugin_log::Builder::new()
                 .targets([

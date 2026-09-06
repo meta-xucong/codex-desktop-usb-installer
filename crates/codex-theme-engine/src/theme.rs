@@ -160,11 +160,7 @@ fn err(message: impl Into<String>) -> ThemeEngineError {
 /// absolute paths, no `..` components at all.
 fn resolve_inside(root: &Path, candidate: &str, label: &str) -> Result<PathBuf> {
     let rel = Path::new(candidate);
-    if rel.is_absolute()
-        || rel
-            .components()
-            .any(|c| !matches!(c, Component::Normal(_)))
-    {
+    if rel.is_absolute() || rel.components().any(|c| !matches!(c, Component::Normal(_))) {
         return Err(err(format!(
             "{label} must stay inside the theme directory: {candidate}"
         )));
@@ -436,10 +432,13 @@ pub fn load_theme(theme_dir: &Path) -> Result<LoadedTheme> {
 pub fn inline_assets(theme: &LoadedTheme) -> Result<BTreeMap<String, String>> {
     let mut data_urls = BTreeMap::new();
     for (key, asset) in &theme.assets {
-        let bytes = std::fs::read(&asset.path)
-            .map_err(|e| err(format!("asset {key} unreadable: {e}")))?;
+        let bytes =
+            std::fs::read(&asset.path).map_err(|e| err(format!("asset {key} unreadable: {e}")))?;
         let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-        data_urls.insert(key.clone(), format!("data:{};base64,{}", asset.mime, encoded));
+        data_urls.insert(
+            key.clone(),
+            format!("data:{};base64,{}", asset.mime, encoded),
+        );
     }
     Ok(data_urls)
 }
@@ -453,18 +452,17 @@ pub fn inline_motion_assets(theme: &LoadedTheme) -> Result<BTreeMap<String, Stri
         let bytes = std::fs::read(&asset.path)
             .map_err(|e| err(format!("motion asset {key} unreadable: {e}")))?;
         let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-        data_urls.insert(key.clone(), format!("data:{};base64,{}", asset.mime, encoded));
+        data_urls.insert(
+            key.clone(),
+            format!("data:{};base64,{}", asset.mime, encoded),
+        );
     }
     Ok(data_urls)
 }
 
 /// Collapse a loaded theme into its gallery summary.
 pub fn summarize(theme: LoadedTheme) -> ThemeSummary {
-    let preview = theme
-        .meta
-        .previews
-        .first()
-        .map(|rel| theme.dir.join(rel));
+    let preview = theme.meta.previews.first().map(|rel| theme.dir.join(rel));
     ThemeSummary {
         id: theme.config.id.clone(),
         name: theme.config.name.clone(),
@@ -554,7 +552,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("theme.json"), r#"{"schemaVersion":1,"id":"x"}"#).unwrap();
         assert!(load_theme(&dir).is_err());
-        std::fs::write(dir.join("theme.json"), r#"{"schemaVersion":2,"id":"Bad_ID"}"#).unwrap();
+        std::fs::write(
+            dir.join("theme.json"),
+            r#"{"schemaVersion":2,"id":"Bad_ID"}"#,
+        )
+        .unwrap();
         assert!(load_theme(&dir).is_err());
     }
 

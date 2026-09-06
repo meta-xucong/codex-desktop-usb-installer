@@ -891,7 +891,7 @@ export const managerApi = {
       packagePath: packagePath ?? null,
     });
   },
-  /** Copy the verified USB payload into the local temporary directory. */
+  /** Stage the verified USB payload in the local temporary directory. */
   offlinePayloadStage(packagePath?: string): Promise<OfflineStageReport> {
     if (!hasTauriRuntime()) {
       return Promise.resolve({
@@ -958,6 +958,7 @@ export const managerApi = {
     operationToken?: OperationToken,
     installRoot?: string,
     forceMsix = false,
+    installToUsb = false,
   ): Promise<WinPerformReport> {
     if (!hasTauriRuntime()) {
       return Promise.resolve({
@@ -988,6 +989,7 @@ export const managerApi = {
       installRoot,
       expected,
       ...(forceMsix ? { forceMsix: true } : {}),
+      ...(installToUsb ? { installToUsb: true } : {}),
     };
     return invoke<WinPerformReport>("win_install_historical_release", request);
   },
@@ -1608,6 +1610,7 @@ export const managerApi = {
     confirm: boolean,
     purgeUserData: boolean,
     purgeCcswitchData: boolean,
+    removeUsbMedia = false,
   ): Promise<WinBundleUninstallReport> {
     if (!hasTauriRuntime()) {
       if (!confirm) {
@@ -1632,6 +1635,7 @@ export const managerApi = {
       token,
       purgeUserData,
       purgeCcswitchData,
+      removeUsbMedia,
     });
   },
   winStatus(): Promise<WinInstallStatus> {
@@ -1690,7 +1694,7 @@ export const managerApi = {
     }
     return invoke<void>("win_launch_codex");
   },
-  /** Copy the bundled Codex Switch configurator to local app data and launch it. */
+  /** Launch the bundled Codex Switch configurator (USB-direct in the offline bundle). */
   installAndLaunchCcswitch(): Promise<CcswitchLaunchReport> {
     if (!hasTauriRuntime()) {
       return Promise.resolve({

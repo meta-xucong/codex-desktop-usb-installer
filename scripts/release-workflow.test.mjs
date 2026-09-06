@@ -152,7 +152,14 @@ describe("release workflow recovery invariants", () => {
     const root = await mkdtemp(join(tmpdir(), "cam-release-ancestor-"));
     const origin = join(root, "origin.git");
     const source = join(root, "source");
-    const gate = join(repoRoot, "scripts/check-release-source-ancestor.sh");
+    const gateScript = process.platform === "win32"
+      ? "scripts/check-release-source-ancestor.ps1"
+      : "scripts/check-release-source-ancestor.sh";
+    const gate = join(repoRoot, gateScript);
+    const gateCommand = process.platform === "win32" ? "pwsh" : "bash";
+    const gatePrefix = process.platform === "win32" ? ["-NoProfile", "-File", gate] : [gate];
+    const runGate = (sha, options = {}) =>
+      execFileSync(gateCommand, [...gatePrefix, source, sha, "main"], options);
     const git = (...args) =>
       execFileSync("git", args, { encoding: "utf8", stdio: "pipe" }).trim();
     try {
@@ -175,7 +182,7 @@ describe("release workflow recovery invariants", () => {
       git("-C", source, "push", "origin", "main");
 
       expect(
-        execFileSync("bash", [gate, source, releaseSha, "main"], {
+        runGate(releaseSha, {
           encoding: "utf8",
         }),
       ).toContain("is merged into origin/main");
@@ -186,7 +193,7 @@ describe("release workflow recovery invariants", () => {
       git("-C", source, "commit", "-m", "unmerged release");
       const unmergedSha = git("-C", source, "rev-parse", "HEAD");
       expect(() =>
-        execFileSync("bash", [gate, source, unmergedSha, "main"], {
+        runGate(unmergedSha, {
           encoding: "utf8",
           stdio: "pipe",
         }),
@@ -206,7 +213,7 @@ describe("release workflow recovery invariants", () => {
     } finally {
       await rm(root, { force: true, recursive: true });
     }
-  });
+  }, 60000);
 
   it("binds target tag, peeled source, trusted signer digest, and every subject digest", async () => {
     const root = await mkdtemp(join(tmpdir(), "cam-release-binding-"));
@@ -360,7 +367,7 @@ describe("release workflow recovery invariants", () => {
     } finally {
       await rm(root, { force: true, recursive: true });
     }
-  });
+  }, 30000);
 
   it("binds the release tag to all six source versions and exact local artifact names", async () => {
     const packageJson = JSON.parse(

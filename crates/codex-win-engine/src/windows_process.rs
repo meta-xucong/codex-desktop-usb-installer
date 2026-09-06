@@ -11,6 +11,28 @@ use std::path::Path;
 
 use crate::EngineError;
 
+/// Result of finding and presenting a real application window for a process
+/// whose image lives below one exact managed program root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsableWindowReport {
+    pub pid: u32,
+    pub width: i32,
+    pub height: i32,
+    pub was_visible: bool,
+    /// Windows may reject `SetForegroundWindow` because of its foreground-lock
+    /// policy.  The window is still restored and moved to the top of the normal
+    /// z-order, so this flag is diagnostic rather than a success condition.
+    pub foreground_accepted: bool,
+}
+
+#[cfg(any(windows, test))]
+fn window_dimensions_are_usable(width: i32, height: i32) -> bool {
+    // Chromium/Tao creates tiny bookkeeping HWNDs (the target report showed
+    // 14x14).  They are not the product window and must never be resized or
+    // treated as proof that the UI is ready.
+    width >= 320 && height >= 200
+}
+
 fn normalize_windows_path_text(value: &str) -> String {
     let mut normalized = value.replace('/', "\\").to_lowercase();
     if let Some(rest) = normalized.strip_prefix(r"\\?\unc\") {
@@ -57,8 +79,11 @@ mod imp {
     use std::time::{Duration, Instant};
 
     use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_NO_MORE_FILES, HANDLE, HWND, INVALID_HANDLE_VALUE, LPARAM, WAIT_FAILED,
-        WAIT_OBJECT_0, WAIT_TIMEOUT,
+        CloseHandle, ERROR_NO_MORE_FILES, HANDLE, HWND, INVALID_HANDLE_VALUE, LPARAM, RECT,
+        WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    };
+    use windows_sys::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
     };
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
@@ -69,10 +94,14 @@ mod imp {
         PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetWindowThreadProcessId, PostMessageW, WM_CLOSE,
+        EnumWindows, GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
+        PostMessageW, SetForegroundWindow, SetWindowPos, ShowWindow, HWND_TOP, SWP_NOSIZE,
+        SWP_SHOWWINDOW, SW_RESTORE, WM_CLOSE,
     };
 
-    use super::{path_is_within_root, EngineError};
+    use super::{
+        path_is_within_root, window_dimensions_are_usable, EngineError, UsableWindowReport,
+    };
 
     const PROCESS_SYNCHRONIZE: u32 = 0x0010_0000;
     const FORCE_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -224,10 +253,189 @@ mod imp {
         Ok(targets)
     }
 
-    pub(crate) fn codex_processes_running_for_root(root: &Path) -> Result<bool, EngineError> {
+    #[derive(Clone, Copy)]
+    struct WindowCandidate {
+        hwnd: HWND,
+        pid: u32,
+        left: i32,
+        top: i32,
+        width: i32,
+        height: i32,
+        visible: bool,
+        score: i64,
+    }
+
+    struct WindowSearchContext {
+        pids: *const u32,
+        pid_count: usize,
+        candidate: Option<WindowCandidate>,
+    }
+
+    unsafe extern "system" fn find_usable_window(hwnd: HWND, raw_context: LPARAM) -> i32 {
+        if raw_context == 0 {
+            return 1;
+        }
+        // SAFETY: `wait_for_usable_window_for_root` passes a live stack context
+        // to synchronous EnumWindows. The PID slice outlives that call.
+        let context = unsafe { &mut *(raw_context as *mut WindowSearchContext) };
+        let pids = unsafe { std::slice::from_raw_parts(context.pids, context.pid_count) };
+        let mut pid = 0_u32;
+        unsafe {
+            GetWindowThreadProcessId(hwnd, &mut pid);
+        }
+        if !pids.contains(&pid) {
+            return 1;
+        }
+        if unsafe { IsIconic(hwnd) } != 0 {
+            // Minimized windows are often reported at -32000 with a tiny icon
+            // rectangle. Restore first so the real normal dimensions can be
+            // assessed instead of misclassifying a healthy product window.
+            unsafe {
+                ShowWindow(hwnd, SW_RESTORE);
+            }
+        }
+        let mut rect = RECT::default();
+        if unsafe { GetWindowRect(hwnd, &mut rect) } == 0 {
+            return 1;
+        }
+        let width = rect.right.saturating_sub(rect.left);
+        let height = rect.bottom.saturating_sub(rect.top);
+        if !window_dimensions_are_usable(width, height) {
+            return 1;
+        }
+        let visible = unsafe { IsWindowVisible(hwnd) } != 0;
+        let area = i64::from(width).saturating_mul(i64::from(height));
+        // Prefer an already-visible application window, then the largest
+        // hidden one. This avoids selecting a sizeable hidden helper over the
+        // real main window when both exist.
+        let score = area.saturating_add(if visible { 1_i64 << 60 } else { 0 });
+        if context
+            .candidate
+            .as_ref()
+            .map_or(true, |candidate| score > candidate.score)
+        {
+            context.candidate = Some(WindowCandidate {
+                hwnd,
+                pid,
+                left: rect.left,
+                top: rect.top,
+                width,
+                height,
+                visible,
+                score,
+            });
+        }
+        1
+    }
+
+    fn visible_origin_on_nearest_monitor(
+        hwnd: HWND,
+        width: i32,
+        height: i32,
+    ) -> Option<(i32, i32)> {
+        // SAFETY: `hwnd` came from EnumWindows and MONITOR_DEFAULTTONEAREST
+        // guarantees a monitor for an otherwise valid top-level window.
+        let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+        if monitor.is_null() {
+            return None;
+        }
+        let mut info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if unsafe { GetMonitorInfoW(monitor, &mut info) } == 0 {
+            return None;
+        }
+        let work = info.rcWork;
+        let max_x = work.right.saturating_sub(width).max(work.left);
+        let max_y = work.bottom.saturating_sub(height).max(work.top);
+        let mut rect = RECT::default();
+        if unsafe { GetWindowRect(hwnd, &mut rect) } == 0 {
+            return None;
+        }
+        Some((
+            rect.left.clamp(work.left, max_x),
+            rect.top.clamp(work.top, max_y),
+        ))
+    }
+
+    /// Wait for a sizeable top-level window owned by a process physically
+    /// loaded from `root`, restore it and request foreground activation.
+    ///
+    /// Returning `None` is an explicit failed postcondition: a process may
+    /// still be alive, but no user-operable UI appeared before the deadline.
+    pub fn wait_for_usable_window_for_root(
+        root: &Path,
+        timeout: Duration,
+    ) -> Result<Option<UsableWindowReport>, EngineError> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let pids = target_processes_under_root(root)?
+                .into_iter()
+                .filter(TargetProcess::is_running)
+                .map(|target| target.pid)
+                .collect::<Vec<_>>();
+            if !pids.is_empty() {
+                let mut context = WindowSearchContext {
+                    pids: pids.as_ptr(),
+                    pid_count: pids.len(),
+                    candidate: None,
+                };
+                // SAFETY: callback and context remain valid for this synchronous
+                // call; no pointer escapes EnumWindows.
+                unsafe {
+                    EnumWindows(
+                        Some(find_usable_window),
+                        (&mut context as *mut WindowSearchContext) as LPARAM,
+                    );
+                }
+                if let Some(candidate) = context.candidate {
+                    // SW_RESTORE also makes a hidden/minimized explicit-launch
+                    // window visible. HWND_TOP avoids a successfully-created
+                    // configurator remaining completely behind the manager.
+                    let (x, y) = visible_origin_on_nearest_monitor(
+                        candidate.hwnd,
+                        candidate.width,
+                        candidate.height,
+                    )
+                    .unwrap_or((candidate.left, candidate.top));
+                    unsafe {
+                        ShowWindow(candidate.hwnd, SW_RESTORE);
+                        SetWindowPos(
+                            candidate.hwnd,
+                            HWND_TOP,
+                            x,
+                            y,
+                            0,
+                            0,
+                            SWP_NOSIZE | SWP_SHOWWINDOW,
+                        );
+                    }
+                    let foreground_accepted = unsafe { SetForegroundWindow(candidate.hwnd) } != 0;
+                    return Ok(Some(UsableWindowReport {
+                        pid: candidate.pid,
+                        width: candidate.width,
+                        height: candidate.height,
+                        was_visible: candidate.visible,
+                        foreground_accepted,
+                    }));
+                }
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    pub fn processes_running_for_root(root: &Path) -> Result<bool, EngineError> {
         Ok(target_processes_under_root(root)?
             .iter()
             .any(TargetProcess::is_running))
+    }
+
+    pub(crate) fn codex_processes_running_for_root(root: &Path) -> Result<bool, EngineError> {
+        processes_running_for_root(root)
     }
 
     unsafe extern "system" fn post_close_to_pid(hwnd: HWND, target_pid: LPARAM) -> i32 {
@@ -270,10 +478,7 @@ mod imp {
         }
     }
 
-    pub(crate) fn close_codex_processes_for_root(
-        timeout_secs: u64,
-        root: &Path,
-    ) -> Result<(), EngineError> {
+    pub fn close_processes_for_root(timeout_secs: u64, root: &Path) -> Result<(), EngineError> {
         let targets = target_processes_under_root(root)?;
         if targets.is_empty() {
             return Ok(());
@@ -323,6 +528,13 @@ mod imp {
         Err(EngineError::Install(format!(
             "managed install process is still running after native close request (pids={remaining:?}); no files were replaced"
         )))
+    }
+
+    pub(crate) fn close_codex_processes_for_root(
+        timeout_secs: u64,
+        root: &Path,
+    ) -> Result<(), EngineError> {
+        close_processes_for_root(timeout_secs, root)
     }
 
     #[cfg(test)]
@@ -383,6 +595,11 @@ mod imp {
 }
 
 #[cfg(windows)]
+pub use imp::{
+    close_processes_for_root, processes_running_for_root, wait_for_usable_window_for_root,
+};
+
+#[cfg(windows)]
 pub(crate) use imp::{close_codex_processes_for_root, codex_processes_running_for_root};
 
 #[cfg(not(windows))]
@@ -394,8 +611,26 @@ pub(crate) fn close_codex_processes_for_root(
 }
 
 #[cfg(not(windows))]
+pub fn close_processes_for_root(_timeout_secs: u64, _root: &Path) -> Result<(), EngineError> {
+    Ok(())
+}
+
+#[cfg(not(windows))]
 pub(crate) fn codex_processes_running_for_root(_root: &Path) -> Result<bool, EngineError> {
     Ok(false)
+}
+
+#[cfg(not(windows))]
+pub fn processes_running_for_root(_root: &Path) -> Result<bool, EngineError> {
+    Ok(false)
+}
+
+#[cfg(not(windows))]
+pub fn wait_for_usable_window_for_root(
+    _root: &Path,
+    _timeout: std::time::Duration,
+) -> Result<Option<UsableWindowReport>, EngineError> {
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -438,5 +673,12 @@ mod tests {
             Path::new(r"C:\Users\Alice\Codex"),
             Path::new(r"C:\Users\Alice\Other")
         ));
+    }
+
+    #[test]
+    fn rejects_tiny_chromium_bookkeeping_windows() {
+        assert!(!window_dimensions_are_usable(14, 14));
+        assert!(!window_dimensions_are_usable(319, 600));
+        assert!(window_dimensions_are_usable(914, 638));
     }
 }

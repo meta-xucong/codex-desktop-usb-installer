@@ -8,8 +8,9 @@
 - `tools/`：离线载荷收集、验证、构建和测试脚本；
 - `release/usb-oneclick/`：当前推荐的一键 U 盘布局（保留轻量包装器、清单和验证脚本）；
 - `README.offline.md`、`TEST-REPORT.offline.md`：第一版使用说明和回归记录；
-- `docs/USB-BINDING-WATCHDOG-DEVELOPMENT.md`：下一阶段开发需求；
-- `docs/USB-BINDING-WATCHDOG-AUDIT.md`：当前实现审计报告。
+- `docs/USB-APPXVOLUME-PORTABLE-DEVELOPMENT.md`：当前 USB AppXVolume + 本地数据开发基线；
+- `docs/USB-APPXVOLUME-PORTABLE-AUDIT.md`：当前实现审计报告；
+- `docs/USB-BINDING-WATCHDOG-DEVELOPMENT.md`、`docs/USB-BINDING-WATCHDOG-AUDIT.md`：历史方案记录，已标记废弃，仅供追溯。
 
 ## 未放入 Git 历史的大文件
 

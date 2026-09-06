@@ -35,7 +35,7 @@ use crate::app::offline_payload::{
 };
 use crate::app::op_phase::{OperationPhase, QuitPolicy};
 use crate::app::operation_outcome::{
-    AncillaryRetryReport, AncillaryRetryRequest, OperationOutcome, StepOutcome,
+    recovery, AncillaryRetryReport, AncillaryRetryRequest, OperationOutcome, StepOutcome,
 };
 use crate::app::oplock::{
     HistoricalResumeContext, HistoricalResumeExpectation, HistoricalResumeSelection,
@@ -56,12 +56,14 @@ use crate::app::url_guard::{validate_custom_proxy, validate_custom_source};
 use crate::app::usb_guard::UsbGuardStatus;
 use crate::app::win_update::{
     auto_stage_windows_update_with_install_mode_and_network, cancel_windows_download,
+    cleanup_windows_codex_machine_orphan,
     detect_existing_windows_install_at_path as detect_windows_install_at_path,
     discard_windows_download, install_windows_historical_release, pause_windows_download,
     perform_windows_update_with_install_mode_network_and_phase,
-    plan_windows_update_with_install_mode_and_network, resolve_windows_local_package,
-    retry_windows_ancillary, stage_windows_update_with_install_mode_and_network,
-    uninstall_windows_codex, win_adopt as adopt_windows_install,
+    plan_windows_update_with_install_mode_and_network, probe_windows_codex_machine_state,
+    resolve_windows_local_package, retry_windows_ancillary,
+    stage_windows_update_with_install_mode_and_network, uninstall_windows_codex,
+    uninstall_windows_codex_for_usb_bundle, win_adopt as adopt_windows_install,
     win_adopt_path as adopt_windows_path, win_install_status,
     DownloadProgress as WinDownloadProgress, HistoricalWinExpectation, OperationEvidence,
     WinAbortGuard, WinAutoStageReport, WinInstallStatus, WinPerformExpectation, WinPerformReport,
@@ -509,7 +511,13 @@ pub async fn manager_install_update(
 fn windows_domain_settings_for_persisted(state: &ManagerState) -> DomainAppSettings {
     let saved = PersistedAppSettings::load();
     let mut settings = state.settings.clone();
-    settings.install_root = saved.install_root;
+    // A removable drive letter can change between sessions. In the fixed USB
+    // product the executable itself is the authority, so always derive the
+    // program root from the currently running, guarded bundle instead of a
+    // stale absolute path persisted on C:.
+    settings.install_root = crate::app::usb_guard::current_usb_codex_root()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or(saved.install_root);
     settings.disable_codex_self_updates = saved.disable_codex_self_updates;
     settings
 }
@@ -1022,8 +1030,10 @@ pub async fn historical_pick_local_package(
 
 /// First-version USB entry point: inspect the fixed manifest and MSIX beside
 /// the running setup executable.  No catalog, GitHub, Store or mirror request
-/// is made.  `package_path` exists only for developer diagnostics and must
-/// still point inside the discovered bundle.
+/// is made.  The quick preflight intentionally defers the expensive
+/// Authenticode scan until `offline_payload_stage` has copied the MSIX to the
+/// local temporary directory.  `package_path` exists only for developer
+/// diagnostics and must still point inside the discovered bundle.
 #[tauri::command]
 pub async fn offline_payload_probe(
     state: State<'_, ManagerState>,
@@ -1041,7 +1051,7 @@ pub async fn offline_payload_probe(
             &executable,
             package_path.as_deref(),
             Some(expected_architecture.as_str()),
-            true,
+            false,
         )
     })
     .await
@@ -1049,9 +1059,10 @@ pub async fn offline_payload_probe(
     .map_err(Into::into)
 }
 
-/// Copy a verified USB MSIX to the local temporary directory.  The subsequent
-/// guarded historical-install command receives this staged path, so the
-/// removable drive is no longer held open during AppX deployment.
+/// Copy a hash/identity-verified USB MSIX to the local temporary directory,
+/// verify Authenticode there, and return the path to the guarded installer.
+/// The subsequent historical-install command receives this staged path, so
+/// the removable drive is no longer held open during AppX deployment.
 #[tauri::command]
 pub async fn offline_payload_stage(
     state: State<'_, ManagerState>,
@@ -2933,10 +2944,11 @@ pub fn usb_guard_status() -> UsbGuardStatus {
 ///
 /// The USB build keeps `ccswitch/CodexSwitch.exe` beside the setup executable;
 /// a packaged Tauri build may instead expose the same directory through its
-/// resource directory.  The helper copies the payload to a per-user local
-/// directory before spawning it, so the configurator remains usable after the
-/// USB drive is removed.  A missing configurator is returned as a non-fatal
-/// report and never rolls back a successful Codex installation.
+/// resource directory.  In USB mode the verified sibling payload is launched
+/// directly from the removable volume (there is no hidden C: copy); normal
+/// non-USB builds may use a per-user local copy.  A missing configurator is
+/// returned as a non-fatal report and never rolls back a successful Codex
+/// installation.
 #[tauri::command]
 pub async fn install_and_launch_ccswitch(
     app: AppHandle,
@@ -3089,11 +3101,11 @@ pub async fn win_perform_update(
     Ok(report)
 }
 
-/// Windows-only historical/offline MSIX install. Reuses the verified normal
-/// perform tail, whose Add-AppxPackage path explicitly opts into
-/// ForceUpdateFromAnyVersion for real downgrade support. A local USB MSIX may
-/// use the same verified bytes for portable recovery if AppX deployment is
-/// blocked by the target Windows image.
+/// Windows-only historical/offline MSIX install. The package is always hashed,
+/// Authenticode-verified and identity-checked first. `install_to_usb` selects
+/// the fixed USB edition: verified program files are transactionally extracted
+/// to `<bundle>\apps\Codex`, while mutable user data stays in the normal local
+/// Windows profile. No AppX volume, WpSystem or StateRepository mutation is used.
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn win_install_historical_release(
@@ -3109,6 +3121,7 @@ pub async fn win_install_historical_release(
     install_root: Option<String>,
     expected: HistoricalWinExpectation,
     force_msix: Option<bool>,
+    install_to_usb: Option<bool>,
 ) -> Result<WinPerformReport, CommandError> {
     if !matches!(state.target.os, OperatingSystem::Windows) {
         return Err(AppError::UnsupportedPlatform.into());
@@ -3129,24 +3142,43 @@ pub async fn win_install_historical_release(
     // the next operation.
     let _abort_scope = WinAbortGuard::new();
     let mut settings = windows_domain_settings_for_persisted(&state);
+    let install_to_usb = install_to_usb.unwrap_or(false);
     // Match the normal fresh-install flow: validate the one-shot destination
     // before use, but remember it only after the historical install succeeds.
-    let pending_install_root = match install_root {
-        Some(raw) => {
-            let validated =
-                tauri::async_runtime::spawn_blocking(move || validate_install_root_path(&raw))
-                    .await
-                    .map_err(|e| AppError::Internal(format!("join: {e}")))??;
-            settings.install_root = validated.clone();
-            Some(validated)
+    let pending_install_root = if install_to_usb {
+        // Ignore renderer-selected destinations in USB mode. The exact target
+        // is derived from the authenticated bundle and rejects reparse points.
+        let usb_root = crate::app::usb_guard::authorized_usb_codex_root()?;
+        // Fail before staging a 700+ MB package if this machine redirects the
+        // normal Codex profile back onto the product USB.
+        crate::app::usb_guard::local_data_paths()?;
+        let raw = usb_root.to_string_lossy().into_owned();
+        let validated =
+            tauri::async_runtime::spawn_blocking(move || validate_install_root_path(&raw))
+                .await
+                .map_err(|e| AppError::Internal(format!("join: {e}")))??;
+        settings.install_root = validated.clone();
+        Some(validated)
+    } else {
+        match install_root {
+            Some(raw) => {
+                let validated =
+                    tauri::async_runtime::spawn_blocking(move || validate_install_root_path(&raw))
+                        .await
+                        .map_err(|e| AppError::Internal(format!("join: {e}")))??;
+                settings.install_root = validated.clone();
+                Some(validated)
+            }
+            None => None,
         }
-        None => None,
     };
     let resume_install_root = pending_install_root.clone();
     // The offline USB flow must never inherit a previous portable preference
     // from the full manager. Keep the optional flag at the command boundary
     // so existing online/historical callers retain their configured route.
-    let install_mode = if force_msix.unwrap_or(false) {
+    let install_mode = if install_to_usb {
+        crate::app::win_update::USB_PORTABLE_INSTALL_MODE.to_string()
+    } else if force_msix.unwrap_or(false) {
         FIXED_MSIX_INSTALL_MODE.to_string()
     } else {
         windows_install_mode_for_settings()
@@ -3158,6 +3190,10 @@ pub async fn win_install_historical_release(
     } else {
         win_network_config_for_settings()?
     };
+    // The v0.5.20 USB architecture is an ordinary removable program tree.
+    // This must stay `None`; a non-None value re-enters the fragile AppXVolume
+    // and WpSystem path retained only for legacy cleanup compatibility.
+    let appx_volume_root = None;
     let progress_app = app.clone();
     let ops = op.operations();
     let phase_token = op.token_clone();
@@ -3262,6 +3298,7 @@ pub async fn win_install_historical_release(
             Some(&evidence_hook),
             policy_transition,
             Some(&before_commit),
+            appx_volume_root,
         )
     })
     .await;
@@ -3292,7 +3329,7 @@ pub async fn win_install_historical_release(
         }
     };
     if let Some(root) = pending_install_root {
-        if report.success && report.portable.is_some() {
+        if report.success && report.portable.is_some() && !install_to_usb {
             let mut saved = PersistedAppSettings::load();
             saved.install_root = root;
             saved.normalize();
@@ -3349,6 +3386,10 @@ pub struct WinBundleUninstallReport {
     pub notes: Vec<String>,
     pub purged_user_data: bool,
     pub purged_ccswitch_data: bool,
+    /// Primary uninstall is complete; the detached helper still has to remove
+    /// the manager's open files after process exit. Never label this "all clean".
+    pub cleanup_pending: bool,
+    pub cleanup_report_path: Option<String>,
     #[serde(default)]
     pub outcome: OperationOutcome,
 }
@@ -3383,6 +3424,17 @@ fn combine_bundle_uninstall(
 
     if let Some(report) = codex.as_ref() {
         messages.push(format!("Codex：{}", report.message));
+        if let Some(msix) = report.msix.as_ref().filter(|msix| !msix.success) {
+            if let Some(raw) = msix
+                .raw_error
+                .as_deref()
+                .filter(|raw| !raw.trim().is_empty())
+            {
+                if !report.message.contains(raw) {
+                    messages.push(format!("AppX 原始错误：{raw}"));
+                }
+            }
+        }
         notes.extend(report.notes.iter().map(|note| format!("Codex：{note}")));
     }
     if let Some(error) = codex_error.as_deref() {
@@ -3442,7 +3494,112 @@ fn combine_bundle_uninstall(
         notes,
         purged_user_data: purged_codex_data,
         purged_ccswitch_data,
+        cleanup_pending: false,
+        cleanup_report_path: None,
         outcome,
+    }
+}
+
+fn fail_usb_codex_machine_cleanup(report: &mut WinUninstallReport, detail: String) {
+    report.success = false;
+    report.message = format!(
+        "{}；机器级 AppX 残留未确认清理完成",
+        report.message.trim_end_matches('。')
+    );
+    report.notes.push(detail.clone());
+    report.outcome.cleanup = StepOutcome::failed(detail.clone());
+    report.outcome.push_warning(detail);
+    report.outcome.push_recovery(recovery::CLEANUP_METADATA);
+}
+
+fn merge_usb_machine_cleanup(
+    report: &mut WinUninstallReport,
+    cleanup: codex_win_engine::MsixRemoveReport,
+) {
+    report
+        .notes
+        .push(format!("机器级 AppX 清理：{}", cleanup.message));
+    report.notes.extend(cleanup.notes.iter().cloned());
+    if cleanup.success {
+        // Keep the ordinary per-user removal report when one exists; otherwise
+        // expose the machine cleanup result through the same public field.
+        if report.msix.is_none() {
+            report.msix = Some(cleanup);
+        }
+        return;
+    }
+    if let Some(raw) = cleanup
+        .raw_error
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        report.notes.push(format!("机器级 AppX 原始错误：{raw}"));
+    }
+    let detail = format!("机器级 AppX 清理失败：{}", cleanup.message);
+    report.msix = Some(cleanup);
+    fail_usb_codex_machine_cleanup(report, detail);
+}
+
+fn bundle_can_start_final_cleanup(report: &WinBundleUninstallReport) -> bool {
+    report.success
+        && report.outcome.primary_ok
+        && !report.outcome.is_partial()
+        && report.outcome.recovery_actions.is_empty()
+}
+
+/// Keep the original primary errors even when later policy/helper steps add
+/// notes. `success` describes primary work; only the detached finalizer can
+/// report that the manager's own files have actually been removed.
+fn finish_bundle_uninstall_report(report: &mut WinBundleUninstallReport) {
+    let phase = if !report.outcome.primary_ok {
+        "primaryFailed"
+    } else if !report.success
+        || report.outcome.is_partial()
+        || !report.outcome.recovery_actions.is_empty()
+    {
+        "partialFailure"
+    } else if report.cleanup_pending {
+        "awaitingFinalCleanup"
+    } else {
+        "primaryCompleted"
+    };
+    if !report.success || report.outcome.is_partial() || !report.outcome.recovery_actions.is_empty()
+    {
+        let mut details = vec![report.message.clone()];
+        if !report.outcome.recovery_actions.is_empty() {
+            details.push(format!(
+                "尚待恢复步骤：{}",
+                report.outcome.recovery_actions.join(", ")
+            ));
+        }
+        for detail in report
+            .notes
+            .iter()
+            .chain(report.outcome.warnings.iter())
+            .chain(report.outcome.provenance.detail.iter())
+            .chain(report.outcome.cleanup.detail.iter())
+        {
+            if !detail.trim().is_empty() && !details.iter().any(|entry| entry.contains(detail)) {
+                details.push(detail.clone());
+            }
+        }
+        let summary = if report.outcome.primary_ok {
+            "Codex 主卸载已完成，但联合卸载或附属清理未全部完成；仍存在的诊断/恢复记录已保留，已经成功删除的所选数据不会恢复。"
+        } else {
+            "Codex 主卸载未完成；仍存在的诊断/恢复记录已保留，已经成功删除的所选数据不会恢复。"
+        };
+        report.message = format!("{summary}\n{}", details.join("\n"));
+        log::warn!(
+            "USB uninstall phase={phase} primary_ok={} success={} detail={}",
+            report.outcome.primary_ok,
+            report.success,
+            report.message
+        );
+    } else {
+        log::info!(
+            "USB uninstall phase={phase} cleanup_pending={}",
+            report.cleanup_pending
+        );
     }
 }
 
@@ -3453,11 +3610,13 @@ fn combine_bundle_uninstall(
 /// explicitly enabled by the UI.
 #[tauri::command]
 pub async fn win_uninstall_bundle(
+    app: tauri::AppHandle,
     state: State<'_, ManagerState>,
     confirm: bool,
     token: OperationToken,
     purge_user_data: bool,
     purge_ccswitch_data: bool,
+    remove_usb_media: Option<bool>,
 ) -> Result<WinBundleUninstallReport, CommandError> {
     if !matches!(state.target.os, OperatingSystem::Windows) {
         return Err(AppError::UnsupportedPlatform.into());
@@ -3469,19 +3628,270 @@ pub async fn win_uninstall_bundle(
     }
     let _op = DetachedGuard::validate_with_phase(&state, token, OperationPhase::Committing)?;
     let settings = windows_domain_settings_for_persisted(&state);
+    let remove_usb_media = remove_usb_media.unwrap_or(false);
+    // Capture/check the source before any uninstall mutation. No renderer path
+    // is accepted. Source-media erasure has its own explicit UI confirmation.
+    let source_license = if remove_usb_media {
+        // Capture the process-owned lease identity before primary uninstall
+        // stops the watchdog. The detached helper receives this stable
+        // fingerprint; it never treats a path string or filename as proof that
+        // the manager-created license is safe to erase.
+        let (bundle, fingerprint) = crate::app::usb_guard::authorized_bundle_identity()?;
+        let runtime_root = crate::app::usb_guard::usb_codex_root(&bundle);
+        let runtime_root = runtime_root.is_dir().then_some(runtime_root);
+        let preflight_fingerprint = fingerprint.clone();
+        // The complete offline kit exceeds 1 GB; keep its read-only hash scan
+        // off the async runtime so status/cancel UI remains responsive.
+        tauri::async_runtime::spawn_blocking(move || {
+            crate::app::usb_media_cleanup::preflight_bundle_before_uninstall(
+                &bundle,
+                runtime_root.as_deref(),
+                &preflight_fingerprint,
+            )
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("安装介质预检任务失败: {e}")))?
+        .map_err(AppError::Internal)?;
+        Some(fingerprint)
+    } else {
+        None
+    };
     let report = tauri::async_runtime::spawn_blocking(move || {
-        let codex = uninstall_windows_codex(&settings, confirm, purge_user_data);
+        let mut codex =
+            uninstall_windows_codex_for_usb_bundle(&settings, confirm, purge_user_data);
+        let mut cleanup_claim = None;
+        let mut cleanup_claim_note = None;
+
+        // Current-user removal is not the complete AppX postcondition. Failed
+        // deployments can leave one machine-level Staged record with an empty
+        // or dangling package path. Classify it before destroying the guard
+        // lease or the AppX-volume journal, then authenticate the exact cleanup
+        // identity from the signed USB MSIX. Never edit PackageRepository or a
+        // WindowsApps ACL/link directly.
+        if let Ok(codex_report) = &mut codex {
+            if codex_report.success {
+                let machine_state = probe_windows_codex_machine_state();
+                let volume_cleanup_pending =
+                    match crate::app::appx_volume::has_pending_volume_cleanup() {
+                        Ok(pending) => pending,
+                        Err(error) => {
+                            cleanup_claim_note = Some(format!(
+                                "无法预读 AppX 卷恢复记录：{error}；未授权删除任何未知或共享机器包。"
+                            ));
+                            false
+                        }
+                    };
+                let orphan_candidate = machine_state
+                    .as_ref()
+                    .is_ok_and(|state| state.is_orphan_candidate());
+                let machine_reconciliation = machine_state
+                    .as_ref()
+                    .is_ok_and(|state| state.is_none() && volume_cleanup_pending);
+                if orphan_candidate || volume_cleanup_pending {
+                    match std::env::current_exe()
+                        .map_err(|error| AppError::Internal(error.to_string()))
+                        .and_then(|exe| crate::app::offline_payload::cleanup_package_claim(&exe))
+                    {
+                        Ok(claim) => cleanup_claim = Some(claim),
+                        Err(error) => {
+                            log::warn!("USB machine/staged cleanup claim unavailable: {error}");
+                            cleanup_claim_note = Some(format!(
+                                "未建立精确机器包清理授权：{error}；未知、共享或未签名身份只会列出并保留。"
+                            ));
+                        }
+                    }
+                }
+
+                match machine_state {
+                    Err(error) => fail_usb_codex_machine_cleanup(
+                        codex_report,
+                        format!(
+                            "无法核验所有用户/预配/机器级 Codex AppX 状态，不能把当前用户包已删除当作彻底卸载：{error}"
+                        ),
+                    ),
+                    Ok(state) if state.is_orphan_candidate() => {
+                        let observed = state.package_full_name.as_deref().unwrap_or("");
+                        match cleanup_claim.as_ref() {
+                            Some(claim)
+                                if claim.package_full_name.eq_ignore_ascii_case(observed) => {
+                                match cleanup_windows_codex_machine_orphan(
+                                    &claim.package_full_name,
+                                    &claim.payload_path,
+                                    &claim.payload_sha256,
+                                    !purge_user_data,
+                                ) {
+                                    Ok(cleanup) => {
+                                        merge_usb_machine_cleanup(codex_report, cleanup)
+                                    }
+                                    Err(error) => fail_usb_codex_machine_cleanup(
+                                        codex_report,
+                                        format!("执行精确机器级 AppX 孤儿清理失败：{error}"),
+                                    ),
+                                }
+                            }
+                            Some(claim) => fail_usb_codex_machine_cleanup(
+                                codex_report,
+                                format!(
+                                    "机器级孤儿包 {observed} 与已签名离线载荷 {} 不一致；已保留现场",
+                                    claim.package_full_name
+                                ),
+                            ),
+                            None => fail_usb_codex_machine_cleanup(
+                                codex_report,
+                                cleanup_claim_note.clone().unwrap_or_else(|| {
+                                    "没有经过 Authenticode 校验的精确 FullName，未清理机器级孤儿包"
+                                        .to_string()
+                                }),
+                            ),
+                        }
+                    }
+                    Ok(state) if machine_reconciliation && state.is_none() => {
+                        // A durable AppX-volume journal can outlive the
+                        // PowerShell projection. Give the documented WinRT API
+                        // one exact reconciliation attempt before removing the
+                        // journal and verify the Windows-managed system entry.
+                        if let Some(claim) = cleanup_claim.as_ref() {
+                            match cleanup_windows_codex_machine_orphan(
+                                &claim.package_full_name,
+                                &claim.payload_path,
+                                &claim.payload_sha256,
+                                !purge_user_data,
+                            ) {
+                                Ok(cleanup) => merge_usb_machine_cleanup(codex_report, cleanup),
+                                Err(error) => fail_usb_codex_machine_cleanup(
+                                    codex_report,
+                                    format!("核对机器级 AppX 清理状态失败：{error}"),
+                                ),
+                            }
+                        }
+                    }
+                    Ok(state) if !state.is_none() => fail_usb_codex_machine_cleanup(
+                        codex_report,
+                        format!(
+                            "检测到不可自动删除的机器级 Codex 状态：classification={}；reason={}；package={}；owners={}；provisioned={}",
+                            state.classification,
+                            state.reason,
+                            state.package_full_name.as_deref().unwrap_or("none"),
+                            state.owner_states.join(","),
+                            state.provisioned_packages.join(",")
+                        ),
+                    ),
+                    Ok(_) => {}
+                }
+            }
+        }
+
         let ccswitch = uninstall_ccswitch_impl(purge_ccswitch_data);
         // CCSwitch termination uses the active lease's PID list.  Stop and
-        // remove the helper only after that step has had a chance to use it.
+        // remove the helper only after that step and machine AppX data backup
+        // have had a chance to use the verified bound-volume lease.
         let guard_notes = crate::app::usb_guard::stop_and_uninstall();
         let mut report =
             combine_bundle_uninstall(codex, ccswitch, purge_user_data, purge_ccswitch_data);
         report.notes.extend(guard_notes);
+        // Local installer staging is neither AppX package data nor recovery
+        // evidence. Clean it even when an owned/shared AppX volume must remain,
+        // so a partial system cleanup cannot strand the ~800 MB MSIX copy.
+        match crate::app::uninstall_cleanup::cleanup_install_staging_now() {
+            Ok(items) => {
+                let failures = items
+                    .iter()
+                    .filter(|item| item.status == "failed")
+                    .map(|item| format!("{}：{}", item.path, item.detail))
+                    .collect::<Vec<_>>();
+                report.notes.extend(items.into_iter().map(|item| {
+                    format!("安装暂存 {}：{}（{}）", item.status, item.path, item.detail)
+                }));
+                if !failures.is_empty() {
+                    let detail = format!("安装暂存清理未完成：{}", failures.join("；"));
+                    report.success = false;
+                    report.outcome.cleanup = StepOutcome::failed(detail);
+                }
+            }
+            Err(error) => {
+                let detail = format!("无法枚举安装暂存目录：{error}");
+                report.success = false;
+                report.notes.push(detail.clone());
+                report.outcome.cleanup = StepOutcome::failed(detail);
+            }
+        }
+        // Do not discard recovery evidence while the program or its policies
+        // remain unresolved. Each failure leaves the manager available to retry.
+        if report.codex.as_ref().is_some_and(|r| r.success) {
+            let system = crate::app::appx_volume::cleanup_system_after_uninstall(
+                cleanup_claim
+                    .as_ref()
+                    .map(|claim| claim.package_full_name.as_str()),
+            );
+            report.notes.extend(system.messages);
+            report.notes.extend(system.warnings);
+            if system.pending {
+                if let Some(note) = cleanup_claim_note {
+                    report.notes.push(note);
+                }
+                report.success = false;
+                report.outcome.cleanup =
+                    StepOutcome::failed("AppX 卷或策略尚未清理，已保留恢复记录");
+            }
+            match crate::app::codex_self_update::cleanup_for_uninstall() {
+                Ok(notes) => report.notes.extend(notes),
+                Err(error) => {
+                    report.success = false;
+                    report
+                        .notes
+                        .push(format!("自动更新策略恢复未完成：{error}"));
+                    report.outcome.cleanup = StepOutcome::failed(error.to_string());
+                }
+            }
+            if report.success {
+                if let Err(error) = crate::app::msix_policy_tx::clear_pending_after_uninstall() {
+                    report.success = false;
+                    report.notes.push(format!("安装策略事务仍待处理：{error}"));
+                    report.outcome.cleanup = StepOutcome::failed(error.to_string());
+                }
+                if let Err(error) = crate::app::install_tx::clear_completed_for_uninstall() {
+                    report.success = false;
+                    report.notes.push(format!("安装文件事务仍待处理：{error}"));
+                    report.outcome.cleanup = StepOutcome::failed(error.to_string());
+                }
+            }
+        }
+        if bundle_can_start_final_cleanup(&report) {
+            match crate::app::uninstall_cleanup::launch_deferred_cleanup(
+                purge_user_data,
+                purge_ccswitch_data,
+                remove_usb_media,
+                source_license,
+                report.notes.clone(),
+            ) {
+                Ok(handoff) => {
+                    crate::app::usb_guard::suppress_status_for_uninstall();
+                    report.cleanup_pending = true;
+                    report.cleanup_report_path = Some(handoff.report_path);
+                    report.message = handoff.message;
+                    report.outcome.cleanup =
+                        StepOutcome::skipped("等待管理器退出后进行最终清理与复核");
+                }
+                Err(error) => {
+                    report.success = false;
+                    report.notes.push(format!("最终清理进程未启动：{error}"));
+                    report.outcome.cleanup = StepOutcome::failed(error);
+                }
+            }
+        }
+        finish_bundle_uninstall_report(&mut report);
         report
     })
     .await
     .map_err(|e| AppError::Internal(format!("join: {e}")))?;
+    if report.cleanup_pending {
+        // Return the truthful handoff state before exiting. The helper already
+        // holds the session mutex and waits on this exact process handle.
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            crate::exit_after_confirm(&app);
+        });
+    }
     Ok(report)
 }
 
@@ -3507,6 +3917,280 @@ mod tests {
 
     fn temp_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("{name}-{}", std::process::id()))
+    }
+
+    fn uninstall_fixture(success: bool) -> super::WinUninstallReport {
+        super::WinUninstallReport {
+            success,
+            action: "remove-msix".into(),
+            message: if success {
+                "package absent"
+            } else {
+                "linked package data blocked"
+            }
+            .into(),
+            installed_before: None,
+            msix: Some(codex_win_engine::MsixRemoveReport {
+                success,
+                message: "package result".into(),
+                raw_error: (!success)
+                    .then(|| "HRESULT=0x80073CFA ActivityId=fixture-activity".into()),
+                notes: vec![],
+            }),
+            portable: None,
+            purged_user_data: false,
+            notes: vec!["fixture backup retained".into()],
+            outcome: if success {
+                super::OperationOutcome::full_success("absent", Some("none"))
+            } else {
+                super::OperationOutcome::primary_failed("present", "linked package data blocked")
+            },
+        }
+    }
+
+    fn switch_uninstall_fixture(success: bool) -> super::CcswitchUninstallReport {
+        super::CcswitchUninstallReport {
+            success,
+            installed_before: true,
+            removed_install: success,
+            removed_autostart: success,
+            purged_user_data: false,
+            install_dir: "fixture".into(),
+            data_dirs: vec![],
+            message: if success {
+                "switch absent"
+            } else {
+                "switch file locked"
+            }
+            .into(),
+            notes: vec![],
+        }
+    }
+
+    #[test]
+    fn machine_orphan_cleanup_failure_blocks_finalizer_but_keeps_primary_evidence() {
+        let mut codex = uninstall_fixture(true);
+        super::merge_usb_machine_cleanup(
+            &mut codex,
+            codex_win_engine::MsixRemoveReport {
+                success: false,
+                message: "Windows-managed package entry remains".into(),
+                raw_error: Some("fixture machine cleanup error".into()),
+                notes: vec!["recovery evidence retained".into()],
+            },
+        );
+        assert!(!codex.success);
+        assert!(codex.outcome.primary_ok);
+        assert!(codex
+            .outcome
+            .recovery_actions
+            .iter()
+            .any(|item| item == crate::app::operation_outcome::recovery::CLEANUP_METADATA));
+        let report = super::combine_bundle_uninstall(
+            Ok(codex),
+            Ok(switch_uninstall_fixture(true)),
+            false,
+            false,
+        );
+        assert!(!report.success);
+        assert!(!super::bundle_can_start_final_cleanup(&report));
+        assert!(report
+            .notes
+            .iter()
+            .any(|note| note.contains("fixture machine cleanup error")));
+    }
+
+    #[test]
+    fn successful_machine_orphan_cleanup_can_continue_to_finalizer() {
+        let mut codex = uninstall_fixture(true);
+        codex.msix = None;
+        super::merge_usb_machine_cleanup(
+            &mut codex,
+            codex_win_engine::MsixRemoveReport {
+                success: true,
+                message: "exact orphan absent".into(),
+                raw_error: None,
+                notes: vec!["supported AppX API used".into()],
+            },
+        );
+        assert!(codex.success);
+        assert!(codex.msix.as_ref().is_some_and(|item| item.success));
+        let report = super::combine_bundle_uninstall(
+            Ok(codex),
+            Ok(switch_uninstall_fixture(true)),
+            false,
+            false,
+        );
+        assert!(super::bundle_can_start_final_cleanup(&report));
+    }
+
+    #[test]
+    fn bundle_uninstall_keeps_primary_and_raw_errors_when_notes_are_added() {
+        let mut report = super::combine_bundle_uninstall(
+            Ok(uninstall_fixture(false)),
+            Ok(switch_uninstall_fixture(true)),
+            false,
+            false,
+        );
+        report.notes.push("later policy note".into());
+        super::finish_bundle_uninstall_report(&mut report);
+        assert!(!report.success);
+        assert!(!super::bundle_can_start_final_cleanup(&report));
+        for detail in [
+            "linked package data blocked",
+            "HRESULT=0x80073CFA",
+            "ActivityId=fixture-activity",
+            "fixture backup retained",
+            "later policy note",
+        ] {
+            assert!(
+                report.message.contains(detail),
+                "missing {detail}: {}",
+                report.message
+            );
+        }
+        assert!(report.message.starts_with("Codex 主卸载未完成"));
+    }
+
+    #[test]
+    fn bundle_uninstall_keeps_both_thrown_errors_without_a_nested_report() {
+        let mut report = super::combine_bundle_uninstall(
+            Err(AppError::Engine("AppX query failed".into())),
+            Err(AppError::Engine("CCSwitch access denied".into())),
+            false,
+            false,
+        );
+        super::finish_bundle_uninstall_report(&mut report);
+        assert!(!report.success);
+        assert_eq!(report.outcome.app_state, "unknown");
+        assert!(report.message.contains("AppX query failed"));
+        assert!(report.message.contains("CCSwitch access denied"));
+        assert!(!super::bundle_can_start_final_cleanup(&report));
+    }
+
+    #[test]
+    fn bundle_uninstall_preserves_switch_failure_after_codex_success() {
+        let mut report = super::combine_bundle_uninstall(
+            Ok(uninstall_fixture(true)),
+            Ok(switch_uninstall_fixture(false)),
+            false,
+            false,
+        );
+        super::finish_bundle_uninstall_report(&mut report);
+        assert!(!report.success);
+        assert!(report.message.contains("switch file locked"));
+        assert!(report.message.starts_with("Codex 主卸载未完成"));
+        assert!(!super::bundle_can_start_final_cleanup(&report));
+    }
+
+    #[test]
+    fn bundle_uninstall_does_not_handoff_after_provenance_or_cleanup_failure() {
+        for provenance_failure in [true, false] {
+            let mut codex = uninstall_fixture(true);
+            if provenance_failure {
+                codex.outcome.provenance = super::StepOutcome::failed("record save denied");
+            } else {
+                codex.outcome.cleanup = super::StepOutcome::failed("metadata busy");
+            }
+            let mut report = super::combine_bundle_uninstall(
+                Ok(codex),
+                Ok(switch_uninstall_fixture(true)),
+                false,
+                false,
+            );
+            assert!(
+                report.success,
+                "primary result stays successful for targeted retry"
+            );
+            assert!(!super::bundle_can_start_final_cleanup(&report));
+            super::finish_bundle_uninstall_report(&mut report);
+            assert!(report
+                .message
+                .starts_with("Codex 主卸载已完成，但联合卸载或附属清理未全部完成"));
+            assert!(report.message.contains(if provenance_failure {
+                "record save denied"
+            } else {
+                "metadata busy"
+            }));
+        }
+    }
+
+    #[test]
+    fn bundle_uninstall_keeps_late_helper_or_policy_error_and_primary_result() {
+        let mut report = super::combine_bundle_uninstall(
+            Ok(uninstall_fixture(true)),
+            Ok(switch_uninstall_fixture(true)),
+            false,
+            false,
+        );
+        report.success = false;
+        report.outcome.cleanup = super::StepOutcome::failed("helper handshake timed out");
+        super::finish_bundle_uninstall_report(&mut report);
+        assert!(report.message.contains("package absent"));
+        assert!(report.message.contains("helper handshake timed out"));
+        assert!(!super::bundle_can_start_final_cleanup(&report));
+    }
+
+    #[test]
+    fn bundle_uninstall_pending_never_replaces_handoff_with_all_clean() {
+        let mut report = super::combine_bundle_uninstall(
+            Ok(uninstall_fixture(true)),
+            Ok(switch_uninstall_fixture(true)),
+            false,
+            false,
+        );
+        assert!(super::bundle_can_start_final_cleanup(&report));
+        report.cleanup_pending = true;
+        report.cleanup_report_path = Some("fixture-report.json".into());
+        report.message = "waiting for manager exit; pending final cleanup".into();
+        report.outcome.cleanup = super::StepOutcome::skipped("pending");
+        super::finish_bundle_uninstall_report(&mut report);
+        assert_eq!(
+            report.message,
+            "waiting for manager exit; pending final cleanup"
+        );
+        assert!(report.cleanup_pending);
+        assert_eq!(
+            report.cleanup_report_path.as_deref(),
+            Some("fixture-report.json")
+        );
+    }
+
+    #[test]
+    fn bundle_uninstall_pending_recovery_action_blocks_helper_even_without_failed_flag() {
+        let mut report = super::combine_bundle_uninstall(
+            Ok(uninstall_fixture(true)),
+            Ok(switch_uninstall_fixture(true)),
+            false,
+            false,
+        );
+        report
+            .outcome
+            .recovery_actions
+            .push("clear_provenance".into());
+        assert!(!super::bundle_can_start_final_cleanup(&report));
+        super::finish_bundle_uninstall_report(&mut report);
+        assert!(report.success);
+        assert!(report.message.contains("尚待恢复步骤：clear_provenance"));
+        assert!(report
+            .message
+            .starts_with("Codex 主卸载已完成，但联合卸载或附属清理未全部完成"));
+    }
+
+    #[test]
+    fn bundle_uninstall_shared_data_flags_are_independent() {
+        for (purge_codex, purge_switch) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let mut codex = uninstall_fixture(true);
+            codex.purged_user_data = true;
+            let mut switch = switch_uninstall_fixture(true);
+            switch.purged_user_data = true;
+            let report =
+                super::combine_bundle_uninstall(Ok(codex), Ok(switch), purge_codex, purge_switch);
+            assert_eq!(report.purged_user_data, purge_codex);
+            assert_eq!(report.purged_ccswitch_data, purge_switch);
+        }
     }
 
     #[test]

@@ -387,8 +387,11 @@ impl InstallTransaction {
     }
 
     pub fn remove_file(&self) {
-        if let Some(path) = tx_path_for(&self.id) {
-            let _ = fs::remove_file(path);
+        if let Err(error) = self.remove_file_checked() {
+            log::warn!(
+                "install transaction cleanup retained id={} error={error}",
+                self.id
+            );
         }
     }
 
@@ -396,14 +399,13 @@ impl InstallTransaction {
         let path = tx_path_for(&self.id).ok_or_else(|| {
             AppError::Internal("无法定位 install-transactions 数据目录".to_string())
         })?;
-        match fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(AppError::Internal(format!(
-                "删除事务日志失败（{}）: {err}",
-                path.display()
-            ))),
+        if uuid::Uuid::parse_str(&self.id).is_err() {
+            return Err(AppError::Internal("安装事务 ID 非法，拒绝清理".into()));
         }
+        // Drop the obsolete backup first: a crash before removing the current
+        // terminal journal remains recoverable, not a stale backup-only intent.
+        remove_transaction_file(&atomic_file::backup_path(&path))?;
+        remove_transaction_file(&path)
     }
 
     pub fn load_from_path(path: &Path) -> Result<Self, AppError> {
@@ -411,6 +413,164 @@ impl InstallTransaction {
             fs::read(path).map_err(|e| AppError::Internal(format!("读取事务日志失败: {e}")))?;
         serde_json::from_slice(&bytes)
             .map_err(|e| AppError::Internal(format!("解析事务日志失败: {e}")))
+    }
+}
+
+fn remove_transaction_file(path: &Path) -> Result<(), AppError> {
+    codex_win_engine::validate_cleanup_path(path).map_err(|e| AppError::Engine(e.to_string()))?;
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(AppError::Internal(format!(
+            "删除事务日志失败（{}）: {err}",
+            path.display()
+        ))),
+    }
+}
+
+/// Uninstall only removes bookkeeping for unambiguously finished transactions.
+/// It never replays a rename/rollback or deletes a path stored in a journal.
+/// Call after the app uninstall and environment-policy cleanup have completed.
+pub fn clear_completed_for_uninstall() -> Result<usize, AppError> {
+    let dir =
+        transactions_dir().ok_or_else(|| AppError::Internal("无法定位安装事务目录".into()))?;
+    clear_completed_in_dir(&dir)
+}
+
+fn clear_completed_in_dir(dir: &Path) -> Result<usize, AppError> {
+    codex_win_engine::validate_cleanup_path(dir).map_err(|e| AppError::Engine(e.to_string()))?;
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(AppError::Engine(format!("无法扫描安装事务目录：{error}"))),
+    };
+    let mut groups = std::collections::BTreeMap::<String, Vec<PathBuf>>::new();
+    for entry in entries {
+        let path = entry.map_err(|e| AppError::Engine(e.to_string()))?.path();
+        codex_win_engine::validate_cleanup_path(&path)
+            .map_err(|e| AppError::Engine(e.to_string()))?;
+        let name = path.file_name().and_then(|v| v.to_str()).unwrap_or("");
+        let id = name
+            .strip_suffix(".json")
+            .or_else(|| name.strip_suffix(".json.bak"))
+            .ok_or_else(|| {
+                AppError::Engine(format!("安装事务目录存在未知材料：{}", path.display()))
+            })?;
+        if uuid::Uuid::parse_str(id).is_err() {
+            return Err(AppError::Engine("安装事务文件名无效，已保留".into()));
+        }
+        let tx = InstallTransaction::load_from_path(&path)?;
+        if tx.schema_version != SCHEMA_VERSION || tx.id != id {
+            return Err(AppError::Engine("安装事务身份/版本不符，已保留".into()));
+        }
+        groups.entry(id.into()).or_default().push(path);
+    }
+    // Validate every group before deleting even the first journal.
+    for (id, paths) in &groups {
+        let primary = dir.join(format!("{id}.json"));
+        let authoritative = paths.iter().find(|p| **p == primary).unwrap_or(&paths[0]);
+        let tx = InstallTransaction::load_from_path(authoritative)?;
+        if !matches!(
+            tx.step,
+            InstallTxStep::Completed | InstallTxStep::RolledBack
+        ) {
+            return Err(AppError::Engine(format!(
+                "安装事务 {id} 尚未完成（{}）；保留恢复材料，不在卸载中自动回滚",
+                tx.step.as_str()
+            )));
+        }
+        for raw in [&tx.new_path, &tx.backup_path] {
+            let path = Path::new(raw);
+            codex_win_engine::validate_cleanup_path(path)
+                .map_err(|e| AppError::Engine(e.to_string()))?;
+            match fs::symlink_metadata(path) {
+                Ok(_) => {
+                    return Err(AppError::Engine(format!(
+                        "已结束事务仍引用恢复文件 {}；保留事务供明确处理",
+                        path.display()
+                    )))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(AppError::Engine(format!("无法验证事务恢复文件：{error}")))
+                }
+            }
+        }
+    }
+    let count = groups.len();
+    for (id, _) in groups {
+        let primary = dir.join(format!("{id}.json"));
+        remove_transaction_file(&atomic_file::backup_path(&primary))?;
+        remove_transaction_file(&primary)?;
+    }
+    Ok(count)
+}
+
+#[cfg(test)]
+mod uninstall_cleanup_tests {
+    use super::*;
+
+    fn fixture_root() -> PathBuf {
+        let temp = std::env::temp_dir();
+        fs::canonicalize(&temp)
+            .unwrap_or(temp)
+            .join(format!("codex-tx-cleanup-{}", uuid::Uuid::new_v4()))
+    }
+
+    fn fixture(root: &Path, id: &str, step: InstallTxStep) -> InstallTransaction {
+        InstallTransaction {
+            schema_version: 1,
+            id: id.into(),
+            kind: InstallTxKind::WindowsPortable,
+            step,
+            install_path: root.join("install").to_string_lossy().into_owned(),
+            new_path: root.join("new").to_string_lossy().into_owned(),
+            backup_path: root.join("backup").to_string_lossy().into_owned(),
+            had_previous: false,
+            was_running: None,
+            self_update_policy: None,
+            started_unix: 1,
+            updated_unix: 2,
+            notes: vec![],
+        }
+    }
+    #[test]
+    fn terminal_primary_clears_its_old_backup_without_replaying_rename() {
+        let root = fixture_root();
+        let dir = root.join("journals");
+        fs::create_dir_all(&dir).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let path = dir.join(format!("{id}.json"));
+        fs::write(
+            &path,
+            serde_json::to_vec(&fixture(&root, &id, InstallTxStep::Completed)).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            atomic_file::backup_path(&path),
+            serde_json::to_vec(&fixture(&root, &id, InstallTxStep::NewInstalled)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(clear_completed_in_dir(&dir).unwrap(), 1);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        assert!(!root.join("install").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn unfinished_backup_only_journal_is_not_silently_discarded() {
+        let root = fixture_root();
+        let dir = root.join("journals");
+        fs::create_dir_all(&dir).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let path = dir.join(format!("{id}.json.bak"));
+        fs::write(
+            &path,
+            serde_json::to_vec(&fixture(&root, &id, InstallTxStep::NewInstalled)).unwrap(),
+        )
+        .unwrap();
+        assert!(clear_completed_in_dir(&dir).is_err());
+        assert!(path.is_file());
+        fs::remove_dir_all(root).unwrap();
     }
 }
 
