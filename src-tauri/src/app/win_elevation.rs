@@ -13,6 +13,7 @@
 //! whether the current user may elevate, and a cancelled prompt is surfaced as
 //! a clear startup error.
 
+#[cfg(target_os = "windows")]
 use std::ffi::OsStr;
 
 pub const ELEVATED_ARG: &str = "--codex-usb-elevated";

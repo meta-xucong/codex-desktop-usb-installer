@@ -9,6 +9,7 @@
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+#[cfg(windows)]
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};

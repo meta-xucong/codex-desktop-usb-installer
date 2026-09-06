@@ -25,8 +25,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 #[cfg(target_os = "windows")]
 use std::thread;
+#[cfg(any(target_os = "windows", test))]
+use std::time::Duration;
 #[cfg(target_os = "windows")]
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
@@ -91,12 +93,13 @@ impl AppxSystemCleanupReport {
 
 /// The volume helper is deliberately bounded; a stalled service must not
 /// leave the Tauri operation waiting forever.
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 const ELEVATED_OPERATION_TIMEOUT: Duration = Duration::from_secs(120);
 /// Removing a staged 800 MB package and unregistering its removable AppX
 /// volume can legitimately outlive the small policy-operation budget on slow
 /// media with Defender scanning. Keep this bounded, but never kill the system
 /// deployment command at the old two-minute boundary.
+#[cfg(any(target_os = "windows", test))]
 const ELEVATED_USB_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 #[cfg(target_os = "windows")]
@@ -1495,6 +1498,27 @@ fn pending_system_package_entry(audit: &serde_json::Value) -> Result<Option<Stri
     }
 }
 
+#[cfg(target_os = "windows")]
+fn cleanup_volume_journal_data(
+    journal: &VolumeJournal,
+    authorized_package_full_name: Option<&str>,
+) -> Result<serde_json::Value, AppError> {
+    run_elevated_powershell_data_with_timeout(
+        &appx_volume_cleanup_script_with_claim(journal, authorized_package_full_name),
+        "USB AppX 卷卸载清理",
+        ELEVATED_USB_CLEANUP_TIMEOUT,
+    )?
+    .ok_or_else(|| AppError::Engine("AppX 卷清理未返回可验证结果".into()))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn cleanup_volume_journal_data(
+    _journal: &VolumeJournal,
+    _authorized_package_full_name: Option<&str>,
+) -> Result<serde_json::Value, AppError> {
+    Err(AppError::UnsupportedPlatform)
+}
+
 /// Must be called only after current-user Codex absence is verified. Each
 /// restoration is independent so a bad policy does not hide a volume result.
 /// This never deletes machine policy keys or guesses legacy previous values.
@@ -1521,18 +1545,7 @@ pub fn cleanup_system_after_uninstall(
         let target = path.display().to_string();
         let result = (|| -> Result<(String, String), AppError> {
             let journal = load_volume_journal(&path)?;
-            #[cfg(target_os = "windows")]
-            let data = run_elevated_powershell_data_with_timeout(
-                &appx_volume_cleanup_script_with_claim(&journal, authorized_package_full_name),
-                "USB AppX 卷卸载清理",
-                ELEVATED_USB_CLEANUP_TIMEOUT,
-            )?
-            .ok_or_else(|| AppError::Engine("AppX 卷清理未返回可验证结果".into()))?;
-            #[cfg(not(target_os = "windows"))]
-            let data: serde_json::Value = {
-                let _ = journal;
-                return Err(AppError::UnsupportedPlatform);
-            };
+            let data = cleanup_volume_journal_data(&journal, authorized_package_full_name)?;
             let status = data
                 .get("status")
                 .and_then(|value| value.as_str())

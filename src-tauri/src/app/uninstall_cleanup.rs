@@ -5,7 +5,9 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(windows)]
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

@@ -11,6 +11,7 @@
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "windows")]
 use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};

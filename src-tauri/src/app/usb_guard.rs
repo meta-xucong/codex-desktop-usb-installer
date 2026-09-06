@@ -15,9 +15,14 @@
 //! verified before a lease is created.  No API key or private signing key is
 //! ever written to the USB or local guard directory.
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+#[cfg(target_os = "windows")]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
+#[cfg(target_os = "windows")]
+use std::io::Write;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "windows")]
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
