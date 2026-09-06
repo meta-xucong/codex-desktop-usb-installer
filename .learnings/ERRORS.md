@@ -516,3 +516,65 @@ After changing test fixture types, run strict Clippy before committing and remov
 - **Notes**: Removed the obsolete import and reran the strict validation gate.
 
 ---
+## [ERR-20260906-018] powershell-rg-regex-quoting
+
+**Logged**: 2026-09-06T15:56:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: tooling
+
+### Summary
+A PowerShell `rg` scan used a double-quoted regular expression containing literal double quotes, so PowerShell parsed part of the pattern as syntax.
+
+### Error
+```
+ParserError: Array index expression is missing or not valid.
+```
+
+### Context
+- The read-only scan was checking standalone engine tests for Windows path literals.
+- No source command ran and no files were changed by the failed invocation.
+
+### Suggested Fix
+Use a single-quoted PowerShell string for regular expressions that contain literal double quotes and backslashes.
+
+### Metadata
+- Reproducible: yes
+- Related Files: crates/codex-win-engine/src
+
+### Resolution
+- **Resolved**: 2026-09-06T15:56:00+08:00
+- **Notes**: Reissued the scan with a single-quoted pattern.
+
+---
+## [ERR-20260906-019] windows-verbatim-temp-parent-component
+
+**Logged**: 2026-09-06T16:01:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: tests
+
+### Summary
+Canonicalizing the test temp root on Windows produced a verbatim `\\?\` path, which changed how the parent-traversal fixture exposed `..` to `Path::components`.
+
+### Error
+```
+assertion failed: validate_cleanup_path(&root.join("..").join("escape")).is_err()
+```
+
+### Context
+- Temp-root canonicalization is needed on macOS because `/var` is a system symlink to `/private/var`.
+- It is unnecessary on Windows and made the traversal assertion less representative of ordinary Win32 paths.
+
+### Suggested Fix
+Canonicalize the temp root only on non-Windows hosts; retain `std::env::temp_dir()` on Windows.
+
+### Metadata
+- Reproducible: yes
+- Related Files: crates/codex-win-engine/src/portable.rs
+
+### Resolution
+- **Resolved**: 2026-09-06T16:01:00+08:00
+- **Notes**: Added target-specific temp-root handling and reran the standalone engine tests.
+
+---

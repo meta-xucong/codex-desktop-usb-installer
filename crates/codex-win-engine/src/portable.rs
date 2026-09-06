@@ -1506,10 +1506,22 @@ mod tests {
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(1);
     static TEST_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+    fn canonical_temp_dir() -> PathBuf {
+        let temp = std::env::temp_dir();
+        #[cfg(windows)]
+        {
+            temp
+        }
+        #[cfg(not(windows))]
+        {
+            fs::canonicalize(&temp).unwrap_or(temp)
+        }
+    }
+
     fn temp_test_dir(name: &str) -> PathBuf {
         let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir =
-            std::env::temp_dir().join(format!("codex-portable-{name}-{}-{id}", std::process::id()));
+            canonical_temp_dir().join(format!("codex-portable-{name}-{}-{id}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -1787,7 +1799,7 @@ mod tests {
     #[test]
     fn cleanup_boundary_rejects_relative_and_parent_traversal() {
         assert!(validate_cleanup_path(Path::new("relative/.codex")).is_err());
-        let root = std::env::temp_dir().join("codex-cleanup-boundary-missing");
+        let root = canonical_temp_dir().join("codex-cleanup-boundary-missing");
         assert!(validate_cleanup_path(&root.join("child")).is_ok());
         assert!(validate_cleanup_path(&root.join("..").join("escape")).is_err());
     }
@@ -1900,7 +1912,7 @@ if ($null -ne (Get-OwnedPortableEntry)) {{ 'owned' }} else {{ 'missing' }}
 
     #[test]
     fn installs_portable_payload_from_msix_layout() {
-        let root = std::env::temp_dir().join(format!("codex-portable-test-{}", std::process::id()));
+        let root = canonical_temp_dir().join(format!("codex-portable-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let msix = root.join("codex.msix");
@@ -1919,7 +1931,7 @@ if ($null -ne (Get-OwnedPortableEntry)) {{ 'owned' }} else {{ 'missing' }}
 
     #[test]
     fn installs_rebranded_portable_payload_by_manifest_entry() {
-        let root = std::env::temp_dir().join(format!(
+        let root = canonical_temp_dir().join(format!(
             "codex-portable-rebrand-test-{}",
             std::process::id()
         ));
@@ -1952,7 +1964,7 @@ if ($null -ne (Get-OwnedPortableEntry)) {{ 'owned' }} else {{ 'missing' }}
     #[test]
     fn installed_app_exe_prefers_manifest_then_known_names() {
         let root =
-            std::env::temp_dir().join(format!("codex-portable-exe-probe-{}", std::process::id()));
+            canonical_temp_dir().join(format!("codex-portable-exe-probe-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
 
@@ -1995,7 +2007,7 @@ if ($null -ne (Get-OwnedPortableEntry)) {{ 'owned' }} else {{ 'missing' }}
         // Manifest declares app/ChatGPT.exe but the payload only carries the
         // legacy app/Codex.exe (e.g. the entry was quarantined). Selecting the
         // leftover binary would health-check the wrong thing — must error out.
-        let root = std::env::temp_dir().join(format!(
+        let root = canonical_temp_dir().join(format!(
             "codex-portable-missing-entry-{}",
             std::process::id()
         ));
@@ -2033,7 +2045,7 @@ if ($null -ne (Get-OwnedPortableEntry)) {{ 'owned' }} else {{ 'missing' }}
 
     #[test]
     fn replaces_existing_portable_and_removes_rollback_backup() {
-        let root = std::env::temp_dir().join(format!(
+        let root = canonical_temp_dir().join(format!(
             "codex-portable-replace-test-{}",
             std::process::id()
         ));
@@ -2067,7 +2079,7 @@ if ($null -ne (Get-OwnedPortableEntry)) {{ 'owned' }} else {{ 'missing' }}
         // whoami.exe exits instantly — models a broken payload that CreateProcess
         // accepts then immediately dies. The health check must fail closed.
         let root =
-            std::env::temp_dir().join(format!("codex-portable-liveness-{}", std::process::id()));
+            canonical_temp_dir().join(format!("codex-portable-liveness-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let windir = std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into());
@@ -2098,7 +2110,7 @@ if ($null -ne (Get-OwnedPortableEntry)) {{ 'owned' }} else {{ 'missing' }}
 
     #[test]
     fn restore_previous_install_removes_failed_payload() {
-        let root = std::env::temp_dir().join(format!(
+        let root = canonical_temp_dir().join(format!(
             "codex-portable-rollback-test-{}",
             std::process::id()
         ));
@@ -2122,7 +2134,7 @@ if ($null -ne (Get-OwnedPortableEntry)) {{ 'owned' }} else {{ 'missing' }}
 
     #[test]
     fn fault_after_move_old_leaves_crash_window_for_recovery() {
-        let root = std::env::temp_dir().join(format!(
+        let root = canonical_temp_dir().join(format!(
             "codex-portable-fault-after-old-{}",
             std::process::id()
         ));
@@ -2156,7 +2168,7 @@ if ($null -ne (Get-OwnedPortableEntry)) {{ 'owned' }} else {{ 'missing' }}
 
     #[test]
     fn fault_before_move_old_leaves_install_intact() {
-        let root = std::env::temp_dir().join(format!(
+        let root = canonical_temp_dir().join(format!(
             "codex-portable-fault-before-old-{}",
             std::process::id()
         ));
@@ -2179,7 +2191,7 @@ if ($null -ne (Get-OwnedPortableEntry)) {{ 'owned' }} else {{ 'missing' }}
     #[test]
     fn observer_sees_rename_boundaries() {
         let root =
-            std::env::temp_dir().join(format!("codex-portable-observer-{}", std::process::id()));
+            canonical_temp_dir().join(format!("codex-portable-observer-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let msix = root.join("codex.msix");
@@ -2207,7 +2219,7 @@ if ($null -ne (Get-OwnedPortableEntry)) {{ 'owned' }} else {{ 'missing' }}
 
     #[test]
     fn successful_fresh_install_rollback_emits_absent_state_evidence() {
-        let root = std::env::temp_dir().join(format!(
+        let root = canonical_temp_dir().join(format!(
             "codex-portable-fresh-rollback-{}",
             std::process::id()
         ));
@@ -2268,7 +2280,7 @@ if ($null -ne (Get-OwnedPortableEntry)) {{ 'owned' }} else {{ 'missing' }}
 
     #[test]
     fn missing_upgrade_backup_never_reports_rollback_completion() {
-        let root = std::env::temp_dir().join(format!(
+        let root = canonical_temp_dir().join(format!(
             "codex-portable-missing-rollback-{}",
             std::process::id()
         ));
@@ -2316,7 +2328,7 @@ if ($null -ne (Get-OwnedPortableEntry)) {{ 'owned' }} else {{ 'missing' }}
 
     #[test]
     fn successful_upgrade_rollback_restores_old_tree_before_evidence() {
-        let root = std::env::temp_dir().join(format!(
+        let root = canonical_temp_dir().join(format!(
             "codex-portable-upgrade-rollback-{}",
             std::process::id()
         ));
