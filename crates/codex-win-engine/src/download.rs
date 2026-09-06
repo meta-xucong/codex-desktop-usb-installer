@@ -622,8 +622,10 @@ mod tests {
             seen.lock().unwrap().push(downloaded);
         });
         if let Err(EngineError::Io(message)) = &result {
-            if message.contains("Protocol \"file\" is disabled")
-                || message.contains("Protocol 'file' is disabled")
+            let normalized = message.to_ascii_lowercase();
+            if normalized.contains("protocol")
+                && normalized.contains("file")
+                && normalized.contains("disabled")
             {
                 let _ = std::fs::remove_dir_all(&root);
                 return;
