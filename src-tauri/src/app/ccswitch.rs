@@ -974,23 +974,26 @@ mod tests {
         CCSWITCH_SOURCE_DIR,
     };
     use std::fs;
-    use std::path::Path;
+    use std::path::PathBuf;
+
+    fn fixture_temp_dir(name: &str) -> PathBuf {
+        let temp = std::env::temp_dir();
+        fs::canonicalize(&temp).unwrap_or(temp).join(name)
+    }
 
     #[test]
     fn sibling_usb_payload_is_checked_before_embedded_resources() {
-        let candidates = source_candidates(
-            Path::new(r"F:\usb\CodexDesktopSetup.exe"),
-            Some(Path::new(r"C:\Program Files\CodexManager\resources")),
-        );
+        let usb_root = PathBuf::from("usb-volume").join("usb-oneclick");
+        let resources = PathBuf::from("installed-manager").join("resources");
+        let candidates =
+            source_candidates(&usb_root.join("CodexDesktopSetup.exe"), Some(&resources));
         assert_eq!(
             candidates[0],
-            Path::new(r"F:\usb")
-                .join(CCSWITCH_SOURCE_DIR)
-                .join(CCSWITCH_EXECUTABLE)
+            usb_root.join(CCSWITCH_SOURCE_DIR).join(CCSWITCH_EXECUTABLE)
         );
         assert!(candidates.iter().any(|candidate| {
             candidate
-                == &Path::new(r"C:\Program Files\CodexManager\resources")
+                == &resources
                     .join(CCSWITCH_SOURCE_DIR)
                     .join(CCSWITCH_EXECUTABLE)
         }));
@@ -1011,8 +1014,7 @@ mod tests {
 
     #[test]
     fn source_manifest_hash_gate_rejects_tampered_executable() {
-        let dir =
-            std::env::temp_dir().join(format!("codex-ccswitch-hash-test-{}", std::process::id()));
+        let dir = fixture_temp_dir(&format!("codex-ccswitch-hash-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let executable = dir.join(CCSWITCH_EXECUTABLE);
@@ -1031,8 +1033,10 @@ mod tests {
 
     #[test]
     fn local_ccswitch_cleanup_requires_a_valid_ownership_marker() {
-        let dir =
-            std::env::temp_dir().join(format!("codex-ccswitch-marker-test-{}", std::process::id()));
+        let dir = fixture_temp_dir(&format!(
+            "codex-ccswitch-marker-test-{}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         assert!(!local_install_is_managed(&dir));

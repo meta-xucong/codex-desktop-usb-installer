@@ -424,19 +424,19 @@ mod tests {
 
     #[test]
     fn installer_candidates_prefer_usb_resources() {
-        let paths = installer_candidates(
-            Path::new(r"F:\usb-oneclick\CodexDesktopSetup.exe"),
-            Some(Path::new(r"C:\Program Files\CodexManager\resources")),
-        );
+        let usb_root = PathBuf::from("usb-volume").join("usb-oneclick");
+        let resources = PathBuf::from("installed-manager").join("resources");
+        let paths = installer_candidates(&usb_root.join("CodexDesktopSetup.exe"), Some(&resources));
         assert_eq!(
             paths[0],
-            Path::new(r"F:\usb-oneclick\resources\prerequisites\vc_redist.x64.exe")
+            usb_root
+                .join("resources")
+                .join("prerequisites")
+                .join(VC_REDIST_FILE_NAME)
         );
-        assert!(paths.iter().any(|path| {
-            path == Path::new(
-                r"C:\Program Files\CodexManager\resources\prerequisites\vc_redist.x64.exe",
-            )
-        }));
+        assert!(paths
+            .iter()
+            .any(|path| { path == &resources.join("prerequisites").join(VC_REDIST_FILE_NAME) }));
     }
 
     #[test]
@@ -509,15 +509,17 @@ mod tests {
         assert!(WEBVIEW2_INSTALLER_SHA256
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit()));
+        let usb_root = PathBuf::from("usb-volume").join("usb-oneclick");
         assert_eq!(
             prerequisite_candidates(
-                Path::new(r"F:\usb-oneclick\CodexAppManager.exe"),
+                &usb_root.join("CodexAppManager.exe"),
                 None,
                 WEBVIEW2_INSTALLER_FILE_NAME
             )[0],
-            Path::new(
-                r"F:\usb-oneclick\resources\prerequisites\MicrosoftEdgeWebView2RuntimeInstallerX64.exe"
-            )
+            usb_root
+                .join("resources")
+                .join("prerequisites")
+                .join(WEBVIEW2_INSTALLER_FILE_NAME)
         );
     }
 

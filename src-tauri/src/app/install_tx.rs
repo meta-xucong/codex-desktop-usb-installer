@@ -509,6 +509,14 @@ fn clear_completed_in_dir(dir: &Path) -> Result<usize, AppError> {
 #[cfg(test)]
 mod uninstall_cleanup_tests {
     use super::*;
+
+    fn fixture_root() -> PathBuf {
+        let temp = std::env::temp_dir();
+        fs::canonicalize(&temp)
+            .unwrap_or(temp)
+            .join(format!("codex-tx-cleanup-{}", uuid::Uuid::new_v4()))
+    }
+
     fn fixture(root: &Path, id: &str, step: InstallTxStep) -> InstallTransaction {
         InstallTransaction {
             schema_version: 1,
@@ -528,7 +536,7 @@ mod uninstall_cleanup_tests {
     }
     #[test]
     fn terminal_primary_clears_its_old_backup_without_replaying_rename() {
-        let root = std::env::temp_dir().join(format!("codex-tx-cleanup-{}", uuid::Uuid::new_v4()));
+        let root = fixture_root();
         let dir = root.join("journals");
         fs::create_dir_all(&dir).unwrap();
         let id = uuid::Uuid::new_v4().to_string();
@@ -550,7 +558,7 @@ mod uninstall_cleanup_tests {
     }
     #[test]
     fn unfinished_backup_only_journal_is_not_silently_discarded() {
-        let root = std::env::temp_dir().join(format!("codex-tx-cleanup-{}", uuid::Uuid::new_v4()));
+        let root = fixture_root();
         let dir = root.join("journals");
         fs::create_dir_all(&dir).unwrap();
         let id = uuid::Uuid::new_v4().to_string();

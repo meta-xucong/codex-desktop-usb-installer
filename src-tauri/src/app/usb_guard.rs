@@ -921,9 +921,9 @@ pub fn register_process(
 }
 
 fn executable_name(path: &str) -> Option<String> {
-    Path::new(path)
-        .file_name()
-        .and_then(|value| value.to_str())
+    path.rsplit(['/', '\\'])
+        .next()
+        .filter(|value| !value.is_empty())
         .map(|value| value.to_ascii_lowercase())
 }
 
@@ -1782,7 +1782,12 @@ mod tests {
             executable_name(r"C:\Programs\CodexSwitch.exe"),
             Some("codexswitch.exe".to_string())
         );
+        assert_eq!(
+            executable_name("/opt/codex/Codex.exe"),
+            Some("codex.exe".to_string())
+        );
         assert!(executable_name("Codex.exe").is_some());
+        assert!(executable_name("C:\\Programs\\").is_none());
     }
 
     #[test]

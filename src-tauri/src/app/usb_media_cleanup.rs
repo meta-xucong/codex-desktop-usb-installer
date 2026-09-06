@@ -678,8 +678,14 @@ fn cleanup_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixture_parent() -> PathBuf {
+        let temp = std::env::temp_dir();
+        fs::canonicalize(&temp).unwrap_or(temp)
+    }
+
     fn fixture() -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
+        let root = fixture_parent().join(format!(
             "codex-media-cleanup-中文 空格 ' 测试-{}",
             uuid::Uuid::new_v4()
         ));
@@ -722,7 +728,8 @@ mod tests {
         }
     }
     fn discard(root: &Path) {
-        assert_eq!(root.parent(), Some(std::env::temp_dir().as_path()));
+        let parent = fixture_parent();
+        assert_eq!(root.parent(), Some(parent.as_path()));
         assert!(root
             .file_name()
             .unwrap()

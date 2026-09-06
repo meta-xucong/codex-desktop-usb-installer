@@ -484,3 +484,35 @@ Run the full Vitest suite once in isolation. If it reproduces, make the fixture 
 - **Notes**: `npm test` completed 32/32 files and 364/364 tests when run once in isolation. The failure was caused by running the full suite and its release subset concurrently; final validation schedules them serially.
 
 ---
+## [ERR-20260906-017] cross-platform-fixture-unused-import
+
+**Logged**: 2026-09-06T15:53:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: tests
+
+### Summary
+Converting Windows-only path fixtures to platform-native `PathBuf` values left an obsolete `Path` import, and the local `-D warnings` gate rejected it.
+
+### Error
+```
+error: unused import: `Path`
+  --> src/app/ccswitch.rs:977:21
+```
+
+### Context
+- The test conversion itself passed all 305 active manager tests.
+- The strict Clippy command correctly caught the stale import before the change was pushed.
+
+### Suggested Fix
+After changing test fixture types, run strict Clippy before committing and remove imports that were only needed by the old literals.
+
+### Metadata
+- Reproducible: yes
+- Related Files: src-tauri/src/app/ccswitch.rs
+
+### Resolution
+- **Resolved**: 2026-09-06T15:53:00+08:00
+- **Notes**: Removed the obsolete import and reran the strict validation gate.
+
+---
