@@ -418,7 +418,7 @@ pub fn parse_windows_build_number(output: &str) -> Option<u32> {
         .split(|character: char| !character.is_ascii_digit())
         .filter(|part| !part.is_empty())
         .filter_map(|part| part.parse::<u32>().ok())
-        .last()
+        .next_back()
 }
 
 #[cfg(windows)]
@@ -1226,6 +1226,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::permissions_set_readonly_false)]
     fn staging_reuses_valid_bytes_even_when_locked_and_disk_is_full() {
         let root = test_root("stage-reuse");
         let source_dir = root.join("payload");
@@ -1277,6 +1278,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::permissions_set_readonly_false)]
     fn staging_preserves_broken_locked_attempt_and_does_not_inherit_readonly() {
         let root = test_root("stage-broken");
         let source_dir = root.join("payload");

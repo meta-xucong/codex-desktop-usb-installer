@@ -1710,6 +1710,10 @@ pub fn perform_windows_update_with_install_mode_network_and_phase(
     )
 }
 
+// This is the single commit boundary for a staged Windows update. Keeping the
+// policy hooks and USB placement evidence explicit makes the transaction order
+// auditable at each call site.
+#[allow(clippy::too_many_arguments)]
 fn perform_verified_windows_stage_tail(
     settings: &AppSettings,
     stage: WinStageReport,
@@ -3431,7 +3435,7 @@ fn uninstall_windows_codex_impl(
         &installed_before.path,
         version_key(&installed_before.version),
     );
-    if !managed_build && !(allow_external_msix && installed_before.source == "msix") {
+    if !(managed_build || allow_external_msix && installed_before.source == "msix") {
         log::warn!("Windows uninstall rejected external install");
         return Ok(WinUninstallReport {
             success: false,

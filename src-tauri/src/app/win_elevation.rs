@@ -435,18 +435,18 @@ fn quote_windows_arg(value: &OsStr) -> String {
         match character {
             '\\' => backslashes += 1,
             '"' => {
-                output.extend(std::iter::repeat('\\').take(backslashes * 2 + 1));
+                output.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
                 output.push('"');
                 backslashes = 0;
             }
             _ => {
-                output.extend(std::iter::repeat('\\').take(backslashes));
+                output.extend(std::iter::repeat_n('\\', backslashes));
                 output.push(character);
                 backslashes = 0;
             }
         }
     }
-    output.extend(std::iter::repeat('\\').take(backslashes * 2));
+    output.extend(std::iter::repeat_n('\\', backslashes * 2));
     output.push('"');
     output
 }

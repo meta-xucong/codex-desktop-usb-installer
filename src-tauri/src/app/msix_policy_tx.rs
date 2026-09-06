@@ -185,8 +185,8 @@ pub fn clear_pending_after_uninstall() -> Result<usize, AppError> {
 }
 
 fn scan_uninstall_journals(dir: &Path) -> Result<Vec<MsixPolicyJournal>, AppError> {
-    codex_win_engine::validate_cleanup_path(&dir).map_err(|e| AppError::Engine(e.to_string()))?;
-    let entries = match fs::read_dir(&dir) {
+    codex_win_engine::validate_cleanup_path(dir).map_err(|e| AppError::Engine(e.to_string()))?;
+    let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
         Err(error) => return Err(AppError::Engine(format!("无法扫描 MSIX 策略事务：{error}"))),

@@ -404,10 +404,7 @@ fn remove_path_retry(path: &Path) -> Result<bool, AppError> {
                 // explicit NotFound probe confirms absence. AccessDenied and
                 // other lookup errors must never turn into successful cleanup.
                 if path_exists_checked(path)? {
-                    last_error = Some(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "path still exists after removal",
-                    ));
+                    last_error = Some(std::io::Error::other("path still exists after removal"));
                 } else {
                     return Ok(true);
                 }

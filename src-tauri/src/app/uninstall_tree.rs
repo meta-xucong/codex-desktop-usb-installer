@@ -245,7 +245,7 @@ impl Entry {
                 let length =
                     u32::from_ne_bytes(bytes[length_offset..length_offset + 4].try_into().unwrap())
                         as usize;
-                if length % 2 != 0 || offset + header + length > bytes.len() {
+                if !length.is_multiple_of(2) || offset + header + length > bytes.len() {
                     return Err("目录枚举名称超界".into());
                 }
                 let units = bytes[offset + header..offset + header + length]

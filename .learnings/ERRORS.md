@@ -27,7 +27,7 @@ SyntaxError: Unexpected token '?'
 
 ## [ERR-20260906-013] package-lock-powershell-empty-key
 
-**Logged**: 2026-09-06T10:15:00+08:00
+**Logged**: 2026-09-06T15:10:00+08:00
 **Priority**: low
 **Status**: resolved
 **Area**: diagnostics
@@ -48,8 +48,59 @@ ConvertFrom-Json: The provided JSON includes a property whose name is an empty s
 Inspect npm lockfiles with Node.js, or use `ConvertFrom-Json -AsHashTable` on supported PowerShell versions.
 
 ### Resolution
-- **Resolved**: 2026-09-06T10:16:00+08:00
+- **Resolved**: 2026-09-06T15:11:00+08:00
 - **Notes**: Re-ran the inspection with Node.js and confirmed `browserslist` was updated from 4.28.6 to 4.28.9.
+
+---
+
+## [ERR-20260906-014] rg-windows-wildcard-path
+
+**Logged**: 2026-09-06T15:16:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: diagnostics
+
+### Summary
+A read-only `rg` invocation passed a Windows wildcard path as a literal search path, producing an invalid filename error while the remaining searches still completed.
+
+### Error
+```
+rg: src-tauri/tauri.*.conf.json: 文件名、目录名或卷标语法不正确。 (os error 123)
+```
+
+### Context
+- Ripgrep accepts glob filters through `-g`; Windows does not expand this wildcard path for it.
+- The command was diagnostic only and made no filesystem changes.
+
+### Resolution
+- **Resolved**: 2026-09-06T15:16:00+08:00
+- **Notes**: Used explicit paths plus `-g` filters for subsequent searches.
+
+---
+
+## [ERR-20260906-015] mismatched-async-command-handle
+
+**Logged**: 2026-09-06T15:19:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: infra
+
+### Summary
+An asynchronous test launched through an orchestration cell was first polled as a direct command session, so the polling tool rejected the identifier.
+
+### Error
+```
+write_stdin failed: Unknown process id 41568
+exec cell 41568 not found
+```
+
+### Context
+- Orchestration cell IDs belong to `functions.wait`; direct command session IDs belong to `write_stdin`.
+- The test process was not cancelled and no product or repository state was changed by the failed polls.
+
+### Resolution
+- **Resolved**: 2026-09-06T15:20:00+08:00
+- **Notes**: Re-ran the long Windows engine suite as a direct command, polled its returned session ID correctly, and obtained 173 passed / 1 ignored.
 
 ---
 

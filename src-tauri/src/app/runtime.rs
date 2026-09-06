@@ -426,7 +426,7 @@ mod tests {
             Path::new(r"F:\usb-oneclick\resources\prerequisites\vc_redist.x64.exe")
         );
         assert!(paths.iter().any(|path| {
-            path == &Path::new(
+            path == Path::new(
                 r"C:\Program Files\CodexManager\resources\prerequisites\vc_redist.x64.exe",
             )
         }));

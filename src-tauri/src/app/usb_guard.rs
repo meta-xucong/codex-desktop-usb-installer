@@ -268,7 +268,7 @@ pub fn bundle_relative_path(bundle_path: &str, drive_root: &str) -> Option<Strin
         .split('/')
         .filter(|part| !part.is_empty() && *part != ".")
         .collect::<Vec<_>>();
-    if relative.iter().any(|part| *part == "..") {
+    if relative.contains(&"..") {
         return None;
     }
     Some(relative.join("/").to_ascii_lowercase())
@@ -496,9 +496,9 @@ fn bundle_root_for_executable(executable: &Path) -> Option<PathBuf> {
 pub fn current_bundle_root() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
-        return std::env::current_exe()
+        std::env::current_exe()
             .ok()
-            .and_then(|path| bundle_root_for_executable(&path));
+            .and_then(|path| bundle_root_for_executable(&path))
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -637,10 +637,10 @@ pub fn current_status() -> UsbGuardStatus {
 pub fn guard_required() -> bool {
     #[cfg(target_os = "windows")]
     {
-        return std::env::current_exe()
+        std::env::current_exe()
             .ok()
             .and_then(|path| bundle_root_for_executable(&path))
-            .is_some();
+            .is_some()
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -657,7 +657,7 @@ pub fn current_bundle_volume_root() -> Option<PathBuf> {
         let bundle_root = current_bundle_root()?;
         let observation = observe_bundle(&bundle_root).ok()?;
         let root = observation.drive_root?;
-        return Some(PathBuf::from(root));
+        Some(PathBuf::from(root))
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -1492,10 +1492,7 @@ pub fn run_guard_cli() {
         };
         let _lock = lock;
         let mut missing_since: Option<std::time::Instant> = None;
-        loop {
-            let Some(lease) = read_json::<UsbLease>(&lease_file) else {
-                break;
-            };
+        while let Some(lease) = read_json::<UsbLease>(&lease_file) {
             if lease.schema_version != LEASE_SCHEMA_VERSION || lease.product != PRODUCT_ID {
                 break;
             }

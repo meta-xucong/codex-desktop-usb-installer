@@ -745,7 +745,7 @@ fn validate_stale_helper(directory: &Path, roots: &CleanupRoots) -> Result<(), S
     let plan: CleanupPlan =
         serde_json::from_slice(&fs::read(&plan_path).map_err(|error| error.to_string())?)
             .map_err(|error| format!("旧组件身份计划无效：{error}"))?;
-    if !matches!(plan.schema_version, 1 | 2 | 3) || plan.nonce != nonce || &plan.roots != roots {
+    if !matches!(plan.schema_version, 1..=3) || plan.nonce != nonce || &plan.roots != roots {
         return Err("旧组件身份/用户目录不匹配".into());
     }
     if !original_parent_is_dead(&plan)? {
@@ -2122,7 +2122,7 @@ mod tests {
         let target = root.0.join(".codex");
         fs::create_dir(&target).unwrap();
         fs::write(target.join("initial"), b"old").unwrap();
-        let report = clean_targets_with_recheck(&[target.clone()], || {
+        let report = clean_targets_with_recheck(std::slice::from_ref(&target), || {
             fs::create_dir(&target).unwrap();
             fs::write(target.join("recreated"), b"late writer").unwrap();
         });
@@ -2133,6 +2133,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[allow(clippy::permissions_set_readonly_false)]
     fn directory_pin_prevents_rename_and_readonly_handle_refuses_hardlinks() {
         let root = TempRoot::new();
         let directory = root.0.join("pinned");

@@ -2182,13 +2182,9 @@ function Mount-AppxVolume {{ throw 'unexpected mount' }}
 "#,
             super::ps_quote(&path.to_string_lossy())
         );
-        let script = format!(
-            "{mocks}\n{} | ConvertTo-Json -Compress",
-            format!(
-                "& {{ {} }}",
-                super::appx_volume_registration_script_with_journal(Path::new(r"D:\"), Some(&path))
-            )
-        );
+        let registration =
+            super::appx_volume_registration_script_with_journal(Path::new(r"D:\"), Some(&path));
+        let script = format!("{mocks}\n& {{ {registration} }} | ConvertTo-Json -Compress");
         let output = std::process::Command::new(super::powershell_exe())
             .args(["-NoProfile", "-NonInteractive", "-Command", &script])
             .output()
