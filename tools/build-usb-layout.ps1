@@ -4,6 +4,7 @@ param(
     [string]$InstallerPath,
     [string]$BundlePath = "",
     [string]$OutputPath = "",
+    [string]$CapabilityPackSource = "",
     [switch]$SkipSignature
 )
 
@@ -11,6 +12,9 @@ $ErrorActionPreference = "Stop"
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 if ([string]::IsNullOrWhiteSpace($BundlePath)) { $BundlePath = Join-Path $repo "release\usb" }
 if ([string]::IsNullOrWhiteSpace($OutputPath)) { $OutputPath = Join-Path $repo "release\usb-final" }
+if ([string]::IsNullOrWhiteSpace($CapabilityPackSource)) {
+    $CapabilityPackSource = Join-Path (Split-Path -Parent $repo) "openclaw-codex-kit\installer-pack"
+}
 $bundle = (Resolve-Path -LiteralPath $BundlePath).Path
 $installer = (Resolve-Path -LiteralPath $InstallerPath).Path
 
@@ -26,6 +30,83 @@ function Get-RelativePathCompat([string]$BasePath, [string]$FilePath) {
         throw "文件不在 U 盘输出目录内：$FilePath"
     }
     return $full.Substring($base.Length)
+}
+
+function Normalize-BundleRelativePath([string]$RelativePath) {
+    $relative = ([string]$RelativePath).Trim().Replace('/', '\')
+    if ([string]::IsNullOrWhiteSpace($relative) -or [System.IO.Path]::IsPathRooted($relative)) {
+        throw "manifest 中的路径必须是 bundle 内的相对路径：$RelativePath"
+    }
+    foreach ($segment in $relative.Split('\')) {
+        if ([string]::IsNullOrWhiteSpace($segment) -or $segment -eq '.' -or $segment -eq '..' -or $segment.Contains(':')) {
+            throw "manifest 中的路径包含非法片段：$RelativePath"
+        }
+    }
+    return $relative.Replace('\', '/')
+}
+
+function Read-JsonFile([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "缺少 JSON 清单：$Path"
+    }
+    $utf8 = [System.Text.UTF8Encoding]::new($false, $true)
+    return [System.IO.File]::ReadAllText($Path, $utf8) | ConvertFrom-Json
+}
+
+function Assert-NoSuccessfulStateResidue([string]$RootPath) {
+    foreach ($entry in Get-ChildItem -LiteralPath $RootPath -Recurse -Force) {
+        $relative = (Get-RelativePathCompat $RootPath $entry.FullName).Replace('\', '/')
+        $forbidden = $false
+        foreach ($segment in $relative.Split('/')) {
+            if ($segment -ieq '.staging' -or $segment -ieq 'staging' -or
+                $segment -ieq '.transaction' -or $segment -ieq 'transaction' -or
+                $segment -match '(?i)^transaction([.-]|$)' -or
+                $segment -match '(?i)\.(bak|part|tmp)$') {
+                $forbidden = $true
+                break
+            }
+        }
+        if ($forbidden) {
+            throw "构建输出包含成功状态不允许的事务/临时残留：$relative"
+        }
+    }
+}
+
+function Assert-AuthenticodePe([string]$Path, [string]$Label) {
+    $signature = Get-AuthenticodeSignature -LiteralPath $Path
+    if ($signature.Status -ne "Valid") {
+        throw "$Label Authenticode 状态不是 Valid：$($signature.Status)"
+    }
+    if ($null -eq $signature.SignerCertificate -or
+        [string]::IsNullOrWhiteSpace([string]$signature.SignerCertificate.Subject)) {
+        throw "$Label 缺少有效签名主体"
+    }
+}
+
+$sourceManifest = Read-JsonFile (Join-Path $bundle "manifest.json")
+$architecture = [string]$sourceManifest.architecture
+if ($architecture -notin @("x64", "arm64")) {
+    throw "manifest.architecture 无效：$architecture"
+}
+$payloadRelative = Normalize-BundleRelativePath ([string]$sourceManifest.payload.path)
+if (([System.IO.Path]::GetExtension($payloadRelative) -ine ".msix")) {
+    throw "manifest.payload.path 必须指向 .msix 文件：$payloadRelative"
+}
+$sourcePayload = Join-Path $bundle ($payloadRelative.Replace('/', '\'))
+if (-not (Test-Path -LiteralPath $sourcePayload -PathType Leaf)) {
+    throw "manifest.payload.path 指向的载荷不存在：$sourcePayload"
+}
+$sourcePayload = (Resolve-Path -LiteralPath $sourcePayload).Path
+$bundleFull = [System.IO.Path]::GetFullPath($bundle).TrimEnd('\') + '\'
+$sourcePayloadFull = [System.IO.Path]::GetFullPath($sourcePayload)
+if (-not $sourcePayloadFull.StartsWith($bundleFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "manifest.payload.path 不得逃逸 bundle 根目录：$payloadRelative"
+}
+$payloadDirectoryRelative = $payloadRelative -replace '/[^/]+$', ''
+$backupDirectory = if ([string]::IsNullOrWhiteSpace($payloadDirectoryRelative)) {
+    "_backup"
+} else {
+    "$payloadDirectoryRelative/_backup"
 }
 $installerItem = Get-Item -LiteralPath $installer
 if ($installerItem.PSIsContainer -or $installerItem.Extension -ine ".exe") {
@@ -50,6 +131,17 @@ if ($installerItem.Name -ieq "CodexUsbLauncher.exe" -or $installerItem.Name -ieq
 }
 & (Join-Path $PSScriptRoot "verify-payload.ps1") -BundlePath $bundle -SkipSignature:$SkipSignature
 
+$managerSource = Join-Path $installerItem.DirectoryName "CodexAppManager.exe"
+if ($isUsbLauncher) {
+    if (-not (Test-Path -LiteralPath $managerSource -PathType Leaf)) {
+        throw "CodexUsbLauncher.exe 必须与同目录 CodexAppManager.exe 一起构建"
+    }
+    if (-not $SkipSignature) {
+        Assert-AuthenticodePe $installer "CodexUsbLauncher.exe"
+        Assert-AuthenticodePe $managerSource "CodexAppManager.exe"
+    }
+}
+
 $outputFull = [System.IO.Path]::GetFullPath($OutputPath).TrimEnd('\')
 $volumeRoot = [System.IO.Path]::GetPathRoot($outputFull).TrimEnd('\')
 foreach ($unsafeRoot in @($volumeRoot, $repo.TrimEnd('\'), (Split-Path -Parent $repo).TrimEnd('\'), $bundle.TrimEnd('\'), $installerItem.DirectoryName.TrimEnd('\'))) {
@@ -68,6 +160,38 @@ $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 foreach ($directory in @("apps", "content", "content\skills", "content\mcp")) {
     New-Item -ItemType Directory -Force -Path (Join-Path $output $directory) | Out-Null
 }
+
+# Ship the complete capability pack in the generated USB layout. The manager
+# installs this local tree after Codex verification, so the USB workflow does
+# not depend on GitHub, npm, PyPI, or a second installer window.
+$capabilityPackSourceFull = (Resolve-Path -LiteralPath $CapabilityPackSource -ErrorAction Stop).Path
+if (-not (Test-Path -LiteralPath $capabilityPackSourceFull -PathType Container)) {
+    throw "能力包源目录不存在：$CapabilityPackSource"
+}
+foreach ($requiredPackFile in @(
+    "pack.json",
+    "dependencies.json",
+    "file-manifest.json",
+    "checksums.sha256",
+    "install-all.ps1",
+    "install-to-codex.ps1",
+    "runtime\provision-runtime.ps1"
+)) {
+    if (-not (Test-Path -LiteralPath (Join-Path $capabilityPackSourceFull $requiredPackFile) -PathType Leaf)) {
+        throw "能力包缺少必要文件：$(Join-Path $capabilityPackSourceFull $requiredPackFile)"
+    }
+}
+$packReparse = @(Get-ChildItem -LiteralPath $capabilityPackSourceFull -Recurse -Force |
+    Where-Object { ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 } |
+    Select-Object -First 1)
+if ($packReparse.Count -gt 0) {
+    throw "能力包包含符号链接或重解析点，拒绝复制：$($packReparse[0].FullName)"
+}
+$capabilityPackOutput = Join-Path $output "content\codex-starter-kit"
+New-Item -ItemType Directory -Force -Path $capabilityPackOutput | Out-Null
+foreach ($packEntry in Get-ChildItem -LiteralPath $capabilityPackSourceFull -Force) {
+    Copy-Item -LiteralPath $packEntry.FullName -Destination $capabilityPackOutput -Recurse -Force
+}
 [System.IO.File]::WriteAllText(
     (Join-Path $output "apps\README.txt"),
     "此目录由安装器管理。Codex 程序将解包到 apps\Codex；账号、会话、缓存和配置不写入这里。`r`n",
@@ -80,20 +204,16 @@ foreach ($directory in @("apps", "content", "content\skills", "content\mcp")) {
 )
 [System.IO.File]::WriteAllText(
     (Join-Path $output "content\skills\README.txt"),
-    "预装 Skill 载荷目录（首期仅预留）。后续导入器通过受支持的本地发现入口引用此处内容，用户数据仍保存在本机。`r`n",
+    "兼容性内容目录。完整能力包位于同级 codex-starter-kit，安装器会将其中的 Skills 导入当前用户；用户数据仍保存在本机。`r`n",
     $utf8NoBom
 )
 [System.IO.File]::WriteAllText(
     (Join-Path $output "content\mcp\README.txt"),
-    "预装 MCP 可执行文件和静态资源目录（首期仅预留）。MCP 配置写入本机 %USERPROFILE%\.codex\config.toml，密钥不得写入 U 盘。`r`n",
+    "兼容性 MCP 资源目录。完整能力包位于同级 codex-starter-kit；MCP 配置写入本机 %USERPROFILE%\.codex\config.toml，密钥不得写入 U 盘。`r`n",
     $utf8NoBom
 )
 Copy-Item -LiteralPath $installer -Destination (Join-Path $output "CodexDesktopSetup.exe") -Force
-$managerSource = Join-Path $installerItem.DirectoryName "CodexAppManager.exe"
 if ($isUsbLauncher) {
-    if (-not (Test-Path -LiteralPath $managerSource -PathType Leaf)) {
-        throw "CodexUsbLauncher.exe 必须与同目录 CodexAppManager.exe 一起构建"
-    }
     Copy-Item -LiteralPath $managerSource -Destination (Join-Path $output "CodexAppManager.exe") -Force
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot "verify-usb-launcher.ps1") -Destination (Join-Path $output "verify-usb-launcher.ps1") -Force
 }
@@ -129,11 +249,37 @@ $webView2Output = Join-Path $output "resources\prerequisites\MicrosoftEdgeWebVie
 if (-not (Test-Path -LiteralPath $webView2Output -PathType Leaf)) {
     throw "安装器资源中缺少 WebView2 x64 完整离线安装包：$webView2Output"
 }
-Copy-Item -LiteralPath (Join-Path $bundle "manifest.json") -Destination (Join-Path $output "manifest.json") -Force
-Get-ChildItem -LiteralPath (Join-Path $bundle "payload") -File | Copy-Item -Destination (Join-Path $output "payload") -Force
+[void](Add-Member -InputObject $sourceManifest -MemberType NoteProperty -Name "schemaVersion" -Value 2 -Force)
+[void](Add-Member -InputObject $sourceManifest -MemberType NoteProperty -Name "updateCapability" -Value ([ordered]@{
+    codexPayload = $true
+    schemaVersion = 2
+    mutableFields = @(
+        "codexDesktopVersion",
+        "packageVersion",
+        "releaseTag",
+        "payload/sha256",
+        "payload/size"
+    )
+    checksumFile = "SHA256SUMS.txt"
+    backupDirectory = $backupDirectory
+    backupPolicy = "single-msix-listed-in-SHA256SUMS"
+    transactionDirectory = ".staging"
+    successState = "clean"
+}) -Force)
+[System.IO.File]::WriteAllText(
+    (Join-Path $output "manifest.json"),
+    ($sourceManifest | ConvertTo-Json -Depth 8),
+    $utf8NoBom
+)
+$outputPayload = Join-Path $output ($payloadRelative.Replace('/', '\'))
+New-Item -ItemType Directory -Force -Path (Split-Path -Parent $outputPayload) | Out-Null
+Copy-Item -LiteralPath $sourcePayload -Destination $outputPayload -Force
 
-$lines = Get-ChildItem -LiteralPath $output -File -Recurse |
-    Where-Object { $_.Name -ne "SHA256SUMS.txt" } |
+Assert-NoSuccessfulStateResidue $output
+
+$lines = Get-ChildItem -LiteralPath $output -File -Recurse -Force |
+    Sort-Object -Property FullName |
+    Where-Object { $_.Name -ne "SHA256SUMS.txt" -and $_.Name -ine "usb-license.json" } |
     ForEach-Object {
         $relative = Get-RelativePathCompat $output $_.FullName
         $relative = $relative.Replace('\', '/')

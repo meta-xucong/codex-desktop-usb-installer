@@ -1,6 +1,13 @@
-import { useCallback, useId, useState } from "react";
+import { useCallback, useEffect, useId, useState } from "react";
 
-import { managerApi, type ManagerUpdateAvailable } from "../../services/managerApi";
+import {
+  errorCode,
+  managerApi,
+  type CodexPayloadCheck,
+  type ManagerUpdateAvailable,
+  type UpdateInfo,
+} from "../../services/managerApi";
+import type { UsbGuardStatus } from "../../shared/types";
 import { userErrorMessage } from "../errorCopy";
 import { Icon, CodexMark } from "../icons";
 import { useI18n } from "../i18n";
@@ -23,8 +30,44 @@ export function About({ onBack }: { onBack: () => void }) {
   const [mgrBusy, setMgrBusy] = useState(false);
   const [mgrMsg, setMgrMsg] = useState<string | null>(null);
   const [pendingUpdate, setPendingUpdate] = useState<ManagerUpdateAvailable | null>(null);
+  const [codexBusy, setCodexBusy] = useState(false);
+  const [codexMsg, setCodexMsg] = useState<string | null>(null);
+  const [pendingCodexUpdate, setPendingCodexUpdate] = useState<UpdateInfo | null>(null);
+  const [codexConfirmOpen, setCodexConfirmOpen] = useState(false);
+  const [usbGuard, setUsbGuard] = useState<UsbGuardStatus | null>(null);
   const updateTitleId = useId();
   const updateBodyId = useId();
+  const codexTitleId = useId();
+  const codexBodyId = useId();
+  const win = currentPlatform() === "windows";
+
+  useEffect(() => {
+    let active = true;
+    setUsbGuard(null);
+    if (!win) {
+      return () => {
+        active = false;
+      };
+    }
+    void managerApi
+      .usbGuardStatus()
+      .then((status) => {
+        if (active) setUsbGuard(status);
+      })
+      .catch(() => {
+        if (active) setUsbGuard(null);
+      });
+    return () => {
+      active = false;
+    };
+  }, [win]);
+
+  const codexPayloadAvailable =
+    win &&
+    usbGuard?.status === "authorized" &&
+    usbGuard.watchdog === "running" &&
+    usbGuard.removable &&
+    Boolean(usbGuard.bundlePath);
 
   const closeUpdateConfirm = useCallback(() => {
     if (mgrBusy) return;
@@ -72,6 +115,61 @@ export function About({ onBack }: { onBack: () => void }) {
       setMgrBusy(false);
     }
   }, [pendingUpdate, t]);
+
+  // Codex payload update channel (docs/UPDATE-CHANNELS.md § "Channel: codex").
+  // Two independent user-confirmed actions: refresh the USB payload here;
+  // updating the deployed Windows app is offered separately by the home flow.
+  const checkCodexPayload = useCallback(async () => {
+    if (codexBusy || !codexPayloadAvailable) return;
+    setCodexBusy(true);
+    setCodexMsg(null);
+    setPendingCodexUpdate(null);
+    try {
+      const result: CodexPayloadCheck = await managerApi.checkCodexPayloadUpdate();
+      if (result.kind === "available") {
+        setPendingCodexUpdate(result.info);
+        setCodexMsg(
+          t("about.codexFound", {
+            version: result.info.latestVersion,
+          }),
+        );
+      } else if (result.kind === "none") {
+        setCodexMsg(t("about.codexUpToDate"));
+      } else if (result.kind === "development") {
+        setCodexMsg(t("about.mgrDev"));
+      } else {
+        setCodexMsg(
+          result.message ? `${t("about.codexUnavailable")}：${result.message}` : t("about.codexUnavailable"),
+        );
+      }
+    } catch (cause) {
+      setCodexMsg(userErrorMessage(cause, t));
+    } finally {
+      setCodexBusy(false);
+    }
+  }, [codexBusy, codexPayloadAvailable, t]);
+
+  const applyCodexPayload = useCallback(async () => {
+    if (!pendingCodexUpdate) return;
+    setCodexBusy(true);
+    setCodexMsg(t("progress.installing"));
+    try {
+      await managerApi.applyCodexPayloadUpdate(pendingCodexUpdate);
+      setCodexMsg(t("about.codexApplied", { version: pendingCodexUpdate.latestVersion }));
+      setPendingCodexUpdate(null);
+      setCodexConfirmOpen(false);
+    } catch (cause) {
+      if (errorCode(cause) === "stale_expectation") {
+        setPendingCodexUpdate(null);
+        setCodexMsg(t("about.codexStale"));
+      } else {
+        setCodexMsg(userErrorMessage(cause, t));
+      }
+      setCodexConfirmOpen(false);
+    } finally {
+      setCodexBusy(false);
+    }
+  }, [pendingCodexUpdate, t]);
 
   const openLogsDir = useCallback(async () => {
     setMgrMsg(null);
@@ -122,6 +220,20 @@ export function About({ onBack }: { onBack: () => void }) {
               <span className="rval">{mgrBusy ? t("about.mgrChecking") : ""}</span>
             </button>
           ) : null}
+          {codexPayloadAvailable ? (
+            <button
+              className="row"
+              onClick={codexConfirmOpen || pendingCodexUpdate ? () => setCodexConfirmOpen(true) : checkCodexPayload}
+              disabled={codexBusy}
+            >
+              <Icon name="download" className="ricon" />
+              <span className="rtext">
+                <span className="rtitle">{t("about.checkCodexPayload")}</span>
+                {codexMsg ? <span className="rsub">{codexMsg}</span> : null}
+              </span>
+              <span className="rval">{codexBusy ? t("about.mgrChecking") : ""}</span>
+            </button>
+          ) : null}
           <button className="row" onClick={() => void managerApi.openUrl(REPO_URL)}>
             <Icon name="message" className="ricon" />
             <span className="rtext">
@@ -165,6 +277,41 @@ export function About({ onBack }: { onBack: () => void }) {
           </button>
           <button className="btn primary" onClick={installManagerUpdate} disabled={mgrBusy}>
             {mgrBusy ? t("progress.installing") : t("confirm.ok")}
+          </button>
+        </div>
+      </Sheet>
+      <Sheet
+        open={codexConfirmOpen && Boolean(pendingCodexUpdate)}
+        onDismiss={() => {
+          if (codexBusy) return;
+          setCodexConfirmOpen(false);
+        }}
+        dismissable={!codexBusy}
+        labelledBy={codexTitleId}
+        describedBy={codexBodyId}
+        initialFocus="dismiss"
+      >
+        <Ring icon="download" />
+        <h3 id={codexTitleId}>
+          {pendingCodexUpdate
+            ? t("about.codexConfirmTitle", { version: pendingCodexUpdate.latestVersion })
+            : ""}
+        </h3>
+        <p id={codexBodyId}>
+          {t("about.codexConfirmBody", {
+            current: pendingCodexUpdate?.currentVersion ?? "",
+          })}
+        </p>
+        <div className="row2 sheet-actions">
+          <button
+            className="btn ghost"
+            onClick={() => setCodexConfirmOpen(false)}
+            disabled={codexBusy}
+          >
+            {t("confirm.cancel")}
+          </button>
+          <button className="btn primary" onClick={applyCodexPayload} disabled={codexBusy}>
+            {codexBusy ? t("progress.installing") : t("confirm.ok")}
           </button>
         </div>
       </Sheet>

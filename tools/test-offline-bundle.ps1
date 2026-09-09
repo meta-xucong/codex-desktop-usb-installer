@@ -126,6 +126,9 @@ try {
         "content/README.txt",
         "content/skills/README.txt",
         "content/mcp/README.txt",
+        "content/codex-starter-kit/pack.json",
+        "content/codex-starter-kit/install-all.ps1",
+        "content/codex-starter-kit/runtime/provision-runtime.ps1",
         "resources/prerequisites/vc_redist.x64.exe",
         "resources/prerequisites/MicrosoftEdgeWebView2RuntimeInstallerX64.exe"
     )

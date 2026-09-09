@@ -1,0 +1,24 @@
+[Unit]
+Description=Fetch and verify the Codex Windows payload relay
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=codexrelay
+Group=codexrelay
+ExecStart=/usr/bin/python3 /usr/local/libexec/codex-update-relay-sync.py --config /etc/codex-update-relay/config.json
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/srv/codex-update-relay
+UMask=0022
+TimeoutStartSec=2h
+StandardOutput=journal
+StandardError=journal

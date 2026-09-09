@@ -1,0 +1,32 @@
+version: "3.3"
+
+services:
+  codex-update-edge:
+    image: nginx@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10
+    container_name: codex-update-relay-edge
+    restart: unless-stopped
+    ports:
+      - "443:443"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+      - CHOWN
+      - SETUID
+      - SETGID
+    tmpfs:
+      - /var/cache/nginx:rw,noexec,nosuid,nodev,size=16m
+      - /var/run:rw,noexec,nosuid,nodev,size=1m
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    volumes:
+      - /srv/codex-update-relay/export:/srv/codex-update-relay/export:ro
+      - /opt/codex-update-relay-edge/conf.d:/etc/nginx/conf.d:ro
+      - /srv/codex-update-relay/tls:/etc/nginx/tls:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"

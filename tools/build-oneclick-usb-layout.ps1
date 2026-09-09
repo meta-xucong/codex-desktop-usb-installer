@@ -4,6 +4,7 @@ param(
     [string]$ManagerPath = "",
     [string]$BundlePath = "",
     [string]$OutputPath = "",
+    [string]$CapabilityPackSource = "",
     [switch]$SkipSignature
 )
 
@@ -17,6 +18,9 @@ if ([string]::IsNullOrWhiteSpace($InstallerPath)) { $InstallerPath = Join-Path $
 if ([string]::IsNullOrWhiteSpace($ManagerPath)) { $ManagerPath = Join-Path $repo "release\setup\CodexAppManager.exe" }
 if ([string]::IsNullOrWhiteSpace($BundlePath)) { $BundlePath = Join-Path $repo "release\usb-final" }
 if ([string]::IsNullOrWhiteSpace($OutputPath)) { $OutputPath = Join-Path $repo "release\usb-oneclick" }
+if ([string]::IsNullOrWhiteSpace($CapabilityPackSource)) {
+    $CapabilityPackSource = Join-Path (Split-Path -Parent $repo) "openclaw-codex-kit\installer-pack"
+}
 $installer = (Resolve-Path -LiteralPath $InstallerPath).Path
 $manager = (Resolve-Path -LiteralPath $ManagerPath).Path
 $bundle = (Resolve-Path -LiteralPath $BundlePath).Path
@@ -33,16 +37,100 @@ function Get-RelativePathCompat([string]$BasePath, [string]$FilePath) {
     return $full.Substring($base.Length)
 }
 
+function Read-JsonFile([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "缺少 JSON 清单：$Path"
+    }
+    $utf8 = [System.Text.UTF8Encoding]::new($false, $true)
+    return [System.IO.File]::ReadAllText($Path, $utf8) | ConvertFrom-Json
+}
+
+function Normalize-BundleRelativePath([string]$RelativePath) {
+    $relative = ([string]$RelativePath).Trim().Replace('/', '\')
+    if ([string]::IsNullOrWhiteSpace($relative) -or [System.IO.Path]::IsPathRooted($relative)) {
+        throw "manifest 中的路径必须是 bundle 内的相对路径：$RelativePath"
+    }
+    foreach ($segment in $relative.Split('\')) {
+        if ([string]::IsNullOrWhiteSpace($segment) -or $segment -eq '.' -or $segment -eq '..' -or $segment.Contains(':')) {
+            throw "manifest 中的路径包含非法片段：$RelativePath"
+        }
+    }
+    return $relative.Replace('\', '/')
+}
+
+function Resolve-BundleRelativeFile([string]$RootPath, [string]$RelativePath) {
+    $relative = Normalize-BundleRelativePath $RelativePath
+    $candidate = Join-Path $RootPath ($relative.Replace('/', '\'))
+    if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+        throw "manifest.payload.path 指向的文件不存在：$relative"
+    }
+    $resolved = (Resolve-Path -LiteralPath $candidate).Path
+    $rootFull = [System.IO.Path]::GetFullPath($RootPath).TrimEnd('\') + '\'
+    $resolvedFull = [System.IO.Path]::GetFullPath($resolved)
+    if (-not $resolvedFull.StartsWith($rootFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "manifest.payload.path 不得逃逸 bundle 根目录：$relative"
+    }
+    return $resolved
+}
+
+function Assert-NoSuccessfulStateResidue([string]$RootPath) {
+    foreach ($entry in Get-ChildItem -LiteralPath $RootPath -Recurse -Force) {
+        $relative = (Get-RelativePathCompat $RootPath $entry.FullName).Replace('\', '/')
+        $forbidden = $false
+        foreach ($segment in $relative.Split('/')) {
+            if ($segment -ieq '.staging' -or $segment -ieq 'staging' -or
+                $segment -ieq '.transaction' -or $segment -ieq 'transaction' -or
+                $segment -match '(?i)^transaction([.-]|$)' -or
+                $segment -match '(?i)\.(bak|part|tmp)$') {
+                $forbidden = $true
+                break
+            }
+        }
+        if ($forbidden) {
+            throw "构建输出包含成功状态不允许的事务/临时残留：$relative"
+        }
+    }
+}
+
 & (Join-Path $PSScriptRoot "build-usb-layout.ps1") `
     -InstallerPath $installer `
     -BundlePath $bundle `
     -OutputPath $OutputPath `
+    -CapabilityPackSource $CapabilityPackSource `
     -SkipSignature:$SkipSignature
 # The nested PowerShell script communicates failures through terminating
 # errors.  `$LASTEXITCODE` is intentionally not inspected here because it can
 # retain the exit code of a previous native command in the parent session.
 
 $output = (Resolve-Path -LiteralPath $OutputPath).Path
+$manifestPath = Join-Path $output "manifest.json"
+$manifest = Read-JsonFile $manifestPath
+if ($manifest.schemaVersion -is [string] -or [int64]$manifest.schemaVersion -ne 2) {
+    throw "输出 root manifest 必须声明 schemaVersion=2"
+}
+$architecture = [string]$manifest.architecture
+if ($architecture -notin @("x64", "arm64")) {
+    throw "输出 root manifest 的 architecture 无效：$architecture"
+}
+$payloadRelative = Normalize-BundleRelativePath ([string]$manifest.payload.path)
+if (([System.IO.Path]::GetExtension($payloadRelative) -ine ".msix")) {
+    throw "输出 root manifest 的 payload.path 必须指向 .msix：$payloadRelative"
+}
+$payload = Resolve-BundleRelativeFile $output $payloadRelative
+$payloadItem = Get-Item -LiteralPath $payload
+$payloadDirectoryRelative = $payloadRelative -replace '/[^/]+$', ''
+$backupDirectory = if ([string]::IsNullOrWhiteSpace($payloadDirectoryRelative)) {
+    "_backup"
+} else {
+    "$payloadDirectoryRelative/_backup"
+}
+$rootUpdateCapability = $manifest.updateCapability
+if ($null -eq $rootUpdateCapability -or
+    $rootUpdateCapability.codexPayload -ne $true -or
+    $rootUpdateCapability.schemaVersion -is [string] -or
+    [int64]$rootUpdateCapability.schemaVersion -ne 2) {
+    throw "输出 root manifest 未声明 Codex payload update capability"
+}
 if ((Get-Item -LiteralPath $manager).Name -ine "CodexAppManager.exe") {
     throw "ManagerPath 必须指向名为 CodexAppManager.exe 的 Tauri 管理器本体"
 }
@@ -65,7 +153,6 @@ if (Test-Path -LiteralPath $ccswitchVerifier -PathType Leaf) {
 
 $installerItem = Get-Item -LiteralPath (Join-Path $output "CodexDesktopSetup.exe")
 $managerItem = Get-Item -LiteralPath (Join-Path $output "CodexAppManager.exe")
-$payloadItem = Get-Item -LiteralPath (Join-Path $output "payload\OpenAI.Codex_x64.msix")
 $ccswitchItem = Get-Item -LiteralPath (Join-Path $output "ccswitch\CodexSwitch.exe")
 $vcRedistItem = Get-Item -LiteralPath (Join-Path $output "resources\prerequisites\vc_redist.x64.exe")
 $webView2Item = Get-Item -LiteralPath (Join-Path $output "resources\prerequisites\MicrosoftEdgeWebView2RuntimeInstallerX64.exe")
@@ -80,16 +167,35 @@ if ($webView2Hash -ine "1F4638309F3D82C31A3028C3CF7D75998F58E4D1407380F5CB8A8E91
 }
 
 $usbManifest = [ordered]@{
-    schemaVersion = 1
+    schemaVersion = 2
     product = "codex-usb-oneclick"
     releaseVersion = $releaseVersion
     status = "oneclick"
+    updateCapability = [ordered]@{
+        codexPayload = $true
+        schemaVersion = 2
+        mutableFields = @(
+            "manifest.json/codexDesktopVersion",
+            "manifest.json/packageVersion",
+            "manifest.json/releaseTag",
+            "manifest.json/payload/sha256",
+            "manifest.json/payload/size",
+            "codexInstaller/payloadSha256",
+            "codexInstaller/payloadSize"
+        )
+        checksumFile = "SHA256SUMS.txt"
+        backupDirectory = $backupDirectory
+        backupPolicy = "single-msix-listed-in-SHA256SUMS"
+        transactionDirectory = ".staging"
+        successState = "clean"
+    }
     description = "Offline Codex desktop extracted from a verified MSIX into the authorized USB bundle. Codex account, session, cache and configuration data remain in the normal local Windows profile; no external AppX volume or WpSystem data layout is used."
     codexInstaller = [ordered]@{
         file = "CodexDesktopSetup.exe"
         size = [int64]$installerItem.Length
         sha256 = $installerHash
-        payload = "payload/OpenAI.Codex_x64.msix"
+        architecture = $architecture
+        payload = $payloadRelative
         payloadSize = [int64]$payloadItem.Length
         payloadSha256 = $payloadHash
     }
@@ -189,9 +295,10 @@ $usbManifest = [ordered]@{
     managedContent = [ordered]@{
         skillsDirectory = "content/skills"
         mcpDirectory = "content/mcp"
+        capabilityPackDirectory = "content/codex-starter-kit"
         configLocation = "%USERPROFILE%/.codex/config.toml"
         secretsIncluded = $false
-        status = "layout-ready-import-later"
+        status = "bundled-auto-installable"
     }
     workflow = @(
         "Double-click CodexDesktopSetup.exe; it is the USB-only requireAdministrator launcher and asks for one standard Windows UAC confirmation before starting CodexAppManager.exe.",
@@ -214,7 +321,7 @@ $usbManifest = [ordered]@{
         "CodexDesktopSetup.exe is a tiny USB-only launcher with an embedded requireAdministrator manifest; after the user's standard UAC approval it starts the USB-specific CodexAppManager.exe, which also embeds requireAdministrator as a defence-in-depth boundary. The normal installed manager build remains asInvoker. Declining UAC, lacking administrator credentials, or an enterprise policy that blocks elevation cannot be bypassed.",
         "The manager entry point is statically linked to the MSVC CRT so it can start before the prerequisite is present. The bundled vc_redist.x64.exe is the unmodified Microsoft installer and is hash-pinned; no DLL is copied directly to System32.",
         "No AppX external-volume registry policy, developer mode or sideload policy is required for the portable route. Enterprise execution-control restrictions are diagnosed, not bypassed.",
-        "The content/skills and content/mcp folders define the USB payload boundary for the next import phase. This release does not yet auto-import them. Skill payloads may later be exposed through supported discovery links; MCP executables may live on USB, but MCP configuration and secrets remain local in %USERPROFILE%/.codex/config.toml.",
+        "The content/codex-starter-kit folder contains the complete offline capability pack. The manager automatically installs or repairs its Skills, Agents, runtimes and local MCP resources after Codex is verified; external connections remain opt-in and their secrets stay in the local Windows user environment.",
         "Ordinary uninstall preserves the user's independent .codex, Roaming Codex and Local Codex data. Advanced purge is destructive and may affect an official/CLI Codex installation sharing those paths.",
         "usb-license.json is manager-created mutable USB identity metadata, not an immutable SHA256SUMS entry. The detached finalizer validates it against the active lease and deletes it last; unrelated or modified files are listed and preserved.",
         "Unsigned development bundles auto-enroll on first run; strict anti-copy releases require a pre-provisioned signed usb-license.json."
@@ -226,8 +333,11 @@ $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 $readme = Get-Content -LiteralPath (Join-Path $repo "docs\USB-INSTALL-USER-GUIDE.txt") -Raw -Encoding UTF8
 [System.IO.File]::WriteAllText((Join-Path $output "README.txt"), $readme, $utf8NoBom)
 
-$lines = Get-ChildItem -LiteralPath $output -File -Recurse |
-    Where-Object { $_.Name -ne "SHA256SUMS.txt" } |
+Assert-NoSuccessfulStateResidue $output
+
+$lines = Get-ChildItem -LiteralPath $output -File -Recurse -Force |
+    Sort-Object -Property FullName |
+    Where-Object { $_.Name -ne "SHA256SUMS.txt" -and $_.Name -ine "usb-license.json" } |
     ForEach-Object {
         $relative = Get-RelativePathCompat $output $_.FullName
         $relative = $relative.Replace('\', '/')

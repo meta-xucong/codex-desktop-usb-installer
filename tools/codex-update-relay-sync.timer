@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodic Codex Windows payload relay sync
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=6h
+RandomizedDelaySec=30min
+Persistent=true
+Unit=codex-update-relay-sync.service
+
+[Install]
+WantedBy=timers.target

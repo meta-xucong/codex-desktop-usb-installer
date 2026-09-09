@@ -33,6 +33,34 @@ function SheetHarness({ dismissable = true }: { dismissable?: boolean }) {
   );
 }
 
+function RerenderingSheetHarness() {
+  const [open, setOpen] = useState(false);
+  const [revision, setRevision] = useState(0);
+  return (
+    <>
+      <button onClick={() => setOpen(true)}>Open</button>
+      <Sheet
+        open={open}
+        // Deliberately create a new callback on every render. The focus trap
+        // must not re-arm just because a parent supplied an inline handler.
+        onDismiss={() => setOpen(false)}
+        labelledBy="rerender-title"
+        describedBy="rerender-body"
+        initialFocus="dismiss"
+      >
+        <h3 id="rerender-title">Rerendering sheet</h3>
+        <p id="rerender-body">The dialog remains stable while its parent updates.</p>
+        <div className="row2 sheet-actions">
+          <button className="btn ghost" onClick={() => setRevision((value) => value + 1)}>
+            Rerender {revision}
+          </button>
+          <button className="btn primary">Confirm</button>
+        </div>
+      </Sheet>
+    </>
+  );
+}
+
 describe("Sheet", () => {
   it("keeps dialog actions reachable when content overflows (text scaling)", async () => {
     const user = userEvent.setup();
@@ -91,5 +119,16 @@ describe("Sheet", () => {
 
     expect(screen.getByRole("dialog", { name: "Danger zone" })).toBeInTheDocument();
     onError.mockRestore();
+  });
+
+  it("does not reset focus when an inline dismiss callback changes after a rerender", async () => {
+    const user = userEvent.setup();
+    render(<RerenderingSheetHarness />);
+
+    await user.click(screen.getByRole("button", { name: "Open" }));
+    const rerender = screen.getByRole("button", { name: "Rerender 0" });
+    await user.click(rerender);
+
+    expect(screen.getByRole("button", { name: "Rerender 1" })).toHaveFocus();
   });
 });

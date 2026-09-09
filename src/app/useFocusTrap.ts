@@ -1,4 +1,4 @@
-import { useEffect, type RefObject } from "react";
+import { useEffect, useRef, type RefObject } from "react";
 
 // tabindex="-1" is excluded everywhere so a roving-tabindex radio group (the
 // language grid) counts as ONE Tab stop — otherwise the trap's first/last
@@ -51,10 +51,15 @@ export function useFocusTrap(
     active?: boolean;
   },
 ) {
-  // Destructure so the effect depends on the specific option values (stable
-  // primitives / callbacks) rather than the freshly-spread `opts` object, which
-  // would re-arm the trap every render.
+  // Keep the latest Escape handler without making the focus-management effect
+  // depend on its identity. Sheets are often passed inline callbacks; if that
+  // callback changed on every parent render, the old effect cleanup restored
+  // focus to the opener and the new effect focused the first control again.
+  // That made a ticking parent (for example the USB watchdog status) yank the
+  // user's focus and scroll position back every second.
   const { onEsc, initialFocus } = opts;
+  const onEscRef = useRef(onEsc);
+  onEscRef.current = onEsc;
   const active = opts.active ?? true;
   useEffect(() => {
     const node = ref.current;
@@ -83,7 +88,7 @@ export function useFocusTrap(
 
     const onKey = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
-        onEsc?.();
+        onEscRef.current?.();
         return;
       }
       if (event.key !== "Tab") {
@@ -103,5 +108,5 @@ export function useFocusTrap(
         opener.focus();
       }
     };
-  }, [ref, onEsc, initialFocus, active]);
+  }, [ref, initialFocus, active]);
 }

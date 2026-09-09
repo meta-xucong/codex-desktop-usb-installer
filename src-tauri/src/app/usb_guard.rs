@@ -54,6 +54,8 @@ pub const LOCK_FILE_NAME: &str = "guard.lock";
 pub const PRODUCT_ID: &str = "codex-usb-oneclick";
 pub const POLL_INTERVAL_MS: u64 = 1_000;
 pub const DISCONNECT_GRACE_MS: u64 = 5_000;
+pub const ANCHOR_SCHEMA_V1: u32 = 1;
+pub const ANCHOR_SCHEMA_V2: u32 = 2;
 const LICENSE_SCHEMA_VERSION: u32 = 1;
 const LEASE_SCHEMA_VERSION: u32 = 1;
 const STATUS_SCHEMA_VERSION: u32 = 1;
@@ -69,12 +71,18 @@ pub fn suppress_status_for_uninstall() {
 /// Public fingerprint fields are deliberately small and stable.  A drive
 /// letter is not part of the identity, so a Windows letter reassignment does
 /// not break an authorized session.
+fn default_anchor_schema() -> u32 {
+    ANCHOR_SCHEMA_V1
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct UsbFingerprint {
     pub volume_serial: u32,
     pub anchor_sha256: String,
     pub bundle_relative_path: String,
+    #[serde(default = "default_anchor_schema")]
+    pub anchor_schema: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -283,8 +291,15 @@ pub fn bundle_relative_path(bundle_path: &str, drive_root: &str) -> Option<Strin
     Some(relative.join("/").to_ascii_lowercase())
 }
 
+pub fn is_supported_anchor_schema(anchor_schema: u32) -> bool {
+    matches!(anchor_schema, ANCHOR_SCHEMA_V1 | ANCHOR_SCHEMA_V2)
+}
+
 pub fn fingerprints_match(expected: &UsbFingerprint, actual: &UsbFingerprint) -> bool {
-    expected.volume_serial == actual.volume_serial
+    is_supported_anchor_schema(expected.anchor_schema)
+        && is_supported_anchor_schema(actual.anchor_schema)
+        && expected.anchor_schema == actual.anchor_schema
+        && expected.volume_serial == actual.volume_serial
         && expected
             .anchor_sha256
             .eq_ignore_ascii_case(&actual.anchor_sha256)
@@ -320,15 +335,22 @@ fn validate_lease_observation(
         .fingerprint
         .as_ref()
         .ok_or_else(|| engine("当前安装器目录不在可移动 U 盘上"))?;
+    if !is_supported_anchor_schema(lease.fingerprint.anchor_schema)
+        || !is_supported_anchor_schema(actual.anchor_schema)
+    {
+        return Err(engine("租约锚点版本不兼容"));
+    }
     if !fingerprints_match(&lease.fingerprint, actual) {
         return Err(engine(format!(
-            "当前安装器与租约的 U 盘指纹不一致（currentPath={} leasePath={} currentSerial={} leaseSerial={} currentRelative={} leaseRelative={} currentAnchor={} leaseAnchor={}）",
+            "当前安装器与租约的 U 盘指纹不一致（currentPath={} leasePath={} currentSerial={} leaseSerial={} currentRelative={} leaseRelative={} currentAnchorSchema={} leaseAnchorSchema={} currentAnchor={} leaseAnchor={}）",
             observation.bundle_path,
             lease.bundle_path,
             actual.volume_serial,
             lease.fingerprint.volume_serial,
             actual.bundle_relative_path,
             lease.fingerprint.bundle_relative_path,
+            actual.anchor_schema,
+            lease.fingerprint.anchor_schema,
             fingerprint_excerpt(&actual.anchor_sha256),
             fingerprint_excerpt(&lease.fingerprint.anchor_sha256),
         )));
@@ -379,6 +401,23 @@ struct UnsignedLicense<'a> {
     key_id: &'a Option<String>,
 }
 
+#[derive(Serialize)]
+struct LegacyUsbFingerprint<'a> {
+    volume_serial: u32,
+    anchor_sha256: &'a str,
+    bundle_relative_path: &'a str,
+}
+
+#[derive(Serialize)]
+struct LegacyUnsignedLicense<'a> {
+    schema_version: u32,
+    product: &'a str,
+    installation_id: &'a str,
+    fingerprint: LegacyUsbFingerprint<'a>,
+    issued_at: &'a str,
+    key_id: &'a Option<String>,
+}
+
 fn unsigned_license_payload(license: &UsbLicense) -> Result<Vec<u8>, AppError> {
     serde_json::to_vec(&UnsignedLicense {
         schema_version: license.schema_version,
@@ -389,6 +428,22 @@ fn unsigned_license_payload(license: &UsbLicense) -> Result<Vec<u8>, AppError> {
         key_id: &license.key_id,
     })
     .map_err(|error| engine(format!("序列化许可证失败: {error}")))
+}
+
+fn legacy_unsigned_license_payload(license: &UsbLicense) -> Result<Vec<u8>, AppError> {
+    serde_json::to_vec(&LegacyUnsignedLicense {
+        schema_version: license.schema_version,
+        product: &license.product,
+        installation_id: &license.installation_id,
+        fingerprint: LegacyUsbFingerprint {
+            volume_serial: license.fingerprint.volume_serial,
+            anchor_sha256: &license.fingerprint.anchor_sha256,
+            bundle_relative_path: &license.fingerprint.bundle_relative_path,
+        },
+        issued_at: &license.issued_at,
+        key_id: &license.key_id,
+    })
+    .map_err(|error| engine(format!("序列化旧版许可证失败: {error}")))
 }
 
 /// Verify a license with an explicit public key.  Keeping this function
@@ -420,8 +475,16 @@ pub fn verify_signature_with_key(
         .map_err(|_| engine("许可证签名必须是 64 字节"))?;
     let sig = Signature::from_bytes(&sig_array);
     let payload = unsigned_license_payload(license)?;
-    key.verify(&payload, &sig)
-        .map_err(|_| engine("许可证签名校验失败"))
+    if key.verify(&payload, &sig).is_ok() {
+        return Ok(());
+    }
+    if license.fingerprint.anchor_schema == ANCHOR_SCHEMA_V1 {
+        let legacy_payload = legacy_unsigned_license_payload(license)?;
+        if key.verify(&legacy_payload, &sig).is_ok() {
+            return Ok(());
+        }
+    }
+    Err(engine("许可证签名校验失败"))
 }
 
 fn verify_configured_signature(license: &UsbLicense) -> Result<bool, AppError> {
@@ -451,6 +514,11 @@ pub fn validate_license(license: &UsbLicense, expected: &UsbFingerprint) -> Resu
     if license.product != PRODUCT_ID {
         return Err(engine("许可证产品标识不匹配"));
     }
+    if !is_supported_anchor_schema(license.fingerprint.anchor_schema)
+        || !is_supported_anchor_schema(expected.anchor_schema)
+    {
+        return Err(engine("许可证锚点版本不兼容"));
+    }
     if !fingerprints_match(&license.fingerprint, expected) {
         return Err(engine("许可证与当前 U 盘指纹不匹配"));
     }
@@ -469,21 +537,162 @@ pub fn new_unsigned_license(fingerprint: UsbFingerprint) -> UsbLicense {
     }
 }
 
-fn anchor_sha256(bundle_root: &Path) -> Result<String, AppError> {
+fn update_anchor_part(hasher: &mut Sha256, name: &str, bytes: &[u8]) {
+    hasher.update(name.as_bytes());
+    hasher.update([0u8]);
+    hasher.update((bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
+fn finish_anchor(hasher: Sha256) -> String {
+    let digest = hasher.finalize();
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Preserve the original v1 anchor exactly: both manifest files are hashed as
+/// raw bytes with the historical filename/NUL/length framing.
+pub fn raw_anchor_sha256(bundle_root: &Path) -> Result<String, AppError> {
     let mut hasher = Sha256::new();
-    // These files are part of the tracked USB layout.  Hashing both makes a
-    // copied/edited manifest fail even if the large MSIX payload is untouched.
     for name in ["manifest.json", "usb-manifest.json"] {
         let path = bundle_root.join(name);
         let bytes = fs::read(&path)
             .map_err(|error| engine(format!("读取锚点 {} 失败: {error}", path.display())))?;
-        hasher.update(name.as_bytes());
-        hasher.update([0u8]);
-        hasher.update((bytes.len() as u64).to_le_bytes());
-        hasher.update(bytes);
+        update_anchor_part(&mut hasher, name, &bytes);
     }
-    let digest = hasher.finalize();
-    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+    Ok(finish_anchor(hasher))
+}
+
+fn read_anchor_json(bundle_root: &Path, name: &str) -> Result<serde_json::Value, AppError> {
+    let path = bundle_root.join(name);
+    let bytes = fs::read(&path)
+        .map_err(|error| engine(format!("读取锚点 {} 失败: {error}", path.display())))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| engine(format!("解析锚点 {} 失败: {error}", path.display())))
+}
+
+fn remove_v2_mutable_fields(value: &mut serde_json::Value, name: &str) {
+    match name {
+        "manifest.json" => {
+            if let Some(object) = value.as_object_mut() {
+                for key in ["codexDesktopVersion", "packageVersion", "releaseTag"] {
+                    object.remove(key);
+                }
+            }
+            if let Some(payload) = value
+                .get_mut("payload")
+                .and_then(|value| value.as_object_mut())
+            {
+                payload.remove("sha256");
+                payload.remove("size");
+            }
+        }
+        "usb-manifest.json" => {
+            if let Some(codex_installer) = value
+                .get_mut("codexInstaller")
+                .and_then(|value| value.as_object_mut())
+            {
+                codex_installer.remove("payloadSha256");
+                codex_installer.remove("payloadSize");
+            }
+        }
+        _ => {}
+    }
+}
+
+fn write_canonical_json(
+    value: &serde_json::Value,
+    output: &mut Vec<u8>,
+) -> Result<(), serde_json::Error> {
+    match value {
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => serde_json::to_writer(output, value),
+        serde_json::Value::Array(values) => {
+            output.push(b'[');
+            for (index, value) in values.iter().enumerate() {
+                if index != 0 {
+                    output.push(b',');
+                }
+                write_canonical_json(value, output)?;
+            }
+            output.push(b']');
+            Ok(())
+        }
+        serde_json::Value::Object(object) => {
+            let mut entries = object.iter().collect::<Vec<_>>();
+            entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
+            output.push(b'{');
+            for (index, (key, value)) in entries.into_iter().enumerate() {
+                if index != 0 {
+                    output.push(b',');
+                }
+                serde_json::to_writer(&mut *output, key)?;
+                output.push(b':');
+                write_canonical_json(value, output)?;
+            }
+            output.push(b'}');
+            Ok(())
+        }
+    }
+}
+
+fn canonical_json_bytes(value: &serde_json::Value) -> Result<Vec<u8>, serde_json::Error> {
+    let mut output = Vec::new();
+    write_canonical_json(value, &mut output)?;
+    Ok(output)
+}
+
+/// Hash the v2 canonical representation.  Only the allow-listed mutable
+/// metadata is removed; all other JSON values remain part of the anchor.
+pub fn canonical_anchor_sha256(bundle_root: &Path) -> Result<String, AppError> {
+    let mut hasher = Sha256::new();
+    for name in ["manifest.json", "usb-manifest.json"] {
+        let mut value = read_anchor_json(bundle_root, name)?;
+        remove_v2_mutable_fields(&mut value, name);
+        let canonical = canonical_json_bytes(&value).map_err(|error| {
+            engine(format!(
+                "规范化锚点 {} 失败: {error}",
+                bundle_root.join(name).display()
+            ))
+        })?;
+        update_anchor_part(&mut hasher, name, &canonical);
+    }
+    Ok(finish_anchor(hasher))
+}
+
+/// Resolve the anchor schema from the bundle capability.  A missing or
+/// unparsable legacy usb-manifest remains v1-compatible; an explicit unknown
+/// schema is rejected so it cannot be silently downgraded to v1.
+pub fn bundle_anchor_schema(bundle_root: &Path) -> Result<u32, AppError> {
+    let path = bundle_root.join("usb-manifest.json");
+    let bytes = fs::read(&path)
+        .map_err(|error| engine(format!("读取锚点 {} 失败: {error}", path.display())))?;
+    let value = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(value) => value,
+        Err(_) => return Ok(ANCHOR_SCHEMA_V1),
+    };
+    let Some(schema_value) = value.get("schemaVersion") else {
+        return Ok(ANCHOR_SCHEMA_V1);
+    };
+    let Some(schema) = schema_value.as_u64() else {
+        return Err(engine("U 盘清单 schemaVersion 不是整数，拒绝确定锚点版本"));
+    };
+    match schema {
+        1 => Ok(ANCHOR_SCHEMA_V1),
+        2 => Ok(ANCHOR_SCHEMA_V2),
+        _ => Err(engine(format!("U 盘清单锚点版本不兼容: {schema}"))),
+    }
+}
+
+/// Hash the bundle using the representation selected by its explicit
+/// capability.  This is the API callers should use for observed fingerprints.
+pub fn anchor_sha256(bundle_root: &Path) -> Result<String, AppError> {
+    match bundle_anchor_schema(bundle_root)? {
+        ANCHOR_SCHEMA_V1 => raw_anchor_sha256(bundle_root),
+        ANCHOR_SCHEMA_V2 => canonical_anchor_sha256(bundle_root),
+        _ => Err(engine("U 盘清单锚点版本不兼容")),
+    }
 }
 
 fn bundle_root_for_executable(executable: &Path) -> Option<PathBuf> {
@@ -549,8 +758,14 @@ fn read_license(bundle_root: &Path) -> Result<Option<UsbLicense>, AppError> {
 fn write_license(bundle_root: &Path, license: &UsbLicense) -> Result<(), AppError> {
     let bytes = serde_json::to_vec_pretty(license)
         .map_err(|error| engine(format!("序列化许可证失败: {error}")))?;
-    atomic_file::write_atomic(&license_path(bundle_root), &bytes)
-        .map_err(|error| engine(format!("写入许可证失败: {error}")))
+    let path = license_path(bundle_root);
+    atomic_file::write_atomic(&path, &bytes)
+        .map_err(|error| engine(format!("写入许可证失败: {error}")))?;
+    // usb-license.json is mutable manager state and is intentionally outside
+    // SHA256SUMS. Do not leave the atomic writer's backup in a successful
+    // bundle: the bundle verifier treats backup files as interrupted state.
+    let _ = fs::remove_file(atomic_file::backup_path(&path));
+    Ok(())
 }
 
 fn local_guard_dir() -> Result<PathBuf, AppError> {
@@ -721,11 +936,12 @@ pub fn authorized_bundle_identity() -> Result<(PathBuf, UsbFingerprint), AppErro
         )));
     }
     log::debug!(
-        "USB install destination authorized by fingerprint current_path={} lease_path={} serial={} relative={} anchor={}",
+        "USB install destination authorized by fingerprint current_path={} lease_path={} serial={} relative={} anchor_schema={} anchor={}",
         observation.bundle_path,
         lease.bundle_path,
         current_fingerprint.volume_serial,
         current_fingerprint.bundle_relative_path,
+        current_fingerprint.anchor_schema,
         fingerprint_excerpt(&current_fingerprint.anchor_sha256)
     );
     Ok((bundle, current_fingerprint.clone()))
@@ -1160,10 +1376,12 @@ fn observe_windows_bundle(bundle_root: &Path) -> Result<UsbObservation, AppError
     }
     let relative =
         bundle_relative_path(&path, &drive_root).ok_or_else(|| engine("U 盘目录不在卷根路径下"))?;
+    let anchor_schema = bundle_anchor_schema(&normalized_bundle_root)?;
     let fingerprint = UsbFingerprint {
         volume_serial: serial,
         anchor_sha256: anchor_sha256(&normalized_bundle_root)?,
         bundle_relative_path: relative,
+        anchor_schema,
     };
     Ok(UsbObservation {
         removable: true,
@@ -1689,11 +1907,13 @@ mod tests {
             volume_serial: 42,
             anchor_sha256: "Aa".repeat(32),
             bundle_relative_path: "codex/setup".to_string(),
+            anchor_schema: ANCHOR_SCHEMA_V1,
         };
         let same = UsbFingerprint {
             volume_serial: 42,
             anchor_sha256: expected.anchor_sha256.to_uppercase(),
             bundle_relative_path: "CODEX/SETUP".to_string(),
+            anchor_schema: ANCHOR_SCHEMA_V1,
         };
         let copied = UsbFingerprint {
             volume_serial: 43,
@@ -1701,6 +1921,13 @@ mod tests {
         };
         assert!(fingerprints_match(&expected, &same));
         assert!(!fingerprints_match(&expected, &copied));
+        assert!(!fingerprints_match(
+            &expected,
+            &UsbFingerprint {
+                anchor_schema: ANCHOR_SCHEMA_V2,
+                ..same
+            }
+        ));
     }
 
     #[test]
@@ -1709,6 +1936,7 @@ mod tests {
             volume_serial: 42,
             anchor_sha256: "a".repeat(64),
             bundle_relative_path: "usb-oneclick-v0.5.20-final".to_string(),
+            anchor_schema: ANCHOR_SCHEMA_V1,
         };
         let lease = UsbLease {
             schema_version: LEASE_SCHEMA_VERSION,
@@ -1767,6 +1995,7 @@ mod tests {
             volume_serial: 7,
             anchor_sha256: "b".repeat(64),
             bundle_relative_path: "codex".to_string(),
+            anchor_schema: ANCHOR_SCHEMA_V1,
         });
         let payload = unsigned_license_payload(&license).unwrap();
         license.signature = Some(B64.encode(signing.sign(&payload).to_bytes()));
@@ -1774,6 +2003,190 @@ mod tests {
         assert!(verify_signature_with_key(&license, &public).is_ok());
         license.fingerprint.volume_serial = 8;
         assert!(verify_signature_with_key(&license, &public).is_err());
+    }
+
+    #[test]
+    fn legacy_v1_signed_license_without_anchor_schema_still_verifies() {
+        let signing = SigningKey::from_bytes(&[12u8; 32]);
+        let license = new_unsigned_license(UsbFingerprint {
+            volume_serial: 7,
+            anchor_sha256: "c".repeat(64),
+            bundle_relative_path: "codex".to_string(),
+            anchor_schema: ANCHOR_SCHEMA_V1,
+        });
+        let signature = B64.encode(
+            signing
+                .sign(&legacy_unsigned_license_payload(&license).unwrap())
+                .to_bytes(),
+        );
+        let mut legacy_json = serde_json::to_value(&license).unwrap();
+        legacy_json["fingerprint"]
+            .as_object_mut()
+            .unwrap()
+            .remove("anchorSchema");
+        legacy_json["signature"] = serde_json::Value::String(signature);
+        let legacy: UsbLicense = serde_json::from_value(legacy_json).unwrap();
+        let public = B64.encode(signing.verifying_key().to_bytes());
+        assert_eq!(legacy.fingerprint.anchor_schema, ANCHOR_SCHEMA_V1);
+        assert!(verify_signature_with_key(&legacy, &public).is_ok());
+    }
+
+    fn anchor_fixture(manifest: &str, usb_manifest: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("codex-usb-anchor-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("payload")).unwrap();
+        fs::write(root.join("manifest.json"), manifest).unwrap();
+        fs::write(root.join("usb-manifest.json"), usb_manifest).unwrap();
+        root
+    }
+
+    #[test]
+    fn v2_anchor_ignores_only_allow_listed_mutable_metadata() {
+        let root = anchor_fixture(
+            r#"{
+                "packageName": "OpenAI.Codex",
+                "codexDesktopVersion": "26.1.1",
+                "packageVersion": "26.1.1.0",
+                "releaseTag": "v26.1.1",
+                "architecture": "x64",
+                "payload": {
+                    "path": "payload/OpenAI.Codex_x64.msix",
+                    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "size": 11
+                },
+                "immutable": {"z": 2, "a": [true, null]}
+            }"#,
+            r#"{
+                "schemaVersion": 2,
+                "product": "codex-usb-oneclick",
+                "codexInstaller": {
+                    "file": "CodexDesktopSetup.exe",
+                    "payload": "payload/OpenAI.Codex_x64.msix",
+                    "payloadSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "payloadSize": 11
+                },
+                "programLayout": {"mode": "verified-msix-extraction", "codexRoot": "apps/Codex"}
+            }"#,
+        );
+        assert_eq!(bundle_anchor_schema(&root).unwrap(), ANCHOR_SCHEMA_V2);
+        let original = anchor_sha256(&root).unwrap();
+
+        let mut manifest: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(root.join("manifest.json")).unwrap()).unwrap();
+        manifest["codexDesktopVersion"] = serde_json::Value::String("26.2.2".to_string());
+        manifest["packageVersion"] = serde_json::Value::String("26.2.2.0".to_string());
+        manifest["releaseTag"] = serde_json::Value::String("v26.2.2".to_string());
+        manifest["payload"]["sha256"] = serde_json::Value::String("b".repeat(64));
+        manifest["payload"]["size"] = serde_json::Value::Number(22.into());
+        fs::write(
+            root.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let mut usb_manifest: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(root.join("usb-manifest.json")).unwrap())
+                .unwrap();
+        usb_manifest["codexInstaller"]["payloadSha256"] = serde_json::Value::String("b".repeat(64));
+        usb_manifest["codexInstaller"]["payloadSize"] = serde_json::Value::Number(22.into());
+        fs::write(
+            root.join("usb-manifest.json"),
+            serde_json::to_vec_pretty(&usb_manifest).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(anchor_sha256(&root).unwrap(), original);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn v2_anchor_changes_when_an_immutable_field_changes() {
+        let root = anchor_fixture(
+            r#"{
+                "packageName": "OpenAI.Codex",
+                "architecture": "x64",
+                "payload": {"path": "payload/OpenAI.Codex_x64.msix", "sha256": "a", "size": 1}
+            }"#,
+            r#"{
+                "schemaVersion": 2,
+                "product": "codex-usb-oneclick",
+                "codexInstaller": {"payload": "payload/OpenAI.Codex_x64.msix", "payloadSha256": "a", "payloadSize": 1}
+            }"#,
+        );
+        let original = anchor_sha256(&root).unwrap();
+        let mut manifest: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(root.join("manifest.json")).unwrap()).unwrap();
+        manifest["payload"]["path"] =
+            serde_json::Value::String("payload/OpenAI.Codex_arm64.msix".to_string());
+        fs::write(
+            root.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        assert_ne!(anchor_sha256(&root).unwrap(), original);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn v1_anchor_keeps_historical_raw_bytes() {
+        let root = anchor_fixture(
+            r#"{"packageName":"OpenAI.Codex","codexDesktopVersion":"26.1.1"}"#,
+            r#"{"schemaVersion":1,"product":"codex-usb-oneclick"}"#,
+        );
+        assert_eq!(bundle_anchor_schema(&root).unwrap(), ANCHOR_SCHEMA_V1);
+        assert_eq!(
+            anchor_sha256(&root).unwrap(),
+            raw_anchor_sha256(&root).unwrap()
+        );
+        let original = anchor_sha256(&root).unwrap();
+        fs::write(
+            root.join("manifest.json"),
+            r#"{ "packageName": "OpenAI.Codex", "codexDesktopVersion": "26.1.1" }"#,
+        )
+        .unwrap();
+        assert_ne!(anchor_sha256(&root).unwrap(), original);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_fingerprint_json_defaults_anchor_schema_to_v1() {
+        let fingerprint_json = serde_json::json!({
+            "volumeSerial": 42,
+            "anchorSha256": "a".repeat(64),
+            "bundleRelativePath": "codex"
+        });
+        let fingerprint: UsbFingerprint = serde_json::from_value(fingerprint_json.clone()).unwrap();
+        assert_eq!(fingerprint.anchor_schema, ANCHOR_SCHEMA_V1);
+
+        let license: UsbLicense = serde_json::from_value(serde_json::json!({
+            "schemaVersion": 1,
+            "product": PRODUCT_ID,
+            "installationId": "legacy-installation",
+            "fingerprint": fingerprint_json,
+            "issuedAt": "now"
+        }))
+        .unwrap();
+        assert_eq!(license.fingerprint.anchor_schema, ANCHOR_SCHEMA_V1);
+        assert_eq!(
+            serde_json::to_value(&license).unwrap()["fingerprint"]["anchorSchema"],
+            ANCHOR_SCHEMA_V1
+        );
+
+        let lease: UsbLease = serde_json::from_value(serde_json::json!({
+            "schemaVersion": 1,
+            "product": PRODUCT_ID,
+            "leaseId": "legacy-lease",
+            "bundlePath": "D:\\codex",
+            "fingerprint": {
+                "volumeSerial": 42,
+                "anchorSha256": "a".repeat(64),
+                "bundleRelativePath": "codex"
+            },
+            "ownerPid": 7,
+            "managedProcesses": [],
+            "issuedAt": "now"
+        }))
+        .unwrap();
+        assert_eq!(lease.fingerprint.anchor_schema, ANCHOR_SCHEMA_V1);
     }
 
     #[test]

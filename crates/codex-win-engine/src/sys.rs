@@ -309,45 +309,69 @@ impl MsixDependencyPrecheck {
 }
 
 pub fn fetch_text(url: &str) -> Result<String, EngineError> {
-    fetch_text_with_network(url, &NetworkConfig::system())
-}
-
-fn fetch_text_output(
-    url: &str,
-    network: &NetworkConfig,
-    revocation_check: SchannelRevocationCheck,
-) -> Result<std::process::Output, EngineError> {
-    let max_text = MAX_TEXT_BYTES.to_string();
-    let mut command = hidden_command(curl_exe());
-    network.apply_to_command_with_schannel_revocation(&mut command, revocation_check);
-    command.args([
-        "-fsSL",
-        "--proto",
-        "=https",
-        "--proto-redir",
-        "=https",
-        "--connect-timeout",
-        "20",
-        "--max-time",
-        "60",
-        "--max-filesize",
-        &max_text,
-        url,
-    ]);
-    // curl's own --max-time is the primary budget; the outer deadline is a
-    // backstop that also kills a hung curl that ignored max-time.
-    run_capturing(
-        command,
-        RunLimits::total(std::time::Duration::from_secs(75)),
-        None,
-    )
-    .map_err(|e| EngineError::Io(format!("curl: {}", e.message())))
+    fetch_text_with_network_headers(url, &NetworkConfig::system(), &[])
 }
 
 pub fn fetch_text_with_network(url: &str, network: &NetworkConfig) -> Result<String, EngineError> {
+    fetch_text_with_network_headers(url, network, &[])
+}
+
+/// Fetch a small HTTPS text resource without following redirects. Relay
+/// metadata is served from a fixed same-origin path, so accepting a redirect
+/// would allow an otherwise valid relay configuration to move the request to
+/// an unrelated host.
+pub fn fetch_text_with_network_no_redirect(
+    url: &str,
+    network: &NetworkConfig,
+) -> Result<String, EngineError> {
+    let source = url_host(url);
+    let mut output = fetch_text_output(url, network, SchannelRevocationCheck::Strict, &[], false)?;
+    if is_schannel_revocation_offline(
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr).as_ref(),
+    ) {
+        output = fetch_text_output(url, network, SchannelRevocationCheck::Disabled, &[], false)?;
+    }
+    if !output.status.success() {
+        return Err(EngineError::Io(curl_failure_message(
+            url,
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stderr),
+        )));
+    }
+    if output.stdout.len() > MAX_TEXT_BYTES as usize {
+        return Err(EngineError::Io(format!(
+            "text response exceeded {MAX_TEXT_BYTES} bytes"
+        )));
+    }
+    let text = String::from_utf8(output.stdout).map_err(|e| EngineError::Io(e.to_string()))?;
+    log::debug!(
+        "fetch Windows text completed without redirects source={source} bytes={}",
+        text.len()
+    );
+    Ok(text)
+}
+
+/// Stable headers for callers that fetch GitHub's REST API.
+pub const GITHUB_API_HEADERS: &[&'static str] = &[
+    "Accept: application/vnd.github+json",
+    "User-Agent: Codex-App-Manager",
+];
+
+/// Fetch a small HTTPS text resource with compile-time-trusted curl headers.
+///
+/// Header strings are deliberately required to be `static` and are passed as
+/// separate process arguments, never through a shell. Do not pass user- or
+/// network-provided header values to this API.
+pub fn fetch_text_with_network_headers(
+    url: &str,
+    network: &NetworkConfig,
+    headers: &[&'static str],
+) -> Result<String, EngineError> {
     let source = url_host(url);
     log::debug!("fetch Windows text source={source}");
-    let mut output = fetch_text_output(url, network, SchannelRevocationCheck::Strict)?;
+    let mut output =
+        fetch_text_output(url, network, SchannelRevocationCheck::Strict, headers, true)?;
     let should_retry_without_revocation = {
         let stderr = String::from_utf8_lossy(&output.stderr);
         !output.status.success()
@@ -357,7 +381,13 @@ pub fn fetch_text_with_network(url: &str, network: &NetworkConfig) -> Result<Str
         log::warn!(
             "Windows curl Schannel revocation check failed; retrying with --ssl-no-revoke source={source}"
         );
-        output = fetch_text_output(url, network, SchannelRevocationCheck::Disabled)?;
+        output = fetch_text_output(
+            url,
+            network,
+            SchannelRevocationCheck::Disabled,
+            headers,
+            true,
+        )?;
     }
 
     if !output.status.success() {
@@ -380,6 +410,50 @@ pub fn fetch_text_with_network(url: &str, network: &NetworkConfig) -> Result<Str
     let bytes = text.len();
     log::debug!("fetch Windows text completed source={source} bytes={bytes}");
     Ok(text)
+}
+
+fn fetch_text_output(
+    url: &str,
+    network: &NetworkConfig,
+    revocation_check: SchannelRevocationCheck,
+    headers: &[&'static str],
+    follow_redirects: bool,
+) -> Result<std::process::Output, EngineError> {
+    let max_text = MAX_TEXT_BYTES.to_string();
+    let mut command = hidden_command(curl_exe());
+    network.apply_to_command_with_schannel_revocation(&mut command, revocation_check);
+    append_curl_headers(&mut command, headers);
+    command.args([
+        "-fsS",
+        "--proto",
+        "=https",
+        "--proto-redir",
+        "=https",
+        "--connect-timeout",
+        "20",
+        "--max-time",
+        "60",
+        "--max-filesize",
+        &max_text,
+    ]);
+    if follow_redirects {
+        command.arg("-L");
+    }
+    command.arg(url);
+    // curl's own --max-time is the primary budget; the outer deadline is a
+    // backstop that also kills a hung curl that ignored max-time.
+    run_capturing(
+        command,
+        RunLimits::total(std::time::Duration::from_secs(75)),
+        None,
+    )
+    .map_err(|e| EngineError::Io(format!("curl: {}", e.message())))
+}
+
+fn append_curl_headers(command: &mut std::process::Command, headers: &[&'static str]) {
+    for header in headers {
+        command.arg("-H").arg(*header);
+    }
 }
 
 fn curl_failure_message(url: &str, exit_code: Option<i32>, stderr: &str) -> String {
@@ -5441,6 +5515,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn github_api_headers_are_separate_curl_arguments() {
+        let mut command = std::process::Command::new("curl");
+        super::append_curl_headers(&mut command, super::GITHUB_API_HEADERS);
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            vec![
+                "-H",
+                "Accept: application/vnd.github+json",
+                "-H",
+                "User-Agent: Codex-App-Manager",
+            ]
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn usb_launch_starts_safe_and_adds_no_sandbox_only_for_fallback() {
@@ -7523,10 +7616,21 @@ function Invoke-CodexMoveRehydratedPackageToUsb {
                     "      catch { $localCmdletError = [string]$_ }\n      $afterRemove = Wait-CodexMachineRepairState",
                     "      catch { $localCmdletError = [string]$_ }\n      if ($script:mode -eq 'orphan-removal-interrupted' -and $script:removeCalls -eq 1) { throw 'fixture process terminated before AppX removal requery' }\n      $afterRemove = Wait-CodexMachineRepairState",
                 )
+                // APPX_DATA_BACKUP_SCRIPT is included verbatim from a CRLF
+                // PowerShell file. Anchor on the assertion line itself so the
+                // interruption hook remains effective if the source line
+                // ending changes again; a LF-only multiline replacement would
+                // silently leave this recovery-resume case untested.
                 .replace(
-                    "      Write-CodexRecoveryJournal $journal $context\n    }\n    Assert-CodexRecoveryJournal $journal $context $ExpectedFullName $payloadHash",
-                    "      Write-CodexRecoveryJournal $journal $context\n      Invoke-FixtureAfterInitialJournal\n    }\n    Assert-CodexRecoveryJournal $journal $context $ExpectedFullName $payloadHash",
+                    "    Assert-CodexRecoveryJournal $journal $context $ExpectedFullName $payloadHash",
+                    "    Invoke-FixtureAfterInitialJournal\r\n    Assert-CodexRecoveryJournal $journal $context $ExpectedFullName $payloadHash",
                 );
+            assert!(
+                production.contains(
+                    "    Invoke-FixtureAfterInitialJournal\r\n    Assert-CodexRecoveryJournal"
+                ),
+                "late-orphan interruption hook was not injected into the production fixture"
+            );
             let script = format!(
                 r#"{setup}
 $script:mode = {mode}

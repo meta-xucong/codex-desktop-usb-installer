@@ -2,7 +2,7 @@
 param(
     [ValidateSet("x64", "arm64")]
     [string]$Architecture = "x64",
-    [string]$Repository = "meta-xucong/codex-app-mirror",
+    [string]$Repository = "Wangnov/codex-app-mirror",
     [string]$ReleaseTag,
     [string]$DownloadDir = "",
     [string]$BundleDir = "",

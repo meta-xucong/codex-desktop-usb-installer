@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { managerApi } from "../../services/managerApi";
 import type {
+  CapabilityPackInstallOptions,
+  CapabilityPackReport,
   HistoricalInstallSelection,
   OfflinePayloadReport,
   OfflineStageReport,
@@ -14,10 +16,36 @@ import {
 } from "../errorCopy";
 import { Icon, CodexGlyph } from "../icons";
 import { useI18n, type TFn } from "../i18n";
-import { FailureBanner, Ring, StatusBanner, TopBar } from "../components";
+import { FailureBanner, Ring, StatusBanner, Tooltip, TopBar } from "../components";
 import { mib } from "../format";
+import { OfflineComponentsSheet } from "./OfflineComponentsSheet";
 
 type OfflinePhase = "loading" | "ready" | "installed" | "staging" | "installing" | "error";
+
+const DEFAULT_CAPABILITY_PACK_OPTIONS: CapabilityPackInstallOptions = {
+  enableFeishu: false,
+  persistConnections: false,
+  feishuAppId: "",
+  feishuAppSecret: "",
+  feishuUserAccessToken: "",
+  feishuDomain: "https://open.feishu.cn",
+  feishuAuthMode: "tenant",
+  enabledApiServices: [],
+  dashscopeApiKey: "",
+  dashscopeBaseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+  dashscopeModel: "",
+  image2ApiKey: "",
+  image2BaseUrl: "",
+  image2Model: "",
+  image2AgentId: "",
+  seedanceApiKey: "",
+  seedanceBaseUrl: "",
+  seedanceModel: "",
+  seedanceAgentId: "",
+  seedancePrechargePoints: "",
+  seedanceOfficialLinkTtlHours: "",
+  seedanceRefundRule: "",
+};
 
 function versionParts(value: string): number[] {
   return value
@@ -113,6 +141,7 @@ export function OfflineHome({
   const [failure, setFailure] = useState<FailureSurface | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [installationDetail, setInstallationDetail] = useState<string | null>(null);
+  const [componentsOpen, setComponentsOpen] = useState(false);
   const [busyAction, setBusyAction] = useState<
     "install" | "launch" | "ccswitch" | "logs" | "adopt" | null
   >(null);
@@ -176,6 +205,10 @@ export function OfflineHome({
   // the visible countdown useful without adding a WebSocket or privileged
   // background service.
   useEffect(() => {
+    // The modal owns a long, scrollable form. The watchdog countdown is not
+    // useful while it is open, and updating it would needlessly re-render the
+    // whole page behind the modal once per second.
+    if (componentsOpen) return;
     let active = true;
     const timer = window.setInterval(() => {
       void managerApi
@@ -189,7 +222,7 @@ export function OfflineHome({
       active = false;
       window.clearInterval(timer);
     };
-  }, []);
+  }, [componentsOpen]);
 
   const newerInstalled = useMemo(() => {
     if (!payload || !status?.installed) return false;
@@ -257,9 +290,18 @@ export function OfflineHome({
       // Keep diagnostic staging until all installed-state/placement checks
       // pass. A verification failure must not claim a deleted file was kept.
       await managerApi.offlinePayloadCleanup(stage.stagedPath).catch(() => undefined);
-      // Codex is now confirmed on disk.  Hand off to the bundled CCSwitch
-      // configurator; a missing/failed configurator must not turn a successful
-      // Codex installation into a failure, so it is shown as a notice instead.
+      // Codex is now confirmed on disk. Install the complete local capability
+      // pack first, then hand off to CCSwitch. Either auxiliary component is
+      // best-effort: a failure never rolls back a verified Codex installation
+      // and remains retryable from the quiet Components entry below.
+      let capabilityPackReport: CapabilityPackReport | null = null;
+      try {
+        capabilityPackReport = await managerApi.installCapabilityPack({
+          ...DEFAULT_CAPABILITY_PACK_OPTIONS,
+        });
+      } catch (capabilityError) {
+        console.warn("[capability-pack] automatic install failed", capabilityError);
+      }
       let ccswitchReport = null;
       try {
         ccswitchReport = await managerApi.installAndLaunchCcswitch();
@@ -268,15 +310,25 @@ export function OfflineHome({
       }
       setStatus(installed);
       setPhase("installed");
-      if (ccswitchReport?.launched) {
-        setNotice(t("offline.ccswitchLaunched"));
-      } else if (ccswitchReport && !ccswitchReport.available) {
-        setNotice(t("offline.ccswitchUnavailable"));
-      } else if (!ccswitchReport) {
-        setNotice(t("offline.ccswitchFailed"));
+      const notices: string[] = [];
+      if (capabilityPackReport?.success) {
+        notices.push(
+          t("offline.capabilityInstalled", {
+            skills: capabilityPackReport.skills,
+            agents: capabilityPackReport.agents,
+          }),
+        );
       } else {
-        setNotice(ccswitchReport.message || t("offline.doneDetail"));
+        notices.push(t("offline.capabilityFailed"));
       }
+      if (ccswitchReport?.launched) {
+        notices.push(t("offline.ccswitchLaunched"));
+      } else if (ccswitchReport && !ccswitchReport.available) {
+        notices.push(t("offline.ccswitchUnavailable"));
+      } else {
+        notices.push(t("offline.ccswitchFailed"));
+      }
+      setNotice(notices.join(" "));
     } catch (cause) {
       setPhase("ready");
       setFailure(resolveFailure(cause, t));
@@ -386,14 +438,24 @@ export function OfflineHome({
               {usbGuard.countdownSeconds !== null ? (
                 <span className="usb-guard-countdown">{usbGuard.countdownSeconds}s</span>
               ) : null}
+              <Tooltip
+                content={[
+                  usbGuard.message,
+                  usbGuard.driveRoot
+                    ? `${usbGuard.driveRoot}${usbGuard.bundleRelativePath ? ` · ${usbGuard.bundleRelativePath}` : ""}`
+                    : null,
+                  !usbGuard.signed && usbGuard.status === "authorized"
+                    ? t("offline.usbGuard.unsigned")
+                    : null,
+                ]
+                  .filter(Boolean)
+                  .join("\n")}
+              >
+                <span className="tooltip-icon" aria-label={t("themes.details")}>
+                  <Icon name="info" />
+                </span>
+              </Tooltip>
             </div>
-            <div className="usb-guard-status-message">{usbGuard.message}</div>
-            {usbGuard.driveRoot ? (
-              <div className="usb-guard-status-path">{usbGuard.driveRoot}{usbGuard.bundleRelativePath ? ` · ${usbGuard.bundleRelativePath}` : ""}</div>
-            ) : null}
-            {!usbGuard.signed && usbGuard.status === "authorized" ? (
-              <div className="usb-guard-status-note">{t("offline.usbGuard.unsigned")}</div>
-            ) : null}
           </section>
         ) : null}
         <section className="hero" data-testid="offline-hero">
@@ -418,7 +480,11 @@ export function OfflineHome({
               <Ring icon="shield" variant="amber" />
               <div className="headline">{t("home.external.title")}</div>
               <div className="prov"><span className="dot external" />{t("prov.external")}</div>
-              <div className="desc">{t("offline.external")}</div>
+              <Tooltip content={t("offline.external")}>
+                <span className="tooltip-icon hero-info" aria-label={t("themes.details")}>
+                  <Icon name="info" />
+                </span>
+              </Tooltip>
             </>
           ) : (
             <>
@@ -426,7 +492,11 @@ export function OfflineHome({
               <div className="headline">
                 {phase === "staging" || phase === "installing" ? t("offline.installing") : t("offline.ready")}
               </div>
-              <div className="desc">{t("offline.description")}</div>
+              <Tooltip content={t("offline.description")}>
+                <span className="tooltip-icon hero-info" aria-label={t("themes.details")}>
+                  <Icon name="info" />
+                </span>
+              </Tooltip>
             </>
           )}
         </section>
@@ -479,7 +549,11 @@ export function OfflineHome({
               <button className="btn ghost" onClick={() => void install()} disabled={disabled}>
                 <Icon name="refresh" />{t("offline.repair")}
               </button>
-              <div className="desc">{t("offline.repairHint")}</div>
+              <Tooltip content={t("offline.repairHint")}>
+                <span className="tooltip-icon action-info" aria-label={t("themes.details")}>
+                  <Icon name="info" />
+                </span>
+              </Tooltip>
               {onOpenUninstall ? (
                 <button className="btn ghost danger" onClick={onOpenUninstall} disabled={disabled}>
                   <Icon name="trash" />{t("offline.uninstallBundle")}
@@ -508,9 +582,16 @@ export function OfflineHome({
               <Icon name="trash" />{t("offline.uninstallBundle")}
             </button>
           ) : null}
-          <button className="btn ghost" onClick={() => void openLogs()} disabled={disabled}>
+              <button className="btn ghost" onClick={() => void openLogs()} disabled={disabled}>
             {busyAction === "logs" ? <Icon name="loader" className="spinicon" /> : <Icon name="folder" />}
             {t("offline.openLogs")}
+          </button>
+          <button
+            className="linkbtn component-entry"
+            onClick={() => setComponentsOpen(true)}
+            disabled={disabled}
+          >
+            <Icon name="sliders" />{t("offline.components.entry")}
           </button>
         </div>
 
@@ -528,6 +609,10 @@ export function OfflineHome({
           </div>
         ) : null}
       </div>
+      <OfflineComponentsSheet
+        open={componentsOpen}
+        onDismiss={() => setComponentsOpen(false)}
+      />
     </div>
   );
 }

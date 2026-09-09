@@ -25,8 +25,9 @@ v0.5.20+ 不再把 Codex 注册为 U 盘 AppX 包，也不再依赖 Windows 的�
 ├─ apps/
 │  └─ Codex/                      安装后生成；只放 Codex 程序文件
 ├─ content/
-│  ├─ skills/                     预装 Skill 载荷边界
-│  └─ mcp/                        预装 MCP 程序/静态资源边界
+│  ├─ skills/                     兼容性 Skill 载荷边界
+│  ├─ mcp/                        兼容性 MCP 程序/静态资源边界
+│  └─ codex-starter-kit/          完整离线 Skills/Agents/运行时/MCP 能力包
 ├─ ccswitch/CodexSwitch.exe
 └─ resources/prerequisites/
    ├─ vc_redist.x64.exe
@@ -43,8 +44,8 @@ v0.5.20+ 不再把 Codex 注册为 U 盘 AppX 包，也不再依赖 Windows 的�
 | 桌面端本地缓存/日志 | `%LOCALAPPDATA%\Codex` |
 | Codex Switch 程序 | U 盘 `ccswitch` |
 | Codex Switch 用户配置 | 应用定义的本机用户目录 |
-| Skill 载荷（后续导入） | U 盘 `content\skills` |
-| MCP 可执行文件/静态资源（后续导入） | U 盘 `content\mcp` |
+| 能力包源文件 | U 盘 `content\codex-starter-kit` |
+| 已安装 Skill/Agent/运行时/MCP 支持文件 | `%USERPROFILE%\.codex\codex-agent-kit`、`%USERPROFILE%\.agents\skills`、`%USERPROFILE%\.codex\agents` |
 | MCP/Codex 配置与密钥 | 本机 `%USERPROFILE%\.codex\config.toml` 等用户目录 |
 
 “数据在本机”按 Windows 用户实际配置判断，通常就是 C 盘。安装前同时核验环境变量
@@ -75,7 +76,9 @@ v0.5.20+ 从结构上消除这类不确定性：生产安装路线不调用
 9. 检查 WebView2 与 VC++ x64 运行库；只运行 U 盘内哈希固定、微软签名的完整离线安装器，不手工复制 DLL。
 10. 以仅作用于子进程的软件渲染参数从 U 盘启动 Codex Switch；只有检测到尺寸正常的
     可操作窗口并将其恢复到屏幕内、前置显示后才报告成功，再引导用户填写 API Key。
-    密钥不预置在发行包中。
+     密钥不预置在发行包中。
+11. Codex 验证通过后，管理器自动从 `content\codex-starter-kit` 安装全部随包
+    Skills、Agents、运行时和 MCP 支持文件；失败时保留可单独重试的组件入口。
 
 ## 启动与 U 盘约束
 
@@ -95,15 +98,17 @@ Codex 后会重新从安全模式探测。`--no-sandbox` 会降低 Chromium 子�
 不创建直接 Codex 快捷方式是有意设计：快捷方式指向 `Codex.exe` 会绕过 U 盘租约。
 发行包复制到另一位置后，卷序列号、锚点哈希和 bundle 相对路径不匹配时不能获得租约。
 
-## Skill 与 MCP 边界
+## Skill、Agent 与 MCP 边界
 
-v0.5.20+ 先固化目录与安全约束，尚未声称自动导入 Skill/MCP：
+一键流程在 Codex 安装并完成位置校验后，会调用 U 盘内的
+`content\codex-starter-kit\install-all.ps1`。它会离线校验能力包清单，将完整随包
+Skills、Agents、Python/Node 运行时、MCP wrapper 和配置模板安装到当前用户目录。
+该步骤不依赖 GitHub、npm 或 PyPI 网络下载。
 
-- Skill 的程序和说明文件可预置到 `content\skills\<skill>`。下一阶段导入器可在 Codex
-  支持的发现目录创建指向 U 盘的目录链接，使载荷仍留在 U 盘。
-- MCP 的可执行文件和只读资源可预置到 `content\mcp`；Codex 的 MCP 配置仍写入本机
-  `~/.codex/config.toml`，并在盘符变化时由管理器更新绝对路径。
-- API Key、OAuth token、登录状态和用户会话不得写进 `content`，也不得加入发行校验清单。
+安装器前端还提供一个低调的“组件修复”入口：可以单独重跑能力包，或单独重试
+CCSwitch。外部连接全部是可选项，默认不启用；没有填写凭据就不会启用飞书、DashScope、
+Image-2 或 Seedance。API Key、OAuth token、登录状态和用户会话不得写进 U 盘，
+仅在用户主动配置时保存到本机用户环境变量或 Codex 用户目录。
 
 ## 卸载
 

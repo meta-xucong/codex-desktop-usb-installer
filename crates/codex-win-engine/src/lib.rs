@@ -44,6 +44,7 @@ pub use checksums::{find_msix_sha256, parse_checksums, ChecksumEntry};
 pub use download::{
     cancel_active_download, download_to, download_to_with_network, download_to_with_progress,
     download_to_with_progress_bounded, download_to_with_progress_bounded_with_network,
+    download_to_with_progress_bounded_with_network_no_redirect,
     download_to_with_progress_with_network, pause_active_download, read_file, sha256_file,
 };
 pub use manifest::{parse_manifest, WindowsRelease};
@@ -65,12 +66,12 @@ pub use portable::{
 };
 pub use sys::{
     close_msix_codex_processes, detect_installed_codex, detect_portable_install, fetch_text,
-    fetch_text_with_network, launch_codex, launch_codex_with_options, probe_capabilities,
-    probe_msix_machine_state, registered_msix_package_full_name,
-    remove_exact_msix_machine_orphan_with_volume, remove_msix_package,
-    remove_msix_package_with_options, remove_msix_package_with_volume, CodexLaunchReport,
-    InstalledWindowsCodex, LaunchOptions, MsixMachineStateReport, MsixRemoveReport,
-    PortableLaunchPolicy,
+    fetch_text_with_network, fetch_text_with_network_no_redirect, launch_codex,
+    launch_codex_with_options, probe_capabilities, probe_msix_machine_state,
+    registered_msix_package_full_name, remove_exact_msix_machine_orphan_with_volume,
+    remove_msix_package, remove_msix_package_with_options, remove_msix_package_with_volume,
+    CodexLaunchReport, InstalledWindowsCodex, LaunchOptions, MsixMachineStateReport,
+    MsixRemoveReport, PortableLaunchPolicy,
 };
 pub use sys::{
     install_msix_sideload, install_msix_sideload_with_observer,

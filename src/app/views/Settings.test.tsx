@@ -215,6 +215,152 @@ describe("Settings runtime contract", () => {
     );
   });
 
+  it("saves the dedicated Codex payload repo without changing the manager URL source", async () => {
+    const user = userEvent.setup();
+    api.getSettings.mockResolvedValue(
+      settings({
+        source: "custom",
+        customUrl: "https://mirror.example.test/appcast.xml",
+      }),
+    );
+    renderSettings();
+
+    await waitFor(() => expect(screen.queryByText("正在加载设置…")).not.toBeInTheDocument());
+    const repo = screen.getByRole("textbox", {
+      name: CATALOG["zh-CN"]["settings.codexPayload.repo"],
+    });
+    expect(repo).toHaveAttribute(
+      "placeholder",
+      CATALOG["zh-CN"]["settings.codexPayload.placeholder"],
+    );
+    expect(
+      screen.getByText(CATALOG["zh-CN"]["settings.codexPayload.desc"]),
+    ).toBeInTheDocument();
+
+    await user.type(repo, "someone/codex-app-mirror-v2");
+    await user.tab();
+
+    await waitFor(() =>
+      expect(api.setSettings).toHaveBeenCalledWith(
+        expect.objectContaining({
+          source: "custom",
+          customUrl: "https://mirror.example.test/appcast.xml",
+          codexPayloadRepo: "someone/codex-app-mirror-v2",
+        }),
+      ),
+    );
+  });
+
+  it("persists an empty Codex payload repo as the default sentinel", async () => {
+    const user = userEvent.setup();
+    api.getSettings.mockResolvedValue(
+      settings({
+        source: "custom",
+        customUrl: "https://mirror.example.test/appcast.xml",
+        codexPayloadRepo: "someone/codex-app-mirror-v2",
+      }),
+    );
+    renderSettings();
+
+    await waitFor(() => expect(screen.queryByText("正在加载设置…")).not.toBeInTheDocument());
+    const repo = screen.getByRole("textbox", {
+      name: CATALOG["zh-CN"]["settings.codexPayload.repo"],
+    });
+    await user.clear(repo);
+    await user.tab();
+
+    await waitFor(() =>
+      expect(api.setSettings).toHaveBeenCalledWith(
+        expect.objectContaining({
+          source: "custom",
+          customUrl: "https://mirror.example.test/appcast.xml",
+          codexPayloadRepo: "",
+        }),
+      ),
+    );
+  });
+
+  it("selects the Codex payload source and only shows Relay URL for auto or Relay", async () => {
+    const user = userEvent.setup();
+    api.getSettings.mockResolvedValue(
+      settings({
+        codexPayloadSourceKind: "auto",
+        codexPayloadBaseUrl: "https://relay.example.test/codex/",
+      }),
+    );
+    renderSettings();
+
+    await waitFor(() => expect(screen.queryByText("正在加载设置…")).not.toBeInTheDocument());
+    const sourceGroup = screen.getByRole("radiogroup", {
+      name: CATALOG["zh-CN"]["settings.codexPayload.source.header"],
+    });
+    const relayUrl = screen.getByRole("textbox", {
+      name: CATALOG["zh-CN"]["settings.codexPayload.relayUrl"],
+    });
+    expect(relayUrl).toHaveValue("https://relay.example.test/codex/");
+    expect(
+      within(sourceGroup).getByRole("radio", {
+        name: new RegExp(
+          `^${CATALOG["zh-CN"]["settings.codexPayload.source.auto"]}`,
+        ),
+      }),
+    ).toHaveAttribute("aria-checked", "true");
+
+    await user.click(
+      within(sourceGroup).getByRole("radio", {
+        name: new RegExp(
+          `^${CATALOG["zh-CN"]["settings.codexPayload.source.github"]}`,
+        ),
+      }),
+    );
+    await waitFor(() =>
+      expect(api.setSettings).toHaveBeenCalledWith(
+        expect.objectContaining({ codexPayloadSourceKind: "github" }),
+      ),
+    );
+    expect(
+      screen.queryByRole("textbox", {
+        name: CATALOG["zh-CN"]["settings.codexPayload.relayUrl"],
+      }),
+    ).not.toBeInTheDocument();
+
+    await user.click(
+      within(sourceGroup).getByRole("radio", {
+        name: new RegExp(
+          `^${CATALOG["zh-CN"]["settings.codexPayload.source.relay"]}`,
+        ),
+      }),
+    );
+    expect(
+      screen.getByRole("textbox", {
+        name: CATALOG["zh-CN"]["settings.codexPayload.relayUrl"],
+      }),
+    ).toBeInTheDocument();
+  });
+
+  it("trims a Relay URL on blur", async () => {
+    const user = userEvent.setup();
+    api.getSettings.mockResolvedValue(settings({ codexPayloadSourceKind: "relay" }));
+    renderSettings();
+
+    await waitFor(() => expect(screen.queryByText("正在加载设置…")).not.toBeInTheDocument());
+    const relayUrl = screen.getByRole("textbox", {
+      name: CATALOG["zh-CN"]["settings.codexPayload.relayUrl"],
+    });
+    await user.clear(relayUrl);
+    await user.type(relayUrl, "  https://relay.example.test/v2/  ");
+    await user.tab();
+
+    await waitFor(() =>
+      expect(api.setSettings).toHaveBeenCalledWith(
+        expect.objectContaining({
+          codexPayloadSourceKind: "relay",
+          codexPayloadBaseUrl: "https://relay.example.test/v2/",
+        }),
+      ),
+    );
+  });
+
   it("states that periodic checks only run while the manager is open", async () => {
     api.getSettings.mockResolvedValue(settings());
     renderSettings();

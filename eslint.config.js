@@ -26,6 +26,7 @@ export default tseslint.config(
       "cloudflare/",
       "scripts/",
       "docs/",
+      ".workbuddy/",
       "*.config.*",
     ],
   },

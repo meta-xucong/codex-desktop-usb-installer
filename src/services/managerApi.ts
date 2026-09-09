@@ -12,6 +12,8 @@ import type {
   CommandError,
   CcswitchLaunchReport,
   CcswitchUninstallReport,
+  CapabilityPackInstallOptions,
+  CapabilityPackReport,
   CodexUpdatePlatform,
   ConfigHealth,
   ConfigWhich,
@@ -70,6 +72,27 @@ interface ManagerUpdateMetadata {
   body?: string;
 }
 
+/** Channel-identifying subset of the backend `UpdateInfo` (kebab tag). */
+export type CodexChannel = "manager" | "codex" | "ccswitch" | "skill-repo";
+
+export interface UpdateInfo {
+  channel: CodexChannel;
+  currentVersion: string;
+  latestVersion: string;
+  releaseNotes?: string | null;
+  sizeBytes?: number | null;
+  requiresRestart: boolean;
+  payload: unknown;
+}
+
+export type CodexPayloadCheck =
+  | { kind: "development" }
+  | { kind: "unavailable"; message: string }
+  | { kind: "none" }
+  | { kind: "available"; info: UpdateInfo };
+
+let lastCodexPayloadError: string | null = null;
+
 export interface FrontendErrorPayload {
   kind: string;
   message: string;
@@ -90,6 +113,14 @@ function normalizedProxyMode(value: unknown): AppSettings["proxyMode"] {
   return value === "direct" || value === "custom" || value === "system"
     ? value
     : "system";
+}
+
+function normalizedCodexPayloadSourceKind(
+  value: unknown,
+): AppSettings["codexPayloadSourceKind"] {
+  return value === "relay" || value === "github" || value === "auto"
+    ? value
+    : "auto";
 }
 
 function normalizedSkippedCodexUpdate(
@@ -124,6 +155,10 @@ function normalizeSettings(raw: Partial<AppSettings>): AppSettings {
     typeof raw.customUrl === "string" ? raw.customUrl.trim() : "";
   const customProxyUrl =
     typeof raw.customProxyUrl === "string" ? raw.customProxyUrl.trim() : "";
+  const codexPayloadBaseUrl =
+    typeof raw.codexPayloadBaseUrl === "string"
+      ? raw.codexPayloadBaseUrl.trim()
+      : "";
   // Empty custom modes are not a real runtime choice — fall back so UI, disk,
   // and update paths agree (mirror/auto for source, system proxy for network).
   let source = raw.source ?? DEFAULT_SETTINGS.source;
@@ -149,6 +184,11 @@ function normalizeSettings(raw: Partial<AppSettings>): AppSettings {
     signedOnly: true,
     proxyMode,
     customProxyUrl,
+    codexPayloadSourceKind: normalizedCodexPayloadSourceKind(
+      raw.codexPayloadSourceKind,
+    ),
+    codexPayloadBaseUrl:
+      codexPayloadBaseUrl || DEFAULT_SETTINGS.codexPayloadBaseUrl,
     disableCodexSelfUpdates:
       typeof raw.disableCodexSelfUpdates === "boolean"
         ? raw.disableCodexSelfUpdates
@@ -167,6 +207,10 @@ function normalizeSettings(raw: Partial<AppSettings>): AppSettings {
       raw.codexThemeStoreDir.trim()
         ? raw.codexThemeStoreDir
         : null,
+    codexPayloadRepo:
+      typeof raw.codexPayloadRepo === "string"
+        ? raw.codexPayloadRepo.trim()
+        : "",
   };
 }
 
@@ -1057,6 +1101,34 @@ export const managerApi = {
     }
     return managerUpdateAvailable(update);
   },
+  // Codex payload update channel (docs/UPDATE-CHANNELS.md § "Channel: codex").
+  // check is read-only; apply runs only on an explicit user click and
+  // re-validates everything server-side.
+  async checkCodexPayloadUpdate(): Promise<CodexPayloadCheck> {
+    if (!hasTauriRuntime()) {
+      return { kind: "development" };
+    }
+    const update = await invoke<UpdateInfo | null>("payload_check_codex").catch(
+      (cause: unknown) => {
+        lastCodexPayloadError = errorMessage(cause);
+        return undefined;
+      },
+    );
+    if (update === undefined) {
+      return { kind: "unavailable", message: lastCodexPayloadError ?? "" };
+    }
+    lastCodexPayloadError = null;
+    if (!update) {
+      return { kind: "none" };
+    }
+    return { kind: "available", info: update };
+  },
+  async applyCodexPayloadUpdate(info: UpdateInfo): Promise<void> {
+    if (!hasTauriRuntime()) {
+      return Promise.reject(new Error("payload update requires the desktop app"));
+    }
+    return invoke<void>("payload_apply_codex", { info });
+  },
   macStatus(): Promise<MacInstallStatus> {
     if (!hasTauriRuntime()) {
       return Promise.resolve({ installed: null, status: "none" });
@@ -1708,6 +1780,46 @@ export const managerApi = {
       });
     }
     return invoke<CcswitchLaunchReport>("install_and_launch_ccswitch");
+  },
+  /** Inspect the bundled offline Skills/MCP/Agents capability pack. */
+  capabilityPackStatus(): Promise<CapabilityPackReport> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({
+        available: false,
+        installed: false,
+        success: false,
+        sourcePath: null,
+        packVersion: null,
+        skills: 0,
+        agents: 0,
+        runtimeReady: false,
+        feishuEnabled: false,
+        enabledApiServices: [],
+        message: "browser preview: capability pack status is unavailable",
+      });
+    }
+    return invoke<CapabilityPackReport>("capability_pack_status");
+  },
+  /** Install or repair the complete offline capability pack. */
+  installCapabilityPack(
+    options: CapabilityPackInstallOptions,
+  ): Promise<CapabilityPackReport> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({
+        available: false,
+        installed: false,
+        success: false,
+        sourcePath: null,
+        packVersion: null,
+        skills: 0,
+        agents: 0,
+        runtimeReady: false,
+        feishuEnabled: false,
+        enabledApiServices: [],
+        message: "browser preview: capability pack installation is unavailable",
+      });
+    }
+    return invoke<CapabilityPackReport>("install_capability_pack", { options });
   },
   /** Read the local USB lease/watchdog snapshot (no mutation). */
   usbGuardStatus(): Promise<UsbGuardStatus> {

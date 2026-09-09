@@ -49,6 +49,7 @@ const RECOVERY: &[&str] = &[
     "usb-license.json.bak",
 ];
 const EXTRA: &[&str] = &["SHA256SUMS.txt", "usb-license.json", "usb-license.json.bak"];
+const CAPABILITY_PACK_PREFIX: &str = "content/codex-starter-kit/";
 const DIRS: &[&str] = &[
     "content/skills",
     "content/mcp",
@@ -60,6 +61,26 @@ const DIRS: &[&str] = &[
     "ccswitch",
     "payload",
 ];
+
+fn is_capability_pack_path(name: &str) -> bool {
+    if !name.starts_with(CAPABILITY_PACK_PREFIX) || name.contains('\\') {
+        return false;
+    }
+    let relative = &name[CAPABILITY_PACK_PREFIX.len()..];
+    !relative.split('/').any(|segment| {
+        segment.is_empty() || segment == "." || segment == ".." || segment.contains(':')
+    })
+}
+
+fn is_allowed_release_file(name: &str) -> bool {
+    FILES.contains(&name) || EXTRA.contains(&name) || is_capability_pack_path(name)
+}
+
+fn is_allowed_release_dir(name: &str) -> bool {
+    DIRS.contains(&name)
+        || name.eq_ignore_ascii_case("content/codex-starter-kit")
+        || name.starts_with(CAPABILITY_PACK_PREFIX)
+}
 
 fn metadata(path: &Path) -> Result<Option<fs::Metadata>, String> {
     match fs::symlink_metadata(path) {
@@ -319,7 +340,7 @@ fn parse_checksums(text: &str) -> Result<BTreeMap<String, String>, String> {
         let (hash, name) = line.split_once("  ").ok_or("无效 SHA256 清单行")?;
         if hash.len() != 64
             || !hash.bytes().all(|c| c.is_ascii_hexdigit())
-            || !FILES.contains(&name)
+            || !is_allowed_release_file(name)
         {
             return Err(format!("清单包含不允许删除的条目：{name}"));
         }
@@ -386,13 +407,13 @@ impl BundlePins {
                     self.dirs.insert(name, Pin::open(&path, true, false)?);
                     continue;
                 }
-                if !DIRS.contains(&name.as_str()) {
+                if !is_allowed_release_dir(&name) {
                     blockers.push(format!("保留非发行包目录：{name}"));
                     continue;
                 }
                 blockers.extend(self.inventory(&name, deletable, allowed_runtime_dir)?);
             } else {
-                if !FILES.contains(&name.as_str()) && !EXTRA.contains(&name.as_str()) {
+                if !is_allowed_release_file(&name) {
                     blockers.push(format!("保留非发行包文件：{name}"));
                     continue;
                 }
@@ -441,7 +462,7 @@ impl BundlePins {
         )
         .map_err(|e| e.to_string())?;
         if manifest["product"].as_str() != Some("codex-usb-oneclick")
-            || manifest["schemaVersion"].as_u64() != Some(1)
+            || manifest["schemaVersion"].as_u64() != Some(2)
         {
             return Err("不是本产品可清理的 U 盘发行包".into());
         }
@@ -457,7 +478,7 @@ impl BundlePins {
                 if &file.hash()? != expected {
                     return Err(format!("文件已被修改，保留：{name}"));
                 }
-            } else if !EXTRA.contains(&name.as_str()) {
+            } else if !EXTRA.contains(&name.as_str()) && !is_capability_pack_path(name) {
                 return Err(format!("保留清单外文件：{name}"));
             }
         }
@@ -643,8 +664,24 @@ fn cleanup_inner(
             notes.push(format!("已清理：{name}"));
         }
         // Finish all potentially nonempty directories BEFORE metadata commit.
-        for name in DIRS {
-            pins.remove_dir(name)?;
+        // The capability pack has a recursive source tree, so remove pinned
+        // directories deepest-first; static release roots remain covered by
+        // the same inventory and checksum gates.
+        let mut directories = pins
+            .dirs
+            .keys()
+            .filter(|name| !name.is_empty())
+            .cloned()
+            .collect::<Vec<_>>();
+        directories.sort_by(|left, right| {
+            right
+                .matches('/')
+                .count()
+                .cmp(&left.matches('/').count())
+                .then_with(|| right.len().cmp(&left.len()))
+        });
+        for name in directories {
+            pins.remove_dir(&name)?;
         }
         for entry in fs::read_dir(bundle).map_err(|e| e.to_string())? {
             let name = entry
@@ -697,7 +734,7 @@ mod tests {
             ("manifest.json", "{}"),
             (
                 "usb-manifest.json",
-                r#"{"schemaVersion":1,"product":"codex-usb-oneclick"}"#,
+                r#"{"schemaVersion":2,"product":"codex-usb-oneclick"}"#,
             ),
             ("payload/OpenAI.Codex_x64.msix", "package"),
         ] {
@@ -717,6 +754,7 @@ mod tests {
             volume_serial: 42,
             anchor_sha256: "ab".repeat(32),
             bundle_relative_path: "usb-oneclick-v0.5.24-final".into(),
+            anchor_schema: 1,
         }
     }
     fn write_license(root: &Path, expected: &UsbFingerprint, backup: bool) {
@@ -745,6 +783,7 @@ mod tests {
             "C:/Windows/file",
             "resources/../private",
             "ccswitch\\CodexSwitch.exe",
+            "content/codex-starter-kit/../private.txt",
             "notes.txt",
             "CodexAppManager.exe:secret",
         ] {
@@ -762,6 +801,25 @@ mod tests {
         cleanup_bundle(&root).unwrap();
         assert!(!root.exists());
     }
+
+    #[test]
+    fn bundled_capability_pack_tree_is_verified_and_removed() {
+        let root = fixture();
+        let pack_file = root.join("content/codex-starter-kit/agents/general.toml");
+        fs::create_dir_all(pack_file.parent().unwrap()).unwrap();
+        fs::write(&pack_file, "name = 'general'\n").unwrap();
+        let hash = Pin::open(&pack_file, false, false).unwrap().hash().unwrap();
+        let mut sums = fs::read_to_string(root.join("SHA256SUMS.txt")).unwrap();
+        sums.push_str(&format!(
+            "{hash}  content/codex-starter-kit/agents/general.toml\n"
+        ));
+        fs::write(root.join("SHA256SUMS.txt"), sums).unwrap();
+
+        preflight_bundle(&root).unwrap();
+        cleanup_bundle(&root).unwrap();
+        assert!(!root.exists());
+    }
+
     #[test]
     fn unknown_and_modified_files_are_found_before_mutation() {
         let root = fixture();

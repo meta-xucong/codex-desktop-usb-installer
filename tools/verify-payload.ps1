@@ -27,6 +27,34 @@ function Read-MsixManifest {
     finally { $archive.Dispose() }
 }
 
+function Normalize-BundleRelativePath([string]$RelativePath) {
+    $relative = ([string]$RelativePath).Trim().Replace('/', '\')
+    if ([string]::IsNullOrWhiteSpace($relative) -or [System.IO.Path]::IsPathRooted($relative)) {
+        throw "payload.path 必须是 bundle 内的相对路径"
+    }
+    foreach ($segment in $relative.Split('\')) {
+        if ([string]::IsNullOrWhiteSpace($segment) -or $segment -eq '.' -or $segment -eq '..' -or $segment.Contains(':')) {
+            throw "payload.path 必须是 bundle 内的相对路径"
+        }
+    }
+    return $relative.Replace('\', '/')
+}
+
+function Resolve-BundleRelativeFile([string]$RootPath, [string]$RelativePath) {
+    $relative = Normalize-BundleRelativePath $RelativePath
+    $candidate = Join-Path $RootPath ($relative.Replace('/', '\'))
+    if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+        throw "未找到 payload：$relative"
+    }
+    $resolved = (Resolve-Path -LiteralPath $candidate).Path
+    $rootFull = [System.IO.Path]::GetFullPath($RootPath).TrimEnd('\') + '\'
+    $resolvedFull = [System.IO.Path]::GetFullPath($resolved)
+    if (-not $resolvedFull.StartsWith($rootFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "payload 不在 bundle 根目录内"
+    }
+    return $resolved
+}
+
 $root = (Resolve-Path -LiteralPath $BundlePath).Path
 $manifestPath = Join-Path $root "manifest.json"
 if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { throw "未找到 $manifestPath" }
@@ -35,11 +63,14 @@ $manifest = [System.IO.File]::ReadAllText($manifestPath, $utf8) | ConvertFrom-Js
 if ($manifest.packageName -ne "OpenAI.Codex") { throw "manifest.packageName 必须为 OpenAI.Codex" }
 if ($manifest.architecture -notin @("x64", "arm64")) { throw "manifest.architecture 无效" }
 
-$relative = ([string]$manifest.payload.path).Replace('/', '\')
+$relative = Normalize-BundleRelativePath ([string]$manifest.payload.path)
+if ([System.IO.Path]::GetExtension($relative) -ine ".msix") {
+    throw "payload.path 必须指向 .msix 文件"
+}
 if ([System.IO.Path]::IsPathRooted($relative) -or $relative -match '(^|\\)\.\.($|\\)') {
     throw "payload.path 必须是 bundle 内的相对路径"
 }
-$payload = (Resolve-Path -LiteralPath (Join-Path $root $relative)).Path
+$payload = Resolve-BundleRelativeFile $root $relative
 $rootFull = [System.IO.Path]::GetFullPath($root).TrimEnd('\') + '\'
 $payloadFull = [System.IO.Path]::GetFullPath($payload)
 if (-not $payloadFull.StartsWith($rootFull, [System.StringComparison]::OrdinalIgnoreCase)) {

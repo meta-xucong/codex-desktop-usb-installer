@@ -23,6 +23,58 @@ function Read-JsonFile([string]$Path) {
     return [System.IO.File]::ReadAllText($Path, $utf8) | ConvertFrom-Json
 }
 
+function Normalize-BundleRelativePath([string]$RelativePath) {
+    $relative = ([string]$RelativePath).Trim().Replace('/', '\')
+    if ([string]::IsNullOrWhiteSpace($relative) -or [System.IO.Path]::IsPathRooted($relative)) {
+        throw "manifest 中的路径必须是 bundle 内的相对路径：$RelativePath"
+    }
+    foreach ($segment in $relative.Split('\')) {
+        if ([string]::IsNullOrWhiteSpace($segment) -or $segment -eq '.' -or $segment -eq '..' -or $segment.Contains(':')) {
+            throw "manifest 中的路径包含非法片段：$RelativePath"
+        }
+    }
+    return $relative.Replace('\', '/')
+}
+
+function Resolve-BundleRelativeFile([string]$RootPath, [string]$RelativePath) {
+    $relative = Normalize-BundleRelativePath $RelativePath
+    $candidate = Join-Path $RootPath ($relative.Replace('/', '\'))
+    Assert-Condition (Test-Path -LiteralPath $candidate -PathType Leaf) "manifest.payload.path 指向的文件不存在：$relative"
+    $resolved = (Resolve-Path -LiteralPath $candidate).Path
+    $rootFull = [System.IO.Path]::GetFullPath($RootPath).TrimEnd('\') + '\'
+    $resolvedFull = [System.IO.Path]::GetFullPath($resolved)
+    Assert-Condition $resolvedFull.StartsWith($rootFull, [System.StringComparison]::OrdinalIgnoreCase) "manifest.payload.path 不得逃逸 bundle 根目录"
+    return $resolved
+}
+
+function Get-RelativePathCompat([string]$BasePath, [string]$FilePath) {
+    $base = [System.IO.Path]::GetFullPath($BasePath).TrimEnd('\') + '\'
+    $full = [System.IO.Path]::GetFullPath($FilePath)
+    Assert-Condition $full.StartsWith($base, [System.StringComparison]::OrdinalIgnoreCase) "文件不在 bundle 根目录内：$FilePath"
+    return $full.Substring($base.Length)
+}
+
+function Assert-NoSuccessfulStateResidue([string]$RootPath) {
+    foreach ($entry in Get-ChildItem -LiteralPath $RootPath -Recurse -Force) {
+        $relative = (Get-RelativePathCompat $RootPath $entry.FullName).Replace('\', '/')
+        foreach ($segment in $relative.Split('/')) {
+            if ($segment -ieq '.staging' -or $segment -ieq 'staging' -or
+                $segment -ieq '.transaction' -or $segment -ieq 'transaction' -or
+                $segment -match '(?i)^transaction([.-]|$)' -or
+                $segment -match '(?i)\.(bak|part|tmp)$') {
+                throw "成功状态不得包含事务/临时残留：$relative"
+            }
+        }
+    }
+}
+
+function Assert-AuthenticodePe([string]$Path, [string]$Label) {
+    $signature = Get-AuthenticodeSignature -LiteralPath $Path
+    Assert-Condition ($signature.Status -eq "Valid") "$Label Authenticode 状态不是 Valid：$($signature.Status)"
+    Assert-Condition ($null -ne $signature.SignerCertificate -and
+        -not [string]::IsNullOrWhiteSpace([string]$signature.SignerCertificate.Subject)) "$Label 缺少有效签名主体"
+}
+
 $manifestPath = Join-Path $root "manifest.json"
 $usbManifestPath = Join-Path $root "usb-manifest.json"
 $sumsPath = Join-Path $root "SHA256SUMS.txt"
@@ -31,6 +83,18 @@ $launcherVerifierPath = Join-Path $root "verify-usb-launcher.ps1"
 $manifest = Read-JsonFile $manifestPath
 $usbManifest = Read-JsonFile $usbManifestPath
 
+Assert-Condition ($manifest.schemaVersion -isnot [string] -and [int64]$manifest.schemaVersion -eq 2) "根 manifest 必须声明 schemaVersion=2"
+$rootUpdateCapability = $manifest.updateCapability
+Assert-Condition ($null -ne $rootUpdateCapability -and $rootUpdateCapability.codexPayload -eq $true) "根 manifest 未声明 Codex payload update capability"
+Assert-Condition ($rootUpdateCapability.schemaVersion -isnot [string] -and [int64]$rootUpdateCapability.schemaVersion -eq 2) "根 manifest 的 update capability 必须声明 schemaVersion=2"
+Assert-Condition ($usbManifest.schemaVersion -isnot [string] -and [int64]$usbManifest.schemaVersion -eq 2) "联合清单必须声明 schemaVersion=2"
+$updateCapability = $usbManifest.updateCapability
+Assert-Condition ($null -ne $updateCapability -and $updateCapability.codexPayload -eq $true) "联合清单未声明 Codex payload update capability"
+Assert-Condition ($updateCapability.schemaVersion -isnot [string] -and [int64]$updateCapability.schemaVersion -eq 2) "update capability 必须声明 schemaVersion=2"
+Assert-Condition ($updateCapability.checksumFile -eq "SHA256SUMS.txt") "update capability 的 SHA256 清单路径不正确"
+Assert-Condition ($updateCapability.transactionDirectory -eq ".staging") "update capability 的事务目录不正确"
+Assert-Condition ($updateCapability.backupPolicy -eq "single-msix-listed-in-SHA256SUMS") "update capability 的 backup 策略不正确"
+Assert-Condition ($updateCapability.successState -eq "clean") "update capability 未声明成功状态清理策略"
 Assert-Condition ($usbManifest.product -eq "codex-usb-oneclick") "不是 Codex 一键安装包"
 Assert-Condition ($usbManifest.status -eq "oneclick") "联合清单状态不是 oneclick"
 Assert-Condition ($usbManifest.secretsIncluded -eq $false) "U 盘包不应包含 API Key"
@@ -48,9 +112,10 @@ Assert-Condition ($usbManifest.dataLayout.onUsb -eq $false) "可变 Codex 数据
 Assert-Condition ($usbManifest.dataLayout.observedBeforeInstall -eq $true) "安装前必须核验数据实际卷"
 Assert-Condition ($usbManifest.managedContent.skillsDirectory -eq "content/skills") "Skill U 盘目录声明不正确"
 Assert-Condition ($usbManifest.managedContent.mcpDirectory -eq "content/mcp") "MCP U 盘目录声明不正确"
+Assert-Condition ($usbManifest.managedContent.capabilityPackDirectory -eq "content/codex-starter-kit") "能力包 U 盘目录声明不正确"
 Assert-Condition ($usbManifest.managedContent.configLocation -eq "%USERPROFILE%/.codex/config.toml") "MCP/Codex 配置必须保存在本机"
 Assert-Condition ($usbManifest.managedContent.secretsIncluded -eq $false) "托管内容目录不得包含密钥"
-Assert-Condition ($usbManifest.managedContent.status -eq "layout-ready-import-later") "不得误报 Skill/MCP 已自动导入"
+Assert-Condition ($usbManifest.managedContent.status -eq "bundled-auto-installable") "能力包必须声明已随包提供并可自动安装"
 Assert-Condition ($usbManifest.startupElevation.mode -eq "usb-launcher-requireAdministrator") "USB 入口必须声明 requireAdministrator 启动提权模式"
 Assert-Condition ($usbManifest.startupElevation.mechanism -eq "embedded requireAdministrator manifest + standard Windows UAC consent") "USB 入口提权机制不是标准 Windows UAC"
 Assert-Condition ($usbManifest.startupElevation.marker -eq "--codex-usb-elevated") "USB 入口提权标记不正确"
@@ -78,7 +143,37 @@ Assert-Condition ($usbManifest.sourceMediaCleanup.deleteOrder -eq "payload-first
 Assert-Condition ($usbManifest.sourceMediaCleanup.unknownPolicy -eq "enumerate-and-preserve") "未知安装介质内容必须列名并保留"
 Assert-Condition ($usbManifest.sourceMediaCleanup.usesRecycleBin -eq $false) "可移动介质清理不得依赖回收站"
 Assert-Condition ($manifest.packageName -eq "OpenAI.Codex") "根 manifest 不是 Codex 离线安装清单"
-Assert-Condition ($manifest.payload.path -eq "payload/OpenAI.Codex_x64.msix") "根 manifest 的 MSIX 路径不正确"
+$architecture = [string]$manifest.architecture
+Assert-Condition ($architecture -in @("x64", "arm64")) "根 manifest 的 architecture 无效"
+$payloadRelative = Normalize-BundleRelativePath ([string]$manifest.payload.path)
+Assert-Condition ([System.IO.Path]::GetExtension($payloadRelative) -ieq ".msix") "根 manifest 的 payload.path 必须指向 .msix"
+$payload = Resolve-BundleRelativeFile $root $payloadRelative
+$payloadItem = Get-Item -LiteralPath $payload
+$payloadDirectoryRelative = $payloadRelative -replace '/[^/]+$', ''
+$backupDirectoryRelative = if ([string]::IsNullOrWhiteSpace($payloadDirectoryRelative)) {
+    "_backup"
+} else {
+    "$payloadDirectoryRelative/_backup"
+}
+Assert-Condition ($updateCapability.backupDirectory -eq $backupDirectoryRelative) "update capability 的 backup 目录与 payload.path 不一致"
+$backupRelative = $null
+$backupDirectory = Join-Path $root ($backupDirectoryRelative.Replace('/', '\'))
+if (Test-Path -LiteralPath $backupDirectory) {
+    $backupDirectoryItem = Get-Item -LiteralPath $backupDirectory
+    Assert-Condition ($backupDirectoryItem.PSIsContainer) "backup 路径必须是目录"
+    Assert-Condition (-not (($backupDirectoryItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)) "backup 目录不能是链接或联接点"
+    $backupEntries = @(Get-ChildItem -LiteralPath $backupDirectory -Force)
+    Assert-Condition ($backupEntries.Count -le 1) "成功状态最多保留一份 payload backup"
+    if ($backupEntries.Count -eq 1) {
+        $backupEntry = $backupEntries[0]
+        Assert-Condition (-not $backupEntry.PSIsContainer) "backup 目录只能包含一个文件"
+        $backupPattern = '^OpenAI\.Codex_' + [regex]::Escape($architecture) + '_[A-Za-z0-9][A-Za-z0-9._-]*\.msix$'
+        Assert-Condition ($backupEntry.Name -match $backupPattern) "payload backup 文件名或架构不正确"
+        Assert-Condition ([int64]$backupEntry.Length -gt 0) "payload backup 不能为空"
+        $backupRelative = (Get-RelativePathCompat $root $backupEntry.FullName).Replace('\', '/')
+    }
+}
+Assert-NoSuccessfulStateResidue $root
 
 $payloadArgs = @{ BundlePath = $root }
 if ($SkipSignature) { $payloadArgs.SkipSignature = $true }
@@ -95,6 +190,7 @@ $appsReadme = Join-Path $root "apps\README.txt"
 $contentReadme = Join-Path $root "content\README.txt"
 $skillsReadme = Join-Path $root "content\skills\README.txt"
 $mcpReadme = Join-Path $root "content\mcp\README.txt"
+$capabilityPack = Join-Path $root "content\codex-starter-kit"
 $expectedWebView2Hash = "1F4638309F3D82C31A3028C3CF7D75998F58E4D1407380F5CB8A8E9172CAF17D"
 $expectedVcRedistHash = "843068991DAAA1F73AD9F6239BCE4D0F6A07A51F18C37EA2A867E9BECA71295C"
 Assert-Condition (Test-Path -LiteralPath $installer -PathType Leaf) "缺少 CodexDesktopSetup.exe"
@@ -108,6 +204,12 @@ Assert-Condition (Test-Path -LiteralPath $appsReadme -PathType Leaf) "缺少 app
 Assert-Condition (Test-Path -LiteralPath $contentReadme -PathType Leaf) "缺少 content 托管内容目录契约"
 Assert-Condition (Test-Path -LiteralPath $skillsReadme -PathType Leaf) "缺少 content/skills 目录契约"
 Assert-Condition (Test-Path -LiteralPath $mcpReadme -PathType Leaf) "缺少 content/mcp 目录契约"
+Assert-Condition (Test-Path -LiteralPath $capabilityPack -PathType Container) "缺少完整能力包目录 content/codex-starter-kit"
+foreach ($packFile in @("pack.json", "dependencies.json", "file-manifest.json", "checksums.sha256", "install-all.ps1", "install-to-codex.ps1", "runtime\provision-runtime.ps1")) {
+    Assert-Condition (Test-Path -LiteralPath (Join-Path $capabilityPack $packFile) -PathType Leaf) "能力包缺少 $packFile"
+}
+$packJson = Get-Content -LiteralPath (Join-Path $capabilityPack "pack.json") -Raw | ConvertFrom-Json
+Assert-Condition ([int]$packJson.schemaVersion -eq 2 -and $packJson.id -eq "codex-starter") "能力包 pack.json 身份或 schema 不正确"
 Assert-Condition (-not (Test-Path -LiteralPath (Join-Path $root "WindowsApps"))) "发行包不得预建 WindowsApps"
 Assert-Condition (-not (Test-Path -LiteralPath (Join-Path $root "WpSystem"))) "发行包不得预建 WpSystem"
 $actualWebView2Hash = (Get-FileHash -LiteralPath $webView2 -Algorithm SHA256).Hash
@@ -144,7 +246,8 @@ $embeddedCcswitchHash = (Get-FileHash -LiteralPath $embeddedCcswitch -Algorithm 
 Assert-Condition ($usbManifest.codexInstaller.file -eq "CodexDesktopSetup.exe") "联合清单的入口文件名不正确"
 Assert-Condition ($usbManifest.codexInstaller.sha256 -ieq $installerHash) "联合清单中的入口哈希与实际文件不一致"
 Assert-Condition ([int64]$usbManifest.codexInstaller.size -eq $installerItem.Length) "联合清单中的入口大小与实际文件不一致"
-Assert-Condition ($usbManifest.codexInstaller.payload -eq "payload/OpenAI.Codex_x64.msix") "联合清单的 MSIX 路径不正确"
+Assert-Condition ($usbManifest.codexInstaller.architecture -eq $architecture) "联合清单中的 MSIX 架构不正确"
+Assert-Condition ($usbManifest.codexInstaller.payload -eq $payloadRelative) "联合清单的 MSIX 路径不正确"
 Assert-Condition ($usbManifest.codexInstaller.payloadSha256 -ieq $payloadReport.sha256) "联合清单中的 MSIX 哈希与实际文件不一致"
 Assert-Condition ([int64]$usbManifest.codexInstaller.payloadSize -eq [int64]$payloadReport.size) "联合清单中的 MSIX 大小与实际文件不一致"
 Assert-Condition ($usbManifest.manager.file -eq "CodexAppManager.exe") "联合清单中的管理器本体路径不正确"
@@ -157,6 +260,8 @@ Assert-Condition ([int64]$usbManifest.ccswitch.size -eq $ccswitchItem.Length) "�
 Assert-Condition ($usbManifest.ccswitch.embeddedExecutable -eq "resources/ccswitch/CodexSwitch.exe") "联合清单的嵌入 CCSwitch 路径不正确"
 Assert-Condition ($embeddedCcswitchHash -ieq $ccswitchHash) "根目录与资源中的 CCSwitch 载荷不一致"
 if (-not $SkipSignature) {
+    Assert-AuthenticodePe $installer "CodexDesktopSetup.exe"
+    Assert-AuthenticodePe $manager "CodexAppManager.exe"
     $webView2Signature = Get-AuthenticodeSignature -LiteralPath $webView2
     Assert-Condition ($webView2Signature.Status -eq "Valid") "WebView2 安装包 Authenticode 签名无效"
     Assert-Condition ($webView2Signature.SignerCertificate.Subject -match "Microsoft Corporation") "WebView2 安装包签名者不是 Microsoft Corporation"
@@ -172,8 +277,11 @@ foreach ($line in Get-Content -LiteralPath $sumsPath) {
     if ([string]::IsNullOrWhiteSpace($line)) { continue }
     $parts = $line -split '\s+', 2
     Assert-Condition ($parts.Count -eq 2) "SHA256SUMS.txt 格式错误：$line"
+    $expected = $parts[0].Trim()
+    Assert-Condition ($expected -match '^[0-9A-Fa-f]{64}$') "SHA256SUMS.txt 哈希格式错误：$line"
     $relative = $parts[1].Trim()
-    $relative = $relative.Replace('\', '/')
+    $relative = Normalize-BundleRelativePath $relative
+    Assert-Condition ($relative -ine "SHA256SUMS.txt") "SHA256SUMS.txt 不得列出自身"
     if (-not $listed.Add($relative)) {
         $failed += "$relative（SHA256SUMS.txt 重复清单项）"
         continue
@@ -184,20 +292,21 @@ foreach ($line in Get-Content -LiteralPath $sumsPath) {
         continue
     }
     $actual = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($actual -ne $parts[0].ToLowerInvariant()) {
+    if ($actual -ne $expected.ToLowerInvariant()) {
         $failed += "$relative（哈希不匹配）"
     }
 }
+if ($null -ne $backupRelative) {
+    Assert-Condition ($listed.Contains($backupRelative)) "允许保留的 payload backup 必须列入 SHA256SUMS.txt：$backupRelative"
+}
 # A stale file left by an interrupted/repeated build must not be silently
 # accepted: it could contain an older payload that the manifest never covers.
-$rootFull = [System.IO.Path]::GetFullPath($root).TrimEnd('\') + '\'
-foreach ($fileItem in Get-ChildItem -LiteralPath $root -File -Recurse | Where-Object { $_.Name -ne "SHA256SUMS.txt" }) {
-    $fileFull = [System.IO.Path]::GetFullPath($fileItem.FullName)
-    if (-not $fileFull.StartsWith($rootFull, [System.StringComparison]::OrdinalIgnoreCase)) {
-        $failed += "$($fileItem.FullName)（文件不在包根目录内）"
-        continue
-    }
-    $relative = $fileFull.Substring($rootFull.Length).Replace('\', '/')
+foreach ($fileItem in Get-ChildItem -LiteralPath $root -File -Recurse -Force) {
+    if ($fileItem.Name -ieq "SHA256SUMS.txt") { continue }
+    $relative = (Get-RelativePathCompat $root $fileItem.FullName).Replace('\', '/')
+    # The manager-created license is mutable runtime identity metadata and is
+    # deliberately outside the immutable release checksum set.
+    if ($relative -ieq "usb-license.json") { continue }
     if (-not $listed.Contains($relative)) {
         $failed += "$relative（未列入 SHA256SUMS.txt）"
     }

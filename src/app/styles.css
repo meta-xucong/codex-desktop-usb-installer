@@ -1881,6 +1881,142 @@ button.themecard-art:focus-visible {
   background: var(--surface-2);
   box-shadow: var(--elev-1);
 }
+.component-entry {
+  align-self: center;
+  gap: 5px;
+  color: var(--text-faint);
+  font-size: var(--fs-label);
+  padding: 5px 8px;
+}
+.component-entry svg {
+  width: 13px;
+  height: 13px;
+}
+.component-entry:hover:not(:disabled) {
+  color: var(--text-soft);
+}
+.component-sheet {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-height: min(78vh, 700px);
+  overflow-y: auto;
+  padding-right: 2px;
+}
+.component-sheet-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.component-sheet-heading svg {
+  width: 20px;
+  height: 20px;
+  color: var(--accent);
+}
+.component-sheet-heading h3 {
+  margin: 0;
+}
+.component-sheet > p {
+  margin: 0;
+}
+.component-note {
+  color: var(--text-faint);
+  font-size: var(--fs-label);
+  line-height: 1.45;
+}
+.component-service-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.component-service {
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: color-mix(in oklch, var(--surface-2) 55%, transparent);
+  padding: 10px 12px;
+}
+.component-service-toggle {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  cursor: pointer;
+}
+.component-service-toggle-label {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  cursor: pointer;
+}
+.component-service-toggle input {
+  margin-top: 3px;
+  accent-color: var(--accent);
+}
+.component-service-toggle-label > span:first-child {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.component-service-toggle small,
+.component-separate-action small {
+  color: var(--text-faint);
+  line-height: 1.4;
+}
+.component-fields {
+  display: grid;
+  gap: 8px;
+  margin: 10px 0 2px 25px;
+}
+.component-field {
+  display: grid;
+  gap: 4px;
+  color: var(--text-soft);
+  font-size: var(--fs-label);
+}
+.component-field .input {
+  min-width: 0;
+  width: 100%;
+}
+.component-result,
+.component-error {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  padding: 9px 11px;
+  font-size: var(--fs-sm);
+  line-height: 1.4;
+}
+.component-result.success {
+  border-color: color-mix(in oklch, var(--success) 45%, var(--line));
+  background: color-mix(in oklch, var(--success) 8%, transparent);
+}
+.component-result small {
+  color: var(--text-faint);
+}
+.component-error {
+  color: var(--danger);
+  border-color: color-mix(in oklch, var(--danger) 35%, var(--line));
+  background: var(--danger-tint);
+}
+.component-separate-action {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+}
+.component-separate-action > div {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.component-separate-action .btn {
+  flex: 0 0 auto;
+}
 .linkbtn {
   appearance: none;
   border: 0;
@@ -4257,4 +4393,296 @@ button.row.danger:hover {
 }
 [data-platform="windows"] .microcue {
   font-weight: 450;
+}
+
+/* ── Apple-style visual pass ────────────────────────────────────────────────
+   Keep the existing layout contracts intact while replacing the high-contrast
+   material language with a quieter system-surface treatment: solid window
+   backgrounds, translucent panels, restrained slate accents, and one soft
+   blur layer. This is intentionally appended so older view-specific rules
+   continue to work without a broad layout rewrite. */
+:root {
+  --glass-blur: 24px;
+  --r-xl: 20px;
+  --r-lg: 15px;
+  --r-md: 12px;
+  --r-sm: 9px;
+}
+
+:root,
+[data-theme="dark"] {
+  --bg: #1c1c1e;
+  --surface: rgba(44, 44, 46, 0.78);
+  --surface-top: rgba(52, 52, 54, 0.82);
+  --surface-2: rgba(58, 58, 60, 0.68);
+  --surface-2-top: rgba(64, 64, 66, 0.74);
+  --surface-3: rgba(72, 72, 74, 0.82);
+  --surface-3-top: rgba(78, 78, 80, 0.86);
+  --line: rgba(255, 255, 255, 0.1);
+  --line-2: rgba(255, 255, 255, 0.17);
+  --text: #f5f5f7;
+  --text-soft: #b8b8c0;
+  --text-faint: #85858d;
+  --accent: oklch(0.71 0.08 258);
+  --accent-2: oklch(0.65 0.09 258);
+  --accent-deep: oklch(0.8 0.06 258);
+  --accent-ink: #ffffff;
+  --success: oklch(0.75 0.08 156);
+  --success-2: oklch(0.68 0.08 156);
+  --success-deep: oklch(0.82 0.06 156);
+  --amber: oklch(0.78 0.08 82);
+  --amber-deep: oklch(0.84 0.06 82);
+  --danger: oklch(0.7 0.1 25);
+  --danger-2: oklch(0.63 0.1 25);
+  --danger-deep: oklch(0.8 0.07 25);
+  --shadow-1: rgba(0, 0, 0, 0.28);
+  --shadow-2: rgba(0, 0, 0, 0.22);
+  --shadow-3: rgba(0, 0, 0, 0.38);
+  --hl-top: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  --hl-top-strong: inset 0 1px 0 rgba(255, 255, 255, 0.13);
+  --elev-1: 0 1px 2px var(--shadow-1);
+  --elev-2: 0 1px 2px var(--shadow-1), 0 12px 28px -14px var(--shadow-2);
+  --elev-3: 0 2px 8px var(--shadow-1), 0 28px 64px -24px var(--shadow-3);
+  --ambient: none;
+  --grain-opacity: 0;
+}
+
+[data-theme="light"] {
+  --bg: #f5f5f7;
+  --surface: rgba(255, 255, 255, 0.72);
+  --surface-top: rgba(255, 255, 255, 0.84);
+  --surface-2: rgba(255, 255, 255, 0.58);
+  --surface-2-top: rgba(255, 255, 255, 0.72);
+  --surface-3: rgba(255, 255, 255, 0.9);
+  --surface-3-top: rgba(255, 255, 255, 0.98);
+  --line: rgba(60, 60, 67, 0.14);
+  --line-2: rgba(60, 60, 67, 0.22);
+  --text: #1d1d1f;
+  --text-soft: #626269;
+  --text-faint: #8a8a91;
+  --accent: oklch(0.56 0.08 258);
+  --accent-2: oklch(0.51 0.09 258);
+  --accent-deep: oklch(0.48 0.08 258);
+  --accent-ink: #ffffff;
+  --success: oklch(0.61 0.08 156);
+  --success-2: oklch(0.55 0.08 156);
+  --success-deep: oklch(0.47 0.07 156);
+  --amber: oklch(0.67 0.08 82);
+  --amber-deep: oklch(0.53 0.07 82);
+  --danger: oklch(0.59 0.1 25);
+  --danger-2: oklch(0.53 0.1 25);
+  --danger-deep: oklch(0.5 0.08 25);
+  --shadow-1: rgba(30, 30, 35, 0.1);
+  --shadow-2: rgba(30, 30, 35, 0.08);
+  --shadow-3: rgba(30, 30, 35, 0.16);
+  --hl-top: inset 0 1px 0 rgba(255, 255, 255, 0.92);
+  --hl-top-strong: inset 0 1px 0 rgba(255, 255, 255, 1);
+  --elev-1: 0 1px 2px var(--shadow-1);
+  --elev-2: 0 1px 2px var(--shadow-1), 0 12px 28px -14px var(--shadow-2);
+  --elev-3: 0 2px 8px var(--shadow-1), 0 28px 64px -24px var(--shadow-3);
+  --ambient: none;
+  --grain-opacity: 0;
+}
+
+/* Solid base + translucent cards. No grain or decorative gradient remains in
+   the normal installer path. */
+.pop {
+  background-color: var(--bg);
+  background-image: none;
+  border-color: var(--line-2);
+  box-shadow: 0 8px 24px var(--shadow-2), 0 1px 3px var(--shadow-1);
+  backdrop-filter: blur(var(--glass-blur)) saturate(1.06);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(1.06);
+}
+.pop::before {
+  display: none;
+}
+:is(.list, .themecard, .skinrow, .select-bar, .usb-guard-status, .component-service,
+  .sheet-frame, .sheet-path) {
+  background-image: none;
+  background-color: var(--surface);
+  backdrop-filter: blur(var(--glass-blur)) saturate(1.06);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(1.06);
+}
+.list,
+.themecard,
+.skinrow,
+.select-bar,
+.usb-guard-status,
+.component-service {
+  border-color: var(--line);
+  box-shadow: var(--elev-1);
+}
+
+.ring,
+.ring.muted {
+  background: var(--surface);
+  box-shadow: var(--hl-top), 0 8px 24px -16px var(--shadow-2);
+}
+.ring {
+  border-color: var(--line-2);
+}
+
+.btn {
+  background: var(--surface-2);
+  background-image: none;
+  border-color: var(--line-2);
+  box-shadow: var(--elev-1);
+  backdrop-filter: blur(18px) saturate(1.04);
+  -webkit-backdrop-filter: blur(18px) saturate(1.04);
+}
+.btn:hover:not(:disabled) {
+  background: var(--surface-3);
+  background-image: none;
+  box-shadow: var(--elev-2);
+}
+.btn.primary,
+.btn.primary:hover:not(:disabled) {
+  background: var(--accent);
+  background-image: none;
+  border-color: transparent;
+  box-shadow: 0 6px 18px -10px color-mix(in oklch, var(--accent) 55%, transparent);
+}
+.btn.danger,
+.btn.danger:hover:not(:disabled) {
+  background: var(--danger);
+  background-image: none;
+  border-color: transparent;
+  box-shadow: 0 6px 18px -10px color-mix(in oklch, var(--danger) 55%, transparent);
+}
+.btn.ghost {
+  background: transparent;
+  box-shadow: none;
+}
+.btn.ghost:hover:not(:disabled) {
+  background: var(--surface-2);
+  box-shadow: var(--elev-1);
+}
+
+.sheet-frame {
+  border-color: var(--line-2);
+  box-shadow: var(--elev-3);
+}
+.sheet-frame::after {
+  background: var(--surface);
+}
+
+/* ── Hover help ──────────────────────────────────────────────────────────── */
+.sr-only {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  padding: 0 !important;
+  margin: -1px !important;
+  overflow: hidden !important;
+  clip: rect(0, 0, 0, 0) !important;
+  white-space: nowrap !important;
+  border: 0 !important;
+}
+.tooltip-anchor {
+  position: relative;
+  z-index: 2;
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  color: var(--text-faint);
+  cursor: help;
+  outline: none;
+}
+.tooltip-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  color: var(--text-faint);
+  transition: color 0.16s var(--ease), transform 0.16s var(--ease);
+}
+.tooltip-icon svg {
+  width: 15px;
+  height: 15px;
+}
+.tooltip-anchor:hover .tooltip-icon,
+.tooltip-anchor:focus-visible .tooltip-icon {
+  color: var(--accent-deep);
+  transform: scale(1.06);
+}
+.tooltip-popover {
+  position: absolute;
+  z-index: 90;
+  width: max-content;
+  max-width: min(320px, calc(100vw - 32px));
+  padding: 9px 11px;
+  border: 1px solid var(--line-2);
+  border-radius: 11px;
+  background: color-mix(in srgb, var(--surface) 92%, var(--bg));
+  color: var(--text-soft);
+  box-shadow: var(--elev-3);
+  backdrop-filter: blur(22px) saturate(1.08);
+  -webkit-backdrop-filter: blur(22px) saturate(1.08);
+  font-size: var(--fs-label);
+  font-weight: 450;
+  line-height: 1.45;
+  text-align: start;
+  white-space: pre-wrap;
+  pointer-events: none;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.14s var(--ease), transform 0.14s var(--ease), visibility 0.14s;
+}
+.tooltip-top .tooltip-popover {
+  left: 50%;
+  bottom: calc(100% + 8px);
+  transform: translate(-50%, 4px);
+}
+.tooltip-bottom .tooltip-popover {
+  left: 50%;
+  top: calc(100% + 8px);
+  transform: translate(-50%, -4px);
+}
+.tooltip-anchor:hover .tooltip-popover,
+.tooltip-anchor:focus-visible .tooltip-popover {
+  opacity: 1;
+  visibility: visible;
+}
+.tooltip-top:hover .tooltip-popover,
+.tooltip-top:focus-visible .tooltip-popover {
+  transform: translate(-50%, 0);
+}
+.tooltip-bottom:hover .tooltip-popover,
+.tooltip-bottom:focus-visible .tooltip-popover {
+  transform: translate(-50%, 0);
+}
+.hero-info {
+  margin-top: 8px;
+}
+.action-info {
+  align-self: center;
+  margin-inline-start: -2px;
+}
+.component-service-toggle-label {
+  align-items: center;
+  gap: 6px;
+}
+.component-service-toggle-label > .tooltip-anchor,
+.component-separate-action > div > .tooltip-anchor {
+  flex: 0 0 auto;
+  flex-direction: row;
+}
+.component-separate-action > div {
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+}
+.usb-guard-status-head {
+  align-items: center;
+}
+.usb-guard-status-head > .tooltip-anchor {
+  margin-inline-start: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tooltip-popover {
+    transition: none;
+  }
 }

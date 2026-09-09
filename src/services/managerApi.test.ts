@@ -1,11 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { DEFAULT_SETTINGS } from "../shared/types";
+import { DEFAULT_SETTINGS, type AppSettings } from "../shared/types";
 import {
   isNetworkError,
   managerApi,
   SETTINGS_CHANGED_EVENT,
+  type UpdateInfo,
 } from "./managerApi";
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -13,6 +14,19 @@ vi.mock("@tauri-apps/api/core", () => ({
 }));
 
 const invokeMock = vi.mocked(invoke);
+
+const CODEX_PAYLOAD_INFO: UpdateInfo = {
+  channel: "codex",
+  currentVersion: "26.825.51511",
+  latestVersion: "26.826.51511",
+  releaseNotes: null,
+  sizeBytes: 1234,
+  requiresRestart: false,
+  payload: {
+    repo: "owner/repo",
+    releaseId: 42,
+  },
+};
 
 beforeEach(() => {
   invokeMock.mockReset();
@@ -77,6 +91,11 @@ describe("settings API", () => {
     expect(settings.periodicCheck).toBe(false);
     expect(settings.periodicCheckIntervalSeconds).toBe(15 * 60);
     expect(settings.disableCodexSelfUpdates).toBe(false);
+    expect(settings.codexPayloadSourceKind).toBe("auto");
+    expect(settings.codexPayloadBaseUrl).toBe(
+      "https://update.404token.xyz/__codex_update__/",
+    );
+    expect(settings.codexPayloadRepo).toBe("");
   });
 
   it("normalizes and broadcasts browser settings writes", async () => {
@@ -123,6 +142,60 @@ describe("settings API", () => {
     expect(saved.customUrl).toBe("");
     expect(saved.proxyMode).toBe("system");
     expect(saved.customProxyUrl).toBe("");
+  });
+
+  it("trims the dedicated Codex payload repo and preserves blank as the default sentinel", async () => {
+    vi.stubGlobal("window", {
+      open: vi.fn(),
+      __TAURI_INTERNALS__: undefined,
+      dispatchEvent: vi.fn(),
+    });
+
+    const saved = await managerApi.setSettings({
+      ...DEFAULT_SETTINGS,
+      source: "custom",
+      customUrl: "https://mirror.example.test/appcast.xml",
+      codexPayloadRepo: "  owner/repo  ",
+    });
+
+    expect(saved.codexPayloadRepo).toBe("owner/repo");
+    expect(saved.source).toBe("custom");
+    expect(saved.customUrl).toBe("https://mirror.example.test/appcast.xml");
+
+    const reset = await managerApi.setSettings({
+      ...saved,
+      codexPayloadRepo: "   ",
+    });
+
+    expect(reset.codexPayloadRepo).toBe("");
+    expect(reset.source).toBe("custom");
+    expect(reset.customUrl).toBe("https://mirror.example.test/appcast.xml");
+  });
+
+  it("normalizes the Codex payload source kind and Relay URL", async () => {
+    vi.stubGlobal("window", {
+      open: vi.fn(),
+      __TAURI_INTERNALS__: undefined,
+      dispatchEvent: vi.fn(),
+    });
+
+    const relay = await managerApi.setSettings({
+      ...DEFAULT_SETTINGS,
+      codexPayloadSourceKind: "relay",
+      codexPayloadBaseUrl: "  https://relay.example.test/codex/  ",
+    });
+    expect(relay.codexPayloadSourceKind).toBe("relay");
+    expect(relay.codexPayloadBaseUrl).toBe("https://relay.example.test/codex/");
+
+    const fallback = await managerApi.setSettings({
+      ...DEFAULT_SETTINGS,
+      codexPayloadSourceKind: "invalid" as AppSettings["codexPayloadSourceKind"],
+      codexPayloadBaseUrl: "   ",
+    });
+    expect(fallback.codexPayloadSourceKind).toBe("auto");
+    expect(fallback.codexPayloadBaseUrl).toBe(
+      DEFAULT_SETTINGS.codexPayloadBaseUrl,
+    );
   });
 });
 
@@ -316,6 +389,26 @@ describe("Windows perform API", () => {
       expected: { currentPath: null, currentVersion: null, currentSource: null },
       forceMsix: true,
       installToUsb: true,
+    });
+  });
+});
+
+describe("Codex payload API", () => {
+  it("does not invoke the destructive command outside the Tauri runtime", async () => {
+    await expect(managerApi.applyCodexPayloadUpdate(CODEX_PAYLOAD_INFO)).rejects.toThrow(
+      "payload update requires the desktop app",
+    );
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps the payload command and UpdateInfo round trip inside Tauri", async () => {
+    window.__TAURI_INTERNALS__ = {};
+    invokeMock.mockResolvedValue(undefined);
+
+    await managerApi.applyCodexPayloadUpdate(CODEX_PAYLOAD_INFO);
+
+    expect(invokeMock).toHaveBeenCalledWith("payload_apply_codex", {
+      info: CODEX_PAYLOAD_INFO,
     });
   });
 });

@@ -20,6 +20,33 @@ import { useWindowModeOptional } from "./windowMode";
 
 const FRONTEND_READY_EVENT = "cam:frontend-readiness";
 
+/**
+ * Compact, keyboard-reachable help that keeps the primary UI focused on the
+ * action. It deliberately lives in the renderer so the same affordance works
+ * in the compact installer and the expanded workbench.
+ */
+export function Tooltip({
+  content,
+  children,
+  side = "top",
+}: {
+  content: ReactNode;
+  children: ReactNode;
+  side?: "top" | "bottom";
+}) {
+  const id = useId();
+  return (
+    <span
+      className={`tooltip-anchor tooltip-${side}`}
+    >
+      {children}
+      <span id={id} className="tooltip-popover" role="tooltip">
+        {content}
+      </span>
+    </span>
+  );
+}
+
 type FrontendReadiness = { generation: number; token: string };
 
 function frontendReadiness(): FrontendReadiness | null {

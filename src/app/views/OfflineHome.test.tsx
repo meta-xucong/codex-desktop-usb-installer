@@ -21,6 +21,8 @@ vi.mock("../../services/managerApi", async (importOriginal) => {
       winInstallHistoricalRelease: vi.fn(),
       winLaunch: vi.fn(),
       installAndLaunchCcswitch: vi.fn(),
+      capabilityPackStatus: vi.fn(),
+      installCapabilityPack: vi.fn(),
       usbGuardStatus: vi.fn(),
       openLogsDir: vi.fn(),
     },
@@ -123,6 +125,32 @@ describe("OfflineHome", () => {
       copiedFiles: 5,
       message: "launched",
     });
+    api.capabilityPackStatus.mockResolvedValue({
+      available: true,
+      installed: false,
+      success: false,
+      sourcePath: "F:\\content\\codex-starter-kit",
+      packVersion: "1.2.0",
+      skills: 0,
+      agents: 0,
+      runtimeReady: false,
+      feishuEnabled: false,
+      enabledApiServices: [],
+      message: "ready",
+    });
+    api.installCapabilityPack.mockResolvedValue({
+      available: true,
+      installed: true,
+      success: true,
+      sourcePath: "F:\\content\\codex-starter-kit",
+      packVersion: "1.2.0",
+      skills: 50,
+      agents: 7,
+      runtimeReady: true,
+      feishuEnabled: false,
+      enabledApiServices: [],
+      message: "installed",
+    });
     api.openLogsDir.mockResolvedValue();
     api.usbGuardStatus.mockResolvedValue(USB_GUARD);
   });
@@ -170,8 +198,37 @@ describe("OfflineHome", () => {
     expect(api.winInstallHistoricalRelease.mock.calls[0]?.[5]).toBe(true);
     expect(api.winInstallHistoricalRelease.mock.calls[0]?.[6]).toBe(true);
     expect(api.offlinePayloadCleanup).toHaveBeenCalledWith(STAGE.stagedPath);
+    expect(api.installCapabilityPack).toHaveBeenCalledTimes(1);
+    expect(api.installCapabilityPack.mock.calls[0]?.[0]).toMatchObject({
+      enableFeishu: false,
+      enabledApiServices: [],
+    });
     expect(api.installAndLaunchCcswitch).toHaveBeenCalledTimes(1);
     await waitFor(() => expect(screen.getByText(/Codex Switch 已从 U 盘启动/)).toBeInTheDocument());
+  });
+
+  it("keeps a quiet entry for capability repair and an independent CCSwitch retry", async () => {
+    const user = userEvent.setup();
+    renderView();
+    const entry = await screen.findByRole("button", { name: "组件修复" });
+    await user.click(entry);
+    expect(await screen.findByRole("heading", { name: "组件安装与修复" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "单独重试 CCSwitch" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "安装 / 修复能力包" })).toBeInTheDocument();
+  });
+
+  it("shows the structured CCSwitch command error instead of [object Object]", async () => {
+    const user = userEvent.setup();
+    api.installAndLaunchCcswitch.mockRejectedValueOnce({
+      code: "permission",
+      message: "USB 看门狗：未检测到有效 U 盘租约",
+    });
+    renderView();
+    await user.click(await screen.findByRole("button", { name: "组件修复" }));
+    await user.click(screen.getByRole("button", { name: "单独重试 CCSwitch" }));
+
+    expect(await screen.findByText("USB 看门狗：未检测到有效 U 盘租约")).toBeInTheDocument();
+    expect(screen.queryByText("[object Object]")).not.toBeInTheDocument();
   });
 
   it("offers a manual CCSwitch retry after Codex is already installed", async () => {

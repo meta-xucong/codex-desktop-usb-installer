@@ -223,6 +223,49 @@ export interface CcswitchLaunchReport {
   message: string;
 }
 
+/** Options for the offline capability-pack installer. Secrets are never
+ * serialized to the USB bundle; the native command uses them only for the
+ * current install and writes configured values to the current user's private
+ * environment after a successful run. */
+export interface CapabilityPackInstallOptions {
+  enableFeishu: boolean;
+  persistConnections: boolean;
+  feishuAppId: string;
+  feishuAppSecret: string;
+  feishuUserAccessToken: string;
+  feishuDomain: string;
+  feishuAuthMode: string;
+  enabledApiServices: string[];
+  dashscopeApiKey: string;
+  dashscopeBaseUrl: string;
+  dashscopeModel: string;
+  image2ApiKey: string;
+  image2BaseUrl: string;
+  image2Model: string;
+  image2AgentId: string;
+  seedanceApiKey: string;
+  seedanceBaseUrl: string;
+  seedanceModel: string;
+  seedanceAgentId: string;
+  seedancePrechargePoints: string;
+  seedanceOfficialLinkTtlHours: string;
+  seedanceRefundRule: string;
+}
+
+export interface CapabilityPackReport {
+  available: boolean;
+  installed: boolean;
+  success: boolean;
+  sourcePath: string | null;
+  packVersion: string | null;
+  skills: number;
+  agents: number;
+  runtimeReady: boolean;
+  feishuEnabled: boolean;
+  enabledApiServices: string[];
+  message: string;
+}
+
 /** Result of removing the per-user CCSwitch copy installed by the manager. */
 export interface CcswitchUninstallReport {
   success: boolean;
@@ -350,6 +393,7 @@ export interface MacInstallStatus {
 }
 
 export type UpdateSourceKind = "auto" | "mirror" | "official" | "custom";
+export type CodexPayloadSourceKind = "auto" | "relay" | "github";
 export type WindowsInstallMode = "msix" | "portable";
 export type ProxyMode = "system" | "direct" | "custom";
 export type CodexUpdatePlatform = "macos" | "windows";
@@ -407,6 +451,15 @@ export interface AppSettings {
   codexThemeStoreDir: string | null;
   /** User-defined local skin groups, in display order. */
   skinGroups: SkinGroup[];
+  /** Source strategy for the Codex payload channel. */
+  codexPayloadSourceKind: CodexPayloadSourceKind;
+  /** Base URL used by the Codex payload Relay source. */
+  codexPayloadBaseUrl: string;
+  /**
+   * GitHub repository ("owner/repo") hosting the codex payload releases used
+   * by the codex update channel. Empty string = channel's baked-in default.
+   */
+  codexPayloadRepo: string;
 }
 
 export interface ConfigHealth {
@@ -456,6 +509,9 @@ export const DEFAULT_SETTINGS: AppSettings = {
   codexThemeDir: null,
   codexThemeStoreDir: null,
   skinGroups: [],
+  codexPayloadSourceKind: "auto",
+  codexPayloadBaseUrl: "https://update.404token.xyz/__codex_update__/",
+  codexPayloadRepo: "",
 };
 
 export interface MacUninstallReport {

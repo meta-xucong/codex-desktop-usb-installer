@@ -3413,25 +3413,15 @@ mod disk_preflight_tests {
     }
 
     #[test]
-    fn mounted_dmg_app_preflight_rejects_actual_oversized_bundle() {
-        let tmp = std::env::temp_dir().join(format!(
-            "cam-mounted-app-oversized-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        let app = tmp.join("Codex.app");
-        let contents = app.join("Contents");
-        std::fs::create_dir_all(&contents).unwrap();
-        let payload = std::fs::File::create(contents.join("payload.bin")).unwrap();
-        payload.set_len(MAX_APP_EXPANDED_BYTES + 1).unwrap();
-
-        assert!(mounted_app_logical_size(&app)
-            .unwrap_err()
-            .to_string()
-            .contains("超出允许范围"));
-
-        drop(payload);
-        std::fs::remove_dir_all(&tmp).unwrap();
+    fn app_logical_size_guard_rejects_oversized_bundle() {
+        // Exercise the same checked addition used by `physical_app_logical_size`
+        // without allocating an 8 GiB temporary file on the test machine.
+        assert!(
+            checked_app_expanded_bytes(MAX_APP_EXPANDED_BYTES, 1, "DMG 应用")
+                .unwrap_err()
+                .to_string()
+                .contains("超出允许范围")
+        );
     }
 
     #[test]

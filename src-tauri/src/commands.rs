@@ -10,10 +10,15 @@ use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_updater::UpdaterExt;
 
 use crate::app::atomic_file;
+use crate::app::capability_pack::{
+    install as install_capability_pack_impl, status as capability_pack_status_impl,
+    CapabilityPackInstallOptions, CapabilityPackReport,
+};
 use crate::app::ccswitch::{
     install_and_launch as install_and_launch_ccswitch_impl, uninstall as uninstall_ccswitch_impl,
     CcswitchLaunchReport, CcswitchUninstallReport,
 };
+use crate::app::channels::codex::normalize_relay_base_url;
 use crate::app::config_health::ConfigHealth;
 use crate::app::diagnostics::Diagnostics;
 use crate::app::disk::available_space;
@@ -51,7 +56,7 @@ use crate::app::release_install::{
     ReleaseArchitecture, ReleasePlatform, ResolvedReleaseAsset,
 };
 use crate::app::settings_store::AppSettings as PersistedAppSettings;
-use crate::app::settings_store::{ProxyMode, UpdateSource};
+use crate::app::settings_store::{CodexPayloadSourceKind, ProxyMode, UpdateSource};
 use crate::app::url_guard::{validate_custom_proxy, validate_custom_source};
 use crate::app::usb_guard::UsbGuardStatus;
 use crate::app::win_update::{
@@ -505,6 +510,76 @@ pub async fn manager_install_update(
         .download_and_install(|_, _| {}, || {})
         .await
         .map_err(|e| AppError::Engine(format!("install manager update: {e}")))?;
+    Ok(())
+}
+
+// ── Codex payload update channel (docs/UPDATE-CHANNELS.md § "Channel: codex")
+
+/// Read-only check of the USB payload against the configured codex payload
+/// repo. Returns `None` when up to date. Network failures surface as errors;
+/// the frontend decides how softly to present them.
+#[tauri::command]
+pub async fn payload_check_codex(
+    state: State<'_, ManagerState>,
+) -> Result<Option<crate::app::update_channel::UpdateInfo>, CommandError> {
+    if !matches!(state.target.os, OperatingSystem::Windows) {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    let bundle_root = crate::app::usb_guard::authorized_bundle_identity()?.0;
+    let settings = PersistedAppSettings::load();
+    let ctx = crate::app::update_channel::UpdateContext {
+        bundle_root,
+        settings,
+    };
+    tauri::async_runtime::spawn_blocking(move || crate::app::channels::codex::check(&ctx))
+        .await
+        .map_err(|e| AppError::Internal(format!("join: {e}")))?
+        .map_err(Into::into)
+}
+
+/// Phase-1 apply: refresh the USB payload after the user clicks. Re-validates
+/// everything against fresh remote metadata (never trusts the round-tripped
+/// `info`). Deployment to this machine's Windows installation is a separate
+/// user action reusing the existing win_* update commands.
+#[tauri::command]
+pub async fn payload_apply_codex(
+    app: AppHandle,
+    state: State<'_, ManagerState>,
+    info: crate::app::update_channel::UpdateInfo,
+) -> Result<(), CommandError> {
+    if !matches!(state.target.os, OperatingSystem::Windows) {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    let bundle_root = crate::app::usb_guard::authorized_bundle_identity()?.0;
+    let settings = PersistedAppSettings::load();
+    let ctx = crate::app::update_channel::UpdateContext {
+        bundle_root,
+        settings,
+    };
+    let progress_app = app.clone();
+    let progress = move |done: u64, total: u64| {
+        let _ = progress_app.emit(
+            "payload-update-progress",
+            serde_json::json!({
+                "channel": "codex",
+                "phase": "download",
+                "bytesDone": done,
+                "bytesTotal": total,
+            }),
+        );
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::app::channels::codex::apply(&ctx, &info, &progress)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("join: {e}")))??;
+    let _ = app.emit(
+        "payload-update-progress",
+        serde_json::json!({
+            "channel": "codex",
+            "phase": "done",
+        }),
+    );
     Ok(())
 }
 
@@ -1795,6 +1870,12 @@ pub fn set_settings(
     if s.proxy_mode == ProxyMode::Custom {
         s.custom_proxy_url = validated_custom_proxy_for_settings(&s.custom_proxy_url, "settings")?;
     }
+    if matches!(
+        s.codex_payload_source_kind,
+        CodexPayloadSourceKind::Auto | CodexPayloadSourceKind::Relay
+    ) {
+        s.codex_payload_base_url = normalize_relay_base_url(&s.codex_payload_base_url)?;
+    }
     let previous = PersistedAppSettings::load();
     let _op = begin_guard(&state, OperationKind::SetInstallRoot)?;
     if previous.disable_codex_self_updates != s.disable_codex_self_updates {
@@ -2957,6 +3038,35 @@ pub async fn install_and_launch_ccswitch(
     tauri::async_runtime::spawn_blocking(move || install_and_launch_ccswitch_impl(&app))
         .await
         .map_err(|e| AppError::Internal(format!("join: {e}")))?
+        .map_err(Into::into)
+}
+
+/// Inspect the bundled Codex capability pack without changing the local
+/// profile.  The pack is optional in development builds, but a release USB
+/// bundle is expected to ship it under content/codex-starter-kit.
+#[tauri::command]
+pub async fn capability_pack_status(app: AppHandle) -> Result<CapabilityPackReport, CommandError> {
+    crate::app::usb_guard::require_authorized()?;
+    tauri::async_runtime::spawn_blocking(move || capability_pack_status_impl(&app))
+        .await
+        .map_err(|error| AppError::Internal(format!("join: {error}")))?
+        .map_err(Into::into)
+}
+
+/// Install or repair the complete local capability pack.  All connection
+/// fields are opt-in; empty fields never enable Feishu, API adapters, or paid
+/// requests.  Secrets are passed to the child only for this invocation and,
+/// after a successful install, persisted to the current user's environment
+/// rather than to the USB package or Codex TOML.
+#[tauri::command]
+pub async fn install_capability_pack(
+    app: AppHandle,
+    options: CapabilityPackInstallOptions,
+) -> Result<CapabilityPackReport, CommandError> {
+    crate::app::usb_guard::require_authorized()?;
+    tauri::async_runtime::spawn_blocking(move || install_capability_pack_impl(&app, options))
+        .await
+        .map_err(|error| AppError::Internal(format!("join: {error}")))?
         .map_err(Into::into)
 }
 

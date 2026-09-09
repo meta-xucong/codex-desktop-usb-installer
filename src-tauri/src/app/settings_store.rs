@@ -39,6 +39,37 @@ pub enum ProxyMode {
     Custom,
 }
 
+/// Preferred source for the Codex desktop payload channel. `Auto` tries the
+/// controlled relay first and falls back to GitHub when the relay is
+/// unavailable. The actual source used by a check is embedded in the signed
+/// update identity, so apply never silently switches source after confirmation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CodexPayloadSourceKind {
+    Auto,
+    Relay,
+    Github,
+}
+
+impl CodexPayloadSourceKind {
+    pub fn from_raw(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "relay" => Ok(Self::Relay),
+            "github" => Ok(Self::Github),
+            _ => Err(raw.to_string()),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Relay => "relay",
+            Self::Github => "github",
+        }
+    }
+}
+
 impl ProxyMode {
     pub fn from_raw(raw: &str) -> Result<Self, String> {
         match raw.trim().to_ascii_lowercase().as_str() {
@@ -94,6 +125,16 @@ fn default_proxy_mode() -> ProxyMode {
 fn default_proxy_mode_string() -> String {
     ProxyMode::System.as_str().to_string()
 }
+
+fn default_codex_payload_source_kind() -> CodexPayloadSourceKind {
+    CodexPayloadSourceKind::Auto
+}
+
+fn default_codex_payload_source_kind_string() -> String {
+    CodexPayloadSourceKind::Auto.as_str().to_string()
+}
+
+pub const DEFAULT_CODEX_PAYLOAD_BASE_URL: &str = "https://update.404token.xyz/__codex_update__/";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -169,6 +210,19 @@ pub struct AppSettings {
     /// stored here.
     #[serde(default)]
     pub skin_groups: Vec<SkinGroup>,
+    /// GitHub repository ("owner/repo") hosting the codex payload releases
+    /// used by the codex update channel. Empty string = use the channel's
+    /// baked-in default. Validated by the channel, not here; normalization
+    /// only trims whitespace.
+    #[serde(default)]
+    pub codex_payload_repo: String,
+    /// Preferred source for the Codex payload channel. Empty/invalid legacy
+    /// values normalize to auto for compatibility.
+    #[serde(default = "default_codex_payload_source_kind")]
+    pub codex_payload_source_kind: CodexPayloadSourceKind,
+    /// HTTPS base URL of the controlled Codex relay.
+    #[serde(default = "default_codex_payload_base_url")]
+    pub codex_payload_base_url: String,
 }
 
 /// A user-defined grouping of local skins.
@@ -220,6 +274,12 @@ struct RawAppSettings {
     codex_theme_store_dir: Option<String>,
     #[serde(default)]
     skin_groups: Vec<SkinGroup>,
+    #[serde(default)]
+    codex_payload_repo: String,
+    #[serde(default = "default_codex_payload_source_kind_string")]
+    codex_payload_source_kind: String,
+    #[serde(default = "default_codex_payload_base_url")]
+    codex_payload_base_url: String,
 }
 
 fn default_true() -> bool {
@@ -232,6 +292,10 @@ fn default_periodic_check_interval_seconds() -> u64 {
 
 fn default_windows_install_mode() -> String {
     "msix".to_string()
+}
+
+fn default_codex_payload_base_url() -> String {
+    DEFAULT_CODEX_PAYLOAD_BASE_URL.to_string()
 }
 
 pub fn default_install_root() -> String {
@@ -261,6 +325,9 @@ impl Default for AppSettings {
             codex_theme_dir: None,
             codex_theme_store_dir: None,
             skin_groups: Vec::new(),
+            codex_payload_repo: String::new(),
+            codex_payload_source_kind: CodexPayloadSourceKind::Auto,
+            codex_payload_base_url: default_codex_payload_base_url(),
         }
     }
 }
@@ -276,6 +343,9 @@ impl RawAppSettings {
             Err(raw) => (UpdateSource::Auto, Some(raw)),
         };
         let proxy_mode = ProxyMode::from_raw(&self.proxy_mode).unwrap_or(ProxyMode::System);
+        let codex_payload_source_kind =
+            CodexPayloadSourceKind::from_raw(&self.codex_payload_source_kind)
+                .unwrap_or(CodexPayloadSourceKind::Auto);
         let newer_schema = (self.schema_version > CURRENT_SCHEMA_VERSION).then(|| {
             format!(
                 "settings.json schema_version={} 高于当前支持版本 {}",
@@ -310,6 +380,9 @@ impl RawAppSettings {
                 codex_theme_dir: self.codex_theme_dir,
                 codex_theme_store_dir: self.codex_theme_store_dir,
                 skin_groups: self.skin_groups,
+                codex_payload_repo: self.codex_payload_repo,
+                codex_payload_source_kind,
+                codex_payload_base_url: self.codex_payload_base_url,
             },
             unknown_source,
             newer_schema,
@@ -348,6 +421,11 @@ impl AppSettings {
         }
         self.custom_url = self.custom_url.trim().to_string();
         self.custom_proxy_url = self.custom_proxy_url.trim().to_string();
+        self.codex_payload_repo = self.codex_payload_repo.trim().to_string();
+        self.codex_payload_base_url = self.codex_payload_base_url.trim().to_string();
+        if self.codex_payload_base_url.is_empty() {
+            self.codex_payload_base_url = default_codex_payload_base_url();
+        }
         // Empty custom modes are not a real runtime choice (update paths fall
         // back silently). Coerce so UI selection, disk, and runtime agree.
         if self.source == UpdateSource::Custom && self.custom_url.is_empty() {
@@ -435,7 +513,8 @@ impl AppSettings {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppSettings, ProxyMode, RawAppSettings, UpdateSource, CURRENT_SCHEMA_VERSION,
+        AppSettings, CodexPayloadSourceKind, ProxyMode, RawAppSettings, UpdateSource,
+        CURRENT_SCHEMA_VERSION, DEFAULT_CODEX_PAYLOAD_BASE_URL,
         DEFAULT_PERIODIC_CHECK_INTERVAL_SECONDS, MAX_PERIODIC_CHECK_INTERVAL_SECONDS,
         MIN_PERIODIC_CHECK_INTERVAL_SECONDS,
     };
@@ -467,6 +546,94 @@ mod tests {
         assert!(!settings.disable_codex_self_updates);
         assert!(unknown_source.is_none());
         assert!(newer_schema.is_none());
+        // New optional field: absent on old files → empty → channel default.
+        assert_eq!(settings.codex_payload_repo, "");
+        assert_eq!(
+            settings.codex_payload_source_kind,
+            CodexPayloadSourceKind::Auto
+        );
+        assert_eq!(
+            settings.codex_payload_base_url,
+            DEFAULT_CODEX_PAYLOAD_BASE_URL
+        );
+    }
+
+    #[test]
+    fn codex_payload_source_round_trips_and_normalizes_invalid_legacy_values() {
+        let relay: RawAppSettings = serde_json::from_str(
+            r#"{
+                "codexPayloadSourceKind": "relay",
+                "codexPayloadBaseUrl": "  https://update.404token.xyz/__codex_update__  "
+            }"#,
+        )
+        .unwrap();
+        let (mut settings, _, _) = relay.into_settings();
+        settings.normalize();
+        assert_eq!(
+            settings.codex_payload_source_kind,
+            CodexPayloadSourceKind::Relay
+        );
+        assert_eq!(
+            settings.codex_payload_base_url,
+            "https://update.404token.xyz/__codex_update__"
+        );
+
+        let invalid: RawAppSettings = serde_json::from_str(
+            r#"{
+                "codexPayloadSourceKind": "not-a-source",
+                "codexPayloadBaseUrl": "  "
+            }"#,
+        )
+        .unwrap();
+        let (mut settings, _, _) = invalid.into_settings();
+        settings.normalize();
+        assert_eq!(
+            settings.codex_payload_source_kind,
+            CodexPayloadSourceKind::Auto
+        );
+        assert_eq!(
+            settings.codex_payload_base_url,
+            DEFAULT_CODEX_PAYLOAD_BASE_URL
+        );
+    }
+
+    #[test]
+    fn codex_payload_repo_round_trips_and_trims() {
+        let raw: RawAppSettings = serde_json::from_str(
+            r#"{
+                "schemaVersion": 1,
+                "source": "auto",
+                "customUrl": "",
+                "codexPayloadRepo": "  owner/repo  ",
+                "askBefore": true,
+                "signedOnly": true
+            }"#,
+        )
+        .unwrap();
+        let (mut settings, _, _) = raw.into_settings();
+        settings.normalize();
+        assert_eq!(settings.codex_payload_repo, "owner/repo");
+
+        settings.codex_payload_repo = "  ".to_string();
+        settings.normalize();
+        assert_eq!(settings.codex_payload_repo, "");
+    }
+
+    #[test]
+    fn codex_payload_repo_absent_field_survives_save_load() {
+        // Old file without the field → default empty; after a save with a
+        // non-empty value, a fresh parse must preserve it (RawAppSettings
+        // touchpoint present).
+        let raw: RawAppSettings =
+            serde_json::from_str(r#"{ "schemaVersion": 1, "source": "auto", "customUrl": "" }"#)
+                .unwrap();
+        let (mut settings, _, _) = raw.into_settings();
+        settings.normalize();
+        settings.codex_payload_repo = "meta-xucong/codex-app-mirror".to_string();
+        let json = serde_json::to_string(&settings).unwrap();
+        let reparsed: RawAppSettings = serde_json::from_str(&json).unwrap();
+        let (reloaded, _, _) = reparsed.into_settings();
+        assert_eq!(reloaded.codex_payload_repo, "meta-xucong/codex-app-mirror");
     }
 
     #[test]

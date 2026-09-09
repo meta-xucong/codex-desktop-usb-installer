@@ -1,0 +1,421 @@
+import { useEffect, useId, useState } from "react";
+
+import { errorMessage, managerApi } from "../../services/managerApi";
+import type {
+  CapabilityPackInstallOptions,
+  CapabilityPackReport,
+  CcswitchLaunchReport,
+} from "../../shared/types";
+import { Icon } from "../icons";
+import { useI18n } from "../i18n";
+import { Sheet } from "../Sheet";
+import { Tooltip } from "../components";
+
+type ServiceId = "feishu" | "dashscope-web-search" | "image-2" | "seedance";
+type FormValues = Omit<CapabilityPackInstallOptions, "enabledApiServices">;
+
+const EMPTY_FORM: FormValues = {
+  enableFeishu: false,
+  persistConnections: true,
+  feishuAppId: "",
+  feishuAppSecret: "",
+  feishuUserAccessToken: "",
+  feishuDomain: "https://open.feishu.cn",
+  feishuAuthMode: "tenant",
+  dashscopeApiKey: "",
+  dashscopeBaseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+  dashscopeModel: "",
+  image2ApiKey: "",
+  image2BaseUrl: "",
+  image2Model: "",
+  image2AgentId: "",
+  seedanceApiKey: "",
+  seedanceBaseUrl: "",
+  seedanceModel: "",
+  seedanceAgentId: "",
+  seedancePrechargePoints: "",
+  seedanceOfficialLinkTtlHours: "",
+  seedanceRefundRule: "",
+};
+
+const SERVICE_KEYS: ServiceId[] = [
+  "feishu",
+  "dashscope-web-search",
+  "image-2",
+  "seedance",
+];
+
+export function OfflineComponentsSheet({
+  open,
+  onDismiss,
+}: {
+  open: boolean;
+  onDismiss: () => void;
+}) {
+  const { t } = useI18n();
+  const titleId = useId();
+  const bodyId = useId();
+  const [form, setForm] = useState<FormValues>(EMPTY_FORM);
+  const [enabled, setEnabled] = useState<Record<ServiceId, boolean>>({
+    feishu: false,
+    "dashscope-web-search": false,
+    "image-2": false,
+    seedance: false,
+  });
+  const [busy, setBusy] = useState<"pack" | "ccswitch" | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [packReport, setPackReport] = useState<CapabilityPackReport | null>(null);
+  const [ccswitchReport, setCcswitchReport] = useState<CcswitchLaunchReport | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    setError(null);
+    void managerApi
+      .capabilityPackStatus()
+      .then(setPackReport)
+      .catch((cause) => setError(errorMessage(cause)));
+  }, [open]);
+
+  const update = <K extends keyof FormValues>(key: K, value: FormValues[K]) => {
+    setForm((current) => ({ ...current, [key]: value }));
+    setError(null);
+  };
+
+  const toggleService = (service: ServiceId) => {
+    setEnabled((current) => ({ ...current, [service]: !current[service] }));
+    setError(null);
+  };
+
+  const validate = (): string | null => {
+    if (enabled.feishu && (!form.feishuAppId.trim() || !form.feishuAppSecret.trim())) {
+      return t("offline.components.validationFeishu");
+    }
+    if (enabled.feishu && form.feishuAuthMode === "user" && !form.feishuUserAccessToken.trim()) {
+      return t("offline.components.validationFeishuUser");
+    }
+    if (
+      enabled["dashscope-web-search"] &&
+      (!form.dashscopeApiKey.trim() || !form.dashscopeBaseUrl.trim() || !form.dashscopeModel.trim())
+    ) {
+      return t("offline.components.validationDashscope");
+    }
+    if (
+      enabled["image-2"] &&
+      (!form.image2ApiKey.trim() ||
+        !form.image2BaseUrl.trim() ||
+        !form.image2Model.trim() ||
+        !form.image2AgentId.trim())
+    ) {
+      return t("offline.components.validationImage");
+    }
+    if (
+      enabled.seedance &&
+      (!form.seedanceApiKey.trim() ||
+        !form.seedanceBaseUrl.trim() ||
+        !form.seedanceModel.trim() ||
+        !form.seedanceAgentId.trim() ||
+        !form.seedancePrechargePoints.trim() ||
+        !form.seedanceOfficialLinkTtlHours.trim() ||
+        !form.seedanceRefundRule.trim())
+    ) {
+      return t("offline.components.validationSeedance");
+    }
+    return null;
+  };
+
+  const installPack = async () => {
+    const validation = validate();
+    if (validation) {
+      setError(validation);
+      return;
+    }
+    setBusy("pack");
+    setError(null);
+    try {
+      const report = await managerApi.installCapabilityPack({
+        ...form,
+        enableFeishu: enabled.feishu,
+        enabledApiServices: SERVICE_KEYS.filter(
+          (service) => service !== "feishu" && enabled[service],
+        ),
+      });
+      setPackReport(report);
+      if (!report.success) setError(report.message);
+    } catch (cause) {
+      setError(errorMessage(cause));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const retryCcswitch = async () => {
+    setBusy("ccswitch");
+    setError(null);
+    setCcswitchReport(null);
+    try {
+      const report = await managerApi.installAndLaunchCcswitch();
+      setCcswitchReport(report);
+      if (!report.launched) setError(report.message);
+    } catch (cause) {
+      setError(errorMessage(cause));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const field = (
+    key: keyof FormValues,
+    label: string,
+    secret = false,
+    placeholder?: string,
+  ) => (
+    <label className="component-field" key={String(key)}>
+      <span>{label}</span>
+      <input
+        className="input"
+        type={secret ? "password" : "text"}
+        autoComplete={secret ? "new-password" : "off"}
+        value={String(form[key])}
+        placeholder={placeholder}
+        onChange={(event) => update(key, event.target.value)}
+        disabled={busy !== null}
+      />
+    </label>
+  );
+
+  return (
+    <Sheet
+      open={open}
+      onDismiss={() => {
+        if (!busy) onDismiss();
+      }}
+      dismissable={busy === null}
+      labelledBy={titleId}
+      describedBy={bodyId}
+      initialFocus="dismiss"
+      centeredInExpanded
+    >
+      <div className="component-sheet">
+        <div className="component-sheet-heading">
+          <Icon name="sliders" />
+          <h3 id={titleId}>{t("offline.components.title")}</h3>
+          <Tooltip
+            content={`${t("offline.components.body")}\n\n${t("offline.components.skipNote")}`}
+            side="bottom"
+          >
+            <span className="tooltip-icon" aria-label={t("themes.details")}>
+              <Icon name="info" />
+            </span>
+          </Tooltip>
+        </div>
+        <span id={bodyId} className="sr-only">
+          {t("offline.components.body")} {t("offline.components.skipNote")}
+        </span>
+
+        <div className="component-service-list">
+          <section className="component-service">
+            <div className="component-service-toggle">
+              <input
+                id="component-feishu-enabled"
+                type="checkbox"
+                checked={enabled.feishu}
+                onChange={() => toggleService("feishu")}
+                disabled={busy !== null}
+              />
+              <label
+                className="component-service-toggle-label"
+                htmlFor="component-feishu-enabled"
+                aria-label={t("offline.components.feishu")}
+              >
+                <span>
+                  <strong>{t("offline.components.feishu")}</strong>
+                </span>
+                <Tooltip content={t("offline.components.feishuDesc")}>
+                  <span className="tooltip-icon" aria-label={t("themes.details")}>
+                    <Icon name="info" />
+                  </span>
+                </Tooltip>
+              </label>
+            </div>
+            {enabled.feishu ? (
+              <div className="component-fields">
+                {field("feishuAppId", t("offline.components.feishuAppId"))}
+                {field("feishuAppSecret", t("offline.components.feishuAppSecret"), true)}
+                <label className="component-field">
+                  <span>{t("offline.components.feishuAuthMode")}</span>
+                  <select
+                    className="input"
+                    value={form.feishuAuthMode}
+                    onChange={(event) => update("feishuAuthMode", event.target.value)}
+                    disabled={busy !== null}
+                  >
+                    <option value="tenant">tenant</option>
+                    <option value="user">user</option>
+                    <option value="oauth">oauth</option>
+                  </select>
+                </label>
+                {field("feishuUserAccessToken", t("offline.components.feishuToken"), true)}
+                {field("feishuDomain", t("offline.components.feishuDomain"))}
+              </div>
+            ) : null}
+          </section>
+
+          <section className="component-service">
+            <div className="component-service-toggle">
+              <input
+                id="component-dashscope-enabled"
+                type="checkbox"
+                checked={enabled["dashscope-web-search"]}
+                onChange={() => toggleService("dashscope-web-search")}
+                disabled={busy !== null}
+              />
+              <label
+                className="component-service-toggle-label"
+                htmlFor="component-dashscope-enabled"
+                aria-label={t("offline.components.dashscope")}
+              >
+                <span>
+                  <strong>{t("offline.components.dashscope")}</strong>
+                </span>
+                <Tooltip content={t("offline.components.dashscopeDesc")}>
+                  <span className="tooltip-icon" aria-label={t("themes.details")}>
+                    <Icon name="info" />
+                  </span>
+                </Tooltip>
+              </label>
+            </div>
+            {enabled["dashscope-web-search"] ? (
+              <div className="component-fields">
+                {field("dashscopeApiKey", t("offline.components.apiKey"), true)}
+                {field("dashscopeBaseUrl", t("offline.components.baseUrl"))}
+                {field("dashscopeModel", t("offline.components.model"))}
+              </div>
+            ) : null}
+          </section>
+
+          <section className="component-service">
+            <div className="component-service-toggle">
+              <input
+                id="component-image-enabled"
+                type="checkbox"
+                checked={enabled["image-2"]}
+                onChange={() => toggleService("image-2")}
+                disabled={busy !== null}
+              />
+              <label
+                className="component-service-toggle-label"
+                htmlFor="component-image-enabled"
+                aria-label={t("offline.components.image")}
+              >
+                <span>
+                  <strong>{t("offline.components.image")}</strong>
+                </span>
+                <Tooltip content={t("offline.components.imageDesc")}>
+                  <span className="tooltip-icon" aria-label={t("themes.details")}>
+                    <Icon name="info" />
+                  </span>
+                </Tooltip>
+              </label>
+            </div>
+            {enabled["image-2"] ? (
+              <div className="component-fields">
+                {field("image2ApiKey", t("offline.components.apiKey"), true)}
+                {field("image2BaseUrl", t("offline.components.baseUrl"))}
+                {field("image2Model", t("offline.components.model"))}
+                {field("image2AgentId", t("offline.components.routeId"))}
+              </div>
+            ) : null}
+          </section>
+
+          <section className="component-service">
+            <div className="component-service-toggle">
+              <input
+                id="component-seedance-enabled"
+                type="checkbox"
+                checked={enabled.seedance}
+                onChange={() => toggleService("seedance")}
+                disabled={busy !== null}
+              />
+              <label
+                className="component-service-toggle-label"
+                htmlFor="component-seedance-enabled"
+                aria-label={t("offline.components.seedance")}
+              >
+                <span>
+                  <strong>{t("offline.components.seedance")}</strong>
+                </span>
+                <Tooltip content={t("offline.components.seedanceDesc")}>
+                  <span className="tooltip-icon" aria-label={t("themes.details")}>
+                    <Icon name="info" />
+                  </span>
+                </Tooltip>
+              </label>
+            </div>
+            {enabled.seedance ? (
+              <div className="component-fields">
+                {field("seedanceApiKey", t("offline.components.apiKey"), true)}
+                {field("seedanceBaseUrl", t("offline.components.baseUrl"))}
+                {field("seedanceModel", t("offline.components.model"))}
+                {field("seedanceAgentId", t("offline.components.routeId"))}
+                {field("seedancePrechargePoints", t("offline.components.precharge"))}
+                {field("seedanceOfficialLinkTtlHours", t("offline.components.ttl"))}
+                {field("seedanceRefundRule", t("offline.components.refund"))}
+              </div>
+            ) : null}
+          </section>
+        </div>
+
+        {packReport ? (
+          <div className={`component-result${packReport.success ? " success" : ""}`}>
+            <strong>{packReport.success ? t("offline.components.ready") : t("offline.components.notReady")}</strong>
+            <span>{packReport.message}</span>
+            {packReport.skills > 0 ? (
+              <small>
+                {t("offline.components.counts", {
+                  skills: packReport.skills,
+                  agents: packReport.agents,
+                })}
+              </small>
+            ) : null}
+          </div>
+        ) : null}
+        {ccswitchReport ? (
+          <div className={`component-result${ccswitchReport.launched ? " success" : ""}`}>
+            <strong>
+              {ccswitchReport.launched
+                ? t("offline.components.ccswitchReady")
+                : t("offline.components.ccswitchNotReady")}
+            </strong>
+            <span>{ccswitchReport.message}</span>
+          </div>
+        ) : null}
+        {error ? <div className="component-error">{error}</div> : null}
+
+        <div className="component-separate-action">
+          <div>
+            <strong>{t("offline.components.ccswitchTitle")}</strong>
+            <Tooltip content={t("offline.components.ccswitchDesc")}>
+              <span className="tooltip-icon" aria-label={t("themes.details")}>
+                <Icon name="info" />
+              </span>
+            </Tooltip>
+          </div>
+          <button className="btn ghost" onClick={() => void retryCcswitch()} disabled={busy !== null}>
+            {busy === "ccswitch" ? <Icon name="loader" className="spinicon" /> : <Icon name="gear" />}
+            {busy === "ccswitch" ? t("offline.ccswitchLaunching") : t("offline.components.ccswitchRetry")}
+          </button>
+        </div>
+
+        <div className="row2 sheet-actions">
+          <button className="btn ghost" onClick={onDismiss} disabled={busy !== null}>
+            {t("offline.components.skip")}
+          </button>
+          <button className="btn primary" onClick={() => void installPack()} disabled={busy !== null}>
+            {busy === "pack" ? <Icon name="loader" className="spinicon" /> : <Icon name="download" />}
+            {busy === "pack" ? t("offline.components.installing") : t("offline.components.install")}
+          </button>
+        </div>
+      </div>
+    </Sheet>
+  );
+}

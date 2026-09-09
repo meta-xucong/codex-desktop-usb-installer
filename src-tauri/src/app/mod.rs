@@ -1,6 +1,8 @@
 pub mod appx_volume;
 pub mod atomic_file;
+pub mod capability_pack;
 pub mod ccswitch;
+pub mod channels;
 pub mod codex_self_update;
 pub mod codex_theme;
 pub mod config_health;
@@ -22,6 +24,7 @@ pub mod settings_store;
 pub mod shell;
 pub mod staging;
 pub mod uninstall_cleanup;
+pub mod update_channel;
 pub mod url_guard;
 pub mod usb_guard;
 pub mod usb_media_cleanup;

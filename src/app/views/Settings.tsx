@@ -4,6 +4,7 @@ import { errorMessage, managerApi } from "../../services/managerApi";
 import type {
   ConfigHealth,
   ConfigWhich,
+  CodexPayloadSourceKind,
   ProxyMode,
   UpdateSourceKind,
   WindowsInstallMode,
@@ -46,6 +47,28 @@ const SOURCES: { kind: UpdateSourceKind; label: TKey; desc: TKey | "" }[] = [
   { kind: "mirror", label: "settings.source.mirror", desc: "settings.source.mirrorDesc" },
   { kind: "official", label: "settings.source.official", desc: "settings.source.officialDesc" },
   { kind: "custom", label: "settings.source.custom", desc: "" },
+];
+
+const CODEX_PAYLOAD_SOURCES: {
+  kind: CodexPayloadSourceKind;
+  label: TKey;
+  desc: TKey;
+}[] = [
+  {
+    kind: "auto",
+    label: "settings.codexPayload.source.auto",
+    desc: "settings.codexPayload.source.autoDesc",
+  },
+  {
+    kind: "relay",
+    label: "settings.codexPayload.source.relay",
+    desc: "settings.codexPayload.source.relayDesc",
+  },
+  {
+    kind: "github",
+    label: "settings.codexPayload.source.github",
+    desc: "settings.codexPayload.source.githubDesc",
+  },
 ];
 
 const WINDOWS_INSTALL_MODES: { kind: WindowsInstallMode; label: TKey; desc: TKey }[] = [
@@ -275,6 +298,12 @@ export function Settings({
     update(next);
   };
 
+  const selectCodexPayloadSource = (kind: CodexPayloadSourceKind) => {
+    setCommandError(null);
+    setFieldError(null);
+    update({ ...s, codexPayloadSourceKind: kind });
+  };
+
   const themes: { v: ThemeMode; k: "settings.appearance.system" | "settings.appearance.light" | "settings.appearance.dark" }[] = [
     { v: "system", k: "settings.appearance.system" },
     { v: "light", k: "settings.appearance.light" },
@@ -434,6 +463,107 @@ export function Settings({
             ) : null}
           </div>
         </div> : null}
+
+        <div className="group">
+          <div className="group-h">{t("settings.codexPayload.header")}</div>
+          <div className="list">
+            {/* Roving-tabindex radiogroup — child radios carry focus + Tab. */}
+            {/* eslint-disable-next-line jsx-a11y/interactive-supports-focus */}
+            <div
+              className="list"
+              role="radiogroup"
+              aria-label={t("settings.codexPayload.source.header")}
+              onKeyDown={(event) => {
+                const next = radioNavTarget(
+                  CODEX_PAYLOAD_SOURCES.map((source) => source.kind),
+                  s.codexPayloadSourceKind,
+                  event,
+                  event.currentTarget,
+                );
+                if (next === null) return;
+                selectCodexPayloadSource(next as CodexPayloadSourceKind);
+              }}
+            >
+              {CODEX_PAYLOAD_SOURCES.map((source) => (
+                <button
+                  key={source.kind}
+                  className="row"
+                  role="radio"
+                  aria-checked={s.codexPayloadSourceKind === source.kind}
+                  tabIndex={s.codexPayloadSourceKind === source.kind ? 0 : -1}
+                  onClick={() => selectCodexPayloadSource(source.kind)}
+                >
+                  <span className="radio" />
+                  <span className="rtext">
+                    <span className="rtitle">{t(source.label)}</span>
+                    <span className="rsub">{t(source.desc)}</span>
+                  </span>
+                </button>
+              ))}
+            </div>
+            {s.codexPayloadSourceKind !== "github" ? (
+              <div className="row" style={{ display: "block" }}>
+                <div className="rtitle" style={{ marginBottom: 8 }}>
+                  {t("settings.codexPayload.relayUrl")}
+                </div>
+                <input
+                  className="input mono"
+                  aria-label={t("settings.codexPayload.relayUrl")}
+                  value={s.codexPayloadBaseUrl}
+                  placeholder={t("settings.codexPayload.relayUrlPlaceholder")}
+                  autoCapitalize="none"
+                  autoCorrect="off"
+                  spellCheck={false}
+                  onChange={(e) => {
+                    setCommandError(null);
+                    setFieldError(null);
+                    setDraft({ ...s, codexPayloadBaseUrl: e.target.value });
+                  }}
+                  onBlur={(e) => {
+                    setCommandError(null);
+                    setFieldError(null);
+                    update({
+                      ...s,
+                      codexPayloadBaseUrl:
+                        e.currentTarget.value.trim() ||
+                        DEFAULT_SETTINGS.codexPayloadBaseUrl,
+                    });
+                  }}
+                />
+                <span className="rsub" style={{ display: "block", marginTop: 8 }}>
+                  {t("settings.codexPayload.relayUrlDesc")}
+                </span>
+              </div>
+            ) : null}
+            <div className="row" style={{ display: "block" }}>
+              <div className="rtitle" style={{ marginBottom: 8 }}>
+                {t("settings.codexPayload.repo")}
+              </div>
+              <input
+                className="input mono"
+                aria-label={t("settings.codexPayload.repo")}
+                value={s.codexPayloadRepo}
+                placeholder={t("settings.codexPayload.placeholder")}
+                autoCapitalize="none"
+                autoCorrect="off"
+                spellCheck={false}
+                onChange={(e) => {
+                  setCommandError(null);
+                  setFieldError(null);
+                  setDraft({ ...s, codexPayloadRepo: e.target.value });
+                }}
+                onBlur={(e) => {
+                  setCommandError(null);
+                  setFieldError(null);
+                  update({ ...s, codexPayloadRepo: e.currentTarget.value.trim() });
+                }}
+              />
+              <span className="rsub" style={{ display: "block", marginTop: 8 }}>
+                {t("settings.codexPayload.desc")}
+              </span>
+            </div>
+          </div>
+        </div>
 
         {!offlineOnly && win ? (
           <div className="group">

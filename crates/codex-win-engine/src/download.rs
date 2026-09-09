@@ -159,6 +159,7 @@ fn is_connectivity_exit(exit_code: Option<i32>) -> bool {
     )
 }
 
+#[cfg(test)]
 fn curl_args(
     url: &str,
     dest: &str,
@@ -168,9 +169,34 @@ fn curl_args(
     network: &NetworkConfig,
     revocation_check: SchannelRevocationCheck,
 ) -> Vec<String> {
+    curl_args_with_redirects(
+        url,
+        dest,
+        resume,
+        max_bytes,
+        progress_mode,
+        network,
+        revocation_check,
+        true,
+    )
+}
+
+fn curl_args_with_redirects(
+    url: &str,
+    dest: &str,
+    resume: bool,
+    max_bytes: &str,
+    progress_mode: ProgressMode,
+    network: &NetworkConfig,
+    revocation_check: SchannelRevocationCheck,
+    follow_redirects: bool,
+) -> Vec<String> {
     let mut args = network.curl_args_with_schannel_revocation(revocation_check);
+    args.push("-f".to_string());
+    if follow_redirects {
+        args.push("-L".to_string());
+    }
     args.extend([
-        "-fL".to_string(),
         "--proto".to_string(),
         "=https".to_string(),
         "--proto-redir".to_string(),
@@ -269,6 +295,7 @@ struct CurlRun<'a> {
     max_bytes: &'a str,
     network: &'a NetworkConfig,
     on_progress: &'a dyn Fn(u64),
+    follow_redirects: bool,
 }
 
 impl CurlRun<'_> {
@@ -282,7 +309,7 @@ fn run_curl_with_mode(
     progress_mode: ProgressMode,
     revocation_check: SchannelRevocationCheck,
 ) -> Result<(), CurlAttemptError> {
-    let args = curl_args(
+    let args = curl_args_with_redirects(
         run.url,
         run.dest,
         run.resume,
@@ -290,6 +317,7 @@ fn run_curl_with_mode(
         progress_mode,
         run.network,
         revocation_check,
+        run.follow_redirects,
     );
     run_curl_once(run.source(), run.dest, args, run.on_progress)
 }
@@ -316,13 +344,14 @@ fn retry_with_schannel_no_revoke(
     run_curl_with_mode(run, progress_mode, SchannelRevocationCheck::Disabled)
 }
 
-fn run_curl(
+fn run_curl_with_redirect_policy(
     url: &str,
     dest: &Path,
     resume: bool,
     max_bytes: u64,
     on_progress: &dyn Fn(u64),
     network: &NetworkConfig,
+    follow_redirects: bool,
 ) -> Result<(), String> {
     let source = url_host(url);
     let dest = dest.to_string_lossy().into_owned();
@@ -334,6 +363,7 @@ fn run_curl(
         max_bytes: &max_bytes,
         network,
         on_progress,
+        follow_redirects,
     };
 
     if let Err(first_err) = run_curl_with_mode(
@@ -427,6 +457,44 @@ pub fn download_to_with_progress_bounded_with_network(
     on_progress: &dyn Fn(u64),
     network: &NetworkConfig,
 ) -> Result<(), EngineError> {
+    download_to_with_progress_bounded_with_network_policy(
+        url,
+        dest,
+        max_bytes,
+        on_progress,
+        network,
+        true,
+    )
+}
+
+/// Relay-only variant that refuses HTTP redirects. GitHub downloads retain
+/// the normal redirect-following behavior because GitHub assets legitimately
+/// redirect to their CDN.
+pub fn download_to_with_progress_bounded_with_network_no_redirect(
+    url: &str,
+    dest: &Path,
+    max_bytes: u64,
+    on_progress: &dyn Fn(u64),
+    network: &NetworkConfig,
+) -> Result<(), EngineError> {
+    download_to_with_progress_bounded_with_network_policy(
+        url,
+        dest,
+        max_bytes,
+        on_progress,
+        network,
+        false,
+    )
+}
+
+fn download_to_with_progress_bounded_with_network_policy(
+    url: &str,
+    dest: &Path,
+    max_bytes: u64,
+    on_progress: &dyn Fn(u64),
+    network: &NetworkConfig,
+    follow_redirects: bool,
+) -> Result<(), EngineError> {
     // The manager has one Windows package staging slot. Serialize downloads so
     // auto-stage and manual-stage cannot reset each other's cancel flag.
     let _guard = DownloadGuard::acquire().map_err(EngineError::Io)?;
@@ -446,7 +514,15 @@ pub fn download_to_with_progress_bounded_with_network(
     log::info!(
         "Windows download start source={source} dest={dest_name} resume={should_resume} max_bytes={max_bytes}"
     );
-    let download_result = run_curl(url, &part, should_resume, max_bytes, on_progress, network);
+    let download_result = run_curl_with_redirect_policy(
+        url,
+        &part,
+        should_resume,
+        max_bytes,
+        on_progress,
+        network,
+        follow_redirects,
+    );
     if let Err(first_err) = download_result {
         if is_cancelled_error(&first_err) {
             if DOWNLOAD_DISCARD.load(Ordering::SeqCst) {
@@ -459,7 +535,16 @@ pub fn download_to_with_progress_bounded_with_network(
             log::warn!(
                 "Windows resume failed; retrying fresh source={source} first_err={first_err}"
             );
-            run_curl(url, &part, false, max_bytes, on_progress, network).map_err(|second_err| {
+            run_curl_with_redirect_policy(
+                url,
+                &part,
+                false,
+                max_bytes,
+                on_progress,
+                network,
+                follow_redirects,
+            )
+            .map_err(|second_err| {
                 if is_cancelled_error(&second_err) {
                     if DOWNLOAD_DISCARD.load(Ordering::SeqCst) {
                         let _ = std::fs::remove_file(&part);
@@ -565,6 +650,22 @@ mod tests {
         assert!(args.contains(&"-sS".to_string()));
         assert!(!args.contains(&"--no-progress-meter".to_string()));
         assert!(args.windows(2).any(|pair| pair == ["-C", "-"]));
+    }
+
+    #[test]
+    fn relay_curl_args_refuse_redirects() {
+        let args = curl_args_with_redirects(
+            "https://example.test/Codex.msix",
+            "Codex.msix.part",
+            false,
+            "123",
+            ProgressMode::NoProgressMeter,
+            &NetworkConfig::system(),
+            SchannelRevocationCheck::Strict,
+            false,
+        );
+        assert!(!args.contains(&"-L".to_string()));
+        assert!(args.contains(&"--proto-redir".to_string()));
     }
 
     #[test]
