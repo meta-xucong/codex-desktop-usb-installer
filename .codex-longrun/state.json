@@ -1,12 +1,11 @@
 {
   "objective": "完成 Skill Hub 可诊断更新链路和上游模型同步/预装方案：先写开发文档，落代码，独立只读审计，测试回归；把最终代码发布到授权 GitHub 仓库；打包最新 EXE 并生成匹配的本地 USB 签名产物。保留现有用户改动，直到完成或真实阻断。",
-  "current_phase": "Release verification and publication",
-  "phase_status": "artifact-rebuild-and-publication",
-  "completed_phases": ["Discover project structure", "Freeze development contract", "Implement Skill Hub diagnostics, model policy, and G22 uninstall hardening", "Build and verify EXE, USB bundle, capability pack, and signer"],
+  "current_phase": "Delivery complete; target-machine acceptance pending",
+  "phase_status": "complete",
+  "completed_phases": ["Discover project structure", "Freeze development contract", "Implement Skill Hub diagnostics, model policy, and G22 uninstall hardening", "Build and verify EXE, USB bundle, capability pack, and signer", "Independent audit, artifact rebuild, commit, and GitHub push"],
   "next_actions": [
-    "Publish the rebuilt release candidate after the independent audit and package-hash regeneration",
-    "Commit the verified source/docs to the authorized GitHub repository",
-    "Record final release paths and acceptance boundary"
+    "Run target-machine physical USB acceptance for the r4 bundle",
+    "Record target-machine evidence if any device-specific regression is found"
   ],
   "tests_run": [
     "Frontend full Vitest: 411 passed, 1 skipped",
@@ -24,7 +23,7 @@
     "Relevant tests or checks pass",
     "Progress and verification are recorded"
   ],
-  "last_verified_at": "2026-09-13T05:05:00+08:00",
+  "last_verified_at": "2026-09-13T04:55:10+08:00",
   "created_at": "2026-09-13T03:02:00+08:00",
-  "updated_at": "2026-09-13T05:05:00+08:00"
+  "updated_at": "2026-09-13T04:55:10+08:00"
 }

@@ -2,18 +2,18 @@
 
 ## Current release gate — 2026-09-13
 
-1. 等待独立只读审计反馈，若有 P0/P1 立即修复并重跑对应门禁。
-2. 提交源码、安装包契约、模型快照、Skill Hub/G22 文档和测试记录到授权 GitHub 仓库。
-3. 交付本地最新 EXE、U 盘发行目录和 GUI 签名工具；不把 `usb-license.json` 写进静态包，也不操作物理 U 盘。
-4. 目标 Windows 机器仍需手工验收真实 U 盘复制、签名、安装、断网启动、Skill Hub 网络失败详情和卸载二阶段；开发机不能替代这些设备级测试。
+1. [完成] 独立只读审计完成；修正审计器类型边界并重新生成能力包哈希清单。
+2. [完成] 提交源码、安装包契约、模型快照、Skill Hub/G22 文档和测试记录到授权 GitHub 仓库，提交 `c5ca533`。
+3. [完成] 交付本地 r4 EXE、U 盘发行目录和 GUI 签名工具；不把 `usb-license.json` 写进静态包，也未操作物理 U 盘。
+4. [待实机] 目标 Windows 机器仍需手工验收真实 U 盘复制、签名、安装、断网启动、Skill Hub 网络失败详情和卸载二阶段；开发机不能替代这些设备级测试。
 
 ## 2026-09-13 G22/G23 follow-up
 
 1. [完成] 阅读并纳入 G22 报告：卸载二阶段不能向已删除的 `io.github.wangnov.codexappmanager` 回写日志。
 2. [完成] 固化 Skill Hub 可诊断更新、脱敏模型目录同步和卸载收尾的开发契约：`docs/SKILL-HUB-MODEL-SYNC-AND-UNINSTALL-G22-DEVELOPMENT.md`。
-3. [进行中] 实施 Skill Hub 错误详情/来源尝试日志、模型快照同步、卸载独立报告目录与日志 fallback。
-4. [待执行] 独立只读审计与全量回归；确认不包含原始模型缓存、密钥、U 盘写入或删除逻辑。
-5. [待执行] 构建正式 EXE、生成 package manifest/checksum、用同一发布目录生成本地 USB 签名产物并做签名前后校验。
+3. [完成] 实施 Skill Hub 错误详情/来源尝试日志、模型快照同步、卸载独立报告目录与日志 fallback。
+4. [完成] 独立只读审计与全量回归；确认不包含原始模型缓存、密钥、U 盘写入或删除逻辑。
+5. [完成] 构建正式 EXE、生成 package manifest/checksum、用同一发布目录生成本地 USB 签名产物并做签名前后校验。
 
 Objective: 采用 USB 便携程序 + 本地用户数据方案，把 Codex 程序和 CCSwitch 载荷留在 U 盘，保留早期 AppX 状态的安全兼容清理，并完成可复制、可验证的一键发布目录。
 
