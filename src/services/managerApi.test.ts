@@ -93,7 +93,7 @@ describe("settings API", () => {
     expect(settings.disableCodexSelfUpdates).toBe(false);
     expect(settings.codexPayloadSourceKind).toBe("auto");
     expect(settings.codexPayloadBaseUrl).toBe(
-      "https://update.404token.xyz/__codex_update__/",
+      "https://codexapp.agentsmirror.com/",
     );
     expect(settings.codexPayloadRepo).toBe("");
   });

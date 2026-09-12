@@ -14,6 +14,10 @@ import type {
   CcswitchUninstallReport,
   CapabilityPackInstallOptions,
   CapabilityPackReport,
+  SkillRepoApplyReport,
+  SkillRepoExpected,
+  SkillRepoRollbackReport,
+  SkillRepoUpdateInfo,
   CodexUpdatePlatform,
   ConfigHealth,
   ConfigWhich,
@@ -50,6 +54,14 @@ export const SETTINGS_CHANGED_EVENT = "cam:settings-changed";
 const DEFAULT_PERIODIC_CHECK_INTERVAL_SECONDS = 15 * 60;
 const MIN_PERIODIC_CHECK_INTERVAL_SECONDS = 60;
 const MAX_PERIODIC_CHECK_INTERVAL_SECONDS = 7 * 24 * 60 * 60;
+const BROWSER_SKILL_REPO_ERROR = {
+  code: "unsupported_platform",
+  message: "Skill Hub update is unavailable in browser preview",
+} satisfies CommandError;
+
+function browserSkillRepoUnavailable(): Promise<never> {
+  return Promise.reject({ ...BROWSER_SKILL_REPO_ERROR });
+}
 
 export type ManagerUpdateCheck =
   | { kind: "development" }
@@ -118,7 +130,7 @@ function normalizedProxyMode(value: unknown): AppSettings["proxyMode"] {
 function normalizedCodexPayloadSourceKind(
   value: unknown,
 ): AppSettings["codexPayloadSourceKind"] {
-  return value === "relay" || value === "github" || value === "auto"
+  return value === "mirror" || value === "relay" || value === "github" || value === "auto"
     ? value
     : "auto";
 }
@@ -273,6 +285,12 @@ export function errorMessage(cause: unknown): string {
     }
   }
   return String(cause);
+}
+
+/** Optional backend detail kept separate from the primary localized message. */
+export function errorDetail(cause: unknown): string | null {
+  if (!isCommandError(cause)) return null;
+  return typeof cause.detail === "string" && cause.detail.trim() ? cause.detail : null;
 }
 
 /** Stable machine code from a backend `CommandError`, or null for other throwables. */
@@ -1788,11 +1806,16 @@ export const managerApi = {
         available: false,
         installed: false,
         success: false,
+        coreReady: false,
+        overallStatus: "failed",
         sourcePath: null,
         packVersion: null,
         skills: 0,
         agents: 0,
         runtimeReady: false,
+        runtimeStatus: "unknown",
+        configStatus: "unknown",
+        diagnosticsPath: null,
         feishuEnabled: false,
         enabledApiServices: [],
         message: "browser preview: capability pack status is unavailable",
@@ -1809,17 +1832,43 @@ export const managerApi = {
         available: false,
         installed: false,
         success: false,
+        coreReady: false,
+        overallStatus: "failed",
         sourcePath: null,
         packVersion: null,
         skills: 0,
         agents: 0,
         runtimeReady: false,
+        runtimeStatus: "unknown",
+        configStatus: "unknown",
+        diagnosticsPath: null,
         feishuEnabled: false,
         enabledApiServices: [],
         message: "browser preview: capability pack installation is unavailable",
       });
     }
     return invoke<CapabilityPackReport>("install_capability_pack", { options });
+  },
+  /** Inspect the independent unsigned Skill Hub overlay. */
+  skillRepoCheckUpdate(): Promise<SkillRepoUpdateInfo> {
+    if (!hasTauriRuntime()) {
+      return browserSkillRepoUnavailable();
+    }
+    return invoke<SkillRepoUpdateInfo>("skill_repo_check_update");
+  },
+  /** Apply the exact identity returned by skillRepoCheckUpdate. */
+  skillRepoApplyUpdate(expected: SkillRepoExpected): Promise<SkillRepoApplyReport> {
+    if (!hasTauriRuntime()) {
+      return browserSkillRepoUnavailable();
+    }
+    return invoke<SkillRepoApplyReport>("skill_repo_apply_update", { expected });
+  },
+  /** Roll back the last complete Skill Hub generation. */
+  skillRepoRollback(): Promise<SkillRepoRollbackReport> {
+    if (!hasTauriRuntime()) {
+      return browserSkillRepoUnavailable();
+    }
+    return invoke<SkillRepoRollbackReport>("skill_repo_rollback");
   },
   /** Read the local USB lease/watchdog snapshot (no mutation). */
   usbGuardStatus(): Promise<UsbGuardStatus> {
@@ -1833,6 +1882,9 @@ export const managerApi = {
         bundlePath: null,
         bundleRelativePath: null,
         signed: false,
+        signatureState: "not-applicable",
+        codexAllowed: false,
+        codexBlockReason: "browser preview: USB guard is unavailable",
         lastCheckedAtMs: Date.now(),
         missingSinceMs: null,
         countdownSeconds: null,

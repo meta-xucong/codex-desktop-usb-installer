@@ -72,6 +72,12 @@ export default tseslint.config(
     rules: { "@typescript-eslint/triple-slash-reference": "off" },
   },
   {
+    // Relay contract tests execute under Node and are intentionally kept next
+    // to the deployment fixtures rather than under the renderer source tree.
+    files: ["tools/skill-hub-relay-sync.test.mjs"],
+    languageOptions: { globals: { ...globals.node } },
+  },
+  {
     // Test files run under Vitest globals-free (imports describe/it/expect), but
     // use jsdom + node timers; allow both realms.
     files: ["src/**/*.test.{ts,tsx}", "vitest.setup.ts"],

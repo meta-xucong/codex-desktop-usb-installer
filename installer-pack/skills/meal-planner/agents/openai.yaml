@@ -1,0 +1,6 @@
+interface:
+  display_name: "饮食规划"
+  short_description: "根据健康目标、饮食偏好和现实约束，制定食谱、营养分析与购物清单。"
+  default_prompt: "Use $meal-planner to build a practical meal plan for my goals, preferences, and constraints."
+policy:
+  allow_implicit_invocation: false

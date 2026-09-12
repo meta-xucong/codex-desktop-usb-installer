@@ -1,0 +1,16 @@
+[package]
+name = "codex-usb-license"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+description = "Stable schema, signing, and bundle-anchor core for Codex USB licenses"
+
+[dependencies]
+base64 = "0.23"
+ed25519-dalek = "3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.11"
+thiserror = "2.0"
+uuid = { version = "1", features = ["v4"] }

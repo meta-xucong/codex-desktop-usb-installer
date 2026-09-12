@@ -111,7 +111,11 @@ describe("Settings runtime contract", () => {
     load.resolve(settings({ source: "mirror", periodicCheck: false }));
     await waitFor(() => expect(screen.queryByText("正在加载设置…")).not.toBeInTheDocument());
     expect(form).not.toHaveAttribute("inert");
-    expect(screen.getByRole("radio", { name: /镜像/ })).toHaveAttribute("aria-checked", "true");
+    expect(
+      within(screen.getByRole("radiogroup", { name: "更新源" })).getByRole("radio", {
+        name: /^镜像/,
+      }),
+    ).toHaveAttribute("aria-checked", "true");
   });
 
   it("does not persist empty custom source selection until a URL is entered", async () => {
@@ -425,11 +429,21 @@ describe("Settings runtime contract", () => {
     load.resolve(settings({ source: "auto" }));
     await waitFor(() => expect(screen.queryByText("正在加载设置…")).not.toBeInTheDocument());
 
-    await user.click(screen.getByRole("radio", { name: /镜像/ }));
-    await waitFor(() =>
-      expect(api.setSettings).toHaveBeenCalledWith(expect.objectContaining({ source: "mirror" })),
+    await user.click(
+      within(screen.getByRole("radiogroup", { name: "来源策略" })).getByRole("radio", {
+        name: /^国内镜像/,
+      }),
     );
-    expect(screen.getByRole("radio", { name: /镜像/ })).toHaveAttribute("aria-checked", "true");
+    await waitFor(() =>
+      expect(api.setSettings).toHaveBeenCalledWith(
+        expect.objectContaining({ codexPayloadSourceKind: "mirror" }),
+      ),
+    );
+    expect(
+      within(screen.getByRole("radiogroup", { name: "来源策略" })).getByRole("radio", {
+        name: /^国内镜像/,
+      }),
+    ).toHaveAttribute("aria-checked", "true");
   });
 
   it.each(SAFETY_FLOW_LANGS)(

@@ -1,0 +1,2013 @@
+{
+  "schemaVersion": 2,
+  "statuses": [
+    "ready",
+    "requires-runtime",
+    "requires-mcp",
+    "requires-credential",
+    "unsupported/disabled"
+  ],
+  "afterRemediationStatuses": [
+    "core-ready",
+    "auto-installable-runtime",
+    "guided-config",
+    "unsupported"
+  ],
+  "policy": {
+    "defaultInstall": "installByDefault=true only",
+    "implicitInvocation": "non-core-ready skills are disabled until enableWhen passes",
+    "dependencyModel": "Each dependency is an object; status never hides runtime, connection, credential, or capability closure.",
+    "pythonRuntime": {"platform": "win_amd64", "implementation": "cpython", "abi": "cp312", "version": "3.12.10", "materializationStatus": "ready", "installReady": true, "mediaManifest": "runtime/bundled/media-manifest.json", "wheelhouseManifest": "runtime/wheelhouse-manifest.json"}
+  },
+  "skills": [
+    {
+      "id": "academic-research",
+      "status": "ready",
+      "defaultEnabled": true,
+      "dependencies": [
+        {
+          "id": "capability.codex-web",
+          "kind": "capability",
+          "required": true,
+          "autoInstallable": false,
+          "healthCheck": "Codex web tool available or user supplied source",
+          "failureMessage": "没有网页能力时只处理用户提供的材料。"
+        }
+      ],
+      "capabilities": [
+        "学术检索策略",
+        "引用校验",
+        "研究设计"
+      ],
+      "installByDefault": true,
+      "afterRemediationStatus": "core-ready",
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "verification": {
+        "skillFile": "skills/academic-research/SKILL.md",
+        "windowsEntry": "Codex workflow / frontmatter",
+        "smoke": "frontmatter, pack-copy, and dependency health-check path"
+      },
+      "notes": ""
+    },
+    {
+      "id": "canvas",
+      "status": "unsupported/disabled",
+      "defaultEnabled": false,
+      "dependencies": [
+        {
+          "id": "external.host-specific-canvas-runtime",
+          "kind": "external",
+          "required": true,
+          "autoInstallable": false,
+          "healthCheck": "manual",
+          "failureMessage": "缺少外部依赖时安全失败。"
+        }
+      ],
+      "capabilities": [
+        "HTML 原型说明"
+      ],
+      "notes": "保持禁用：当前能力包没有可验证的远程 Canvas 节点/画布运行时；仅提供替代建议。",
+      "installByDefault": false,
+      "afterRemediationStatus": "unsupported",
+    "enableWhen": [
+      "disabled"
+      ],
+      "verification": {
+        "skillFile": "skills/canvas/SKILL.md",
+        "windowsEntry": "Codex workflow / frontmatter",
+        "smoke": "negative test: no compatible automatic entry point; must remain disabled"
+      }
+    },
+    {
+      "id": "china-stock-analysis",
+      "status": "requires-runtime",
+      "defaultEnabled": false,
+      "dependencies": [
+        {
+          "id": "runtime.python312",
+          "kind": "runtime",
+          "required": true,
+          "autoInstallable": true,
+          "minVersion": "3.12",
+          "lockedVersion": "3.12.10",
+          "abi": "cp312",
+          "platform": "win_amd64",
+          "healthCheck": "python-env-setup/scripts/check_python_env.ps1 -Json; require cpython-312/win_amd64",
+          "failureMessage": "需要安装 U 盘提供的 Python 3.12 per-user 运行时。"
+        },
+        {
+          "id": "python.package.akshare",
+          "kind": "python-package",
+          "required": true,
+          "autoInstallable": true,
+          "packageName": "akshare",
+          "importName": "akshare",
+          "lockedVersion": "1.18.94",
+          "healthCheck": "python -c \"import akshare\"",
+          "failureMessage": "离线 wheelhouse 未就绪时，明确报告缺少包，不伪造结果。"
+        },
+        {
+          "id": "python.package.pandas",
+          "kind": "python-package",
+          "required": true,
+          "autoInstallable": true,
+          "packageName": "pandas",
+          "importName": "pandas",
+          "lockedVersion": "3.0.5",
+          "healthCheck": "python -c \"import pandas\"",
+          "failureMessage": "离线 wheelhouse 未就绪时，明确报告缺少包，不伪造结果。"
+        },
+        {
+          "id": "python.package.numpy",
+          "kind": "python-package",
+          "required": true,
+          "autoInstallable": true,
+          "packageName": "numpy",
+          "importName": "numpy",
+          "lockedVersion": "2.5.2",
+          "healthCheck": "python -c \"import numpy\"",
+          "failureMessage": "离线 wheelhouse 未就绪时，明确报告缺少包，不伪造结果。"
+        }
+      ],
+      "capabilities": [
+        "A 股行情",
+        "财务分析",
+        "估值与筛选"
+      ],
+      "installByDefault": false,
+      "afterRemediationStatus": "auto-installable-runtime",
+      "enableWhen": [
+        "skill-installed",
+        "runtime-healthy"
+      ],
+      "verification": {
+        "skillFile": "skills/china-stock-analysis/SKILL.md",
+        "windowsEntry": "data_fetcher.py --help; financial_analyzer.py --help; realtime_quote.py --help; stock_screener.py --help; technical_analysis.py --help; valuation_calculator.py --help",
+      "smoke": "frontmatter, pack-copy, dependency health-check path, provider-failure closure, provenance, neutral financial analysis, and fake AkShare no-network contract tests"
+    },
+    "notes": "行情缓存已迁移到项目 CODEX_DATA_DIR/CHINA_STOCK_CACHE_DIR，按代码与允许的数据类型生成路径且只缓存完整结果；实时和 AkShare 数据入口记录来源/时点/完整性并对全量或部分失败返回非零状态。技术分析不再模拟行情或生成交易信号；财务分析和报告模板已删除固定评级、综合分、排名、目标价与行业均值占位。筛选和估值只执行实际字段或显式、可归因假设。"
+    },
+    {
+      "id": "competitor-intelligence",
+      "status": "ready",
+      "defaultEnabled": true,
+      "dependencies": [
+        {
+          "id": "capability.codex-web",
+          "kind": "capability",
+          "required": true,
+          "autoInstallable": false,
+          "healthCheck": "Codex web tool available or user supplied source",
+          "failureMessage": "没有网页能力时只处理用户提供的材料。"
+        }
+      ],
+      "capabilities": [
+        "竞品矩阵",
+        "定价与模式分析",
+        "差异化建议"
+      ],
+      "installByDefault": true,
+      "afterRemediationStatus": "core-ready",
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "verification": {
+        "skillFile": "skills/competitor-intelligence/SKILL.md",
+        "windowsEntry": "Codex workflow / frontmatter",
+        "smoke": "frontmatter, pack-copy, and dependency health-check path"
+      },
+      "notes": ""
+    },
+    {
+      "id": "conversion-optimizer",
+      "status": "ready",
+      "defaultEnabled": true,
+      "dependencies": [],
+      "capabilities": [
+        "销售话术",
+        "页面转化",
+        "行动召唤"
+      ],
+      "installByDefault": true,
+      "afterRemediationStatus": "core-ready",
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "verification": {
+        "skillFile": "skills/conversion-optimizer/SKILL.md",
+        "windowsEntry": "Codex workflow / frontmatter",
+        "smoke": "frontmatter, pack-copy, and dependency health-check path"
+      },
+      "notes": ""
+    },
+    {
+      "id": "daily-reflection",
+      "status": "ready",
+      "defaultEnabled": true,
+      "dependencies": [
+        {
+          "id": "runtime.python312",
+          "kind": "runtime",
+          "required": false,
+          "autoInstallable": true,
+          "minVersion": "3.12",
+          "lockedVersion": "3.12.10",
+          "abi": "cp312",
+          "platform": "win_amd64",
+          "healthCheck": "python-env-setup/scripts/check_python_env.ps1 -Json; require cpython-312/win_amd64",
+          "failureMessage": "可先使用 Codex 原生工作流；启用本地脚本时再安装 Python。"
+        }
+      ],
+      "capabilities": [
+        "每日复盘",
+        "目标追踪",
+        "习惯与情绪记录"
+      ],
+      "installByDefault": true,
+      "afterRemediationStatus": "core-ready",
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "verification": {
+        "skillFile": "skills/daily-reflection/SKILL.md",
+        "windowsEntry": "skills/daily-reflection/scripts/reflection.ps1 health",
+        "smoke": "PowerShell JSONL log/summary round-trip"
+      },
+      "notes": "核心复盘使用 Codex 项目文件与 PowerShell JSONL；原 Python 数据库脚本只作为可选兼容增强，其月度主题字段已改为确定性的用户短语频次提取，不再占位返回空结果。"
+    },
+    {
+      "id": "data-assistant",
+      "status": "requires-runtime",
+      "defaultEnabled": false,
+      "dependencies": [
+        {
+          "id": "runtime.python312",
+          "kind": "runtime",
+          "required": true,
+          "autoInstallable": true,
+          "minVersion": "3.12",
+          "lockedVersion": "3.12.10",
+          "abi": "cp312",
+          "platform": "win_amd64",
+          "healthCheck": "python-env-setup/scripts/check_python_env.ps1 -Json; require cpython-312/win_amd64",
+          "failureMessage": "需要安装 U 盘提供的 Python 3.12 per-user 运行时。"
+        },
+        {
+          "id": "python.package.openpyxl",
+          "kind": "python-package",
+          "required": true,
+          "autoInstallable": true,
+          "packageName": "openpyxl",
+          "importName": "openpyxl",
+          "lockedVersion": "3.1.5",
+          "healthCheck": "python -c \"import openpyxl\"",
+          "failureMessage": "离线 wheelhouse 未就绪时，明确报告缺少包，不伪造结果。"
+        },
+        {
+          "id": "python.package.pandas",
+          "kind": "python-package",
+          "required": true,
+          "autoInstallable": true,
+          "packageName": "pandas",
+          "importName": "pandas",
+          "lockedVersion": "3.0.5",
+          "healthCheck": "python -c \"import pandas\"",
+          "failureMessage": "离线 wheelhouse 未就绪时，明确报告缺少包，不伪造结果。"
+        },
+        {
+          "id": "python.package.matplotlib",
+          "kind": "python-package",
+          "required": true,
+          "autoInstallable": true,
+          "packageName": "matplotlib",
+          "importName": "matplotlib",
+          "lockedVersion": "3.11.1",
+          "healthCheck": "python -c \"import matplotlib\"",
+          "failureMessage": "离线 wheelhouse 未就绪时，明确报告缺少包，不伪造结果。"
+        },
+        {
+          "id": "python.package.pypdf",
+          "kind": "python-package",
+          "required": true,
+          "autoInstallable": true,
+          "packageName": "pypdf",
+          "importName": "pypdf",
+          "lockedVersion": "6.17.0",
+          "healthCheck": "python -c \"import pypdf\"",
+          "failureMessage": "离线 wheelhouse 未就绪时，明确报告缺少包，不伪造结果。"
+        }
+      ],
+      "capabilities": [
+        "表格分析",
+        "数据清洗",
+        "图表与 PDF 提取"
+      ],
+      "installByDefault": false,
+      "afterRemediationStatus": "auto-installable-runtime",
+      "enableWhen": [
+        "skill-installed",
+        "runtime-healthy"
+      ],
+      "verification": {
+        "skillFile": "skills/data-assistant/SKILL.md",
+        "windowsEntry": "Codex workflow / frontmatter",
+        "smoke": "frontmatter, pack-copy, and dependency health-check path"
+      },
+      "notes": ""
+    },
+    {
+      "id": "docx-butler",
+      "status": "requires-runtime",
+      "defaultEnabled": false,
+      "dependencies": [
+        {
+          "id": "runtime.python312",
+          "kind": "runtime",
+          "required": true,
+          "autoInstallable": true,
+          "minVersion": "3.12",
+          "lockedVersion": "3.12.10",
+          "abi": "cp312",
+          "platform": "win_amd64",
+          "healthCheck": "python-env-setup/scripts/check_python_env.ps1 -Json; require cpython-312/win_amd64",
+          "failureMessage": "需要安装 U 盘提供的 Python 3.12 per-user 运行时。"
+        },
+        {
+          "id": "python.package.python-docx",
+          "kind": "python-package",
+          "required": true,
+          "autoInstallable": true,
+          "packageName": "python-docx",
+          "importName": "docx",
+          "lockedVersion": "1.2.0",
+          "healthCheck": "python -c \"import docx\"",
+          "failureMessage": "离线 wheelhouse 未就绪时，明确报告缺少包，不伪造结果。"
+        },
+        {
+          "id": "python.package.python-pptx",
+          "kind": "python-package",
+          "required": true,
+          "autoInstallable": true,
+          "packageName": "python-pptx",
+          "importName": "pptx",
+          "lockedVersion": "1.0.2",
+          "healthCheck": "python -c \"import pptx\"",
+          "failureMessage": "离线 wheelhouse 未就绪时，明确报告缺少包，不伪造结果。"
+        },
+        {
+          "id": "python.package.reportlab",
+          "kind": "python-package",
+          "required": true,
+          "autoInstallable": true,
+          "packageName": "reportlab",
+          "importName": "reportlab",
+          "lockedVersion": "5.0.1",
+          "healthCheck": "python -c \"import reportlab\"",
+          "failureMessage": "离线 wheelhouse 未就绪时，明确报告缺少包，不伪造结果。"
+        }
+      ],
+      "capabilities": [
+        "文档排版",
+        "格式转换",
+        "演示稿结构"
+      ],
+      "installByDefault": false,
+      "afterRemediationStatus": "auto-installable-runtime",
+      "enableWhen": [
+        "skill-installed",
+        "runtime-healthy"
+      ],
+      "verification": {
+        "skillFile": "skills/docx-butler/SKILL.md",
+        "windowsEntry": "Codex workflow / frontmatter",
+        "smoke": "frontmatter, pack-copy, and dependency health-check path"
+      },
+      "notes": ""
+    },
+    {
+      "id": "efficiency-toolkit",
+      "status": "ready",
+      "defaultEnabled": true,
+      "dependencies": [],
+      "capabilities": [
+        "文件整理方案",
+        "笔记与待办",
+        "时间规划"
+      ],
+      "installByDefault": true,
+      "afterRemediationStatus": "core-ready",
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "verification": {
+        "skillFile": "skills/efficiency-toolkit/SKILL.md",
+        "windowsEntry": "Codex workflow / frontmatter",
+        "smoke": "frontmatter, pack-copy, and dependency health-check path"
+      },
+      "notes": ""
+    },
+    {
+      "id": "email-expert",
+      "status": "ready",
+      "defaultEnabled": true,
+      "dependencies": [],
+      "capabilities": [
+        "商务邮件",
+        "模板",
+        "跟进与语气优化"
+      ],
+      "installByDefault": true,
+      "afterRemediationStatus": "core-ready",
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "verification": {
+        "skillFile": "skills/email-expert/SKILL.md",
+        "windowsEntry": "Codex workflow / frontmatter",
+        "smoke": "frontmatter, pack-copy, and dependency health-check path"
+      },
+      "notes": ""
+    },
+    {
+      "id": "excel-xlsx",
+      "status": "requires-runtime",
+      "defaultEnabled": false,
+      "dependencies": [
+        {
+          "id": "runtime.python312",
+          "kind": "runtime",
+          "required": true,
+          "autoInstallable": true,
+          "minVersion": "3.12",
+          "lockedVersion": "3.12.10",
+          "abi": "cp312",
+          "platform": "win_amd64",
+          "healthCheck": "python-env-setup/scripts/check_python_env.ps1 -Json; require cpython-312/win_amd64",
+          "failureMessage": "需要安装 U 盘提供的 Python 3.12 per-user 运行时。"
+        },
+        {
+          "id": "python.package.openpyxl",
+          "kind": "python-package",
+          "required": true,
+          "autoInstallable": true,
+          "packageName": "openpyxl",
+          "importName": "openpyxl",
+          "lockedVersion": "3.1.5",
+          "healthCheck": "python -c \"import openpyxl\"",
+          "failureMessage": "离线 wheelhouse 未就绪时，明确报告缺少包，不伪造结果。"
+        }
+      ],
+      "capabilities": [
+        "Excel 读写",
+        "公式与日期",
+        "工作簿生成"
+      ],
+      "installByDefault": false,
+      "afterRemediationStatus": "auto-installable-runtime",
+      "enableWhen": [
+        "skill-installed",
+        "runtime-healthy"
+      ],
+      "verification": {
+        "skillFile": "skills/excel-xlsx/SKILL.md",
+        "windowsEntry": "Codex workflow / frontmatter",
+        "smoke": "frontmatter, pack-copy, and dependency health-check path"
+      },
+      "notes": ""
+    },
+    {
+      "id": "feishu-doc",
+      "status": "requires-mcp",
+      "defaultEnabled": false,
+      "dependencies": [
+        {
+          "id": "mcp.feishu",
+          "kind": "mcp",
+          "required": true,
+          "autoInstallable": false,
+          "healthCheck": "codex mcp list; read-only Feishu tool probe",
+          "failureMessage": "飞书连接未健康时只提供操作步骤，不声称已读写飞书。"
+        }
+      ],
+      "capabilities": [
+        "飞书文档标题、纯文本和块结构读取"
+      ],
+      "notes": "已适配官方 Lark MCP dot-case 工具；当前锁定版本按官方限制保持文档只读，不承诺直接编辑或上传下载。",
+      "installByDefault": false,
+      "afterRemediationStatus": "guided-config",
+      "enableWhen": [
+        "skill-installed",
+        "mcp.feishu.healthy"
+      ],
+      "verification": {
+        "skillFile": "skills/feishu-doc/SKILL.md",
+        "windowsEntry": "Codex workflow / frontmatter",
+        "smoke": "frontmatter, pack-copy, and dependency health-check path"
+      }
+    },
+    {
+      "id": "feishu-drive",
+      "status": "requires-mcp",
+      "defaultEnabled": false,
+      "dependencies": [
+        {
+          "id": "mcp.feishu",
+          "kind": "mcp",
+          "required": true,
+          "autoInstallable": false,
+          "healthCheck": "codex mcp list; read-only Feishu tool probe",
+          "failureMessage": "飞书连接未健康时只提供操作步骤，不声称已读写飞书。"
+        }
+      ],
+      "capabilities": [
+        "飞书云盘浏览、元数据和受控文件管理"
+      ],
+      "notes": "已适配官方 Lark MCP dot-case 工具；文件上传下载保持不支持，写操作受 Codex 审批策略约束。",
+      "installByDefault": false,
+      "afterRemediationStatus": "guided-config",
+      "enableWhen": [
+        "skill-installed",
+        "mcp.feishu.healthy"
+      ],
+      "verification": {
+        "skillFile": "skills/feishu-drive/SKILL.md",
+        "windowsEntry": "Codex workflow / frontmatter",
+        "smoke": "frontmatter, pack-copy, and dependency health-check path"
+      }
+    },
+    {
+      "id": "feishu-perm",
+      "status": "requires-mcp",
+      "defaultEnabled": false,
+      "dependencies": [
+        {
+          "id": "mcp.feishu",
+          "kind": "mcp",
+          "required": true,
+          "autoInstallable": false,
+          "healthCheck": "codex mcp list; read-only Feishu tool probe",
+          "failureMessage": "飞书连接未健康时只提供操作步骤，不声称已读写飞书。"
+        }
+      ],
+      "capabilities": [
+        "飞书文件权限"
+      ],
+      "notes": "已适配官方 Lark MCP 权限工具；移除协作者和转移所有者属于高风险显式写操作。",
+      "installByDefault": false,
+      "afterRemediationStatus": "guided-config",
+      "enableWhen": [
+        "skill-installed",
+        "mcp.feishu.healthy"
+      ],
+      "verification": {
+        "skillFile": "skills/feishu-perm/SKILL.md",
+        "windowsEntry": "Codex workflow / frontmatter",
+        "smoke": "frontmatter, pack-copy, and dependency health-check path"
+      }
+    },
+    {
+      "id": "feishu-wiki",
+      "status": "requires-mcp",
+      "defaultEnabled": false,
+      "dependencies": [
+        {
+          "id": "mcp.feishu",
+          "kind": "mcp",
+          "required": true,
+          "autoInstallable": false,
+          "healthCheck": "codex mcp list; read-only Feishu tool probe",
+          "failureMessage": "飞书连接未健康时只提供操作步骤，不声称已读写飞书。"
+        }
+      ],
+      "capabilities": [
+        "飞书知识库导航和受控节点管理"
+      ],
+      "notes": "已适配官方 Lark MCP dot-case Wiki 工具；页面正文读取委托 feishu-doc，正文编辑不在当前范围。",
+      "installByDefault": false,
+      "afterRemediationStatus": "guided-config",
+      "enableWhen": [
+        "skill-installed",
+        "mcp.feishu.healthy"
+      ],
+      "verification": {
+        "skillFile": "skills/feishu-wiki/SKILL.md",
+        "windowsEntry": "Codex workflow / frontmatter",
+        "smoke": "frontmatter, pack-copy, and dependency health-check path"
+      }
+    },
+    {
+      "id": "fitness-coach",
+      "status": "requires-runtime",
+      "defaultEnabled": false,
+      "dependencies": [
+        {
+          "id": "runtime.python312",
+          "kind": "runtime",
+          "required": true,
+          "autoInstallable": true,
+          "minVersion": "3.12",
+          "lockedVersion": "3.12.10",
+          "abi": "cp312",
+          "platform": "win_amd64",
+          "healthCheck": "python-env-setup/scripts/check_python_env.ps1 -Json; require cpython-312/win_amd64",
+          "failureMessage": "需要安装 U 盘提供的 Python 3.12 per-user 运行时。"
+        }
+      ],
+      "capabilities": [
+        "训练计划",
+        "动作与周期",
+        "进度记录"
+      ],
+      "installByDefault": false,
+      "afterRemediationStatus": "auto-installable-runtime",
+      "enableWhen": [
+        "skill-installed",
+        "runtime-healthy"
+      ],
+      "verification": {
+        "skillFile": "skills/fitness-coach/SKILL.md",
+        "windowsEntry": "fitness_db.py --help; program_generator.py --help",
+        "smoke": "frontmatter, pack-copy, and dependency health-check path"
+      },
+      "notes": ""
+    },
+    {
+      "id": "fund-portfolio",
+      "status": "requires-runtime",
+      "defaultEnabled": false,
+      "dependencies": [
+        {
+          "id": "runtime.python312",
+          "kind": "runtime",
+          "required": true,
+          "autoInstallable": true,
+          "minVersion": "3.12",
+          "lockedVersion": "3.12.10",
+          "abi": "cp312",
+          "platform": "win_amd64",
+          "healthCheck": "python-env-setup/scripts/check_python_env.ps1 -Json; require cpython-312/win_amd64",
+          "failureMessage": "需要安装 U 盘提供的 Python 3.12 per-user 运行时。"
+        },
+        {
+          "id": "python.package.akshare",
+          "kind": "python-package",
+          "required": true,
+          "autoInstallable": true,
+          "packageName": "akshare",
+          "importName": "akshare",
+          "lockedVersion": "1.18.94",
+          "healthCheck": "python -c \"import akshare\"",
+          "failureMessage": "离线 wheelhouse 未就绪时，明确报告缺少包，不伪造结果。"
+        },
+        {
+          "id": "python.package.pandas",
+          "kind": "python-package",
+          "required": true,
+          "autoInstallable": true,
+          "packageName": "pandas",
+          "importName": "pandas",
+          "lockedVersion": "3.0.5",
+          "healthCheck": "python -c \"import pandas\"",
+          "failureMessage": "离线 wheelhouse 未就绪时，明确报告缺少包，不伪造结果。"
+        },
+        {
+          "id": "python.package.numpy",
+          "kind": "python-package",
+          "required": true,
+          "autoInstallable": true,
+          "packageName": "numpy",
+          "importName": "numpy",
+          "lockedVersion": "2.5.2",
+          "healthCheck": "python -c \"import numpy\"",
+          "failureMessage": "离线 wheelhouse 未就绪时，明确报告缺少包，不伪造结果。"
+        },
+        {
+          "id": "python.package.matplotlib",
+          "kind": "python-package",
+          "required": true,
+          "autoInstallable": true,
+          "packageName": "matplotlib",
+          "importName": "matplotlib",
+          "lockedVersion": "3.11.1",
+          "healthCheck": "python -c \"import matplotlib\"",
+          "failureMessage": "离线 wheelhouse 未就绪时，明确报告缺少包，不伪造结果。"
+        }
+      ],
+      "capabilities": [
+        "基金筛选",
+        "组合配置",
+        "定投与风险"
+      ],
+      "installByDefault": false,
+      "afterRemediationStatus": "auto-installable-runtime",
+      "enableWhen": [
+        "skill-installed",
+        "runtime-healthy"
+      ],
+      "verification": {
+        "skillFile": "skills/fund-portfolio/SKILL.md",
+        "windowsEntry": "fund_screener.py --help; portfolio_builder.py --help; risk_assessor.py --help; sip_calculator.py --help",
+      "smoke": "frontmatter, pack-copy, dependency health-check path, provider-failure closure, explicit scenario, neutral risk, and user-note labelling contract tests"
+    },
+    "notes": "筛选器只暴露 AkShare 排行接口实际读取的基金类型及 1/3 年收益字段，接口失败非零退出。配置构建器要求带来源的用户审阅模型，只换算金额并保留 fund_type_notes 原标签；定投只比较显式收益场景。风险评估器删除硬编码波动率、风险评级、适配人群和调仓/止损建议，要求完整来源、时点与场景参数。"
+    },
+    {
+      "id": "growth-analyst",
+      "status": "ready",
+      "defaultEnabled": true,
+      "dependencies": [],
+      "capabilities": [
+        "指标体系",
+        "增长复盘",
+        "实验迭代"
+      ],
+      "installByDefault": true,
+      "afterRemediationStatus": "core-ready",
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "verification": {
+        "skillFile": "skills/growth-analyst/SKILL.md",
+        "windowsEntry": "Codex workflow / frontmatter",
+        "smoke": "frontmatter, pack-copy, and dependency health-check path"
+      },
+      "notes": ""
+    },
+    {
+      "id": "healthcheck",
+      "status": "unsupported/disabled",
+      "defaultEnabled": false,
+      "dependencies": [
+        {
+          "id": "external.windows-security-admin-tools",
+          "kind": "external",
+          "required": true,
+          "autoInstallable": false,
+          "healthCheck": "manual",
+          "failureMessage": "缺少外部依赖时安全失败。"
+        }
+      ],
+      "capabilities": [
+        "主机安全检查说明"
+      ],
+      "notes": "保持禁用：主机加固涉及管理员权限、策略和外部设备状态，不能用静态 Skill 冒充审计结果。",
+      "installByDefault": false,
+      "afterRemediationStatus": "unsupported",
+      "enableWhen": [
+        "disabled"
+      ],
+      "verification": {
+        "skillFile": "skills/healthcheck/SKILL.md",
+        "windowsEntry": "Codex workflow / frontmatter",
+        "smoke": "negative test: no compatible automatic entry point; must remain disabled"
+      }
+    },
+    {
+      "id": "image-2",
+      "status": "requires-credential",
+      "defaultEnabled": false,
+      "dependencies": [
+        {
+          "id": "runtime.python312",
+          "kind": "runtime",
+          "required": true,
+          "autoInstallable": true,
+          "minVersion": "3.12",
+          "lockedVersion": "3.12.10",
+          "abi": "cp312",
+          "platform": "win_amd64",
+          "healthCheck": "python-env-setup/scripts/check_python_env.ps1 -Json; require cpython-312/win_amd64",
+          "failureMessage": "需要安装 U 盘提供的 Python 3.12 per-user 运行时。"
+        },
+        {
+          "id": "api.image-2",
+          "kind": "api-service",
+          "required": true,
+          "autoInstallable": false,
+        "healthCheck": "IMAGE_2_API_BASE_URL is a root HTTPS URL; IMAGE_2_MODEL and IMAGE_2_AGENT_ID are explicit; offline adapter tests pass",
+        "failureMessage": "未配置图像模型或网关路由 ID 时不生成清单；未配置端点或专用凭据时不提交任务。"
+        },
+        {
+          "id": "credential.image-2-api-key",
+          "kind": "credential",
+          "required": true,
+          "autoInstallable": false,
+          "secret": true,
+          "healthCheck": "IMAGE_2_API_KEY non-empty",
+          "failureMessage": "未配置凭据时不触发计费请求。"
+        }
+      ],
+      "capabilities": [
+        "异步文生图",
+        "图生图",
+        "两阶段确认"
+      ],
+      "installByDefault": false,
+      "afterRemediationStatus": "guided-config",
+      "enableWhen": [
+        "skill-installed",
+        "runtime.python312",
+        "api.image-2",
+        "credential.image-2-api-key"
+      ],
+      "verification": {
+        "skillFile": "skills/image-2/SKILL.md",
+        "windowsEntry": "image_2_gen.py --help; missing credentials exits safely",
+        "smoke": "frontmatter, pack-copy, and dependency health-check path"
+      },
+    "notes": "专用 API Key 不回退到 OPENAI_API_KEY；外部 agent-id 不是 Codex 任务 ID。远程参考图受 HTTPS、公网地址、重定向和 25MB 限制，本地参考图按 SHA-256 锁定。"
+    },
+    {
+      "id": "image-prompt-generator",
+      "status": "ready",
+      "defaultEnabled": true,
+      "dependencies": [],
+      "capabilities": [
+        "结构化图片提示词",
+        "信息图与场景设计"
+      ],
+      "installByDefault": true,
+      "afterRemediationStatus": "core-ready",
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "verification": {
+        "skillFile": "skills/image-prompt-generator/SKILL.md",
+        "windowsEntry": "Codex workflow / frontmatter",
+        "smoke": "frontmatter, pack-copy, and dependency health-check path"
+      },
+      "notes": "提示词生成不依赖图像服务；用户明确要求实际图片时优先使用 Codex 原生图像能力，外部 image-2 仅显式调用。"
+    },
+    {
+      "id": "industry-analysis",
+      "status": "ready",
+      "defaultEnabled": true,
+      "dependencies": [
+        {
+          "id": "capability.codex-web",
+          "kind": "capability",
+          "required": true,
+          "autoInstallable": false,
+          "healthCheck": "Codex web tool available or user supplied source",
+          "failureMessage": "没有网页能力时只处理用户提供的材料。"
+        }
+      ],
+      "capabilities": [
+        "产业链",
+        "政策与趋势",
+        "竞争格局"
+      ],
+      "installByDefault": true,
+      "afterRemediationStatus": "core-ready",
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "verification": {
+        "skillFile": "skills/industry-analysis/SKILL.md",
+        "windowsEntry": "Codex workflow / frontmatter",
+        "smoke": "frontmatter, pack-copy, and dependency health-check path"
+      },
+      "notes": ""
+    },
+    {
+      "id": "macro-research",
+      "status": "requires-runtime",
+      "defaultEnabled": false,
+      "dependencies": [
+        {
+          "id": "runtime.python312",
+          "kind": "runtime",
+          "required": true,
+          "autoInstallable": true,
+          "minVersion": "3.12",
+          "lockedVersion": "3.12.10",
+          "abi": "cp312",
+          "platform": "win_amd64",
+          "healthCheck": "python-env-setup/scripts/check_python_env.ps1 -Json; require cpython-312/win_amd64",
+          "failureMessage": "需要安装 U 盘提供的 Python 3.12 per-user 运行时。"
+        },
+        {
+          "id": "python.package.pandas",
+          "kind": "python-package",
+          "required": true,
+          "autoInstallable": true,
+          "packageName": "pandas",
+          "importName": "pandas",
+          "lockedVersion": "3.0.5",
+          "healthCheck": "python -c \"import pandas\"",
+          "failureMessage": "离线 wheelhouse 未就绪时，明确报告缺少包，不伪造结果。"
+        },
+        {
+          "id": "python.package.numpy",
+          "kind": "python-package",
+          "required": true,
+          "autoInstallable": true,
+          "packageName": "numpy",
+          "importName": "numpy",
+          "lockedVersion": "2.5.2",
+          "healthCheck": "python -c \"import numpy\"",
+          "failureMessage": "离线 wheelhouse 未就绪时，明确报告缺少包，不伪造结果。"
+        },
+        {
+          "id": "python.package.matplotlib",
+          "kind": "python-package",
+          "required": true,
+          "autoInstallable": true,
+          "packageName": "matplotlib",
+          "importName": "matplotlib",
+          "lockedVersion": "3.11.1",
+          "healthCheck": "python -c \"import matplotlib\"",
+          "failureMessage": "离线 wheelhouse 未就绪时，明确报告缺少包，不伪造结果。"
+        }
+      ],
+      "capabilities": [
+        "周期判断",
+        "政策解读",
+        "资产配置框架"
+      ],
+      "installByDefault": false,
+      "afterRemediationStatus": "auto-installable-runtime",
+      "enableWhen": [
+        "skill-installed",
+        "runtime-healthy"
+      ],
+      "verification": {
+        "skillFile": "skills/macro-research/SKILL.md",
+        "windowsEntry": "cycle_analyzer.py --help; policy_analyzer.py --help; sentiment_monitor.py --help",
+      "smoke": "frontmatter, pack-copy, dependency health-check path, explicit cycle-rule, policy-evidence, sentiment-weight, and neutral-output contract tests"
+    },
+    "notes": "周期阶段只由显式增长/通胀变化和用户审阅规则场景计算；政策分析要求原文证据、传导依据和条件场景。情绪监控删除固定 mock 指标、情绪档位和仓位建议，并要求六项完整指标、显式合计为 1 的权重、数据时点和来源；缺字段时非零退出。"
+    },
+    {
+      "id": "market-sizing-analysis",
+      "status": "ready",
+      "defaultEnabled": true,
+      "dependencies": [
+        {
+          "id": "capability.codex-web",
+          "kind": "capability",
+          "required": true,
+          "autoInstallable": false,
+          "healthCheck": "Codex web tool available or user supplied source",
+          "failureMessage": "没有网页能力时只处理用户提供的材料。"
+        }
+      ],
+      "capabilities": [
+        "TAM/SAM/SOM",
+        "市场模型",
+        "口径与假设"
+      ],
+      "installByDefault": true,
+      "afterRemediationStatus": "core-ready",
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "verification": {
+        "skillFile": "skills/market-sizing-analysis/SKILL.md",
+        "windowsEntry": "Codex workflow / frontmatter",
+        "smoke": "frontmatter, pack-copy, and dependency health-check path"
+      },
+      "notes": ""
+    },
+    {
+      "id": "meal-planner",
+      "status": "requires-runtime",
+      "defaultEnabled": false,
+      "dependencies": [
+        {
+          "id": "runtime.python312",
+          "kind": "runtime",
+          "required": true,
+          "autoInstallable": true,
+          "minVersion": "3.12",
+          "lockedVersion": "3.12.10",
+          "abi": "cp312",
+          "platform": "win_amd64",
+          "healthCheck": "python-env-setup/scripts/check_python_env.ps1 -Json; require cpython-312/win_amd64",
+          "failureMessage": "需要安装 U 盘提供的 Python 3.12 per-user 运行时。"
+        }
+      ],
+      "capabilities": [
+        "食谱",
+        "营养分析",
+        "购物清单"
+      ],
+      "installByDefault": false,
+      "afterRemediationStatus": "auto-installable-runtime",
+      "enableWhen": [
+        "skill-installed",
+        "runtime-healthy"
+      ],
+      "verification": {
+        "skillFile": "skills/meal-planner/SKILL.md",
+        "windowsEntry": "meal_db.py --help; recipe_generator.py --help",
+        "smoke": "frontmatter, pack-copy, and dependency health-check path"
+      },
+      "notes": ""
+    },
+    {
+      "id": "meeting-secretary",
+      "status": "ready",
+      "defaultEnabled": true,
+      "dependencies": [],
+      "capabilities": [
+        "会议纪要",
+        "决定与行动项",
+        "议程"
+      ],
+      "installByDefault": true,
+      "afterRemediationStatus": "core-ready",
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "verification": {
+        "skillFile": "skills/meeting-secretary/SKILL.md",
+        "windowsEntry": "Codex workflow / frontmatter",
+        "smoke": "frontmatter, pack-copy, and dependency health-check path"
+      },
+      "notes": ""
+    },
+    {
+      "id": "multi-search-engine",
+      "status": "ready",
+      "defaultEnabled": true,
+      "dependencies": [
+        {
+          "id": "capability.codex-web",
+          "kind": "capability",
+          "required": true,
+          "autoInstallable": false,
+          "healthCheck": "Codex web tool available or user supplied source",
+          "failureMessage": "没有网页能力时只处理用户提供的材料。"
+        }
+      ],
+      "capabilities": [
+        "多来源检索",
+        "查询拆解",
+        "证据交叉验证"
+      ],
+      "installByDefault": true,
+      "afterRemediationStatus": "core-ready",
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "verification": {
+        "skillFile": "skills/multi-search-engine/SKILL.md",
+        "windowsEntry": "Codex workflow / frontmatter",
+        "smoke": "frontmatter, pack-copy, and dependency health-check path"
+      },
+      "notes": ""
+    },
+    {
+      "id": "node-connect",
+      "status": "unsupported/disabled",
+      "defaultEnabled": false,
+      "dependencies": [
+        {
+          "id": "external.device-pairing-runtime",
+          "kind": "external",
+          "required": true,
+          "autoInstallable": false,
+          "healthCheck": "manual",
+          "failureMessage": "缺少外部依赖时安全失败。"
+        }
+      ],
+      "capabilities": [
+        "连接问题排查说明"
+      ],
+      "notes": "保持禁用：设备配对协议与节点后端不在本能力包可验证边界内。",
+      "installByDefault": false,
+      "afterRemediationStatus": "unsupported",
+      "enableWhen": [
+        "disabled"
+      ],
+      "verification": {
+        "skillFile": "skills/node-connect/SKILL.md",
+        "windowsEntry": "Codex workflow / frontmatter",
+        "smoke": "negative test: no compatible automatic entry point; must remain disabled"
+      }
+    },
+    {
+      "id": "offer-designer",
+      "status": "ready",
+      "defaultEnabled": true,
+      "dependencies": [],
+      "capabilities": [
+        "产品定位",
+        "Offer 设计",
+        "定价与商业模式"
+      ],
+      "installByDefault": true,
+      "afterRemediationStatus": "core-ready",
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "verification": {
+        "skillFile": "skills/offer-designer/SKILL.md",
+        "windowsEntry": "Codex workflow / frontmatter",
+        "smoke": "frontmatter, pack-copy, and dependency health-check path"
+      },
+      "notes": ""
+    },
+    {
+      "id": "painpoint-analyzer",
+      "status": "ready",
+      "defaultEnabled": true,
+      "dependencies": [],
+      "capabilities": [
+        "痛点挖掘",
+        "需求分层",
+        "机会判断"
+      ],
+      "installByDefault": true,
+      "afterRemediationStatus": "core-ready",
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "verification": {
+        "skillFile": "skills/painpoint-analyzer/SKILL.md",
+        "windowsEntry": "Codex workflow / frontmatter",
+        "smoke": "frontmatter, pack-copy, and dependency health-check path"
+      },
+      "notes": ""
+    },
+    {
+      "id": "pdf-processing-toolkit",
+      "status": "unsupported/disabled",
+      "defaultEnabled": false,
+      "dependencies": [
+        {
+          "id": "runtime.python312",
+          "kind": "runtime",
+          "required": true,
+          "autoInstallable": true,
+          "minVersion": "3.12",
+          "lockedVersion": "3.12.10",
+          "abi": "cp312",
+          "platform": "win_amd64",
+          "healthCheck": "python-env-setup/scripts/check_python_env.ps1 -Json; require cpython-312/win_amd64",
+          "failureMessage": "需要安装 U 盘提供的 Python 3.12 per-user 运行时。"
+        },
+        {
+          "id": "python.package.pypdf",
+          "kind": "python-package",
+          "required": true,
+          "autoInstallable": true,
+          "packageName": "pypdf",
+          "importName": "pypdf",
+          "lockedVersion": "6.17.0",
+          "healthCheck": "python -c \"import pypdf\"",
+          "failureMessage": "离线 wheelhouse 未就绪时，明确报告缺少包，不伪造结果。"
+        },
+        {
+          "id": "python.package.pdfplumber",
+          "kind": "python-package",
+          "required": true,
+          "autoInstallable": true,
+          "packageName": "pdfplumber",
+          "importName": "pdfplumber",
+          "lockedVersion": "0.11.10",
+          "healthCheck": "python -c \"import pdfplumber\"",
+          "failureMessage": "离线 wheelhouse 未就绪时，明确报告缺少包，不伪造结果。"
+        },
+        {
+          "id": "python.package.reportlab",
+          "kind": "python-package",
+          "required": true,
+          "autoInstallable": true,
+          "packageName": "reportlab",
+          "importName": "reportlab",
+          "lockedVersion": "5.0.1",
+          "healthCheck": "python -c \"import reportlab\"",
+          "failureMessage": "离线 wheelhouse 未就绪时，明确报告缺少包，不伪造结果。"
+        }
+      ],
+      "capabilities": [
+        "PDF 提取",
+        "合并拆分",
+        "表单与生成"
+      ],
+      "installByDefault": false,
+      "afterRemediationStatus": "unsupported",
+      "redistribution": {
+        "status": "quarantined-stub-only",
+        "sourceBodyIncluded": false,
+        "evidenceRequired": true,
+        "publicStubMarker": "CODEX_PUBLIC_QUARANTINE_STUB_V1",
+        "maxPublicStubBytes": 4096
+      },
+      "enableWhen": [
+        "license-evidence-approved",
+        "skill-installed",
+        "runtime-healthy"
+      ],
+      "verification": {
+        "skillFile": "skills/pdf-processing-toolkit/SKILL.md",
+        "windowsEntry": "Codex workflow / frontmatter",
+        "smoke": "frontmatter and provenance warning; must remain disabled without license evidence"
+      },
+      "notes": "原始 frontmatter 声称 Proprietary 且引用缺失的 LICENSE.txt；在再分发条款可核验前保持 unsupported。"
+    },
+    {
+      "id": "powerpoint-pptx",
+      "status": "requires-runtime",
+      "defaultEnabled": false,
+      "dependencies": [
+        {
+          "id": "runtime.python312",
+          "kind": "runtime",
+          "required": true,
+          "autoInstallable": true,
+          "minVersion": "3.12",
+          "lockedVersion": "3.12.10",
+          "abi": "cp312",
+          "platform": "win_amd64",
+          "healthCheck": "python-env-setup/scripts/check_python_env.ps1 -Json; require cpython-312/win_amd64",
+          "failureMessage": "需要安装 U 盘提供的 Python 3.12 per-user 运行时。"
+        },
+        {
+          "id": "python.package.python-pptx",
+          "kind": "python-package",
+          "required": true,
+          "autoInstallable": true,
+          "packageName": "python-pptx",
+          "importName": "pptx",
+          "lockedVersion": "1.0.2",
+          "healthCheck": "python -c \"import pptx\"",
+          "failureMessage": "离线 wheelhouse 未就绪时，明确报告缺少包，不伪造结果。"
+        }
+      ],
+      "capabilities": [
+        "PPTX 创建",
+        "版式与图表",
+        "批量处理"
+      ],
+      "installByDefault": false,
+      "afterRemediationStatus": "auto-installable-runtime",
+      "enableWhen": [
+        "skill-installed",
+        "runtime-healthy"
+      ],
+      "verification": {
+        "skillFile": "skills/powerpoint-pptx/SKILL.md",
+        "windowsEntry": "Codex workflow / frontmatter",
+        "smoke": "frontmatter, pack-copy, and dependency health-check path"
+      },
+      "notes": ""
+    },
+    {
+      "id": "python-env-setup",
+      "status": "ready",
+      "defaultEnabled": true,
+      "dependencies": [
+        {
+          "id": "system.powershell",
+          "kind": "system",
+          "required": true,
+          "autoInstallable": false,
+          "minVersion": "5.1",
+          "healthCheck": "$PSVersionTable.PSVersion",
+          "failureMessage": "Windows PowerShell 5.1 是安装器基础环境。"
+        }
+      ],
+      "capabilities": [
+        "Python 检测",
+        "安装前检查",
+        "PATH 指引"
+      ],
+      "installByDefault": true,
+      "afterRemediationStatus": "core-ready",
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "verification": {
+        "skillFile": "skills/python-env-setup/SKILL.md",
+        "windowsEntry": "skills/python-env-setup/scripts/check_python_env.ps1 -Json",
+        "smoke": "missing-Python path returns JSON and non-zero without changing PATH"
+      },
+      "notes": "已改为 PowerShell 原生检查器，Python 缺失时仍可运行。"
+    },
+    {
+      "id": "safe-disk-operations",
+      "status": "ready",
+      "defaultEnabled": true,
+      "dependencies": [
+        {
+          "id": "system.powershell",
+          "kind": "system",
+          "required": true,
+          "autoInstallable": false,
+          "minVersion": "5.1",
+          "healthCheck": "$PSVersionTable.PSVersion",
+          "failureMessage": "Windows PowerShell 5.1 是安装器基础环境。"
+        }
+      ],
+      "capabilities": [
+        "删除与迁移的精确范围审查",
+        "所有权、哈希与链接边界保护",
+        "运行时配置备份、校验与回滚"
+      ],
+      "installByDefault": true,
+      "afterRemediationStatus": "core-ready",
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "verification": {
+        "skillFile": "skills/safe-disk-operations/SKILL.md",
+        "windowsEntry": "Codex workflow / frontmatter",
+        "smoke": "frontmatter, pack-copy, and dependency health-check path"
+      },
+      "notes": "已移除与磁盘安全无关的财务计算触发器和一律拒绝只读检查的旧策略；当前流程与 Codex 的精确授权、只读预检、可恢复优先和用户改动保护原则一致。"
+    },
+    {
+      "id": "seedance2-0-video-gen",
+      "status": "requires-credential",
+      "defaultEnabled": false,
+      "dependencies": [
+        {
+          "id": "runtime.python312",
+          "kind": "runtime",
+          "required": true,
+          "autoInstallable": true,
+          "minVersion": "3.12",
+          "lockedVersion": "3.12.10",
+          "abi": "cp312",
+          "platform": "win_amd64",
+          "healthCheck": "python-env-setup/scripts/check_python_env.ps1 -Json; require cpython-312/win_amd64",
+          "failureMessage": "需要安装 U 盘提供的 Python 3.12 per-user 运行时。"
+        },
+        {
+          "id": "api.seedance",
+          "kind": "api-service",
+          "required": true,
+          "autoInstallable": false,
+        "healthCheck": "SEEDANCE_API_BASE_URL is a root HTTPS URL; model, gateway routing ID, precharge points, refund rule, and link TTL are explicit; offline adapter tests pass",
+        "failureMessage": "未配置模型、网关路由 ID 或服务方费用策略时不生成清单；未配置端点或专用凭据时不提交任务。"
+        },
+        {
+          "id": "credential.seedance-api-key",
+          "kind": "credential",
+          "required": true,
+          "autoInstallable": false,
+          "secret": true,
+          "healthCheck": "SEEDANCE_API_KEY non-empty",
+          "failureMessage": "未配置凭据时不触发计费请求。"
+        }
+      ],
+      "capabilities": [
+        "视频生成",
+        "媒体顺序保护",
+        "幂等提交与轮询"
+      ],
+      "installByDefault": false,
+      "afterRemediationStatus": "guided-config",
+      "enableWhen": [
+        "skill-installed",
+        "runtime.python312",
+        "api.seedance",
+        "credential.seedance-api-key"
+      ],
+      "verification": {
+        "skillFile": "skills/seedance2-0-video-gen/SKILL.md",
+        "windowsEntry": "seedance_video_gen.py --help; missing credentials exits safely",
+        "smoke": "frontmatter, pack-copy, and dependency health-check path"
+      },
+    "notes": "不再猜测模型、20000 积分或 24 小时策略；媒体 URL 必须为 HTTPS，重复素材严格保留；任务记录写入项目数据目录而不是已安装 Skill。已删除无法可靠绑定当前 Codex 会话的旧会话历史读取入口。"
+    },
+    {
+      "id": "self-improvement-agent",
+      "status": "ready",
+      "defaultEnabled": true,
+      "dependencies": [],
+      "capabilities": [
+        "错误记录",
+        "纠正复盘",
+        "项目内经验沉淀"
+      ],
+      "installByDefault": true,
+      "afterRemediationStatus": "core-ready",
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "verification": {
+        "skillFile": "skills/self-improvement-agent/SKILL.md",
+        "windowsEntry": "Codex workflow / frontmatter",
+      "smoke": "frontmatter, pack-copy, dependency health-check path, reviewed rubric, explicit model/valuation assumptions, and contextual due-diligence template contract tests"
+    },
+    "notes": "商业评估只计算用户审阅评分表；财务模型显式区分净增长、流失、CAC、成本、初始现金和流动性缓冲，不判断健康度或推荐融资轮次。估值方法并列展示，不平均为公允值或生成谈判建议。尽调生成器要求法域、行业与交易结构，只生成全部为未审阅/待确认的起点清单，不自动分优先级、负责人、周期或投资处置。"
+    },
+    {
+      "id": "skills-search",
+      "status": "ready",
+      "defaultEnabled": true,
+      "dependencies": [],
+      "capabilities": [
+        "本地技能目录搜索",
+        "状态与依赖查询"
+      ],
+      "installByDefault": true,
+      "afterRemediationStatus": "core-ready",
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "verification": {
+        "skillFile": "skills/skills-search/SKILL.md",
+        "windowsEntry": "skills/skills-search/scripts/skills_search.ps1 -Keyword 视频 -Json",
+        "smoke": "local catalog query returns JSON without Python"
+      },
+      "notes": "已改为 PowerShell 原生本地目录搜索器。"
+    },
+    {
+      "id": "traffic-hunter",
+      "status": "ready",
+      "defaultEnabled": true,
+      "dependencies": [],
+      "capabilities": [
+        "流量渠道",
+        "内容矩阵",
+        "获客系统"
+      ],
+      "installByDefault": true,
+      "afterRemediationStatus": "core-ready",
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "verification": {
+        "skillFile": "skills/traffic-hunter/SKILL.md",
+        "windowsEntry": "Codex workflow / frontmatter",
+      "smoke": "frontmatter, pack-copy, dependency health-check path, reviewed allocation policy, explicit transaction-cost, and neutral tracker contract tests"
+    },
+    "notes": "资产配置只把带来源的用户政策换算为金额；再平衡只计算当前到目标的机械差额，阈值和卖出成本率必须显式提供；追踪器要求真实历史序列、无风险利率、基准、时点与来源。三个入口均不生成产品推荐、评分、收益承诺、调仓、止盈或止损建议。"
+    },
+    {
+      "id": "travel-planner",
+      "status": "requires-runtime",
+      "defaultEnabled": false,
+      "dependencies": [
+        {
+          "id": "runtime.python312",
+          "kind": "runtime",
+          "required": true,
+          "autoInstallable": true,
+          "minVersion": "3.12",
+          "lockedVersion": "3.12.10",
+          "abi": "cp312",
+          "platform": "win_amd64",
+          "healthCheck": "python-env-setup/scripts/check_python_env.ps1 -Json; require cpython-312/win_amd64",
+          "failureMessage": "需要安装 U 盘提供的 Python 3.12 per-user 运行时。"
+        },
+        {
+          "id": "capability.codex-web",
+          "kind": "capability",
+          "required": true,
+          "autoInstallable": false,
+          "healthCheck": "Codex web tool available or user supplied source",
+          "failureMessage": "没有网页能力时只处理用户提供的材料。"
+        }
+      ],
+      "capabilities": [
+        "行程",
+        "预算",
+        "打包与交通检索"
+      ],
+      "installByDefault": false,
+      "afterRemediationStatus": "auto-installable-runtime",
+      "enableWhen": [
+        "skill-installed",
+        "runtime-healthy"
+      ],
+      "verification": {
+        "skillFile": "skills/travel-planner/SKILL.md",
+        "windowsEntry": "plan_generator.py --help; travel_db.py --help",
+        "smoke": "frontmatter, pack-copy, and dependency health-check path"
+      },
+      "notes": "已移除未实现且会虚假返回成功的旧 Node index.js/package.json；当前只有已登记的 Python 入口。"
+    },
+    {
+      "id": "user-research",
+      "status": "ready",
+      "defaultEnabled": true,
+      "dependencies": [
+        {
+          "id": "capability.codex-web",
+          "kind": "capability",
+          "required": true,
+          "autoInstallable": false,
+          "healthCheck": "Codex web tool available or user supplied source",
+          "failureMessage": "没有网页能力时只处理用户提供的材料。"
+        }
+      ],
+      "capabilities": [
+        "用户画像",
+        "行为与反馈",
+        "需求验证"
+      ],
+      "installByDefault": true,
+      "afterRemediationStatus": "core-ready",
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "verification": {
+        "skillFile": "skills/user-research/SKILL.md",
+        "windowsEntry": "Codex workflow / frontmatter",
+        "smoke": "frontmatter, pack-copy, and dependency health-check path"
+      },
+      "notes": ""
+    },
+    {
+      "id": "venture-analysis",
+      "status": "requires-runtime",
+      "defaultEnabled": false,
+      "dependencies": [
+        {
+          "id": "runtime.python312",
+          "kind": "runtime",
+          "required": true,
+          "autoInstallable": true,
+          "minVersion": "3.12",
+          "lockedVersion": "3.12.10",
+          "abi": "cp312",
+          "platform": "win_amd64",
+          "healthCheck": "python-env-setup/scripts/check_python_env.ps1 -Json; require cpython-312/win_amd64",
+          "failureMessage": "需要安装 U 盘提供的 Python 3.12 per-user 运行时。"
+        },
+        {
+          "id": "python.package.pandas",
+          "kind": "python-package",
+          "required": true,
+          "autoInstallable": true,
+          "packageName": "pandas",
+          "importName": "pandas",
+          "lockedVersion": "3.0.5",
+          "healthCheck": "python -c \"import pandas\"",
+          "failureMessage": "离线 wheelhouse 未就绪时，明确报告缺少包，不伪造结果。"
+        },
+        {
+          "id": "python.package.numpy",
+          "kind": "python-package",
+          "required": true,
+          "autoInstallable": true,
+          "packageName": "numpy",
+          "importName": "numpy",
+          "lockedVersion": "2.5.2",
+          "healthCheck": "python -c \"import numpy\"",
+          "failureMessage": "离线 wheelhouse 未就绪时，明确报告缺少包，不伪造结果。"
+        },
+        {
+          "id": "python.package.matplotlib",
+          "kind": "python-package",
+          "required": true,
+          "autoInstallable": true,
+          "packageName": "matplotlib",
+          "importName": "matplotlib",
+          "lockedVersion": "3.11.1",
+          "healthCheck": "python -c \"import matplotlib\"",
+          "failureMessage": "离线 wheelhouse 未就绪时，明确报告缺少包，不伪造结果。"
+        }
+      ],
+      "capabilities": [
+        "商业计划",
+        "财务模型",
+        "估值与尽调"
+      ],
+      "installByDefault": false,
+      "afterRemediationStatus": "auto-installable-runtime",
+      "enableWhen": [
+        "skill-installed",
+        "runtime-healthy"
+      ],
+      "verification": {
+        "skillFile": "skills/venture-analysis/SKILL.md",
+        "windowsEntry": "business_evaluator.py --help; due_diligence.py --help; financial_model.py --help; valuation_analyzer.py --help",
+        "smoke": "frontmatter, pack-copy, and dependency health-check path"
+      },
+      "notes": ""
+    },
+    {
+      "id": "video-prompt-generator",
+      "status": "ready",
+      "defaultEnabled": true,
+      "dependencies": [],
+      "capabilities": [
+        "视频提示词",
+        "分镜",
+        "运镜和负面提示"
+      ],
+      "installByDefault": true,
+      "afterRemediationStatus": "core-ready",
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "verification": {
+        "skillFile": "skills/video-prompt-generator/SKILL.md",
+        "windowsEntry": "Codex workflow / frontmatter",
+        "smoke": "frontmatter, pack-copy, and dependency health-check path"
+      },
+      "notes": ""
+    },
+    {
+      "id": "wealth-allocation",
+      "status": "requires-runtime",
+      "defaultEnabled": false,
+      "dependencies": [
+        {
+          "id": "runtime.python312",
+          "kind": "runtime",
+          "required": true,
+          "autoInstallable": true,
+          "minVersion": "3.12",
+          "lockedVersion": "3.12.10",
+          "abi": "cp312",
+          "platform": "win_amd64",
+          "healthCheck": "python-env-setup/scripts/check_python_env.ps1 -Json; require cpython-312/win_amd64",
+          "failureMessage": "需要安装 U 盘提供的 Python 3.12 per-user 运行时。"
+        },
+        {
+          "id": "python.package.pandas",
+          "kind": "python-package",
+          "required": true,
+          "autoInstallable": true,
+          "packageName": "pandas",
+          "importName": "pandas",
+          "lockedVersion": "3.0.5",
+          "healthCheck": "python -c \"import pandas\"",
+          "failureMessage": "离线 wheelhouse 未就绪时，明确报告缺少包，不伪造结果。"
+        },
+        {
+          "id": "python.package.numpy",
+          "kind": "python-package",
+          "required": true,
+          "autoInstallable": true,
+          "packageName": "numpy",
+          "importName": "numpy",
+          "lockedVersion": "2.5.2",
+          "healthCheck": "python -c \"import numpy\"",
+          "failureMessage": "离线 wheelhouse 未就绪时，明确报告缺少包，不伪造结果。"
+        },
+        {
+          "id": "python.package.matplotlib",
+          "kind": "python-package",
+          "required": true,
+          "autoInstallable": true,
+          "packageName": "matplotlib",
+          "importName": "matplotlib",
+          "lockedVersion": "3.11.1",
+          "healthCheck": "python -c \"import matplotlib\"",
+          "failureMessage": "离线 wheelhouse 未就绪时，明确报告缺少包，不伪造结果。"
+        }
+      ],
+      "capabilities": [
+        "资产配置",
+        "再平衡",
+        "收益追踪"
+      ],
+      "installByDefault": false,
+      "afterRemediationStatus": "auto-installable-runtime",
+      "enableWhen": [
+        "skill-installed",
+        "runtime-healthy"
+      ],
+      "verification": {
+        "skillFile": "skills/wealth-allocation/SKILL.md",
+        "windowsEntry": "asset_allocator.py --help; portfolio_tracker.py --help; rebalance_planner.py --help",
+        "smoke": "frontmatter, pack-copy, and dependency health-check path"
+      },
+      "notes": ""
+    },
+    {
+      "id": "weather",
+      "status": "ready",
+      "defaultEnabled": true,
+      "dependencies": [
+        {
+          "id": "capability.network",
+          "kind": "capability",
+          "required": true,
+          "autoInstallable": false,
+        "healthCheck": "current Codex weather/web capability is available, or an explicitly allowed public weather endpoint responds",
+          "failureMessage": "当前为离线模式，不能提供实时数据。"
+        }
+      ],
+      "capabilities": [
+        "当前天气",
+        "短期预报"
+      ],
+      "installByDefault": true,
+      "afterRemediationStatus": "core-ready",
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "verification": {
+        "skillFile": "skills/weather/SKILL.md",
+        "windowsEntry": "Invoke-RestMethod or Codex web tool",
+        "smoke": "offline branch reports network requirement"
+      },
+      "notes": "优先使用当前 Codex 原生天气/网页能力；curl/PowerShell 公开服务仅作允许联网时的回退。"
+    },
+    {
+      "id": "weather-forecast",
+      "status": "ready",
+      "defaultEnabled": true,
+      "dependencies": [
+        {
+          "id": "capability.network",
+          "kind": "capability",
+          "required": true,
+          "autoInstallable": false,
+        "healthCheck": "current Codex weather/web capability is available, or an explicitly allowed public weather endpoint responds",
+          "failureMessage": "当前为离线模式，不能提供实时数据。"
+        }
+      ],
+      "capabilities": [
+        "城市偏好",
+        "天气预报",
+        "本地数据"
+      ],
+      "installByDefault": true,
+      "afterRemediationStatus": "core-ready",
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "verification": {
+        "skillFile": "skills/weather-forecast/SKILL.md",
+        "windowsEntry": "skills/weather-forecast/scripts/weather_db.ps1 health",
+        "smoke": "set/get city round-trip in isolated WEATHER_DATA_DIR"
+      },
+      "notes": "城市偏好已改为 PowerShell JSON 存储；实时查询优先使用 Codex 原生天气/网页能力，公开 HTTP 服务仅作回退。"
+    },
+    {
+      "id": "web-content-fetcher",
+      "status": "ready",
+      "defaultEnabled": true,
+      "dependencies": [
+        {
+          "id": "capability.codex-web",
+          "kind": "capability",
+          "required": true,
+          "autoInstallable": false,
+          "healthCheck": "Codex web tool available or user supplied source",
+          "failureMessage": "没有网页能力时只处理用户提供的材料。"
+        },
+        {
+          "id": "python.package.scrapling",
+          "kind": "python-package",
+          "required": false,
+          "autoInstallable": true,
+          "packageName": "scrapling",
+          "importName": "scrapling",
+          "lockedVersion": "0.4.15",
+          "healthCheck": "python -c \"import scrapling\"",
+          "failureMessage": "离线 wheelhouse 未就绪时，明确报告缺少包，不伪造结果。"
+        },
+        {
+          "id": "python.package.html2text",
+          "kind": "python-package",
+          "required": false,
+          "autoInstallable": true,
+          "packageName": "html2text",
+          "importName": "html2text",
+          "lockedVersion": "2025.4.15",
+          "healthCheck": "python -c \"import html2text\"",
+          "failureMessage": "离线 wheelhouse 未就绪时，明确报告缺少包，不伪造结果。"
+        }
+      ],
+      "capabilities": [
+        "网页正文提取",
+        "Markdown 清理"
+      ],
+      "installByDefault": true,
+      "afterRemediationStatus": "core-ready",
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "verification": {
+        "skillFile": "skills/web-content-fetcher/SKILL.md",
+        "windowsEntry": "Codex web reader; optional scripts/fetch.py",
+        "smoke": "native path is documented and optional adapter missing-dependency failure is explicit"
+      },
+      "notes": "Codex 原生网页读取为核心路径；Scrapling/html2text 仅作批处理增强。"
+    },
+    {
+      "id": "web-search-extraction",
+      "status": "requires-credential",
+      "defaultEnabled": false,
+      "dependencies": [
+        {
+          "id": "runtime.python312",
+          "kind": "runtime",
+          "required": true,
+          "autoInstallable": true,
+          "minVersion": "3.12",
+          "lockedVersion": "3.12.10",
+          "abi": "cp312",
+          "platform": "win_amd64",
+          "healthCheck": "python-env-setup/scripts/check_python_env.ps1 -Json; require cpython-312/win_amd64",
+          "failureMessage": "需要安装 U 盘提供的 Python 3.12 per-user 运行时。"
+        },
+        {
+          "id": "credential.dashscope-api-key",
+          "kind": "credential",
+          "required": true,
+          "autoInstallable": false,
+          "secret": true,
+          "healthCheck": "DASHSCOPE_API_KEY non-empty",
+          "failureMessage": "未配置搜索 API 时优先使用 Codex 原生网页能力。"
+        },
+        {
+          "id": "connection.dashscope-base-url",
+          "kind": "connection",
+          "required": true,
+          "autoInstallable": false,
+          "defaultUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+          "healthCheck": "URL is HTTPS and path is compatible-mode/v1",
+          "failureMessage": "未配置服务地址时不调用适配器。"
+        },
+        {
+          "id": "connection.dashscope-model",
+          "kind": "connection",
+          "required": true,
+          "autoInstallable": false,
+          "healthCheck": "DASHSCOPE_MODEL non-empty; no repository default is allowed",
+          "failureMessage": "未配置服务当前支持且启用联网搜索的实际模型时不调用适配器。"
+        },
+        {
+          "id": "capability.network",
+          "kind": "capability",
+          "required": true,
+          "autoInstallable": false,
+          "healthCheck": "Test-NetConnection -ComputerName wttr.in -Port 443",
+          "failureMessage": "当前为离线模式，不能提供实时数据。"
+        }
+      ],
+      "capabilities": [
+        "联网搜索适配",
+        "结构化摘要"
+      ],
+      "notes": "Codex 原生联网工具可用时优先使用原生工具；显式选择适配器后仍必须提供专用 Key、compatible-mode/v1 根地址和实际模型，脚本再拼接 /chat/completions。",
+      "installByDefault": false,
+      "afterRemediationStatus": "guided-config",
+      "enableWhen": [
+        "skill-installed",
+        "credential.dashscope-api-key",
+        "connection.dashscope-base-url",
+        "connection.dashscope-model",
+        "capability.network"
+      ],
+      "verification": {
+        "skillFile": "skills/web-search-extraction/SKILL.md",
+        "windowsEntry": "web_search.py --help; missing credentials/model exits nonzero before network I/O",
+        "smoke": "frontmatter, pack-copy, dependency health-check path, and no-network adapter contract tests"
+      }
+    },
+    {
+      "id": "wechat-article-creator",
+      "status": "requires-runtime",
+      "defaultEnabled": false,
+      "dependencies": [
+        {
+          "id": "runtime.python312",
+          "kind": "runtime",
+          "required": true,
+          "autoInstallable": true,
+          "minVersion": "3.12",
+          "lockedVersion": "3.12.10",
+          "abi": "cp312",
+          "platform": "win_amd64",
+          "healthCheck": "python-env-setup/scripts/check_python_env.ps1 -Json; require cpython-312/win_amd64",
+          "failureMessage": "需要安装 U 盘提供的 Python 3.12 per-user 运行时。"
+        },
+        {
+          "id": "python.package.Pillow",
+          "kind": "python-package",
+          "required": true,
+          "autoInstallable": true,
+          "packageName": "Pillow",
+          "importName": "PIL",
+          "lockedVersion": "12.3.0",
+          "healthCheck": "python -c \"import PIL\"",
+          "failureMessage": "公众号封面脚本需要 Pillow；离线 wheelhouse 未健康时不得声称封面生成可用。"
+        },
+        {
+          "id": "api.image-2",
+          "kind": "api-service",
+          "required": false,
+          "autoInstallable": false,
+          "healthCheck": "IMAGE_2_API_BASE_URL optional",
+          "failureMessage": "封面生成退化为文字版或本地模板。"
+        }
+      ],
+      "capabilities": [
+        "公众号选题",
+        "文章结构",
+        "标题与封面"
+      ],
+      "installByDefault": false,
+      "afterRemediationStatus": "auto-installable-runtime",
+      "enableWhen": [
+        "skill-installed",
+        "runtime-healthy"
+      ],
+      "verification": {
+        "skillFile": "skills/wechat-article-creator/SKILL.md",
+        "windowsEntry": "start_article.py --help; polish_text.py --help; generate_cover.py --help",
+        "smoke": "frontmatter, pack-copy, and dependency health-check path"
+      },
+    "notes": "草稿和封面默认目录已从 Skill 树迁移到项目 codex-data；草稿文件名净化，封面限制尺寸/像素并校验输出格式。文本检查器已删除未实现的 auto-fix 参数与发布就绪评分，只输出可人工复核的编辑提示。"
+    },
+    {
+      "id": "word-docx",
+      "status": "requires-runtime",
+      "defaultEnabled": false,
+      "dependencies": [
+        {
+          "id": "runtime.python312",
+          "kind": "runtime",
+          "required": true,
+          "autoInstallable": true,
+          "minVersion": "3.12",
+          "lockedVersion": "3.12.10",
+          "abi": "cp312",
+          "platform": "win_amd64",
+          "healthCheck": "python-env-setup/scripts/check_python_env.ps1 -Json; require cpython-312/win_amd64",
+          "failureMessage": "需要安装 U 盘提供的 Python 3.12 per-user 运行时。"
+        },
+        {
+          "id": "python.package.python-docx",
+          "kind": "python-package",
+          "required": true,
+          "autoInstallable": true,
+          "packageName": "python-docx",
+          "importName": "docx",
+          "lockedVersion": "1.2.0",
+          "healthCheck": "python -c \"import docx\"",
+          "failureMessage": "离线 wheelhouse 未就绪时，明确报告缺少包，不伪造结果。"
+        }
+      ],
+      "capabilities": [
+        "Word 读写",
+        "样式与页眉页脚"
+      ],
+      "installByDefault": false,
+      "afterRemediationStatus": "auto-installable-runtime",
+      "enableWhen": [
+        "skill-installed",
+        "runtime-healthy"
+      ],
+      "verification": {
+        "skillFile": "skills/word-docx/SKILL.md",
+        "windowsEntry": "Codex workflow / frontmatter",
+        "smoke": "frontmatter, pack-copy, and dependency health-check path"
+      },
+      "notes": ""
+    },
+    {
+      "id": "xiaohongshu-writing",
+      "status": "ready",
+      "defaultEnabled": true,
+      "dependencies": [],
+      "capabilities": [
+        "小红书标题",
+        "笔记结构",
+        "去模板化检查"
+      ],
+      "installByDefault": true,
+      "afterRemediationStatus": "core-ready",
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "verification": {
+        "skillFile": "skills/xiaohongshu-writing/SKILL.md",
+        "windowsEntry": "Codex workflow / frontmatter",
+        "smoke": "frontmatter, pack-copy, and dependency health-check path"
+      },
+      "notes": ""
+    }
+  ]
+}

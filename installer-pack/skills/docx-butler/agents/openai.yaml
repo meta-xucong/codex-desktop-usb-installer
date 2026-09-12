@@ -1,0 +1,6 @@
+interface:
+  display_name: "文档排版"
+  short_description: "整理、排版和转换 Word、Markdown、PPT 与白板内容。"
+  default_prompt: "Use $docx-butler to organize and format this content into the requested document structure."
+policy:
+  allow_implicit_invocation: false

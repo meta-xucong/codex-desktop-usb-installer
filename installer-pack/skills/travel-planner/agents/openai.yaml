@@ -1,0 +1,6 @@
+interface:
+  display_name: "旅行规划"
+  short_description: "根据时间、预算、地点与个人偏好，规划可执行行程、预订项和出行清单。"
+  default_prompt: "Use $travel-planner to plan this trip around my dates, budget, locations, and preferences."
+policy:
+  allow_implicit_invocation: false

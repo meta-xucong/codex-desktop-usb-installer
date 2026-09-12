@@ -1,0 +1,105 @@
+{
+  "schemaVersion": 2,
+  "kind": "direct-http-api-services-only",
+  "policy": "These are HTTP/API adapters, not MCP servers. Credentials stay outside the pack.",
+  "services": [
+    {
+      "id": "dashscope-web-search",
+      "status": "guided-config",
+      "protocol": "https-json",
+      "baseUrlField": "dashscope.base-url",
+      "defaultUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "path": "/chat/completions",
+      "credentialFields": [
+        "dashscope.api-key"
+      ],
+      "configurationFields": [
+        "dashscope.base-url",
+        "dashscope.model"
+      ],
+      "relatedSkills": [
+        "web-search-extraction"
+      ],
+      "healthCheck": "Run web_search.py --json with a non-sensitive test query; missing credentials must fail before network I/O.",
+      "enableWhen": [
+        "dashscope.api-key",
+        "dashscope.base-url",
+        "dashscope.model",
+        "capability.network"
+      ],
+      "failureMessage": "未配置 DashScope 时优先使用 Codex 原生网页能力；不要把 API 适配器伪装成 MCP。",
+      "disableRule": "Unset the credential or set the service enabled flag to false in the private connection store."
+    },
+    {
+      "id": "image-2",
+      "status": "guided-config",
+      "protocol": "https-json",
+      "baseUrlField": "image-2.base-url",
+      "defaultUrl": "",
+      "path": "/api/llm/openai/v1/images/generations",
+      "additionalPaths": [
+        "/api/llm/openai/v1/images/edits",
+        "/api/llm/openai/v1/images/tasks/{task_id}"
+      ],
+      "credentialFields": [
+        "image-2.api-key"
+      ],
+      "configurationFields": [
+        "image-2.base-url",
+        "image-2.model",
+        "image-2.agent-id"
+      ],
+      "relatedSkills": [
+        "image-2"
+      ],
+      "healthCheck": "Run image_2_gen.py --help and the offline adapter contract tests; a dry-run additionally requires model, gateway routing ID, and an immutable confirmation manifest.",
+      "enableWhen": [
+        "image-2.api-key",
+        "image-2.base-url",
+        "image-2.model",
+        "image-2.agent-id",
+        "runtime.python312.healthy"
+      ],
+      "failureMessage": "未配置端点或凭据时只生成不可变确认清单，不提交计费任务。",
+      "disableRule": "Remove private endpoint/key references and leave the Skill installed but disabled."
+    },
+    {
+      "id": "seedance",
+      "status": "guided-config",
+      "protocol": "https-json",
+      "baseUrlField": "seedance.base-url",
+      "defaultUrl": "",
+      "path": "/api/llm/doubao/contents/generations/tasks",
+      "additionalPaths": [
+        "/api/llm/doubao/contents/generations/tasks/{task_id}"
+      ],
+      "credentialFields": [
+        "seedance.api-key"
+      ],
+      "configurationFields": [
+        "seedance.base-url",
+        "seedance.model",
+        "seedance.agent-id",
+        "seedance.precharge-points",
+        "seedance.official-link-ttl-hours",
+        "seedance.refund-rule"
+      ],
+      "relatedSkills": [
+        "seedance2-0-video-gen"
+      ],
+      "healthCheck": "Run seedance_video_gen.py --help and the offline adapter contract tests; do not submit a paid task during health check.",
+      "enableWhen": [
+        "seedance.api-key",
+        "seedance.base-url",
+        "seedance.model",
+        "seedance.agent-id",
+        "seedance.precharge-points",
+        "seedance.official-link-ttl-hours",
+        "seedance.refund-rule",
+        "runtime.python312.healthy"
+      ],
+      "failureMessage": "未配置端点或凭据时只提供脚本和确认清单，不声称已生成视频。",
+      "disableRule": "Unset private endpoint/key references and keep the service disabled."
+    }
+  ]
+}

@@ -31,15 +31,20 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use base64::engine::general_purpose::STANDARD as B64;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::app::atomic_file;
 use crate::errors::AppError;
+
+use codex_usb_license as license_core;
+pub use license_core::{
+    UsbFingerprint, UsbLicense, ANCHOR_SCHEMA_V1, ANCHOR_SCHEMA_V2, LICENSE_SCHEMA_VERSION,
+    PRODUCT_ID,
+};
 
 pub const GUARD_ARG: &str = "--codex-usb-guard";
 pub const GUARD_EXE_NAME: &str = "CodexUsbGuard.exe";
@@ -51,52 +56,26 @@ pub const LICENSE_FILE_NAME: &str = "usb-license.json";
 pub const LEASE_FILE_NAME: &str = "lease.json";
 pub const STATUS_FILE_NAME: &str = "status.json";
 pub const LOCK_FILE_NAME: &str = "guard.lock";
-pub const PRODUCT_ID: &str = "codex-usb-oneclick";
 pub const POLL_INTERVAL_MS: u64 = 1_000;
 pub const DISCONNECT_GRACE_MS: u64 = 5_000;
-pub const ANCHOR_SCHEMA_V1: u32 = 1;
-pub const ANCHOR_SCHEMA_V2: u32 = 2;
-const LICENSE_SCHEMA_VERSION: u32 = 1;
 const LEASE_SCHEMA_VERSION: u32 = 1;
 const STATUS_SCHEMA_VERSION: u32 = 1;
+const USB_MANIFEST_POLICY_MAX_BYTES: u64 = 256 * 1024;
+#[used]
+static COMPILED_USB_POLICY_MARKER: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/codex-usb-policy-marker.txt"));
 static SUPPRESS_STATUS_AFTER_UNINSTALL: AtomicBool = AtomicBool::new(false);
+/// Formal USB bundles do a complete SHA/AuthentiCode verification after the
+/// local window exists.  Keep this fail-closed marker visible to read-only
+/// status calls so a stale authorized status cannot enable an operation while
+/// the first full scan is still running.
+static STARTUP_INTEGRITY_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// Called only after the detached cleanup hand-off is accepted. Normal exit
 /// callbacks must not recreate the very directory that the helper removes.
 pub fn suppress_status_for_uninstall() {
     SUPPRESS_STATUS_AFTER_UNINSTALL.store(true, Ordering::SeqCst);
     remove_lease();
-}
-
-/// Public fingerprint fields are deliberately small and stable.  A drive
-/// letter is not part of the identity, so a Windows letter reassignment does
-/// not break an authorized session.
-fn default_anchor_schema() -> u32 {
-    ANCHOR_SCHEMA_V1
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct UsbFingerprint {
-    pub volume_serial: u32,
-    pub anchor_sha256: String,
-    pub bundle_relative_path: String,
-    #[serde(default = "default_anchor_schema")]
-    pub anchor_schema: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct UsbLicense {
-    pub schema_version: u32,
-    pub product: String,
-    pub installation_id: String,
-    pub fingerprint: UsbFingerprint,
-    pub issued_at: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub key_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub signature: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -116,6 +95,16 @@ pub struct UsbLease {
     pub lease_id: String,
     pub bundle_path: String,
     pub fingerprint: UsbFingerprint,
+    /// Session snapshot fields prevent a later valid-looking replacement of
+    /// the mutable license from being accepted by an already running manager.
+    /// They are optional only so an older lease can be read and then replaced;
+    /// formal signed gates reject a lease that lacks them.
+    #[serde(default)]
+    pub installation_id: Option<String>,
+    #[serde(default)]
+    pub key_id: Option<String>,
+    #[serde(default)]
+    pub license_digest: Option<String>,
     pub owner_pid: u32,
     pub managed_processes: Vec<ManagedProcess>,
     pub issued_at: String,
@@ -136,6 +125,15 @@ pub struct UsbGuardStatus {
     pub bundle_path: Option<String>,
     pub bundle_relative_path: Option<String>,
     pub signed: bool,
+    /// missing / unsigned / valid / invalid / unknown-key / revoked
+    #[serde(default = "default_signature_state")]
+    pub signature_state: String,
+    /// Whether Codex operations are currently permitted by the signed gate.
+    /// The default is false for status files written by older managers.
+    #[serde(default)]
+    pub codex_allowed: bool,
+    #[serde(default)]
+    pub codex_block_reason: Option<String>,
     pub last_checked_at_ms: u64,
     pub missing_since_ms: Option<u64>,
     pub countdown_seconds: Option<u64>,
@@ -158,6 +156,82 @@ pub struct UsbObservation {
     pub fingerprint: Option<UsbFingerprint>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedUsbAuthorization {
+    pub bundle_root: PathBuf,
+    pub codex_root: PathBuf,
+    pub fingerprint: UsbFingerprint,
+    pub installation_id: String,
+    pub key_id: String,
+    pub license_digest: String,
+    pub checked_at_ms: u64,
+}
+
+/// Startup may continue into a restricted manager UI when the immutable USB
+/// bundle is authentic but its mutable authorization metadata is missing or
+/// invalid. The normal path first exposes a local read-only shell while the
+/// expensive immutable scan is pending; no Codex operation, prerequisite,
+/// recovery, or shortcut write is allowed in that state. Structural/media
+/// failures still return `Err` and abort before Tauri side effects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartupPreflight {
+    Ready,
+    IntegrityPending { reason: String },
+    AuthorizationBlocked { reason: String },
+}
+
+impl StartupPreflight {
+    pub fn is_authorization_blocked(&self) -> bool {
+        matches!(self, Self::AuthorizationBlocked { .. })
+    }
+
+    pub fn is_integrity_pending(&self) -> bool {
+        matches!(self, Self::IntegrityPending { .. })
+    }
+
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Ready => None,
+            Self::IntegrityPending { reason } | Self::AuthorizationBlocked { reason } => {
+                Some(reason)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StartupGuardPlan {
+    establish_lease: bool,
+    prepare_or_start_helper: bool,
+    clear_current_lease: bool,
+    preserve_current_manager: bool,
+    codex_allowed: bool,
+}
+
+fn startup_guard_plan(policy_signed_required: bool, license_is_signed: bool) -> StartupGuardPlan {
+    if policy_signed_required && !license_is_signed {
+        StartupGuardPlan {
+            establish_lease: false,
+            prepare_or_start_helper: false,
+            clear_current_lease: true,
+            preserve_current_manager: true,
+            codex_allowed: false,
+        }
+    } else {
+        StartupGuardPlan {
+            establish_lease: true,
+            prepare_or_start_helper: true,
+            clear_current_lease: false,
+            preserve_current_manager: false,
+            codex_allowed: license_is_signed,
+        }
+    }
+}
+
+fn default_signature_state() -> String {
+    "unknown".to_string()
+}
+
 /// Local data paths used by the USB portable edition. Program and managed
 /// content live on the removable bundle; account, session, cache and Electron
 /// profile data remain in the user's ordinary Windows profile.
@@ -170,6 +244,75 @@ pub struct UsbLocalDataPaths {
 
 fn engine(message: impl Into<String>) -> AppError {
     AppError::Engine(format!("USB 看门狗：{}", message.into()))
+}
+
+const COMPILETIME_PUBLIC_KEY_B64: Option<&str> = option_env!("CODEX_USB_GUARD_PUBLIC_KEY_B64");
+const COMPILETIME_PUBLIC_KEY_ID: Option<&str> = option_env!("CODEX_USB_GUARD_PUBLIC_KEY_ID");
+
+/// Formal release policy is compile-time only.  An environment variable may
+/// select the same policy for a locally reproduced build, but never weakens a
+/// binary compiled with signed-required.
+pub fn signed_required() -> bool {
+    cfg!(feature = "signed-required")
+        || option_env!("CODEX_USB_GUARD_POLICY").is_some_and(|value| value == "SignedRequired")
+}
+
+pub fn policy_name() -> &'static str {
+    if signed_required() {
+        "SignedRequired"
+    } else {
+        "DevelopmentAutoEnroll"
+    }
+}
+
+/// The release builder writes the compile-time USB policy into the immutable
+/// usb-manifest.  Keep this check separate from the cryptographic bundle
+/// verifier so a development manager can never auto-enrol a license into a
+/// formal Bundle merely because it was copied beside that Bundle.
+fn validate_bundle_policy_binding(bundle_root: &Path) -> Result<(), AppError> {
+    let path = bundle_root.join("usb-manifest.json");
+    let metadata = fs::symlink_metadata(&path)
+        .map_err(|error| engine(format!("读取 USB 联合清单失败：{error}")))?;
+    if !metadata.is_file()
+        || path_has_reparse_point(&path)?
+        || metadata.len() > USB_MANIFEST_POLICY_MAX_BYTES
+    {
+        return Err(engine("USB 联合清单不是可核验的普通文件"));
+    }
+    let bytes =
+        fs::read(&path).map_err(|error| engine(format!("读取 USB 联合清单失败：{error}")))?;
+    let manifest: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| engine(format!("USB 联合清单 JSON 无效：{error}")))?;
+    let Some(declared) = manifest
+        .pointer("/usbGuard/signing/policy")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Err(engine(
+            "usb_policy_missing：USB 联合清单缺少 usbGuard.signing.policy，拒绝自动注册或授权",
+        ));
+    };
+    if !matches!(declared, "SignedRequired" | "DevelopmentAutoEnroll") {
+        return Err(engine(format!(
+            "usb_policy_invalid：USB 联合清单声明了未知策略：{declared}"
+        )));
+    }
+    let expected = policy_name();
+    if declared != expected {
+        return Err(engine(format!(
+            "usb_policy_mismatch：管理器策略 {expected} 与 USB 联合清单策略 {declared} 不一致；已禁止自动注册和受保护操作"
+        )));
+    }
+    Ok(())
+}
+
+fn verify_runtime_bundle_integrity(
+    bundle_root: &Path,
+) -> Result<crate::app::usb_bundle::BundleIntegrityReport, AppError> {
+    if signed_required() {
+        crate::app::usb_bundle::verify_signed_internal_bundle(bundle_root)
+    } else {
+        crate::app::usb_bundle::verify_bundle_integrity(bundle_root, false)
+    }
 }
 
 pub fn now_ms() -> u64 {
@@ -292,20 +435,11 @@ pub fn bundle_relative_path(bundle_path: &str, drive_root: &str) -> Option<Strin
 }
 
 pub fn is_supported_anchor_schema(anchor_schema: u32) -> bool {
-    matches!(anchor_schema, ANCHOR_SCHEMA_V1 | ANCHOR_SCHEMA_V2)
+    license_core::is_supported_anchor_schema(anchor_schema)
 }
 
 pub fn fingerprints_match(expected: &UsbFingerprint, actual: &UsbFingerprint) -> bool {
-    is_supported_anchor_schema(expected.anchor_schema)
-        && is_supported_anchor_schema(actual.anchor_schema)
-        && expected.anchor_schema == actual.anchor_schema
-        && expected.volume_serial == actual.volume_serial
-        && expected
-            .anchor_sha256
-            .eq_ignore_ascii_case(&actual.anchor_sha256)
-        && expected
-            .bundle_relative_path
-            .eq_ignore_ascii_case(&actual.bundle_relative_path)
+    license_core::fingerprints_match(expected, actual)
 }
 
 fn fingerprint_excerpt(value: &str) -> String {
@@ -358,6 +492,36 @@ fn validate_lease_observation(
     Ok(())
 }
 
+fn validate_lease_license_snapshot(
+    lease: &UsbLease,
+    license: &UsbLicense,
+    bundle: &Path,
+) -> Result<(), AppError> {
+    if let Some(expected) = lease.installation_id.as_deref() {
+        if expected != license.installation_id {
+            return Err(engine(
+                "usb_toctou_changed：当前许可证 installationId 与本会话快照不一致",
+            ));
+        }
+    }
+    if let Some(expected) = lease.key_id.as_deref() {
+        if Some(expected) != license.key_id.as_deref() {
+            return Err(engine(
+                "usb_toctou_changed：当前许可证 keyId 与本会话快照不一致",
+            ));
+        }
+    }
+    if let Some(expected) = lease.license_digest.as_deref() {
+        let actual = license_digest(bundle)?;
+        if !expected.eq_ignore_ascii_case(&actual) {
+            return Err(engine(
+                "usb_toctou_changed：当前许可证摘要与本会话快照不一致",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Pure disconnect state transition used by the helper and unit-tested without
 /// Windows device APIs.  `grace_ms` is injected to make boundary tests fast.
 pub fn next_disconnect_state(
@@ -390,309 +554,190 @@ pub fn next_disconnect_state(
     }
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct UnsignedLicense<'a> {
-    schema_version: u32,
-    product: &'a str,
-    installation_id: &'a str,
-    fingerprint: &'a UsbFingerprint,
-    issued_at: &'a str,
-    key_id: &'a Option<String>,
+fn map_license_error(error: license_core::LicenseError) -> AppError {
+    match error {
+        license_core::LicenseError::FingerprintMismatch => engine("许可证：指纹不匹配"),
+        license_core::LicenseError::InvalidProduct { .. } => engine("许可证：产品标识不匹配"),
+        error => engine(format!("许可证：{error}")),
+    }
 }
 
-#[derive(Serialize)]
-struct LegacyUsbFingerprint<'a> {
-    volume_serial: u32,
-    anchor_sha256: &'a str,
-    bundle_relative_path: &'a str,
+/// These adapters deliberately delegate serialization, validation and
+/// cryptography to the shared core crate. The manager owns only policy and
+/// Windows observation; it must not grow a second signing format.
+pub fn unsigned_license_payload(license: &UsbLicense) -> Result<Vec<u8>, AppError> {
+    license_core::unsigned_license_payload(license).map_err(map_license_error)
 }
 
-#[derive(Serialize)]
-struct LegacyUnsignedLicense<'a> {
-    schema_version: u32,
-    product: &'a str,
-    installation_id: &'a str,
-    fingerprint: LegacyUsbFingerprint<'a>,
-    issued_at: &'a str,
-    key_id: &'a Option<String>,
+pub fn legacy_unsigned_license_payload(license: &UsbLicense) -> Result<Vec<u8>, AppError> {
+    license_core::legacy_unsigned_license_payload(license).map_err(map_license_error)
 }
 
-fn unsigned_license_payload(license: &UsbLicense) -> Result<Vec<u8>, AppError> {
-    serde_json::to_vec(&UnsignedLicense {
-        schema_version: license.schema_version,
-        product: &license.product,
-        installation_id: &license.installation_id,
-        fingerprint: &license.fingerprint,
-        issued_at: &license.issued_at,
-        key_id: &license.key_id,
-    })
-    .map_err(|error| engine(format!("序列化许可证失败: {error}")))
-}
-
-fn legacy_unsigned_license_payload(license: &UsbLicense) -> Result<Vec<u8>, AppError> {
-    serde_json::to_vec(&LegacyUnsignedLicense {
-        schema_version: license.schema_version,
-        product: &license.product,
-        installation_id: &license.installation_id,
-        fingerprint: LegacyUsbFingerprint {
-            volume_serial: license.fingerprint.volume_serial,
-            anchor_sha256: &license.fingerprint.anchor_sha256,
-            bundle_relative_path: &license.fingerprint.bundle_relative_path,
-        },
-        issued_at: &license.issued_at,
-        key_id: &license.key_id,
-    })
-    .map_err(|error| engine(format!("序列化旧版许可证失败: {error}")))
-}
-
-/// Verify a license with an explicit public key.  Keeping this function
-/// public allows the release packer and deterministic unit tests to share the
-/// exact canonical payload format.
 pub fn verify_signature_with_key(
     license: &UsbLicense,
     public_key_b64: &str,
 ) -> Result<(), AppError> {
-    let signature = license
-        .signature
-        .as_deref()
-        .ok_or_else(|| engine("许可证没有签名"))?;
-    let key_bytes = B64
-        .decode(public_key_b64.trim())
-        .map_err(|error| engine(format!("许可证公钥不是有效 Base64: {error}")))?;
-    let key_array: [u8; 32] = key_bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| engine("许可证公钥必须是 32 字节"))?;
-    let key = VerifyingKey::from_bytes(&key_array)
-        .map_err(|error| engine(format!("许可证公钥无效: {error}")))?;
-    let sig_bytes = B64
-        .decode(signature.trim())
-        .map_err(|error| engine(format!("许可证签名不是有效 Base64: {error}")))?;
-    let sig_array: [u8; 64] = sig_bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| engine("许可证签名必须是 64 字节"))?;
-    let sig = Signature::from_bytes(&sig_array);
-    let payload = unsigned_license_payload(license)?;
-    if key.verify(&payload, &sig).is_ok() {
-        return Ok(());
+    license_core::verify_signature_with_key(license, public_key_b64).map_err(map_license_error)
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConfiguredUsbKey {
+    key_id: String,
+    public_key_b64: String,
+    #[serde(default)]
+    revoked: bool,
+}
+
+fn decode_configured_public_key(value: &str, label: &str) -> Result<Vec<u8>, AppError> {
+    let decoded = BASE64
+        .decode(value.trim())
+        .map_err(|error| engine(format!("{label} Base64 无效: {error}")))?;
+    if decoded.len() != 32 {
+        return Err(engine(format!("{label} 必须是 32 字节 Ed25519 公钥")));
     }
-    if license.fingerprint.anchor_schema == ANCHOR_SCHEMA_V1 {
-        let legacy_payload = legacy_unsigned_license_payload(license)?;
-        if key.verify(&legacy_payload, &sig).is_ok() {
-            return Ok(());
+    Ok(decoded)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveKeyBinding {
+    Matched,
+    MissingActiveKeyId,
+    MissingLicenseKeyId,
+    InvalidActiveKeyId,
+    InvalidLicenseKeyId,
+    Mismatch,
+}
+
+fn active_key_binding_state(
+    active_key_id: Option<&str>,
+    license_key_id: Option<&str>,
+) -> ActiveKeyBinding {
+    let Some(active_key_id) = active_key_id else {
+        return ActiveKeyBinding::MissingActiveKeyId;
+    };
+    if license_core::validate_key_id(active_key_id).is_err() {
+        return ActiveKeyBinding::InvalidActiveKeyId;
+    }
+    let Some(license_key_id) = license_key_id else {
+        return ActiveKeyBinding::MissingLicenseKeyId;
+    };
+    if license_core::validate_key_id(license_key_id).is_err() {
+        return ActiveKeyBinding::InvalidLicenseKeyId;
+    }
+    if active_key_id == license_key_id {
+        ActiveKeyBinding::Matched
+    } else {
+        ActiveKeyBinding::Mismatch
+    }
+}
+
+fn require_active_key_binding<'a>(
+    active_key_id: Option<&'a str>,
+    license_key_id: Option<&str>,
+) -> Result<&'a str, AppError> {
+    match active_key_binding_state(active_key_id, license_key_id) {
+        ActiveKeyBinding::Matched => Ok(active_key_id.expect("matched key binding has active id")),
+        ActiveKeyBinding::MissingActiveKeyId => Err(engine(
+            "签名许可证验证缺少编译期 CODEX_USB_GUARD_PUBLIC_KEY_ID",
+        )),
+        ActiveKeyBinding::MissingLicenseKeyId => Err(engine("正式签名许可证缺少 keyId")),
+        ActiveKeyBinding::InvalidActiveKeyId => Err(engine("编译期 active keyId 不是合法 keyId")),
+        ActiveKeyBinding::InvalidLicenseKeyId => Err(engine("正式签名许可证包含非法 keyId")),
+        ActiveKeyBinding::Mismatch => Err(engine(format!(
+            "USB 许可证 keyId 与当前编译期 active keyId 不一致: {}",
+            license_key_id.unwrap_or_default()
+        ))),
+    }
+}
+
+fn configured_key_for(license: &UsbLicense) -> Result<Option<String>, AppError> {
+    if license.signature.is_none() {
+        return Ok(None);
+    }
+
+    let active_key_id =
+        require_active_key_binding(COMPILETIME_PUBLIC_KEY_ID, license.key_id.as_deref())?;
+    let compiletime_public_key = COMPILETIME_PUBLIC_KEY_B64;
+    let compiletime_public_key_bytes = compiletime_public_key
+        .map(|value| decode_configured_public_key(value, "编译期 USB 公钥"))
+        .transpose()?;
+
+    if let Some(raw_keyring) = option_env!("CODEX_USB_GUARD_KEYRING_JSON") {
+        let keyring = serde_json::from_str::<Vec<ConfiguredUsbKey>>(raw_keyring)
+            .map_err(|error| engine(format!("构建内置 USB 公钥环无效: {error}")))?;
+        let key = keyring
+            .into_iter()
+            .find(|entry| entry.key_id == active_key_id)
+            .ok_or_else(|| {
+                engine(format!(
+                    "USB 许可证 active keyId 未被当前构建公钥环配置: {active_key_id}"
+                ))
+            })?;
+        if key.revoked {
+            return Err(engine(format!(
+                "USB 许可证 active keyId 已撤销: {active_key_id}"
+            )));
         }
+        let keyring_public_key_bytes =
+            decode_configured_public_key(&key.public_key_b64, "USB 公钥环 active 公钥")?;
+        if let Some(compiletime_public_key_bytes) = &compiletime_public_key_bytes {
+            if keyring_public_key_bytes != *compiletime_public_key_bytes {
+                return Err(engine(format!(
+                    "USB 公钥环 active keyId 与编译期 USB 公钥不一致: {active_key_id}"
+                )));
+            }
+        }
+        return Ok(Some(key.public_key_b64.trim().to_string()));
     }
-    Err(engine("许可证签名校验失败"))
+    let Some(public_key) = compiletime_public_key else {
+        return Err(engine(
+            "许可证带签名，但当前构建没有配置 USB 公钥；请使用 SignedRequired 配置构建",
+        ));
+    };
+    let _ = compiletime_public_key_bytes
+        .as_ref()
+        .ok_or_else(|| engine("许可证带签名，但构建公钥为空"))?;
+    Ok(Some(public_key.trim().to_string()))
 }
 
 fn verify_configured_signature(license: &UsbLicense) -> Result<bool, AppError> {
-    let Some(signature) = license.signature.as_ref() else {
+    let Some(public_key) = configured_key_for(license)? else {
         return Ok(false);
     };
-    let Some(public_key) = option_env!("CODEX_USB_GUARD_PUBLIC_KEY_B64") else {
-        return Err(engine(
-            "许可证带签名，但当前构建没有配置 CODEX_USB_GUARD_PUBLIC_KEY_B64",
-        ));
-    };
-    if public_key.trim().is_empty() {
-        return Err(engine("许可证带签名，但构建公钥为空"));
-    }
-    let _ = signature;
-    verify_signature_with_key(license, public_key)?;
+    verify_signature_with_key(license, &public_key)?;
     Ok(true)
 }
 
 pub fn validate_license(license: &UsbLicense, expected: &UsbFingerprint) -> Result<bool, AppError> {
-    if license.schema_version != LICENSE_SCHEMA_VERSION {
-        return Err(engine(format!(
-            "许可证版本不兼容: {}",
-            license.schema_version
-        )));
+    let configured_key = configured_key_for(license)?;
+    license_core::validate_license(license, expected, configured_key.as_deref())
+        .map_err(map_license_error)?;
+    if license.signature.is_some() {
+        verify_configured_signature(license)
+    } else {
+        Ok(false)
     }
-    if license.product != PRODUCT_ID {
-        return Err(engine("许可证产品标识不匹配"));
-    }
-    if !is_supported_anchor_schema(license.fingerprint.anchor_schema)
-        || !is_supported_anchor_schema(expected.anchor_schema)
-    {
-        return Err(engine("许可证锚点版本不兼容"));
-    }
-    if !fingerprints_match(&license.fingerprint, expected) {
-        return Err(engine("许可证与当前 U 盘指纹不匹配"));
-    }
-    verify_configured_signature(license)
 }
 
 pub fn new_unsigned_license(fingerprint: UsbFingerprint) -> UsbLicense {
-    UsbLicense {
-        schema_version: LICENSE_SCHEMA_VERSION,
-        product: PRODUCT_ID.to_string(),
-        installation_id: Uuid::new_v4().to_string(),
-        fingerprint,
-        issued_at: now_ms().to_string(),
-        key_id: None,
-        signature: None,
-    }
+    license_core::new_unsigned_license(fingerprint, now_ms())
 }
 
-fn update_anchor_part(hasher: &mut Sha256, name: &str, bytes: &[u8]) {
-    hasher.update(name.as_bytes());
-    hasher.update([0u8]);
-    hasher.update((bytes.len() as u64).to_le_bytes());
-    hasher.update(bytes);
-}
-
-fn finish_anchor(hasher: Sha256) -> String {
-    let digest = hasher.finalize();
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-/// Preserve the original v1 anchor exactly: both manifest files are hashed as
-/// raw bytes with the historical filename/NUL/length framing.
 pub fn raw_anchor_sha256(bundle_root: &Path) -> Result<String, AppError> {
-    let mut hasher = Sha256::new();
-    for name in ["manifest.json", "usb-manifest.json"] {
-        let path = bundle_root.join(name);
-        let bytes = fs::read(&path)
-            .map_err(|error| engine(format!("读取锚点 {} 失败: {error}", path.display())))?;
-        update_anchor_part(&mut hasher, name, &bytes);
-    }
-    Ok(finish_anchor(hasher))
+    license_core::raw_anchor_sha256(bundle_root).map_err(map_license_error)
 }
 
-fn read_anchor_json(bundle_root: &Path, name: &str) -> Result<serde_json::Value, AppError> {
-    let path = bundle_root.join(name);
-    let bytes = fs::read(&path)
-        .map_err(|error| engine(format!("读取锚点 {} 失败: {error}", path.display())))?;
-    serde_json::from_slice(&bytes)
-        .map_err(|error| engine(format!("解析锚点 {} 失败: {error}", path.display())))
-}
-
-fn remove_v2_mutable_fields(value: &mut serde_json::Value, name: &str) {
-    match name {
-        "manifest.json" => {
-            if let Some(object) = value.as_object_mut() {
-                for key in ["codexDesktopVersion", "packageVersion", "releaseTag"] {
-                    object.remove(key);
-                }
-            }
-            if let Some(payload) = value
-                .get_mut("payload")
-                .and_then(|value| value.as_object_mut())
-            {
-                payload.remove("sha256");
-                payload.remove("size");
-            }
-        }
-        "usb-manifest.json" => {
-            if let Some(codex_installer) = value
-                .get_mut("codexInstaller")
-                .and_then(|value| value.as_object_mut())
-            {
-                codex_installer.remove("payloadSha256");
-                codex_installer.remove("payloadSize");
-            }
-        }
-        _ => {}
-    }
-}
-
-fn write_canonical_json(
-    value: &serde_json::Value,
-    output: &mut Vec<u8>,
-) -> Result<(), serde_json::Error> {
-    match value {
-        serde_json::Value::Null
-        | serde_json::Value::Bool(_)
-        | serde_json::Value::Number(_)
-        | serde_json::Value::String(_) => serde_json::to_writer(output, value),
-        serde_json::Value::Array(values) => {
-            output.push(b'[');
-            for (index, value) in values.iter().enumerate() {
-                if index != 0 {
-                    output.push(b',');
-                }
-                write_canonical_json(value, output)?;
-            }
-            output.push(b']');
-            Ok(())
-        }
-        serde_json::Value::Object(object) => {
-            let mut entries = object.iter().collect::<Vec<_>>();
-            entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
-            output.push(b'{');
-            for (index, (key, value)) in entries.into_iter().enumerate() {
-                if index != 0 {
-                    output.push(b',');
-                }
-                serde_json::to_writer(&mut *output, key)?;
-                output.push(b':');
-                write_canonical_json(value, output)?;
-            }
-            output.push(b'}');
-            Ok(())
-        }
-    }
-}
-
-fn canonical_json_bytes(value: &serde_json::Value) -> Result<Vec<u8>, serde_json::Error> {
-    let mut output = Vec::new();
-    write_canonical_json(value, &mut output)?;
-    Ok(output)
-}
-
-/// Hash the v2 canonical representation.  Only the allow-listed mutable
-/// metadata is removed; all other JSON values remain part of the anchor.
 pub fn canonical_anchor_sha256(bundle_root: &Path) -> Result<String, AppError> {
-    let mut hasher = Sha256::new();
-    for name in ["manifest.json", "usb-manifest.json"] {
-        let mut value = read_anchor_json(bundle_root, name)?;
-        remove_v2_mutable_fields(&mut value, name);
-        let canonical = canonical_json_bytes(&value).map_err(|error| {
-            engine(format!(
-                "规范化锚点 {} 失败: {error}",
-                bundle_root.join(name).display()
-            ))
-        })?;
-        update_anchor_part(&mut hasher, name, &canonical);
-    }
-    Ok(finish_anchor(hasher))
+    license_core::canonical_anchor_sha256(bundle_root).map_err(map_license_error)
 }
 
-/// Resolve the anchor schema from the bundle capability.  A missing or
-/// unparsable legacy usb-manifest remains v1-compatible; an explicit unknown
-/// schema is rejected so it cannot be silently downgraded to v1.
 pub fn bundle_anchor_schema(bundle_root: &Path) -> Result<u32, AppError> {
-    let path = bundle_root.join("usb-manifest.json");
-    let bytes = fs::read(&path)
-        .map_err(|error| engine(format!("读取锚点 {} 失败: {error}", path.display())))?;
-    let value = match serde_json::from_slice::<serde_json::Value>(&bytes) {
-        Ok(value) => value,
-        Err(_) => return Ok(ANCHOR_SCHEMA_V1),
-    };
-    let Some(schema_value) = value.get("schemaVersion") else {
-        return Ok(ANCHOR_SCHEMA_V1);
-    };
-    let Some(schema) = schema_value.as_u64() else {
-        return Err(engine("U 盘清单 schemaVersion 不是整数，拒绝确定锚点版本"));
-    };
-    match schema {
-        1 => Ok(ANCHOR_SCHEMA_V1),
-        2 => Ok(ANCHOR_SCHEMA_V2),
-        _ => Err(engine(format!("U 盘清单锚点版本不兼容: {schema}"))),
-    }
+    license_core::bundle_anchor_schema(bundle_root).map_err(map_license_error)
 }
 
-/// Hash the bundle using the representation selected by its explicit
-/// capability.  This is the API callers should use for observed fingerprints.
 pub fn anchor_sha256(bundle_root: &Path) -> Result<String, AppError> {
-    match bundle_anchor_schema(bundle_root)? {
-        ANCHOR_SCHEMA_V1 => raw_anchor_sha256(bundle_root),
-        ANCHOR_SCHEMA_V2 => canonical_anchor_sha256(bundle_root),
-        _ => Err(engine("U 盘清单锚点版本不兼容")),
-    }
+    license_core::anchor_sha256(bundle_root).map_err(map_license_error)
 }
 
 fn bundle_root_for_executable(executable: &Path) -> Option<PathBuf> {
@@ -816,12 +861,25 @@ fn base_status(status: &str, watchdog: &str) -> UsbGuardStatus {
         bundle_path: None,
         bundle_relative_path: None,
         signed: false,
+        signature_state: if signed_required() {
+            "missing".to_string()
+        } else {
+            "unsigned-development".to_string()
+        },
+        codex_allowed: false,
+        codex_block_reason: None,
         last_checked_at_ms: now_ms(),
         missing_since_ms: None,
         countdown_seconds: None,
         managed_processes: Vec::new(),
         message: status_message(status),
     }
+}
+
+fn mark_invalid_license(status: &mut UsbGuardStatus, detail: String) {
+    status.signature_state = "invalid".to_string();
+    status.codex_block_reason = Some(detail.clone());
+    status.message = detail;
 }
 
 pub fn disabled_status() -> UsbGuardStatus {
@@ -843,6 +901,13 @@ fn lock_path() -> Result<PathBuf, AppError> {
 }
 
 pub fn current_status() -> UsbGuardStatus {
+    if STARTUP_INTEGRITY_PENDING.load(Ordering::SeqCst) && guard_required() {
+        let mut status = base_status("starting", "not-running");
+        status.removable = true;
+        status.codex_block_reason = Some("U 盘能力包正在进行启动完整性校验".to_string());
+        status.message = "正在校验 U 盘能力包，完成后才会开放 Codex 操作".to_string();
+        return status;
+    }
     status_path()
         .ok()
         .and_then(|path| read_json::<UsbGuardStatus>(&path))
@@ -908,6 +973,156 @@ fn path_has_reparse_point(_path: &Path) -> Result<bool, AppError> {
     Ok(false)
 }
 
+fn license_digest(bundle_root: &Path) -> Result<String, AppError> {
+    let bytes = fs::read(license_path(bundle_root))
+        .map_err(|error| engine(format!("读取许可证摘要失败: {error}")))?;
+    let digest = Sha256::digest(bytes);
+    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// Capability content is independent from the formal Codex signature. It
+/// still requires the live removable-volume lease and physical re-observation,
+/// but a development bundle may use the documented unsigned license.
+pub fn require_usb_content_access(phase: &str) -> Result<(), AppError> {
+    if !guard_required() {
+        return Ok(());
+    }
+    // Do not trust a stale authorized status while the asynchronous startup
+    // integrity scan is still pending. This gate intentionally accepts an
+    // unsigned development lease, but it still requires the live lease and
+    // watchdog that prove this process completed startup authorization.
+    require_authorized().map_err(|error| {
+        engine(format!(
+            "usb_watchdog_not_ready phase={phase}：能力包操作尚未获得活动 U 盘租约：{error}"
+        ))
+    })?;
+    let bundle = current_bundle_root().ok_or_else(|| {
+        engine(format!(
+            "usb_data_boundary phase={phase}：无法确定当前 USB bundle"
+        ))
+    })?;
+    validate_bundle_policy_binding(&bundle).map_err(|error| {
+        engine(format!(
+            "usb_policy_gate phase={phase}：能力包操作被策略互锁拒绝：{error}"
+        ))
+    })?;
+    let observation = observe_bundle(&bundle).map_err(|error| {
+        engine(format!(
+            "usb_data_boundary phase={phase}：现场 U 盘复核失败：{error}"
+        ))
+    })?;
+    let fingerprint = observation.fingerprint.as_ref().ok_or_else(|| {
+        engine(format!(
+            "usb_not_ntfs phase={phase}：能力包只允许从可移动 NTFS U 盘读取"
+        ))
+    })?;
+    let integrity =
+        crate::app::usb_bundle::verify_bundle_integrity(&bundle, false).map_err(|error| {
+            engine(format!(
+                "usb_bundle_integrity_failed phase={phase}：{error}"
+            ))
+        })?;
+    if !integrity
+        .anchor_sha256
+        .eq_ignore_ascii_case(&fingerprint.anchor_sha256)
+    {
+        return Err(engine(format!(
+            "usb_anchor_mismatch phase={phase}：能力包所在 Bundle 已变化"
+        )));
+    }
+    let content = usb_content_root(&bundle);
+    if !content.is_dir() || path_has_reparse_point(&content)? {
+        return Err(engine(format!(
+            "usb_data_boundary phase={phase}：能力包目录不可用：{}",
+            content.display()
+        )));
+    }
+    log::debug!(
+        "USB content gate passed phase={phase} bundle={} serial={} relative={}",
+        bundle.display(),
+        fingerprint.volume_serial,
+        fingerprint.bundle_relative_path
+    );
+    Ok(())
+}
+
+/// Unified Codex gate. Every launch, install, repair, update and commit path
+/// calls this boundary. The returned snapshot is captured from the live
+/// observation immediately before the operation; it is never reconstructed
+/// from renderer-provided paths.
+pub fn require_signed_codex_bundle(
+    phase: &str,
+) -> Result<Option<SignedUsbAuthorization>, AppError> {
+    if !guard_required() {
+        return Ok(None);
+    }
+    let (bundle, fingerprint) = authorized_bundle_identity()
+        .map_err(|error| engine(format!("usb_license_gate phase={phase} failed: {error}")))?;
+    let license = read_license(&bundle)?.ok_or_else(|| {
+        engine(format!(
+            "usb_license_missing phase={phase}：当前 U 盘缺少 usb-license.json"
+        ))
+    })?;
+    let signed = validate_license(&license, &fingerprint)
+        .map_err(|error| engine(format!("usb_license_invalid phase={phase}：{error}")))?;
+    if signed && license.key_id.is_none() && signed_required() {
+        return Err(engine(format!(
+            "usb_license_missing_key_id phase={phase}：正式许可证必须包含 keyId"
+        )));
+    }
+    if !signed {
+        return Err(engine(format!(
+            "usb_license_unsigned phase={phase}：未签名许可证只允许诊断和能力包操作，Codex 操作必须使用正式签名许可证"
+        )));
+    }
+    let lease = read_lease().ok_or_else(|| {
+        engine(format!(
+            "usb_watchdog_not_running phase={phase}：当前没有有效 U 盘租约"
+        ))
+    })?;
+    if lease.installation_id.is_none() || lease.key_id.is_none() || lease.license_digest.is_none() {
+        return Err(engine(format!(
+            "usb_toctou_changed phase={phase}：当前租约缺少正式授权快照，请重启管理器"
+        )));
+    }
+
+    // Hash/path/manifest verification is required for every route. Formal
+    // USB builds additionally require the internal license/anchor binding and
+    // Authenticode on the external MSIX/prerequisites; product-owned EXEs are
+    // protected by the same signed USB anchor and SHA-256 rows.
+    let integrity = verify_runtime_bundle_integrity(&bundle)
+        .map_err(|error| engine(format!("usb_bundle_invalid phase={phase}：{error}")))?;
+    if !integrity
+        .anchor_sha256
+        .eq_ignore_ascii_case(&fingerprint.anchor_sha256)
+    {
+        return Err(engine(format!(
+            "usb_bundle_anchor_changed phase={phase}：现场锚点与物理观察不一致"
+        )));
+    }
+    let apps = bundle.join(USB_APPS_DIR_NAME);
+    let codex_root = usb_codex_root(&bundle);
+    for candidate in [&bundle, &apps, &codex_root] {
+        if path_has_reparse_point(candidate)? {
+            return Err(engine(format!(
+                "usb_bundle_reparse phase={phase}：U 盘程序目录不能是 Junction/符号链接：{}",
+                candidate.display()
+            )));
+        }
+    }
+    let _ = local_data_paths()
+        .map_err(|error| engine(format!("usb_data_boundary phase={phase} failed: {error}")))?;
+    Ok(Some(SignedUsbAuthorization {
+        bundle_root: bundle.clone(),
+        codex_root,
+        fingerprint: fingerprint.clone(),
+        installation_id: license.installation_id,
+        key_id: license.key_id.unwrap_or_default(),
+        license_digest: license_digest(&bundle)?,
+        checked_at_ms: now_ms(),
+    }))
+}
+
 /// Re-observe and authorize the exact physical bundle owned by this manager
 /// session.  Callers that hand work to a detached helper must persist this
 /// fingerprint; a renderer path or a drive letter is not an authorization
@@ -927,8 +1142,16 @@ pub fn authorized_bundle_identity() -> Result<(PathBuf, UsbFingerprint), AppErro
         .as_ref()
         .ok_or_else(|| engine("当前安装器目录不在可移动 U 盘上"))?;
     let bundle = PathBuf::from(&observation.bundle_path);
+    validate_bundle_policy_binding(&bundle)?;
+    if path_has_reparse_point(&bundle)? {
+        return Err(engine(format!(
+            "当前 U 盘 bundle 根目录不能是 Junction/符号链接：{}",
+            bundle.display()
+        )));
+    }
     let license = read_license(&bundle)?.ok_or_else(|| engine("当前 U 盘缺少许可证"))?;
     validate_license(&license, current_fingerprint)?;
+    validate_lease_license_snapshot(&lease, &license, &bundle)?;
     if !fingerprints_match(&license.fingerprint, &lease.fingerprint) {
         return Err(engine(format!(
             "当前许可证与本会话租约不一致（currentPath={} leasePath={}）",
@@ -947,11 +1170,32 @@ pub fn authorized_bundle_identity() -> Result<(PathBuf, UsbFingerprint), AppErro
     Ok((bundle, current_fingerprint.clone()))
 }
 
+/// Codex payload refresh is a release operation, not a development-mode
+/// bundle operation.  Keep the general USB authorization API permissive for
+/// local development, but require a configured signed license at this update
+/// boundary so an unsigned auto-enrolled bundle can never refresh its payload.
+pub fn authorized_signed_bundle_identity() -> Result<(PathBuf, UsbFingerprint), AppError> {
+    let authorization = require_signed_codex_bundle("codex-payload")?
+        .ok_or_else(|| engine("当前进程不是 USB bundle，不能执行 USB payload 更新"))?;
+    if guard_required() {
+        let license = read_license(&authorization.bundle_root)?
+            .ok_or_else(|| engine("usb_license_missing：当前 U 盘缺少许可证"))?;
+        if license.signature.is_none() {
+            return Err(engine(
+                "usb_license_unsigned：Codex payload 远程更新要求签名许可证",
+            ));
+        }
+    }
+    Ok((authorization.bundle_root, authorization.fingerprint))
+}
+
 /// Resolve and authorize the only install destination permitted to the fixed
 /// USB product. Existing `apps`/`Codex` reparse points are rejected so a copied
 /// or tampered bundle cannot redirect the payload onto C: or another volume.
 pub fn authorized_usb_codex_root() -> Result<PathBuf, AppError> {
-    let (bundle, _) = authorized_bundle_identity()?;
+    let authorization = require_signed_codex_bundle("codex-install-destination")?
+        .ok_or_else(|| engine("当前进程不是 USB bundle，不能解析 USB Codex 目录"))?;
+    let bundle = authorization.bundle_root;
     let apps = bundle.join(USB_APPS_DIR_NAME);
     let codex = usb_codex_root(&bundle);
     for candidate in [&apps, &codex] {
@@ -1017,8 +1261,8 @@ pub fn local_data_paths() -> Result<UsbLocalDataPaths, AppError> {
 
 /// Re-check the physical USB identity at a privileged-operation boundary.
 ///
-/// `require_authorized()` is intentionally a cheap status-file check for the
-/// command boundary.  A UAC prompt can remain open long enough for a user to
+/// `require_authorized()` checks the status, lease and live helper lock for the
+/// command boundary. A UAC prompt can remain open long enough for a user to
 /// remove the drive, reassign its letter, or insert another removable disk.
 /// Before a machine-level AppX-volume write we therefore resolve the current
 /// lease fingerprint against the live removable volumes again and require the
@@ -1027,6 +1271,7 @@ pub fn local_data_paths() -> Result<UsbLocalDataPaths, AppError> {
 /// drive letter.
 #[cfg(target_os = "windows")]
 pub fn verify_authorized_volume_root(volume_root: &Path) -> Result<(), AppError> {
+    let _ = require_signed_codex_bundle("appx-volume-boundary")?;
     let expected_root = normalize_drive_root(&volume_root.to_string_lossy())
         .ok_or_else(|| engine("AppX 目标卷不是本地盘根路径"))?;
     let status = current_status();
@@ -1071,13 +1316,114 @@ pub fn require_authorized() -> Result<(), AppError> {
         return Ok(());
     }
     let status = current_status();
-    if status.status == "authorized" && status.watchdog == "running" {
+    let lease_live = read_lease().is_some();
+    #[cfg(target_os = "windows")]
+    let helper_live = guard_helper_is_live();
+    #[cfg(not(target_os = "windows"))]
+    let helper_live = true;
+    if status.status == "authorized" && status.watchdog == "running" && lease_live && helper_live {
         return Ok(());
     }
     Err(engine(format!(
-        "未检测到有效 U 盘租约（status={} watchdog={}），拒绝执行受保护操作",
-        status.status, status.watchdog
+        "未检测到有效 U 盘租约或看门狗（status={} watchdog={} lease={} helper={}），拒绝执行受保护操作",
+        status.status, status.watchdog, lease_live, helper_live
     )))
+}
+
+#[cfg(target_os = "windows")]
+fn guard_helper_is_live() -> bool {
+    let Some(pid) = lock_path()
+        .ok()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|text| text.trim().parse::<u32>().ok())
+    else {
+        return false;
+    };
+    process_matches(pid, Some(GUARD_EXE_NAME))
+}
+
+/// Perform the small, read-only portion of startup validation. The expensive
+/// SHA/AuthentiCode walk is deliberately deferred until after the local shell
+/// exists when the machine already has the runtimes needed to render it. No
+/// install, recovery, lease, or Codex operation is allowed while the returned
+/// `IntegrityPending` state is active.
+fn startup_preflight_impl(complete_integrity: bool) -> Result<StartupPreflight, AppError> {
+    if !guard_required() {
+        STARTUP_INTEGRITY_PENDING.store(false, Ordering::SeqCst);
+        return Ok(StartupPreflight::Ready);
+    }
+    STARTUP_INTEGRITY_PENDING.store(!complete_integrity, Ordering::SeqCst);
+    let bundle = current_bundle_root()
+        .ok_or_else(|| engine("usb_license_bundle_missing：无法确定当前 USB bundle"))?;
+    validate_bundle_policy_binding(&bundle)?;
+    let observation = observe_bundle(&bundle)?;
+    let fingerprint = observation
+        .fingerprint
+        .as_ref()
+        .ok_or_else(|| engine("usb_license_media_invalid：当前介质必须是可移动 NTFS U 盘"))?;
+    let license_reason = match read_license(&bundle) {
+        Err(error) => Some(format!(
+            "usb_license_invalid：启动前许可证读取失败：{error}"
+        )),
+        Ok(Some(license)) => match validate_license(&license, fingerprint) {
+            Err(error) => Some(format!(
+                "usb_license_invalid：启动前许可证校验失败：{error}"
+            )),
+            Ok(signed) if signed_required() && !signed => {
+                Some("usb_license_unsigned：SignedRequired 启动前拒绝未签名许可证".to_string())
+            }
+            Ok(_) if signed_required() && license.key_id.is_none() => Some(
+                "usb_license_missing_key_id：SignedRequired 启动前拒绝缺少 keyId 的许可证"
+                    .to_string(),
+            ),
+            Ok(_) => None,
+        },
+        Ok(None) if signed_required() => {
+            Some("usb_license_missing：SignedRequired 启动前缺少 usb-license.json".to_string())
+        }
+        Ok(None) => None,
+    };
+    if complete_integrity {
+        verify_runtime_bundle_integrity(&bundle).map_err(|error| {
+            engine(format!(
+                "usb_bundle_invalid：启动前完整 bundle 校验失败：{error}"
+            ))
+        })?;
+    }
+    let _ = local_data_paths()?;
+    if complete_integrity {
+        STARTUP_INTEGRITY_PENDING.store(false, Ordering::SeqCst);
+        Ok(match license_reason {
+            Some(reason) => StartupPreflight::AuthorizationBlocked { reason },
+            None => StartupPreflight::Ready,
+        })
+    } else {
+        Ok(StartupPreflight::IntegrityPending {
+            reason: license_reason.unwrap_or_else(|| {
+                "启动完整性校验将在本地界面显示后完成；校验期间不开放 Codex 操作".to_string()
+            }),
+        })
+    }
+}
+
+/// Read-only launch preflight. It returns quickly after validating the fixed
+/// bundle shape, removable NTFS identity, license syntax/binding and local
+/// data boundary. The full immutable tree check is performed by the manager
+/// worker before any lease, recovery, shortcut or Codex operation is enabled.
+pub fn startup_preflight() -> Result<StartupPreflight, AppError> {
+    startup_preflight_impl(false)
+}
+
+/// Complete the preflight synchronously for machines that need a bundled
+/// runtime installed before a Tauri window can be created. This preserves the
+/// old fail-closed prerequisite path while the normal path gets a visible
+/// local shell first.
+pub fn complete_startup_preflight() -> Result<StartupPreflight, AppError> {
+    startup_preflight_impl(true)
+}
+
+pub fn startup_integrity_pending() -> bool {
+    STARTUP_INTEGRITY_PENDING.load(Ordering::SeqCst)
 }
 
 pub fn write_status(status: &UsbGuardStatus) -> Result<(), AppError> {
@@ -1302,6 +1648,15 @@ fn terminate_managed_processes(lease: &UsbLease) -> usize {
     terminated
 }
 
+#[cfg(target_os = "windows")]
+fn terminate_managed_processes_without_manager(lease: &UsbLease) -> usize {
+    let mut scoped = lease.clone();
+    scoped
+        .managed_processes
+        .retain(|process| process.pid != lease.owner_pid && process.role != "manager");
+    terminate_managed_processes(&scoped)
+}
+
 #[cfg(not(target_os = "windows"))]
 fn terminate_managed_processes(_lease: &UsbLease) -> usize {
     0
@@ -1374,6 +1729,23 @@ fn observe_windows_bundle(bundle_root: &Path) -> Result<UsbObservation, AppError
             io::Error::last_os_error()
         )));
     }
+    let fs_name_len = fs_name
+        .iter()
+        .position(|value| *value == 0)
+        .unwrap_or(fs_name.len());
+    let file_system = String::from_utf16_lossy(&fs_name[..fs_name_len]);
+    if !file_system.eq_ignore_ascii_case("NTFS") {
+        // A removable FAT/exFAT volume is visible but is not an authorized
+        // release medium. Returning no fingerprint makes every lease and
+        // signed operation fail closed without treating a different
+        // filesystem as an equivalent USB identity.
+        return Ok(UsbObservation {
+            removable: true,
+            drive_root: Some(drive_root),
+            bundle_path: path,
+            fingerprint: None,
+        });
+    }
     let relative =
         bundle_relative_path(&path, &drive_root).ok_or_else(|| engine("U 盘目录不在卷根路径下"))?;
     let anchor_schema = bundle_anchor_schema(&normalized_bundle_root)?;
@@ -1401,26 +1773,41 @@ pub fn observe_bundle(bundle_root: &Path) -> Result<UsbObservation, AppError> {
 }
 
 #[cfg(target_os = "windows")]
-fn scan_removable_for(expected: &UsbFingerprint) -> Option<UsbObservation> {
+fn scan_removable_matches(expected: &UsbFingerprint) -> Vec<UsbObservation> {
+    let mut matches = Vec::new();
     for letter in b'A'..=b'Z' {
         let root = format!("{}:\\", letter as char);
-        let candidate = PathBuf::from(bundle_path_on_drive(&root, &expected.bundle_relative_path)?);
+        let Some(candidate) = bundle_path_on_drive(&root, &expected.bundle_relative_path) else {
+            continue;
+        };
+        let candidate = PathBuf::from(candidate);
         if let Ok(observation) = observe_windows_bundle(&candidate) {
             if observation
                 .fingerprint
                 .as_ref()
                 .is_some_and(|actual| fingerprints_match(expected, actual))
             {
-                return Some(observation);
+                matches.push(observation);
             }
         }
     }
-    None
+    matches
+}
+
+#[cfg(target_os = "windows")]
+fn scan_removable_for(expected: &UsbFingerprint) -> Option<UsbObservation> {
+    let matches = scan_removable_matches(expected);
+    (matches.len() == 1).then(|| matches.into_iter().next().expect("one match"))
 }
 
 #[cfg(not(target_os = "windows"))]
 fn scan_removable_for(_expected: &UsbFingerprint) -> Option<UsbObservation> {
     None
+}
+
+#[cfg(not(target_os = "windows"))]
+fn scan_removable_matches(_expected: &UsbFingerprint) -> Vec<UsbObservation> {
+    Vec::new()
 }
 
 fn file_sha256(path: &Path) -> Result<[u8; 32], AppError> {
@@ -1551,14 +1938,44 @@ fn spawn_guard(_executable: &Path, _lease_path: &Path) -> Result<(), AppError> {
 }
 
 #[cfg(target_os = "windows")]
+fn finish_restricted_start(status: UsbGuardStatus) -> Result<UsbGuardStatus, AppError> {
+    // Publish the restricted state before clearing a prior lease. The helper
+    // refresh path only removes the lease and waits for the detached helper;
+    // it never terminates the current manager process. Even if the status
+    // write fails, still perform the lease/helper cleanup so an old authorized
+    // session cannot survive a newly rejected startup.
+    let status_write = write_status(&status);
+    let lease_cleanup = stop_previous_guard_for_refresh();
+    match (status_write, lease_cleanup) {
+        (Ok(()), Ok(())) => Ok(status),
+        (Err(status_error), Ok(())) => Err(status_error),
+        (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
+        (Err(status_error), Err(cleanup_error)) => Err(engine(format!(
+            "受限启动状态写入失败，且旧 U 盘租约清理失败：status={status_error}; cleanup={cleanup_error}"
+        ))),
+    }
+}
+
+#[cfg(target_os = "windows")]
 pub fn start_for_manager() -> Result<UsbGuardStatus, AppError> {
+    let result = start_for_manager_inner();
+    // Keep the fail-closed `starting` status visible when an unexpected
+    // initialization error occurs. A stale status.json must never become the
+    // apparent authorization state after the pending marker is cleared.
+    if result.is_ok() {
+        STARTUP_INTEGRITY_PENDING.store(false, Ordering::SeqCst);
+    }
+    result
+}
+
+#[cfg(target_os = "windows")]
+fn start_for_manager_inner() -> Result<UsbGuardStatus, AppError> {
     let executable =
         std::env::current_exe().map_err(|error| engine(format!("无法确定安装器路径: {error}")))?;
     let Some(bundle_root) = bundle_root_for_executable(&executable) else {
         let mut status = base_status("unsupported", "not-running");
         status.message = "未找到离线安装器根目录，U 盘绑定未启用".to_string();
-        write_status(&status)?;
-        return Ok(status);
+        return finish_restricted_start(status);
     };
     let observation = observe_windows_bundle(&bundle_root)?;
     let Some(fingerprint) = observation.fingerprint.clone() else {
@@ -1566,10 +1983,21 @@ pub fn start_for_manager() -> Result<UsbGuardStatus, AppError> {
         status.removable = observation.removable;
         status.drive_root = observation.drive_root;
         status.bundle_path = Some(observation.bundle_path);
-        write_status(&status)?;
-        return Ok(status);
+        return finish_restricted_start(status);
     };
     let observed_bundle_root = PathBuf::from(&observation.bundle_path);
+    validate_bundle_policy_binding(&observed_bundle_root)?;
+    if let Err(error) = verify_runtime_bundle_integrity(&observed_bundle_root) {
+        let mut status = base_status("mismatch", "not-running");
+        status.removable = true;
+        status.drive_root = observation.drive_root;
+        status.bundle_path = Some(observation.bundle_path);
+        status.bundle_relative_path = Some(fingerprint.bundle_relative_path);
+        status.signature_state = "invalid".to_string();
+        status.codex_block_reason = Some(error.to_string());
+        status.message = error.to_string();
+        return finish_restricted_start(status);
+    }
 
     let existing_license = match read_license(&observed_bundle_root) {
         Ok(value) => value,
@@ -1579,9 +2007,10 @@ pub fn start_for_manager() -> Result<UsbGuardStatus, AppError> {
             status.drive_root = observation.drive_root;
             status.bundle_path = Some(observation.bundle_path);
             status.bundle_relative_path = Some(fingerprint.bundle_relative_path);
+            status.signature_state = "invalid".to_string();
+            status.codex_block_reason = Some(error.to_string());
             status.message = error.to_string();
-            let _ = write_status(&status);
-            return Ok(status);
+            return finish_restricted_start(status);
         }
     };
     let (license, signed) = match existing_license {
@@ -1593,11 +2022,22 @@ pub fn start_for_manager() -> Result<UsbGuardStatus, AppError> {
                 status.drive_root = observation.drive_root;
                 status.bundle_path = Some(observation.bundle_path);
                 status.bundle_relative_path = Some(fingerprint.bundle_relative_path);
-                status.message = error.to_string();
-                let _ = write_status(&status);
-                return Ok(status);
+                mark_invalid_license(&mut status, error.to_string());
+                return finish_restricted_start(status);
             }
         },
+        None if signed_required() => {
+            let mut status = base_status("mismatch", "not-running");
+            status.removable = true;
+            status.drive_root = observation.drive_root;
+            status.bundle_path = Some(observation.bundle_path);
+            status.bundle_relative_path = Some(fingerprint.bundle_relative_path);
+            status.signature_state = "missing".to_string();
+            status.codex_block_reason =
+                Some("SignedRequired 构建缺少 usb-license.json".to_string());
+            status.message = "正式 USB 包缺少签名许可证，未创建租约".to_string();
+            return finish_restricted_start(status);
+        }
         None => {
             let license = new_unsigned_license(fingerprint.clone());
             write_license(&observed_bundle_root, &license)?;
@@ -1608,12 +2048,38 @@ pub fn start_for_manager() -> Result<UsbGuardStatus, AppError> {
         }
     };
 
+    let startup_plan = startup_guard_plan(signed_required(), signed);
+    if !startup_plan.establish_lease {
+        debug_assert!(!startup_plan.prepare_or_start_helper);
+        debug_assert!(startup_plan.clear_current_lease);
+        debug_assert!(startup_plan.preserve_current_manager);
+        let mut status = base_status("mismatch", "not-running");
+        status.removable = true;
+        status.drive_root = observation.drive_root;
+        status.bundle_path = Some(observation.bundle_path);
+        status.bundle_relative_path = Some(fingerprint.bundle_relative_path);
+        status.signed = signed;
+        status.signature_state = "unsigned-development".to_string();
+        status.codex_allowed = startup_plan.codex_allowed;
+        status.codex_block_reason = Some(
+            "usb_license_unsigned：SignedRequired 下未签名许可证不能建立租约或执行 Codex 操作"
+                .to_string(),
+        );
+        status.message =
+            "正式 USB 包许可证未签名，未创建租约或启动看门狗；管理器保持受限".to_string();
+
+        return finish_restricted_start(status);
+    }
+
     let lease = UsbLease {
         schema_version: LEASE_SCHEMA_VERSION,
         product: PRODUCT_ID.to_string(),
         lease_id: Uuid::new_v4().to_string(),
         bundle_path: observation.bundle_path.clone(),
         fingerprint: license.fingerprint.clone(),
+        installation_id: Some(license.installation_id.clone()),
+        key_id: license.key_id.clone(),
+        license_digest: Some(license_digest(&observed_bundle_root)?),
         owner_pid: std::process::id(),
         managed_processes: vec![ManagedProcess {
             pid: std::process::id(),
@@ -1643,6 +2109,19 @@ pub fn start_for_manager() -> Result<UsbGuardStatus, AppError> {
     status.bundle_path = Some(observation.bundle_path);
     status.bundle_relative_path = Some(license.fingerprint.bundle_relative_path);
     status.signed = signed;
+    status.signature_state = if signed {
+        "valid".to_string()
+    } else {
+        "unsigned-development".to_string()
+    };
+    status.codex_allowed = spawn_result.is_ok() && signed;
+    status.codex_block_reason = (!status.codex_allowed).then(|| {
+        if !signed {
+            "未签名开发许可证不能执行 Codex 操作".to_string()
+        } else {
+            "USB 看门狗未能启动".to_string()
+        }
+    });
     status.managed_processes = lease.managed_processes;
     status.message = if signed {
         "U 盘已验证，签名许可证有效".to_string()
@@ -1658,6 +2137,7 @@ pub fn start_for_manager() -> Result<UsbGuardStatus, AppError> {
 
 #[cfg(not(target_os = "windows"))]
 pub fn start_for_manager() -> Result<UsbGuardStatus, AppError> {
+    STARTUP_INTEGRITY_PENDING.store(false, Ordering::SeqCst);
     let status = disabled_status();
     let _ = write_status(&status);
     Ok(status)
@@ -1725,17 +2205,77 @@ pub fn run_guard_cli() {
         let now = now_ms();
         if let Some(observation) = present {
             missing_since = None;
+            let bundle = PathBuf::from(&observation.bundle_path);
+            let license_check = read_license(&bundle).and_then(|license| {
+                let license = license.ok_or_else(|| engine("USB 看门狗发现许可证缺失"))?;
+                validate_lease_observation(&lease, &observation, lease.owner_pid)?;
+                let signed = validate_license(
+                    &license,
+                    observation
+                        .fingerprint
+                        .as_ref()
+                        .ok_or_else(|| engine("USB 看门狗发现物理指纹缺失"))?,
+                )?;
+                if signed_required() && !signed {
+                    return Err(engine("USB 看门狗发现未签名许可证"));
+                }
+                if signed
+                    && (lease.installation_id.is_none()
+                        || lease.key_id.is_none()
+                        || lease.license_digest.is_none())
+                {
+                    return Err(engine("USB 看门狗发现租约缺少签名授权快照"));
+                }
+                validate_lease_license_snapshot(&lease, &license, &bundle)?;
+                Ok((license, signed))
+            });
+            let (license, signed) = match license_check {
+                Ok(value) => value,
+                Err(error) => {
+                    // A mutable-license failure can race with a restricted
+                    // manager startup that is clearing the lease. Stop only
+                    // Codex/other managed children; never taskkill the
+                    // manager that must remain available for diagnostics and
+                    // user-initiated uninstall.
+                    let terminated = terminate_managed_processes_without_manager(&lease);
+                    let mut status = base_status("mismatch", "not-running");
+                    status.removable = true;
+                    status.drive_root = observation.drive_root;
+                    status.bundle_path = Some(observation.bundle_path);
+                    status.bundle_relative_path =
+                        Some(lease.fingerprint.bundle_relative_path.clone());
+                    status.signature_state = "invalid".to_string();
+                    status.codex_block_reason = Some(error.to_string());
+                    status.last_checked_at_ms = now;
+                    status.managed_processes = lease.managed_processes.clone();
+                    status.message = format!(
+                        "USB 许可证现场复核失败，已停止 {terminated} 个受保护进程：{error}"
+                    );
+                    let _ = write_json_atomic(
+                        &status_path()
+                            .unwrap_or_else(|_| lease_file.with_file_name(STATUS_FILE_NAME)),
+                        &status,
+                    );
+                    let _ = fs::remove_file(&lease_file);
+                    let _ = fs::remove_file(atomic_file::backup_path(&lease_file));
+                    break;
+                }
+            };
             let mut status = base_status("authorized", "running");
             status.removable = true;
             status.drive_root = observation.drive_root;
             status.bundle_path = Some(observation.bundle_path);
             status.bundle_relative_path = Some(lease.fingerprint.bundle_relative_path.clone());
-            status.signed = read_json::<UsbLicense>(
-                &PathBuf::from(status.bundle_path.as_deref().unwrap_or(&lease.bundle_path))
-                    .join(LICENSE_FILE_NAME),
-            )
-            .and_then(|license| license.signature)
-            .is_some();
+            status.signed = signed;
+            status.signature_state = if signed {
+                "valid".to_string()
+            } else {
+                "unsigned-development".to_string()
+            };
+            status.codex_allowed = signed;
+            status.codex_block_reason =
+                (!status.codex_allowed).then(|| "未签名开发许可证不能执行 Codex 操作".to_string());
+            let _ = license;
             status.last_checked_at_ms = now;
             status.managed_processes = lease.managed_processes.clone();
             let _ = write_json_atomic(
@@ -1830,7 +2370,137 @@ pub fn guard_requested() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::engine::general_purpose::STANDARD as B64;
     use ed25519_dalek::{Signer, SigningKey};
+
+    #[test]
+    fn startup_preflight_restricted_ui_never_counts_as_ready() {
+        let blocked = StartupPreflight::AuthorizationBlocked {
+            reason: "usb_license_missing".to_string(),
+        };
+        assert!(blocked.is_authorization_blocked());
+        assert_eq!(blocked.reason(), Some("usb_license_missing"));
+        let pending = StartupPreflight::IntegrityPending {
+            reason: "bundle scan deferred".to_string(),
+        };
+        assert!(!pending.is_authorization_blocked());
+        assert!(pending.is_integrity_pending());
+        assert_eq!(pending.reason(), Some("bundle scan deferred"));
+        assert!(!StartupPreflight::Ready.is_authorization_blocked());
+        assert!(!StartupPreflight::Ready.is_integrity_pending());
+        assert_eq!(StartupPreflight::Ready.reason(), None);
+    }
+
+    #[test]
+    fn bundle_policy_binding_rejects_missing_or_mismatched_policy() {
+        let root = std::env::temp_dir().join(format!("codex-usb-policy-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let manifest = root.join("usb-manifest.json");
+
+        fs::write(&manifest, br#"{"usbGuard":{"signing":{}}}"#).unwrap();
+        let missing = validate_bundle_policy_binding(&root)
+            .unwrap_err()
+            .to_string();
+        assert!(missing.contains("usb_policy_missing"), "{missing}");
+
+        let mismatched = if policy_name() == "SignedRequired" {
+            "DevelopmentAutoEnroll"
+        } else {
+            "SignedRequired"
+        };
+        fs::write(
+            &manifest,
+            serde_json::to_vec(&serde_json::json!({
+                "usbGuard": {"signing": {"policy": mismatched}}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mismatch = validate_bundle_policy_binding(&root)
+            .unwrap_err()
+            .to_string();
+        assert!(mismatch.contains("usb_policy_mismatch"), "{mismatch}");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bundle_policy_binding_accepts_the_manager_compile_policy() {
+        let root = std::env::temp_dir().join(format!("codex-usb-policy-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("usb-manifest.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "usbGuard": {"signing": {"policy": policy_name()}}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(validate_bundle_policy_binding(&root).is_ok());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn signed_required_unsigned_license_clears_lease_without_stopping_manager() {
+        let plan = startup_guard_plan(true, false);
+        assert_eq!(
+            plan,
+            StartupGuardPlan {
+                establish_lease: false,
+                prepare_or_start_helper: false,
+                clear_current_lease: true,
+                preserve_current_manager: true,
+                codex_allowed: false,
+            }
+        );
+
+        let development_plan = startup_guard_plan(false, false);
+        assert!(development_plan.establish_lease);
+        assert!(development_plan.prepare_or_start_helper);
+        assert!(!development_plan.clear_current_lease);
+        assert!(!development_plan.codex_allowed);
+    }
+
+    #[test]
+    fn invalid_license_status_is_explicitly_blocked() {
+        let mut status = base_status("mismatch", "not-running");
+        mark_invalid_license(&mut status, "fingerprint mismatch".to_string());
+        assert_eq!(status.signature_state, "invalid");
+        assert_eq!(
+            status.codex_block_reason.as_deref(),
+            Some("fingerprint mismatch")
+        );
+        assert_eq!(status.message, "fingerprint mismatch");
+        assert!(!status.codex_allowed);
+    }
+
+    #[test]
+    fn signed_license_key_id_must_match_the_compile_time_active_key() {
+        assert_eq!(
+            active_key_binding_state(None, Some("arbitrary-key")),
+            ActiveKeyBinding::MissingActiveKeyId
+        );
+        assert_eq!(
+            active_key_binding_state(Some("active-key"), None),
+            ActiveKeyBinding::MissingLicenseKeyId
+        );
+        assert_eq!(
+            active_key_binding_state(Some("active-key"), Some("other-key")),
+            ActiveKeyBinding::Mismatch
+        );
+        assert_eq!(
+            active_key_binding_state(Some("active-key"), Some("active-key")),
+            ActiveKeyBinding::Matched
+        );
+        assert_eq!(
+            active_key_binding_state(Some("active key"), Some("active key")),
+            ActiveKeyBinding::InvalidActiveKeyId
+        );
+        assert_eq!(
+            active_key_binding_state(Some("active-key"), Some("other/key")),
+            ActiveKeyBinding::InvalidLicenseKeyId
+        );
+    }
 
     #[test]
     fn normalizes_drive_roots_and_rejects_unc() {
@@ -1944,6 +2614,9 @@ mod tests {
             lease_id: "lease".to_string(),
             bundle_path: r"D:\usb-oneclick-v0.5.20-final".to_string(),
             fingerprint: fingerprint.clone(),
+            installation_id: None,
+            key_id: None,
+            license_digest: None,
             owner_pid: 77,
             managed_processes: Vec::new(),
             issued_at: "now".to_string(),
@@ -2036,6 +2709,11 @@ mod tests {
         fs::create_dir_all(root.join("payload")).unwrap();
         fs::write(root.join("manifest.json"), manifest).unwrap();
         fs::write(root.join("usb-manifest.json"), usb_manifest).unwrap();
+        fs::write(
+            root.join("SHA256SUMS.txt"),
+            format!("{}  payload/OpenAI.Codex_x64.msix\n", "a".repeat(64)),
+        )
+        .unwrap();
         root
     }
 
@@ -2122,6 +2800,11 @@ mod tests {
             serde_json::to_vec_pretty(&manifest).unwrap(),
         )
         .unwrap();
+        fs::write(
+            root.join("SHA256SUMS.txt"),
+            format!("{}  payload/OpenAI.Codex_arm64.msix\n", "a".repeat(64)),
+        )
+        .unwrap();
         assert_ne!(anchor_sha256(&root).unwrap(), original);
         fs::remove_dir_all(root).unwrap();
     }
@@ -2160,9 +2843,9 @@ mod tests {
         let license: UsbLicense = serde_json::from_value(serde_json::json!({
             "schemaVersion": 1,
             "product": PRODUCT_ID,
-            "installationId": "legacy-installation",
+            "installationId": "00000000-0000-0000-0000-000000000002",
             "fingerprint": fingerprint_json,
-            "issuedAt": "now"
+            "issuedAt": "1"
         }))
         .unwrap();
         assert_eq!(license.fingerprint.anchor_schema, ANCHOR_SCHEMA_V1);

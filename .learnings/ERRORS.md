@@ -25,6 +25,63 @@ SyntaxError: Unexpected token '?'
 
 ---
 
+## [ERR-20260913-G22] stage2-finalizer-self-reference
+
+**Logged**: 2026-09-13T04:40:00+08:00
+**Priority**: critical
+**Status**: resolved
+**Area**: windows-uninstall
+
+### Symptom
+
+二阶段卸载清理后弹出 Windows“位置不可用”，报告写入失败并显示 `E_FAIL`；清理目标本身可能已删除。
+
+### Root Cause
+
+finalizer 把最终报告写回已被清理的 `%LOCALAPPDATA%\io.github.wangnov.codexappmanager\logs`，形成
+报告根目录自引用。
+
+### Prevention
+
+独立临时报告根目录、目标交叉检查、明确阶段/退出码/失败路径/重试建议，以及日志目录缺失时的 fallback；
+新增 G22 回归测试并在发行包中拒绝运行期授权残留。
+
+---
+
+## [ERR-20260913-G22] usb-package-bound-to-wrong-dpapi-key
+
+**Logged**: 2026-09-13T00:00:00+08:00
+**Priority**: critical
+**Status**: resolved
+**Area**: infra
+
+### Summary
+新打包的 G21 U 盘包在测试机无法签名，界面显示本机公钥摘要为 `216ae3…`，而包绑定了开发机的 `4d1407…`。
+
+### Error
+```text
+签名环境与当前安装包不匹配；本机 keyId=prod-2026-01 / 公钥摘要=216ae358…
+```
+
+### Context
+- 打包命令从当前 PowerShell 的 USB 公钥环境变量构建。
+- 两个环境使用相同 keyId，但 DPAPI Blob 实际不是同一把密钥。
+- 签名器拒绝写入许可证是正确的 fail-closed 行为。
+
+### Suggested Fix
+使用项目级发行公钥 profile 固定生产公钥；构建和验包在环境变量为空时自动加载 profile，在摘要不一致时立即失败。
+
+### Metadata
+- Reproducible: yes
+- Related Files: tools/usb-signing-release-profile.json, tools/usb-signing-profile.ps1
+- See Also: ERR-20260906-003
+
+### Resolution
+- **Resolved**: 2026-09-13
+- **Notes**: Added canonical profile and build/verify fail-closed checks; next package is rebuilt against the target signer key.
+
+---
+
 ## [ERR-20260906-013] package-lock-powershell-empty-key
 
 **Logged**: 2026-09-06T15:10:00+08:00
@@ -576,5 +633,39 @@ Canonicalize the temp root only on non-Windows hosts; retain `std::env::temp_dir
 ### Resolution
 - **Resolved**: 2026-09-06T16:01:00+08:00
 - **Notes**: Added target-specific temp-root handling and reran the standalone engine tests.
+
+---
+
+## [ERR-20260913-G23] stale-startup-guard-disabled-actions
+
+**Logged**: 2026-09-13T02:30:00+08:00
+**Priority**: high
+**Status**: resolved
+**Area**: windows-usb-ui
+
+### Summary
+
+The signed U-disk manager initially disabled both “one-click install” and “check and install update”, then enabled them only after the user waited. The backend was still performing its intentional startup integrity check; the UI had not yet consumed the new authorized status.
+
+### Root Cause
+
+`OfflineHome` made the final action decision from the first `usbGuardStatus()` result. Its only follow-up read was a 1-second polling timer, and the final payload probe did not trigger a fresh Guard read. `About` did not treat the explicit `starting` state as retryable.
+
+### Fix
+
+- Refresh the Guard after `offlinePayloadProbe()` completes.
+- Poll `starting` at 250ms for a bounded window, then fall back to 1 second.
+- Show a non-error startup-readiness message.
+- Retry `starting` in About with a bounded 20-attempt window.
+- Keep all existing signed authorization and backend fail-closed checks unchanged.
+
+### Verification
+
+- `npm exec vitest run src/app/views/OfflineHome.test.tsx src/app/views/About.test.tsx`
+- Result: 2 test files, 31 tests passed.
+
+### Prevention
+
+Every asynchronous USB startup consumer must test the initial `starting` state, a later authorized transition, and the failure/timeout paths. See `docs/USB-STARTUP-READINESS-G23.md`.
 
 ---

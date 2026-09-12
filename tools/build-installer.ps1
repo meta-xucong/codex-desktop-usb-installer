@@ -2,6 +2,9 @@
 param(
     [string]$Target = "x86_64-pc-windows-msvc",
     [string]$CcswitchArtifactDir = "",
+    [ValidateSet("SignedRequired", "DevelopmentAutoEnroll")]
+    [string]$UsbPolicy = "SignedRequired",
+    [string]$UsbSigningProfilePath = "",
     [switch]$SkipNpmInstall,
     [switch]$SkipTests,
     [switch]$FullTests
@@ -9,14 +12,51 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$previousUsbPolicy = $env:CODEX_USB_GUARD_POLICY
 Push-Location $repo
 try {
+    . (Join-Path $repo "tools\usb-signing-profile.ps1")
+    # This script produces the USB manager artifact.  Formal mode is the
+    # default and must be selected explicitly as DevelopmentAutoEnroll when a
+    # local unsigned fixture is intended; an inherited environment variable
+    # must never silently downgrade a release build.
+    $env:CODEX_USB_GUARD_POLICY = $UsbPolicy
+    $signedRequired = $UsbPolicy -eq "SignedRequired"
+    if ($signedRequired) {
+        $signingProfile = Get-CodexUsbSigningProfile -RepoRoot $repo -ProfilePath $UsbSigningProfilePath
+        Initialize-CodexUsbSigningEnvironment -Profile $signingProfile
+        $publicKeyId = [string]$env:CODEX_USB_GUARD_PUBLIC_KEY_ID
+        $publicKeyB64 = [string]$env:CODEX_USB_GUARD_PUBLIC_KEY_B64
+        if ([string]::IsNullOrWhiteSpace($publicKeyId) -or
+            [string]::IsNullOrWhiteSpace($publicKeyB64)) {
+            throw "SignedRequired 构建必须配置 CODEX_USB_GUARD_PUBLIC_KEY_ID 和 CODEX_USB_GUARD_PUBLIC_KEY_B64"
+        }
+        try {
+            $keyBytes = [Convert]::FromBase64String($publicKeyB64.Trim())
+        } catch {
+            throw "SignedRequired 构建的 CODEX_USB_GUARD_PUBLIC_KEY_B64 不是有效 Base64"
+        }
+        if ($keyBytes.Length -ne 32) {
+            throw "SignedRequired 构建的 USB 公钥必须是 32 字节"
+        }
+        Write-Output "USB 签名强制策略已启用（keyId=$publicKeyId；公钥内容不输出）"
+    }
+    $ccswitchArtifactExplicit = -not [string]::IsNullOrWhiteSpace($CcswitchArtifactDir)
     if ([string]::IsNullOrWhiteSpace($CcswitchArtifactDir)) {
         $workspace = (Split-Path -Parent $repo)
         $CcswitchArtifactDir = Join-Path $workspace "release\ccswitch-product"
     }
     $ccswitchSource = Join-Path $CcswitchArtifactDir "CodexSwitch.exe"
     $ccswitchResourceDir = Join-Path $repo "src-tauri\resources\ccswitch"
+    if (-not (Test-Path -LiteralPath $ccswitchSource -PathType Leaf) -and -not $ccswitchArtifactExplicit) {
+        $embeddedCcswitchDir = Join-Path $repo "src-tauri\resources\ccswitch"
+        $embeddedCcswitchSource = Join-Path $embeddedCcswitchDir "CodexSwitch.exe"
+        if (Test-Path -LiteralPath $embeddedCcswitchSource -PathType Leaf) {
+            $CcswitchArtifactDir = $embeddedCcswitchDir
+            $ccswitchSource = $embeddedCcswitchSource
+            Write-Warning "未找到外部 CCSwitch 产物，改用仓库内已校验的资源：$CcswitchArtifactDir"
+        }
+    }
     $vcRedistPath = Join-Path $repo "src-tauri\resources\prerequisites\vc_redist.x64.exe"
     $vcRedistExpectedSha256 = "843068991DAAA1F73AD9F6239BCE4D0F6A07A51F18C37EA2A867E9BECA71295C"
     if (-not (Test-Path -LiteralPath $vcRedistPath -PathType Leaf)) {
@@ -111,7 +151,8 @@ try {
     $previousUsbManagerFlag = $env:CODEX_USB_MANAGER
     try {
         $env:CODEX_USB_MANAGER = "1"
-        & cargo.exe build --release --features custom-protocol --manifest-path src-tauri\Cargo.toml --target $Target
+        $usbFeatures = if ($signedRequired) { "custom-protocol,signed-required" } else { "custom-protocol" }
+        & cargo.exe build --release --features $usbFeatures --manifest-path src-tauri\Cargo.toml --target $Target
         if ($LASTEXITCODE -ne 0) { throw "Tauri USB 管理器构建失败" }
     } finally {
         if ($null -eq $previousUsbManagerFlag) {
@@ -211,4 +252,11 @@ try {
     Write-Output "USB 入口别名：$usbLauncher"
     Write-Output "USB 管理器本体：$managerForUsb（requireAdministrator，入口启动或直接启动均安全）"
 }
-finally { Pop-Location }
+finally {
+    if ($null -eq $previousUsbPolicy) {
+        Remove-Item Env:CODEX_USB_GUARD_POLICY -ErrorAction SilentlyContinue
+    } else {
+        $env:CODEX_USB_GUARD_POLICY = $previousUsbPolicy
+    }
+    Pop-Location
+}

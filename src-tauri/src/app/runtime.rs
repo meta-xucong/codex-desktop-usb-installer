@@ -348,6 +348,14 @@ fn webview2_version() -> Option<String> {
     (result.is_ok() && usable_webview2_version(&value)).then_some(value)
 }
 
+/// Cheap read-only probe used to decide whether the full USB integrity walk
+/// may be deferred until after the local shell is visible. It never touches
+/// the bundled installer and never performs a registry/system write.
+#[cfg(target_os = "windows")]
+pub fn webview2_runtime_ready() -> bool {
+    webview2_version().is_some()
+}
+
 #[cfg(any(target_os = "windows", test))]
 fn usable_webview2_version(version: &str) -> bool {
     // The native browser-accelerator safety gate needs Settings3. Runtime

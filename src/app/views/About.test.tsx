@@ -116,6 +116,47 @@ describe("About Codex payload update entry", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("rechecks a transient guard state so the update entry survives startup races", async () => {
+    platformMock.mockReturnValue("windows");
+    api.usbGuardStatus
+      .mockResolvedValueOnce({
+        ...NO_USB_GUARD,
+        status: "stopped",
+        message: "starting",
+      })
+      .mockResolvedValueOnce(USB_GUARD);
+
+    renderAbout();
+
+    expect(
+      await screen.findByRole("button", {
+        name: CATALOG.en["about.checkCodexPayload"],
+      }),
+    ).toBeInTheDocument();
+    expect(api.usbGuardStatus).toHaveBeenCalledTimes(2);
+  });
+
+  it("rechecks the explicit startup state before hiding payload updates", async () => {
+    platformMock.mockReturnValue("windows");
+    api.usbGuardStatus
+      .mockResolvedValueOnce({
+        ...NO_USB_GUARD,
+        status: "starting",
+        removable: true,
+        message: "正在校验 U 盘能力包",
+      })
+      .mockResolvedValueOnce(USB_GUARD);
+
+    renderAbout();
+
+    expect(
+      await screen.findByRole("button", {
+        name: CATALOG.en["about.checkCodexPayload"],
+      }),
+    ).toBeInTheDocument();
+    expect(api.usbGuardStatus).toHaveBeenCalledTimes(2);
+  });
+
   it("keeps the manual confirmation and clears an expired pending update", async () => {
     const user = userEvent.setup();
     platformMock.mockReturnValue("windows");

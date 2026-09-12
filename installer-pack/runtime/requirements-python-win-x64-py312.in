@@ -1,0 +1,19 @@
+# Direct input for the reproducible Windows x64 / CPython 3.12 wheelhouse build.
+# Do not install this file directly. The materializer resolves the full dependency
+# closure and writes a hashed lock under runtime/materialized/.
+akshare==1.18.94
+pandas==3.0.5
+numpy==2.5.2
+matplotlib==3.11.1
+openpyxl==3.1.5
+python-docx==1.2.0
+python-pptx==1.0.2
+pypdf==6.17.0
+pdfplumber==0.11.10
+reportlab==5.0.1
+Pillow==12.3.0
+scrapling==0.4.15
+html2text==2025.4.15
+# akshare declares jsonpath without a Windows wheel on the approved index.
+# The bundle carries a reproducibly built py3-none-any wheel for this exact version.
+jsonpath==0.82.2

@@ -1,0 +1,6 @@
+interface:
+  display_name: "联网搜索提取"
+  short_description: "通过用户明确配置的外部搜索服务，获取最新网页信息并提取可引用正文。"
+  default_prompt: "Use $web-search-extraction to search for current sources through my configured adapter."
+policy:
+  allow_implicit_invocation: false

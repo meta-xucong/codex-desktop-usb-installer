@@ -29,7 +29,7 @@ const winUninstallBundle = vi.mocked(managerApi.winUninstallBundle);
 const retryAncillary = vi.mocked(managerApi.retryAncillary);
 const SAFETY_FLOW_LANGS = ["fr", "ar", "es", "zh-TW"] as const satisfies readonly Lang[];
 const CODEX_PURGE_PATHS = [
-  "%USERPROFILE%\\.codex", "%LOCALAPPDATA%\\Packages\\OpenAI.Codex_2p2nqsd0c76g0",
+  "%USERPROFILE%\\.codex", "%USERPROFILE%\\.agents\\skills", "%LOCALAPPDATA%\\Packages\\OpenAI.Codex_2p2nqsd0c76g0",
   "%LOCALAPPDATA%\\OpenAI\\Codex", "%LOCALAPPDATA%\\Codex\\Logs",
   "%APPDATA%\\OpenAI\\Codex", "%APPDATA%\\Codex",
   "%LOCALAPPDATA%\\CodexAppxDataBackups\\OpenAI.Codex_2p2nqsd0c76g0",

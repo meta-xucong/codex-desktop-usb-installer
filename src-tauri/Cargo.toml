@@ -18,16 +18,23 @@ repository = "https://github.com/Wangnov/Codex-App-Manager"
 # server (`devUrl`) to its embedded `frontendDist` assets.  The USB build is
 # always offline, so the release binary must be compiled with this feature.
 custom-protocol = ["tauri/custom-protocol"]
+# Formal USB builds reject missing/unsigned/unknown-key licenses before any
+# WebView2/VC/recovery/lease side effect. Development builds keep the
+# explicit unsigned auto-enrolment path for local assembly.
+signed-required = []
 
 [lib]
 name = "codex_app_manager_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
+serde_json = "1.0"
+sha2 = "0.11"
 tauri-build = { version = "2.6.2", features = [] }
 
 [dependencies]
 base64 = "0.23"
+codex-usb-license = { path = "../crates/codex-usb-license" }
 codex-mac-engine = { path = "../crates/codex-mac-engine" }
 codex-theme-engine = { path = "../crates/codex-theme-engine" }
 codex-win-engine = { path = "../crates/codex-win-engine" }

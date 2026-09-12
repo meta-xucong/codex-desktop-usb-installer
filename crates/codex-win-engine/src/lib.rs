@@ -35,7 +35,8 @@ pub use app_version::{
     read_codex_app_version_from_msix,
 };
 pub use authenticode::{
-    verify_openai_authenticode, AuthenticodeReport, OPENAI_MARKETPLACE_PUBLISHER_SUBJECT,
+    verify_authenticode, verify_openai_authenticode, AuthenticodeReport,
+    OPENAI_MARKETPLACE_PUBLISHER_SUBJECT,
 };
 pub use capability::{
     CapabilityCheck, CapabilityState, SideloadRecommendation, WinCapabilityReport,
@@ -47,7 +48,7 @@ pub use download::{
     download_to_with_progress_bounded_with_network_no_redirect,
     download_to_with_progress_with_network, pause_active_download, read_file, sha256_file,
 };
-pub use manifest::{parse_manifest, WindowsRelease};
+pub use manifest::{parse_manifest, parse_manifest_for_arch, WindowsRelease};
 pub use msix::{
     canonical_codex_package_moniker, framework_dependencies, is_framework_dependency,
     parse_appx_application_executable, parse_appx_manifest_dependencies, parse_appx_manifest_xml,
@@ -57,12 +58,12 @@ pub use msix::{
 pub use network::NetworkConfig;
 pub use plan::{plan_update, WinInstallRoute, WindowsUpdatePlan};
 pub use portable::{
-    cleanup_portable_metadata, close_codex_gracefully_for_root, codex_running_for_root,
-    inject_portable_fault, install_portable_from_msix, install_portable_from_msix_with_observer,
-    install_portable_from_msix_with_observer_options, installed_app_exe, purge_codex_user_data,
-    remove_directory_all_with_retry, rename_directory_with_retry, uninstall_portable,
-    validate_cleanup_path, PortableBoundary, PortableFault, PortableInstallOptions,
-    PortableInstallReport, PortableUninstallReport,
+    cleanup_portable_metadata, cleanup_stale_portable_shortcuts, close_codex_gracefully_for_root,
+    codex_running_for_root, inject_portable_fault, install_portable_from_msix,
+    install_portable_from_msix_with_observer, install_portable_from_msix_with_observer_options,
+    installed_app_exe, purge_codex_user_data, remove_directory_all_with_retry,
+    rename_directory_with_retry, uninstall_portable, validate_cleanup_path, PortableBoundary,
+    PortableFault, PortableInstallOptions, PortableInstallReport, PortableUninstallReport,
 };
 pub use sys::{
     close_msix_codex_processes, detect_installed_codex, detect_portable_install, fetch_text,

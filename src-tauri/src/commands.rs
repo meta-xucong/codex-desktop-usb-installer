@@ -57,6 +57,11 @@ use crate::app::release_install::{
 };
 use crate::app::settings_store::AppSettings as PersistedAppSettings;
 use crate::app::settings_store::{CodexPayloadSourceKind, ProxyMode, UpdateSource};
+use crate::app::skill_repo_update::{
+    apply_update as apply_skill_repo_update, check_update as check_skill_repo_update,
+    rollback as rollback_skill_repo_update, SkillRepoApplyReport, SkillRepoExpected,
+    SkillRepoRollbackReport, SkillRepoUpdateInfo,
+};
 use crate::app::url_guard::{validate_custom_proxy, validate_custom_source};
 use crate::app::usb_guard::UsbGuardStatus;
 use crate::app::win_update::{
@@ -142,6 +147,12 @@ fn normalize_settings_for_target(
 }
 
 fn windows_install_mode_for_settings() -> String {
+    // A running USB bundle owns the program tree below the authenticated
+    // removable bundle. Never let a persisted local-manager preference select
+    // MSIX/AppX or an ordinary C: portable fallback for this command path.
+    if crate::app::usb_guard::guard_required() {
+        return crate::app::win_update::USB_PORTABLE_INSTALL_MODE.to_string();
+    }
     let saved = PersistedAppSettings::load();
     if saved.windows_install_mode == "portable" {
         "portable".to_string()
@@ -467,13 +478,21 @@ fn manager_update_matches_confirmation(
 pub async fn manager_check_update(
     app: AppHandle,
 ) -> Result<Option<ManagerUpdateMetadata>, CommandError> {
+    log::info!("manager update check start channel=self");
     let updater = manager_updater_builder(&app)?
         .build()
         .map_err(|e| AppError::Engine(format!("build manager updater: {e}")))?;
-    let update = updater
-        .check()
-        .await
-        .map_err(|e| AppError::Engine(format!("check manager update: {e}")))?;
+    let update = match updater.check().await {
+        Ok(update) => update,
+        Err(error) => {
+            log::warn!("manager update check failed stage=metadata error={error}");
+            return Err(AppError::Engine(format!("check manager update: {error}")).into());
+        }
+    };
+    log::info!(
+        "manager update check completed available={}",
+        update.is_some()
+    );
     Ok(update.map(|update| ManagerUpdateMetadata {
         version: update.version,
         current_version: update.current_version,
@@ -487,6 +506,11 @@ pub async fn manager_install_update(
     expected_version: String,
     expected_current_version: String,
 ) -> Result<(), CommandError> {
+    log::info!(
+        "manager update install start expected_version={} expected_current_version={}",
+        expected_version,
+        expected_current_version
+    );
     let updater = manager_updater_builder(&app)?
         .build()
         .map_err(|e| AppError::Engine(format!("build manager updater: {e}")))?;
@@ -506,10 +530,11 @@ pub async fn manager_install_update(
         )
         .into());
     }
-    update
-        .download_and_install(|_, _| {}, || {})
-        .await
-        .map_err(|e| AppError::Engine(format!("install manager update: {e}")))?;
+    if let Err(error) = update.download_and_install(|_, _| {}, || {}).await {
+        log::error!("manager update install failed stage=download-install error={error}");
+        return Err(AppError::Engine(format!("install manager update: {error}")).into());
+    }
+    log::info!("manager update install completed");
     Ok(())
 }
 
@@ -525,7 +550,7 @@ pub async fn payload_check_codex(
     if !matches!(state.target.os, OperatingSystem::Windows) {
         return Err(AppError::UnsupportedPlatform.into());
     }
-    let bundle_root = crate::app::usb_guard::authorized_bundle_identity()?.0;
+    let bundle_root = crate::app::usb_guard::authorized_signed_bundle_identity()?.0;
     let settings = PersistedAppSettings::load();
     let ctx = crate::app::update_channel::UpdateContext {
         bundle_root,
@@ -550,7 +575,7 @@ pub async fn payload_apply_codex(
     if !matches!(state.target.os, OperatingSystem::Windows) {
         return Err(AppError::UnsupportedPlatform.into());
     }
-    let bundle_root = crate::app::usb_guard::authorized_bundle_identity()?.0;
+    let bundle_root = crate::app::usb_guard::authorized_signed_bundle_identity()?.0;
     let settings = PersistedAppSettings::load();
     let ctx = crate::app::update_channel::UpdateContext {
         bundle_root,
@@ -1146,7 +1171,7 @@ pub async fn offline_payload_stage(
     if !matches!(state.target.os, OperatingSystem::Windows) {
         return Err(AppError::UnsupportedPlatform.into());
     }
-    crate::app::usb_guard::require_authorized()?;
+    crate::app::usb_guard::require_signed_codex_bundle("offline-payload-stage")?;
     let executable = std::env::current_exe()
         .map_err(|error| AppError::Internal(format!("无法确定安装器路径: {error}")))?;
     let expected_architecture = state.target.arch.as_str().to_string();
@@ -1822,6 +1847,7 @@ pub async fn win_stage_update(
     if !matches!(state.target.os, OperatingSystem::Windows) {
         return Err(AppError::UnsupportedPlatform.into());
     }
+    crate::app::usb_guard::require_signed_codex_bundle("win-stage-update")?;
     let _op = begin_guard(&state, OperationKind::Update)?;
     let endpoints = windows_endpoints_for_settings(&state)?;
     let settings = windows_domain_settings_for_persisted(&state);
@@ -1872,7 +1898,9 @@ pub fn set_settings(
     }
     if matches!(
         s.codex_payload_source_kind,
-        CodexPayloadSourceKind::Auto | CodexPayloadSourceKind::Relay
+        CodexPayloadSourceKind::Auto
+            | CodexPayloadSourceKind::Mirror
+            | CodexPayloadSourceKind::Relay
     ) {
         s.codex_payload_base_url = normalize_relay_base_url(&s.codex_payload_base_url)?;
     }
@@ -2242,6 +2270,7 @@ pub fn win_adopt_path(
     if !matches!(state.target.os, OperatingSystem::Windows) {
         return Err(AppError::UnsupportedPlatform.into());
     }
+    crate::app::usb_guard::require_signed_codex_bundle("win-adopt-path")?;
     let _op = begin_guard(&state, OperationKind::Adopt)?;
     let settings = windows_domain_settings_for_persisted(&state);
     adopt_windows_path(&settings, Path::new(&path)).map_err(Into::into)
@@ -2330,6 +2359,9 @@ pub async fn win_auto_stage_update(
 ) -> Result<WinAutoStageReport, CommandError> {
     if !matches!(state.target.os, OperatingSystem::Windows) {
         return Err(AppError::UnsupportedPlatform.into());
+    }
+    if enabled {
+        crate::app::usb_guard::require_signed_codex_bundle("win-auto-stage-update")?;
     }
     let _op = if enabled {
         match state.operations.begin(OperationKind::Update) {
@@ -2428,6 +2460,7 @@ pub fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<(), Command
 /// the operation lock — a themed relaunch racing an updater's quit/swap would
 /// interleave two owners of the Codex process lifecycle.
 fn ensure_theme_may_restart_codex(state: &ManagerState) -> Result<(), CommandError> {
+    crate::app::usb_guard::require_signed_codex_bundle("codex-theme-restart")?;
     if state.operations.snapshot().is_some() {
         return Err(AppError::Engine("有正在进行的操作，请稍后再试".to_string()).into());
     }
@@ -2454,6 +2487,7 @@ pub async fn codex_theme_try_on(
     state: State<'_, ManagerState>,
     theme_ref: String,
 ) -> Result<crate::app::codex_theme::ThemeStatusReport, CommandError> {
+    crate::app::usb_guard::require_signed_codex_bundle("codex-theme-try-on")?;
     let settings = PersistedAppSettings::load();
     state.codex_theme.try_on(&settings, &theme_ref).await?;
     Ok(state.codex_theme.status(&settings).await)
@@ -2479,6 +2513,7 @@ pub async fn codex_theme_try_on_restart(
 /// future launches through the manager apply it automatically).
 #[tauri::command]
 pub fn codex_theme_keep(theme_ref: String) -> Result<(), CommandError> {
+    crate::app::usb_guard::require_signed_codex_bundle("codex-theme-keep")?;
     let mut settings = PersistedAppSettings::load();
     let dir = crate::app::codex_theme::resolve_theme_for_keep(&settings, &theme_ref)?;
     settings.codex_theme = Some(dir);
@@ -2702,6 +2737,7 @@ pub async fn codex_theme_off(
         settings.save()?;
         return Ok(state.codex_theme.status(&settings).await);
     }
+    crate::app::usb_guard::require_signed_codex_bundle("codex-theme-off-live")?;
     state.codex_theme.turn_off_live().await?;
     let settings = PersistedAppSettings::load();
     Ok(state.codex_theme.status(&settings).await)
@@ -2713,6 +2749,7 @@ pub async fn codex_theme_off(
 pub async fn codex_theme_cancel(
     state: State<'_, ManagerState>,
 ) -> Result<crate::app::codex_theme::ThemeStatusReport, CommandError> {
+    crate::app::usb_guard::require_signed_codex_bundle("codex-theme-cancel")?;
     state.codex_theme.cancel_try_on().await?;
     let settings = PersistedAppSettings::load();
     Ok(state.codex_theme.status(&settings).await)
@@ -2757,9 +2794,12 @@ pub fn get_host_architecture(state: State<'_, ManagerState>) -> String {
 
 #[tauri::command]
 pub fn open_logs_dir(app: tauri::AppHandle) -> Result<(), CommandError> {
-    let dir = crate::app::logging::logs_dir(&app)
-        .ok_or_else(|| AppError::Internal("无法定位日志目录".to_string()))?;
-    let _ = std::fs::create_dir_all(&dir);
+    let preferred = crate::app::logging::logs_dir(&app);
+    let dir = preferred
+        .filter(|candidate| candidate.is_dir())
+        .unwrap_or_else(crate::app::logging::stable_uninstall_reports_dir);
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| AppError::Internal(format!("创建日志目录失败: {error}")))?;
     let path = dir.display();
     log::info!("open logs dir path={path}");
     open_dir_platform(&dir).map_err(|e| AppError::Internal(format!("打开日志目录失败: {e}")).into())
@@ -2963,7 +3003,7 @@ pub async fn win_adopt(state: State<'_, ManagerState>) -> Result<WinInstallStatu
     if !matches!(state.target.os, OperatingSystem::Windows) {
         return Err(AppError::UnsupportedPlatform.into());
     }
-    crate::app::usb_guard::require_authorized()?;
+    crate::app::usb_guard::require_signed_codex_bundle("win-adopt")?;
     let _op = begin_guard(&state, OperationKind::Adopt)?;
     let settings = windows_domain_settings_for_persisted(&state);
     tauri::async_runtime::spawn_blocking(move || adopt_windows_install(&settings))
@@ -2984,7 +3024,7 @@ pub async fn win_launch_codex(state: State<'_, ManagerState>) -> Result<(), Comm
     if !matches!(state.target.os, OperatingSystem::Windows) {
         return Err(AppError::UnsupportedPlatform.into());
     }
-    crate::app::usb_guard::require_authorized()?;
+    crate::app::usb_guard::require_signed_codex_bundle("win-launch-codex")?;
     let persisted = PersistedAppSettings::load();
     let before_codex = crate::app::usb_guard::snapshot_processes("Codex.exe");
     let before_chatgpt = crate::app::usb_guard::snapshot_processes("ChatGPT.exe");
@@ -3034,7 +3074,7 @@ pub fn usb_guard_status() -> UsbGuardStatus {
 pub async fn install_and_launch_ccswitch(
     app: AppHandle,
 ) -> Result<CcswitchLaunchReport, CommandError> {
-    crate::app::usb_guard::require_authorized()?;
+    crate::app::usb_guard::require_usb_content_access("ccswitch-launch")?;
     tauri::async_runtime::spawn_blocking(move || install_and_launch_ccswitch_impl(&app))
         .await
         .map_err(|e| AppError::Internal(format!("join: {e}")))?
@@ -3046,7 +3086,7 @@ pub async fn install_and_launch_ccswitch(
 /// bundle is expected to ship it under content/codex-starter-kit.
 #[tauri::command]
 pub async fn capability_pack_status(app: AppHandle) -> Result<CapabilityPackReport, CommandError> {
-    crate::app::usb_guard::require_authorized()?;
+    crate::app::usb_guard::require_usb_content_access("capability-pack-status")?;
     tauri::async_runtime::spawn_blocking(move || capability_pack_status_impl(&app))
         .await
         .map_err(|error| AppError::Internal(format!("join: {error}")))?
@@ -3061,13 +3101,47 @@ pub async fn capability_pack_status(app: AppHandle) -> Result<CapabilityPackRepo
 #[tauri::command]
 pub async fn install_capability_pack(
     app: AppHandle,
+    state: State<'_, ManagerState>,
     options: CapabilityPackInstallOptions,
 ) -> Result<CapabilityPackReport, CommandError> {
-    crate::app::usb_guard::require_authorized()?;
+    let _op = begin_guard(&state, OperationKind::Install)?;
+    crate::app::usb_guard::require_usb_content_access("capability-pack-install")?;
     tauri::async_runtime::spawn_blocking(move || install_capability_pack_impl(&app, options))
         .await
         .map_err(|error| AppError::Internal(format!("join: {error}")))?
         .map_err(Into::into)
+}
+
+/// Inspect the independent, unsigned Skill Hub overlay. This deliberately
+/// does not require USB presence or USB signature authorization.
+#[tauri::command]
+pub async fn skill_repo_check_update(
+    app: AppHandle,
+    state: State<'_, ManagerState>,
+) -> Result<SkillRepoUpdateInfo, CommandError> {
+    let operations = state.operations.clone();
+    check_skill_repo_update(&app, &operations).await
+}
+
+/// Apply the exact identity returned by a preceding Skill Hub check.
+#[tauri::command]
+pub async fn skill_repo_apply_update(
+    app: AppHandle,
+    state: State<'_, ManagerState>,
+    expected: SkillRepoExpected,
+) -> Result<SkillRepoApplyReport, CommandError> {
+    let operations = state.operations.clone();
+    apply_skill_repo_update(&app, &operations, expected).await
+}
+
+/// Roll back the last complete independent Skill Hub generation.
+#[tauri::command]
+pub async fn skill_repo_rollback(
+    app: AppHandle,
+    state: State<'_, ManagerState>,
+) -> Result<SkillRepoRollbackReport, CommandError> {
+    let operations = state.operations.clone();
+    rollback_skill_repo_update(&app, &operations).await
 }
 
 /// Windows-only: guarded execution. Requires explicit confirmation, stages and
@@ -3086,7 +3160,7 @@ pub async fn win_perform_update(
     if !matches!(state.target.os, OperatingSystem::Windows) {
         return Err(AppError::UnsupportedPlatform.into());
     }
-    crate::app::usb_guard::require_authorized()?;
+    crate::app::usb_guard::require_signed_codex_bundle("win-perform-update")?;
     if !confirm {
         return Err(
             AppError::Internal("拒绝执行：Windows 更新必须带显式 confirm".to_string()).into(),
@@ -3236,7 +3310,7 @@ pub async fn win_install_historical_release(
     if !matches!(state.target.os, OperatingSystem::Windows) {
         return Err(AppError::UnsupportedPlatform.into());
     }
-    crate::app::usb_guard::require_authorized()?;
+    crate::app::usb_guard::require_signed_codex_bundle("win-install-historical")?;
     if !confirm {
         return Err(AppError::Internal(
             "拒绝执行：Windows 历史版本安装必须带显式 confirm".to_string(),
@@ -3393,6 +3467,21 @@ pub async fn win_install_historical_release(
             }
         };
         let before_commit = || {
+            if install_to_usb {
+                let authorization =
+                    crate::app::usb_guard::require_signed_codex_bundle("historical-usb-precommit")?
+                        .ok_or_else(|| {
+                            AppError::Engine("USB 历史安装提交前未获得当前 bundle 授权".to_string())
+                        })?;
+                if !codex_win_engine::same_windows_path(
+                    Path::new(&settings.install_root),
+                    &authorization.codex_root,
+                ) {
+                    return Err(AppError::StaleExpectation(
+                        "USB 历史安装提交前目标目录已变化，请重新检查后再试".to_string(),
+                    ));
+                }
+            }
             policy_attempted_worker.store(true, Ordering::SeqCst);
             persist_historical_self_update_policy(block_updates)
         };
@@ -3746,7 +3835,13 @@ pub async fn win_uninstall_bundle(
         // stops the watchdog. The detached helper receives this stable
         // fingerprint; it never treats a path string or filename as proof that
         // the manager-created license is safe to erase.
-        let (bundle, fingerprint) = crate::app::usb_guard::authorized_bundle_identity()?;
+        let authorization =
+            crate::app::usb_guard::require_signed_codex_bundle("remove-usb-media-preflight")?
+                .ok_or_else(|| {
+                    AppError::Engine("删除 U 盘介质需要当前 USB bundle 授权".to_string())
+                })?;
+        let bundle = authorization.bundle_root;
+        let fingerprint = authorization.fingerprint;
         let runtime_root = crate::app::usb_guard::usb_codex_root(&bundle);
         let runtime_root = runtime_root.is_dir().then_some(runtime_root);
         let preflight_fingerprint = fingerprint.clone();

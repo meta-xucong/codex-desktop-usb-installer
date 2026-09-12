@@ -40,13 +40,15 @@ pub enum ProxyMode {
 }
 
 /// Preferred source for the Codex desktop payload channel. `Auto` tries the
-/// controlled relay first and falls back to GitHub when the relay is
-/// unavailable. The actual source used by a check is embedded in the signed
-/// update identity, so apply never silently switches source after confirmation.
+/// domestic mirror first, then the built-in compatibility relay (or a
+/// user-configured relay), and finally GitHub. The actual source used by a
+/// check is embedded in the signed update identity, so apply never silently
+/// switches source after confirmation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CodexPayloadSourceKind {
     Auto,
+    Mirror,
     Relay,
     Github,
 }
@@ -55,6 +57,7 @@ impl CodexPayloadSourceKind {
     pub fn from_raw(raw: &str) -> Result<Self, String> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "auto" => Ok(Self::Auto),
+            "mirror" => Ok(Self::Mirror),
             "relay" => Ok(Self::Relay),
             "github" => Ok(Self::Github),
             _ => Err(raw.to_string()),
@@ -64,6 +67,7 @@ impl CodexPayloadSourceKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Auto => "auto",
+            Self::Mirror => "mirror",
             Self::Relay => "relay",
             Self::Github => "github",
         }
@@ -134,7 +138,15 @@ fn default_codex_payload_source_kind_string() -> String {
     CodexPayloadSourceKind::Auto.as_str().to_string()
 }
 
-pub const DEFAULT_CODEX_PAYLOAD_BASE_URL: &str = "https://update.404token.xyz/__codex_update__/";
+/// The public mirror serves the Codex payload channel at `/latest/manifest`,
+/// `/latest/checksums`, and `/latest/win-{arch}`. It is intentionally distinct
+/// from the manager self-update feed at `/manager/latest.json`.
+pub const DEFAULT_CODEX_PAYLOAD_BASE_URL: &str = "https://codexapp.agentsmirror.com/";
+/// Built-in compatibility relay used by the automatic payload source after
+/// the public mirror is unavailable. Keep this separate from the mirror URL:
+/// the two endpoints expose different metadata contracts.
+pub(crate) const LEGACY_CODEX_PAYLOAD_BASE_URL: &str =
+    "https://update.404token.xyz/__codex_update__/";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -423,8 +435,20 @@ impl AppSettings {
         self.custom_proxy_url = self.custom_proxy_url.trim().to_string();
         self.codex_payload_repo = self.codex_payload_repo.trim().to_string();
         self.codex_payload_base_url = self.codex_payload_base_url.trim().to_string();
-        if self.codex_payload_base_url.is_empty() {
+        // v0.5.x wrote the abandoned 404token relay as the default. Migrate
+        // only that exact baked-in value; other user-provided relay URLs remain
+        // untouched. If an older settings file explicitly selected Relay while
+        // still pointing at the baked-in address, move the pair together so it
+        // cannot become the invalid combination "Relay + mirror protocol".
+        let legacy_base = self
+            .codex_payload_base_url
+            .trim_end_matches('/')
+            .eq_ignore_ascii_case(LEGACY_CODEX_PAYLOAD_BASE_URL.trim_end_matches('/'));
+        if self.codex_payload_base_url.is_empty() || legacy_base {
             self.codex_payload_base_url = default_codex_payload_base_url();
+            if legacy_base && self.codex_payload_source_kind == CodexPayloadSourceKind::Relay {
+                self.codex_payload_source_kind = CodexPayloadSourceKind::Mirror;
+            }
         }
         // Empty custom modes are not a real runtime choice (update paths fall
         // back silently). Coerce so UI selection, disk, and runtime agree.
@@ -560,10 +584,28 @@ mod tests {
 
     #[test]
     fn codex_payload_source_round_trips_and_normalizes_invalid_legacy_values() {
+        let mirror: RawAppSettings = serde_json::from_str(
+            r#"{
+                "codexPayloadSourceKind": "mirror",
+                "codexPayloadBaseUrl": "  https://update.404token.xyz/__codex_update__  "
+            }"#,
+        )
+        .unwrap();
+        let (mut settings, _, _) = mirror.into_settings();
+        settings.normalize();
+        assert_eq!(
+            settings.codex_payload_source_kind,
+            CodexPayloadSourceKind::Mirror
+        );
+        assert_eq!(
+            settings.codex_payload_base_url,
+            DEFAULT_CODEX_PAYLOAD_BASE_URL
+        );
+
         let relay: RawAppSettings = serde_json::from_str(
             r#"{
                 "codexPayloadSourceKind": "relay",
-                "codexPayloadBaseUrl": "  https://update.404token.xyz/__codex_update__  "
+                "codexPayloadBaseUrl": "  https://relay.example.test/codex  "
             }"#,
         )
         .unwrap();
@@ -575,7 +617,25 @@ mod tests {
         );
         assert_eq!(
             settings.codex_payload_base_url,
-            "https://update.404token.xyz/__codex_update__"
+            "https://relay.example.test/codex"
+        );
+
+        let legacy_relay: RawAppSettings = serde_json::from_str(
+            r#"{
+                "codexPayloadSourceKind": "relay",
+                "codexPayloadBaseUrl": "https://update.404token.xyz/__codex_update__/"
+            }"#,
+        )
+        .unwrap();
+        let (mut settings, _, _) = legacy_relay.into_settings();
+        settings.normalize();
+        assert_eq!(
+            settings.codex_payload_source_kind,
+            CodexPayloadSourceKind::Mirror
+        );
+        assert_eq!(
+            settings.codex_payload_base_url,
+            DEFAULT_CODEX_PAYLOAD_BASE_URL
         );
 
         let invalid: RawAppSettings = serde_json::from_str(

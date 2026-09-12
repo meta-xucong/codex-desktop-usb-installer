@@ -1,0 +1,6 @@
+interface:
+  display_name: "Excel 表格"
+  short_description: "读写、生成和校验 Excel 工作簿、公式与日期。"
+  default_prompt: "Use $excel-xlsx to create and verify this Excel workbook, including formulas and dates."
+policy:
+  allow_implicit_invocation: false

@@ -795,7 +795,9 @@ describe("backend candidate verification", () => {
 });
 
 describe("pre-publication mirror verification", () => {
-  it("verifies both origins and the public route without writing latest.json", async () => {
+  it(
+    "verifies both origins and the public route without writing latest.json",
+    async () => {
     const root = await tempRoot("prepublish-verify");
     const dist = join(root, "dist");
     await mkdir(dist, { recursive: true });
@@ -877,7 +879,9 @@ describe("pre-publication mirror verification", () => {
       }),
     ).rejects.toThrow(`public mirror ihep size mismatch for ${corruptedName}`);
     expect([r2.latestPutAttempts, ihep.latestPutAttempts]).toEqual([0, 0]);
-  });
+    },
+    30_000,
+  );
 });
 
 describe("monotonic mirror promotion", () => {

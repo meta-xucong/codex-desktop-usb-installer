@@ -6,7 +6,12 @@ E2E 通过。
 
 ## 2026-09-09 最终代码阶段复核
 
-以下结果覆盖当前 Relay/GitHub 自动回退实现及其安全边界：
+以下结果是 2026-09-09 的历史 Relay/GitHub 自动回退验收记录。当前 Codex payload
+自动源契约为“国内镜像 → 内置兼容 Relay（或用户配置的 Relay）→ GitHub”；实现与
+新增契约见 `docs/UPDATE-FAILURE-G19-DEVELOPMENT.md` 和 `docs/UPDATE-CHANNELS.md`。
+内置 Relay 是镜像不可用时的真实默认回退，不需要用户先手工填写 URL。
+
+以下结果覆盖当时 Relay/GitHub 自动回退实现及其安全边界：
 
 - `cargo test --manifest-path crates/codex-win-engine/Cargo.toml --no-fail-fast`：175 项通过、0 失败、1 项忽略。
 - `cargo test --manifest-path src-tauri/Cargo.toml --no-fail-fast`：348 项通过、0 失败、1 项忽略。
@@ -65,7 +70,8 @@ check/apply 验收；这些边界见“Windows人工E2E”。Relay 的 VPS 同�
 
 Rust channel tests cover strict repo validation, digest validation, confined
 relative paths, payload metadata integrity, deterministic root SHA256
-generation (excluding mutable usb-license.json and .staging), all asset-id
+generation (excluding mutable usb-license.json, .staging, and the portable
+manager staging directory), all asset-id
 stale fields, deterministic committed-transaction recovery/rollback, and a
 fully mocked pre-commit apply pipeline.
 
@@ -98,7 +104,7 @@ cleanup, plus Tauri-boundary refusal in managerApi.
 4. usb-manifest 声明 updateCapability.schemaVersion == 2；
 5. 可选一份 payload/_backup/OpenAI.Codex_<arch>_<version>.msix，
    并列入根 SHA256SUMS；
-6. 不含 .bak、.part、.tmp 或 .staging 残留；
+6. 不含 .bak、.part、.tmp 或成功事务留下的 .staging / portable manager staging 残留；
 7. 运行 verify-oneclick-usb.ps1 -SkipSignature -SkipNetwork。
 
 当前仓库的 release/usb-oneclick-v0.5.24-final 是历史 schemaVersion=1

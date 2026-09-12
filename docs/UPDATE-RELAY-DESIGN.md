@@ -1,6 +1,11 @@
 # Codex USB 更新中继设计
 
-状态：relay 同步服务、独立 443 edge、TLS 和客户端 Relay/GitHub 自动回退均已完成并通过当前阶段审计；公网路由矩阵已从 VPS 和本机直连验证。剩余关键证据是中国大陆测试机插入 U 盘后的真实 check/apply；Debian 11 生命周期和正式 Authenticode 发布证书仍是运维/发布治理事项。
+状态：这是旧 Relay 方案的历史兼容设计文档。当前 Codex payload 默认源已经切换为
+`https://codexapp.agentsmirror.com/` 的镜像协议；`/manager/latest.json` 只用于
+管理器自身更新，不是 Codex payload 清单。旧 Relay 仍作为用户显式配置旧地址时的
+兼容通道保留，当前源选择、重试和诊断契约以 `docs/UPDATE-FAILURE-G19-DEVELOPMENT.md`
+与 `docs/UPDATE-CHANNELS.md` 为准。下文的 Relay 同步服务、独立 443 edge、TLS 和
+Relay/GitHub 自动回退记录均为历史设计/验收证据，不代表当前默认源。
 
 ## 1. 目标
 
@@ -204,11 +209,12 @@ Relay 配置只存本机 `settings.json`，不写 USB 根 manifest、不参与 U
 
 ### 6.2 Failover 顺序
 
-推荐顺序：
+当前客户端实现顺序：
 
-1. Relay（中国大陆默认优先）。
-2. GitHub 直连（relay 不可用时的备用）。
-3. 用户明确启用的企业代理/系统代理（沿用现有网络配置）。
+1. 国内公开镜像（默认优先，使用 `/latest/manifest` 协议）。
+2. 兼容 Relay（内置地址或用户明确配置的地址，使用 `latest.json` 协议）。
+3. GitHub 直连（前两者不可用时的备用）。
+4. 用户明确启用的企业代理/系统代理（沿用现有网络配置）。
 
 公共第三方 GitHub 代理不作为默认信任源；如以后加入，只能作为显式、可禁用的候选，并仍执行全部客户端校验。
 
@@ -217,7 +223,7 @@ Relay 配置只存本机 `settings.json`，不写 USB 根 manifest、不参与 U
 - check 阶段可以按候选源顺序尝试，每个源有短超时和冷却时间。
 - apply 阶段先重新取得 release identity；必须与用户确认时的目标一致，否则停止并要求重新 check。
 - Relay 的 metadata、manifest、checksum 和 MSIX 必须来自同一规范化 base URL/路径；客户端对 Relay 传输明确禁止 HTTP redirect，GitHub 资产仍允许其必要的 CDN redirect；不将任何 redirect 后 URL 写入 identity。
-- Relay/GitHub 都失败时，旧 USB bundle 保持不变，界面报告可诊断的网络失败原因。
+- 镜像、Relay、GitHub 都失败时，旧 USB bundle 保持不变，界面报告可诊断的网络失败原因。
 - 不能因为 relay 返回 200 就跳过 Authenticode、digest、checksum、manifest、MSIX identity 或回滚检查。
 
 ### 6.3 版本与安全边界

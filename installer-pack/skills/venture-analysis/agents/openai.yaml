@@ -1,0 +1,6 @@
+interface:
+  display_name: "创业项目评估"
+  short_description: "结合证据评估商业计划、财务模型、估值假设和尽职调查风险。"
+  default_prompt: "Use $venture-analysis to evaluate this venture, its model, valuation assumptions, and risks."
+policy:
+  allow_implicit_invocation: false

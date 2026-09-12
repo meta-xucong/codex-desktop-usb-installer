@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 2,
+  "source": "manifest/connection-fields.json",
+  "values": {},
+  "enabledServices": [],
+  "healthChecks": {}
+}

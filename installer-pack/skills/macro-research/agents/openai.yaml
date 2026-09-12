@@ -1,0 +1,6 @@
+interface:
+  display_name: "宏观研究"
+  short_description: "结合最新政策和经济周期证据，分析宏观变化及大类资产配置影响。"
+  default_prompt: "Use $macro-research to analyze this macroeconomic question with current, dated sources."
+policy:
+  allow_implicit_invocation: false

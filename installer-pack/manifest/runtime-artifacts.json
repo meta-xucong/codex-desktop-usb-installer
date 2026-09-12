@@ -1,0 +1,141 @@
+{
+  "schemaVersion": 3,
+  "releaseGate": {
+    "materializationStatus": "ready",
+    "installReady": true,
+    "rule": "Bundled Windows x64 media is accepted only when every artifact has exact bytes, SHA-256, source/provenance evidence and a passing offline health check. Credentials and tenant authorization remain first-run configuration."
+  },
+  "policy": {
+    "starterKitContains": "metadata, source inputs, bundled Windows x64 media, lock contracts and verification instructions",
+    "installerOwns": "offline media, exact artifact hashes, Authenticode verification, package materialization, installation and rollback",
+    "pythonStrategy": {
+      "choice": "per-user-cpython-3.12-x64",
+      "abi": "cp312",
+      "platform": "win_amd64",
+      "reason": "The wheelhouse is compiled/selected for CPython 3.12 cp312 on Windows x64. A per-user install avoids administrator elevation and USB drive-letter fragility.",
+      "installRoot": "%LocalAppData%\\Programs\\Python\\Python312",
+      "reuseRule": "Reuse only a healthy CPython 3.12 win_amd64 interpreter whose cache tag is cpython-312. Python 3.11, 3.13, non-CPython and other architectures do not satisfy this contract.",
+      "fallback": "If no exact ABI-compatible interpreter is healthy, install the locked private 3.12.10 artifact; never silently switch ABI."
+    }
+  },
+  "artifacts": [
+    {
+      "artifactId": "runtime.python312",
+      "materializationStatus": "ready",
+      "installReady": true,
+      "purpose": "CPython runtime for local data, document, PDF, media and optional stateful Skills",
+      "relatedSkills": ["china-stock-analysis", "data-assistant", "docx-butler", "excel-xlsx", "fitness-coach", "fund-portfolio", "macro-research", "meal-planner", "pdf-processing-toolkit", "powerpoint-pptx", "travel-planner", "venture-analysis", "wealth-allocation", "wechat-article-creator", "word-docx", "image-2", "seedance2-0-video-gen", "web-search-extraction"],
+      "required": true,
+      "optional": false,
+      "detect": {
+        "command": "python -c \"import platform,sys,sysconfig; print(sys.version_info[:3],sys.implementation.cache_tag,sysconfig.get_platform(),platform.machine())\"",
+        "expected": "3.12.x | cpython-312 | win-amd64 | AMD64/x86_64",
+        "reject": ["3.11", "3.13", "pypy", "win32", "arm64"]
+      },
+      "source": {
+        "directUrl": "https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe",
+        "releasePage": "https://www.python.org/downloads/release/python-31210/",
+        "productVersion": "3.12.10",
+        "architecture": "x64",
+        "filename": "python-3.12.10-amd64.exe",
+        "bytes": 26964224
+      },
+      "integrity": {
+        "materializationStatus": "ready",
+        "sha256": "67b5635e80ea51072b87941312d00ec8927c4db9ba18938f7ad2d27b328b95fb",
+        "sha256Source": "SHA-256 of runtime/bundled/python-3.12.10-amd64.exe; downloaded from the official Python release URL.",
+        "authenticode": {"required": true, "publisher": "Python Software Foundation", "evidence": "Get-AuthenticodeSignature returned Valid on the bundled installer."}
+      },
+      "install": {
+        "silentArgs": "/quiet InstallAllUsers=0 PrependPath=0 Include_test=0",
+        "acceptedReturnCodes": [0, 3010],
+        "timeoutSeconds": 300,
+        "restart": "none",
+        "scope": "current-user",
+        "path": "Do not edit system PATH; record absolute python.exe and expose CODEX_PYTHON only in the private runtime record."
+      },
+      "healthCheck": "& $env:CODEX_PYTHON -c \"import platform,sys,sysconfig; assert sys.version_info[:2] == (3,12); assert sys.implementation.cache_tag == 'cpython-312'; assert sysconfig.get_platform() == 'win-amd64'; assert platform.machine() in ('AMD64','x86_64')\"",
+      "uninstallUpgrade": "Use Windows installed-app uninstall for the same per-user version; upgrade only after a new exact media lock and health check. Never delete an unrelated Python installation."
+    },
+    {
+      "artifactId": "runtime.python312-wheelhouse",
+      "materializationStatus": "ready",
+      "installReady": true,
+      "purpose": "Complete offline Python wheelhouse for Skills that retain real Python functionality",
+      "relatedSkills": ["china-stock-analysis", "data-assistant", "docx-butler", "excel-xlsx", "fitness-coach", "fund-portfolio", "macro-research", "meal-planner", "pdf-processing-toolkit", "powerpoint-pptx", "travel-planner", "venture-analysis", "wealth-allocation", "wechat-article-creator", "word-docx", "web-content-fetcher", "image-2", "seedance2-0-video-gen", "web-search-extraction"],
+      "required": false,
+      "optional": true,
+      "target": {"platform": "win_amd64", "python": "cpython-312", "abi": "cp312"},
+      "source": {
+        "directRequirements": "runtime/requirements-python-win-x64-py312.in",
+        "materializer": "runtime/materialize-python-wheelhouse.ps1",
+        "indexPolicy": "approved package index; record the index URL and timestamp in the private media manifest",
+        "archiveFilename": "runtime/bundled/python-wheels/",
+        "archiveBytes": 85236661
+      },
+      "integrity": {
+        "materializationStatus": "ready",
+        "sha256": null,
+        "sha256Source": "Each of the 52 bundled wheels has an individual SHA-256 in runtime/bundled/python-wheelhouse-manifest.json and is verified before installation.",
+        "authenticode": {"required": false, "evidence": "per-wheel SHA-256, PyPI/index provenance and signed media manifest"}
+      },
+      "install": {
+        "command": "CODEX_PYTHON -m pip install --no-index --find-links <wheelhouse> --require-hashes -r <generated-lock>",
+        "acceptedReturnCodes": [0],
+        "timeoutSeconds": 600,
+        "scope": "current-user CPython 3.12 environment",
+        "path": "No global PATH change"
+      },
+      "healthCheck": "CODEX_PYTHON -c \"import openpyxl,docx,pptx,pypdf; print('wheelhouse-ok')\"",
+      "uninstallUpgrade": "Install a new versioned per-user environment and switch the runtime pointer only after all wheel hashes and import checks pass; retain the old environment for rollback."
+    },
+    {
+      "artifactId": "runtime.node20-feishu-optional",
+      "materializationStatus": "ready",
+      "installReady": true,
+      "purpose": "Optional Node.js runtime for the locked official Feishu/Lark MCP package",
+      "relatedSkills": ["feishu-doc", "feishu-drive", "feishu-perm", "feishu-wiki"],
+      "required": false,
+      "optional": true,
+      "source": {
+        "directUrl": "https://nodejs.org/dist/v20.20.0/node-v20.20.0-win-x64.zip",
+        "checksumUrl": "https://nodejs.org/dist/v20.20.0/SHASUMS256.txt",
+        "productVersion": "20.20.0",
+        "architecture": "x64",
+        "filename": "node-v20.20.0-win-x64.zip",
+        "bytes": 29902899
+      },
+      "integrity": {
+        "materializationStatus": "ready",
+        "sha256": "32f24e1405b113d4e01ad2585c92024df673b6156ef6f43a5469a75bf52c0a5a",
+        "sha256Source": "SHA-256 of runtime/bundled/node-v20.20.0-win-x64.zip; matches the official Node.js SHASUMS256.txt.",
+        "authenticode": {"required": false, "publisher": "Node.js / OpenJS Foundation", "evidence": "Official SHASUMS256.txt plus exact archive hash; ZIP archives do not carry Authenticode signatures."}
+      },
+      "install": {"method": "extract-per-user", "archive": "runtime/bundled/node-v20.20.0-win-x64.zip", "scope": "current-user", "path": "User-local runtime pointer and PATH entry; no administrator elevation."},
+      "healthCheck": "node --version; npm --version; npm exec --offline --prefix <private-feishu-cache> -- @larksuiteoapi/lark-mcp@0.5.1 mcp --help",
+      "offlineConstraint": "Never use npx --yes for a health check or enabled Codex configuration. The package must already be present in the private cache and npm must run with --offline.",
+      "uninstallUpgrade": "Manage through Windows installed apps; upgrade Node and the MCP package together under a new media lock."
+    },
+    {
+      "artifactId": "runtime.feishu-mcp-package",
+      "materializationStatus": "ready",
+      "installReady": true,
+      "purpose": "Offline npm package cache for the official Feishu/Lark MCP",
+      "package": {"name": "@larksuiteoapi/lark-mcp", "version": "0.5.1", "license": "MIT", "nodeEngine": ">=20.0.0", "bin": "lark-mcp"},
+      "source": {
+        "tarballUrl": "https://registry.npmjs.org/@larksuiteoapi/lark-mcp/-/lark-mcp-0.5.1.tgz",
+        "packageJsonUrl": "https://registry.npmjs.org/@larksuiteoapi/lark-mcp/0.5.1",
+        "integrity": "bundled package-lock.json preserves npm integrity for the 195-package closure",
+        "bundleFilename": "runtime/bundled/feishu-node-modules.zip",
+        "bundleBytes": 12898130,
+        "bundleSha256": "cbf988b8a1f1b9da7e8df418755b68d052961ff7e06881d4097dabbe76c36b9d"
+      },
+      "install": {
+        "command": "npm install --offline --ignore-scripts --prefix <private-feishu-cache> <locked-local-tarball>",
+        "healthCheck": "npm exec --offline --prefix <private-feishu-cache> -- @larksuiteoapi/lark-mcp@0.5.1 mcp --help",
+        "configCommand": "Use the private wrapper command from config-fragments/feishu-official-stdio.template.toml; do not put App Secret in Codex TOML."
+      },
+      "offlineConstraint": "The bundled ZIP contains the locked npm node_modules closure and package-lock.json. The installer extracts it without network access; Feishu still remains disabled until credentials and tenant permissions are supplied."
+    }
+  ]
+}

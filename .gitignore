@@ -4,6 +4,8 @@ target/
 src-tauri/target/
 src-tauri/gen/schemas/
 .devserver/
+**/__pycache__/
+*.pyc
 
 .DS_Store
 *.log
@@ -21,6 +23,7 @@ src-tauri/resources/BinaryDelta
 # is ~802 MB and GitHub rejects regular Git blobs over 100 MB.  Keep the
 # generated wrapper/metadata available for local USB builds, but never add the
 # large signed payload to commits by accident.
+release/**
 release/**/payload/*.msix
 release/upstream/*.Msix
 release/upstream/*.msix

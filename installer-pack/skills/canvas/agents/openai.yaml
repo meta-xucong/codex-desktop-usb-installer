@@ -1,0 +1,6 @@
+interface:
+  display_name: "画布原型"
+  short_description: "输出 HTML 原型说明；当前没有兼容的自动画布运行时。"
+  default_prompt: "Use $canvas to draft a safe HTML prototype and explain the unavailable canvas runtime."
+policy:
+  allow_implicit_invocation: false

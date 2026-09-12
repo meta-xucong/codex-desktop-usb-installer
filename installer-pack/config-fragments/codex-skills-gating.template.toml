@@ -1,0 +1,12 @@
+# Render absolute paths after installation. Keep unmet capabilities disabled until health checks pass.
+[[skills.config]]
+path = "__ABSOLUTE_SKILL_ROOT__\\image-2\\SKILL.md"
+enabled = false
+
+[[skills.config]]
+path = "__ABSOLUTE_SKILL_ROOT__\\seedance2-0-video-gen\\SKILL.md"
+enabled = false
+
+[[skills.config]]
+path = "__ABSOLUTE_SKILL_ROOT__\\web-search-extraction\\SKILL.md"
+enabled = false

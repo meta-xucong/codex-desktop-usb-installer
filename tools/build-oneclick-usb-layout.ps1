@@ -5,11 +5,15 @@ param(
     [string]$BundlePath = "",
     [string]$OutputPath = "",
     [string]$CapabilityPackSource = "",
+    [string]$UsbPolicy = "",
+    [string]$UsbSigningProfilePath = "",
+    [switch]$InternalSigned,
     [switch]$SkipSignature
 )
 
 $ErrorActionPreference = "Stop"
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+. (Join-Path $repo "tools\usb-signing-profile.ps1")
 $releaseVersion = [string]((Get-Content -LiteralPath (Join-Path $repo "package.json") -Raw | ConvertFrom-Json).version)
 if ([string]::IsNullOrWhiteSpace($releaseVersion)) {
     throw "package.json 缺少发布版本号"
@@ -19,7 +23,66 @@ if ([string]::IsNullOrWhiteSpace($ManagerPath)) { $ManagerPath = Join-Path $repo
 if ([string]::IsNullOrWhiteSpace($BundlePath)) { $BundlePath = Join-Path $repo "release\usb-final" }
 if ([string]::IsNullOrWhiteSpace($OutputPath)) { $OutputPath = Join-Path $repo "release\usb-oneclick" }
 if ([string]::IsNullOrWhiteSpace($CapabilityPackSource)) {
-    $CapabilityPackSource = Join-Path (Split-Path -Parent $repo) "openclaw-codex-kit\installer-pack"
+    $CapabilityPackSource = Join-Path $repo "installer-pack"
+}
+
+if ([string]::IsNullOrWhiteSpace($UsbPolicy)) {
+    $UsbPolicy = [string]$env:CODEX_USB_GUARD_POLICY
+}
+if ([string]::IsNullOrWhiteSpace($UsbPolicy)) {
+    $UsbPolicy = if ($SkipSignature -and -not $InternalSigned) { "DevelopmentAutoEnroll" } else { "SignedRequired" }
+}
+if ($UsbPolicy -notin @("SignedRequired", "DevelopmentAutoEnroll")) {
+    throw "UsbPolicy 必须是 SignedRequired 或 DevelopmentAutoEnroll：$UsbPolicy"
+}
+if ($InternalSigned -and $SkipSignature) {
+    throw "InternalSigned 不能与 SkipSignature 同时使用"
+}
+if ($InternalSigned -and $UsbPolicy -ne "SignedRequired") {
+    throw "InternalSigned 必须使用 SignedRequired 策略"
+}
+if ($SkipSignature -and $UsbPolicy -eq "SignedRequired" -and -not $InternalSigned) {
+    throw "SignedRequired 静态发行包必须使用 -InternalSigned；-SkipSignature 仅适用于 DevelopmentAutoEnroll，不能生成正式签名包元数据"
+}
+
+if ($UsbPolicy -eq "SignedRequired") {
+    $signingProfile = Get-CodexUsbSigningProfile -RepoRoot $repo -ProfilePath $UsbSigningProfilePath
+    Initialize-CodexUsbSigningEnvironment -Profile $signingProfile
+    $publicKeyId = [string]$env:CODEX_USB_GUARD_PUBLIC_KEY_ID
+    $publicKeyB64 = [string]$env:CODEX_USB_GUARD_PUBLIC_KEY_B64
+    if ([string]::IsNullOrWhiteSpace($publicKeyId) -or
+        [string]::IsNullOrWhiteSpace($publicKeyB64)) {
+        throw "SignedRequired U 盘包必须配置 CODEX_USB_GUARD_PUBLIC_KEY_ID 和 CODEX_USB_GUARD_PUBLIC_KEY_B64"
+    }
+    if ($publicKeyId -notmatch '^[A-Za-z0-9._-]{1,128}$') {
+        throw "CODEX_USB_GUARD_PUBLIC_KEY_ID 不是合法 keyId：$publicKeyId"
+    }
+    try {
+        $publicKeyBytes = [Convert]::FromBase64String($publicKeyB64.Trim())
+    } catch {
+        throw "CODEX_USB_GUARD_PUBLIC_KEY_B64 不是有效 Base64"
+    }
+    if ($publicKeyBytes.Length -ne 32) {
+        throw "CODEX_USB_GUARD_PUBLIC_KEY_B64 必须解码为 32 字节 Ed25519 公钥"
+    }
+    $hasher = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $publicKeyDigestBytes = $hasher.ComputeHash($publicKeyBytes)
+    } finally {
+        $hasher.Dispose()
+    }
+    $publicKeySha256 = (($publicKeyDigestBytes | ForEach-Object { $_.ToString('x2') }) -join '')
+    $signingBinding = [ordered]@{
+        policy = "SignedRequired"
+        keyId = $publicKeyId
+        publicKeySha256 = $publicKeySha256
+    }
+} else {
+    $signingBinding = [ordered]@{
+        policy = "DevelopmentAutoEnroll"
+        keyId = $null
+        publicKeySha256 = $null
+    }
 }
 $installer = (Resolve-Path -LiteralPath $InstallerPath).Path
 $manager = (Resolve-Path -LiteralPath $ManagerPath).Path
@@ -43,6 +106,49 @@ function Read-JsonFile([string]$Path) {
     }
     $utf8 = [System.Text.UTF8Encoding]::new($false, $true)
     return [System.IO.File]::ReadAllText($Path, $utf8) | ConvertFrom-Json
+}
+
+function Assert-AuthenticodePe([string]$Path, [string]$Label) {
+    $signature = Get-AuthenticodeSignature -LiteralPath $Path
+    if ($signature.Status -ne "Valid") {
+        throw "$Label Authenticode 状态不是 Valid：$($signature.Status)"
+    }
+    if ($null -eq $signature.SignerCertificate -or
+        [string]::IsNullOrWhiteSpace([string]$signature.SignerCertificate.Subject)) {
+        throw "$Label 缺少有效签名主体"
+    }
+}
+
+function Assert-CompiledUsbManagerBinding([string]$Path, [string]$KeyId, [string]$PublicKeyB64, [string]$PublicKeySha256) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "USB 管理器不存在，无法验证编译期签名绑定：$Path"
+    }
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    # The Tauri manager embeds these compile-time option_env! values as
+    # ordinary ASCII constants.  Checking the actual PE supplied through
+    # -ManagerPath closes the stale-manager/new-manifest composition gap
+    # before any release manifest is written.
+    $ascii = [System.Text.Encoding]::ASCII.GetString($bytes)
+    if ($ascii.IndexOf($KeyId, [System.StringComparison]::Ordinal) -lt 0) {
+        throw "USB 管理器未嵌入预期 active keyId，拒绝打包：$KeyId"
+    }
+    $expectedPublicKey = $PublicKeyB64.Trim()
+    if ($ascii.IndexOf($expectedPublicKey, [System.StringComparison]::Ordinal) -lt 0) {
+        throw "USB 管理器未嵌入与发布配置一致的公钥，拒绝打包：publicKeySha256=$PublicKeySha256"
+    }
+    Write-Output "USB 管理器编译期签名绑定已验证：keyId=$KeyId；publicKeySha256=$PublicKeySha256"
+}
+
+function Assert-CompiledUsbManagerPolicy([string]$Path, [string]$ExpectedPolicy) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "USB 管理器不存在，无法验证编译期策略绑定：$Path"
+    }
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    $ascii = [System.Text.Encoding]::ASCII.GetString($bytes)
+    $marker = "codex-usb-compiled-policy:$ExpectedPolicy"
+    if ($ascii.IndexOf($marker, [System.StringComparison]::Ordinal) -lt 0) {
+        throw "USB 管理器编译期策略与发布策略不一致：期望 $ExpectedPolicy；未找到标记 $marker"
+    }
 }
 
 function Normalize-BundleRelativePath([string]$RelativePath) {
@@ -74,8 +180,18 @@ function Resolve-BundleRelativeFile([string]$RootPath, [string]$RelativePath) {
 }
 
 function Assert-NoSuccessfulStateResidue([string]$RootPath) {
+    $rootLicensePath = Join-Path $RootPath "usb-license.json"
+    if (Test-Path -LiteralPath $rootLicensePath) {
+        throw "静态发行目录不得携带 usb-license.json；请在真实 U 盘复制完成后使用签名工具写入运行期授权"
+    }
     foreach ($entry in Get-ChildItem -LiteralPath $RootPath -Recurse -Force) {
         $relative = (Get-RelativePathCompat $RootPath $entry.FullName).Replace('\', '/')
+        if ($entry.Name -ieq "usb-license.json" -and $relative -ine "usb-license.json") {
+            throw "usb-license.json 只能出现在 U 盘 bundle 根目录：$relative"
+        }
+        if ($entry.Name -ieq "usb-license.json.bak") {
+            throw "U 盘 bundle 不得包含 usb-license.json.bak 残留：$relative"
+        }
         $forbidden = $false
         foreach ($segment in $relative.Split('/')) {
             if ($segment -ieq '.staging' -or $segment -ieq 'staging' -or
@@ -97,6 +213,7 @@ function Assert-NoSuccessfulStateResidue([string]$RootPath) {
     -BundlePath $bundle `
     -OutputPath $OutputPath `
     -CapabilityPackSource $CapabilityPackSource `
+    -InternalSigned:$InternalSigned `
     -SkipSignature:$SkipSignature
 # The nested PowerShell script communicates failures through terminating
 # errors.  `$LASTEXITCODE` is intentionally not inspected here because it can
@@ -134,6 +251,13 @@ if ($null -eq $rootUpdateCapability -or
 if ((Get-Item -LiteralPath $manager).Name -ine "CodexAppManager.exe") {
     throw "ManagerPath 必须指向名为 CodexAppManager.exe 的 Tauri 管理器本体"
 }
+if ($UsbPolicy -eq "SignedRequired") {
+    Assert-CompiledUsbManagerPolicy $manager $UsbPolicy
+    Assert-CompiledUsbManagerBinding $manager $publicKeyId $publicKeyB64 $publicKeySha256
+}
+if ($UsbPolicy -eq "DevelopmentAutoEnroll") {
+    Assert-CompiledUsbManagerPolicy $manager $UsbPolicy
+}
 Copy-Item -LiteralPath $manager -Destination (Join-Path $output "CodexAppManager.exe") -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "verify-payload.ps1") -Destination (Join-Path $output "verify-payload.ps1") -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "verify-oneclick-usb.ps1") -Destination (Join-Path $output "verify-usb.ps1") -Force
@@ -153,9 +277,21 @@ if (Test-Path -LiteralPath $ccswitchVerifier -PathType Leaf) {
 
 $installerItem = Get-Item -LiteralPath (Join-Path $output "CodexDesktopSetup.exe")
 $managerItem = Get-Item -LiteralPath (Join-Path $output "CodexAppManager.exe")
+if ($UsbPolicy -eq "SignedRequired") {
+    Assert-CompiledUsbManagerPolicy $managerItem.FullName $UsbPolicy
+    Assert-CompiledUsbManagerBinding $managerItem.FullName $publicKeyId $publicKeyB64 $publicKeySha256
+}
+if ($UsbPolicy -eq "DevelopmentAutoEnroll") {
+    Assert-CompiledUsbManagerPolicy $managerItem.FullName $UsbPolicy
+}
 $ccswitchItem = Get-Item -LiteralPath (Join-Path $output "ccswitch\CodexSwitch.exe")
+$embeddedCcswitchItem = Get-Item -LiteralPath (Join-Path $output "resources\ccswitch\CodexSwitch.exe")
 $vcRedistItem = Get-Item -LiteralPath (Join-Path $output "resources\prerequisites\vc_redist.x64.exe")
 $webView2Item = Get-Item -LiteralPath (Join-Path $output "resources\prerequisites\MicrosoftEdgeWebView2RuntimeInstallerX64.exe")
+if (-not $SkipSignature -and -not $InternalSigned) {
+    Assert-AuthenticodePe $ccswitchItem.FullName "CCSwitch"
+    Assert-AuthenticodePe $embeddedCcswitchItem.FullName "embedded CCSwitch"
+}
 $installerHash = (Get-FileHash -LiteralPath $installerItem.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
 $managerHash = (Get-FileHash -LiteralPath $managerItem.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
 $payloadHash = (Get-FileHash -LiteralPath $payloadItem.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -242,6 +378,12 @@ $usbManifest = [ordered]@{
         localDirectory = "%LOCALAPPDATA%/CodexUsbGuard"
         licenseFile = "usb-license.json"
         binding = "removable-volume + volume-serial + anchor-sha256 + bundle-relative-path"
+        signing = $signingBinding
+        verification = [ordered]@{
+            runtimeMode = if ($InternalSigned -or $UsbPolicy -eq "SignedRequired") { "internal-signed-usb-license" } elseif ($SkipSignature) { "hash-only-development" } else { "strict-authenticode" }
+            productAuthenticode = if ($InternalSigned -or $UsbPolicy -eq "SignedRequired") { "not-required-internal-license-mode" } else { "required" }
+            externalAuthenticode = if ($SkipSignature) { "not-required-development-mode" } else { "required-openai-msix-and-microsoft-prerequisites" }
+        }
         pollIntervalMs = 1000
         disconnectGraceMs = 5000
         startMenuInterception = $false
@@ -303,7 +445,7 @@ $usbManifest = [ordered]@{
     workflow = @(
         "Double-click CodexDesktopSetup.exe; it is the USB-only requireAdministrator launcher and asks for one standard Windows UAC confirmation before starting CodexAppManager.exe.",
         "Before the UI opens, detect WebView2 and install the hash-pinned Microsoft x64 standalone runtime from the USB if missing; runtime failures use a native dialog.",
-        "The installer verifies the manifest, fixed MSIX identity, SHA-256 and Authenticode signature, checks free USB space, and observes that CODEX_HOME/APPDATA/LOCALAPPDATA do not resolve onto the authorized USB.",
+        "The installer verifies the manifest, fixed MSIX identity and SHA-256. In the formal internal-signed USB mode it verifies the USB license/anchor plus OpenAI-signed MSIX and Microsoft-signed prerequisites; product-owned launcher, manager and CCSwitch files are protected by the immutable bundle hash and do not require Authenticode.",
         "The verified MSIX is treated as an archive and transactionally extracted to <bundle>/apps/Codex. The old tree is kept as a rollback directory until the new executable and manifest pass postconditions.",
         "This route never calls StagePackageAsync, RegisterPackageAsync, Add-AppxPackage, Add-AppxVolume or Move-AppxPackage and never creates <USB>/WindowsApps or <USB>/WpSystem.",
         "A legacy exact OpenAI.Codex MSIX left by an earlier product version may be removed through supported Windows APIs after the USB portable tree is ready; no WindowsApps ACL or private package database is edited.",
@@ -337,7 +479,10 @@ Assert-NoSuccessfulStateResidue $output
 
 $lines = Get-ChildItem -LiteralPath $output -File -Recurse -Force |
     Sort-Object -Property FullName |
-    Where-Object { $_.Name -ne "SHA256SUMS.txt" -and $_.Name -ine "usb-license.json" } |
+    Where-Object {
+        $relative = (Get-RelativePathCompat $output $_.FullName).Replace('\', '/')
+        $_.Name -ne "SHA256SUMS.txt" -and $relative -ine "usb-license.json"
+    } |
     ForEach-Object {
         $relative = Get-RelativePathCompat $output $_.FullName
         $relative = $relative.Replace('\', '/')

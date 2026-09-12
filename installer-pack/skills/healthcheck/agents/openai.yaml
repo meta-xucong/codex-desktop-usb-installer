@@ -1,0 +1,6 @@
+interface:
+  display_name: "主机安全检查"
+  short_description: "输出可执行的主机安全审计清单，并明确区分实测状态与待核验项目。"
+  default_prompt: "Use $healthcheck to prepare a host security audit checklist without inventing system state."
+policy:
+  allow_implicit_invocation: false

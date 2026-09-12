@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 2,
+  "kind": "mcp-servers-only",
+  "policy": "Only STDIO or Streamable HTTP MCP servers belong here. Direct HTTP APIs are in api-services.json.",
+  "servers": [
+    {
+      "id": "feishu",
+      "status": "guided-config",
+      "available": true,
+      "recommended": true,
+      "purpose": "飞书/Lark 文档、会话、日历和 OpenAPI 工具",
+      "implementation": {
+        "publisher": "Lark Technologies / larksuite",
+        "repository": "https://github.com/larksuite/lark-openapi-mcp",
+        "package": "@larksuiteoapi/lark-mcp@0.5.1",
+        "license": "MIT",
+        "runtime": "Node.js >=20",
+        "publishedArtifact": "npm package",
+        "release": "v0.5.1",
+        "beta": true,
+        "offlineArtifact": "runtime.feishu-mcp-package",
+        "offlineCacheRequired": true
+      },
+      "toolContract": {
+        "manifest": "manifest/feishu-tools.json",
+        "nameCase": "dot",
+        "documentMode": "read-only",
+        "writeApproval": "writes",
+        "unsupported": ["direct cloud-document editing", "file upload", "file download"]
+      },
+      "transports": ["stdio", "streamable-http", "sse"],
+      "configFragment": "config-fragments/feishu-official-stdio.template.toml",
+      "connectionFields": ["feishu.app-id", "feishu.app-secret", "feishu.base-url", "feishu.auth-mode", "feishu.user-access-token"],
+      "healthCheck": {"offlineCommand": "scripts/start-feishu-mcp.ps1 -PackageCache <private-feishu-cache> -DryRun", "codexCommand": "codex mcp get feishu --json", "expected": "Node >=20, locked package name/version/entrypoint and the wrapper validate without exposing credentials; then Codex parses the 25-tool allowlist and a read-only document/tool probe succeeds", "failure": "连接未健康时只显示配置步骤，不声称已经读写飞书"},
+      "enableWhen": ["runtime.node20-feishu-optional.ready", "runtime.feishu-mcp-package.ready", "feishu.app-id", "feishu.app-secret", "codex.mcp.feishu.healthy"],
+      "secretHandling": {"officialCli": "The upstream CLI currently accepts App Secret via -s/--app-secret arguments.", "risk": "The upstream child process still receives the secret as an argument and trusted local process inspection may reveal it.", "requiredMitigation": "Codex config forwards only process environment variable names to the local wrapper. The wrapper never logs values, validates the locked package metadata and JavaScript entrypoint, invokes Node directly instead of a cmd.exe shim, and refuses to enable the server if credentials or package files are absent.", "publicTemplateRule": "The public template contains placeholders and environment variable names only and remains disabled."},
+      "disableRule": "Set enabled=false or remove the generated [mcp_servers.feishu] block; do not delete unrelated MCP entries.",
+      "relatedSkills": ["feishu-doc", "feishu-drive", "feishu-perm", "feishu-wiki"]
+    }
+  ]
+}

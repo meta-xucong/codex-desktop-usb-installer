@@ -1,0 +1,21 @@
+[Unit]
+Description=Fetch and publish the Skill Hub hot-update archive
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=codexskillrelay
+Group=codexskillrelay
+WorkingDirectory=/opt/codex-update-relay
+ExecStart=/usr/bin/python3 /opt/codex-update-relay/skill-hub-relay-sync.py --config /etc/codex-update-relay/skill-hub.json
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/srv/codex-update-relay/export/skill-hub /srv/codex-update-relay/work/skill-hub /srv/codex-update-relay/state
+UMask=0027
+TimeoutStartSec=5min
+StandardOutput=journal
+StandardError=journal

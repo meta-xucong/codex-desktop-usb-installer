@@ -16,32 +16,37 @@ USB 一键流程在 Codex 便携程序完成位置、哈希和运行状态校验
 - 两个辅助步骤都是可重试的非主流程；失败会显示提示，但不会宣称 Codex 安装失败。
 - “组件修复”面板默认不启用任何外部连接。勾选服务并填写完整字段后，才会配置飞书
   MCP、DashScope 搜索、Image-2 或 Seedance。
+- 未勾选的服务不会触发密钥校验、运行时健康检查或环境变量删除；若核心 Skills/Agents
+  已完成而某个运行时失败，界面显示“核心能力已就绪，运行时待修复”，不把能力包误报为未安装。
 - “跳过”不会执行能力包安装；“安装 / 修复能力包”只安装本地包和用户明确勾选的连接。
 
 ## 后端边界
 
 `src-tauri/src/app/capability_pack.rs` 只从当前 EXE 的 `content`、Tauri resource
 或相邻目录寻找能力包，并拒绝符号链接/重解析点。PowerShell 子进程运行包内的
-`install-all.ps1`，由包自身校验 `file-manifest.json`、`checksums.sha256` 和完整
-离线 runtime media。管理器只向这个外层包装脚本传递其公开参数；全量安装所需的
+`install-all.ps1`，由包自身校验 `file-manifest.json`、`checksums.sha256` 和离线
+runtime media。未启用飞书时 Node/飞书 MCP 媒体不进入运行时必需健康条件；管理器只向
+这个外层包装脚本传递其公开参数；全量安装所需的
 `IncludeNonDefault`、`IncludeUnsupported`、`Overwrite` 由包装脚本继续传给内部的
 `install-to-codex.ps1`，避免把内部参数误传到公开入口。
 
-外部连接参数通过当前 PowerShell 子进程环境传递，绝不写入 U 盘、日志或 readiness
-文件。手动面板提交后，选中的连接写入当前用户 HKCU 环境变量；未选中的连接会清除
-本包管理的同名变量。一键自动安装使用 `persistConnections=false`，不会覆盖用户已有
-的连接配置。
+外部连接参数通过当前 PowerShell 子进程环境传递，绝不写入 U 盘或 readiness 文件。
+手动面板提交后，只有选中的、非空连接字段才会写入当前用户 HKCU 环境变量；未选中的
+连接不会清除用户已有变量。一键自动安装使用 `persistConnections=false`，不会覆盖用户
+已有的连接配置。运行时和配置阶段的子进程输出只写入能力包目录下的脱敏诊断文件。
 
 ## 发行包契约
 
-`tools/build-usb-layout.ps1` 和 `tools/build-oneclick-usb-layout.ps1` 默认从相邻的
-`openclaw-codex-kit/installer-pack` 复制完整能力包到：
+`tools/build-usb-layout.ps1` 和 `tools/build-oneclick-usb-layout.ps1` 默认从当前仓库内的
+`installer-pack` 复制完整能力包到：
 
 ```text
 content/codex-starter-kit/
 ```
 
-如果源目录不在默认位置，可显式传入 `-CapabilityPackSource`。最终构建会把能力包
+克隆仓库后无需准备同级目录即可复现构建。如果源目录不在默认位置，可显式传入
+`-CapabilityPackSource`；旧的相邻 `openclaw-codex-kit/installer-pack` 目录仍可作为
+外部源传入。最终构建会把能力包
 所有文件加入根目录 `SHA256SUMS.txt`；`verify-oneclick-usb.ps1` 还会检查能力包身份、
 schema、核心脚本、runtime provisioner 和内部文件清单。
 

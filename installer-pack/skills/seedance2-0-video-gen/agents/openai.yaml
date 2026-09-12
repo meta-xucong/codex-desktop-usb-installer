@@ -1,0 +1,6 @@
+interface:
+  display_name: "视频生成连接"
+  short_description: "调用已配置的视频服务，安全提交、轮询并核对视频生成任务与费用。"
+  default_prompt: "Use $seedance2-0-video-gen to prepare and confirm this video generation job before submission."
+policy:
+  allow_implicit_invocation: false

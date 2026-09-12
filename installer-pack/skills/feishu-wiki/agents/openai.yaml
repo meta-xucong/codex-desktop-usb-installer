@@ -1,0 +1,12 @@
+interface:
+  display_name: "知识库导航"
+  short_description: "浏览飞书知识空间与页面层级，并安全管理 Wiki 节点位置和标题。"
+  default_prompt: "Use $feishu-wiki to inspect this knowledge space and navigate to the requested page."
+policy:
+  allow_implicit_invocation: false
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "feishu"
+      description: "Official Feishu/Lark OpenAPI MCP server"
+      transport: "stdio"

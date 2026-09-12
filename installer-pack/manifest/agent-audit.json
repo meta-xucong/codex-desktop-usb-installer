@@ -1,0 +1,105 @@
+{
+  "schemaVersion": 2,
+  "policy": {
+    "dependencyClosure": "requiredSkills are the minimum useful capability; optionalSkills may be skipped with an explicit safe fallback.",
+    "runtimeClosure": "runtimeDependencies describe the complete offline runtime family needed by required or optional skills.",
+    "connectionClosure": "connectionDependencies name guided MCP/API setup; credentials are never bundled.",
+    "safeDegradation": "An agent must not claim a missing skill, runtime, MCP server, API or credential is available.",
+    "agentStatus": "status is derived only from requiredSkills; optionalSkills, runtimeDependencies and connectionDependencies are enhancements and never downgrade the base Agent."
+  },
+  "agents": [
+    {
+      "id": "general",
+      "file": "general.toml",
+      "name": "全能官",
+      "description": "综合统筹与长期协作，覆盖跨领域分析、文件处理、计划制定和任务拆解。",
+      "requiredSkills": ["multi-search-engine", "image-prompt-generator", "video-prompt-generator"],
+      "optionalSkills": ["web-search-extraction", "data-assistant", "docx-butler", "excel-xlsx", "word-docx", "powerpoint-pptx"],
+      "blockedSkills": ["pdf-processing-toolkit"],
+      "skills": ["multi-search-engine", "image-prompt-generator", "video-prompt-generator", "web-search-extraction", "data-assistant", "docx-butler", "excel-xlsx", "word-docx", "powerpoint-pptx"],
+      "runtimeDependencies": ["runtime.python312", "runtime.python312-wheelhouse"],
+      "connectionDependencies": ["api.dashscope-web-search"],
+      "status": "core-ready",
+      "readiness": {"minimum": "core-ready", "fallback": "没有 Python 时先完成文字、研究框架和提示词；没有联网服务时只使用用户材料。"}
+    },
+    {
+      "id": "research",
+      "file": "research.toml",
+      "name": "研究官",
+      "description": "深度研究与情报分析，覆盖学术、竞品、产业链、用户研究和市场测算。",
+      "requiredSkills": ["academic-research", "competitor-intelligence", "industry-analysis", "user-research", "market-sizing-analysis", "multi-search-engine"],
+      "optionalSkills": ["web-search-extraction"],
+      "skills": ["academic-research", "competitor-intelligence", "industry-analysis", "user-research", "market-sizing-analysis", "multi-search-engine", "web-search-extraction"],
+      "runtimeDependencies": [],
+      "connectionDependencies": ["api.dashscope-web-search"],
+      "status": "core-ready",
+      "readiness": {"minimum": "core-ready", "fallback": "没有联网连接时只基于用户提供的论文、链接和数据，并标注无法实时核验。"}
+    },
+    {
+      "id": "content",
+      "file": "content.toml",
+      "name": "创作官",
+      "description": "新媒体内容架构与创意生产，覆盖公众号、小红书、图片提示词、视频提示词和脚本。",
+      "requiredSkills": ["xiaohongshu-writing", "image-prompt-generator", "video-prompt-generator"],
+      "optionalSkills": ["wechat-article-creator", "web-search-extraction", "image-2", "seedance2-0-video-gen"],
+      "skills": ["xiaohongshu-writing", "image-prompt-generator", "video-prompt-generator", "wechat-article-creator", "web-search-extraction", "image-2", "seedance2-0-video-gen"],
+      "runtimeDependencies": ["runtime.python312", "runtime.python312-wheelhouse"],
+      "connectionDependencies": ["api.dashscope-web-search", "api.image-2", "api.seedance"],
+      "status": "core-ready",
+      "readiness": {"minimum": "core-ready", "fallback": "没有图像/视频服务时输出可直接交给外部生成器的提示词和分镜，不伪造生成结果。"}
+    },
+    {
+      "id": "investment",
+      "file": "investment.toml",
+      "name": "投资官",
+      "description": "投资研究与财富配置，覆盖 A 股、基金、宏观、创业投资和组合管理。",
+      "requiredSkills": ["china-stock-analysis", "fund-portfolio", "macro-research", "venture-analysis", "wealth-allocation"],
+      "optionalSkills": ["web-search-extraction"],
+      "skills": ["china-stock-analysis", "fund-portfolio", "macro-research", "venture-analysis", "wealth-allocation", "web-search-extraction"],
+      "runtimeDependencies": ["runtime.python312", "runtime.python312-wheelhouse"],
+      "connectionDependencies": ["api.dashscope-web-search"],
+      "status": "auto-installable-runtime",
+      "readiness": {"minimum": "auto-installable-runtime", "fallback": "没有行情包或联网数据时只提供分析框架和风险清单，不输出虚构的实时价格、财务数据或收益承诺。"}
+    },
+    {
+      "id": "growth",
+      "file": "growth.toml",
+      "name": "增长官",
+      "description": "商业增长与变现设计，覆盖用户痛点、产品 Offer、流量、转化、留存和增长实验。",
+      "requiredSkills": ["painpoint-analyzer", "offer-designer", "traffic-hunter", "conversion-optimizer", "growth-analyst"],
+      "optionalSkills": ["web-search-extraction"],
+      "skills": ["painpoint-analyzer", "offer-designer", "traffic-hunter", "conversion-optimizer", "growth-analyst", "web-search-extraction"],
+      "runtimeDependencies": [],
+      "connectionDependencies": ["api.dashscope-web-search"],
+      "status": "core-ready",
+      "readiness": {"minimum": "core-ready", "fallback": "没有外部研究数据时先用用户提供的业务数据，所有市场数字和增长判断都标明假设。"}
+    },
+    {
+      "id": "lifestyle",
+      "file": "lifestyle.toml",
+      "name": "生活官",
+      "description": "健康与生活方式规划，覆盖健身、饮食、旅行、天气和个人复盘。",
+      "requiredSkills": ["daily-reflection", "weather-forecast", "weather"],
+      "optionalSkills": ["fitness-coach", "meal-planner", "travel-planner", "multi-search-engine", "web-search-extraction"],
+      "skills": ["daily-reflection", "weather-forecast", "weather", "fitness-coach", "meal-planner", "travel-planner", "multi-search-engine", "web-search-extraction"],
+      "runtimeDependencies": ["runtime.python312", "runtime.python312-wheelhouse"],
+      "connectionDependencies": ["api.dashscope-web-search"],
+      "status": "core-ready",
+      "readiness": {"minimum": "core-ready", "fallback": "没有 Python 时保留计划、清单和复盘文本；没有实时网络时不声称天气、交通或价格已核验；健康建议不替代医生。"}
+    },
+    {
+      "id": "office",
+      "file": "office.toml",
+      "name": "办公官",
+      "description": "职场效率与交付管家，覆盖文档、数据、邮件、会议、表格和文件整理。",
+      "requiredSkills": ["efficiency-toolkit", "email-expert", "meeting-secretary"],
+      "optionalSkills": ["data-assistant", "docx-butler", "excel-xlsx", "word-docx", "powerpoint-pptx"],
+      "blockedSkills": ["pdf-processing-toolkit"],
+      "skills": ["efficiency-toolkit", "email-expert", "meeting-secretary", "data-assistant", "docx-butler", "excel-xlsx", "word-docx", "powerpoint-pptx"],
+      "runtimeDependencies": ["runtime.python312", "runtime.python312-wheelhouse"],
+      "connectionDependencies": [],
+      "status": "core-ready",
+      "readiness": {"minimum": "core-ready", "fallback": "没有文件运行时就输出结构化文本、表格设计和操作步骤，不声称文件已生成或已修改。"}
+    }
+  ]
+}

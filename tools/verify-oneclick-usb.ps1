@@ -4,12 +4,16 @@ param(
     [string]$ApiKey,
     [switch]$PromptForApiKey,
     [switch]$SkipNetwork,
+    [switch]$InternalSigned,
+    [string]$UsbSigningProfilePath = "",
     [switch]$SkipSignature
 )
 
 $ErrorActionPreference = "Stop"
 if ([string]::IsNullOrWhiteSpace($BundlePath)) { $BundlePath = $PSScriptRoot }
 $root = (Resolve-Path -LiteralPath $BundlePath).Path
+$repo = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+. (Join-Path $repo "tools\usb-signing-profile.ps1")
 
 function Assert-Condition([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw "验证失败：$Message" }
@@ -54,6 +58,30 @@ function Get-RelativePathCompat([string]$BasePath, [string]$FilePath) {
     return $full.Substring($base.Length)
 }
 
+# A directory or reparse point with the mutable license name must not be
+# mistaken for the one authorized root metadata file.
+$rootLicensePath = Join-Path $root "usb-license.json"
+if (Test-Path -LiteralPath $rootLicensePath) {
+    $rootLicenseItem = Get-Item -LiteralPath $rootLicensePath -Force
+    Assert-Condition (-not $rootLicenseItem.PSIsContainer) "根目录 usb-license.json 必须是普通文件"
+    Assert-Condition (($rootLicenseItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0) "根目录 usb-license.json 不能是链接或联接点"
+}
+
+# The license is the one mutable root metadata file.  Do not let a nested
+# same-name file, an atomic-writer backup, or a copied license become an
+# untracked authorization source.
+$licenseEntries = @(Get-ChildItem -LiteralPath $root -Recurse -Force |
+    Where-Object { $_.Name -ieq "usb-license.json" -or $_.Name -ieq "usb-license.json.bak" })
+foreach ($licenseEntry in $licenseEntries) {
+    $licenseRelative = (Get-RelativePathCompat $root $licenseEntry.FullName).Replace('\', '/')
+    if ($licenseEntry.Name -ieq "usb-license.json.bak") {
+        throw "禁止存在 usb-license.json.bak 残留：$licenseRelative"
+    }
+    if ($licenseRelative -ine "usb-license.json") {
+        throw "usb-license.json 只能位于 bundle 根目录：$licenseRelative"
+    }
+}
+
 function Assert-NoSuccessfulStateResidue([string]$RootPath) {
     foreach ($entry in Get-ChildItem -LiteralPath $RootPath -Recurse -Force) {
         $relative = (Get-RelativePathCompat $RootPath $entry.FullName).Replace('\', '/')
@@ -73,6 +101,22 @@ function Assert-AuthenticodePe([string]$Path, [string]$Label) {
     Assert-Condition ($signature.Status -eq "Valid") "$Label Authenticode 状态不是 Valid：$($signature.Status)"
     Assert-Condition ($null -ne $signature.SignerCertificate -and
         -not [string]::IsNullOrWhiteSpace([string]$signature.SignerCertificate.Subject)) "$Label 缺少有效签名主体"
+}
+
+function Assert-CompiledUsbManagerBinding([string]$Path, [string]$KeyId, [string]$PublicKeyB64, [string]$PublicKeySha256) {
+    Assert-Condition (Test-Path -LiteralPath $Path -PathType Leaf) "USB 管理器不存在，无法验证编译期签名绑定：$Path"
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    $ascii = [System.Text.Encoding]::ASCII.GetString($bytes)
+    Assert-Condition ($ascii.IndexOf($KeyId, [System.StringComparison]::Ordinal) -ge 0) "USB 管理器未嵌入预期 active keyId：$KeyId"
+    Assert-Condition ($ascii.IndexOf($PublicKeyB64.Trim(), [System.StringComparison]::Ordinal) -ge 0) "USB 管理器未嵌入与清单一致的公钥：publicKeySha256=$PublicKeySha256"
+}
+
+function Assert-CompiledUsbManagerPolicy([string]$Path, [string]$ExpectedPolicy) {
+    Assert-Condition (Test-Path -LiteralPath $Path -PathType Leaf) "USB 管理器不存在，无法验证编译期策略绑定：$Path"
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    $ascii = [System.Text.Encoding]::ASCII.GetString($bytes)
+    $marker = "codex-usb-compiled-policy:$ExpectedPolicy"
+    Assert-Condition ($ascii.IndexOf($marker, [System.StringComparison]::Ordinal) -ge 0) "USB 管理器编译期策略与联合清单不一致：期望 $ExpectedPolicy；未找到标记 $marker"
 }
 
 $manifestPath = Join-Path $root "manifest.json"
@@ -99,6 +143,47 @@ Assert-Condition ($usbManifest.product -eq "codex-usb-oneclick") "不是 Codex �
 Assert-Condition ($usbManifest.status -eq "oneclick") "联合清单状态不是 oneclick"
 Assert-Condition ($usbManifest.secretsIncluded -eq $false) "U 盘包不应包含 API Key"
 Assert-Condition ($usbManifest.automaticPostInstallLaunch -eq $true) "未声明安装后自动启动 CCSwitch"
+$signingBinding = $usbManifest.usbGuard.signing
+Assert-Condition ($null -ne $signingBinding) "联合清单缺少 usbGuard.signing 签名绑定声明"
+$signingPolicy = [string]$signingBinding.policy
+if ($InternalSigned -and $SkipSignature) {
+    throw "InternalSigned 不能与 SkipSignature 同时使用"
+}
+if ($InternalSigned) {
+    Assert-Condition ($signingPolicy -eq "SignedRequired") "InternalSigned 正式校验只接受 SignedRequired 签名策略"
+}
+if ($SkipSignature) {
+    Assert-Condition ($signingPolicy -in @("SignedRequired", "DevelopmentAutoEnroll")) "usbGuard.signing.policy 无效：$signingPolicy"
+} else {
+    Assert-Condition ($signingPolicy -eq "SignedRequired") "正式校验只接受 SignedRequired 签名策略"
+}
+if ($signingPolicy -eq "SignedRequired") {
+    $signingProfile = Get-CodexUsbSigningProfile -RepoRoot $repo -ProfilePath $UsbSigningProfilePath
+    Initialize-CodexUsbSigningEnvironment -Profile $signingProfile
+    $signingKeyId = [string]$signingBinding.keyId
+    $signingDigest = [string]$signingBinding.publicKeySha256
+    Assert-Condition ($signingKeyId -match '^[A-Za-z0-9._-]{1,128}$') "usbGuard.signing.keyId 无效"
+    Assert-Condition ($signingDigest -match '^[0-9a-fA-F]{64}$') "usbGuard.signing.publicKeySha256 无效"
+    $configuredKeyId = [string]$env:CODEX_USB_GUARD_PUBLIC_KEY_ID
+    $configuredPublicKey = [string]$env:CODEX_USB_GUARD_PUBLIC_KEY_B64
+    Assert-Condition (-not [string]::IsNullOrWhiteSpace($configuredKeyId) -and
+        -not [string]::IsNullOrWhiteSpace($configuredPublicKey)) "SignedRequired 校验必须配置当前构建的 USB 公钥和 keyId"
+    Assert-Condition ($configuredKeyId -eq $signingKeyId) "Bundle signing keyId 与当前构建配置不一致"
+    try {
+        $configuredPublicKeyBytes = [Convert]::FromBase64String($configuredPublicKey.Trim())
+    } catch {
+        throw "当前构建配置的 CODEX_USB_GUARD_PUBLIC_KEY_B64 不是有效 Base64"
+    }
+    Assert-Condition ($configuredPublicKeyBytes.Length -eq 32) "当前构建配置的 USB 公钥必须是 32 字节"
+    $configuredHasher = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $configuredDigestBytes = $configuredHasher.ComputeHash($configuredPublicKeyBytes)
+    } finally {
+        $configuredHasher.Dispose()
+    }
+    $configuredDigest = (($configuredDigestBytes | ForEach-Object { $_.ToString('x2') }) -join '')
+    Assert-Condition ($configuredDigest -ieq $signingDigest) "Bundle signing 公钥摘要与当前构建配置不一致"
+}
 Assert-Condition ($usbManifest.programLayout.mode -eq "verified-msix-extraction") "Codex 程序必须使用验签 MSIX 解包模式"
 Assert-Condition ($usbManifest.programLayout.codexRoot -eq "apps/Codex") "Codex U 盘程序目录声明不正确"
 Assert-Condition ($usbManifest.programLayout.usesAppxVolume -eq $false) "当前架构不得使用外部 AppXVolume"
@@ -136,6 +221,11 @@ Assert-Condition ($usbManifest.codexLaunch.compatibilityMemory -eq "local-exact-
 Assert-Condition ($usbManifest.codexLaunch.selfUpdate -eq "disabled-for-usb-child") "USB Codex 必须对子进程关闭原地自更新"
 Assert-Condition ($usbManifest.codexLaunch.globalEnvironmentModified -eq $false) "启动兼容参数不得修改全局环境"
 Assert-Condition ($usbManifest.usbGuard.localHelperRefresh -eq "length-and-sha256-before-new-lease") "本机看门狗必须在新租约前按哈希刷新"
+if ($InternalSigned) {
+    Assert-Condition ($usbManifest.usbGuard.verification.runtimeMode -eq "internal-signed-usb-license") "联合清单未声明 internal-signed-usb-license 运行期校验模式"
+    Assert-Condition ($usbManifest.usbGuard.verification.productAuthenticode -eq "not-required-internal-license-mode") "内部授权模式不应把自有 EXE 声明为 Authenticode 必需"
+    Assert-Condition ($usbManifest.usbGuard.verification.externalAuthenticode -eq "required-openai-msix-and-microsoft-prerequisites") "内部授权模式必须声明外部可信输入 Authenticode 必需"
+}
 Assert-Condition ([int]$usbManifest.sourceMediaCleanup.planSchema -eq 3) "安装介质二阶段计划版本不正确"
 Assert-Condition ($usbManifest.sourceMediaCleanup.runtimeLicenseMode -eq "typed-manager-mutable-metadata") "运行期许可文件不得再被当作未知发行文件"
 Assert-Condition ($usbManifest.sourceMediaCleanup.authorization -eq "active-lease-fingerprint+volume+immutable-manifest+license-snapshot") "安装介质清理授权证据不完整"
@@ -205,6 +295,10 @@ Assert-Condition (Test-Path -LiteralPath $contentReadme -PathType Leaf) "缺少 
 Assert-Condition (Test-Path -LiteralPath $skillsReadme -PathType Leaf) "缺少 content/skills 目录契约"
 Assert-Condition (Test-Path -LiteralPath $mcpReadme -PathType Leaf) "缺少 content/mcp 目录契约"
 Assert-Condition (Test-Path -LiteralPath $capabilityPack -PathType Container) "缺少完整能力包目录 content/codex-starter-kit"
+Assert-CompiledUsbManagerPolicy $manager $signingPolicy
+if ($signingPolicy -eq "SignedRequired") {
+    Assert-CompiledUsbManagerBinding $manager $signingKeyId $configuredPublicKey $signingDigest
+}
 foreach ($packFile in @("pack.json", "dependencies.json", "file-manifest.json", "checksums.sha256", "install-all.ps1", "install-to-codex.ps1", "runtime\provision-runtime.ps1")) {
     Assert-Condition (Test-Path -LiteralPath (Join-Path $capabilityPack $packFile) -PathType Leaf) "能力包缺少 $packFile"
 }
@@ -260,8 +354,12 @@ Assert-Condition ([int64]$usbManifest.ccswitch.size -eq $ccswitchItem.Length) "�
 Assert-Condition ($usbManifest.ccswitch.embeddedExecutable -eq "resources/ccswitch/CodexSwitch.exe") "联合清单的嵌入 CCSwitch 路径不正确"
 Assert-Condition ($embeddedCcswitchHash -ieq $ccswitchHash) "根目录与资源中的 CCSwitch 载荷不一致"
 if (-not $SkipSignature) {
-    Assert-AuthenticodePe $installer "CodexDesktopSetup.exe"
-    Assert-AuthenticodePe $manager "CodexAppManager.exe"
+    if (-not $InternalSigned) {
+        Assert-AuthenticodePe $installer "CodexDesktopSetup.exe"
+        Assert-AuthenticodePe $manager "CodexAppManager.exe"
+        Assert-AuthenticodePe $ccswitch "CCSwitch"
+        Assert-AuthenticodePe $embeddedCcswitch "embedded CCSwitch"
+    }
     $webView2Signature = Get-AuthenticodeSignature -LiteralPath $webView2
     Assert-Condition ($webView2Signature.Status -eq "Valid") "WebView2 安装包 Authenticode 签名无效"
     Assert-Condition ($webView2Signature.SignerCertificate.Subject -match "Microsoft Corporation") "WebView2 安装包签名者不是 Microsoft Corporation"
@@ -282,6 +380,7 @@ foreach ($line in Get-Content -LiteralPath $sumsPath) {
     $relative = $parts[1].Trim()
     $relative = Normalize-BundleRelativePath $relative
     Assert-Condition ($relative -ine "SHA256SUMS.txt") "SHA256SUMS.txt 不得列出自身"
+    Assert-Condition ($relative -ine "usb-license.json") "SHA256SUMS.txt 不得列出运行期 usb-license.json"
     if (-not $listed.Add($relative)) {
         $failed += "$relative（SHA256SUMS.txt 重复清单项）"
         continue

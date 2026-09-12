@@ -1,5 +1,25 @@
 # Test Log
 
+## 2026-09-13 G22/G23 release candidate
+
+- `npm.cmd test -- --run`: 36 files, 411 passed, 1 skipped.
+- `npm.cmd run build`, `npm.cmd run check`, `npm.cmd run lint`: passed.
+- `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check`: passed.
+- `cargo test --manifest-path src-tauri/Cargo.toml --lib --quiet`: 390 passed, 2 ignored; existing Windows incremental `.rmeta` access warning only.
+- `cargo test --manifest-path tools/usb-license-signer/Cargo.toml --quiet`: 26 passed.
+- `installer-pack/scripts/build-pack.py --check/--verify`: 253 files and source tree hash passed.
+- `installer-pack/audit-codex-compatibility.py --root installer-pack --require-codex`: 50 Skills, 7 Agents, model policy, hashes and compatibility passed.
+- `installer-pack/test-adapter-contracts.py -q`: 41 passed.
+- `release/.../scripts/verify-package.ps1`: 253-file closure passed; target machine has no Python so optional compatibility audit was skipped by design.
+- `tools/verify-oneclick-usb.ps1 -InternalSigned -SkipNetwork`: latest MSIX identity/hash, CCSwitch, VC++/WebView2, USB manager binding and PE manifests passed.
+- USB signer package contains no private key; signer crate tests passed. Static bundle contains no `usb-license.json`.
+- After the independent audit corrected the package-audit robustness boundary, `build-pack.py --check` regenerated metadata; full source and copied-bundle closure verification passed again. Final rebuilt artifacts are the `r4` bundle and signer directories.
+
+## 2026-09-13 G22/G23 follow-up baseline
+
+- Baseline evidence: Skill Repo Rust targeted tests 9/9 and SkillRepoUpdateCard UI tests 8/8 pass before this change; attached G22 log is an older packaged build and is treated as a regression requirement, not as proof of the current source.
+- Required new gates: Skill Hub safe detail/logging, model-catalog schema and no-secret audit, idempotent installer migration, independent uninstall report root, and no recreation of deleted manager data.
+
 ## 2026-09-06 v0.5.24 最终验证
 
 - 许可证/介质清理定向回归 17 通过、0 失败、1 默认忽略；Tauri manager 305 通过、0 失败、1 默认忽略；Windows engine 173 通过、0 失败、1 默认忽略；Windows x64/custom-protocol 编译与 Rust 格式通过。

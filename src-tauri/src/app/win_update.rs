@@ -76,6 +76,10 @@ pub const USB_APPX_INSTALL_MODE: &str = "msix-usb-volume";
 /// remains in the ordinary local user profile. This avoids AppXVolume/WpSystem.
 pub const USB_PORTABLE_INSTALL_MODE: &str = "portable-usb";
 
+fn is_usb_portable_install_mode(install_mode: &str) -> bool {
+    install_mode.eq_ignore_ascii_case(USB_PORTABLE_INSTALL_MODE)
+}
+
 fn allows_portable_fallback(install_mode: &str) -> bool {
     install_mode != FIXED_MSIX_INSTALL_MODE && install_mode != USB_APPX_INSTALL_MODE
 }
@@ -251,20 +255,24 @@ fn should_retry_usb_volume_registration(
     appx_volume_registration_needs_elevation(report) && !combined_prerequisites_succeeded
 }
 
-/// The USB edition may take over an existing current-user MSIX registration
-/// even when this manager has no provenance record for it. Moving that
-/// registration to the removable AppX volume is the supported way to recover
-/// from an earlier/official install and avoids the Windows `0x80073CF9`
-/// data-volume conflict. Keep the exception limited to MSIX: an external
-/// portable directory still requires the explicit adoption flow.
-fn usb_can_migrate_external_msix(
-    install_mode: &str,
-    installed: Option<&InstalledWindowsCodex>,
-) -> bool {
-    matches!(
-        install_mode,
-        USB_APPX_INSTALL_MODE | USB_PORTABLE_INSTALL_MODE
-    ) && installed.is_some_and(|candidate| candidate.source == "msix")
+/// USB installation must never silently take ownership of an existing Codex.
+/// The renderer presents the same policy, but the backend repeats it here so a
+/// stale page or a time-of-check/time-of-use race cannot trigger an uninstall,
+/// migration, or overwrite of an external installation.
+fn usb_install_blocks_existing_install(status: &WinInstallStatus, usb_codex_root: &Path) -> bool {
+    if status.status == "external" {
+        return true;
+    }
+    let Some(installed) = status.installed.as_ref() else {
+        return false;
+    };
+    // A USB install is only allowed to refresh the portable tree owned by the
+    // currently authenticated bundle. A managed record on C:, a stale MSIX,
+    // or any other path is still an existing installation and must remain
+    // untouched; the caller should ask the user to remove it explicitly or use
+    // the ordinary Manager takeover flow.
+    installed.source != "portable"
+        || !codex_win_engine::same_windows_path(Path::new(&installed.path), usb_codex_root)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -773,13 +781,17 @@ pub fn plan_windows_update_with_install_mode_and_network(
         &capabilities,
         portable_fallback_ready(endpoints),
     );
-    if install_mode == "portable" {
+    if install_mode == "portable" || is_usb_portable_install_mode(install_mode) {
         log::info!("Windows user selected portable; skipping MSIX sideload");
         plan.route = WinInstallRoute::PortableFallback;
-        plan.warnings.push(
-            "User selected the portable Windows install mode; MSIX sideload will be skipped."
-                .to_string(),
-        );
+        plan.warnings
+            .push(if is_usb_portable_install_mode(install_mode) {
+                "The USB bundle selected its signed portable route; MSIX sideload will be skipped."
+                    .to_string()
+            } else {
+                "User selected the portable Windows install mode; MSIX sideload will be skipped."
+                    .to_string()
+            });
     }
 
     let report = WinUpdateReport {
@@ -1223,7 +1235,7 @@ fn stage_windows_historical_release(
     let managed = detect_managed_codex(settings, &ProvenanceStore::load());
     let fixed_msix = !allows_portable_fallback(install_mode);
     if install_mode == "portable"
-        || install_mode == USB_PORTABLE_INSTALL_MODE
+        || is_usb_portable_install_mode(install_mode)
         || (!fixed_msix
             && managed
                 .as_ref()
@@ -1248,7 +1260,7 @@ fn stage_windows_historical_release(
         "MSIX Authenticode signature and package identity were verified before installation."
             .to_string(),
     );
-    if install_mode == USB_PORTABLE_INSTALL_MODE {
+    if is_usb_portable_install_mode(install_mode) {
         notes.push(
             "USB edition will extract the verified Codex program tree into the current bundle; no AppX volume or WpSystem package-data volume will be created."
                 .to_string(),
@@ -1324,11 +1336,12 @@ pub fn install_windows_historical_release(
     let _abort_guard = WinAbortGuard::new();
     set_phase(OperationPhase::Preparing);
     let initial_status = win_install_status(settings);
-    if initial_status.status == "external"
-        && !usb_can_migrate_external_msix(install_mode, initial_status.installed.as_ref())
+    if is_usb_portable_install_mode(install_mode)
+        && usb_install_blocks_existing_install(&initial_status, Path::new(&settings.install_root))
     {
         return Err(AppError::StaleExpectation(
-            "当前 Windows Codex 尚未由管理器托管，请先“开始管理”再更换版本".to_string(),
+            "检测到其他位置或其他来源已安装的 Codex；为保护现有安装，U 盘一键安装不会卸载、接管或覆盖它"
+                .to_string(),
         ));
     }
     validate_historical_windows_expectation(&expected, initial_status.installed.as_ref())?;
@@ -1351,11 +1364,12 @@ pub fn install_windows_historical_release(
         .transpose()?;
     set_phase(OperationPhase::Verifying);
     let current_status = win_install_status(settings);
-    if current_status.status == "external"
-        && !usb_can_migrate_external_msix(install_mode, current_status.installed.as_ref())
+    if is_usb_portable_install_mode(install_mode)
+        && usb_install_blocks_existing_install(&current_status, Path::new(&settings.install_root))
     {
         return Err(AppError::StaleExpectation(
-            "当前 Windows Codex 在确认后变为外部安装，请重新检查并先开始管理".to_string(),
+            "确认后检测到其他位置或其他来源已安装的 Codex；为保护现有安装，U 盘一键安装已停止"
+                .to_string(),
         ));
     }
     validate_historical_windows_expectation(&expected, current_status.installed.as_ref())?;
@@ -1368,7 +1382,7 @@ pub fn install_windows_historical_release(
         policy_transition,
         before_commit,
         allow_portable_fallback,
-        install_mode == USB_PORTABLE_INSTALL_MODE,
+        is_usb_portable_install_mode(install_mode),
         appx_volume_root,
     )
 }
@@ -1705,7 +1719,7 @@ pub fn perform_windows_update_with_install_mode_network_and_phase(
         None,
         None,
         true,
-        false,
+        is_usb_portable_install_mode(install_mode),
         None,
     )
 }
@@ -2455,6 +2469,24 @@ fn install_portable_after_stage(
                 backup,
                 had_previous,
             } => {
+                if usb_portable {
+                    let authorization =
+                        usb_guard::require_signed_codex_bundle("portable-usb-precommit")
+                            .map_err(|error| EngineError::Io(error.to_string()))?
+                            .ok_or_else(|| {
+                                EngineError::Io(
+                                    "USB portable 提交前未获得当前 bundle 授权".to_string(),
+                                )
+                            })?;
+                    if !codex_win_engine::same_windows_path(
+                        Path::new(&install_root),
+                        &authorization.codex_root,
+                    ) {
+                        return Err(codex_win_engine::EngineError::Io(
+                            "USB portable 提交目标已偏离当前授权 bundle".to_string(),
+                        ));
+                    }
+                }
                 let mut started = ActiveInstallTx::begin(
                     InstallTxKind::WindowsPortable,
                     &install_root,
@@ -4098,13 +4130,13 @@ mod tests {
         allows_historical_portable_recovery, allows_portable_fallback,
         appx_volume_registration_needs_elevation, bind_manifest_checksums, check_win_update_abort,
         detect_existing_windows_install_at_path, detect_managed_codex,
-        installed_msix_matches_volume, outcome_from_portable_uninstall,
-        portable_boundary_mutated_install_root, portable_fallback_needs_msix_cleanup,
-        portable_install_result_message, retry_windows_ancillary_with_detector,
-        should_retry_usb_volume_registration, usb_can_migrate_external_msix,
-        validate_historical_windows_app_version, WinAbortGuard, WinInstallStatus, WinPerformAction,
-        FIXED_MSIX_INSTALL_MODE, USB_APPX_INSTALL_MODE, USB_PORTABLE_INSTALL_MODE,
-        WIN_UPDATE_ABORT,
+        installed_msix_matches_volume, is_usb_portable_install_mode,
+        outcome_from_portable_uninstall, portable_boundary_mutated_install_root,
+        portable_fallback_needs_msix_cleanup, portable_install_result_message,
+        retry_windows_ancillary_with_detector, should_retry_usb_volume_registration,
+        usb_install_blocks_existing_install, validate_historical_windows_app_version,
+        WinAbortGuard, WinInstallStatus, WinPerformAction, FIXED_MSIX_INSTALL_MODE,
+        USB_APPX_INSTALL_MODE, USB_PORTABLE_INSTALL_MODE, WIN_UPDATE_ABORT,
     };
     use crate::app::operation_outcome::{recovery, OperationOutcome, StepOutcome};
     use crate::app::provenance::ProvenanceStore;
@@ -4220,38 +4252,62 @@ mod tests {
     }
 
     #[test]
-    fn usb_mode_migrates_only_external_msix_and_not_portable_installs() {
-        let msix = InstalledWindowsCodex {
-            path: r"C:\Program Files\WindowsApps\OpenAI.Codex".to_string(),
-            version: "26.825.5331.0".to_string(),
-            arch: Some("x64".to_string()),
-            source: "msix".to_string(),
-            package_family_name: None,
-            package_volume: Some(r"C:\".to_string()),
-            installed_at: None,
+    fn usb_mode_blocks_external_and_non_current_managed_installations() {
+        let usb_root = std::path::Path::new(r"F:\bundle\apps\codex");
+        let external = WinInstallStatus {
+            installed: Some(InstalledWindowsCodex {
+                path: r"C:\Program Files\Codex".to_string(),
+                version: "1.0.0".to_string(),
+                arch: Some("x64".to_string()),
+                source: "msix".to_string(),
+                package_family_name: None,
+                package_volume: None,
+                installed_at: None,
+            }),
+            status: "external".to_string(),
+            recovery_pending: false,
         };
-        let portable = InstalledWindowsCodex {
-            source: "portable".to_string(),
-            ..msix.clone()
+        assert!(usb_install_blocks_existing_install(&external, usb_root));
+
+        let current_usb = WinInstallStatus {
+            installed: Some(InstalledWindowsCodex {
+                path: usb_root.to_string_lossy().into_owned(),
+                version: "1.0.0".to_string(),
+                arch: Some("x64".to_string()),
+                source: "portable".to_string(),
+                package_family_name: None,
+                package_volume: None,
+                installed_at: None,
+            }),
+            status: "managed".to_string(),
+            recovery_pending: false,
         };
-        assert!(usb_can_migrate_external_msix(
-            USB_APPX_INSTALL_MODE,
-            Some(&msix)
+        assert!(!usb_install_blocks_existing_install(&current_usb, usb_root));
+
+        let managed_elsewhere = WinInstallStatus {
+            installed: Some(InstalledWindowsCodex {
+                path: r"C:\Codex\apps\codex".to_string(),
+                version: "1.0.0".to_string(),
+                arch: Some("x64".to_string()),
+                source: "portable".to_string(),
+                package_family_name: None,
+                package_volume: None,
+                installed_at: None,
+            }),
+            status: "managed".to_string(),
+            recovery_pending: false,
+        };
+        assert!(usb_install_blocks_existing_install(
+            &managed_elsewhere,
+            usb_root
         ));
-        assert!(usb_can_migrate_external_msix(
-            USB_PORTABLE_INSTALL_MODE,
-            Some(&msix)
-        ));
-        assert!(!usb_can_migrate_external_msix(
-            USB_APPX_INSTALL_MODE,
-            Some(&portable)
-        ));
-        assert!(!usb_can_migrate_external_msix("msix-fixed", Some(&msix)));
-        assert!(!usb_can_migrate_external_msix(USB_APPX_INSTALL_MODE, None));
-        assert!(!usb_can_migrate_external_msix(
-            USB_PORTABLE_INSTALL_MODE,
-            None
-        ));
+
+        let absent = WinInstallStatus {
+            installed: None,
+            status: "none".to_string(),
+            recovery_pending: false,
+        };
+        assert!(!usb_install_blocks_existing_install(&absent, usb_root));
     }
 
     #[test]
@@ -4441,6 +4497,14 @@ mod tests {
         assert_eq!(installed.source, "portable");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn usb_install_mode_is_the_only_mode_that_enables_usb_commit_guard() {
+        assert!(is_usb_portable_install_mode(USB_PORTABLE_INSTALL_MODE));
+        assert!(is_usb_portable_install_mode("PORTABLE-USB"));
+        assert!(!is_usb_portable_install_mode("portable"));
+        assert!(!is_usb_portable_install_mode("msix"));
     }
 
     #[test]

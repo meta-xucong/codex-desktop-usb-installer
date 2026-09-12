@@ -48,7 +48,12 @@ const RECOVERY: &[&str] = &[
     "usb-license.json",
     "usb-license.json.bak",
 ];
-const EXTRA: &[&str] = &["SHA256SUMS.txt", "usb-license.json", "usb-license.json.bak"];
+// These are not ordinary release files.  SHA256SUMS is the immutable
+// inventory itself; the two root-level license names are manager-owned
+// runtime metadata.  They are allowed only at the exact Bundle root and are
+// validated against the active lease before source-media deletion.
+const EXTRA: &[&str] = &["SHA256SUMS.txt"];
+const ROOT_RUNTIME_LICENSES: &[&str] = &["usb-license.json", "usb-license.json.bak"];
 const CAPABILITY_PACK_PREFIX: &str = "content/codex-starter-kit/";
 const DIRS: &[&str] = &[
     "content/skills",
@@ -73,7 +78,20 @@ fn is_capability_pack_path(name: &str) -> bool {
 }
 
 fn is_allowed_release_file(name: &str) -> bool {
-    FILES.contains(&name) || EXTRA.contains(&name) || is_capability_pack_path(name)
+    let leaf = name.rsplit('/').next().unwrap_or(name);
+    let nested_runtime_license = leaf.eq_ignore_ascii_case("usb-license.json")
+        || leaf.eq_ignore_ascii_case("usb-license.json.bak");
+    if nested_runtime_license && !is_root_runtime_license(name) {
+        return false;
+    }
+    FILES.contains(&name)
+        || EXTRA.contains(&name)
+        || is_root_runtime_license(name)
+        || is_capability_pack_path(name)
+}
+
+fn is_root_runtime_license(name: &str) -> bool {
+    ROOT_RUNTIME_LICENSES.contains(&name)
 }
 
 fn is_allowed_release_dir(name: &str) -> bool {
@@ -338,6 +356,9 @@ fn parse_checksums(text: &str) -> Result<BTreeMap<String, String>, String> {
     let mut entries = BTreeMap::new();
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
         let (hash, name) = line.split_once("  ").ok_or("无效 SHA256 清单行")?;
+        if is_root_runtime_license(name) {
+            return Err(format!("运行期许可文件不得进入 SHA256SUMS.txt：{name}"));
+        }
         if hash.len() != 64
             || !hash.bytes().all(|c| c.is_ascii_hexdigit())
             || !is_allowed_release_file(name)
@@ -478,7 +499,10 @@ impl BundlePins {
                 if &file.hash()? != expected {
                     return Err(format!("文件已被修改，保留：{name}"));
                 }
-            } else if !EXTRA.contains(&name.as_str()) && !is_capability_pack_path(name) {
+            } else if !EXTRA.contains(&name.as_str())
+                && !is_root_runtime_license(name)
+                && !is_capability_pack_path(name)
+            {
                 return Err(format!("保留清单外文件：{name}"));
             }
         }
@@ -497,7 +521,7 @@ impl BundlePins {
             let expected = expected_license.ok_or(
                 "发现运行期许可文件，但没有当前授权 U 盘指纹；为避免误删，已保留：usb-license.json",
             )?;
-            for name in ["usb-license.json", "usb-license.json.bak"] {
+            for &name in ROOT_RUNTIME_LICENSES {
                 let Some(file) = pins.files.get_mut(name) else {
                     continue;
                 };
@@ -784,10 +808,15 @@ mod tests {
             "resources/../private",
             "ccswitch\\CodexSwitch.exe",
             "content/codex-starter-kit/../private.txt",
+            "content/codex-starter-kit/usb-license.json",
+            "content/codex-starter-kit/USB-LICENSE.JSON.BAK",
             "notes.txt",
             "CodexAppManager.exe:secret",
         ] {
             assert!(parse_checksums(&format!("{hash}  {bad}")).is_err());
+        }
+        for runtime_name in ["usb-license.json", "usb-license.json.bak"] {
+            assert!(parse_checksums(&format!("{hash}  {runtime_name}")).is_err());
         }
         assert!(parse_checksums(&format!(
             "{hash}  CodexAppManager.exe\n{hash}  CodexAppManager.exe"
@@ -897,6 +926,17 @@ mod tests {
 
         let unauthenticated = preflight_bundle(&root).unwrap_err();
         assert!(unauthenticated.contains("没有当前授权 U 盘指纹"));
+        preflight_bundle_before_uninstall(&root, None, &expected).unwrap();
+        cleanup_authorized_bundle(&root, &expected).unwrap();
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn root_runtime_license_without_backup_is_explicitly_whitelisted_and_removed_last() {
+        let root = fixture();
+        let expected = fingerprint();
+        write_license(&root, &expected, false);
+
         preflight_bundle_before_uninstall(&root, None, &expected).unwrap();
         cleanup_authorized_bundle(&root, &expected).unwrap();
         assert!(!root.exists());

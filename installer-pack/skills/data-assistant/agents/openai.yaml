@@ -1,0 +1,6 @@
+interface:
+  display_name: "数据处理"
+  short_description: "清洗结构化表格、提取 PDF 信息，并生成可复核的数据分析结果。"
+  default_prompt: "Use $data-assistant to clean this dataset and produce a verifiable analysis."
+policy:
+  allow_implicit_invocation: false

@@ -78,12 +78,14 @@ export interface OperationCompletion {
 export interface CommandError {
   /**
    * Stable machine code, e.g. "unsupported_platform" | "engine_error" |
-   * "stale_expectation" | "internal_error". `stale_expectation` means reality
+   * "stale_expectation" | "post_commit_cleanup" | "internal_error". `stale_expectation` means reality
    * no longer matches the snapshot the user confirmed — re-check, re-confirm.
    */
   code: string;
   /** Human-facing message (the `Display` of the underlying `AppError`). */
   message: string;
+  /** Optional backend diagnostic detail, shown only behind the disclosure UI. */
+  detail?: string;
 }
 
 export interface InstalledCodex {
@@ -256,14 +258,95 @@ export interface CapabilityPackReport {
   available: boolean;
   installed: boolean;
   success: boolean;
+  coreReady: boolean;
+  overallStatus: "ready" | "partial" | "failed" | string;
   sourcePath: string | null;
   packVersion: string | null;
   skills: number;
   agents: number;
   runtimeReady: boolean;
+  runtimeStatus: "ready" | "partial" | "failed" | "skipped" | "unknown" | string;
+  configStatus: "merged" | "partial" | "failed" | "conflict" | "unknown" | string;
+  diagnosticsPath: string | null;
   feishuEnabled: boolean;
   enabledApiServices: string[];
   message: string;
+}
+
+export type SkillRepoSourceKind = "relay" | "github";
+
+export type SkillRepoErrorCode =
+  | "SKILL_REPO_UNAVAILABLE"
+  | "SKILL_REPO_TIMEOUT"
+  | "SKILL_REPO_SOURCE_INVALID"
+  | "SKILL_REPO_STALE"
+  | "SKILL_REPO_HASH_MISMATCH"
+  | "SKILL_REPO_ARCHIVE_INVALID"
+  | "SKILL_REPO_BASE_CONFLICT"
+  | "SKILL_REPO_USER_CONFLICT"
+  | "SKILL_REPO_HOT_MODIFIED"
+  | "SKILL_REPO_LEDGER_INVALID"
+  | "SKILL_REPO_LOCKED"
+  | "SKILL_REPO_ROLLBACK_FAILED"
+  | "SKILL_REPO_UNSUPPORTED";
+
+export type SkillRepoItemStatus = "applied" | "conflict" | "skipped" | "failed";
+export type SkillRepoApplyStatus = "success" | "partial" | "failed" | "blocked";
+export type SkillRepoRollbackStatus = "success" | "failed" | "blocked";
+
+export interface SkillRepoExpected {
+  schemaVersion: number;
+  repo: string;
+  branch: string;
+  commit: string;
+  sourceKind: SkillRepoSourceKind;
+  archiveSize: number;
+  archiveSha256: string;
+}
+
+export interface SkillRepoItem {
+  id: string;
+  status: SkillRepoItemStatus;
+  code: SkillRepoErrorCode | null;
+  fileCount: number;
+}
+
+export interface SkillRepoUpdateInfo {
+  schemaVersion: number;
+  currentCommit: string | null;
+  latestCommit: string;
+  sourceKind: SkillRepoSourceKind;
+  archiveSize: number;
+  archiveSha256: string;
+  expected: SkillRepoExpected;
+  updateAvailable: boolean;
+  installableCount: number;
+  conflictCount: number;
+  skippedCount: number;
+  /** Reserved for a real non-fatal runtime notice; normal Skill Hub updates are null. */
+  warning: string | null;
+}
+
+export interface SkillRepoApplyReport {
+  schemaVersion: number;
+  status: SkillRepoApplyStatus;
+  identity: SkillRepoExpected;
+  applied: SkillRepoItem[];
+  conflicts: SkillRepoItem[];
+  skipped: SkillRepoItem[];
+  failed: SkillRepoItem[];
+  lastGoodGeneration: string | null;
+  reloadedRequired: boolean;
+  logPath: string | null;
+}
+
+export interface SkillRepoRollbackReport {
+  schemaVersion: number;
+  status: SkillRepoRollbackStatus;
+  restoredGeneration: string | null;
+  restoredSkills: string[];
+  reloadedRequired: boolean;
+  logPath: string | null;
 }
 
 /** Result of removing the per-user CCSwitch copy installed by the manager. */
@@ -393,7 +476,7 @@ export interface MacInstallStatus {
 }
 
 export type UpdateSourceKind = "auto" | "mirror" | "official" | "custom";
-export type CodexPayloadSourceKind = "auto" | "relay" | "github";
+export type CodexPayloadSourceKind = "auto" | "mirror" | "relay" | "github";
 export type WindowsInstallMode = "msix" | "portable";
 export type ProxyMode = "system" | "direct" | "custom";
 export type CodexUpdatePlatform = "macos" | "windows";
@@ -510,7 +593,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   codexThemeStoreDir: null,
   skinGroups: [],
   codexPayloadSourceKind: "auto",
-  codexPayloadBaseUrl: "https://update.404token.xyz/__codex_update__/",
+  codexPayloadBaseUrl: "https://codexapp.agentsmirror.com/",
   codexPayloadRepo: "",
 };
 
@@ -844,6 +927,21 @@ export interface UsbGuardStatus {
   bundlePath: string | null;
   bundleRelativePath: string | null;
   signed: boolean;
+  /** Current license classification; older managers may omit these fields. */
+  signatureState?:
+    | "not-applicable"
+    | "missing"
+    | "unsigned-development"
+    | "unsigned"
+    | "valid"
+    | "invalid"
+    | "fingerprint-mismatch"
+    | "unknown-key"
+    | "legacy-unsupported"
+    | string;
+  /** Backend's current signed Codex decision; never trusted as authorization. */
+  codexAllowed?: boolean;
+  codexBlockReason?: string | null;
   lastCheckedAtMs: number;
   missingSinceMs: number | null;
   countdownSeconds: number | null;

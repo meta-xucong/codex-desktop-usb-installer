@@ -15,6 +15,11 @@ pub enum AppError {
     /// re-checking and asking the user to confirm the fresh plan.
     #[error("{0}")]
     StaleExpectation(String),
+    /// The payload and manifests are already committed, but a final
+    /// transaction-directory cleanup failed. Never turn this into a rollback
+    /// or a false success; the caller must surface the residual for retry.
+    #[error("更新已提交，但清理事务残留失败：{0}")]
+    Committed(String),
     #[error("{0}")]
     Busy(String),
     #[error("{0}")]
@@ -37,6 +42,7 @@ pub enum ErrorKind {
     DiskWrite,
     Permission,
     Signature,
+    BundleIntegrity,
     Artifact,
     Incompatible,
     Install,
@@ -56,6 +62,7 @@ impl ErrorKind {
             Self::DiskWrite => "disk_write",
             Self::Permission => "permission",
             Self::Signature => "signature",
+            Self::BundleIntegrity => "bundle_integrity",
             Self::Artifact => "artifact",
             Self::Incompatible => "incompatible",
             Self::Install => "install",
@@ -98,6 +105,13 @@ pub fn classify(message: &str) -> ErrorKind {
     {
         return ErrorKind::DiskSpace;
     }
+    // Keep bundle boundary failures more specific than an embedded OS phrase
+    // such as "Access is denied". The caller needs to know that the USB
+    // bundle itself failed validation, not merely that a generic file write
+    // lacked permission.
+    if m.contains("usb_bundle_") {
+        return ErrorKind::BundleIntegrity;
+    }
     if m.contains("access is denied")
         || m.contains("permission denied")
         || m.contains("operation not permitted")
@@ -109,7 +123,16 @@ pub fn classify(message: &str) -> ErrorKind {
     {
         return ErrorKind::Permission;
     }
-    if m.contains("authenticode")
+    if m.contains("usb_license_")
+        || m.contains("usb_fingerprint_")
+        || m.contains("usb_anchor_")
+        || m.contains("usb_toctou")
+        || m.contains("usb_watchdog")
+        || m.contains("usb_codex")
+        || m.contains("usb_data_boundary")
+        || m.contains("usb_not_ntfs")
+        || m.contains("usb_multiple_candidates")
+        || m.contains("authenticode")
         || m.contains("codesign")
         || m.contains("teamidentifier")
         || m.contains("signature verification")
@@ -194,6 +217,7 @@ impl AppError {
             // message — instead of collapsing everything to `engine_error`.
             Self::Engine(message) => classify(message).as_code(),
             Self::StaleExpectation(_) => "stale_expectation",
+            Self::Committed(_) => "post_commit_cleanup",
             Self::Busy(_) => "operation_busy",
             Self::Internal(_) => "internal_error",
         }
@@ -211,6 +235,12 @@ impl From<OperationError> for AppError {
 pub struct CommandError {
     pub code: String,
     pub message: String,
+    /// Optional diagnostic detail for the disclosure UI.  This is deliberately
+    /// separate from the primary message so command callers can provide a
+    /// useful failure category without turning raw transport/OS text into the
+    /// banner copy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 impl From<AppError> for CommandError {
@@ -218,6 +248,7 @@ impl From<AppError> for CommandError {
         Self {
             code: value.code().to_string(),
             message: value.to_string(),
+            detail: None,
         }
     }
 }
@@ -278,6 +309,20 @@ mod tests {
         assert_eq!(
             classify("Authenticode verification failed"),
             ErrorKind::Signature
+        );
+        assert_eq!(
+            classify(
+                "update engine error: usb_bundle_invalid phase=portable-usb-precommit: file is not listed"
+            ),
+            ErrorKind::BundleIntegrity
+        );
+        assert_eq!(
+            code_of("usb_bundle_integrity_failed phase=startup: SHA256 mismatch"),
+            "bundle_integrity"
+        );
+        assert_eq!(
+            classify("usb_bundle_invalid phase=precommit: Access is denied"),
+            ErrorKind::BundleIntegrity
         );
         assert_eq!(
             classify("codesign verification failed: invalid signature"),
@@ -343,6 +388,10 @@ mod tests {
         assert_eq!(
             AppError::StaleExpectation("x".into()).code(),
             "stale_expectation"
+        );
+        assert_eq!(
+            AppError::Committed("x".into()).code(),
+            "post_commit_cleanup"
         );
         assert_eq!(AppError::Busy("x".into()).code(), "operation_busy");
         assert_eq!(AppError::Internal("x".into()).code(), "internal_error");

@@ -1,5 +1,20 @@
 # Roadmap
 
+## Current release gate — 2026-09-13
+
+1. 等待独立只读审计反馈，若有 P0/P1 立即修复并重跑对应门禁。
+2. 提交源码、安装包契约、模型快照、Skill Hub/G22 文档和测试记录到授权 GitHub 仓库。
+3. 交付本地最新 EXE、U 盘发行目录和 GUI 签名工具；不把 `usb-license.json` 写进静态包，也不操作物理 U 盘。
+4. 目标 Windows 机器仍需手工验收真实 U 盘复制、签名、安装、断网启动、Skill Hub 网络失败详情和卸载二阶段；开发机不能替代这些设备级测试。
+
+## 2026-09-13 G22/G23 follow-up
+
+1. [完成] 阅读并纳入 G22 报告：卸载二阶段不能向已删除的 `io.github.wangnov.codexappmanager` 回写日志。
+2. [完成] 固化 Skill Hub 可诊断更新、脱敏模型目录同步和卸载收尾的开发契约：`docs/SKILL-HUB-MODEL-SYNC-AND-UNINSTALL-G22-DEVELOPMENT.md`。
+3. [进行中] 实施 Skill Hub 错误详情/来源尝试日志、模型快照同步、卸载独立报告目录与日志 fallback。
+4. [待执行] 独立只读审计与全量回归；确认不包含原始模型缓存、密钥、U 盘写入或删除逻辑。
+5. [待执行] 构建正式 EXE、生成 package manifest/checksum、用同一发布目录生成本地 USB 签名产物并做签名前后校验。
+
 Objective: 采用 USB 便携程序 + 本地用户数据方案，把 Codex 程序和 CCSwitch 载荷留在 U 盘，保留早期 AppX 状态的安全兼容清理，并完成可复制、可验证的一键发布目录。
 
 1. [完成] 审计既有离线安装器，删除 `APPX-PROCESS-GUARD-DEVELOPMENT.md`，将旧看门狗文档标记为历史记录。
@@ -26,4 +41,3 @@ Objective: 采用 USB 便携程序 + 本地用户数据方案，把 Codex 程序
 22. [等待独立报告] 开始菜单启动 ChatGPT 空白；在 WorkBuddy 返回完整运行时日志后单独诊断，不与安装成功误报修复混合。
 23. [完成（待用户实机确认）] v0.5.23 启动可用性收口：USB Codex 先用软件渲染并以稳定可操作窗口为成功条件，仅失败时自动使用 no-sandbox 兼容重试且按版本记忆；CCSwitch 使用子进程级 WebView2 软件渲染、两秒稳定复核、恢复/屏内钳制/前置主窗口；升级时哈希刷新本地看门狗，消除旧 helper 状态格式残留。源码、真实 MSIX 解包事务和正式整包均已验证，目标机只需验收真实 GPU/前景窗口行为。
 24. [完成（待用户实机确认）] v0.5.24 卸载许可证收口：把 U 盘根目录的 `usb-license.json`/`.bak` 从“未知发行文件”改为按活动租约、物理卷、完整指纹和配置签名验证的可变产品元数据；二阶段计划 schema 3 固化许可证快照，许可与重试入口最后删除；未知项目逐项列名并继续 fail closed。定向、全量、真实 MSIX、Windows PowerShell 5.1 和新版本整包验证均通过，仅剩目标机实际卸载生命周期验收。
-

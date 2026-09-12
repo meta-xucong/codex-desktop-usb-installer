@@ -1,0 +1,53 @@
+{
+  "schemaVersion": 1,
+  "serverId": "feishu",
+  "package": "@larksuiteoapi/lark-mcp@0.5.1",
+  "packageName": "@larksuiteoapi/lark-mcp",
+  "packageVersion": "0.5.1",
+  "cliRelativePath": "node_modules/@larksuiteoapi/lark-mcp/dist/cli.js",
+  "toolNameCase": "dot",
+  "readTools": [
+    "docx.v1.document.get",
+    "docx.v1.document.rawContent",
+    "docx.v1.documentBlock.list",
+    "docx.v1.documentBlock.get",
+    "drive.v1.file.list",
+    "drive.v1.meta.batchQuery",
+    "drive.v1.permissionMember.auth",
+    "drive.v1.permissionMember.list",
+    "drive.v1.permissionPublic.get",
+    "wiki.v2.space.get",
+    "wiki.v2.space.list",
+    "wiki.v2.space.getNode",
+    "wiki.v2.spaceNode.list"
+  ],
+  "writeTools": [
+    "drive.v1.file.copy",
+    "drive.v1.file.createFolder",
+    "drive.v1.file.move",
+    "drive.v1.file.delete",
+    "drive.v1.permissionMember.create",
+    "drive.v1.permissionMember.update",
+    "drive.v1.permissionMember.delete",
+    "drive.v1.permissionMember.transferOwner",
+    "wiki.v2.spaceNode.copy",
+    "wiki.v2.spaceNode.create",
+    "wiki.v2.spaceNode.move",
+    "wiki.v2.spaceNode.updateTitle"
+  ],
+  "highRiskTools": [
+    "drive.v1.file.delete",
+    "drive.v1.permissionMember.delete",
+    "drive.v1.permissionMember.transferOwner"
+  ],
+  "unsupportedOperations": [
+    "direct cloud-document editing",
+    "file upload",
+    "file download"
+  ],
+  "source": {
+    "tools": "https://raw.githubusercontent.com/larksuite/lark-openapi-mcp/main/docs/reference/tool-presets/tools-en.md",
+    "limitations": "https://github.com/larksuite/lark-openapi-mcp/blob/main/README.md",
+    "checkedAt": "2026-09-07"
+  }
+}

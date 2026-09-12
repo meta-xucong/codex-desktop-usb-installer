@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodic Skill Hub hot-update relay sync
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=30min
+Persistent=true
+Unit=skill-hub-relay-sync.service
+
+[Install]
+WantedBy=timers.target

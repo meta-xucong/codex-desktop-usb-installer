@@ -27,6 +27,9 @@ pub struct ManagerState {
     /// release WebView safety gate has failed.
     #[cfg(target_os = "windows")]
     pub webview_gate_failed: AtomicBool,
+    /// Prevent repeated native startup notices when multiple startup
+    /// fallbacks observe the same stalled WebView.
+    pub(crate) startup_notice_shown: AtomicBool,
     pub operations: OperationManager,
     pub config_health: Mutex<ConfigHealth>,
     pub frontend: FrontendGate,
@@ -88,6 +91,7 @@ impl ManagerState {
             webview_safe_to_show: AtomicBool::new(initial_webview_safe_to_show(cfg!(dev))),
             #[cfg(target_os = "windows")]
             webview_gate_failed: AtomicBool::new(false),
+            startup_notice_shown: AtomicBool::new(false),
             operations,
             config_health,
             frontend: FrontendGate::default(),

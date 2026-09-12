@@ -28,6 +28,10 @@ pub struct AuthenticodeReport {
 }
 
 impl AuthenticodeReport {
+    pub fn is_valid(&self) -> bool {
+        self.trusted && !self.subject.trim().is_empty()
+    }
+
     pub fn is_valid_openai(&self) -> bool {
         self.trusted && self.publisher_is_openai
     }
@@ -136,8 +140,7 @@ $sig = Get-AuthenticodeSignature -LiteralPath {path}
 }
 
 #[cfg(windows)]
-pub fn verify_openai_authenticode(path: &Path) -> Result<AuthenticodeReport, EngineError> {
-    log::info!("Authenticode verification start");
+fn read_authenticode_report(path: &Path) -> Result<AuthenticodeReport, EngineError> {
     let script = authenticode_script(path);
 
     let mut command = hidden_command(powershell_exe());
@@ -156,6 +159,26 @@ pub fn verify_openai_authenticode(path: &Path) -> Result<AuthenticodeReport, Eng
     }
 
     let report = report_from_json(String::from_utf8_lossy(&output.stdout).trim())?;
+    Ok(report)
+}
+
+#[cfg(windows)]
+pub fn verify_authenticode(path: &Path) -> Result<AuthenticodeReport, EngineError> {
+    let report = read_authenticode_report(path)?;
+    if !report.is_valid() {
+        log::error!(
+            "Authenticode verification failed error=status={} subject={}",
+            report.status,
+            report.subject
+        );
+    }
+    Ok(report)
+}
+
+#[cfg(windows)]
+pub fn verify_openai_authenticode(path: &Path) -> Result<AuthenticodeReport, EngineError> {
+    log::info!("Authenticode verification start");
+    let report = read_authenticode_report(path)?;
     if report.is_valid_openai() {
         let signer = &report.subject;
         log::info!("Authenticode verification passed signer={signer}");
@@ -167,6 +190,11 @@ pub fn verify_openai_authenticode(path: &Path) -> Result<AuthenticodeReport, Eng
         );
     }
     Ok(report)
+}
+
+#[cfg(not(windows))]
+pub fn verify_authenticode(path: &Path) -> Result<AuthenticodeReport, EngineError> {
+    verify_openai_authenticode(path)
 }
 
 #[cfg(not(windows))]

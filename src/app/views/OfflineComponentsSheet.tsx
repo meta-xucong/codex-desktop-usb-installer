@@ -1,4 +1,4 @@
-import { useEffect, useId, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 
 import { errorMessage, managerApi } from "../../services/managerApi";
 import type {
@@ -45,6 +45,17 @@ const SERVICE_KEYS: ServiceId[] = [
   "seedance",
 ];
 
+const CONFIG_ATTENTION_STATUSES = new Set(["partial", "failed", "conflict"]);
+
+function configNeedsAttention(report: CapabilityPackReport): boolean {
+  return (
+    report.coreReady &&
+    report.runtimeReady &&
+    !report.success &&
+    CONFIG_ATTENTION_STATUSES.has(report.configStatus)
+  );
+}
+
 export function OfflineComponentsSheet({
   open,
   onDismiss,
@@ -63,17 +74,36 @@ export function OfflineComponentsSheet({
     seedance: false,
   });
   const [busy, setBusy] = useState<"pack" | "ccswitch" | null>(null);
+  const [statusLoading, setStatusLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [packReport, setPackReport] = useState<CapabilityPackReport | null>(null);
   const [ccswitchReport, setCcswitchReport] = useState<CcswitchLaunchReport | null>(null);
+  const statusRequestRef = useRef(0);
 
   useEffect(() => {
-    if (!open) return;
+    if (!open) {
+      statusRequestRef.current += 1;
+      setStatusLoading(false);
+      return;
+    }
+    const requestId = statusRequestRef.current + 1;
+    statusRequestRef.current = requestId;
+    setStatusLoading(true);
     setError(null);
     void managerApi
       .capabilityPackStatus()
-      .then(setPackReport)
-      .catch((cause) => setError(errorMessage(cause)));
+      .then((report) => {
+        if (statusRequestRef.current === requestId) setPackReport(report);
+      })
+      .catch((cause) => {
+        if (statusRequestRef.current === requestId) setError(errorMessage(cause));
+      })
+      .finally(() => {
+        if (statusRequestRef.current === requestId) setStatusLoading(false);
+      });
+    return () => {
+      if (statusRequestRef.current === requestId) statusRequestRef.current += 1;
+    };
   }, [open]);
 
   const update = <K extends keyof FormValues>(key: K, value: FormValues[K]) => {
@@ -124,11 +154,16 @@ export function OfflineComponentsSheet({
   };
 
   const installPack = async () => {
+    if (busy !== null || statusLoading) return;
     const validation = validate();
     if (validation) {
       setError(validation);
       return;
     }
+    // An install result is newer than any status query started by opening the
+    // sheet. Invalidate that query before allowing it to update the report.
+    statusRequestRef.current += 1;
+    setStatusLoading(false);
     setBusy("pack");
     setError(null);
     try {
@@ -140,7 +175,7 @@ export function OfflineComponentsSheet({
         ),
       });
       setPackReport(report);
-      if (!report.success) setError(report.message);
+      if (!report.coreReady) setError(report.message);
     } catch (cause) {
       setError(errorMessage(cause));
     } finally {
@@ -366,8 +401,16 @@ export function OfflineComponentsSheet({
         </div>
 
         {packReport ? (
-          <div className={`component-result${packReport.success ? " success" : ""}`}>
-            <strong>{packReport.success ? t("offline.components.ready") : t("offline.components.notReady")}</strong>
+          <div className={`component-result${packReport.coreReady ? " success" : ""}`}>
+            <strong>
+              {packReport.coreReady
+                ? packReport.success
+                  ? t("offline.components.ready")
+                  : configNeedsAttention(packReport)
+                    ? t("offline.components.configConflict")
+                    : t("offline.components.partial")
+                : t("offline.components.notReady")}
+            </strong>
             <span>{packReport.message}</span>
             {packReport.skills > 0 ? (
               <small>
@@ -410,7 +453,11 @@ export function OfflineComponentsSheet({
           <button className="btn ghost" onClick={onDismiss} disabled={busy !== null}>
             {t("offline.components.skip")}
           </button>
-          <button className="btn primary" onClick={() => void installPack()} disabled={busy !== null}>
+          <button
+            className="btn primary"
+            onClick={() => void installPack()}
+            disabled={busy !== null || statusLoading}
+          >
             {busy === "pack" ? <Icon name="loader" className="spinicon" /> : <Icon name="download" />}
             {busy === "pack" ? t("offline.components.installing") : t("offline.components.install")}
           </button>

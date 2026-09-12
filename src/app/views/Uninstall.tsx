@@ -71,6 +71,7 @@ const CCSWITCH_DATA_DISPLAY = "%USERPROFILE%\\.cc-switch";
 // not new cleanup targets or ownership-based authorization to erase data.
 const CODEX_WINDOWS_DATA_PATHS = [
   "%USERPROFILE%\\.codex",
+  "%USERPROFILE%\\.agents\\skills",
   "%LOCALAPPDATA%\\Packages\\OpenAI.Codex_2p2nqsd0c76g0",
   "%LOCALAPPDATA%\\OpenAI\\Codex",
   "%LOCALAPPDATA%\\Codex\\Logs",

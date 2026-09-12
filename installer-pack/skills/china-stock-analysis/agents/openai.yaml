@@ -1,0 +1,6 @@
+interface:
+  display_name: "A股分析"
+  short_description: "使用带日期与来源的可核验行情和财务数据，完成 A 股研究分析。"
+  default_prompt: "Use $china-stock-analysis to analyze this A-share company with dated, verifiable evidence."
+policy:
+  allow_implicit_invocation: false

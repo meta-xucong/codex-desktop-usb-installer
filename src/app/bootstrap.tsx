@@ -24,6 +24,10 @@ export async function bootstrap(): Promise<void> {
   contextMenu.installContextMenuPolicy();
 
   const { App } = await import("./App");
+  // index.html owns a dependency-free startup skeleton. Remove it before the
+  // normal React tree mounts so a slow/offline renderer never leaves duplicate
+  // startup content behind.
+  root.replaceChildren();
   ReactDOM.createRoot(root).render(
     <React.StrictMode>
       <RootCrashBoundary>

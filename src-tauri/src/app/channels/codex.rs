@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Duration;
 use url::{Host, Url};
 
 use codex_win_engine::sys::{fetch_text_with_network_headers, GITHUB_API_HEADERS};
@@ -16,10 +17,13 @@ use codex_win_engine::{
     download_to_with_progress_bounded_with_network,
     download_to_with_progress_bounded_with_network_no_redirect, fetch_text_with_network,
     fetch_text_with_network_no_redirect, find_msix_sha256, limits::MAX_PACKAGE_BYTES,
-    read_msix_identity, sha256_file, validate_codex_identity, MsixIdentity, NetworkConfig,
+    parse_manifest_for_arch, read_msix_identity, sha256_file, validate_codex_identity,
+    MsixIdentity, NetworkConfig,
 };
 
-use crate::app::settings_store::{AppSettings, CodexPayloadSourceKind};
+use crate::app::settings_store::{
+    AppSettings, CodexPayloadSourceKind, LEGACY_CODEX_PAYLOAD_BASE_URL,
+};
 use crate::app::update_channel::{
     compare_versions, read_usb_codex_desktop_version, ChannelKind, UpdateContext, UpdateInfo,
 };
@@ -34,6 +38,8 @@ const ROOT_MANIFEST_NAME: &str = "manifest.json";
 const USB_MANIFEST_NAME: &str = "usb-manifest.json";
 const USB_LICENSE_NAME: &str = "usb-license.json";
 const TRANSACTION_VERSION: u32 = 1;
+const SOURCE_METADATA_ATTEMPTS: usize = 2;
+const SOURCE_METADATA_RETRY_DELAY_MS: u64 = 450;
 static CODEX_UPDATE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Deserialize)]
@@ -139,6 +145,33 @@ struct LocalBundle {
     current_version: String,
 }
 
+/// Immutable local state captured together with a check result. The remote
+/// identity alone cannot detect a media change between check and apply when
+/// the payload and all mutable manifests are changed together.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct LocalBundleSnapshot {
+    current_version: String,
+    payload_relative: String,
+    architecture: String,
+    payload_sha256: String,
+    root_manifest_sha256: String,
+    usb_manifest_sha256: String,
+    checksums_sha256: String,
+}
+
+/// The public UpdateInfo shape remains unchanged. Codex keeps its remote
+/// identity flat and adds an optional stale-state field inside the channel
+/// payload so old callers can still deserialize the identity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexUpdatePayload {
+    #[serde(flatten)]
+    identity: CodexPayloadIdentity,
+    #[serde(default)]
+    local_snapshot: Option<LocalBundleSnapshot>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct TransactionState {
     version: u32,
@@ -200,6 +233,18 @@ fn resolved_repo(settings: &AppSettings) -> Result<String, AppError> {
 
 fn repo_api_url(repo: &str) -> String {
     format!("https://api.github.com/repos/{repo}/releases/latest")
+}
+
+fn is_builtin_codex_mirror_base(raw: &str) -> bool {
+    let Ok(normalized) = normalize_relay_base_url(raw) else {
+        return false;
+    };
+    let Ok(url) = Url::parse(&normalized) else {
+        return false;
+    };
+    url.host_str()
+        .is_some_and(|host| host.eq_ignore_ascii_case("codexapp.agentsmirror.com"))
+        && url.path() == "/"
 }
 
 /// Normalize and validate the relay directory URL. The relay is deliberately
@@ -502,6 +547,121 @@ fn resolve_latest(
     })
 }
 
+/// Resolve the public mirror's Windows payload contract. This is deliberately
+/// separate from the legacy `latest.json` relay contract: the mirror's
+/// `/latest/manifest` is the same manifest consumed by the normal Windows
+/// installer update path, while `/manager/latest.json` belongs to the Tauri
+/// manager self-updater and must never be parsed as a Codex payload release.
+fn resolve_mirror_latest(
+    asset_fetch: &dyn Fn(&str) -> Result<String, AppError>,
+    base_url: &str,
+    architecture: &str,
+) -> Result<ResolvedRelease, AppError> {
+    let base_url = validate_relay_base_url(base_url)?;
+    let manifest_path = "latest/manifest";
+    let checksums_path = "latest/checksums";
+    let msix_path = if architecture.eq_ignore_ascii_case("arm64") {
+        "latest/win-arm64"
+    } else {
+        "latest/win-x64"
+    };
+    let manifest_url = relay_asset_url(&base_url, manifest_path)?;
+    let checksums_url = relay_asset_url(&base_url, checksums_path)?;
+    let msix_url = relay_asset_url(&base_url, msix_path)?;
+
+    let manifest_text = asset_fetch(&manifest_url)?;
+    let release = parse_manifest_for_arch(&manifest_text, Some(architecture))
+        .map_err(|error| AppError::Engine(format!("解析 Codex 镜像 manifest 失败：{error}")))?;
+    let release_architecture = release
+        .architecture
+        .as_deref()
+        .unwrap_or(architecture)
+        .trim();
+    if !release_architecture.eq_ignore_ascii_case(architecture) {
+        return Err(AppError::Engine(format!(
+            "Codex 镜像 manifest 架构与当前目标不一致：{release_architecture}"
+        )));
+    }
+    if !release.package_moniker.starts_with("OpenAI.Codex_")
+        || !release
+            .package_moniker
+            .to_ascii_lowercase()
+            .contains(&format!("_{}_", architecture.to_ascii_lowercase()))
+    {
+        return Err(AppError::Engine(
+            "Codex 镜像 manifest 的 packageMoniker 与目标架构不一致".to_string(),
+        ));
+    }
+    let msix_size = release.content_length.ok_or_else(|| {
+        AppError::Engine("Codex 镜像 manifest 缺少 Windows MSIX 大小".to_string())
+    })?;
+    if msix_size == 0 || msix_size > MAX_PACKAGE_BYTES {
+        return Err(AppError::Engine(format!(
+            "Codex 镜像 MSIX 大小无效：{msix_size}"
+        )));
+    }
+
+    // Fetch the small checksum file during the check, rather than waiting
+    // until after a 700+ MB download. This both proves the mirror is usable
+    // and binds the latest alias to the exact package moniker advertised by
+    // its manifest.
+    let checksums_text = asset_fetch(&checksums_url)?;
+    if checksums_text.is_empty() || checksums_text.len() as u64 > MAX_PACKAGE_BYTES {
+        return Err(AppError::Engine(
+            "Codex 镜像 checksums 响应大小无效".to_string(),
+        ));
+    }
+    let msix_sha = find_msix_sha256(&checksums_text, &release.package_moniker)
+        .map_err(|error| AppError::Engine(format!("解析 Codex 镜像 checksums 失败：{error}")))?;
+    let manifest_sha = sha256_bytes(manifest_text.as_bytes());
+    let checksums_sha = sha256_bytes(checksums_text.as_bytes());
+    // The mirror manifest has no GitHub release id. A digest-derived stable
+    // id still gives check/apply a strong stale-identity comparison without
+    // inventing a mutable numeric release identifier.
+    let release_id = u64::from_str_radix(&manifest_sha[..16], 16).unwrap_or(0);
+    let release_tag = format!(
+        "mirror-{}-{}",
+        release.version.trim(),
+        release.package_version.trim()
+    );
+    let msix_name = format!("{}.Msix", release.package_moniker);
+    Ok(ResolvedRelease {
+        identity: CodexPayloadIdentity {
+            source_kind: CodexPayloadSourceKind::Mirror,
+            source_locator: base_url,
+            repo: DEFAULT_CODEX_PAYLOAD_REPO.to_string(),
+            release_id,
+            release_tag,
+            msix_asset_id: None,
+            msix_asset_name: msix_name,
+            sha256_asset_id: None,
+            sha256_asset_name: checksums_path.to_string(),
+            manifest_asset_id: None,
+            manifest_asset_name: manifest_path.to_string(),
+            package_moniker: release.package_moniker,
+            architecture: architecture.to_string(),
+            msix_version: release.package_version,
+            app_version: release.version.clone(),
+            msix_size,
+            msix_sha256: Some(msix_sha.clone()),
+            checksums_sha256: Some(checksums_sha.clone()),
+            manifest_sha256: Some(manifest_sha),
+            github_digest: None,
+        },
+        app_version: release.version,
+        msix: ResolvedAsset {
+            size: msix_size,
+            url: msix_url,
+            expected_sha256: Some(msix_sha),
+        },
+        checksums: ResolvedAsset {
+            size: checksums_text.len() as u64,
+            url: checksums_url,
+            expected_sha256: Some(checksums_sha),
+        },
+    })
+}
+
 fn resolve_relay_latest(
     asset_fetch: &dyn Fn(&str) -> Result<String, AppError>,
     base_url: &str,
@@ -620,6 +780,27 @@ fn resolve_source(
     source_kind: CodexPayloadSourceKind,
 ) -> Result<ResolvedRelease, AppError> {
     match source_kind {
+        CodexPayloadSourceKind::Mirror => {
+            let mirror_fetch = |url: &str| {
+                require_https_url(url, "Codex 镜像地址")?;
+                let result = if is_builtin_codex_mirror_base(&settings.codex_payload_base_url) {
+                    // The public mirror may hand off metadata to its domestic
+                    // object-storage backend. The base is fixed and the
+                    // downloaded package is still bound by Authenticode and
+                    // the mirror checksum, so following this trusted mirror
+                    // handoff is intentional.
+                    fetch_text_with_network(url, network)
+                } else {
+                    fetch_text_with_network_no_redirect(url, network)
+                };
+                result.map_err(|error| AppError::Engine(error.to_string()))
+            };
+            resolve_mirror_latest(
+                &mirror_fetch,
+                &settings.codex_payload_base_url,
+                architecture,
+            )
+        }
         CodexPayloadSourceKind::Relay => {
             let relay_fetch = |url: &str| {
                 require_https_url(url, "Codex relay 地址")?;
@@ -630,7 +811,8 @@ fn resolve_source(
                 fetch_text_with_network_no_redirect(url, network)
                     .map_err(|error| AppError::Engine(error.to_string()))
             };
-            resolve_relay_latest(&relay_fetch, &settings.codex_payload_base_url, architecture)
+            let relay_base = relay_base_url_for(settings);
+            resolve_relay_latest(&relay_fetch, &relay_base, architecture)
         }
         CodexPayloadSourceKind::Github => {
             let api_fetch = |url: &str| {
@@ -648,6 +830,94 @@ fn resolve_source(
         CodexPayloadSourceKind::Auto => {
             Err(AppError::Internal("resolve_source 不接受 auto".to_string()))
         }
+    }
+}
+
+fn source_locator_for(settings: &AppSettings, source_kind: CodexPayloadSourceKind) -> String {
+    match source_kind {
+        CodexPayloadSourceKind::Mirror => settings.codex_payload_base_url.clone(),
+        CodexPayloadSourceKind::Relay => relay_base_url_for(settings),
+        CodexPayloadSourceKind::Github => resolved_repo(settings)
+            .map(|repo| repo_api_url(&repo))
+            .unwrap_or_else(|_| "https://api.github.com".to_string()),
+        CodexPayloadSourceKind::Auto => "auto".to_string(),
+    }
+}
+
+fn source_error_is_retryable(error: &AppError) -> bool {
+    matches!(
+        crate::errors::classify(&error.to_string()),
+        crate::errors::ErrorKind::Network | crate::errors::ErrorKind::Timeout
+    )
+}
+
+fn resolve_source_with_retry<F>(
+    settings: &AppSettings,
+    architecture: &str,
+    network: &NetworkConfig,
+    source_kind: CodexPayloadSourceKind,
+    resolve: &mut F,
+) -> Result<ResolvedRelease, AppError>
+where
+    F: FnMut(
+        &AppSettings,
+        &str,
+        &NetworkConfig,
+        CodexPayloadSourceKind,
+    ) -> Result<ResolvedRelease, AppError>,
+{
+    let locator = source_locator_for(settings, source_kind);
+    let mut last_error = None;
+    for attempt in 1..=SOURCE_METADATA_ATTEMPTS {
+        log::info!(
+            "codex payload source attempt source={} attempt={}/{} locator={}",
+            source_kind.as_str(),
+            attempt,
+            SOURCE_METADATA_ATTEMPTS,
+            locator
+        );
+        match resolve(settings, architecture, network, source_kind) {
+            Ok(release) => {
+                log::info!(
+                    "codex payload source resolved source={} version={} package={} locator={}",
+                    source_kind.as_str(),
+                    release.app_version,
+                    release.identity.package_moniker,
+                    locator
+                );
+                return Ok(release);
+            }
+            Err(error) => {
+                let retryable = source_error_is_retryable(&error);
+                log::warn!(
+                    "codex payload source failed stage=metadata source={} attempt={}/{} retryable={} locator={} error={}",
+                    source_kind.as_str(),
+                    attempt,
+                    SOURCE_METADATA_ATTEMPTS,
+                    retryable,
+                    locator,
+                    error
+                );
+                last_error = Some(error);
+                if !retryable || attempt == SOURCE_METADATA_ATTEMPTS {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(
+                    SOURCE_METADATA_RETRY_DELAY_MS * attempt as u64,
+                ));
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        AppError::Internal(format!("Codex 更新源未执行：{}", source_kind.as_str()))
+    }))
+}
+
+fn relay_base_url_for(settings: &AppSettings) -> String {
+    if is_builtin_codex_mirror_base(&settings.codex_payload_base_url) {
+        LEGACY_CODEX_PAYLOAD_BASE_URL.to_string()
+    } else {
+        settings.codex_payload_base_url.clone()
     }
 }
 
@@ -682,25 +952,52 @@ where
 {
     match settings.codex_payload_source_kind {
         CodexPayloadSourceKind::Auto => {
-            match resolve(
+            let mirror_result = resolve_source_with_retry(
                 settings,
                 architecture,
                 network,
-                CodexPayloadSourceKind::Relay,
-            ) {
+                CodexPayloadSourceKind::Mirror,
+                &mut resolve,
+            );
+            match mirror_result {
                 Ok(release) => Ok(release),
-                Err(relay_error) => {
-                    log::warn!("Codex relay 不可用，回退 GitHub：{relay_error}");
-                    resolve(
+                Err(mirror_error) => {
+                    log::warn!("Codex 国内镜像不可用，准备回退：{mirror_error}");
+                    let mut fallback_errors = vec![format!("镜像：{mirror_error}")];
+                    let relay_result = resolve_source_with_retry(
+                        settings,
+                        architecture,
+                        network,
+                        CodexPayloadSourceKind::Relay,
+                        &mut resolve,
+                    );
+                    match relay_result {
+                        Ok(release) => return Ok(release),
+                        Err(relay_error) => {
+                            log::warn!("Codex 兼容 Relay 不可用，回退 GitHub：{relay_error}");
+                            fallback_errors.push(format!("兼容 Relay：{relay_error}"));
+                        }
+                    }
+                    let github_result = resolve_source_with_retry(
                         settings,
                         architecture,
                         network,
                         CodexPayloadSourceKind::Github,
-                    )
+                        &mut resolve,
+                    );
+                    match github_result {
+                        Ok(release) => Ok(release),
+                        Err(github_error) => Err(AppError::Engine(format!(
+                            "Codex 更新源均不可用；{}；GitHub：{github_error}",
+                            fallback_errors.join("；")
+                        ))),
+                    }
                 }
             }
         }
-        source_kind => resolve(settings, architecture, network, source_kind),
+        source_kind => {
+            resolve_source_with_retry(settings, architecture, network, source_kind, &mut resolve)
+        }
     }
 }
 
@@ -716,7 +1013,10 @@ fn source_matches_settings(
         return Ok(false);
     }
     let locator = match identity.source_kind {
-        CodexPayloadSourceKind::Relay => validate_relay_base_url(&settings.codex_payload_base_url)?,
+        CodexPayloadSourceKind::Mirror => {
+            validate_relay_base_url(&settings.codex_payload_base_url)?
+        }
+        CodexPayloadSourceKind::Relay => validate_relay_base_url(&relay_base_url_for(settings))?,
         CodexPayloadSourceKind::Github => repo_api_url(&resolved_repo(settings)?),
         CodexPayloadSourceKind::Auto => return Ok(false),
     };
@@ -976,6 +1276,76 @@ fn require_capability(bundle_root: &Path) -> Result<LocalBundle, AppError> {
     })
 }
 
+fn local_bundle_snapshot(
+    bundle_root: &Path,
+    local: &LocalBundle,
+) -> Result<LocalBundleSnapshot, AppError> {
+    let root_manifest = bundle_root.join(ROOT_MANIFEST_NAME);
+    let usb_manifest = bundle_root.join(USB_MANIFEST_NAME);
+    let checksums = bundle_root.join(SHA256SUMS_NAME);
+    for path in [
+        &root_manifest,
+        &usb_manifest,
+        &checksums,
+        &local.payload_path,
+    ] {
+        reject_reparse_chain(path)?;
+    }
+    let digest = |path: &Path, label: &str| {
+        sha256_file(path)
+            .map_err(|error| AppError::Engine(format!("计算 {label} SHA256 失败: {error}")))
+    };
+    Ok(LocalBundleSnapshot {
+        current_version: local.current_version.clone(),
+        payload_relative: local.payload_relative.clone(),
+        architecture: local.architecture.clone(),
+        payload_sha256: digest(&local.payload_path, "payload")?,
+        root_manifest_sha256: digest(&root_manifest, ROOT_MANIFEST_NAME)?,
+        usb_manifest_sha256: digest(&usb_manifest, USB_MANIFEST_NAME)?,
+        checksums_sha256: digest(&checksums, SHA256SUMS_NAME)?,
+    })
+}
+
+fn codex_update_payload(
+    bundle_root: &Path,
+    local: &LocalBundle,
+    identity: &CodexPayloadIdentity,
+) -> Result<serde_json::Value, AppError> {
+    serde_json::to_value(CodexUpdatePayload {
+        identity: identity.clone(),
+        local_snapshot: Some(local_bundle_snapshot(bundle_root, local)?),
+    })
+    .map_err(|error| AppError::Engine(format!("序列化 codex 更新快照失败: {error}")))
+}
+
+fn parse_codex_update_payload(value: &serde_json::Value) -> Result<CodexUpdatePayload, AppError> {
+    serde_json::from_value(value.clone()).map_err(|error| {
+        AppError::StaleExpectation(format!("更新确认对象无效，请重新检查：{error}"))
+    })
+}
+
+fn verify_bundle_integrity(bundle_root: &Path) -> Result<(), AppError> {
+    let sums_path = bundle_root.join(SHA256SUMS_NAME);
+    reject_reparse_chain(&sums_path)?;
+    let sums = fs::read(&sums_path)
+        .map_err(|error| AppError::Engine(format!("读取 {SHA256SUMS_NAME} 失败: {error}")))?;
+    verify_sha256_sums(bundle_root, &sums, &BTreeMap::new())
+}
+
+fn require_local_snapshot(
+    bundle_root: &Path,
+    local: &LocalBundle,
+    expected: &LocalBundleSnapshot,
+) -> Result<(), AppError> {
+    let actual = local_bundle_snapshot(bundle_root, local)?;
+    if &actual != expected {
+        return Err(AppError::StaleExpectation(
+            "本地 USB payload 或清单在确认后发生变化，请重新检查后再确认。".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn pending_transaction_dirs(bundle_root: &Path) -> Result<Vec<PathBuf>, AppError> {
     let staging = bundle_root.join(STAGING_DIR);
     if !staging.exists() {
@@ -1016,17 +1386,25 @@ fn write_transaction_state(tx: &Path, phase: &str) -> Result<(), AppError> {
         phase: phase.to_string(),
     })
     .map_err(|error| AppError::Engine(format!("序列化事务状态失败: {error}")))?;
-    fs::write(tx.join("state.json"), bytes)
-        .map_err(|error| AppError::Engine(format!("写入事务状态失败: {error}")))
+    reject_reparse_chain(tx)?;
+    crate::app::atomic_file::write_atomic(&tx.join("state.json"), &bytes)
+        .map_err(|error| AppError::Engine(format!("原子写入事务状态失败: {error}")))
 }
 
 fn read_transaction_state(tx: &Path) -> Result<TransactionState, AppError> {
     let state_path = tx.join("state.json");
     reject_reparse_chain(&state_path)?;
-    let bytes = fs::read(&state_path)
-        .map_err(|error| AppError::Engine(format!("读取事务状态失败: {error}")))?;
-    let state: TransactionState = serde_json::from_slice(&bytes)
-        .map_err(|error| AppError::Engine(format!("事务状态损坏: {error}")))?;
+    let backup_path = crate::app::atomic_file::backup_path(&state_path);
+    if backup_path.exists() {
+        reject_reparse_chain(&backup_path)?;
+    }
+    let (state, outcome) =
+        crate::app::atomic_file::read_with_recovery::<TransactionState>(&state_path);
+    let state = state.ok_or_else(|| {
+        AppError::Engine(format!(
+            "事务状态缺失或损坏，保留事务供人工恢复（状态={outcome:?}）"
+        ))
+    })?;
     if state.version != TRANSACTION_VERSION {
         return Err(AppError::Engine("事务状态版本不受支持".to_string()));
     }
@@ -1179,7 +1557,11 @@ fn rollback_transaction(bundle_root: &Path, tx: &Path) -> Result<(), AppError> {
                 .map_err(|error| AppError::Engine(error.to_string()))?;
         }
     }
-    fs::remove_dir_all(tx).ok();
+    if tx.exists() {
+        reject_reparse_chain(tx)?;
+        fs::remove_dir_all(tx)
+            .map_err(|error| AppError::Engine(format!("清理已回滚事务失败: {error}")))?;
+    }
     Ok(())
 }
 
@@ -1270,16 +1652,9 @@ fn recover_pending_transactions(bundle_root: &Path) -> Result<(), AppError> {
             .next()
             .is_none()
     {
-        fs::remove_dir(staging).ok();
-    }
-    Ok(())
-}
-
-fn ensure_no_pending_for_check(bundle_root: &Path) -> Result<(), AppError> {
-    if !pending_transaction_dirs(bundle_root)?.is_empty() {
-        return Err(AppError::Engine(
-            "发现未完成的本地 Codex 更新事务，请重新执行更新以恢复后再检查".to_string(),
-        ));
+        reject_reparse_chain(&staging)?;
+        fs::remove_dir(staging)
+            .map_err(|error| AppError::Engine(format!("清理空事务目录失败: {error}")))?;
     }
     Ok(())
 }
@@ -1311,7 +1686,16 @@ fn collect_files(
         };
         let path = entry.path();
         reject_reparse(&path)?;
-        if name == STAGING_DIR && current_relative.is_empty() {
+        let relative_lower = relative.to_ascii_lowercase();
+        // `apps/Codex` is created and updated after the USB bundle is built;
+        // it is deliberately outside SHA256SUMS just like the transaction
+        // directory. Keep checking its reparse boundary above, but never
+        // mistake its managed runtime files for immutable release files.
+        if relative_lower == STAGING_DIR.to_ascii_lowercase()
+            || relative_lower.starts_with(&(STAGING_DIR.to_ascii_lowercase() + "/"))
+            || relative_lower == "apps/codex"
+            || relative_lower.starts_with("apps/codex/")
+        {
             continue;
         }
         let file_type = entry
@@ -1319,7 +1703,9 @@ fn collect_files(
             .map_err(|error| AppError::Engine(error.to_string()))?;
         if file_type.is_dir() {
             collect_files(root, &relative, out)?;
-        } else if file_type.is_file() && relative != SHA256SUMS_NAME && relative != USB_LICENSE_NAME
+        } else if file_type.is_file()
+            && !relative.eq_ignore_ascii_case(SHA256SUMS_NAME)
+            && !relative.eq_ignore_ascii_case(USB_LICENSE_NAME)
         {
             out.push(path);
         }
@@ -1531,13 +1917,49 @@ fn clear_writer_artifacts(bundle_root: &Path) -> Result<(), AppError> {
 
 pub fn check(ctx: &UpdateContext) -> Result<Option<UpdateInfo>, AppError> {
     require_windows()?;
+    // A previous apply may have been interrupted after a rename. Recover the
+    // durable transaction before observing the version; refusing to check
+    // would strand the user in a state that the next check cannot repair.
+    recover_pending_transactions(&ctx.bundle_root)?;
     let local = require_capability(&ctx.bundle_root)?;
-    ensure_no_pending_for_check(&ctx.bundle_root)?;
+    verify_bundle_integrity(&ctx.bundle_root)?;
+    log::info!(
+        "codex payload update check start architecture={} current={} source={} proxy={}",
+        local.architecture,
+        local.current_version,
+        ctx.settings.codex_payload_source_kind.as_str(),
+        ctx.settings.proxy_mode.as_str()
+    );
     let network = network_from_settings(&ctx.settings);
-    let fresh = resolve_preferred_source(&ctx.settings, &local.architecture, &network)?;
+    let fresh = match resolve_preferred_source(&ctx.settings, &local.architecture, &network) {
+        Ok(fresh) => fresh,
+        Err(error) => {
+            log::error!(
+                "codex payload update check failed stage=metadata architecture={} current={} error={}",
+                local.architecture,
+                local.current_version,
+                error
+            );
+            return Err(error);
+        }
+    };
     if compare_versions(&local.current_version, &fresh.app_version) != std::cmp::Ordering::Less {
+        log::info!(
+            "codex payload update check completed stage=compare result=up-to-date current={} latest={} source={}",
+            local.current_version,
+            fresh.app_version,
+            fresh.identity.source_kind.as_str()
+        );
         return Ok(None);
     }
+    log::info!(
+        "codex payload update available stage=compare current={} latest={} source={} bytes={}",
+        local.current_version,
+        fresh.app_version,
+        fresh.identity.source_kind.as_str(),
+        fresh.msix.size
+    );
+    let payload = codex_update_payload(&ctx.bundle_root, &local, &fresh.identity)?;
     Ok(Some(UpdateInfo {
         channel: ChannelKind::Codex,
         current_version: local.current_version,
@@ -1545,8 +1967,7 @@ pub fn check(ctx: &UpdateContext) -> Result<Option<UpdateInfo>, AppError> {
         release_notes: None,
         size_bytes: Some(fresh.msix.size),
         requires_restart: false,
-        payload: serde_json::to_value(fresh.identity)
-            .map_err(|error| AppError::Engine(format!("序列化 codex identity 失败: {error}")))?,
+        payload,
     }))
 }
 
@@ -1556,19 +1977,37 @@ pub fn apply(
     progress: &dyn Fn(u64, u64),
 ) -> Result<(), AppError> {
     // Security boundary: this must remain the first executable statement.
-    crate::app::usb_guard::require_authorized()?;
+    crate::app::usb_guard::require_signed_codex_bundle("codex-payload-apply")?;
     require_windows()?;
+    log::info!(
+        "codex payload update apply start current={} expected_latest={} expected_source={}",
+        expected.current_version,
+        expected.latest_version,
+        parse_codex_update_payload(&expected.payload)
+            .map(|payload| payload.identity.source_kind.as_str().to_string())
+            .unwrap_or_else(|_| "unknown".to_string())
+    );
     let _operation = CODEX_UPDATE_LOCK
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    recover_pending_transactions(&ctx.bundle_root)?;
-    let _ = require_capability(&ctx.bundle_root)?;
-    let (observed_root, _) = crate::app::usb_guard::authorized_bundle_identity()?;
+    let (observed_root, _) = crate::app::usb_guard::authorized_signed_bundle_identity()?;
     let expected_root =
         fs::canonicalize(&ctx.bundle_root).map_err(|error| AppError::Engine(error.to_string()))?;
     let observed_root =
         fs::canonicalize(observed_root).map_err(|error| AppError::Engine(error.to_string()))?;
     if expected_root != observed_root {
+        return Err(AppError::StaleExpectation(
+            "授权 U 盘已变化，请重新检查后再确认。".to_string(),
+        ));
+    }
+    recover_pending_transactions(&ctx.bundle_root)?;
+    // Re-observe after recovery as well. Recovery is the first mutating
+    // operation and a drive removal/reuse during it must not be followed by
+    // capability reads or a network-backed swap.
+    let (post_recovery_root, _) = crate::app::usb_guard::authorized_signed_bundle_identity()?;
+    let post_recovery_root = fs::canonicalize(post_recovery_root)
+        .map_err(|error| AppError::Engine(error.to_string()))?;
+    if expected_root != post_recovery_root {
         return Err(AppError::StaleExpectation(
             "授权 U 盘已变化，请重新检查后再确认。".to_string(),
         ));
@@ -1579,10 +2018,13 @@ pub fn apply(
         ));
     }
     let local = require_capability(&ctx.bundle_root)?;
-    let expected_identity: CodexPayloadIdentity = serde_json::from_value(expected.payload.clone())
-        .map_err(|error| {
-            AppError::StaleExpectation(format!("更新确认对象无效，请重新检查：{error}"))
-        })?;
+    verify_bundle_integrity(&ctx.bundle_root)?;
+    let expected_payload = parse_codex_update_payload(&expected.payload)?;
+    let expected_identity = expected_payload.identity;
+    let expected_snapshot = expected_payload.local_snapshot.ok_or_else(|| {
+        AppError::StaleExpectation("更新确认缺少本地 USB 快照，请重新检查后再确认。".to_string())
+    })?;
+    require_local_snapshot(&ctx.bundle_root, &local, &expected_snapshot)?;
     if !source_matches_settings(&ctx.settings, &expected_identity)?
         || expected.current_version != local.current_version
     {
@@ -1591,11 +2033,18 @@ pub fn apply(
         ));
     }
     let network = network_from_settings(&ctx.settings);
-    let fresh = resolve_source(
+    let mut resolver = |settings: &AppSettings,
+                        architecture: &str,
+                        network: &NetworkConfig,
+                        source_kind: CodexPayloadSourceKind| {
+        resolve_source(settings, architecture, network, source_kind)
+    };
+    let fresh = resolve_source_with_retry(
         &ctx.settings,
         &local.architecture,
         &network,
         expected_identity.source_kind,
+        &mut resolver,
     )?;
     if !same_identity(&expected_identity, &fresh.identity)
         || fresh.app_version != expected.latest_version
@@ -1607,12 +2056,23 @@ pub fn apply(
     require_newer_version(&local.current_version, &fresh.app_version)?;
     require_https_url(&fresh.msix.url, "MSIX 下载地址")?;
     require_https_url(&fresh.checksums.url, "SHA256SUMS 下载地址")?;
-    let tx = ctx
-        .bundle_root
-        .join(STAGING_DIR)
-        .join(format!("{TRANSACTION_PREFIX}{}", uuid::Uuid::new_v4()));
-    fs::create_dir_all(tx.join("old")).map_err(|error| AppError::Engine(error.to_string()))?;
-    fs::create_dir_all(tx.join("next")).map_err(|error| AppError::Engine(error.to_string()))?;
+    reject_reparse_chain(&ctx.bundle_root)?;
+    let staging = ctx.bundle_root.join(STAGING_DIR);
+    if staging.exists() {
+        reject_reparse(&staging)?;
+        if !staging.is_dir() {
+            return Err(AppError::Engine("U 盘事务路径不是目录".to_string()));
+        }
+    } else {
+        fs::create_dir(&staging)
+            .map_err(|error| AppError::Engine(format!("创建事务目录失败: {error}")))?;
+        reject_reparse(&staging)?;
+    }
+    let tx = staging.join(format!("{TRANSACTION_PREFIX}{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&tx).map_err(|error| AppError::Engine(error.to_string()))?;
+    reject_reparse_chain(&tx)?;
+    fs::create_dir(tx.join("old")).map_err(|error| AppError::Engine(error.to_string()))?;
+    fs::create_dir(tx.join("next")).map_err(|error| AppError::Engine(error.to_string()))?;
     if let Err(error) = snapshot_metadata(&ctx.bundle_root, &tx)
         .and_then(|()| write_transaction_state(&tx, "prepared"))
     {
@@ -1629,6 +2089,15 @@ pub fn apply(
         &network,
     );
     if let Err(error) = result {
+        log::error!(
+            "codex payload update failed stage=download-verify-commit current={} expected_latest={} error={}",
+            expected.current_version,
+            expected.latest_version,
+            error
+        );
+        if matches!(error, AppError::Committed(_)) {
+            return Err(error);
+        }
         let rollback = rollback_transaction(&ctx.bundle_root, &tx);
         return match rollback {
             Ok(()) => Err(error),
@@ -1637,6 +2106,11 @@ pub fn apply(
             ))),
         };
     }
+    log::info!(
+        "codex payload update completed stage=commit current={} latest={}",
+        expected.current_version,
+        expected.latest_version
+    );
     Ok(())
 }
 
@@ -1649,7 +2123,9 @@ fn apply_transaction(
     progress: &dyn Fn(u64, u64),
     network: &NetworkConfig,
 ) -> Result<(), AppError> {
-    let allow_redirects = fresh.identity.source_kind == CodexPayloadSourceKind::Github;
+    let allow_redirects = fresh.identity.source_kind == CodexPayloadSourceKind::Github
+        || (fresh.identity.source_kind == CodexPayloadSourceKind::Mirror
+            && is_builtin_codex_mirror_base(&fresh.identity.source_locator));
     let transport = production_apply_transport(network, allow_redirects);
     apply_transaction_with_transport(root, tx, local, fresh, expected, progress, &transport)
 }
@@ -1720,7 +2196,23 @@ fn apply_transaction_with_transport(
     transport: &ApplyTransport,
 ) -> Result<(), AppError> {
     let staged = tx.join(format!("codex-{}.Msix", fresh.identity.msix_version));
+    reject_reparse_chain(tx)?;
+    if staged.exists() {
+        reject_reparse(&staged)?;
+        return Err(AppError::Engine(
+            "事务目录中已存在 staged payload，拒绝覆盖".to_string(),
+        ));
+    }
     let total = fresh.msix.size;
+    log::info!(
+        "codex payload update stage=download start source={} host={} bytes={}",
+        fresh.identity.source_kind.as_str(),
+        Url::parse(&fresh.msix.url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_string))
+            .unwrap_or_else(|| "unknown".to_string()),
+        total
+    );
     let progress_adapter = |done: u64| progress(done, total);
     (transport.download)(
         &fresh.msix.url,
@@ -1729,6 +2221,7 @@ fn apply_transaction_with_transport(
         &progress_adapter,
     )
     .map_err(|error| AppError::Engine(format!("下载 MSIX 失败: {error}")))?;
+    reject_reparse_chain(&staged)?;
     let actual_size = fs::metadata(&staged)
         .map_err(|error| AppError::Engine(format!("读取 staged MSIX 大小失败: {error}")))?
         .len();
@@ -1741,6 +2234,7 @@ fn apply_transaction_with_transport(
             fresh.msix.size
         )));
     }
+    log::info!("codex payload update stage=download completed bytes={actual_size}");
     let checksums_text = (transport.fetch_text)(&fresh.checksums.url)
         .map_err(|error| AppError::Engine(format!("获取 SHA256SUMS 失败: {error}")))?;
     if fresh.checksums.size > 0 && checksums_text.len() as u64 != fresh.checksums.size {
@@ -1772,6 +2266,11 @@ fn apply_transaction_with_transport(
             "MSIX SHA256 不匹配：期望 {expected_sha}，实际 {actual_sha}"
         )));
     }
+    log::info!(
+        "codex payload update stage=checksum verified sha256={} source={}",
+        actual_sha,
+        fresh.identity.source_kind.as_str()
+    );
     if let Some(digest) = &fresh.identity.github_digest {
         if !actual_sha.eq_ignore_ascii_case(digest) {
             return Err(AppError::Engine(
@@ -1799,6 +2298,12 @@ fn apply_transaction_with_transport(
             "MSIX package moniker 与 release manifest 不一致".to_string(),
         ));
     }
+
+    log::info!(
+        "codex payload update stage=authenticode-identity verified package={} version={}",
+        signed_moniker,
+        fresh.identity.msix_version
+    );
 
     commit_staged_payload(StagedCommit {
         root,
@@ -1833,6 +2338,10 @@ fn commit_staged_payload(input: StagedCommit<'_>) -> Result<(), AppError> {
     let usb_manifest_path = root.join(USB_MANIFEST_NAME);
     let sums_path = root.join(SHA256SUMS_NAME);
     let latest_local = require_capability(root)?;
+    verify_bundle_integrity(root)?;
+    if let Some(expected_snapshot) = parse_codex_update_payload(&expected.payload)?.local_snapshot {
+        require_local_snapshot(root, &latest_local, &expected_snapshot)?;
+    }
     if latest_local.current_version != expected.current_version
         || latest_local.payload_relative != local.payload_relative
         || latest_local.architecture != local.architecture
@@ -1866,8 +2375,29 @@ fn commit_staged_payload(input: StagedCommit<'_>) -> Result<(), AppError> {
     } else {
         reject_reparse_chain(backup_dir.parent().unwrap_or(root))?;
     }
+    reject_reparse_chain(tx)?;
+    // The authorization snapshot must be re-observed before any transaction
+    // directory mutation or backup move.  The later check immediately before
+    // replacing the live payload remains necessary because the preparation
+    // work itself can take long enough for the removable volume to change.
+    if let Some(authorization) =
+        crate::app::usb_guard::require_signed_codex_bundle("codex-payload-precommit")?
+    {
+        let expected_root = fs::canonicalize(root)
+            .map_err(|error| AppError::Engine(format!("解析 Codex bundle 根目录失败：{error}")))?;
+        let authorized_root = fs::canonicalize(authorization.bundle_root).map_err(|error| {
+            AppError::Engine(format!("解析授权 USB bundle 根目录失败：{error}"))
+        })?;
+        if expected_root != authorized_root {
+            return Err(AppError::StaleExpectation(
+                "授权 U 盘在 payload 提交前发生变化，请重新检查后再试。".to_string(),
+            ));
+        }
+    }
     fs::create_dir_all(tx.join("backup-dir").join("payload-backup"))
         .map_err(|error| AppError::Engine(error.to_string()))?;
+    reject_reparse_chain(&tx.join("backup-dir"))?;
+    reject_reparse_chain(&tx.join("backup-dir").join("payload-backup"))?;
     if backup_dir.exists() {
         for entry in
             fs::read_dir(&backup_dir).map_err(|error| AppError::Engine(error.to_string()))?
@@ -1891,6 +2421,7 @@ fn commit_staged_payload(input: StagedCommit<'_>) -> Result<(), AppError> {
         }
     } else {
         fs::create_dir_all(&backup_dir).map_err(|error| AppError::Engine(error.to_string()))?;
+        reject_reparse_chain(&backup_dir)?;
     }
     let old_version = latest_local
         .manifest
@@ -1903,6 +2434,23 @@ fn commit_staged_payload(input: StagedCommit<'_>) -> Result<(), AppError> {
         latest_local.architecture,
         sanitize_version(old_version)
     ));
+    // Re-observe immediately before the first destructive rename. The earlier
+    // check protects the read/verify phase; this one closes the final
+    // drive-letter/replacement window after download and metadata preparation.
+    if let Some(authorization) =
+        crate::app::usb_guard::require_signed_codex_bundle("codex-payload-precommit")?
+    {
+        let expected_root = fs::canonicalize(root)
+            .map_err(|error| AppError::Engine(format!("解析 Codex bundle 根目录失败：{error}")))?;
+        let authorized_root = fs::canonicalize(authorization.bundle_root).map_err(|error| {
+            AppError::Engine(format!("解析授权 USB bundle 根目录失败：{error}"))
+        })?;
+        if expected_root != authorized_root {
+            return Err(AppError::StaleExpectation(
+                "授权 U 盘在 payload 提交前发生变化，请重新检查后再试。".to_string(),
+            ));
+        }
+    }
     fs::rename(&latest_local.payload_path, &backup_path)
         .map_err(|error| AppError::Engine(format!("备份旧 MSIX 失败: {error}")))?;
     write_transaction_state(tx, "payload-backup")?;
@@ -1947,7 +2495,9 @@ fn commit_staged_payload(input: StagedCommit<'_>) -> Result<(), AppError> {
     write_transaction_state(tx, "committed")?;
     verify_sha256_sums(root, &next_sums, &BTreeMap::new())?;
     verify_metadata_values(root, actual_sha, payload_size)?;
-    fs::remove_dir_all(tx).map_err(|error| AppError::Engine(error.to_string()))?;
+    fs::remove_dir_all(tx).map_err(|error| {
+        AppError::Committed(format!("无法清理已提交事务目录 {}：{error}", tx.display()))
+    })?;
     let staging = root.join(STAGING_DIR);
     if staging.exists()
         && fs::read_dir(&staging)
@@ -1955,7 +2505,13 @@ fn commit_staged_payload(input: StagedCommit<'_>) -> Result<(), AppError> {
             .next()
             .is_none()
     {
-        fs::remove_dir(staging).ok();
+        reject_reparse_chain(&staging)?;
+        if let Err(error) = fs::remove_dir(&staging) {
+            return Err(AppError::Committed(format!(
+                "无法删除空事务目录 {}：{error}",
+                staging.display()
+            )));
+        }
     }
     progress(payload_size, total);
     Ok(())
@@ -2023,7 +2579,8 @@ mod tests {
             serde_json::to_vec_pretty(&usb).unwrap(),
         )
         .unwrap();
-        fs::write(root.join(SHA256SUMS_NAME), b"").unwrap();
+        let sums = build_sha256_sums(&root, &BTreeMap::new()).unwrap();
+        fs::write(root.join(SHA256SUMS_NAME), sums).unwrap();
         root
     }
 
@@ -2071,6 +2628,21 @@ mod tests {
     }
 
     #[test]
+    fn default_mirror_uses_builtin_relay_for_fallback() {
+        let settings = AppSettings::default();
+        assert_eq!(relay_base_url_for(&settings), LEGACY_CODEX_PAYLOAD_BASE_URL);
+
+        let custom = AppSettings {
+            codex_payload_base_url: "https://relay.example.test/codex/".to_string(),
+            ..settings
+        };
+        assert_eq!(
+            relay_base_url_for(&custom),
+            "https://relay.example.test/codex/"
+        );
+    }
+
+    #[test]
     fn relative_paths_are_confined() {
         assert_eq!(
             normalize_relative_path("payload/OpenAI.Codex_x64.msix").unwrap(),
@@ -2090,12 +2662,19 @@ mod tests {
         fs::write(root.join(USB_LICENSE_NAME), b"mutable").unwrap();
         fs::create_dir_all(root.join(STAGING_DIR)).unwrap();
         fs::write(root.join(STAGING_DIR).join("ignored"), b"ignored").unwrap();
+        fs::create_dir_all(root.join("apps").join("Codex")).unwrap();
+        fs::write(
+            root.join("apps").join("Codex").join("installed.exe"),
+            b"runtime",
+        )
+        .unwrap();
         let sums = build_sha256_sums(&root, &BTreeMap::new()).unwrap();
         let text = String::from_utf8(sums).unwrap();
         assert!(text.contains("a.txt"));
         assert!(text.contains("b.txt"));
         assert!(!text.contains(USB_LICENSE_NAME));
         assert!(!text.contains(STAGING_DIR));
+        assert!(!text.contains("apps/Codex"));
         assert!(text.find("a.txt") < text.find("b.txt"));
         let _ = fs::remove_dir_all(root);
     }
@@ -2156,6 +2735,23 @@ mod tests {
         let root = v2_fixture();
         fs::write(root.join("payload/OpenAI.Codex_x64.msix"), b"tampered").unwrap();
         assert!(require_capability(&root).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_snapshot_rejects_a_coordinated_manifest_change() {
+        let root = v2_fixture();
+        let local = require_capability(&root).unwrap();
+        let snapshot = local_bundle_snapshot(&root, &local).unwrap();
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join(ROOT_MANIFEST_NAME)).unwrap()).unwrap();
+        manifest["unrelated"] = serde_json::json!({"changed": true});
+        fs::write(
+            root.join(ROOT_MANIFEST_NAME),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        assert!(require_local_snapshot(&root, &local, &snapshot).is_err());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2359,7 +2955,8 @@ mod tests {
         }
     }
 
-    fn fake_update_info() -> UpdateInfo {
+    fn fake_update_info(root: &Path, local: &LocalBundle) -> UpdateInfo {
+        let release = fake_resolved_release();
         UpdateInfo {
             channel: ChannelKind::Codex,
             current_version: "1.0.0".into(),
@@ -2367,7 +2964,7 @@ mod tests {
             release_notes: None,
             size_bytes: None,
             requires_restart: false,
-            payload: serde_json::json!({}),
+            payload: codex_update_payload(root, local, &release.identity).unwrap(),
         }
     }
 
@@ -2418,7 +3015,12 @@ mod tests {
         let current = require_capability(root).unwrap();
         assert_eq!(current.current_version, "1.0.0");
         assert_eq!(fs::read(&current.payload_path).unwrap(), b"old payload");
-        assert_eq!(fs::read(root.join(SHA256SUMS_NAME)).unwrap(), b"");
+        verify_sha256_sums(
+            root,
+            &fs::read(root.join(SHA256SUMS_NAME)).unwrap(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
     }
 
     fn release_json(
@@ -2472,6 +3074,96 @@ mod tests {
         .to_string()
     }
 
+    fn mirror_manifest_json(architecture: &str) -> String {
+        let moniker = format!("OpenAI.Codex_2.0.0.0_{architecture}__2p2nqsd0c76g0");
+        let mut architectures = serde_json::Map::new();
+        architectures.insert(
+            architecture.to_string(),
+            serde_json::json!({
+                "architecture": architecture,
+                "version": "2.0.0.0",
+                "appVersion": "2.0.0",
+                "packageMoniker": moniker.clone(),
+                "contentLength": 123,
+                "downloadable": true
+            }),
+        );
+        serde_json::json!({
+            "schemaVersion": 5,
+            "codexVersion": "2.0.0",
+            "sources": {
+                "windows": {
+                    "architecture": architecture,
+                    "version": "2.0.0.0",
+                    "appVersion": "2.0.0",
+                    "packageMoniker": moniker,
+                    "architectures": architectures
+                }
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn resolve_mirror_latest_uses_manifest_checksums_and_architecture_aliases() {
+        let base = DEFAULT_CODEX_PAYLOAD_BASE_URL;
+        let manifest = mirror_manifest_json("x64");
+        let package_moniker = "OpenAI.Codex_2.0.0.0_x64__2p2nqsd0c76g0";
+        let checksums = format!("{}  {package_moniker}.Msix\n", "a".repeat(64));
+        let fetched = |url: &str| {
+            if url.ends_with("latest/manifest") {
+                Ok(manifest.clone())
+            } else if url.ends_with("latest/checksums") {
+                Ok(checksums.clone())
+            } else {
+                Err(AppError::Engine(format!("unexpected URL: {url}")))
+            }
+        };
+        let resolved = resolve_mirror_latest(&fetched, base, "x64").unwrap();
+        assert_eq!(
+            resolved.identity.source_kind,
+            CodexPayloadSourceKind::Mirror
+        );
+        assert_eq!(resolved.identity.app_version, "2.0.0");
+        assert_eq!(resolved.identity.package_moniker, package_moniker);
+        assert_eq!(resolved.msix.size, 123);
+        assert!(resolved.msix.url.ends_with("/latest/win-x64"));
+        assert!(resolved.checksums.url.ends_with("/latest/checksums"));
+        assert_eq!(resolved.msix.expected_sha256, Some("a".repeat(64)));
+    }
+
+    #[test]
+    fn source_metadata_retry_retries_only_transient_transport_failures() {
+        let settings = AppSettings::default();
+        let network = NetworkConfig::direct();
+        let attempts = std::cell::Cell::new(0);
+        let mut resolver = |_: &AppSettings,
+                            _: &str,
+                            _: &NetworkConfig,
+                            _: CodexPayloadSourceKind| {
+            let attempt = attempts.get() + 1;
+            attempts.set(attempt);
+            if attempt == 1 {
+                Err(AppError::Engine(
+                    "curl failed for host=codexapp.agentsmirror.com exit=7: stderr='Failed to connect'"
+                        .to_string(),
+                ))
+            } else {
+                Ok(fake_resolved_release())
+            }
+        };
+        let resolved = resolve_source_with_retry(
+            &settings,
+            "x64",
+            &network,
+            CodexPayloadSourceKind::Mirror,
+            &mut resolver,
+        )
+        .unwrap();
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(resolved.app_version, "2.0.0");
+    }
+
     #[test]
     fn resolve_latest_accepts_valid_manifest_without_network() {
         let release = release_json(
@@ -2493,7 +3185,7 @@ mod tests {
 
     #[test]
     fn resolve_relay_latest_validates_descriptor_and_derives_same_origin_assets() {
-        let base = DEFAULT_CODEX_PAYLOAD_BASE_URL;
+        let base = "https://update.404token.xyz/__codex_update__/";
         let manifest = release_manifest_json("x64");
         let checksums = b"test checksum file";
         let descriptor = serde_json::json!({
@@ -2548,14 +3240,19 @@ mod tests {
 
     #[test]
     fn auto_source_falls_back_to_github_without_mixing_identity() {
-        let mut settings = AppSettings::default();
-        settings.codex_payload_source_kind = CodexPayloadSourceKind::Auto;
+        let settings = AppSettings {
+            codex_payload_source_kind: CodexPayloadSourceKind::Auto,
+            ..AppSettings::default()
+        };
         let network = NetworkConfig::direct();
         let mut attempts = Vec::new();
         let resolved =
             resolve_preferred_source_with(&settings, "x64", &network, |_, _, _, source_kind| {
                 attempts.push(source_kind);
                 match source_kind {
+                    CodexPayloadSourceKind::Mirror => {
+                        Err(AppError::Engine("mirror unavailable".to_string()))
+                    }
                     CodexPayloadSourceKind::Relay => {
                         Err(AppError::Engine("relay unavailable".to_string()))
                     }
@@ -2569,6 +3266,7 @@ mod tests {
         assert_eq!(
             attempts,
             vec![
+                CodexPayloadSourceKind::Mirror,
                 CodexPayloadSourceKind::Relay,
                 CodexPayloadSourceKind::Github
             ]
@@ -2721,7 +3419,7 @@ mod tests {
             &tx,
             &local,
             &release,
-            &fake_update_info(),
+            &fake_update_info(&root, &local),
             &|done, total| progress_events.borrow_mut().push((done, total)),
             &transport,
         )
@@ -2754,7 +3452,7 @@ mod tests {
             &tx,
             &local,
             &release,
-            &fake_update_info(),
+            &fake_update_info(&root, &local),
             &|_, _| {},
             &fake_transport(
                 Err("offline".into()),
@@ -2789,7 +3487,7 @@ mod tests {
                 &tx,
                 &local,
                 &release,
-                &fake_update_info(),
+                &fake_update_info(&root, &local),
                 &|_, _| {},
                 &fake_transport(download, checksums, Ok(()), Ok(fake_identity())),
             );
@@ -2820,7 +3518,7 @@ mod tests {
                 &tx,
                 &local,
                 &release,
-                &fake_update_info(),
+                &fake_update_info(&root, &local),
                 &|_, _| {},
                 &fake_transport(
                     Ok(payload.clone()),
@@ -2858,7 +3556,7 @@ mod tests {
                 &tx,
                 &local,
                 &release,
-                &fake_update_info(),
+                &fake_update_info(&root, &local),
                 &|_, _| {},
                 &fake_transport(Ok(payload), Ok(checksums), authenticode, identity),
             );
@@ -2881,7 +3579,7 @@ mod tests {
         let payload = b"new committed payload";
         fs::write(&staged, payload).unwrap();
         let release = fake_resolved_release();
-        let expected = fake_update_info();
+        let expected = fake_update_info(&root, &local);
         let payload_sha = sha256_bytes(payload);
         let progress_events = std::cell::RefCell::new(Vec::new());
 
@@ -2926,7 +3624,7 @@ mod tests {
         let staged = tx.join("codex-new.Msix");
         fs::write(&staged, b"new but rolled back payload").unwrap();
         let release = fake_resolved_release();
-        let expected = fake_update_info();
+        let expected = fake_update_info(&root, &local);
         let payload_sha = sha256_file(&staged).unwrap();
 
         let result = commit_staged_payload(StagedCommit {
@@ -2946,7 +3644,12 @@ mod tests {
         let current = require_capability(&root).unwrap();
         assert_eq!(current.current_version, "1.0.0");
         assert_eq!(fs::read(&current.payload_path).unwrap(), b"old payload");
-        assert_eq!(fs::read(root.join(SHA256SUMS_NAME)).unwrap(), b"");
+        verify_sha256_sums(
+            &root,
+            &fs::read(root.join(SHA256SUMS_NAME)).unwrap(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
         assert!(!tx.exists());
         let _ = fs::remove_dir_all(root);
     }

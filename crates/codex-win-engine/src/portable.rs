@@ -355,6 +355,100 @@ fn extract_msix(msix_path: &Path, dest: &Path) -> Result<String, EngineError> {
 /// Post-merge packages keep a legacy `Codex.exe` next to the real entrypoint,
 /// so `ChatGPT.exe` must win when the manifest can't tell us (it normally can).
 const APP_EXE_CANDIDATES: [&str; 2] = ["ChatGPT.exe", "Codex.exe"];
+const PORTABLE_SHELL_OWNERSHIP_SCHEMA: u32 = 1;
+const PORTABLE_SHELL_OWNERSHIP_PRODUCT: &str = "codex-app-manager";
+const PORTABLE_SHELL_OWNERSHIP_FILE: &str = "portable-shell-ownership.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PortableShellOwnership {
+    schema_version: u32,
+    product: String,
+    #[serde(default)]
+    install_roots: Vec<String>,
+    #[serde(default)]
+    shortcut_paths: Vec<String>,
+}
+
+fn portable_shell_ownership_path() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(|local| {
+        PathBuf::from(local)
+            .join("io.github.wangnov.codexappmanager")
+            .join(PORTABLE_SHELL_OWNERSHIP_FILE)
+    })
+}
+
+fn record_portable_shell_ownership(
+    install_root: &Path,
+    shortcut: &Path,
+) -> Result<(), EngineError> {
+    validate_cleanup_path(install_root)?;
+    validate_cleanup_path(shortcut)?;
+    let path = portable_shell_ownership_path()
+        .ok_or_else(|| EngineError::Install("LOCALAPPDATA is unavailable".to_string()))?;
+    let parent = path.parent().ok_or_else(|| {
+        EngineError::Install("portable shell ownership has no parent".to_string())
+    })?;
+    validate_cleanup_path(parent)?;
+    fs::create_dir_all(parent)
+        .map_err(|error| io_err("create shell ownership directory", error))?;
+    validate_cleanup_path(&path)?;
+
+    let mut record = if path.is_file() {
+        let bytes = fs::read(&path).map_err(|error| io_err("read shell ownership", error))?;
+        if bytes.len() > 64 * 1024 {
+            return Err(EngineError::Install(
+                "portable shell ownership record is too large".to_string(),
+            ));
+        }
+        serde_json::from_slice::<PortableShellOwnership>(&bytes).map_err(|error| {
+            EngineError::Install(format!("invalid shell ownership record: {error}"))
+        })?
+    } else if path.exists() {
+        return Err(EngineError::Install(
+            "portable shell ownership record is not a regular file".to_string(),
+        ));
+    } else {
+        PortableShellOwnership {
+            schema_version: PORTABLE_SHELL_OWNERSHIP_SCHEMA,
+            product: PORTABLE_SHELL_OWNERSHIP_PRODUCT.to_string(),
+            install_roots: Vec::new(),
+            shortcut_paths: Vec::new(),
+        }
+    };
+    if record.schema_version != PORTABLE_SHELL_OWNERSHIP_SCHEMA
+        || record.product != PORTABLE_SHELL_OWNERSHIP_PRODUCT
+    {
+        return Err(EngineError::Install(
+            "portable shell ownership record identity does not match".to_string(),
+        ));
+    }
+    let root = install_root.to_string_lossy().into_owned();
+    if !record
+        .install_roots
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(&root))
+    {
+        record.install_roots.push(root);
+    }
+    let shortcut = shortcut.to_string_lossy().into_owned();
+    if !record
+        .shortcut_paths
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(&shortcut))
+    {
+        record.shortcut_paths.push(shortcut);
+    }
+    record
+        .install_roots
+        .sort_by_key(|value| value.to_ascii_lowercase());
+    record
+        .shortcut_paths
+        .sort_by_key(|value| value.to_ascii_lowercase());
+    let bytes = serde_json::to_vec_pretty(&record)
+        .map_err(|error| EngineError::Install(format!("serialize shell ownership: {error}")))?;
+    fs::write(path, bytes).map_err(|error| io_err("write shell ownership", error))
+}
 
 fn find_exe_named(root: &Path, name: &str) -> Result<Option<PathBuf>, EngineError> {
     let mut stack = vec![root.to_path_buf()];
@@ -465,7 +559,7 @@ fn prepare_portable_payload(
     })
 }
 
-#[cfg(all(windows, not(test)))]
+#[cfg(windows)]
 fn ps_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
@@ -517,6 +611,41 @@ pub fn codex_running_for_root(root: &Path) -> Result<bool, EngineError> {
     crate::windows_process::codex_processes_running_for_root(root)
 }
 
+#[cfg(windows)]
+fn create_start_menu_shortcut_script(install_root: &Path, shortcut: &Path, exe: &Path) -> String {
+    format!(
+        r#"
+$shell = New-Object -ComObject WScript.Shell
+$shortcut = $shell.CreateShortcut({shortcut})
+$shortcut.TargetPath = {target}
+$shortcut.WorkingDirectory = {workdir}
+$shortcut.IconLocation = {icon}
+$shortcut.Description = 'codex-app-manager:managed-portable'
+$shortcut.Save()
+$acl = Get-Acl -LiteralPath {shortcut}
+$accounts = New-Object System.Collections.Generic.List[string]
+try {{
+  $accounts.Add(([Security.Principal.WindowsIdentity]::GetCurrent().User.Translate([Security.Principal.NTAccount]).Value))
+}} catch {{ }}
+if ($env:USERDOMAIN -and $env:USERNAME) {{
+  try {{
+    $accounts.Add((New-Object -TypeName System.Security.Principal.NTAccount -ArgumentList @($env:USERDOMAIN, $env:USERNAME)).Value)
+  }} catch {{ }}
+}}
+if ($accounts.Count -eq 0) {{ throw '无法确定快捷方式所属用户' }}
+foreach ($account in @($accounts | Select-Object -Unique)) {{
+  $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($account, 'FullControl', 'Allow')
+  $acl.SetAccessRule($rule)
+}}
+Set-Acl -LiteralPath {shortcut} -AclObject $acl
+"#,
+        shortcut = ps_quote(&shortcut.to_string_lossy()),
+        target = ps_quote(&exe.to_string_lossy()),
+        workdir = ps_quote(&install_root.to_string_lossy()),
+        icon = ps_quote(&format!("{},0", exe.to_string_lossy()))
+    )
+}
+
 #[cfg(all(windows, not(test)))]
 fn create_start_menu_shortcut(install_root: &Path) -> Result<bool, EngineError> {
     let Some(exe) = installed_app_exe(install_root) else {
@@ -531,21 +660,8 @@ fn create_start_menu_shortcut(install_root: &Path) -> Result<bool, EngineError> 
         .join("Start Menu")
         .join("Programs")
         .join("Codex.lnk");
-    let script = format!(
-        r#"
-$shell = New-Object -ComObject WScript.Shell
-$shortcut = $shell.CreateShortcut({shortcut})
-$shortcut.TargetPath = {target}
-$shortcut.WorkingDirectory = {workdir}
-$shortcut.IconLocation = {icon}
-$shortcut.Description = 'codex-app-manager:managed-portable'
-$shortcut.Save()
-"#,
-        shortcut = ps_quote(&shortcut.to_string_lossy()),
-        target = ps_quote(&exe.to_string_lossy()),
-        workdir = ps_quote(&install_root.to_string_lossy()),
-        icon = ps_quote(&format!("{},0", exe.to_string_lossy()))
-    );
+    let script = create_start_menu_shortcut_script(install_root, &shortcut, &exe);
+    record_portable_shell_ownership(install_root, &shortcut)?;
     run_powershell(&script)?;
     Ok(true)
 }
@@ -553,6 +669,14 @@ $shortcut.Save()
 #[cfg(any(not(windows), test))]
 fn create_start_menu_shortcut(_install_root: &Path) -> Result<bool, EngineError> {
     Ok(false)
+}
+
+#[cfg(windows)]
+fn portable_uninstall_script(install_root: &Path) -> String {
+    format!(
+        r#"$root = '{root}'; $rootFull = ([IO.Path]::GetFullPath($root)).TrimEnd('\') + '\'; $locations = @(); if ($env:APPDATA) {{ $locations += (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'); $locations += (Join-Path $env:APPDATA 'Microsoft\Windows\Desktop') }}; if ($env:USERPROFILE) {{ $locations += (Join-Path $env:USERPROFILE 'Desktop') }}; if ($env:ProgramData) {{ $locations += (Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs'); $locations += (Join-Path $env:ProgramData 'Microsoft\Windows\Desktop') }}; if ($env:PUBLIC) {{ $locations += (Join-Path $env:PUBLIC 'Desktop') }}; $names = @('Codex.lnk','ChatGPT.lnk','CCSwitch.lnk','Codex Switch.lnk','OpenAI Codex.lnk'); foreach ($location in $locations) {{ foreach ($name in $names) {{ $shortcutPath = Join-Path $location $name; if (Test-Path -LiteralPath $shortcutPath -PathType Leaf) {{ try {{ $link = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcutPath); $target = [IO.Path]::GetFullPath([string]$link.TargetPath); if ($target.StartsWith($rootFull, [StringComparison]::OrdinalIgnoreCase)) {{ Remove-Item -LiteralPath $shortcutPath -Force -ErrorAction SilentlyContinue }} }} catch {{ }} }} }} }}; if ($env:LOCALAPPDATA) {{ Remove-Item -LiteralPath (Join-Path $env:LOCALAPPDATA 'io.github.wangnov.codexappmanager\portable-shell-ownership.json') -Force -ErrorAction SilentlyContinue }}; Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue; Remove-Item -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Codex' -Recurse -Force -ErrorAction SilentlyContinue"#,
+        root = install_root.to_string_lossy().replace('\'', "''")
+    )
 }
 
 #[cfg(all(windows, not(test)))]
@@ -563,10 +687,7 @@ fn register_uninstall_entry(
 ) -> Result<bool, EngineError> {
     // Icon only — the entry works without one, so fall back to the legacy name.
     let exe = installed_app_exe(install_root).unwrap_or_else(|| install_root.join("Codex.exe"));
-    let uninstall_script = format!(
-        "if ($env:APPDATA) {{ $Shortcut = Join-Path $env:APPDATA 'Microsoft\\Windows\\Start Menu\\Programs\\Codex.lnk'; Remove-Item -LiteralPath $Shortcut -Force -ErrorAction SilentlyContinue }}; Remove-Item -LiteralPath '{}' -Recurse -Force -ErrorAction SilentlyContinue; Remove-Item -LiteralPath 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Codex' -Recurse -Force -ErrorAction SilentlyContinue",
-        install_root.to_string_lossy().replace('\'', "''")
-    );
+    let uninstall_script = portable_uninstall_script(install_root);
     // Wrap the script in DOUBLE quotes, not single, so Windows' uninstall entry
     // actually RUNS it: `-Command '<script>'` makes PowerShell evaluate the text
     // as one string literal and echo it back; `-Command "<script>"` executes it.
@@ -631,7 +752,120 @@ if ($env:APPDATA) { $Shortcut = Join-Path $env:APPDATA 'Microsoft\Windows\Start 
   if ($entry.DisplayName -eq 'Codex' -and $entry.Publisher -eq 'OpenAI' -and [string]$entry.UninstallString -ceq $expected) { return $entry }
   return $null
 }
+function Get-PortableShellOwnership {
+  if (-not $env:LOCALAPPDATA) { return $null }
+  $path = Join-Path $env:LOCALAPPDATA 'io.github.wangnov.codexappmanager\portable-shell-ownership.json'
+  if (-not (Test-Path -LiteralPath $path -PathType Leaf -ErrorAction Stop)) { return $null }
+  try {
+    $record = Get-Content -LiteralPath $path -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json
+    if ([int]$record.schemaVersion -eq 1 -and [string]$record.product -eq 'codex-app-manager') { return $record }
+  } catch { }
+  return $null
+}
+function Get-PortableShellLocations {
+  $locations = New-Object System.Collections.Generic.List[string]
+  if ($env:APPDATA) {
+    $locations.Add((Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'))
+    $locations.Add((Join-Path $env:APPDATA 'Microsoft\Windows\Desktop'))
+  }
+  if ($env:USERPROFILE) { $locations.Add((Join-Path $env:USERPROFILE 'Desktop')) }
+  if ($env:ProgramData) {
+    $locations.Add((Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs'))
+    $locations.Add((Join-Path $env:ProgramData 'Microsoft\Windows\Desktop'))
+  }
+  if ($env:PUBLIC) { $locations.Add((Join-Path $env:PUBLIC 'Desktop')) }
+  return @($locations | Select-Object -Unique)
+}
+function Normalize-PortablePath([string]$value) {
+  if ([string]::IsNullOrWhiteSpace($value)) { return $null }
+  try { return [IO.Path]::GetFullPath($value).TrimEnd('\') } catch { return $null }
+}
+function Test-PortablePathUnderRoot([string]$child, [string]$root) {
+  $childFull = Normalize-PortablePath $child
+  $rootFull = Normalize-PortablePath $root
+  if (-not $childFull -or -not $rootFull) { return $false }
+  return $childFull.StartsWith(($rootFull + '\'), [StringComparison]::OrdinalIgnoreCase) -or
+    $childFull.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase)
+}
+function Get-PortableShortcutCandidates {
+  $locations = @(Get-PortableShellLocations)
+  $names = @('Codex.lnk','ChatGPT.lnk','CCSwitch.lnk','Codex Switch.lnk','OpenAI Codex.lnk')
+  $candidates = New-Object System.Collections.Generic.List[string]
+  foreach ($location in $locations) {
+    foreach ($name in $names) {
+      $candidates.Add((Join-Path $location $name))
+    }
+  }
+  $record = Get-PortableShellOwnership
+  if ($record) {
+    foreach ($path in @($record.shortcutPaths)) {
+      try {
+        if ([IO.Path]::GetExtension([string]$path) -ieq '.lnk' -and
+            (@($locations | Where-Object { Test-PortablePathUnderRoot ([string]$path) $_ }).Count -gt 0)) {
+          $candidates.Add([string]$path)
+        }
+      } catch { }
+    }
+  }
+  return @($candidates | Select-Object -Unique)
+}
+function Test-PortableShortcutOwned($shortcutPath, $entry, $record) {
+  $link = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcutPath)
+  if ([string]$link.Description -eq 'codex-app-manager:managed-portable') { return $true }
+  $roots = New-Object System.Collections.Generic.List[string]
+  if ($entry) { $roots.Add([string]$entry.InstallLocation) }
+  if ($record) {
+    foreach ($root in @($record.installRoots)) { $roots.Add([string]$root) }
+  }
+  foreach ($root in $roots) {
+    if (Test-PortablePathUnderRoot ([string]$link.TargetPath) $root) { return $true }
+  }
+  return $false
+}
 "#
+}
+
+#[cfg(windows)]
+fn portable_stale_shortcut_script() -> String {
+    format!(
+        r#"{}
+$entry = Get-OwnedPortableEntry
+$record = Get-PortableShellOwnership
+$removed = $false
+$preserved = $false
+foreach ($shortcutPath in @(Get-PortableShortcutCandidates)) {{
+  if (-not (Test-Path -LiteralPath $shortcutPath -PathType Leaf -ErrorAction Stop)) {{ continue }}
+  try {{
+    $link = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcutPath)
+    $target = [string]$link.TargetPath
+    if (-not [string]::IsNullOrWhiteSpace($target) -and
+        (Test-Path -LiteralPath $target -PathType Leaf -ErrorAction SilentlyContinue)) {{ continue }}
+    if (-not (Test-PortableShortcutOwned $shortcutPath $entry $record)) {{ continue }}
+    $deleted = $false
+    for ($attempt = 0; $attempt -lt 8; $attempt++) {{
+      try {{
+        Remove-Item -LiteralPath $shortcutPath -Force -ErrorAction Stop
+        if (-not (Test-Path -LiteralPath $shortcutPath -ErrorAction Stop)) {{
+          $deleted = $true
+          break
+        }}
+      }} catch {{
+        if ($attempt -eq 7) {{ throw }}
+      }}
+      Start-Sleep -Milliseconds 125
+    }}
+    if (-not $deleted) {{ throw ('stale shortcut still present: ' + $shortcutPath) }}
+    $removed = $true
+  }} catch {{
+    # A startup sweep is best-effort; uninstall remains the authoritative
+    # cleanup path and reports permission/ownership failures to the user.
+    $preserved = $true
+  }}
+}}
+if ($removed) {{ 'removed' }} elseif ($preserved) {{ 'preserved' }} else {{ 'absent' }}
+"#,
+        portable_metadata_ownership_script(),
+    )
 }
 
 fn metadata_cleanup_result(
@@ -654,36 +888,130 @@ fn metadata_cleanup_result(
 }
 
 #[cfg(all(windows, not(test)))]
+fn portable_shell_search_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        let appdata = PathBuf::from(appdata);
+        roots.push(
+            appdata
+                .join("Microsoft")
+                .join("Windows")
+                .join("Start Menu")
+                .join("Programs"),
+        );
+        roots.push(appdata.join("Microsoft").join("Windows").join("Desktop"));
+    }
+    if let Some(user_profile) = std::env::var_os("USERPROFILE") {
+        roots.push(PathBuf::from(user_profile).join("Desktop"));
+    }
+    if let Some(program_data) = std::env::var_os("ProgramData") {
+        let program_data = PathBuf::from(program_data);
+        roots.push(
+            program_data
+                .join("Microsoft")
+                .join("Windows")
+                .join("Start Menu")
+                .join("Programs"),
+        );
+        roots.push(
+            program_data
+                .join("Microsoft")
+                .join("Windows")
+                .join("Desktop"),
+        );
+    }
+    if let Some(public) = std::env::var_os("PUBLIC") {
+        roots.push(PathBuf::from(public).join("Desktop"));
+    }
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+#[cfg(all(windows, not(test)))]
+fn refresh_portable_shell_directories() {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::UI::Shell::{SHChangeNotify, SHCNE_UPDATEDIR, SHCNF_PATHW};
+
+    for root in portable_shell_search_roots() {
+        let wide = root
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        unsafe {
+            SHChangeNotify(
+                SHCNE_UPDATEDIR,
+                SHCNF_PATHW,
+                Some(wide.as_ptr() as *const std::ffi::c_void),
+                None,
+            );
+        }
+    }
+}
+
+#[cfg(all(windows, not(test)))]
+pub fn cleanup_stale_portable_shortcuts() -> Result<bool, EngineError> {
+    for root in portable_shell_search_roots() {
+        validate_cleanup_path(&root)?;
+    }
+    let (removed, note) = metadata_cleanup_result(
+        &run_powershell(&portable_stale_shortcut_script())?,
+        "stale shell",
+    )?;
+    if let Some(note) = note {
+        log::debug!("{note}");
+    }
+    if removed {
+        refresh_portable_shell_directories();
+    }
+    Ok(removed)
+}
+
+#[cfg(any(not(windows), test))]
+pub fn cleanup_stale_portable_shortcuts() -> Result<bool, EngineError> {
+    Ok(false)
+}
+
+#[cfg(all(windows, not(test)))]
 fn remove_start_menu_shortcut() -> Result<(bool, Option<String>), EngineError> {
-    let Some(appdata) = std::env::var_os("APPDATA") else {
-        return Ok((false, None));
-    };
-    let shortcut = PathBuf::from(appdata)
-        .join("Microsoft")
-        .join("Windows")
-        .join("Start Menu")
-        .join("Programs")
-        .join("Codex.lnk");
-    validate_cleanup_path(&shortcut)?;
+    for root in portable_shell_search_roots() {
+        validate_cleanup_path(&root)?;
+    }
     let script = format!(
         r#"{}
-$shortcutPath = {}
-if (-not (Test-Path -LiteralPath $shortcutPath -ErrorAction Stop)) {{ 'absent'; exit 0 }}
-$link = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcutPath)
 $entry = Get-OwnedPortableEntry
-$owned = $link.Description -eq 'codex-app-manager:managed-portable'
-if ($entry) {{
-  $root = [IO.Path]::GetFullPath([string]$entry.InstallLocation).TrimEnd('\') + '\'
-  $target = [IO.Path]::GetFullPath([string]$link.TargetPath)
-  $owned = $target.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)
+$record = Get-PortableShellOwnership
+$removed = $false
+$preserved = $false
+foreach ($shortcutPath in @(Get-PortableShortcutCandidates)) {{
+  if (-not (Test-Path -LiteralPath $shortcutPath -PathType Leaf -ErrorAction Stop)) {{ continue }}
+  $owned = $false
+  try {{ $owned = Test-PortableShortcutOwned $shortcutPath $entry $record }} catch {{ $preserved = $true; continue }}
+  if (-not $owned) {{ $preserved = $true; continue }}
+  $deleted = $false
+  for ($attempt = 0; $attempt -lt 8; $attempt++) {{
+    try {{
+      Remove-Item -LiteralPath $shortcutPath -Force -ErrorAction Stop
+      if (-not (Test-Path -LiteralPath $shortcutPath -ErrorAction Stop)) {{
+        $deleted = $true
+        break
+      }}
+    }} catch {{
+      if ($attempt -eq 7) {{ throw }}
+    }}
+    Start-Sleep -Milliseconds 125
+  }}
+  if (-not $deleted) {{ throw ('shortcut still present: ' + $shortcutPath) }}
+  $removed = $true
 }}
-if (-not $owned) {{ 'preserved'; exit 0 }}
-Remove-Item -LiteralPath $shortcutPath -Force -ErrorAction Stop
-if (Test-Path -LiteralPath $shortcutPath -ErrorAction Stop) {{ throw 'shortcut still present' }}
-'removed'
+$ownershipPath = if ($env:LOCALAPPDATA) {{ Join-Path $env:LOCALAPPDATA 'io.github.wangnov.codexappmanager\portable-shell-ownership.json' }} else {{ $null }}
+if ($ownershipPath -and (Test-Path -LiteralPath $ownershipPath -PathType Leaf -ErrorAction Stop) -and -not $preserved) {{
+  Remove-Item -LiteralPath $ownershipPath -Force -ErrorAction Stop
+}}
+if ($removed) {{ 'removed' }} elseif ($preserved) {{ 'preserved' }} else {{ 'absent' }}
 "#,
         portable_metadata_ownership_script(),
-        ps_quote(&shortcut.to_string_lossy())
     );
     metadata_cleanup_result(&run_powershell(&script)?, "Start Menu shortcut")
 }
@@ -764,7 +1092,7 @@ fn restore_previous_install(
         )));
     }
     if install_root.exists() {
-        fs::remove_dir_all(install_root)
+        remove_directory_all_with_retry("remove failed portable install", install_root)
             .map_err(|e| io_err("remove failed portable install", e))?;
     }
     if had_previous {
@@ -1236,16 +1564,23 @@ pub fn install_portable_from_msix_with_observer_options(
 }
 
 /// Return the user-profile paths that belong to the Codex desktop/CLI
-/// installation.  The first entry (`~/.codex`) is shared with Codex CLI; the
-/// other entries are desktop/AppX caches.  They are only used when the user
-/// explicitly turns off "keep my data".  In particular, this list never
-/// walks a broad `%LOCALAPPDATA%` tree or follows an arbitrary glob.
+/// installation. The first entries (`~/.codex` and `~/.agents/skills`) are
+/// shared with Codex CLI/agent tooling; the other entries are desktop/AppX
+/// caches. They are only used when the user explicitly turns off "keep my
+/// data". In particular, this list never walks a broad `%LOCALAPPDATA%` tree
+/// or follows an arbitrary glob.
 fn codex_user_data_paths() -> Result<Vec<PathBuf>, EngineError> {
     let mut paths = Vec::new();
     let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
 
     if let Some(home) = home {
-        paths.push(PathBuf::from(home).join(".codex"));
+        let home = PathBuf::from(home);
+        paths.push(home.join(".codex"));
+        // The bundled capability pack installs user-scoped Skills here. Keep
+        // it in the same explicit purge contract as ~/.codex so a local
+        // Codex/Skills uninstall does not leave the pack behind. The USB
+        // source tree is outside the user profile and is never selected here.
+        paths.push(home.join(".agents").join("skills"));
     }
 
     if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
@@ -1534,6 +1869,34 @@ mod tests {
             .expect("test environment lock")
     }
 
+    #[cfg(windows)]
+    fn assert_powershell_parses(script: &str) {
+        use std::process::{Command, Stdio};
+
+        let parser = r#"[Console]::InputEncoding=[Text.UTF8Encoding]::new($false);[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);$tokens=$null;$errors=$null;[void][System.Management.Automation.Language.Parser]::ParseInput([Console]::In.ReadToEnd(),[ref]$tokens,[ref]$errors);if($errors.Count -gt 0){$errors | Out-String | Write-Error;exit 1}"#;
+        let mut child = Command::new(powershell_exe())
+            .args(["-NoProfile", "-NonInteractive", "-Command", parser])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start PowerShell parser");
+        child
+            .stdin
+            .take()
+            .expect("PowerShell stdin")
+            .write_all(script.as_bytes())
+            .expect("write PowerShell script");
+        let output = child
+            .wait_with_output()
+            .expect("wait for PowerShell parser");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn usb_profile_never_launches_or_publishes_a_direct_shell_entry() {
         assert_eq!(
@@ -1545,6 +1908,40 @@ mod tests {
                 create_shell_metadata: false,
             }
         );
+    }
+
+    #[test]
+    fn portable_shell_ownership_record_merges_paths_without_credentials() {
+        let _env_lock = test_env_lock();
+        let root = temp_test_dir("shell-ownership");
+        let local = root.join("LocalAppData");
+        let previous = std::env::var_os("LOCALAPPDATA");
+        std::env::set_var("LOCALAPPDATA", &local);
+
+        let install_root_a = root.join("apps/Codex-a");
+        let install_root_b = root.join("apps/Codex-b");
+        let shortcut_a = root.join("shell/Codex.lnk");
+        let shortcut_b = root.join("shell/ChatGPT.lnk");
+        record_portable_shell_ownership(&install_root_a, &shortcut_a).unwrap();
+        record_portable_shell_ownership(&install_root_b, &shortcut_b).unwrap();
+
+        let path = portable_shell_ownership_path().unwrap();
+        let record: PortableShellOwnership =
+            serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(record.schema_version, PORTABLE_SHELL_OWNERSHIP_SCHEMA);
+        assert_eq!(record.product, PORTABLE_SHELL_OWNERSHIP_PRODUCT);
+        assert_eq!(record.install_roots.len(), 2);
+        assert_eq!(record.shortcut_paths.len(), 2);
+        assert!(record
+            .shortcut_paths
+            .iter()
+            .all(|value| !value.contains("KEY") && !value.contains("SECRET")));
+
+        match previous {
+            Some(value) => std::env::set_var("LOCALAPPDATA", value),
+            None => std::env::remove_var("LOCALAPPDATA"),
+        }
+        let _ = fs::remove_dir_all(root);
     }
 
     /// Release QA hook: exercises the exact USB extraction/transaction path
@@ -1730,6 +2127,7 @@ mod tests {
         let local_logs = local.join("Codex").join("Logs");
         let roaming_openai = roaming.join("OpenAI").join("Codex");
         let roaming_codex = roaming.join("Codex");
+        let installed_skills = home.join(".agents").join("skills");
         let recovery_evidence = local
             .join("CodexAppxDataBackups")
             .join("OpenAI.Codex_2p2nqsd0c76g0");
@@ -1741,6 +2139,7 @@ mod tests {
             local_logs.clone(),
             roaming_openai.clone(),
             roaming_codex.clone(),
+            installed_skills.clone(),
             recovery_evidence.clone(),
         ] {
             fs::create_dir_all(&path).unwrap();
@@ -1776,6 +2175,7 @@ mod tests {
         assert!(purged);
         for path in [
             home.join(".codex"),
+            installed_skills,
             package,
             local_openai,
             local_logs,
@@ -1831,6 +2231,59 @@ if ($null -ne (Get-OwnedPortableEntry)) {{ 'owned' }} else {{ 'missing' }}
             portable_metadata_ownership_script()
         );
         assert_eq!(run_powershell(&script).unwrap().trim(), "owned");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn portable_shell_cleanup_script_covers_legacy_locations_and_names() {
+        let script = portable_metadata_ownership_script();
+        for needle in [
+            "ChatGPT.lnk",
+            "CCSwitch.lnk",
+            "Codex Switch.lnk",
+            "$env:PUBLIC",
+            "portable-shell-ownership.json",
+            "codex-app-manager:managed-portable",
+        ] {
+            assert!(
+                script.contains(needle),
+                "script lost required token: {needle}"
+            );
+        }
+        let parsed = format!("{script}\n'parsed'");
+        assert_eq!(run_powershell(&parsed).unwrap().trim(), "parsed");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn portable_shell_create_and_apps_features_scripts_parse() {
+        let install_root = Path::new(r"C:\CodexUsb\apps\Codex");
+        let shortcut = Path::new(
+            r"C:\Users\Fixture\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Codex.lnk",
+        );
+        let exe = install_root.join("ChatGPT.exe");
+        let create = create_start_menu_shortcut_script(install_root, shortcut, &exe);
+        assert!(create.contains("SetAccessRule"));
+        assert!(create.contains("FullControl"));
+        assert_powershell_parses(&create);
+
+        let uninstall = portable_uninstall_script(install_root);
+        for needle in [
+            "ChatGPT.lnk",
+            "$env:PUBLIC",
+            "portable-shell-ownership.json",
+        ] {
+            assert!(
+                uninstall.contains(needle),
+                "missing uninstall token: {needle}"
+            );
+        }
+        assert_powershell_parses(&uninstall);
+
+        let stale = portable_stale_shortcut_script();
+        assert!(stale.contains("Test-PortableShortcutOwned"));
+        assert!(stale.contains("Test-Path -LiteralPath $target"));
+        assert_powershell_parses(&stale);
     }
 
     #[test]
@@ -2184,6 +2637,53 @@ if ($null -ne (Get-OwnedPortableEntry)) {{ 'owned' }} else {{ 'missing' }}
         let err = install_portable_from_msix_inner(&msix, &install_root, false, false).unwrap_err();
         assert!(err.to_string().contains("before-move-old"));
         assert!(install_root.join("old-marker.txt").exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn observer_failure_before_move_old_preserves_previous_install() {
+        let root = canonical_temp_dir().join(format!(
+            "codex-portable-precommit-rollback-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let msix = root.join("codex.msix");
+        let install_root = root.join("apps/Codex");
+        write_fake_msix(&msix);
+        fs::create_dir_all(&install_root).unwrap();
+        fs::write(install_root.join("old-marker.txt"), b"old").unwrap();
+
+        let err = install_portable_from_msix_with_observer(
+            &msix,
+            &install_root,
+            false,
+            false,
+            &mut |boundary| {
+                if matches!(boundary, PortableBoundary::BeforeMoveOld { .. }) {
+                    Err(EngineError::Install(
+                        "USB bundle precommit rejected".to_string(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("USB bundle precommit rejected"));
+        assert!(install_root.join("old-marker.txt").exists());
+        assert!(!root.join("apps/.codex-app-manager-staging").exists());
+        assert!(!fs::read_dir(root.join("apps"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("Codex.rollback-")
+            }));
 
         let _ = fs::remove_dir_all(&root);
     }

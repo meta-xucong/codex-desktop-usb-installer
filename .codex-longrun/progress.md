@@ -1,5 +1,20 @@
 # Progress
 
+## 2026-09-13 G22/G23 release candidate
+
+- G22 归档报告已加入 `docs/reports/`；卸载二阶段报告根目录、phase/exitCode/retrySuggestion、日志 fallback 和路径交叉检查已纳入代码与 Rust 回归。
+- Skill Hub 失败详情仅在该远程功能的 UI 详情中脱敏，卸载/本地清理详情保留原始失败路径，修复了全量前端测试发现的诊断兼容回归。
+- 能力包新增 `scripts/build-pack.py` 与 `scripts/verify-package.ps1`，跨 Python/PowerShell 的 253 文件清单、校验和、来源树摘要均通过。
+- 模型目录以 `gpt-6-astra` 为首选并记录 `gpt-5.2` 历史停用；官方 26.908.4834.0 载荷取证记录已加入文档，明确载荷内旧条目仍待上游刷新。
+- 最新候选目录：`release/usb-oneclick-v0.5.24-g23-model-sync-g22-final-20260913-r4`；签名工具：`release/usb-license-signer-gui-v0.5.24-g23-model-sync-g22-20260913-r4`。两者均未写入物理 U 盘。
+
+## 2026-09-13 G22/G23 follow-up
+
+- 已读取 G22 卸载报告；确认核心回归是 finalizer 自引用：管理器数据根删除后仍向该根写收尾日志，导致 Windows Location unavailable/E_FAIL 弹窗。
+- 已确认当前 Skill Hub 请求链路是 Tauri/Rust command，不是普通前端 fetch；现有 UI 丢弃了后端 detail，来源尝试也未进入主日志。
+- 已确认安装包没有可公开分发的模型目录；当前用户 `models_cache.json` 含服务端模型消息，不可直接打包到公开 GitHub。
+- 已落开发契约文档，下一步只改相应源码与安装脚本，保留其它用户改动。
+
 ## 2026-09-06 当前基线：v0.5.24
 
 - 根据 v0.5.21 现场报告确认：主卸载成功后，二阶段把 manager 自动生成的 `usb-license.json` 当作清单外用户文件，因此自锁并保留整套 U 盘介质；28 个发行哈希均正常，回收站不是根因。
@@ -110,4 +125,3 @@
 - 2026-09-03：重建 v0.5.5 正式 U 盘目录并同步 23 个非 MSIX 文件；`verify-usb.ps1 -SkipNetwork`、`verify-oneclick-usb.ps1 -SkipNetwork -SkipSignature`、两个 PE `requireAdministrator` 清单校验均通过。入口 SHA-256 `d834c4c6708a17c7d06838ff0f969b26b0202d94b44b16498d80b0404a41ffe4`，管理器 SHA-256 `7b1554329feb82822821bd8f11b43907df3d63d3987b727494cca8e9108e66f3`，MSIX SHA-256 `ab0feacc74e982742736da4a7f1d2b59e9fabaa3641606545d3064927da02b1e`。真实 Windows AppX 卸载仍需目标机验收。
 - 2026-09-03：根据 v0.5.5 日志继续收口安装/卸载：USB 管理器及 PowerShell 子进程现在同时验证 `TokenElevation`、完整/默认 `TokenElevationType` 和有效 Administrators SID；安装错盘回滚、数据卷冲突清理与显式卸载共用窄兼容逻辑，遇 `0x80073CFA` 或旧模块缺少 `PreserveApplicationData` 参数时只对同一当前用户包去掉该标记重试，普通权限/策略错误仍失败，并对包内数据不保证保留给出告警。
 - 2026-09-03：新增缺少 Preserve 参数的安装回滚与卸载模拟回归；引擎 `cargo test` 122/122、src-tauri `cargo test` 187/187、Windows MSVC target `cargo check`、TypeScript/lint、前端 29 文件/275 测试、发布 2 文件/56 测试、离线 bundle 均通过。重新构建 v0.5.6 并从 next18 同步正式 `release/usb-oneclick`（24 文件/23 校验项）；入口 SHA-256 `d834c4c6708a17c7d06838ff0f969b26b0202d94b44b16498d80b0404a41ffe4`，管理器 `b89c4ad5e4e6595fa5e38ef6e49c337673f2f15e7827bfb514eca5521760a830`，真实 MSIX `ab0feacc74e982742736da4a7f1d2b59e9fabaa3641606545d3064927da02b1e`；正式校验和两个 PE `requireAdministrator` 检查通过。真实 Windows AppXVolume/UAC 仍需目标机验收。
-

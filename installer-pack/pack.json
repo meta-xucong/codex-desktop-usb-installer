@@ -1,0 +1,113 @@
+{
+  "schemaVersion": 2,
+  "id": "codex-starter",
+  "version": "1.3.0",
+  "sourceCommit": "2f20c330757a1e5e47d618526cf1a185723c7525",
+  "sourceCommitRole": "build-input",
+  "sourceTreeSha256": "cfd60e1933c2e0b8d65f6ec2feaab10377d224d1b797db1bfeb7a9985b329017",
+  "sourceDate": "2026-09-12",
+  "compatibleCodex": {
+    "minCodexVersion": "0.144.0",
+    "testedCodexVersion": "0.147.0",
+    "agentFormat": "TOML with name/description/developer_instructions",
+    "skillRoot": "%USERPROFILE%\\.agents\\skills",
+    "agentRoot": "%USERPROFILE%\\.codex\\agents",
+    "windows": [
+      "10",
+      "11"
+    ]
+  },
+  "statuses": [
+    "auto-installable-runtime",
+    "core-ready",
+    "guided-config",
+    "unsupported"
+  ],
+  "sourceStatuses": [
+    "ready",
+    "requires-credential",
+    "requires-mcp",
+    "requires-runtime",
+    "unsupported/disabled"
+  ],
+  "defaultEnabled": {
+    "skills": [
+      "academic-research",
+      "competitor-intelligence",
+      "conversion-optimizer",
+      "daily-reflection",
+      "efficiency-toolkit",
+      "email-expert",
+      "growth-analyst",
+      "image-prompt-generator",
+      "industry-analysis",
+      "market-sizing-analysis",
+      "meeting-secretary",
+      "multi-search-engine",
+      "offer-designer",
+      "painpoint-analyzer",
+      "python-env-setup",
+      "safe-disk-operations",
+      "self-improvement-agent",
+      "skills-search",
+      "traffic-hunter",
+      "user-research",
+      "video-prompt-generator",
+      "weather",
+      "weather-forecast",
+      "web-content-fetcher",
+      "xiaohongshu-writing"
+    ],
+    "agents": [
+      "agents/general.toml",
+      "agents/research.toml",
+      "agents/content.toml",
+      "agents/investment.toml",
+      "agents/growth.toml",
+      "agents/lifestyle.toml",
+      "agents/office.toml"
+    ]
+  },
+  "sourcePolicy": {
+    "noSecrets": true,
+    "noUserContent": true,
+    "bundledRuntimeMedia": true,
+    "noUserRuntimeCache": true,
+    "ownedFilesOnly": true,
+    "noGlobalAgentsMd": true
+  },
+  "installOrder": [
+    "verify-package-hashes",
+    "install-approved-runtimes",
+    "install-default-skills",
+    "install-all-agents",
+    "render-private-connections",
+    "health-check",
+    "reload-codex"
+  ],
+  "conflictStrategy": {
+    "ownedFilesOnly": true,
+    "skipUnlessOverwrite": true,
+    "neverDeleteUnowned": true,
+    "neverWriteGlobalAgentsMd": true
+  },
+  "extensionContract": {
+    "schemaVersion": 2,
+    "skill": "add manifest entry, skills/<id>/SKILL.md and optional skills/<id>/agents/openai.yaml; rerun builder",
+    "agent": "add agents/<id>.toml and a matching manifest/agent-audit.json closure; rerun builder",
+    "mcp": "add manifest/mcp-servers.json entry and a secret-free config-fragments template; keep credentials local",
+    "apiService": "add manifest/api-services.json and connection-fields.json entries; never commit keys",
+    "runtime": "add a pinned artifact record and an auditable offline manifest; do not bundle unverified binaries",
+    "configFragment": "add a secret-free template with enable/disable and health-check rules"
+  },
+  "runtimeArtifacts": "manifest/runtime-artifacts.json",
+  "mcpServers": "mcp/mcp-servers.json",
+  "apiServices": "mcp/api-services.json",
+  "connectionFields": "mcp/connection-fields.json",
+  "compatibilityAudit": "audit-codex-compatibility.py",
+  "adapterContractTests": "test-adapter-contracts.py",
+  "configRenderer": "render-codex-config.ps1",
+  "modelCatalog": "model-catalog.json",
+  "modelSync": "sync-model-catalog.ps1",
+  "installer": "install-to-codex.ps1"
+}

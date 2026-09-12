@@ -25,6 +25,17 @@ const OFFLINE_ONLY =
   currentPlatform() === "windows" &&
   (import.meta.env.MODE === "production" || import.meta.env.VITE_OFFLINE_ONLY === "1");
 
+function shouldRetryUsbGuard(status: UsbGuardStatus): boolean {
+  return (
+    status.status === "starting" ||
+    status.status === "missing" ||
+    status.status === "grace" ||
+    status.status === "stopped"
+  );
+}
+
+const USB_GUARD_RETRY_LIMIT = 20;
+
 export function About({ onBack }: { onBack: () => void }) {
   const { t } = useI18n();
   const [mgrBusy, setMgrBusy] = useState(false);
@@ -43,22 +54,36 @@ export function About({ onBack }: { onBack: () => void }) {
 
   useEffect(() => {
     let active = true;
+    let retryTimer: number | null = null;
+    let retryCount = 0;
     setUsbGuard(null);
     if (!win) {
       return () => {
         active = false;
       };
     }
-    void managerApi
-      .usbGuardStatus()
-      .then((status) => {
-        if (active) setUsbGuard(status);
-      })
-      .catch(() => {
-        if (active) setUsbGuard(null);
-      });
+    const readStatus = () => {
+      void managerApi
+        .usbGuardStatus()
+        .then((status) => {
+          if (!active) return;
+          setUsbGuard(status);
+          // The guard can still be starting while About mounts. Retry only
+          // transient states and only a bounded number of times; this avoids
+          // both a missing update button and an endless refresh loop.
+          if (shouldRetryUsbGuard(status) && retryCount < USB_GUARD_RETRY_LIMIT) {
+            retryCount += 1;
+            retryTimer = window.setTimeout(readStatus, Math.min(250 * retryCount, 1_000));
+          }
+        })
+        .catch(() => {
+          if (active) setUsbGuard(null);
+        });
+    };
+    readStatus();
     return () => {
       active = false;
+      if (retryTimer !== null) window.clearTimeout(retryTimer);
     };
   }, [win]);
 
@@ -66,6 +91,8 @@ export function About({ onBack }: { onBack: () => void }) {
     win &&
     usbGuard?.status === "authorized" &&
     usbGuard.watchdog === "running" &&
+    usbGuard.signed &&
+    usbGuard.codexAllowed !== false &&
     usbGuard.removable &&
     Boolean(usbGuard.bundlePath);
 

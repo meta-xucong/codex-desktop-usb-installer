@@ -1,0 +1,6 @@
+interface:
+  display_name: "PDF 处理"
+  short_description: "提取、整理、创建并检查 PDF 文档与表格；当前受许可证隔离限制。"
+  default_prompt: "Use $pdf-processing-toolkit to assess this PDF request and first apply its license restriction."
+policy:
+  allow_implicit_invocation: false

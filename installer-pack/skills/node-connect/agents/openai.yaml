@@ -1,0 +1,6 @@
+interface:
+  display_name: "设备连接"
+  short_description: "诊断移动端或桌面端设备配对需求，并明确当前不可用的连接边界。"
+  default_prompt: "Use $node-connect to diagnose this device-pairing request and explain the supported boundary."
+policy:
+  allow_implicit_invocation: false

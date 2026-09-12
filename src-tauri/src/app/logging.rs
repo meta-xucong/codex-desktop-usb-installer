@@ -11,6 +11,15 @@ pub fn logs_dir(app: &tauri::AppHandle) -> Option<PathBuf> {
     app.path().app_log_dir().ok()
 }
 
+/// Finalizer reports must survive removal of the Tauri app-data directory.
+/// This path is intentionally independent from `app_log_dir()` and from all
+/// product cleanup roots.
+pub fn stable_uninstall_reports_dir() -> PathBuf {
+    std::env::temp_dir()
+        .join("CodexAppManager")
+        .join("uninstall-reports")
+}
+
 pub fn redact_url(raw: &str) -> String {
     let Ok(url) = Url::parse(raw.trim()) else {
         return "<invalid-url>".to_string();
@@ -66,7 +75,7 @@ pub fn prune_old_logs(dir: &Path, keep: usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{prune_old_logs, redact_url};
+    use super::{prune_old_logs, redact_url, stable_uninstall_reports_dir};
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("{name}-{}", std::process::id()))
@@ -119,5 +128,16 @@ mod tests {
     #[test]
     fn prune_old_logs_tolerates_missing_dir() {
         prune_old_logs(&temp_dir("codex-manager-log-missing"), 5);
+    }
+
+    #[test]
+    fn uninstall_reports_are_outside_app_log_root() {
+        let reports = stable_uninstall_reports_dir();
+        let app_root = directories::BaseDirs::new().map(|base| {
+            base.data_local_dir()
+                .join("io.github.wangnov.codexappmanager")
+        });
+        assert!(app_root.is_none() || !reports.starts_with(app_root.unwrap()));
+        assert!(reports.ends_with(std::path::Path::new("CodexAppManager/uninstall-reports")));
     }
 }

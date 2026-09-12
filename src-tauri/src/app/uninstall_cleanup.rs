@@ -37,6 +37,45 @@ const HELPER_FILES: &[&str] = &[
 
 const FINALIZER_ERROR_MAX_BYTES: u64 = 16 * 1024;
 const DIAGNOSTIC_LOG_TAIL_BYTES: u64 = 64 * 1024;
+const REPORT_ISSUE_MAX_ITEMS: usize = 8;
+const REPORT_ISSUE_MAX_CHARS: usize = 720;
+#[cfg(windows)]
+const FINALIZER_REPORT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(windows)]
+const FINALIZER_REPORT_CONFIRM_INTERVAL: Duration = Duration::from_millis(100);
+const CONNECTION_OWNERSHIP_MAX_BYTES: u64 = 64 * 1024;
+const CONNECTION_OWNERSHIP_RELATIVE: &str = ".codex/codex-agent-kit/connection-ownership.json";
+const OWNED_CONNECTION_ENV_NAMES: &[&str] = &[
+    "FEISHU_APP_ID",
+    "FEISHU_APP_SECRET",
+    "FEISHU_DOMAIN",
+    "FEISHU_AUTH_MODE",
+    "FEISHU_USER_ACCESS_TOKEN",
+    "DASHSCOPE_API_KEY",
+    "DASHSCOPE_BASE_URL",
+    "DASHSCOPE_MODEL",
+    "IMAGE_2_API_KEY",
+    "IMAGE_2_API_BASE_URL",
+    "IMAGE_2_MODEL",
+    "IMAGE_2_AGENT_ID",
+    "SEEDANCE_API_KEY",
+    "SEEDANCE_API_BASE_URL",
+    "SEEDANCE_MODEL",
+    "SEEDANCE_AGENT_ID",
+    "SEEDANCE_PRECHARGE_POINTS",
+    "SEEDANCE_OFFICIAL_LINK_TTL_HOURS",
+    "SEEDANCE_REFUND_RULE",
+];
+
+fn is_legacy_uninstall_report_name(name: &str) -> bool {
+    let Some(stem) = name
+        .strip_prefix("Codex-Uninstall-Report-")
+        .and_then(|value| value.strip_suffix(".json"))
+    else {
+        return false;
+    };
+    !stem.is_empty() && name.len() <= 160 && !name.contains('\\') && !name.contains('/')
+}
 
 struct UnstartedHelper {
     directory: PathBuf,
@@ -202,9 +241,27 @@ pub struct CleanupItem {
 pub struct CleanupReport {
     pub schema_version: u32,
     pub status: String,
+    /// Explicit lifecycle phase.  Older reports may omit it and deserialize
+    /// to the empty string for backwards compatibility.
+    #[serde(default)]
+    pub phase: String,
+    /// Finalizer process exit code when it has terminated.
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    /// Actionable recovery guidance for a partial or failed second stage.
+    #[serde(default)]
+    pub retry_suggestion: String,
     pub items: Vec<CleanupItem>,
     pub helper_finalization: String,
     pub note: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConnectionOwnershipRecord {
+    schema_version: u32,
+    pack_id: String,
+    names: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -212,6 +269,51 @@ pub struct CleanupReport {
 pub struct CleanupHandoff {
     pub report_path: String,
     pub message: String,
+}
+
+/// Produce a bounded, user-visible explanation for a partial second-stage
+/// cleanup. The full JSON report remains the source of truth; this summary is
+/// deliberately limited so a locked log or a long path cannot make the native
+/// dialog unusable or accidentally echo a whole diagnostic file.
+fn report_issue_summary(report: &CleanupReport) -> Option<String> {
+    let mut lines = Vec::new();
+    for item in &report.items {
+        if !matches!(
+            item.status.as_str(),
+            "failed" | "deferred" | "preserved" | "warning"
+        ) {
+            continue;
+        }
+        let detail = item
+            .detail
+            .chars()
+            .map(|character| {
+                if character == '\r' || character == '\n' {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .take(REPORT_ISSUE_MAX_CHARS)
+            .collect::<String>();
+        let suffix = if item.detail.chars().count() > REPORT_ISSUE_MAX_CHARS {
+            "…"
+        } else {
+            ""
+        };
+        lines.push(format!(
+            "- [{}] {}：{}{}",
+            item.status, item.path, detail, suffix
+        ));
+        if lines.len() >= REPORT_ISSUE_MAX_ITEMS {
+            break;
+        }
+    }
+    if lines.is_empty() {
+        None
+    } else {
+        Some(format!("具体原因/保留项：\n{}", lines.join("\n")))
+    }
 }
 
 fn is_reparse(metadata: &fs::Metadata) -> bool {
@@ -264,20 +366,55 @@ fn canonical_root(path: &Path) -> Result<PathBuf, String> {
     fs::canonicalize(path).map_err(|error| format!("解析目录 {}：{error}", path.display()))
 }
 
+fn canonical_or_parent(path: &Path) -> Result<PathBuf, String> {
+    check_ancestors(path)?;
+    if metadata_optional(path)?.is_some() {
+        return fs::canonicalize(path)
+            .map_err(|error| format!("解析路径 {}：{error}", path.display()));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("路径没有父目录：{}", path.display()))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| format!("路径没有文件名：{}", path.display()))?;
+    Ok(canonical_root(parent)?.join(name))
+}
+
+fn same_or_child_path(child: &Path, parent: &Path) -> bool {
+    if child.strip_prefix(parent).is_ok() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        child
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .starts_with(&parent.to_string_lossy().to_ascii_lowercase())
+    }
+    #[cfg(not(windows))]
+    false
+}
+
 impl CleanupRoots {
     fn discover() -> Result<Self, String> {
         let base = directories::BaseDirs::new().ok_or("无法读取用户目录")?;
-        let user = directories::UserDirs::new().ok_or("无法读取桌面目录")?;
+        // The finalizer runs after the manager data root has been removed.
+        // Keep reports in a stable temp root that is never part of the
+        // product cleanup targets. The old local-app-data candidate created
+        // the G22 self-reference failure on older packaged builds.
+        let report_candidates = [std::env::temp_dir()
+            .join("CodexAppManager")
+            .join("uninstall-reports")];
         let mut report_dir = None;
-        for candidate in [
-            user.desktop_dir(),
-            user.document_dir(),
-            Some(base.home_dir()),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            let Ok(candidate) = canonical_root(candidate) else {
+        for candidate in report_candidates {
+            if check_ancestors(&candidate).is_err() {
+                continue;
+            }
+            if !candidate.exists() && fs::create_dir_all(&candidate).is_err() {
+                continue;
+            }
+            let Ok(candidate) = canonical_root(&candidate) else {
                 continue;
             };
             let probe = candidate.join(format!(".codex-report-probe-{}.tmp", uuid::Uuid::new_v4()));
@@ -289,15 +426,32 @@ impl CleanupRoots {
                 break;
             }
         }
-        Ok(Self {
+        let roots = Self {
             home: canonical_root(base.home_dir())?,
             local: canonical_root(base.data_local_dir())?,
             roaming: canonical_root(base.data_dir())?,
             temp: canonical_root(&std::env::temp_dir())?,
-            // A missing or redirected Desktop must not prevent uninstall.
-            // This field stores the chosen Desktop -> Documents -> home directory.
-            desktop: report_dir.ok_or("桌面、文档和用户目录均无法安全写入卸载报告")?,
-        })
+            // Reports live outside every manager data target and remain
+            // available after the helper deletes the application directory.
+            desktop: report_dir.ok_or("无法安全创建卸载日志目录")?,
+        };
+        roots.ensure_report_root_safe()?;
+        Ok(roots)
+    }
+
+    fn ensure_report_root_safe(&self) -> Result<(), String> {
+        let report_root = canonical_root(&self.desktop)?;
+        for target in self.targets(true, true)? {
+            let target = canonical_or_parent(&target)?;
+            if same_or_child_path(&report_root, &target) {
+                return Err(format!(
+                    "卸载报告目录不能位于待删除目录内：{} -> {}",
+                    report_root.display(),
+                    target.display()
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn install_staging_targets(&self) -> Vec<PathBuf> {
@@ -305,6 +459,48 @@ impl CleanupRoots {
             self.temp.join("CodexDesktopInstaller"),
             self.temp.join("codex-app-manager"),
         ]
+    }
+
+    fn legacy_desktop_report_targets(&self) -> Result<Vec<PathBuf>, String> {
+        let Some(user) = directories::UserDirs::new() else {
+            return Ok(Vec::new());
+        };
+        let Some(desktop) = user.desktop_dir() else {
+            return Ok(Vec::new());
+        };
+        let Some(home) =
+            directories::BaseDirs::new().and_then(|base| canonical_root(base.home_dir()).ok())
+        else {
+            return Ok(Vec::new());
+        };
+        // Synthetic tests use isolated roots; never inspect the real Desktop
+        // from those fixtures. In production this exact home identity enables
+        // removal of only reports emitted by pre-fix builds.
+        if home != self.home {
+            return Ok(Vec::new());
+        }
+        let Ok(desktop) = canonical_root(desktop) else {
+            return Ok(Vec::new());
+        };
+        let mut targets = Vec::new();
+        for entry in fs::read_dir(desktop).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if !is_legacy_uninstall_report_name(name) {
+                continue;
+            }
+            let path = entry.path();
+            let Some(metadata) = metadata_optional(&path)? else {
+                continue;
+            };
+            if metadata.is_file() && !is_reparse(&metadata) {
+                targets.push(path);
+            }
+        }
+        Ok(targets)
     }
 
     fn targets(&self, purge_codex: bool, purge_ccswitch: bool) -> Result<Vec<PathBuf>, String> {
@@ -317,6 +513,7 @@ impl CleanupRoots {
             self.local.join("CodexUsbAppx"),
         ];
         targets.extend(self.install_staging_targets());
+        targets.extend(self.legacy_desktop_report_targets()?);
         // Legacy UAC helpers used decimal PID + Unix-millis names. Restrict
         // extensions and numeric identifier, rather than accepting arbitrary prefix matches.
         for entry in fs::read_dir(&self.temp).map_err(|error| error.to_string())? {
@@ -332,6 +529,12 @@ impl CleanupRoots {
         if purge_codex {
             targets.extend([
                 self.home.join(".codex"),
+                // The offline capability pack installs Codex Skills in the
+                // user-scoped Codex discovery root outside ~/.codex. It is
+                // part of the explicit shared-Codex purge, but never part of
+                // ordinary cleanup. The USB copy under content/ is not a
+                // target and therefore remains untouched.
+                self.home.join(".agents/skills"),
                 self.local.join("Packages/OpenAI.Codex_2p2nqsd0c76g0"),
                 self.local.join("OpenAI/Codex"),
                 self.local.join("Codex/Logs"),
@@ -1052,6 +1255,179 @@ fn read_finalizer_error(helper_dir: &Path) -> Result<Option<String>, String> {
     Ok((!text.is_empty()).then(|| text.to_string()))
 }
 
+/// Read only the installer-owned environment-variable names before `.codex`
+/// is removed.  The record never contains values, and an invalid/mismatched
+/// record is rejected so an arbitrary file cannot turn this into a generic
+/// environment-variable wipe.
+fn read_owned_connection_env_names(roots: &CleanupRoots) -> Result<Option<Vec<String>>, String> {
+    let path = roots.home.join(CONNECTION_OWNERSHIP_RELATIVE);
+    check_ancestors(&path)?;
+    let Some(metadata) = metadata_optional(&path)? else {
+        return Ok(None);
+    };
+    if !metadata.is_file() || is_reparse(&metadata) {
+        return Err("连接所有权记录不是普通文件".into());
+    }
+    if metadata.len() > CONNECTION_OWNERSHIP_MAX_BYTES {
+        return Err("连接所有权记录超过大小限制".into());
+    }
+    let bytes = fs::read(&path).map_err(|error| error.to_string())?;
+    let value = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes);
+    let record: ConnectionOwnershipRecord = serde_json::from_slice(value)
+        .map_err(|error| format!("连接所有权记录 JSON 无效：{error}"))?;
+    if record.schema_version != 1 || record.pack_id != "codex-starter" {
+        return Err("连接所有权记录身份不匹配；为避免误删，未清理环境变量".into());
+    }
+    let mut names = Vec::new();
+    for name in record.names {
+        if !OWNED_CONNECTION_ENV_NAMES.contains(&name.as_str()) {
+            return Err(format!(
+                "连接所有权记录包含未声明的环境变量 {name}；为避免误删，未清理环境变量"
+            ));
+        }
+        if !names.iter().any(|existing| existing == &name) {
+            names.push(name);
+        }
+    }
+    Ok(Some(names))
+}
+
+#[cfg(windows)]
+fn cleanup_owned_connection_environment(names: &[String]) -> CleanupItem {
+    use windows_sys::Win32::Foundation::{
+        ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS,
+    };
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegDeleteValueW, RegOpenKeyExW, HKEY_CURRENT_USER, KEY_SET_VALUE,
+    };
+
+    const REPORT_PATH: &str = "HKCU\\Environment (Codex capability pack)";
+    if names.is_empty() {
+        return CleanupItem {
+            path: REPORT_PATH.into(),
+            status: "absent".into(),
+            detail: "能力包没有登记需要清理的当前用户环境变量".into(),
+        };
+    }
+    let subkey = "Environment\0".encode_utf16().collect::<Vec<_>>();
+    let mut handle = std::ptr::null_mut();
+    let status = unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            0,
+            KEY_SET_VALUE,
+            &mut handle,
+        )
+    };
+    if status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND {
+        return CleanupItem {
+            path: REPORT_PATH.into(),
+            status: "absent".into(),
+            detail: "当前用户环境变量注册表项不存在".into(),
+        };
+    }
+    if status != ERROR_SUCCESS || handle.is_null() {
+        return CleanupItem {
+            path: REPORT_PATH.into(),
+            status: "failed".into(),
+            detail: format!("打开当前用户环境变量注册表项失败（Win32 {status}）"),
+        };
+    }
+
+    struct Key(windows_sys::Win32::System::Registry::HKEY);
+    impl Drop for Key {
+        fn drop(&mut self) {
+            unsafe { RegCloseKey(self.0) };
+        }
+    }
+    let _key = Key(handle);
+    let mut removed = 0usize;
+    let mut absent = 0usize;
+    let mut failures = Vec::new();
+    for name in names {
+        let name_wide = name
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let status = unsafe { RegDeleteValueW(handle, name_wide.as_ptr()) };
+        match status {
+            ERROR_SUCCESS => removed += 1,
+            ERROR_FILE_NOT_FOUND => absent += 1,
+            other => failures.push(format!("{name}（Win32 {other}）")),
+        }
+    }
+    if !failures.is_empty() {
+        return CleanupItem {
+            path: REPORT_PATH.into(),
+            status: "failed".into(),
+            detail: format!(
+                "已删除 {removed} 个、原本不存在 {absent} 个；删除失败：{}",
+                failures.join("、")
+            ),
+        };
+    }
+    CleanupItem {
+        path: REPORT_PATH.into(),
+        status: if removed == 0 { "absent" } else { "removed" }.into(),
+        detail: format!("已删除 {removed} 个能力包登记的当前用户环境变量；原本不存在 {absent} 个"),
+    }
+}
+
+#[cfg(not(windows))]
+fn cleanup_owned_connection_environment(_names: &[String]) -> CleanupItem {
+    CleanupItem {
+        path: "当前用户环境变量（Codex capability pack）".into(),
+        status: "unsupported".into(),
+        detail: "当前平台不支持 Windows 能力包环境变量清理".into(),
+    }
+}
+
+/// The PowerShell finalizer publishes `finalizer.ready` only as a short-lived
+/// observation marker.  It can legitimately create the marker, release the
+/// lifetime lock, remove the helper directory, persist the final report, and
+/// exit before this process observes the marker.  In that race the durable
+/// report is the authoritative completion signal.
+fn finalizer_report_completed(report: &Path) -> Result<bool, String> {
+    check_ancestors(report)?;
+    let Some(metadata) = metadata_optional(report)? else {
+        return Ok(false);
+    };
+    if !metadata.is_file() || is_reparse(&metadata) {
+        return Err("卸载报告不是普通文件".into());
+    }
+    if metadata.len() > 1024 * 1024 {
+        return Err("卸载报告超过大小限制".into());
+    }
+    let bytes = fs::read(report).map_err(|error| error.to_string())?;
+    let value = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes);
+    let report: CleanupReport =
+        serde_json::from_slice(value).map_err(|error| format!("卸载报告 JSON 无效：{error}"))?;
+    Ok(report.helper_finalization == "removed"
+        && matches!(report.status.as_str(), "completed" | "partialFailure")
+        && (report.phase.is_empty() || report.phase == "completed")
+        && report.exit_code.map_or(true, |code| code == 0))
+}
+
+#[cfg(windows)]
+fn confirm_finalizer_report(report: &Path) -> Result<(), String> {
+    let deadline = Instant::now() + FINALIZER_REPORT_CONFIRM_TIMEOUT;
+    loop {
+        let detail = match finalizer_report_completed(report) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {
+                "卸载报告尚未确认收尾完成（helperFinalization 不是 removed，或 status 仍未完成）"
+                    .to_string()
+            }
+            Err(error) => format!("读取最终卸载报告失败：{error}"),
+        };
+        if Instant::now() >= deadline {
+            return Err(detail);
+        }
+        std::thread::sleep(FINALIZER_REPORT_CONFIRM_INTERVAL);
+    }
+}
+
 fn validated_helper_cleanup_targets(
     helper_dir: &Path,
     roots: &CleanupRoots,
@@ -1307,6 +1683,9 @@ pub fn launch_deferred_cleanup(
             &CleanupReport {
                 schema_version: 1,
                 status: "awaitingManagerExit".into(),
+                phase: "prepare".into(),
+                exit_code: None,
+                retry_suggestion: "等待安装器退出后自动继续清理；失败时可根据报告重试卸载".into(),
                 items: plan
                     .prior_notes
                     .iter()
@@ -1462,6 +1841,37 @@ function Publish-FinalizerError([string]$problem) {{
     Move-Item -LiteralPath $pending -Destination $target -ErrorAction Stop
   }} catch {{ }}
 }}
+function Publish-FinalizerReport([object]$value, [bool]$allowFailure) {{
+  # Never expose a partially overwritten JSON file to the Rust confirmer.
+  # The staging file is in the same directory so the final move is a
+  # same-volume replacement, and its name is bound to this nonce.
+  Assert-SafeAncestors $report
+  $pendingReport=$report+'.{token}.pending'
+  Assert-SafeAncestors $pendingReport
+  if(Test-Path -LiteralPath $pendingReport) {{ throw 'Finalizer report staging file already exists' }}
+  $json=$value | ConvertTo-Json -Depth 10
+  $json | Set-Content -LiteralPath $pendingReport -Encoding UTF8
+  $staged=Get-Content -LiteralPath $pendingReport -Raw -Encoding UTF8 | ConvertFrom-Json
+  if(-not $allowFailure -and [string]$staged.helperFinalization -ne 'removed') {{ throw 'Staged finalizer report did not confirm helper removal' }}
+  if($allowFailure -and [string]$staged.status -ne 'partialFailure') {{ throw ('Staged finalizer failure report status is not partialFailure: '+[string]$staged.status) }}
+  if(-not $allowFailure -and @('completed','partialFailure') -notcontains [string]$staged.status) {{ throw ('Staged finalizer report status is not terminal: '+[string]$staged.status) }}
+  Move-Item -LiteralPath $pendingReport -Destination $report -Force -ErrorAction Stop
+  return (Get-Content -LiteralPath $report -Raw -Encoding UTF8 | ConvertFrom-Json)
+}}
+function Get-ReportIssueSummary([object]$value) {{
+  if($null -eq $value) {{ return $null }}
+  $lines=@()
+  foreach($item in @($value.items)) {{
+    if(@('failed','deferred','preserved','warning') -notcontains [string]$item.status) {{ continue }}
+    $detail=[string]$item.detail
+    $detail=($detail -replace '[\r\n]+',' ')
+    if($detail.Length -gt 720) {{ $detail=$detail.Substring(0,720)+'…' }}
+    $lines += ('- ['+[string]$item.status+'] '+[string]$item.path+'：'+$detail)
+    if($lines.Count -ge 8) {{ break }}
+  }}
+  if($lines.Count -eq 0) {{ return $null }}
+  return ('具体原因/保留项：' + "`r`n" + ($lines -join "`r`n"))
+}}
 try {{
   Assert-SafeAncestors $helper
   Assert-SafeAncestors $report
@@ -1501,19 +1911,36 @@ try {{
   if($last) {{ throw $last }}
   $r=Get-Content -LiteralPath $report -Raw -Encoding UTF8 | ConvertFrom-Json
   $r.helperFinalization='removed'
+  $r.phase='completed'
+  $r.exitCode=0
+  $r.retrySuggestion=''
   if($r.status -eq 'finalizing') {{ $r.status='completed' }}
-  $r | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $report -Encoding UTF8
+  $r=Publish-FinalizerReport $r $false
   $finalizationRecorded=$true
 }} catch {{
   $finalizationRecorded=$false
   $problem=$_.Exception.Message
   $finalizationError=$problem
   Publish-FinalizerError $problem
-  try {{ Assert-SafeAncestors $report; $r=Get-Content -LiteralPath $report -Raw -Encoding UTF8 | ConvertFrom-Json; $r.helperFinalization='failed: '+$problem; $r.status='partialFailure'; $r | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $report -Encoding UTF8 }} catch {{ }}
+  try {{
+    Assert-SafeAncestors $report
+    $pendingReport=$report+'.{token}.pending'
+    Assert-SafeAncestors $pendingReport
+    if(Test-Path -LiteralPath $pendingReport) {{ Remove-Item -LiteralPath $pendingReport -Force -ErrorAction Stop }}
+    $r=Get-Content -LiteralPath $report -Raw -Encoding UTF8 | ConvertFrom-Json
+    $r.helperFinalization='failed: '+$problem
+    $r.phase='failed'
+    $r.exitCode=2
+    $r.retrySuggestion='请根据报告中的具体失败文件处理占用或权限后重试卸载'
+    $r.status='partialFailure'
+    $null=Publish-FinalizerReport $r $true
+  }} catch {{ }}
 }}
 if({show_result}) {{ try {{
   $summary=if($finalizationRecorded -and $r.status -eq 'completed') {{ '已完成所选范围清理，临时清理组件也已删除。' }} else {{ '部分卸载清理未完成，请查看报告中的失败与保留项目。' }}
   if($finalizationError) {{ $summary += "`r`n收尾错误："+$finalizationError }}
+  $issueSummary=Get-ReportIssueSummary $r
+  if($issueSummary) {{ $summary += "`r`n"+$issueSummary }}
   $shell=New-Object -ComObject WScript.Shell
   $null=$shell.Popup(($summary+"`r`n"+$report),60,'Codex 卸载清理结果',64)
 }} catch {{ }} }}
@@ -1580,6 +2007,24 @@ fn schedule_self_cleanup(
             return Err(format!("临时组件收尾进程启动失败：{error}"));
         }
         if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+            if status.success() {
+                // The marker may have been created and consumed between two
+                // 100 ms polls.  Confirm the durable report for a short,
+                // bounded window instead of treating one transient read or
+                // parse failure as a cleanup failure. The PowerShell script
+                // also performs a read-back check before it can return 0.
+                match confirm_finalizer_report(report) {
+                    Ok(()) => return Ok(()),
+                    Err(report_error) => {
+                        let detail = read_finalizer_error(helper_dir)?
+                            .map(|error| format!("{report_error}；收尾错误：{error}"))
+                            .unwrap_or(report_error);
+                        return Err(format!(
+                            "临时组件收尾进程已退出但未确认最终报告：{status}；{detail}"
+                        ));
+                    }
+                }
+            }
             let detail = read_finalizer_error(helper_dir)?
                 .unwrap_or_else(|| "收尾进程未写入错误详情".into());
             return Err(format!(
@@ -1633,7 +2078,7 @@ fn run_helper(nonce_arg: &str) -> Result<(), String> {
     let _mutex = acquire_cleanup_mutex()?;
     let lifetime_lock = create_lifetime_lock(helper_dir, &nonce)?;
     let report_file = report_path(&roots, &nonce);
-    let mut report = CleanupReport { schema_version: 1, status: "awaitingManagerExit".into(), items: plan.prior_notes.iter().map(|note| CleanupItem { path: "systemUninstall".into(), status: "note".into(), detail: note.clone() }).collect(), helper_finalization: "pending".into(),
+    let mut report = CleanupReport { schema_version: 1, status: "awaitingManagerExit".into(), phase: "prepare".into(), exit_code: None, retry_suggestion: "等待安装器退出后自动继续清理；失败时可根据报告重试卸载".into(), items: plan.prior_notes.iter().map(|note| CleanupItem { path: "systemUninstall".into(), status: "note".into(), detail: note.clone() }).collect(), helper_finalization: "pending".into(),
         note: "本报告是卸载确认中声明保留的唯一诊断输出。共享 VC++/WebView2、非本产品文件及未知系统状态不强制删除。".into() };
     write_report(&report_file, &report)?;
     // Atomic ready publication avoids a partial JSON handshake read.
@@ -1646,6 +2091,7 @@ fn run_helper(nonce_arg: &str) -> Result<(), String> {
         .and_then(|mut file| file.write_all(&ready_bytes))
         .map_err(|error| error.to_string())?;
     fs::rename(&pending, helper_dir.join("ready.json")).map_err(|error| error.to_string())?;
+    report.phase = "cleanup".into();
     let cleanup = (|| {
         if unsafe { WaitForSingleObject(parent.0, 120000) } != WAIT_OBJECT_0 {
             return Err("安装器 120 秒内未退出，未执行任何数据删除".to_string());
@@ -1673,10 +2119,44 @@ fn run_helper(nonce_arg: &str) -> Result<(), String> {
         // bounded newest tail inside the durable report before deleting the
         // manager-owned log/cache tree.
         report.items.push(capture_latest_log_tail(&roots));
+        // Read the ownership record before `.codex` is removed.  Only names
+        // explicitly recorded by this capability pack are eligible for HKCU
+        // environment cleanup; an absent or invalid record never broadens
+        // the deletion scope.
+        let owned_connection_env_names = if plan.purge_user_data {
+            Some(read_owned_connection_env_names(&roots))
+        } else {
+            None
+        };
         let selected_targets = roots.targets(plan.purge_user_data, plan.purge_ccswitch_data)?;
         report
             .items
             .extend(clean_targets_with_recheck(&selected_targets, || {}));
+        if let Some(result) = owned_connection_env_names {
+            match result {
+                Ok(Some(names)) => report
+                    .items
+                    .push(cleanup_owned_connection_environment(&names)),
+                Ok(None) => report.items.push(CleanupItem {
+                    path: roots
+                        .home
+                        .join(CONNECTION_OWNERSHIP_RELATIVE)
+                        .display()
+                        .to_string(),
+                    status: "absent".into(),
+                    detail: "未发现能力包连接所有权记录；未触碰未核验的环境变量".into(),
+                }),
+                Err(error) => report.items.push(CleanupItem {
+                    path: roots
+                        .home
+                        .join(CONNECTION_OWNERSHIP_RELATIVE)
+                        .display()
+                        .to_string(),
+                    status: "failed".into(),
+                    detail: error,
+                }),
+            }
+        }
         report
             .items
             .extend(clean_stale_helpers(&roots, helper_dir)?);
@@ -1696,6 +2176,7 @@ fn run_helper(nonce_arg: &str) -> Result<(), String> {
         ];
         if plan.purge_user_data {
             empty_containers.extend([
+                roots.home.join(".agents"),
                 roots.local.join("OpenAI"),
                 roots.roaming.join("OpenAI"),
                 roots.local.join("Codex"),
@@ -1761,8 +2242,29 @@ fn run_helper(nonce_arg: &str) -> Result<(), String> {
         "finalizing"
     }
     .into();
+    report.phase = "finalizing".into();
+    report.exit_code = None;
+    report.retry_suggestion = if report.status == "partialFailure" {
+        "请查看报告中的失败/保留项，处理占用或权限后重试卸载".into()
+    } else {
+        "等待收尾组件完成自清理".into()
+    };
     write_report(&report_file, &report)?;
-    if let Err(error) = schedule_self_cleanup(helper_dir, &report_file, &nonce) {
+    let finalizer_error = match schedule_self_cleanup(helper_dir, &report_file, &nonce) {
+        Ok(()) => None,
+        Err(error) => Some(error),
+    };
+    // `finalizer.ready` only means that the detached PowerShell process has
+    // taken ownership of the handoff and is waiting for this exact lifetime
+    // lock. The helper must release the lock before the durable report can be
+    // completed; confirm that report after the release instead of returning
+    // exit code 0 while the finalizer is still racing the report write.
+    drop(lifetime_lock);
+    let finalizer_error = match finalizer_error {
+        Some(error) => Some(error),
+        None => confirm_finalizer_report(&report_file).err(),
+    };
+    if let Some(error) = finalizer_error {
         let fallback = schedule_helper_cleanup_on_reboot(helper_dir, &roots);
         let fallback_detail = match fallback {
             Ok(detail) => {
@@ -1785,17 +2287,17 @@ fn run_helper(nonce_arg: &str) -> Result<(), String> {
         };
         report.helper_finalization = format!("failed: {error}; {fallback_detail}");
         report.status = "partialFailure".into();
+        report.phase = "failed".into();
+        report.exit_code = Some(2);
+        report.retry_suggestion = "请根据报告中的具体失败文件处理占用或权限后重试卸载".into();
         write_report(&report_file, &report)?;
-        drop(lifetime_lock);
+        let issue_summary = report_issue_summary(&report)
+            .unwrap_or_else(|| "具体原因/保留项：未能从报告读取到可展开的失败条目".into());
         return Err(format!(
-            "{error}；{fallback_detail}；报告：{}",
+            "{error}；{fallback_detail}；{issue_summary}；报告：{}",
             report_file.display()
         ));
     }
-    // Releasing this exact no-share file is the finalizer's signal that the
-    // helper has finished every write. The process exits immediately after
-    // returning, so an image-file sharing delay is handled by finalizer retry.
-    drop(lifetime_lock);
     Ok(())
 }
 
@@ -1868,6 +2370,26 @@ mod tests {
     }
 
     #[test]
+    fn exact_legacy_uninstall_report_names_only() {
+        for good in [
+            "Codex-Uninstall-Report-eeb6727-1980-4830-af22-1b989e2cac82.json",
+            "Codex-Uninstall-Report-legacy.json",
+        ] {
+            assert!(is_legacy_uninstall_report_name(good));
+        }
+        for bad in [
+            "Codex-Uninstall-Report-.json",
+            "Codex-Uninstall-Report-legacy.txt",
+            "prefix-Codex-Uninstall-Report-legacy.json",
+            "Codex-Uninstall-Report-legacy.json.backup",
+            "Codex-Uninstall-Report-..\\outside.json",
+            "Codex-Uninstall-Report-../outside.json",
+        ] {
+            assert!(!is_legacy_uninstall_report_name(bad));
+        }
+    }
+
+    #[test]
     fn clean_nested_tree_and_idempotent_absence() {
         let root = TempRoot::new();
         let target = root.0.join("owned");
@@ -1932,6 +2454,44 @@ mod tests {
         )
         .unwrap();
         assert!(read_finalizer_error(&root.0).is_err());
+    }
+
+    #[test]
+    fn connection_ownership_record_is_bounded_to_declared_pack_names() {
+        let root = TempRoot::new();
+        let roots = fake_roots(&root.0);
+        let path = roots.home.join(CONNECTION_OWNERSHIP_RELATIVE);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            serde_json::json!({
+                "schemaVersion": 1,
+                "packId": "codex-starter",
+                "names": ["DASHSCOPE_API_KEY", "FEISHU_APP_SECRET", "DASHSCOPE_API_KEY"]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let names = read_owned_connection_env_names(&roots).unwrap().unwrap();
+        assert_eq!(
+            names,
+            vec![
+                "DASHSCOPE_API_KEY".to_string(),
+                "FEISHU_APP_SECRET".to_string()
+            ]
+        );
+
+        fs::write(
+            &path,
+            serde_json::json!({
+                "schemaVersion": 1,
+                "packId": "codex-starter",
+                "names": ["PATH"]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(read_owned_connection_env_names(&roots).is_err());
     }
 
     #[test]
@@ -2015,6 +2575,17 @@ mod tests {
     }
 
     #[test]
+    fn uninstall_report_path_is_independent_of_manager_data_root() {
+        let root = TempRoot::new();
+        let roots = fake_roots(&root.0);
+        let report = report_path(&roots, "g22");
+        let manager_root = roots.local.join("io.github.wangnov.codexappmanager");
+        assert!(report.starts_with(&roots.desktop));
+        assert!(!report.starts_with(&manager_root));
+        assert!(!report.starts_with(&roots.local));
+    }
+
+    #[test]
     fn allowlist_never_selects_publisher_or_shared_user_data() {
         let root = TempRoot::new();
         let roots = fake_roots(&root.0);
@@ -2022,6 +2593,7 @@ mod tests {
         assert!(targets.contains(&roots.roaming.join("wangnov/codexappmanager")));
         assert!(!targets.contains(&roots.roaming.join("wangnov")));
         assert!(!targets.contains(&roots.home.join(".codex")));
+        assert!(!targets.contains(&roots.home.join(".agents/skills")));
         for shared in [
             roots.local.join("Packages/OpenAI.Codex_2p2nqsd0c76g0"),
             roots.local.join("OpenAI/Codex"),
@@ -2044,6 +2616,10 @@ mod tests {
                 .local
                 .join("CodexAppxDataBackups/OpenAI.Codex_2p2nqsd0c76g0")
         ));
+        assert!(roots
+            .targets(true, false)
+            .unwrap()
+            .contains(&roots.home.join(".agents/skills")));
     }
 
     #[test]
@@ -2101,6 +2677,7 @@ mod tests {
         let switch = roots.targets(false, true).unwrap();
         for expected in [
             roots.home.join(".codex"),
+            roots.home.join(".agents/skills"),
             roots.local.join("Packages/OpenAI.Codex_2p2nqsd0c76g0"),
             roots.local.join("OpenAI/Codex"),
             roots.local.join("Codex/Logs"),
@@ -2362,6 +2939,13 @@ mod tests {
         assert!(!script.contains("StartTime"));
         assert!(script.contains("[IO.File]::ReadAllText($lock)"));
         assert!(script.contains("helperFinalization='removed'"));
+        assert!(script.contains("Publish-FinalizerReport"));
+        assert!(script.contains("Get-ReportIssueSummary"));
+        assert!(script.contains("具体原因/保留项"));
+        assert!(
+            script.contains("Move-Item -LiteralPath $pendingReport -Destination $report -Force")
+        );
+        assert!(script.contains("Staged finalizer report did not confirm helper removal"));
         assert!(script.contains("finalizer.ready"));
         assert!(script.contains("finalizer.error.txt"));
         assert!(script.contains("exit 2"));
@@ -2394,6 +2978,145 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    #[test]
+    fn report_issue_summary_lists_bounded_failure_paths() {
+        let report = CleanupReport {
+            schema_version: 1,
+            status: "partialFailure".into(),
+            phase: "failed".into(),
+            exit_code: Some(2),
+            retry_suggestion: "retry fixture".into(),
+            items: vec![
+                CleanupItem {
+                    path: r"C:\locked\usb-license.json".into(),
+                    status: "preserved".into(),
+                    detail: "许可证身份校验失败\n保留以便重试".into(),
+                },
+                CleanupItem {
+                    path: "ignored-note".into(),
+                    status: "note".into(),
+                    detail: "not an issue".into(),
+                },
+            ],
+            helper_finalization: "failed: fixture".into(),
+            note: "fixture".into(),
+        };
+        let summary = report_issue_summary(&report).unwrap();
+        assert!(summary.contains("具体原因/保留项"));
+        assert!(summary.contains(r"C:\locked\usb-license.json"));
+        assert!(summary.contains("许可证身份校验失败 保留以便重试"));
+        assert!(!summary.contains("not an issue"));
+    }
+
+    #[test]
+    fn durable_finalizer_report_wins_when_transient_ready_marker_was_missed() {
+        let root = TempRoot::new();
+        let report = root.0.join("report.json");
+        fs::write(
+            &report,
+            serde_json::to_vec(&CleanupReport {
+                schema_version: 1,
+                status: "completed".into(),
+                phase: "completed".into(),
+                exit_code: Some(0),
+                retry_suggestion: String::new(),
+                items: Vec::new(),
+                helper_finalization: "removed".into(),
+                note: "fixture".into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(finalizer_report_completed(&report).unwrap());
+
+        let partial = root.0.join("partial.json");
+        fs::write(
+            &partial,
+            serde_json::to_vec(&CleanupReport {
+                schema_version: 1,
+                status: "partialFailure".into(),
+                phase: "completed".into(),
+                exit_code: Some(0),
+                retry_suggestion: "retry fixture".into(),
+                items: vec![CleanupItem {
+                    path: "fixture".into(),
+                    status: "failed".into(),
+                    detail: "locked".into(),
+                }],
+                helper_finalization: "removed".into(),
+                note: "fixture".into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(finalizer_report_completed(&partial).unwrap());
+    }
+
+    #[test]
+    fn incomplete_finalizer_report_is_not_accepted_as_success() {
+        let root = TempRoot::new();
+        let report = root.0.join("report.json");
+        fs::write(
+            &report,
+            serde_json::to_vec(&CleanupReport {
+                schema_version: 1,
+                status: "finalizing".into(),
+                phase: "finalizing".into(),
+                exit_code: None,
+                retry_suggestion: "wait fixture".into(),
+                items: Vec::new(),
+                helper_finalization: "pending".into(),
+                note: "fixture".into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(!finalizer_report_completed(&report).unwrap());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn finalizer_report_confirmation_retries_transient_incomplete_state() {
+        let root = TempRoot::new();
+        let report = root.0.join("report.json");
+        fs::write(
+            &report,
+            serde_json::to_vec(&CleanupReport {
+                schema_version: 1,
+                status: "finalizing".into(),
+                phase: "finalizing".into(),
+                exit_code: None,
+                retry_suggestion: "wait fixture".into(),
+                items: Vec::new(),
+                helper_finalization: "pending".into(),
+                note: "fixture".into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let delayed_report = report.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            fs::write(
+                delayed_report,
+                serde_json::to_vec(&CleanupReport {
+                    schema_version: 1,
+                    status: "completed".into(),
+                    phase: "completed".into(),
+                    exit_code: Some(0),
+                    retry_suggestion: String::new(),
+                    items: Vec::new(),
+                    helper_finalization: "removed".into(),
+                    note: "fixture".into(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        });
+        assert!(confirm_finalizer_report(&report).is_ok());
+        writer.join().unwrap();
     }
 
     #[cfg(windows)]
@@ -2468,6 +3191,9 @@ mod tests {
             serde_json::to_vec(&CleanupReport {
                 schema_version: 1,
                 status: initial_status.into(),
+                phase: initial_status.into(),
+                exit_code: None,
+                retry_suggestion: "retry fixture".into(),
                 items: if initial_status == "partialFailure" {
                     vec![CleanupItem {
                         path: "fixture-owned-cache".into(),

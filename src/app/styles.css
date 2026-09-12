@@ -201,10 +201,12 @@
   margin: 0;
   padding: 0;
 }
+:root,
 html,
 body,
 #root {
   height: 100%;
+  background: transparent;
 }
 body {
   font-family: var(--font);
@@ -1773,6 +1775,15 @@ button.themecard-art:focus-visible {
   border-radius: var(--r-md);
   font-size: var(--fs-body);
 }
+.actions .update-entry-wrap,
+.actions .update-entry-wrap > .tooltip-anchor,
+.actions .update-entry-wrap > .tooltip-anchor > .update-entry {
+  width: 100%;
+}
+.update-entry {
+  border-style: dashed;
+  color: var(--text-soft);
+}
 .btn {
   appearance: none;
   border: 1px solid var(--line-2);
@@ -1894,6 +1905,138 @@ button.themecard-art:focus-visible {
 }
 .component-entry:hover:not(:disabled) {
   color: var(--text-soft);
+}
+.skill-repo-entry {
+  margin: 0 0 2px;
+}
+.skill-repo-entry-button {
+  width: 100%;
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 10px 13px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-weight: 650;
+  text-align: start;
+  cursor: pointer;
+  box-shadow: var(--elev-1);
+  transition: background-color 0.18s var(--ease), border-color 0.18s var(--ease),
+    box-shadow 0.18s var(--ease), transform 0.18s var(--ease);
+}
+.skill-repo-entry-button > svg:first-child {
+  width: 17px;
+  height: 17px;
+  color: var(--accent);
+  flex: 0 0 auto;
+}
+.skill-repo-entry-button:hover,
+.skill-repo-entry-button:focus-visible {
+  background: var(--surface-2);
+  border-color: var(--line-2);
+  box-shadow: var(--elev-2);
+}
+.skill-repo-entry-button:active {
+  transform: translateY(1px);
+}
+.skill-repo-entry-chevron {
+  width: 15px;
+  height: 15px;
+  margin-inline-start: auto;
+  color: var(--text-faint);
+  transition: transform 0.18s var(--ease);
+}
+.skill-repo-entry-button[aria-expanded="true"] .skill-repo-entry-chevron {
+  transform: rotate(90deg);
+}
+.skill-repo-sheet {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-height: min(78vh, 700px);
+  overflow-y: auto;
+  padding-right: 2px;
+  text-align: start;
+}
+.skill-repo-sheet-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.skill-repo-sheet-heading svg {
+  width: 21px;
+  height: 21px;
+  color: var(--accent);
+  flex: 0 0 auto;
+}
+.skill-repo-sheet-heading h3 {
+  margin: 0;
+}
+.skill-repo-sheet-description {
+  margin: 0;
+  color: var(--text-soft);
+  line-height: 1.5;
+}
+.skill-repo-sheet-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.skill-repo-sheet-actions .btn {
+  flex: 1 1 150px;
+}
+.skill-repo-update-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+  color: var(--text-soft);
+  line-height: 1.45;
+}
+.skill-repo-update-summary .btn {
+  align-self: stretch;
+}
+.skill-repo-failure-details {
+  margin-top: 8px;
+  color: var(--text-soft);
+}
+.skill-repo-failure-details summary {
+  cursor: pointer;
+  color: var(--text);
+  font-weight: 650;
+}
+.skill-repo-failure-detail {
+  display: grid;
+  gap: 4px;
+  margin: 8px 0;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--line) 75%, transparent);
+  border-radius: var(--r-md);
+  background: color-mix(in srgb, var(--surface-2) 80%, transparent);
+  overflow-wrap: anywhere;
+  font-size: var(--fs-caption);
+  line-height: 1.45;
+}
+.skill-repo-failure-code {
+  color: var(--text-faint);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+.skill-repo-diagnostic-status {
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+  margin-top: 0.35rem;
+}
+.skill-repo-failure-details .btn {
+  min-height: 34px;
+  padding-block: 6px;
 }
 .component-sheet {
   display: flex;
@@ -2265,6 +2408,10 @@ button.row.danger:hover {
 .usb-guard-authorized {
   border-color: color-mix(in oklch, var(--success) 35%, var(--line));
   background: color-mix(in oklch, var(--success) 8%, var(--surface));
+}
+.usb-guard-starting {
+  border-color: color-mix(in oklch, var(--accent) 35%, var(--line));
+  background: color-mix(in oklch, var(--accent) 7%, var(--surface));
 }
 .usb-guard-grace,
 .usb-guard-mismatch,
@@ -3201,6 +3348,21 @@ button.row.danger:hover {
 .foot .gobtn:hover {
   color: var(--accent-deep);
   background: var(--surface-2);
+}
+.foot-evidence {
+  gap: 5px;
+  cursor: help;
+  outline: none;
+}
+.foot-evidence svg {
+  width: 13px;
+  height: 13px;
+}
+.foot-evidence:focus-visible {
+  color: var(--accent-deep);
+  outline: 2px solid var(--ring-focus);
+  outline-offset: 3px;
+  border-radius: 6px;
 }
 
 /* ── Confirm sheet ───────────────────────────────────────────────────────── */

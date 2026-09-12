@@ -1,0 +1,111 @@
+{
+  "schemaVersion": 1,
+  "source": "upstream-codex-model-catalog",
+  "snapshotVersion": "2026-09-12T20:10:05.9802472Z",
+  "clientVersion": "0.154.0-alpha.6.2",
+  "preferredModel": "gpt-6-astra",
+  "retiredModelIds": [
+    "gpt-5.2"
+  ],
+  "models": [
+    {
+      "id": "gpt-6-astra",
+      "displayName": "GPT-6-Astra",
+      "visibility": "list",
+      "supportedInApi": true,
+      "priority": 1,
+      "defaultReasoningLevel": "low",
+      "reasoningLevels": ["low", "medium", "high", "xhigh", "max", "ultra"]
+    },
+    {
+      "id": "gpt-5.6-sol",
+      "displayName": "GPT-5.6-Sol",
+      "visibility": "list",
+      "supportedInApi": true,
+      "priority": 6,
+      "defaultReasoningLevel": "low",
+      "reasoningLevels": ["low", "medium", "high", "xhigh", "max", "ultra"]
+    },
+    {
+      "id": "gpt-5.6-terra",
+      "displayName": "GPT-5.6-Terra",
+      "visibility": "list",
+      "supportedInApi": true,
+      "priority": 7,
+      "defaultReasoningLevel": "medium",
+      "reasoningLevels": ["low", "medium", "high", "xhigh", "max", "ultra"]
+    },
+    {
+      "id": "gpt-5.6-luna",
+      "displayName": "GPT-5.6-Luna",
+      "visibility": "list",
+      "supportedInApi": true,
+      "priority": 8,
+      "defaultReasoningLevel": "medium",
+      "reasoningLevels": ["low", "medium", "high", "xhigh", "max"]
+    },
+    {
+      "id": "gpt-daybreak-blue-latest",
+      "displayName": "Daybreak Blue",
+      "visibility": "hide",
+      "supportedInApi": true,
+      "priority": 10,
+      "defaultReasoningLevel": "low",
+      "reasoningLevels": ["low", "medium", "high", "xhigh", "max", "ultra"]
+    },
+    {
+      "id": "gpt-daybreak-red-latest",
+      "displayName": "Daybreak Red",
+      "visibility": "hide",
+      "supportedInApi": true,
+      "priority": 11,
+      "defaultReasoningLevel": "medium",
+      "reasoningLevels": ["low", "medium", "high", "xhigh", "max", "ultra"]
+    },
+    {
+      "id": "gpt-5.5",
+      "displayName": "GPT-5.5",
+      "visibility": "list",
+      "supportedInApi": true,
+      "priority": 12,
+      "defaultReasoningLevel": "medium",
+      "reasoningLevels": ["low", "medium", "high", "xhigh"]
+    },
+    {
+      "id": "gpt-5.4",
+      "displayName": "GPT-5.4",
+      "visibility": "hide",
+      "supportedInApi": true,
+      "priority": 16,
+      "defaultReasoningLevel": "medium",
+      "reasoningLevels": ["low", "medium", "high", "xhigh"]
+    },
+    {
+      "id": "gpt-5.4-mini",
+      "displayName": "GPT-5.4-Mini",
+      "visibility": "hide",
+      "supportedInApi": true,
+      "priority": 23,
+      "defaultReasoningLevel": "medium",
+      "reasoningLevels": ["low", "medium", "high", "xhigh"]
+    },
+    {
+      "id": "gpt-5.2",
+      "displayName": "GPT-5.2",
+      "visibility": "list",
+      "supportedInApi": true,
+      "priority": 29,
+      "defaultReasoningLevel": "medium",
+      "reasoningLevels": ["low", "medium", "high", "xhigh"]
+    },
+    {
+      "id": "codex-auto-review",
+      "displayName": "Codex Auto Review",
+      "visibility": "hide",
+      "supportedInApi": true,
+      "priority": 43,
+      "defaultReasoningLevel": "medium",
+      "reasoningLevels": ["low", "medium", "high", "xhigh", "max"]
+    }
+  ]
+}

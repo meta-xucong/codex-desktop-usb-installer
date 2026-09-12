@@ -20,6 +20,13 @@ use crate::app::shell::{
 
 const FRONTEND_READY_GLOBAL: &str = "__CAM_FRONTEND_READY__";
 const FRONTEND_READY_EVENT: &str = "cam:frontend-readiness";
+/// Native event routing may wait for this handshake, but it must never be the
+/// condition for showing the local startup shell.
+const FRONTEND_READY_TIMEOUT_SECS: u64 = 3;
+/// The native WebView2 safety callback is normally immediate. If it is not,
+/// the user must still receive visible feedback instead of a silent process.
+#[cfg(target_os = "windows")]
+const WEBVIEW_STARTUP_NOTICE_TIMEOUT_SECS: u64 = 5;
 
 /// The "ask before closing" setting, read fresh from disk so a toggle in
 /// Settings takes effect immediately (no restart).
@@ -338,6 +345,38 @@ fn show_windows_startup_error(detail: &str) {
     }
 }
 
+/// A non-fatal native notice for the only startup state that cannot render the
+/// HTML shell yet: WebView2 has not completed the release accelerator safety
+/// gate. This deliberately uses a MessageBox rather than a renderer dialog,
+/// so it remains visible when the document never reaches PageLoadEvent::Started.
+#[cfg(target_os = "windows")]
+fn show_windows_startup_notice_once(app: &tauri::AppHandle, detail: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONWARNING, MB_OK};
+
+    let state = app.state::<state::ManagerState>();
+    if state.startup_notice_shown.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    log::warn!("native startup notice shown detail={detail}");
+    let title: Vec<u16> = "Codex App Manager\0".encode_utf16().collect();
+    let body: Vec<u16> = format!(
+        "本地离线界面仍在启动，暂未执行安装或更新。\n\n\
+         此步骤不需要联网。请点击“确定”后重新双击启动；如果反复出现，请打开日志并检查本机 WebView2 运行库。\n\n\
+         {detail}\0"
+    )
+    .encode_utf16()
+    .collect();
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            body.as_ptr(),
+            title.as_ptr(),
+            MB_OK | MB_ICONWARNING,
+        );
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn abort_for_unsafe_windows_webview(app: &tauri::AppHandle, detail: &str) {
     log::error!("WebView2 release safety gate failed: {detail}");
@@ -378,21 +417,21 @@ fn configure_windows_browser_accelerators(
         };
         match result {
             Ok(()) => {
-                let frontend_presentable = {
-                    let state = app_handle.state::<state::ManagerState>();
-                    state.webview_safe_to_show.store(true, Ordering::SeqCst);
-                    state.frontend.can_present_window()
-                };
-                if frontend_presentable {
-                    restore_main_window(&app_handle, "webview-safety-gate");
-                    log::info!(
-                        "disabled native WebView2 browser accelerators and opened window={callback_label}"
-                    );
-                } else {
-                    log::info!(
-                        "disabled native WebView2 browser accelerators window={callback_label}; waiting for frontend readiness"
-                    );
-                }
+                app_handle
+                    .state::<state::ManagerState>()
+                    .webview_safe_to_show
+                    .store(true, Ordering::SeqCst);
+                // Showing the local shell is independent from the React/native
+                // readiness handshake. The document contains an inline startup
+                // skeleton, so a slow renderer cannot leave a hidden process.
+                restore_main_window(&app_handle, "webview-safety-gate");
+                log::info!(
+                    "disabled native WebView2 browser accelerators and requested shell restore window={callback_label} frontend_ready={}",
+                    app_handle
+                        .state::<state::ManagerState>()
+                        .frontend
+                        .can_present_window()
+                );
             }
             Err(error) => abort_for_unsafe_windows_webview(
                 &app_handle,
@@ -409,6 +448,28 @@ fn configure_windows_browser_accelerators(
         return Err(error);
     }
     Ok(())
+}
+
+/// If WebView2 never reaches the native safety callback, no page-load event is
+/// guaranteed to arrive either. Keep an independent native watchdog so an
+/// offline double-click always produces visible feedback.
+#[cfg(target_os = "windows")]
+fn schedule_webview_startup_watchdog(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn_blocking(move || {
+        std::thread::sleep(std::time::Duration::from_secs(
+            WEBVIEW_STARTUP_NOTICE_TIMEOUT_SECS,
+        ));
+        let state = app.state::<state::ManagerState>();
+        if state.webview_gate_failed.load(Ordering::SeqCst)
+            || state.webview_safe_to_show.load(Ordering::SeqCst)
+        {
+            return;
+        }
+        show_windows_startup_notice_once(
+            &app,
+            "WebView2 安全初始化超过 5 秒（window-visible-watchdog）",
+        );
+    });
 }
 
 /// Build the configured main window ourselves so the native webview receives
@@ -456,7 +517,14 @@ fn build_main_window(app: &tauri::App) -> tauri::Result<()> {
         })
         .build()?;
     #[cfg(target_os = "windows")]
-    configure_windows_browser_accelerators(app, &window, browser_accelerators_enabled(cfg!(dev)))?;
+    {
+        configure_windows_browser_accelerators(
+            app,
+            &window,
+            browser_accelerators_enabled(cfg!(dev)),
+        )?;
+        schedule_webview_startup_watchdog(app.handle().clone());
+    }
     #[cfg(not(target_os = "windows"))]
     let _ = window;
     Ok(())
@@ -637,7 +705,7 @@ fn frontend_token_script(readiness: &FrontendToken) -> String {
 
 fn schedule_frontend_ready_fallback(app: tauri::AppHandle, generation: u64) {
     tauri::async_runtime::spawn_blocking(move || {
-        std::thread::sleep(std::time::Duration::from_secs(10));
+        std::thread::sleep(std::time::Duration::from_secs(FRONTEND_READY_TIMEOUT_SECS));
         let Some(degraded) = app
             .state::<state::ManagerState>()
             .frontend
@@ -646,7 +714,8 @@ fn schedule_frontend_ready_fallback(app: tauri::AppHandle, generation: u64) {
             return;
         };
         log::error!(
-            "frontend readiness timed out after 10s; entering native degraded mode generation={} activation_pending={} native_event_pending={}",
+            "frontend readiness timed out after {}s; entering native degraded mode generation={} activation_pending={} native_event_pending={}",
+            FRONTEND_READY_TIMEOUT_SECS,
             generation,
             degraded.activation_pending,
             degraded.next_native_event.is_some()
@@ -656,7 +725,22 @@ fn schedule_frontend_ready_fallback(app: tauri::AppHandle, generation: u64) {
             restore_main_window(&app, "frontend-ready-timeout-single-instance");
         }
         if let Some(event) = degraded.next_native_event {
-            show_native_shell_event(app, event);
+            show_native_shell_event(app.clone(), event);
+        }
+        #[cfg(target_os = "windows")]
+        if !app
+            .state::<state::ManagerState>()
+            .webview_safe_to_show
+            .load(Ordering::SeqCst)
+            && !app
+                .state::<state::ManagerState>()
+                .webview_gate_failed
+                .load(Ordering::SeqCst)
+        {
+            show_windows_startup_notice_once(
+                &app,
+                "前端 readiness 超时，且 WebView2 安全初始化仍未完成（frontend-ready-watchdog）",
+            );
         }
     });
 }
@@ -699,28 +783,71 @@ pub fn run() {
             return;
         }
     };
-    #[cfg(target_os = "windows")]
-    if let Ok(executable) = std::env::current_exe() {
-        // Raw USB EXEs bypass the normal NSIS prerequisite installer. Check
-        // WebView2 BEFORE creating Tauri; otherwise a clean Win10 machine has
-        // no UI in which to show a useful failure. Both installers are offline
-        // and hash-pinned; native dialogs still work without a browser runtime.
-        if let Err(error) = crate::app::runtime::ensure_bundled_webview2_runtime(&executable, None)
-        {
-            eprintln!("WebView2 runtime preflight failed: {error}");
+    // This read-only gate must precede WebView2/VC probing, logging, recovery,
+    // lease creation and any automatic launch. A formal USB binary therefore
+    // cannot perform prerequisite or recovery writes on an unlicensed medium.
+    let mut usb_startup = match crate::app::usb_guard::startup_preflight() {
+        Ok(result) => result,
+        Err(error) => {
+            eprintln!("USB signed startup preflight failed: {error}");
             crate::app::runtime::show_startup_error(&error.to_string());
             return;
         }
-        match crate::app::runtime::ensure_bundled_vc_runtime(&executable, None) {
-            Ok(status) if !status.ready && crate::app::usb_guard::guard_required() => {
-                crate::app::runtime::show_startup_error(&status.message);
-                return;
-            }
-            Ok(status) => eprintln!("VC runtime preflight: {}", status.message),
+    };
+    // A normal signed bundle can render its local shell immediately when the
+    // two local runtimes are already present. If a clean machine needs either
+    // bundled prerequisite installed before Tauri can create a WebView, keep
+    // the old fail-closed order and finish the full bundle check first.
+    #[cfg(target_os = "windows")]
+    if usb_startup.is_integrity_pending()
+        && (!crate::app::runtime::webview2_runtime_ready() || !crate::app::runtime::runtime_ready())
+    {
+        usb_startup = match crate::app::usb_guard::complete_startup_preflight() {
+            Ok(result) => result,
             Err(error) => {
-                eprintln!("VC runtime preflight failed: {error}");
+                eprintln!("USB signed startup preflight failed: {error}");
                 crate::app::runtime::show_startup_error(&error.to_string());
                 return;
+            }
+        };
+    }
+    let usb_authorization_blocked = usb_startup.is_authorization_blocked();
+    if let Some(reason) = usb_startup.reason() {
+        if usb_startup.is_integrity_pending() {
+            eprintln!("USB startup integrity verification deferred: {reason}");
+        } else {
+            // The immutable bundle and Authenticode have passed. Keep the
+            // manager available for read-only diagnostics/logs and ordinary
+            // user-initiated uninstall, but do not install prerequisites or
+            // recover anything until valid USB authorization is supplied.
+            eprintln!("USB authorization restricted UI: {reason}");
+        }
+    }
+    #[cfg(target_os = "windows")]
+    if !usb_authorization_blocked {
+        if let Ok(executable) = std::env::current_exe() {
+            // Raw USB EXEs bypass the normal NSIS prerequisite installer. Check
+            // WebView2 BEFORE creating Tauri; otherwise a clean Win10 machine has
+            // no UI in which to show a useful failure. Both installers are offline
+            // and hash-pinned; native dialogs still work without a browser runtime.
+            if let Err(error) =
+                crate::app::runtime::ensure_bundled_webview2_runtime(&executable, None)
+            {
+                eprintln!("WebView2 runtime preflight failed: {error}");
+                crate::app::runtime::show_startup_error(&error.to_string());
+                return;
+            }
+            match crate::app::runtime::ensure_bundled_vc_runtime(&executable, None) {
+                Ok(status) if !status.ready && crate::app::usb_guard::guard_required() => {
+                    crate::app::runtime::show_startup_error(&status.message);
+                    return;
+                }
+                Ok(status) => eprintln!("VC runtime preflight: {}", status.message),
+                Err(error) => {
+                    eprintln!("VC runtime preflight failed: {error}");
+                    crate::app::runtime::show_startup_error(&error.to_string());
+                    return;
+                }
             }
         }
     }
@@ -892,6 +1019,9 @@ pub fn run() {
             commands::install_and_launch_ccswitch,
             commands::capability_pack_status,
             commands::install_capability_pack,
+            commands::skill_repo_check_update,
+            commands::skill_repo_apply_update,
+            commands::skill_repo_rollback,
             commands::win_perform_update,
             commands::win_install_historical_release,
             commands::win_uninstall,
@@ -902,7 +1032,7 @@ pub fn run() {
             commands::open_codex_home,
             commands::log_frontend_error,
         ])
-        .setup(|app| {
+        .setup(move |app| {
             build_main_window(app)?;
             #[cfg(target_os = "macos")]
             install_macos_menu(app.handle(), NativeLocale::En)?;
@@ -923,20 +1053,48 @@ pub fn run() {
                     );
                 });
             }
-            #[cfg(target_os = "windows")]
-            match crate::app::usb_guard::start_for_manager() {
-                Ok(status) => log::info!(
-                    "USB guard initialized status={} watchdog={} signed={}",
-                    status.status,
-                    status.watchdog,
-                    status.signed
-                ),
-                Err(error) => log::warn!("USB guard initialization skipped error={error}"),
-            }
             let operations = app.state::<state::ManagerState>().operations.clone();
             #[cfg(target_os = "windows")]
             let recovery_app = app.handle().clone();
             tauri::async_runtime::spawn_blocking(move || {
+                // The complete USB SHA/AuthentiCode walk is intentionally
+                // outside Tauri setup. The local shell can render first, but
+                // this worker remains the only place that creates the lease,
+                // starts recovery, or enables any protected action.
+                #[cfg(target_os = "windows")]
+                let usb_startup_ready = match crate::app::usb_guard::start_for_manager() {
+                    Ok(status) => {
+                        let ready = !crate::app::usb_guard::guard_required()
+                            || status.codex_allowed;
+                        log::info!(
+                            "USB guard initialized status={} watchdog={} signed={} codex_allowed={}",
+                            status.status,
+                            status.watchdog,
+                            status.signed,
+                            status.codex_allowed
+                        );
+                        ready
+                    }
+                    Err(error) => {
+                        log::warn!("USB guard initialization skipped error={error}");
+                        !crate::app::usb_guard::guard_required()
+                    }
+                };
+                #[cfg(not(target_os = "windows"))]
+                let usb_startup_ready = true;
+
+                if !usb_startup_ready {
+                    log::warn!(
+                        "USB Codex authorization is not ready; skipped startup recovery and staging cleanup"
+                    );
+                    return;
+                }
+                #[cfg(target_os = "windows")]
+                match codex_win_engine::cleanup_stale_portable_shortcuts() {
+                    Ok(true) => log::info!("removed stale manager-owned portable shortcuts"),
+                    Ok(false) => {}
+                    Err(error) => log::debug!("stale portable shortcut sweep skipped: {error}"),
+                }
                 #[cfg(target_os = "windows")]
                 loop {
                     match recovery_app

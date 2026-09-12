@@ -1,0 +1,3456 @@
+{
+  "schemaVersion": 2,
+  "id": "codex-starter",
+  "version": "1.2.1",
+  "policy": "No secrets, caches, history, databases, drafts or user content.",
+  "system": [
+    {
+      "type": "system",
+      "name": "Windows 10/11",
+      "minVersion": "10",
+      "architecture": "x64",
+      "required": true,
+      "offlineInstallerFilename": null,
+      "detection": "Get-CimInstance Win32_OperatingSystem",
+      "silentArgs": null,
+      "restart": "none",
+      "license": "Microsoft",
+      "source": "Windows",
+      "dependentCapabilities": [
+        "installer"
+      ]
+    },
+    {
+      "type": "runtime",
+      "name": "PowerShell",
+      "minVersion": "5.1",
+      "architecture": "x64",
+      "required": true,
+      "offlineInstallerFilename": null,
+      "detection": "$PSVersionTable.PSVersion",
+      "silentArgs": null,
+      "restart": "none",
+      "license": "Microsoft",
+      "source": "Windows",
+      "dependentCapabilities": [
+        "installer"
+      ]
+    }
+  ],
+  "dependencyCatalog": [
+    {
+      "id": "api.dashscope-web-search",
+      "kind": "connection",
+      "name": "api.dashscope-web-search",
+      "required": false,
+      "autoInstallable": false,
+      "healthCheck": "api.dashscope-web-search.healthy",
+      "failureMessage": "可选增强未就绪时保留 Agent 基础能力并明确降级。",
+      "dependentCapabilities": [
+        "综合统筹与长期协作，覆盖跨领域分析、文件处理、计划制定和任务拆解。"
+      ],
+      "dependentSkills": [],
+      "dependentAgents": [
+        "general",
+        "research",
+        "content",
+        "investment",
+        "growth",
+        "lifestyle"
+      ]
+    },
+    {
+      "id": "api.image-2",
+      "kind": "api-service",
+      "required": true,
+      "autoInstallable": false,
+      "healthCheck": "IMAGE_2_API_BASE_URL is a root HTTPS URL; IMAGE_2_MODEL and IMAGE_2_AGENT_ID are explicit; offline adapter tests pass",
+      "failureMessage": "未配置图像模型或网关路由 ID 时不生成清单；未配置端点或专用凭据时不提交任务。",
+      "dependentCapabilities": [
+        "异步文生图",
+        "图生图",
+        "两阶段确认"
+      ],
+      "dependentSkills": [
+        "image-2",
+        "wechat-article-creator"
+      ],
+      "dependentAgents": [
+        "content"
+      ]
+    },
+    {
+      "id": "api.seedance",
+      "kind": "api-service",
+      "required": true,
+      "autoInstallable": false,
+      "healthCheck": "SEEDANCE_API_BASE_URL is a root HTTPS URL; model, gateway routing ID, precharge points, refund rule, and link TTL are explicit; offline adapter tests pass",
+      "failureMessage": "未配置模型、网关路由 ID 或服务方费用策略时不生成清单；未配置端点或专用凭据时不提交任务。",
+      "dependentCapabilities": [
+        "视频生成",
+        "媒体顺序保护",
+        "幂等提交与轮询"
+      ],
+      "dependentSkills": [
+        "seedance2-0-video-gen"
+      ],
+      "dependentAgents": [
+        "content"
+      ]
+    },
+    {
+      "id": "capability.codex-web",
+      "kind": "capability",
+      "required": true,
+      "autoInstallable": false,
+      "healthCheck": "Codex web tool available or user supplied source",
+      "failureMessage": "没有网页能力时只处理用户提供的材料。",
+      "dependentCapabilities": [
+        "学术检索策略",
+        "引用校验",
+        "研究设计"
+      ],
+      "dependentSkills": [
+        "academic-research",
+        "competitor-intelligence",
+        "industry-analysis",
+        "market-sizing-analysis",
+        "multi-search-engine",
+        "travel-planner",
+        "user-research",
+        "web-content-fetcher"
+      ]
+    },
+    {
+      "id": "capability.network",
+      "kind": "capability",
+      "required": true,
+      "autoInstallable": false,
+      "healthCheck": "current Codex weather/web capability is available, or an explicitly allowed public weather endpoint responds",
+      "failureMessage": "当前为离线模式，不能提供实时数据。",
+      "dependentCapabilities": [
+        "当前天气",
+        "短期预报"
+      ],
+      "dependentSkills": [
+        "weather",
+        "weather-forecast",
+        "web-search-extraction"
+      ]
+    },
+    {
+      "id": "connection.dashscope-base-url",
+      "kind": "connection",
+      "required": true,
+      "autoInstallable": false,
+      "defaultUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "healthCheck": "URL is HTTPS and path is compatible-mode/v1",
+      "failureMessage": "未配置服务地址时不调用适配器。",
+      "dependentCapabilities": [
+        "联网搜索适配",
+        "结构化摘要"
+      ],
+      "dependentSkills": [
+        "web-search-extraction"
+      ]
+    },
+    {
+      "id": "connection.dashscope-model",
+      "kind": "connection",
+      "required": true,
+      "autoInstallable": false,
+      "healthCheck": "DASHSCOPE_MODEL non-empty; no repository default is allowed",
+      "failureMessage": "未配置服务当前支持且启用联网搜索的实际模型时不调用适配器。",
+      "dependentCapabilities": [
+        "联网搜索适配",
+        "结构化摘要"
+      ],
+      "dependentSkills": [
+        "web-search-extraction"
+      ]
+    },
+    {
+      "id": "credential.dashscope-api-key",
+      "kind": "credential",
+      "required": true,
+      "autoInstallable": false,
+      "secret": true,
+      "healthCheck": "DASHSCOPE_API_KEY non-empty",
+      "failureMessage": "未配置搜索 API 时优先使用 Codex 原生网页能力。",
+      "dependentCapabilities": [
+        "联网搜索适配",
+        "结构化摘要"
+      ],
+      "dependentSkills": [
+        "web-search-extraction"
+      ]
+    },
+    {
+      "id": "credential.image-2-api-key",
+      "kind": "credential",
+      "required": true,
+      "autoInstallable": false,
+      "secret": true,
+      "healthCheck": "IMAGE_2_API_KEY non-empty",
+      "failureMessage": "未配置凭据时不触发计费请求。",
+      "dependentCapabilities": [
+        "异步文生图",
+        "图生图",
+        "两阶段确认"
+      ],
+      "dependentSkills": [
+        "image-2"
+      ]
+    },
+    {
+      "id": "credential.seedance-api-key",
+      "kind": "credential",
+      "required": true,
+      "autoInstallable": false,
+      "secret": true,
+      "healthCheck": "SEEDANCE_API_KEY non-empty",
+      "failureMessage": "未配置凭据时不触发计费请求。",
+      "dependentCapabilities": [
+        "视频生成",
+        "媒体顺序保护",
+        "幂等提交与轮询"
+      ],
+      "dependentSkills": [
+        "seedance2-0-video-gen"
+      ]
+    },
+    {
+      "id": "external.device-pairing-runtime",
+      "kind": "external",
+      "required": true,
+      "autoInstallable": false,
+      "healthCheck": "manual",
+      "failureMessage": "缺少外部依赖时安全失败。",
+      "dependentCapabilities": [
+        "连接问题排查说明"
+      ],
+      "dependentSkills": [
+        "node-connect"
+      ]
+    },
+    {
+      "id": "external.host-specific-canvas-runtime",
+      "kind": "external",
+      "required": true,
+      "autoInstallable": false,
+      "healthCheck": "manual",
+      "failureMessage": "缺少外部依赖时安全失败。",
+      "dependentCapabilities": [
+        "HTML 原型说明"
+      ],
+      "dependentSkills": [
+        "canvas"
+      ]
+    },
+    {
+      "id": "external.windows-security-admin-tools",
+      "kind": "external",
+      "required": true,
+      "autoInstallable": false,
+      "healthCheck": "manual",
+      "failureMessage": "缺少外部依赖时安全失败。",
+      "dependentCapabilities": [
+        "主机安全检查说明"
+      ],
+      "dependentSkills": [
+        "healthcheck"
+      ]
+    },
+    {
+      "id": "mcp.feishu",
+      "kind": "mcp",
+      "required": true,
+      "autoInstallable": false,
+      "healthCheck": "codex mcp list; read-only Feishu tool probe",
+      "failureMessage": "飞书连接未健康时只提供操作步骤，不声称已读写飞书。",
+      "dependentCapabilities": [
+        "飞书文档标题、纯文本和块结构读取"
+      ],
+      "dependentSkills": [
+        "feishu-doc",
+        "feishu-drive",
+        "feishu-perm",
+        "feishu-wiki"
+      ]
+    },
+    {
+      "id": "python.package.Pillow",
+      "kind": "python-package",
+      "required": true,
+      "autoInstallable": true,
+      "packageName": "Pillow",
+      "importName": "PIL",
+      "lockedVersion": "12.3.0",
+      "healthCheck": "python -c \"import PIL\"",
+      "failureMessage": "公众号封面脚本需要 Pillow；离线 wheelhouse 未健康时不得声称封面生成可用。",
+      "dependentCapabilities": [
+        "公众号选题",
+        "文章结构",
+        "标题与封面"
+      ],
+      "dependentSkills": [
+        "wechat-article-creator"
+      ]
+    },
+    {
+      "id": "python.package.akshare",
+      "kind": "python-package",
+      "required": true,
+      "autoInstallable": true,
+      "packageName": "akshare",
+      "importName": "akshare",
+      "lockedVersion": "1.18.94",
+      "healthCheck": "python -c \"import akshare\"",
+      "failureMessage": "离线 wheelhouse 未就绪时，明确报告缺少包，不伪造结果。",
+      "dependentCapabilities": [
+        "A 股行情",
+        "财务分析",
+        "估值与筛选"
+      ],
+      "dependentSkills": [
+        "china-stock-analysis",
+        "fund-portfolio"
+      ]
+    },
+    {
+      "id": "python.package.html2text",
+      "kind": "python-package",
+      "required": false,
+      "autoInstallable": true,
+      "packageName": "html2text",
+      "importName": "html2text",
+      "lockedVersion": "2025.4.15",
+      "healthCheck": "python -c \"import html2text\"",
+      "failureMessage": "离线 wheelhouse 未就绪时，明确报告缺少包，不伪造结果。",
+      "dependentCapabilities": [
+        "网页正文提取",
+        "Markdown 清理"
+      ],
+      "dependentSkills": [
+        "web-content-fetcher"
+      ]
+    },
+    {
+      "id": "python.package.matplotlib",
+      "kind": "python-package",
+      "required": true,
+      "autoInstallable": true,
+      "packageName": "matplotlib",
+      "importName": "matplotlib",
+      "lockedVersion": "3.11.1",
+      "healthCheck": "python -c \"import matplotlib\"",
+      "failureMessage": "离线 wheelhouse 未就绪时，明确报告缺少包，不伪造结果。",
+      "dependentCapabilities": [
+        "表格分析",
+        "数据清洗",
+        "图表与 PDF 提取"
+      ],
+      "dependentSkills": [
+        "data-assistant",
+        "fund-portfolio",
+        "macro-research",
+        "venture-analysis",
+        "wealth-allocation"
+      ]
+    },
+    {
+      "id": "python.package.numpy",
+      "kind": "python-package",
+      "required": true,
+      "autoInstallable": true,
+      "packageName": "numpy",
+      "importName": "numpy",
+      "lockedVersion": "2.5.2",
+      "healthCheck": "python -c \"import numpy\"",
+      "failureMessage": "离线 wheelhouse 未就绪时，明确报告缺少包，不伪造结果。",
+      "dependentCapabilities": [
+        "A 股行情",
+        "财务分析",
+        "估值与筛选"
+      ],
+      "dependentSkills": [
+        "china-stock-analysis",
+        "fund-portfolio",
+        "macro-research",
+        "venture-analysis",
+        "wealth-allocation"
+      ]
+    },
+    {
+      "id": "python.package.openpyxl",
+      "kind": "python-package",
+      "required": true,
+      "autoInstallable": true,
+      "packageName": "openpyxl",
+      "importName": "openpyxl",
+      "lockedVersion": "3.1.5",
+      "healthCheck": "python -c \"import openpyxl\"",
+      "failureMessage": "离线 wheelhouse 未就绪时，明确报告缺少包，不伪造结果。",
+      "dependentCapabilities": [
+        "表格分析",
+        "数据清洗",
+        "图表与 PDF 提取"
+      ],
+      "dependentSkills": [
+        "data-assistant",
+        "excel-xlsx"
+      ]
+    },
+    {
+      "id": "python.package.pandas",
+      "kind": "python-package",
+      "required": true,
+      "autoInstallable": true,
+      "packageName": "pandas",
+      "importName": "pandas",
+      "lockedVersion": "3.0.5",
+      "healthCheck": "python -c \"import pandas\"",
+      "failureMessage": "离线 wheelhouse 未就绪时，明确报告缺少包，不伪造结果。",
+      "dependentCapabilities": [
+        "A 股行情",
+        "财务分析",
+        "估值与筛选"
+      ],
+      "dependentSkills": [
+        "china-stock-analysis",
+        "data-assistant",
+        "fund-portfolio",
+        "macro-research",
+        "venture-analysis",
+        "wealth-allocation"
+      ]
+    },
+    {
+      "id": "python.package.pdfplumber",
+      "kind": "python-package",
+      "required": true,
+      "autoInstallable": true,
+      "packageName": "pdfplumber",
+      "importName": "pdfplumber",
+      "lockedVersion": "0.11.10",
+      "healthCheck": "python -c \"import pdfplumber\"",
+      "failureMessage": "离线 wheelhouse 未就绪时，明确报告缺少包，不伪造结果。",
+      "dependentCapabilities": [
+        "PDF 提取",
+        "合并拆分",
+        "表单与生成"
+      ],
+      "dependentSkills": [
+        "pdf-processing-toolkit"
+      ]
+    },
+    {
+      "id": "python.package.pypdf",
+      "kind": "python-package",
+      "required": true,
+      "autoInstallable": true,
+      "packageName": "pypdf",
+      "importName": "pypdf",
+      "lockedVersion": "6.17.0",
+      "healthCheck": "python -c \"import pypdf\"",
+      "failureMessage": "离线 wheelhouse 未就绪时，明确报告缺少包，不伪造结果。",
+      "dependentCapabilities": [
+        "表格分析",
+        "数据清洗",
+        "图表与 PDF 提取"
+      ],
+      "dependentSkills": [
+        "data-assistant",
+        "pdf-processing-toolkit"
+      ]
+    },
+    {
+      "id": "python.package.python-docx",
+      "kind": "python-package",
+      "required": true,
+      "autoInstallable": true,
+      "packageName": "python-docx",
+      "importName": "docx",
+      "lockedVersion": "1.2.0",
+      "healthCheck": "python -c \"import docx\"",
+      "failureMessage": "离线 wheelhouse 未就绪时，明确报告缺少包，不伪造结果。",
+      "dependentCapabilities": [
+        "文档排版",
+        "格式转换",
+        "演示稿结构"
+      ],
+      "dependentSkills": [
+        "docx-butler",
+        "word-docx"
+      ]
+    },
+    {
+      "id": "python.package.python-pptx",
+      "kind": "python-package",
+      "required": true,
+      "autoInstallable": true,
+      "packageName": "python-pptx",
+      "importName": "pptx",
+      "lockedVersion": "1.0.2",
+      "healthCheck": "python -c \"import pptx\"",
+      "failureMessage": "离线 wheelhouse 未就绪时，明确报告缺少包，不伪造结果。",
+      "dependentCapabilities": [
+        "文档排版",
+        "格式转换",
+        "演示稿结构"
+      ],
+      "dependentSkills": [
+        "docx-butler",
+        "powerpoint-pptx"
+      ]
+    },
+    {
+      "id": "python.package.reportlab",
+      "kind": "python-package",
+      "required": true,
+      "autoInstallable": true,
+      "packageName": "reportlab",
+      "importName": "reportlab",
+      "lockedVersion": "5.0.1",
+      "healthCheck": "python -c \"import reportlab\"",
+      "failureMessage": "离线 wheelhouse 未就绪时，明确报告缺少包，不伪造结果。",
+      "dependentCapabilities": [
+        "文档排版",
+        "格式转换",
+        "演示稿结构"
+      ],
+      "dependentSkills": [
+        "docx-butler",
+        "pdf-processing-toolkit"
+      ]
+    },
+    {
+      "id": "python.package.scrapling",
+      "kind": "python-package",
+      "required": false,
+      "autoInstallable": true,
+      "packageName": "scrapling",
+      "importName": "scrapling",
+      "lockedVersion": "0.4.15",
+      "healthCheck": "python -c \"import scrapling\"",
+      "failureMessage": "离线 wheelhouse 未就绪时，明确报告缺少包，不伪造结果。",
+      "dependentCapabilities": [
+        "网页正文提取",
+        "Markdown 清理"
+      ],
+      "dependentSkills": [
+        "web-content-fetcher"
+      ]
+    },
+    {
+      "id": "runtime.python312",
+      "kind": "runtime",
+      "required": true,
+      "autoInstallable": true,
+      "minVersion": "3.12",
+      "lockedVersion": "3.12.10",
+      "abi": "cp312",
+      "platform": "win_amd64",
+      "healthCheck": "python-env-setup/scripts/check_python_env.ps1 -Json; require cpython-312/win_amd64",
+      "failureMessage": "需要安装 U 盘提供的 Python 3.12 per-user 运行时。",
+      "dependentCapabilities": [
+        "A 股行情",
+        "财务分析",
+        "估值与筛选"
+      ],
+      "dependentSkills": [
+        "china-stock-analysis",
+        "daily-reflection",
+        "data-assistant",
+        "docx-butler",
+        "excel-xlsx",
+        "fitness-coach",
+        "fund-portfolio",
+        "image-2",
+        "macro-research",
+        "meal-planner",
+        "pdf-processing-toolkit",
+        "powerpoint-pptx",
+        "seedance2-0-video-gen",
+        "travel-planner",
+        "venture-analysis",
+        "wealth-allocation",
+        "web-search-extraction",
+        "wechat-article-creator",
+        "word-docx"
+      ],
+      "dependentAgents": [
+        "general",
+        "content",
+        "investment",
+        "lifestyle",
+        "office"
+      ]
+    },
+    {
+      "id": "runtime.python312-wheelhouse",
+      "kind": "runtime",
+      "name": "runtime.python312-wheelhouse",
+      "required": false,
+      "autoInstallable": true,
+      "healthCheck": "runtime.python312-wheelhouse.healthy",
+      "failureMessage": "可选增强未就绪时保留 Agent 基础能力并明确降级。",
+      "dependentCapabilities": [
+        "综合统筹与长期协作，覆盖跨领域分析、文件处理、计划制定和任务拆解。"
+      ],
+      "dependentSkills": [],
+      "dependentAgents": [
+        "general",
+        "content",
+        "investment",
+        "lifestyle",
+        "office"
+      ]
+    },
+    {
+      "id": "skill.academic-research",
+      "kind": "skill",
+      "name": "academic-research",
+      "required": true,
+      "autoInstallable": true,
+      "healthCheck": "skills/academic-research/SKILL.md exists",
+      "dependentCapabilities": [
+        "深度研究与情报分析，覆盖学术、竞品、产业链、用户研究和市场测算。"
+      ],
+      "dependentAgents": [
+        "research"
+      ]
+    },
+    {
+      "id": "skill.china-stock-analysis",
+      "kind": "skill",
+      "name": "china-stock-analysis",
+      "required": true,
+      "autoInstallable": true,
+      "healthCheck": "skills/china-stock-analysis/SKILL.md exists",
+      "dependentCapabilities": [
+        "投资研究与财富配置，覆盖 A 股、基金、宏观、创业投资和组合管理。"
+      ],
+      "dependentAgents": [
+        "investment"
+      ]
+    },
+    {
+      "id": "skill.competitor-intelligence",
+      "kind": "skill",
+      "name": "competitor-intelligence",
+      "required": true,
+      "autoInstallable": true,
+      "healthCheck": "skills/competitor-intelligence/SKILL.md exists",
+      "dependentCapabilities": [
+        "深度研究与情报分析，覆盖学术、竞品、产业链、用户研究和市场测算。"
+      ],
+      "dependentAgents": [
+        "research"
+      ]
+    },
+    {
+      "id": "skill.conversion-optimizer",
+      "kind": "skill",
+      "name": "conversion-optimizer",
+      "required": true,
+      "autoInstallable": true,
+      "healthCheck": "skills/conversion-optimizer/SKILL.md exists",
+      "dependentCapabilities": [
+        "商业增长与变现设计，覆盖用户痛点、产品 Offer、流量、转化、留存和增长实验。"
+      ],
+      "dependentAgents": [
+        "growth"
+      ]
+    },
+    {
+      "id": "skill.daily-reflection",
+      "kind": "skill",
+      "name": "daily-reflection",
+      "required": true,
+      "autoInstallable": true,
+      "healthCheck": "skills/daily-reflection/SKILL.md exists",
+      "dependentCapabilities": [
+        "健康与生活方式规划，覆盖健身、饮食、旅行、天气和个人复盘。"
+      ],
+      "dependentAgents": [
+        "lifestyle"
+      ]
+    },
+    {
+      "id": "skill.data-assistant",
+      "kind": "skill",
+      "name": "data-assistant",
+      "required": false,
+      "autoInstallable": true,
+      "healthCheck": "skills/data-assistant/SKILL.md exists",
+      "dependentCapabilities": [
+        "综合统筹与长期协作，覆盖跨领域分析、文件处理、计划制定和任务拆解。"
+      ],
+      "dependentAgents": [
+        "general",
+        "office"
+      ]
+    },
+    {
+      "id": "skill.docx-butler",
+      "kind": "skill",
+      "name": "docx-butler",
+      "required": false,
+      "autoInstallable": true,
+      "healthCheck": "skills/docx-butler/SKILL.md exists",
+      "dependentCapabilities": [
+        "综合统筹与长期协作，覆盖跨领域分析、文件处理、计划制定和任务拆解。"
+      ],
+      "dependentAgents": [
+        "general",
+        "office"
+      ]
+    },
+    {
+      "id": "skill.efficiency-toolkit",
+      "kind": "skill",
+      "name": "efficiency-toolkit",
+      "required": true,
+      "autoInstallable": true,
+      "healthCheck": "skills/efficiency-toolkit/SKILL.md exists",
+      "dependentCapabilities": [
+        "职场效率与交付管家，覆盖文档、数据、邮件、会议、表格和文件整理。"
+      ],
+      "dependentAgents": [
+        "office"
+      ]
+    },
+    {
+      "id": "skill.email-expert",
+      "kind": "skill",
+      "name": "email-expert",
+      "required": true,
+      "autoInstallable": true,
+      "healthCheck": "skills/email-expert/SKILL.md exists",
+      "dependentCapabilities": [
+        "职场效率与交付管家，覆盖文档、数据、邮件、会议、表格和文件整理。"
+      ],
+      "dependentAgents": [
+        "office"
+      ]
+    },
+    {
+      "id": "skill.excel-xlsx",
+      "kind": "skill",
+      "name": "excel-xlsx",
+      "required": false,
+      "autoInstallable": true,
+      "healthCheck": "skills/excel-xlsx/SKILL.md exists",
+      "dependentCapabilities": [
+        "综合统筹与长期协作，覆盖跨领域分析、文件处理、计划制定和任务拆解。"
+      ],
+      "dependentAgents": [
+        "general",
+        "office"
+      ]
+    },
+    {
+      "id": "skill.fitness-coach",
+      "kind": "skill",
+      "name": "fitness-coach",
+      "required": false,
+      "autoInstallable": true,
+      "healthCheck": "skills/fitness-coach/SKILL.md exists",
+      "dependentCapabilities": [
+        "健康与生活方式规划，覆盖健身、饮食、旅行、天气和个人复盘。"
+      ],
+      "dependentAgents": [
+        "lifestyle"
+      ]
+    },
+    {
+      "id": "skill.fund-portfolio",
+      "kind": "skill",
+      "name": "fund-portfolio",
+      "required": true,
+      "autoInstallable": true,
+      "healthCheck": "skills/fund-portfolio/SKILL.md exists",
+      "dependentCapabilities": [
+        "投资研究与财富配置，覆盖 A 股、基金、宏观、创业投资和组合管理。"
+      ],
+      "dependentAgents": [
+        "investment"
+      ]
+    },
+    {
+      "id": "skill.growth-analyst",
+      "kind": "skill",
+      "name": "growth-analyst",
+      "required": true,
+      "autoInstallable": true,
+      "healthCheck": "skills/growth-analyst/SKILL.md exists",
+      "dependentCapabilities": [
+        "商业增长与变现设计，覆盖用户痛点、产品 Offer、流量、转化、留存和增长实验。"
+      ],
+      "dependentAgents": [
+        "growth"
+      ]
+    },
+    {
+      "id": "skill.image-2",
+      "kind": "skill",
+      "name": "image-2",
+      "required": false,
+      "autoInstallable": true,
+      "healthCheck": "skills/image-2/SKILL.md exists",
+      "dependentCapabilities": [
+        "新媒体内容架构与创意生产，覆盖公众号、小红书、图片提示词、视频提示词和脚本。"
+      ],
+      "dependentAgents": [
+        "content"
+      ]
+    },
+    {
+      "id": "skill.image-prompt-generator",
+      "kind": "skill",
+      "name": "image-prompt-generator",
+      "required": true,
+      "autoInstallable": true,
+      "healthCheck": "skills/image-prompt-generator/SKILL.md exists",
+      "dependentCapabilities": [
+        "综合统筹与长期协作，覆盖跨领域分析、文件处理、计划制定和任务拆解。"
+      ],
+      "dependentAgents": [
+        "general",
+        "content"
+      ]
+    },
+    {
+      "id": "skill.industry-analysis",
+      "kind": "skill",
+      "name": "industry-analysis",
+      "required": true,
+      "autoInstallable": true,
+      "healthCheck": "skills/industry-analysis/SKILL.md exists",
+      "dependentCapabilities": [
+        "深度研究与情报分析，覆盖学术、竞品、产业链、用户研究和市场测算。"
+      ],
+      "dependentAgents": [
+        "research"
+      ]
+    },
+    {
+      "id": "skill.macro-research",
+      "kind": "skill",
+      "name": "macro-research",
+      "required": true,
+      "autoInstallable": true,
+      "healthCheck": "skills/macro-research/SKILL.md exists",
+      "dependentCapabilities": [
+        "投资研究与财富配置，覆盖 A 股、基金、宏观、创业投资和组合管理。"
+      ],
+      "dependentAgents": [
+        "investment"
+      ]
+    },
+    {
+      "id": "skill.market-sizing-analysis",
+      "kind": "skill",
+      "name": "market-sizing-analysis",
+      "required": true,
+      "autoInstallable": true,
+      "healthCheck": "skills/market-sizing-analysis/SKILL.md exists",
+      "dependentCapabilities": [
+        "深度研究与情报分析，覆盖学术、竞品、产业链、用户研究和市场测算。"
+      ],
+      "dependentAgents": [
+        "research"
+      ]
+    },
+    {
+      "id": "skill.meal-planner",
+      "kind": "skill",
+      "name": "meal-planner",
+      "required": false,
+      "autoInstallable": true,
+      "healthCheck": "skills/meal-planner/SKILL.md exists",
+      "dependentCapabilities": [
+        "健康与生活方式规划，覆盖健身、饮食、旅行、天气和个人复盘。"
+      ],
+      "dependentAgents": [
+        "lifestyle"
+      ]
+    },
+    {
+      "id": "skill.meeting-secretary",
+      "kind": "skill",
+      "name": "meeting-secretary",
+      "required": true,
+      "autoInstallable": true,
+      "healthCheck": "skills/meeting-secretary/SKILL.md exists",
+      "dependentCapabilities": [
+        "职场效率与交付管家，覆盖文档、数据、邮件、会议、表格和文件整理。"
+      ],
+      "dependentAgents": [
+        "office"
+      ]
+    },
+    {
+      "id": "skill.multi-search-engine",
+      "kind": "skill",
+      "name": "multi-search-engine",
+      "required": true,
+      "autoInstallable": true,
+      "healthCheck": "skills/multi-search-engine/SKILL.md exists",
+      "dependentCapabilities": [
+        "综合统筹与长期协作，覆盖跨领域分析、文件处理、计划制定和任务拆解。"
+      ],
+      "dependentAgents": [
+        "general",
+        "research",
+        "lifestyle"
+      ]
+    },
+    {
+      "id": "skill.offer-designer",
+      "kind": "skill",
+      "name": "offer-designer",
+      "required": true,
+      "autoInstallable": true,
+      "healthCheck": "skills/offer-designer/SKILL.md exists",
+      "dependentCapabilities": [
+        "商业增长与变现设计，覆盖用户痛点、产品 Offer、流量、转化、留存和增长实验。"
+      ],
+      "dependentAgents": [
+        "growth"
+      ]
+    },
+    {
+      "id": "skill.painpoint-analyzer",
+      "kind": "skill",
+      "name": "painpoint-analyzer",
+      "required": true,
+      "autoInstallable": true,
+      "healthCheck": "skills/painpoint-analyzer/SKILL.md exists",
+      "dependentCapabilities": [
+        "商业增长与变现设计，覆盖用户痛点、产品 Offer、流量、转化、留存和增长实验。"
+      ],
+      "dependentAgents": [
+        "growth"
+      ]
+    },
+    {
+      "id": "skill.pdf-processing-toolkit",
+      "kind": "skill",
+      "name": "pdf-processing-toolkit",
+      "required": false,
+      "autoInstallable": false,
+      "blocked": true,
+      "healthCheck": "blocked pending explicit compatibility/license approval",
+      "dependentCapabilities": [
+        "综合统筹与长期协作，覆盖跨领域分析、文件处理、计划制定和任务拆解。"
+      ],
+      "dependentAgents": [
+        "general",
+        "office"
+      ]
+    },
+    {
+      "id": "skill.powerpoint-pptx",
+      "kind": "skill",
+      "name": "powerpoint-pptx",
+      "required": false,
+      "autoInstallable": true,
+      "healthCheck": "skills/powerpoint-pptx/SKILL.md exists",
+      "dependentCapabilities": [
+        "综合统筹与长期协作，覆盖跨领域分析、文件处理、计划制定和任务拆解。"
+      ],
+      "dependentAgents": [
+        "general",
+        "office"
+      ]
+    },
+    {
+      "id": "skill.seedance2-0-video-gen",
+      "kind": "skill",
+      "name": "seedance2-0-video-gen",
+      "required": false,
+      "autoInstallable": true,
+      "healthCheck": "skills/seedance2-0-video-gen/SKILL.md exists",
+      "dependentCapabilities": [
+        "新媒体内容架构与创意生产，覆盖公众号、小红书、图片提示词、视频提示词和脚本。"
+      ],
+      "dependentAgents": [
+        "content"
+      ]
+    },
+    {
+      "id": "skill.traffic-hunter",
+      "kind": "skill",
+      "name": "traffic-hunter",
+      "required": true,
+      "autoInstallable": true,
+      "healthCheck": "skills/traffic-hunter/SKILL.md exists",
+      "dependentCapabilities": [
+        "商业增长与变现设计，覆盖用户痛点、产品 Offer、流量、转化、留存和增长实验。"
+      ],
+      "dependentAgents": [
+        "growth"
+      ]
+    },
+    {
+      "id": "skill.travel-planner",
+      "kind": "skill",
+      "name": "travel-planner",
+      "required": false,
+      "autoInstallable": true,
+      "healthCheck": "skills/travel-planner/SKILL.md exists",
+      "dependentCapabilities": [
+        "健康与生活方式规划，覆盖健身、饮食、旅行、天气和个人复盘。"
+      ],
+      "dependentAgents": [
+        "lifestyle"
+      ]
+    },
+    {
+      "id": "skill.user-research",
+      "kind": "skill",
+      "name": "user-research",
+      "required": true,
+      "autoInstallable": true,
+      "healthCheck": "skills/user-research/SKILL.md exists",
+      "dependentCapabilities": [
+        "深度研究与情报分析，覆盖学术、竞品、产业链、用户研究和市场测算。"
+      ],
+      "dependentAgents": [
+        "research"
+      ]
+    },
+    {
+      "id": "skill.venture-analysis",
+      "kind": "skill",
+      "name": "venture-analysis",
+      "required": true,
+      "autoInstallable": true,
+      "healthCheck": "skills/venture-analysis/SKILL.md exists",
+      "dependentCapabilities": [
+        "投资研究与财富配置，覆盖 A 股、基金、宏观、创业投资和组合管理。"
+      ],
+      "dependentAgents": [
+        "investment"
+      ]
+    },
+    {
+      "id": "skill.video-prompt-generator",
+      "kind": "skill",
+      "name": "video-prompt-generator",
+      "required": true,
+      "autoInstallable": true,
+      "healthCheck": "skills/video-prompt-generator/SKILL.md exists",
+      "dependentCapabilities": [
+        "综合统筹与长期协作，覆盖跨领域分析、文件处理、计划制定和任务拆解。"
+      ],
+      "dependentAgents": [
+        "general",
+        "content"
+      ]
+    },
+    {
+      "id": "skill.wealth-allocation",
+      "kind": "skill",
+      "name": "wealth-allocation",
+      "required": true,
+      "autoInstallable": true,
+      "healthCheck": "skills/wealth-allocation/SKILL.md exists",
+      "dependentCapabilities": [
+        "投资研究与财富配置，覆盖 A 股、基金、宏观、创业投资和组合管理。"
+      ],
+      "dependentAgents": [
+        "investment"
+      ]
+    },
+    {
+      "id": "skill.weather",
+      "kind": "skill",
+      "name": "weather",
+      "required": true,
+      "autoInstallable": true,
+      "healthCheck": "skills/weather/SKILL.md exists",
+      "dependentCapabilities": [
+        "健康与生活方式规划，覆盖健身、饮食、旅行、天气和个人复盘。"
+      ],
+      "dependentAgents": [
+        "lifestyle"
+      ]
+    },
+    {
+      "id": "skill.weather-forecast",
+      "kind": "skill",
+      "name": "weather-forecast",
+      "required": true,
+      "autoInstallable": true,
+      "healthCheck": "skills/weather-forecast/SKILL.md exists",
+      "dependentCapabilities": [
+        "健康与生活方式规划，覆盖健身、饮食、旅行、天气和个人复盘。"
+      ],
+      "dependentAgents": [
+        "lifestyle"
+      ]
+    },
+    {
+      "id": "skill.web-search-extraction",
+      "kind": "skill",
+      "name": "web-search-extraction",
+      "required": false,
+      "autoInstallable": true,
+      "healthCheck": "skills/web-search-extraction/SKILL.md exists",
+      "dependentCapabilities": [
+        "综合统筹与长期协作，覆盖跨领域分析、文件处理、计划制定和任务拆解。"
+      ],
+      "dependentAgents": [
+        "general",
+        "research",
+        "content",
+        "investment",
+        "growth",
+        "lifestyle"
+      ]
+    },
+    {
+      "id": "skill.wechat-article-creator",
+      "kind": "skill",
+      "name": "wechat-article-creator",
+      "required": false,
+      "autoInstallable": true,
+      "healthCheck": "skills/wechat-article-creator/SKILL.md exists",
+      "dependentCapabilities": [
+        "新媒体内容架构与创意生产，覆盖公众号、小红书、图片提示词、视频提示词和脚本。"
+      ],
+      "dependentAgents": [
+        "content"
+      ]
+    },
+    {
+      "id": "skill.word-docx",
+      "kind": "skill",
+      "name": "word-docx",
+      "required": false,
+      "autoInstallable": true,
+      "healthCheck": "skills/word-docx/SKILL.md exists",
+      "dependentCapabilities": [
+        "综合统筹与长期协作，覆盖跨领域分析、文件处理、计划制定和任务拆解。"
+      ],
+      "dependentAgents": [
+        "general",
+        "office"
+      ]
+    },
+    {
+      "id": "skill.xiaohongshu-writing",
+      "kind": "skill",
+      "name": "xiaohongshu-writing",
+      "required": true,
+      "autoInstallable": true,
+      "healthCheck": "skills/xiaohongshu-writing/SKILL.md exists",
+      "dependentCapabilities": [
+        "新媒体内容架构与创意生产，覆盖公众号、小红书、图片提示词、视频提示词和脚本。"
+      ],
+      "dependentAgents": [
+        "content"
+      ]
+    },
+    {
+      "id": "system.powershell",
+      "kind": "system",
+      "required": true,
+      "autoInstallable": false,
+      "minVersion": "5.1",
+      "healthCheck": "$PSVersionTable.PSVersion",
+      "failureMessage": "Windows PowerShell 5.1 是安装器基础环境。",
+      "dependentCapabilities": [
+        "Python 检测",
+        "安装前检查",
+        "PATH 指引"
+      ],
+      "dependentSkills": [
+        "python-env-setup",
+        "safe-disk-operations"
+      ]
+    }
+  ],
+  "skills": [
+    {
+      "id": "academic-research",
+      "path": "skills/academic-research",
+      "status": "ready",
+      "afterRemediationStatus": "core-ready",
+      "installByDefault": true,
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "dependencyTypes": [
+        "capability"
+      ],
+      "dependencies": [
+        "capability.codex-web"
+      ],
+      "dependentCapabilities": [
+        "学术检索策略",
+        "引用校验",
+        "研究设计"
+      ],
+      "healthCheck": "frontmatter, pack-copy, and dependency health-check path",
+      "notes": ""
+    },
+    {
+      "id": "canvas",
+      "path": "skills/canvas",
+      "status": "unsupported/disabled",
+      "afterRemediationStatus": "unsupported",
+      "installByDefault": false,
+      "enableWhen": [
+        "disabled"
+      ],
+      "dependencyTypes": [
+        "external"
+      ],
+      "dependencies": [
+        "external.host-specific-canvas-runtime"
+      ],
+      "dependentCapabilities": [
+        "HTML 原型说明"
+      ],
+      "healthCheck": "negative test: no compatible automatic entry point; must remain disabled",
+      "notes": "保持禁用：当前能力包没有可验证的远程 Canvas 节点/画布运行时；仅提供替代建议。"
+    },
+    {
+      "id": "china-stock-analysis",
+      "path": "skills/china-stock-analysis",
+      "status": "requires-runtime",
+      "afterRemediationStatus": "auto-installable-runtime",
+      "installByDefault": false,
+      "enableWhen": [
+        "skill-installed",
+        "runtime-healthy"
+      ],
+      "dependencyTypes": [
+        "python-package",
+        "runtime"
+      ],
+      "dependencies": [
+        "runtime.python312",
+        "python.package.akshare",
+        "python.package.pandas",
+        "python.package.numpy"
+      ],
+      "dependentCapabilities": [
+        "A 股行情",
+        "财务分析",
+        "估值与筛选"
+      ],
+      "healthCheck": "frontmatter, pack-copy, dependency health-check path, provider-failure closure, provenance, neutral financial analysis, and fake AkShare no-network contract tests",
+      "notes": "行情缓存已迁移到项目 CODEX_DATA_DIR/CHINA_STOCK_CACHE_DIR，按代码与允许的数据类型生成路径且只缓存完整结果；实时和 AkShare 数据入口记录来源/时点/完整性并对全量或部分失败返回非零状态。技术分析不再模拟行情或生成交易信号；财务分析和报告模板已删除固定评级、综合分、排名、目标价与行业均值占位。筛选和估值只执行实际字段或显式、可归因假设。"
+    },
+    {
+      "id": "competitor-intelligence",
+      "path": "skills/competitor-intelligence",
+      "status": "ready",
+      "afterRemediationStatus": "core-ready",
+      "installByDefault": true,
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "dependencyTypes": [
+        "capability"
+      ],
+      "dependencies": [
+        "capability.codex-web"
+      ],
+      "dependentCapabilities": [
+        "竞品矩阵",
+        "定价与模式分析",
+        "差异化建议"
+      ],
+      "healthCheck": "frontmatter, pack-copy, and dependency health-check path",
+      "notes": ""
+    },
+    {
+      "id": "conversion-optimizer",
+      "path": "skills/conversion-optimizer",
+      "status": "ready",
+      "afterRemediationStatus": "core-ready",
+      "installByDefault": true,
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "dependencyTypes": [],
+      "dependencies": [],
+      "dependentCapabilities": [
+        "销售话术",
+        "页面转化",
+        "行动召唤"
+      ],
+      "healthCheck": "frontmatter, pack-copy, and dependency health-check path",
+      "notes": ""
+    },
+    {
+      "id": "daily-reflection",
+      "path": "skills/daily-reflection",
+      "status": "ready",
+      "afterRemediationStatus": "core-ready",
+      "installByDefault": true,
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "dependencyTypes": [
+        "runtime"
+      ],
+      "dependencies": [
+        "runtime.python312"
+      ],
+      "dependentCapabilities": [
+        "每日复盘",
+        "目标追踪",
+        "习惯与情绪记录"
+      ],
+      "healthCheck": "PowerShell JSONL log/summary round-trip",
+      "notes": "核心复盘使用 Codex 项目文件与 PowerShell JSONL；原 Python 数据库脚本只作为可选兼容增强，其月度主题字段已改为确定性的用户短语频次提取，不再占位返回空结果。"
+    },
+    {
+      "id": "data-assistant",
+      "path": "skills/data-assistant",
+      "status": "requires-runtime",
+      "afterRemediationStatus": "auto-installable-runtime",
+      "installByDefault": false,
+      "enableWhen": [
+        "skill-installed",
+        "runtime-healthy"
+      ],
+      "dependencyTypes": [
+        "python-package",
+        "runtime"
+      ],
+      "dependencies": [
+        "runtime.python312",
+        "python.package.openpyxl",
+        "python.package.pandas",
+        "python.package.matplotlib",
+        "python.package.pypdf"
+      ],
+      "dependentCapabilities": [
+        "表格分析",
+        "数据清洗",
+        "图表与 PDF 提取"
+      ],
+      "healthCheck": "frontmatter, pack-copy, and dependency health-check path",
+      "notes": ""
+    },
+    {
+      "id": "docx-butler",
+      "path": "skills/docx-butler",
+      "status": "requires-runtime",
+      "afterRemediationStatus": "auto-installable-runtime",
+      "installByDefault": false,
+      "enableWhen": [
+        "skill-installed",
+        "runtime-healthy"
+      ],
+      "dependencyTypes": [
+        "python-package",
+        "runtime"
+      ],
+      "dependencies": [
+        "runtime.python312",
+        "python.package.python-docx",
+        "python.package.python-pptx",
+        "python.package.reportlab"
+      ],
+      "dependentCapabilities": [
+        "文档排版",
+        "格式转换",
+        "演示稿结构"
+      ],
+      "healthCheck": "frontmatter, pack-copy, and dependency health-check path",
+      "notes": ""
+    },
+    {
+      "id": "efficiency-toolkit",
+      "path": "skills/efficiency-toolkit",
+      "status": "ready",
+      "afterRemediationStatus": "core-ready",
+      "installByDefault": true,
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "dependencyTypes": [],
+      "dependencies": [],
+      "dependentCapabilities": [
+        "文件整理方案",
+        "笔记与待办",
+        "时间规划"
+      ],
+      "healthCheck": "frontmatter, pack-copy, and dependency health-check path",
+      "notes": ""
+    },
+    {
+      "id": "email-expert",
+      "path": "skills/email-expert",
+      "status": "ready",
+      "afterRemediationStatus": "core-ready",
+      "installByDefault": true,
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "dependencyTypes": [],
+      "dependencies": [],
+      "dependentCapabilities": [
+        "商务邮件",
+        "模板",
+        "跟进与语气优化"
+      ],
+      "healthCheck": "frontmatter, pack-copy, and dependency health-check path",
+      "notes": ""
+    },
+    {
+      "id": "excel-xlsx",
+      "path": "skills/excel-xlsx",
+      "status": "requires-runtime",
+      "afterRemediationStatus": "auto-installable-runtime",
+      "installByDefault": false,
+      "enableWhen": [
+        "skill-installed",
+        "runtime-healthy"
+      ],
+      "dependencyTypes": [
+        "python-package",
+        "runtime"
+      ],
+      "dependencies": [
+        "runtime.python312",
+        "python.package.openpyxl"
+      ],
+      "dependentCapabilities": [
+        "Excel 读写",
+        "公式与日期",
+        "工作簿生成"
+      ],
+      "healthCheck": "frontmatter, pack-copy, and dependency health-check path",
+      "notes": ""
+    },
+    {
+      "id": "feishu-doc",
+      "path": "skills/feishu-doc",
+      "status": "requires-mcp",
+      "afterRemediationStatus": "guided-config",
+      "installByDefault": false,
+      "enableWhen": [
+        "skill-installed",
+        "mcp.feishu.healthy"
+      ],
+      "dependencyTypes": [
+        "mcp"
+      ],
+      "dependencies": [
+        "mcp.feishu"
+      ],
+      "dependentCapabilities": [
+        "飞书文档标题、纯文本和块结构读取"
+      ],
+      "healthCheck": "frontmatter, pack-copy, and dependency health-check path",
+      "notes": "已适配官方 Lark MCP dot-case 工具；当前锁定版本按官方限制保持文档只读，不承诺直接编辑或上传下载。"
+    },
+    {
+      "id": "feishu-drive",
+      "path": "skills/feishu-drive",
+      "status": "requires-mcp",
+      "afterRemediationStatus": "guided-config",
+      "installByDefault": false,
+      "enableWhen": [
+        "skill-installed",
+        "mcp.feishu.healthy"
+      ],
+      "dependencyTypes": [
+        "mcp"
+      ],
+      "dependencies": [
+        "mcp.feishu"
+      ],
+      "dependentCapabilities": [
+        "飞书云盘浏览、元数据和受控文件管理"
+      ],
+      "healthCheck": "frontmatter, pack-copy, and dependency health-check path",
+      "notes": "已适配官方 Lark MCP dot-case 工具；文件上传下载保持不支持，写操作受 Codex 审批策略约束。"
+    },
+    {
+      "id": "feishu-perm",
+      "path": "skills/feishu-perm",
+      "status": "requires-mcp",
+      "afterRemediationStatus": "guided-config",
+      "installByDefault": false,
+      "enableWhen": [
+        "skill-installed",
+        "mcp.feishu.healthy"
+      ],
+      "dependencyTypes": [
+        "mcp"
+      ],
+      "dependencies": [
+        "mcp.feishu"
+      ],
+      "dependentCapabilities": [
+        "飞书文件权限"
+      ],
+      "healthCheck": "frontmatter, pack-copy, and dependency health-check path",
+      "notes": "已适配官方 Lark MCP 权限工具；移除协作者和转移所有者属于高风险显式写操作。"
+    },
+    {
+      "id": "feishu-wiki",
+      "path": "skills/feishu-wiki",
+      "status": "requires-mcp",
+      "afterRemediationStatus": "guided-config",
+      "installByDefault": false,
+      "enableWhen": [
+        "skill-installed",
+        "mcp.feishu.healthy"
+      ],
+      "dependencyTypes": [
+        "mcp"
+      ],
+      "dependencies": [
+        "mcp.feishu"
+      ],
+      "dependentCapabilities": [
+        "飞书知识库导航和受控节点管理"
+      ],
+      "healthCheck": "frontmatter, pack-copy, and dependency health-check path",
+      "notes": "已适配官方 Lark MCP dot-case Wiki 工具；页面正文读取委托 feishu-doc，正文编辑不在当前范围。"
+    },
+    {
+      "id": "fitness-coach",
+      "path": "skills/fitness-coach",
+      "status": "requires-runtime",
+      "afterRemediationStatus": "auto-installable-runtime",
+      "installByDefault": false,
+      "enableWhen": [
+        "skill-installed",
+        "runtime-healthy"
+      ],
+      "dependencyTypes": [
+        "runtime"
+      ],
+      "dependencies": [
+        "runtime.python312"
+      ],
+      "dependentCapabilities": [
+        "训练计划",
+        "动作与周期",
+        "进度记录"
+      ],
+      "healthCheck": "frontmatter, pack-copy, and dependency health-check path",
+      "notes": ""
+    },
+    {
+      "id": "fund-portfolio",
+      "path": "skills/fund-portfolio",
+      "status": "requires-runtime",
+      "afterRemediationStatus": "auto-installable-runtime",
+      "installByDefault": false,
+      "enableWhen": [
+        "skill-installed",
+        "runtime-healthy"
+      ],
+      "dependencyTypes": [
+        "python-package",
+        "runtime"
+      ],
+      "dependencies": [
+        "runtime.python312",
+        "python.package.akshare",
+        "python.package.pandas",
+        "python.package.numpy",
+        "python.package.matplotlib"
+      ],
+      "dependentCapabilities": [
+        "基金筛选",
+        "组合配置",
+        "定投与风险"
+      ],
+      "healthCheck": "frontmatter, pack-copy, dependency health-check path, provider-failure closure, explicit scenario, neutral risk, and user-note labelling contract tests",
+      "notes": "筛选器只暴露 AkShare 排行接口实际读取的基金类型及 1/3 年收益字段，接口失败非零退出。配置构建器要求带来源的用户审阅模型，只换算金额并保留 fund_type_notes 原标签；定投只比较显式收益场景。风险评估器删除硬编码波动率、风险评级、适配人群和调仓/止损建议，要求完整来源、时点与场景参数。"
+    },
+    {
+      "id": "growth-analyst",
+      "path": "skills/growth-analyst",
+      "status": "ready",
+      "afterRemediationStatus": "core-ready",
+      "installByDefault": true,
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "dependencyTypes": [],
+      "dependencies": [],
+      "dependentCapabilities": [
+        "指标体系",
+        "增长复盘",
+        "实验迭代"
+      ],
+      "healthCheck": "frontmatter, pack-copy, and dependency health-check path",
+      "notes": ""
+    },
+    {
+      "id": "healthcheck",
+      "path": "skills/healthcheck",
+      "status": "unsupported/disabled",
+      "afterRemediationStatus": "unsupported",
+      "installByDefault": false,
+      "enableWhen": [
+        "disabled"
+      ],
+      "dependencyTypes": [
+        "external"
+      ],
+      "dependencies": [
+        "external.windows-security-admin-tools"
+      ],
+      "dependentCapabilities": [
+        "主机安全检查说明"
+      ],
+      "healthCheck": "negative test: no compatible automatic entry point; must remain disabled",
+      "notes": "保持禁用：主机加固涉及管理员权限、策略和外部设备状态，不能用静态 Skill 冒充审计结果。"
+    },
+    {
+      "id": "image-2",
+      "path": "skills/image-2",
+      "status": "requires-credential",
+      "afterRemediationStatus": "guided-config",
+      "installByDefault": false,
+      "enableWhen": [
+        "skill-installed",
+        "runtime.python312",
+        "api.image-2",
+        "credential.image-2-api-key"
+      ],
+      "dependencyTypes": [
+        "api-service",
+        "credential",
+        "runtime"
+      ],
+      "dependencies": [
+        "runtime.python312",
+        "api.image-2",
+        "credential.image-2-api-key"
+      ],
+      "dependentCapabilities": [
+        "异步文生图",
+        "图生图",
+        "两阶段确认"
+      ],
+      "healthCheck": "frontmatter, pack-copy, and dependency health-check path",
+      "notes": "专用 API Key 不回退到 OPENAI_API_KEY；外部 agent-id 不是 Codex 任务 ID。远程参考图受 HTTPS、公网地址、重定向和 25MB 限制，本地参考图按 SHA-256 锁定。"
+    },
+    {
+      "id": "image-prompt-generator",
+      "path": "skills/image-prompt-generator",
+      "status": "ready",
+      "afterRemediationStatus": "core-ready",
+      "installByDefault": true,
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "dependencyTypes": [],
+      "dependencies": [],
+      "dependentCapabilities": [
+        "结构化图片提示词",
+        "信息图与场景设计"
+      ],
+      "healthCheck": "frontmatter, pack-copy, and dependency health-check path",
+      "notes": "提示词生成不依赖图像服务；用户明确要求实际图片时优先使用 Codex 原生图像能力，外部 image-2 仅显式调用。"
+    },
+    {
+      "id": "industry-analysis",
+      "path": "skills/industry-analysis",
+      "status": "ready",
+      "afterRemediationStatus": "core-ready",
+      "installByDefault": true,
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "dependencyTypes": [
+        "capability"
+      ],
+      "dependencies": [
+        "capability.codex-web"
+      ],
+      "dependentCapabilities": [
+        "产业链",
+        "政策与趋势",
+        "竞争格局"
+      ],
+      "healthCheck": "frontmatter, pack-copy, and dependency health-check path",
+      "notes": ""
+    },
+    {
+      "id": "macro-research",
+      "path": "skills/macro-research",
+      "status": "requires-runtime",
+      "afterRemediationStatus": "auto-installable-runtime",
+      "installByDefault": false,
+      "enableWhen": [
+        "skill-installed",
+        "runtime-healthy"
+      ],
+      "dependencyTypes": [
+        "python-package",
+        "runtime"
+      ],
+      "dependencies": [
+        "runtime.python312",
+        "python.package.pandas",
+        "python.package.numpy",
+        "python.package.matplotlib"
+      ],
+      "dependentCapabilities": [
+        "周期判断",
+        "政策解读",
+        "资产配置框架"
+      ],
+      "healthCheck": "frontmatter, pack-copy, dependency health-check path, explicit cycle-rule, policy-evidence, sentiment-weight, and neutral-output contract tests",
+      "notes": "周期阶段只由显式增长/通胀变化和用户审阅规则场景计算；政策分析要求原文证据、传导依据和条件场景。情绪监控删除固定 mock 指标、情绪档位和仓位建议，并要求六项完整指标、显式合计为 1 的权重、数据时点和来源；缺字段时非零退出。"
+    },
+    {
+      "id": "market-sizing-analysis",
+      "path": "skills/market-sizing-analysis",
+      "status": "ready",
+      "afterRemediationStatus": "core-ready",
+      "installByDefault": true,
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "dependencyTypes": [
+        "capability"
+      ],
+      "dependencies": [
+        "capability.codex-web"
+      ],
+      "dependentCapabilities": [
+        "TAM/SAM/SOM",
+        "市场模型",
+        "口径与假设"
+      ],
+      "healthCheck": "frontmatter, pack-copy, and dependency health-check path",
+      "notes": ""
+    },
+    {
+      "id": "meal-planner",
+      "path": "skills/meal-planner",
+      "status": "requires-runtime",
+      "afterRemediationStatus": "auto-installable-runtime",
+      "installByDefault": false,
+      "enableWhen": [
+        "skill-installed",
+        "runtime-healthy"
+      ],
+      "dependencyTypes": [
+        "runtime"
+      ],
+      "dependencies": [
+        "runtime.python312"
+      ],
+      "dependentCapabilities": [
+        "食谱",
+        "营养分析",
+        "购物清单"
+      ],
+      "healthCheck": "frontmatter, pack-copy, and dependency health-check path",
+      "notes": ""
+    },
+    {
+      "id": "meeting-secretary",
+      "path": "skills/meeting-secretary",
+      "status": "ready",
+      "afterRemediationStatus": "core-ready",
+      "installByDefault": true,
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "dependencyTypes": [],
+      "dependencies": [],
+      "dependentCapabilities": [
+        "会议纪要",
+        "决定与行动项",
+        "议程"
+      ],
+      "healthCheck": "frontmatter, pack-copy, and dependency health-check path",
+      "notes": ""
+    },
+    {
+      "id": "multi-search-engine",
+      "path": "skills/multi-search-engine",
+      "status": "ready",
+      "afterRemediationStatus": "core-ready",
+      "installByDefault": true,
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "dependencyTypes": [
+        "capability"
+      ],
+      "dependencies": [
+        "capability.codex-web"
+      ],
+      "dependentCapabilities": [
+        "多来源检索",
+        "查询拆解",
+        "证据交叉验证"
+      ],
+      "healthCheck": "frontmatter, pack-copy, and dependency health-check path",
+      "notes": ""
+    },
+    {
+      "id": "node-connect",
+      "path": "skills/node-connect",
+      "status": "unsupported/disabled",
+      "afterRemediationStatus": "unsupported",
+      "installByDefault": false,
+      "enableWhen": [
+        "disabled"
+      ],
+      "dependencyTypes": [
+        "external"
+      ],
+      "dependencies": [
+        "external.device-pairing-runtime"
+      ],
+      "dependentCapabilities": [
+        "连接问题排查说明"
+      ],
+      "healthCheck": "negative test: no compatible automatic entry point; must remain disabled",
+      "notes": "保持禁用：设备配对协议与节点后端不在本能力包可验证边界内。"
+    },
+    {
+      "id": "offer-designer",
+      "path": "skills/offer-designer",
+      "status": "ready",
+      "afterRemediationStatus": "core-ready",
+      "installByDefault": true,
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "dependencyTypes": [],
+      "dependencies": [],
+      "dependentCapabilities": [
+        "产品定位",
+        "Offer 设计",
+        "定价与商业模式"
+      ],
+      "healthCheck": "frontmatter, pack-copy, and dependency health-check path",
+      "notes": ""
+    },
+    {
+      "id": "painpoint-analyzer",
+      "path": "skills/painpoint-analyzer",
+      "status": "ready",
+      "afterRemediationStatus": "core-ready",
+      "installByDefault": true,
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "dependencyTypes": [],
+      "dependencies": [],
+      "dependentCapabilities": [
+        "痛点挖掘",
+        "需求分层",
+        "机会判断"
+      ],
+      "healthCheck": "frontmatter, pack-copy, and dependency health-check path",
+      "notes": ""
+    },
+    {
+      "id": "pdf-processing-toolkit",
+      "path": "skills/pdf-processing-toolkit",
+      "status": "unsupported/disabled",
+      "afterRemediationStatus": "unsupported",
+      "installByDefault": false,
+      "enableWhen": [
+        "license-evidence-approved",
+        "skill-installed",
+        "runtime-healthy"
+      ],
+      "dependencyTypes": [
+        "python-package",
+        "runtime"
+      ],
+      "dependencies": [
+        "runtime.python312",
+        "python.package.pypdf",
+        "python.package.pdfplumber",
+        "python.package.reportlab"
+      ],
+      "dependentCapabilities": [
+        "PDF 提取",
+        "合并拆分",
+        "表单与生成"
+      ],
+      "healthCheck": "frontmatter and provenance warning; must remain disabled without license evidence",
+      "notes": "原始 frontmatter 声称 Proprietary 且引用缺失的 LICENSE.txt；在再分发条款可核验前保持 unsupported。"
+    },
+    {
+      "id": "powerpoint-pptx",
+      "path": "skills/powerpoint-pptx",
+      "status": "requires-runtime",
+      "afterRemediationStatus": "auto-installable-runtime",
+      "installByDefault": false,
+      "enableWhen": [
+        "skill-installed",
+        "runtime-healthy"
+      ],
+      "dependencyTypes": [
+        "python-package",
+        "runtime"
+      ],
+      "dependencies": [
+        "runtime.python312",
+        "python.package.python-pptx"
+      ],
+      "dependentCapabilities": [
+        "PPTX 创建",
+        "版式与图表",
+        "批量处理"
+      ],
+      "healthCheck": "frontmatter, pack-copy, and dependency health-check path",
+      "notes": ""
+    },
+    {
+      "id": "python-env-setup",
+      "path": "skills/python-env-setup",
+      "status": "ready",
+      "afterRemediationStatus": "core-ready",
+      "installByDefault": true,
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "dependencyTypes": [
+        "system"
+      ],
+      "dependencies": [
+        "system.powershell"
+      ],
+      "dependentCapabilities": [
+        "Python 检测",
+        "安装前检查",
+        "PATH 指引"
+      ],
+      "healthCheck": "missing-Python path returns JSON and non-zero without changing PATH",
+      "notes": "已改为 PowerShell 原生检查器，Python 缺失时仍可运行。"
+    },
+    {
+      "id": "safe-disk-operations",
+      "path": "skills/safe-disk-operations",
+      "status": "ready",
+      "afterRemediationStatus": "core-ready",
+      "installByDefault": true,
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "dependencyTypes": [
+        "system"
+      ],
+      "dependencies": [
+        "system.powershell"
+      ],
+      "dependentCapabilities": [
+        "删除与迁移的精确范围审查",
+        "所有权、哈希与链接边界保护",
+        "运行时配置备份、校验与回滚"
+      ],
+      "healthCheck": "frontmatter, pack-copy, and dependency health-check path",
+      "notes": "已移除与磁盘安全无关的财务计算触发器和一律拒绝只读检查的旧策略；当前流程与 Codex 的精确授权、只读预检、可恢复优先和用户改动保护原则一致。"
+    },
+    {
+      "id": "seedance2-0-video-gen",
+      "path": "skills/seedance2-0-video-gen",
+      "status": "requires-credential",
+      "afterRemediationStatus": "guided-config",
+      "installByDefault": false,
+      "enableWhen": [
+        "skill-installed",
+        "runtime.python312",
+        "api.seedance",
+        "credential.seedance-api-key"
+      ],
+      "dependencyTypes": [
+        "api-service",
+        "credential",
+        "runtime"
+      ],
+      "dependencies": [
+        "runtime.python312",
+        "api.seedance",
+        "credential.seedance-api-key"
+      ],
+      "dependentCapabilities": [
+        "视频生成",
+        "媒体顺序保护",
+        "幂等提交与轮询"
+      ],
+      "healthCheck": "frontmatter, pack-copy, and dependency health-check path",
+      "notes": "不再猜测模型、20000 积分或 24 小时策略；媒体 URL 必须为 HTTPS，重复素材严格保留；任务记录写入项目数据目录而不是已安装 Skill。已删除无法可靠绑定当前 Codex 会话的旧会话历史读取入口。"
+    },
+    {
+      "id": "self-improvement-agent",
+      "path": "skills/self-improvement-agent",
+      "status": "ready",
+      "afterRemediationStatus": "core-ready",
+      "installByDefault": true,
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "dependencyTypes": [],
+      "dependencies": [],
+      "dependentCapabilities": [
+        "错误记录",
+        "纠正复盘",
+        "项目内经验沉淀"
+      ],
+      "healthCheck": "frontmatter, pack-copy, dependency health-check path, reviewed rubric, explicit model/valuation assumptions, and contextual due-diligence template contract tests",
+      "notes": "商业评估只计算用户审阅评分表；财务模型显式区分净增长、流失、CAC、成本、初始现金和流动性缓冲，不判断健康度或推荐融资轮次。估值方法并列展示，不平均为公允值或生成谈判建议。尽调生成器要求法域、行业与交易结构，只生成全部为未审阅/待确认的起点清单，不自动分优先级、负责人、周期或投资处置。"
+    },
+    {
+      "id": "skills-search",
+      "path": "skills/skills-search",
+      "status": "ready",
+      "afterRemediationStatus": "core-ready",
+      "installByDefault": true,
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "dependencyTypes": [],
+      "dependencies": [],
+      "dependentCapabilities": [
+        "本地技能目录搜索",
+        "状态与依赖查询"
+      ],
+      "healthCheck": "local catalog query returns JSON without Python",
+      "notes": "已改为 PowerShell 原生本地目录搜索器。"
+    },
+    {
+      "id": "traffic-hunter",
+      "path": "skills/traffic-hunter",
+      "status": "ready",
+      "afterRemediationStatus": "core-ready",
+      "installByDefault": true,
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "dependencyTypes": [],
+      "dependencies": [],
+      "dependentCapabilities": [
+        "流量渠道",
+        "内容矩阵",
+        "获客系统"
+      ],
+      "healthCheck": "frontmatter, pack-copy, dependency health-check path, reviewed allocation policy, explicit transaction-cost, and neutral tracker contract tests",
+      "notes": "资产配置只把带来源的用户政策换算为金额；再平衡只计算当前到目标的机械差额，阈值和卖出成本率必须显式提供；追踪器要求真实历史序列、无风险利率、基准、时点与来源。三个入口均不生成产品推荐、评分、收益承诺、调仓、止盈或止损建议。"
+    },
+    {
+      "id": "travel-planner",
+      "path": "skills/travel-planner",
+      "status": "requires-runtime",
+      "afterRemediationStatus": "auto-installable-runtime",
+      "installByDefault": false,
+      "enableWhen": [
+        "skill-installed",
+        "runtime-healthy"
+      ],
+      "dependencyTypes": [
+        "capability",
+        "runtime"
+      ],
+      "dependencies": [
+        "runtime.python312",
+        "capability.codex-web"
+      ],
+      "dependentCapabilities": [
+        "行程",
+        "预算",
+        "打包与交通检索"
+      ],
+      "healthCheck": "frontmatter, pack-copy, and dependency health-check path",
+      "notes": "已移除未实现且会虚假返回成功的旧 Node index.js/package.json；当前只有已登记的 Python 入口。"
+    },
+    {
+      "id": "user-research",
+      "path": "skills/user-research",
+      "status": "ready",
+      "afterRemediationStatus": "core-ready",
+      "installByDefault": true,
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "dependencyTypes": [
+        "capability"
+      ],
+      "dependencies": [
+        "capability.codex-web"
+      ],
+      "dependentCapabilities": [
+        "用户画像",
+        "行为与反馈",
+        "需求验证"
+      ],
+      "healthCheck": "frontmatter, pack-copy, and dependency health-check path",
+      "notes": ""
+    },
+    {
+      "id": "venture-analysis",
+      "path": "skills/venture-analysis",
+      "status": "requires-runtime",
+      "afterRemediationStatus": "auto-installable-runtime",
+      "installByDefault": false,
+      "enableWhen": [
+        "skill-installed",
+        "runtime-healthy"
+      ],
+      "dependencyTypes": [
+        "python-package",
+        "runtime"
+      ],
+      "dependencies": [
+        "runtime.python312",
+        "python.package.pandas",
+        "python.package.numpy",
+        "python.package.matplotlib"
+      ],
+      "dependentCapabilities": [
+        "商业计划",
+        "财务模型",
+        "估值与尽调"
+      ],
+      "healthCheck": "frontmatter, pack-copy, and dependency health-check path",
+      "notes": ""
+    },
+    {
+      "id": "video-prompt-generator",
+      "path": "skills/video-prompt-generator",
+      "status": "ready",
+      "afterRemediationStatus": "core-ready",
+      "installByDefault": true,
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "dependencyTypes": [],
+      "dependencies": [],
+      "dependentCapabilities": [
+        "视频提示词",
+        "分镜",
+        "运镜和负面提示"
+      ],
+      "healthCheck": "frontmatter, pack-copy, and dependency health-check path",
+      "notes": ""
+    },
+    {
+      "id": "wealth-allocation",
+      "path": "skills/wealth-allocation",
+      "status": "requires-runtime",
+      "afterRemediationStatus": "auto-installable-runtime",
+      "installByDefault": false,
+      "enableWhen": [
+        "skill-installed",
+        "runtime-healthy"
+      ],
+      "dependencyTypes": [
+        "python-package",
+        "runtime"
+      ],
+      "dependencies": [
+        "runtime.python312",
+        "python.package.pandas",
+        "python.package.numpy",
+        "python.package.matplotlib"
+      ],
+      "dependentCapabilities": [
+        "资产配置",
+        "再平衡",
+        "收益追踪"
+      ],
+      "healthCheck": "frontmatter, pack-copy, and dependency health-check path",
+      "notes": ""
+    },
+    {
+      "id": "weather",
+      "path": "skills/weather",
+      "status": "ready",
+      "afterRemediationStatus": "core-ready",
+      "installByDefault": true,
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "dependencyTypes": [
+        "capability"
+      ],
+      "dependencies": [
+        "capability.network"
+      ],
+      "dependentCapabilities": [
+        "当前天气",
+        "短期预报"
+      ],
+      "healthCheck": "offline branch reports network requirement",
+      "notes": "优先使用当前 Codex 原生天气/网页能力；curl/PowerShell 公开服务仅作允许联网时的回退。"
+    },
+    {
+      "id": "weather-forecast",
+      "path": "skills/weather-forecast",
+      "status": "ready",
+      "afterRemediationStatus": "core-ready",
+      "installByDefault": true,
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "dependencyTypes": [
+        "capability"
+      ],
+      "dependencies": [
+        "capability.network"
+      ],
+      "dependentCapabilities": [
+        "城市偏好",
+        "天气预报",
+        "本地数据"
+      ],
+      "healthCheck": "set/get city round-trip in isolated WEATHER_DATA_DIR",
+      "notes": "城市偏好已改为 PowerShell JSON 存储；实时查询优先使用 Codex 原生天气/网页能力，公开 HTTP 服务仅作回退。"
+    },
+    {
+      "id": "web-content-fetcher",
+      "path": "skills/web-content-fetcher",
+      "status": "ready",
+      "afterRemediationStatus": "core-ready",
+      "installByDefault": true,
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "dependencyTypes": [
+        "capability",
+        "python-package"
+      ],
+      "dependencies": [
+        "capability.codex-web",
+        "python.package.scrapling",
+        "python.package.html2text"
+      ],
+      "dependentCapabilities": [
+        "网页正文提取",
+        "Markdown 清理"
+      ],
+      "healthCheck": "native path is documented and optional adapter missing-dependency failure is explicit",
+      "notes": "Codex 原生网页读取为核心路径；Scrapling/html2text 仅作批处理增强。"
+    },
+    {
+      "id": "web-search-extraction",
+      "path": "skills/web-search-extraction",
+      "status": "requires-credential",
+      "afterRemediationStatus": "guided-config",
+      "installByDefault": false,
+      "enableWhen": [
+        "skill-installed",
+        "credential.dashscope-api-key",
+        "connection.dashscope-base-url",
+        "connection.dashscope-model",
+        "capability.network"
+      ],
+      "dependencyTypes": [
+        "capability",
+        "connection",
+        "credential",
+        "runtime"
+      ],
+      "dependencies": [
+        "runtime.python312",
+        "credential.dashscope-api-key",
+        "connection.dashscope-base-url",
+        "connection.dashscope-model",
+        "capability.network"
+      ],
+      "dependentCapabilities": [
+        "联网搜索适配",
+        "结构化摘要"
+      ],
+      "healthCheck": "frontmatter, pack-copy, dependency health-check path, and no-network adapter contract tests",
+      "notes": "Codex 原生联网工具可用时优先使用原生工具；显式选择适配器后仍必须提供专用 Key、compatible-mode/v1 根地址和实际模型，脚本再拼接 /chat/completions。"
+    },
+    {
+      "id": "wechat-article-creator",
+      "path": "skills/wechat-article-creator",
+      "status": "requires-runtime",
+      "afterRemediationStatus": "auto-installable-runtime",
+      "installByDefault": false,
+      "enableWhen": [
+        "skill-installed",
+        "runtime-healthy"
+      ],
+      "dependencyTypes": [
+        "api-service",
+        "python-package",
+        "runtime"
+      ],
+      "dependencies": [
+        "runtime.python312",
+        "python.package.Pillow",
+        "api.image-2"
+      ],
+      "dependentCapabilities": [
+        "公众号选题",
+        "文章结构",
+        "标题与封面"
+      ],
+      "healthCheck": "frontmatter, pack-copy, and dependency health-check path",
+      "notes": "草稿和封面默认目录已从 Skill 树迁移到项目 codex-data；草稿文件名净化，封面限制尺寸/像素并校验输出格式。文本检查器已删除未实现的 auto-fix 参数与发布就绪评分，只输出可人工复核的编辑提示。"
+    },
+    {
+      "id": "word-docx",
+      "path": "skills/word-docx",
+      "status": "requires-runtime",
+      "afterRemediationStatus": "auto-installable-runtime",
+      "installByDefault": false,
+      "enableWhen": [
+        "skill-installed",
+        "runtime-healthy"
+      ],
+      "dependencyTypes": [
+        "python-package",
+        "runtime"
+      ],
+      "dependencies": [
+        "runtime.python312",
+        "python.package.python-docx"
+      ],
+      "dependentCapabilities": [
+        "Word 读写",
+        "样式与页眉页脚"
+      ],
+      "healthCheck": "frontmatter, pack-copy, and dependency health-check path",
+      "notes": ""
+    },
+    {
+      "id": "xiaohongshu-writing",
+      "path": "skills/xiaohongshu-writing",
+      "status": "ready",
+      "afterRemediationStatus": "core-ready",
+      "installByDefault": true,
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "dependencyTypes": [],
+      "dependencies": [],
+      "dependentCapabilities": [
+        "小红书标题",
+        "笔记结构",
+        "去模板化检查"
+      ],
+      "healthCheck": "frontmatter, pack-copy, and dependency health-check path",
+      "notes": ""
+    }
+  ],
+  "agents": [
+    {
+      "id": "general",
+      "file": "agents/general.toml",
+      "name": "全能官",
+      "description": "综合统筹与长期协作，覆盖跨领域分析、文件处理、计划制定和任务拆解。",
+      "status": "core-ready",
+      "readiness": {
+        "minimum": "core-ready",
+        "fallback": "没有 Python 时先完成文字、研究框架和提示词；没有联网服务时只使用用户材料。"
+      },
+      "requiredSkills": [
+        "multi-search-engine",
+        "image-prompt-generator",
+        "video-prompt-generator"
+      ],
+      "optionalSkills": [
+        "web-search-extraction",
+        "data-assistant",
+        "docx-butler",
+        "excel-xlsx",
+        "word-docx",
+        "powerpoint-pptx"
+      ],
+      "blockedSkills": [
+        "pdf-processing-toolkit"
+      ],
+      "connectionDependencies": [
+        "api.dashscope-web-search"
+      ],
+      "runtimeDependencies": [
+        "runtime.python312",
+        "runtime.python312-wheelhouse"
+      ],
+      "dependencyTypes": [
+        "connection",
+        "runtime",
+        "skill"
+      ],
+      "dependencies": [
+        {
+          "id": "skill.multi-search-engine",
+          "kind": "skill",
+          "name": "multi-search-engine",
+          "required": true,
+          "autoInstallable": true,
+          "healthCheck": "skills/multi-search-engine/SKILL.md exists",
+          "dependentCapabilities": [
+            "综合统筹与长期协作，覆盖跨领域分析、文件处理、计划制定和任务拆解。"
+          ]
+        },
+        {
+          "id": "skill.image-prompt-generator",
+          "kind": "skill",
+          "name": "image-prompt-generator",
+          "required": true,
+          "autoInstallable": true,
+          "healthCheck": "skills/image-prompt-generator/SKILL.md exists",
+          "dependentCapabilities": [
+            "综合统筹与长期协作，覆盖跨领域分析、文件处理、计划制定和任务拆解。"
+          ]
+        },
+        {
+          "id": "skill.video-prompt-generator",
+          "kind": "skill",
+          "name": "video-prompt-generator",
+          "required": true,
+          "autoInstallable": true,
+          "healthCheck": "skills/video-prompt-generator/SKILL.md exists",
+          "dependentCapabilities": [
+            "综合统筹与长期协作，覆盖跨领域分析、文件处理、计划制定和任务拆解。"
+          ]
+        },
+        {
+          "id": "skill.web-search-extraction",
+          "kind": "skill",
+          "name": "web-search-extraction",
+          "required": false,
+          "autoInstallable": true,
+          "healthCheck": "skills/web-search-extraction/SKILL.md exists",
+          "dependentCapabilities": [
+            "综合统筹与长期协作，覆盖跨领域分析、文件处理、计划制定和任务拆解。"
+          ]
+        },
+        {
+          "id": "skill.data-assistant",
+          "kind": "skill",
+          "name": "data-assistant",
+          "required": false,
+          "autoInstallable": true,
+          "healthCheck": "skills/data-assistant/SKILL.md exists",
+          "dependentCapabilities": [
+            "综合统筹与长期协作，覆盖跨领域分析、文件处理、计划制定和任务拆解。"
+          ]
+        },
+        {
+          "id": "skill.docx-butler",
+          "kind": "skill",
+          "name": "docx-butler",
+          "required": false,
+          "autoInstallable": true,
+          "healthCheck": "skills/docx-butler/SKILL.md exists",
+          "dependentCapabilities": [
+            "综合统筹与长期协作，覆盖跨领域分析、文件处理、计划制定和任务拆解。"
+          ]
+        },
+        {
+          "id": "skill.excel-xlsx",
+          "kind": "skill",
+          "name": "excel-xlsx",
+          "required": false,
+          "autoInstallable": true,
+          "healthCheck": "skills/excel-xlsx/SKILL.md exists",
+          "dependentCapabilities": [
+            "综合统筹与长期协作，覆盖跨领域分析、文件处理、计划制定和任务拆解。"
+          ]
+        },
+        {
+          "id": "skill.word-docx",
+          "kind": "skill",
+          "name": "word-docx",
+          "required": false,
+          "autoInstallable": true,
+          "healthCheck": "skills/word-docx/SKILL.md exists",
+          "dependentCapabilities": [
+            "综合统筹与长期协作，覆盖跨领域分析、文件处理、计划制定和任务拆解。"
+          ]
+        },
+        {
+          "id": "skill.powerpoint-pptx",
+          "kind": "skill",
+          "name": "powerpoint-pptx",
+          "required": false,
+          "autoInstallable": true,
+          "healthCheck": "skills/powerpoint-pptx/SKILL.md exists",
+          "dependentCapabilities": [
+            "综合统筹与长期协作，覆盖跨领域分析、文件处理、计划制定和任务拆解。"
+          ]
+        },
+        {
+          "id": "skill.pdf-processing-toolkit",
+          "kind": "skill",
+          "name": "pdf-processing-toolkit",
+          "required": false,
+          "autoInstallable": false,
+          "blocked": true,
+          "healthCheck": "blocked pending explicit compatibility/license approval",
+          "dependentCapabilities": [
+            "综合统筹与长期协作，覆盖跨领域分析、文件处理、计划制定和任务拆解。"
+          ]
+        },
+        {
+          "id": "runtime.python312",
+          "kind": "runtime",
+          "name": "runtime.python312",
+          "required": false,
+          "autoInstallable": true,
+          "healthCheck": "runtime.python312.healthy",
+          "failureMessage": "可选增强未就绪时保留 Agent 基础能力并明确降级。",
+          "dependentCapabilities": [
+            "综合统筹与长期协作，覆盖跨领域分析、文件处理、计划制定和任务拆解。"
+          ]
+        },
+        {
+          "id": "runtime.python312-wheelhouse",
+          "kind": "runtime",
+          "name": "runtime.python312-wheelhouse",
+          "required": false,
+          "autoInstallable": true,
+          "healthCheck": "runtime.python312-wheelhouse.healthy",
+          "failureMessage": "可选增强未就绪时保留 Agent 基础能力并明确降级。",
+          "dependentCapabilities": [
+            "综合统筹与长期协作，覆盖跨领域分析、文件处理、计划制定和任务拆解。"
+          ]
+        },
+        {
+          "id": "api.dashscope-web-search",
+          "kind": "connection",
+          "name": "api.dashscope-web-search",
+          "required": false,
+          "autoInstallable": false,
+          "healthCheck": "api.dashscope-web-search.healthy",
+          "failureMessage": "可选增强未就绪时保留 Agent 基础能力并明确降级。",
+          "dependentCapabilities": [
+            "综合统筹与长期协作，覆盖跨领域分析、文件处理、计划制定和任务拆解。"
+          ]
+        }
+      ],
+      "dependentCapabilities": [
+        "综合统筹与长期协作，覆盖跨领域分析、文件处理、计划制定和任务拆解。"
+      ]
+    },
+    {
+      "id": "research",
+      "file": "agents/research.toml",
+      "name": "研究官",
+      "description": "深度研究与情报分析，覆盖学术、竞品、产业链、用户研究和市场测算。",
+      "status": "core-ready",
+      "readiness": {
+        "minimum": "core-ready",
+        "fallback": "没有联网连接时只基于用户提供的论文、链接和数据，并标注无法实时核验。"
+      },
+      "requiredSkills": [
+        "academic-research",
+        "competitor-intelligence",
+        "industry-analysis",
+        "user-research",
+        "market-sizing-analysis",
+        "multi-search-engine"
+      ],
+      "optionalSkills": [
+        "web-search-extraction"
+      ],
+      "blockedSkills": [],
+      "connectionDependencies": [
+        "api.dashscope-web-search"
+      ],
+      "runtimeDependencies": [],
+      "dependencyTypes": [
+        "connection",
+        "skill"
+      ],
+      "dependencies": [
+        {
+          "id": "skill.academic-research",
+          "kind": "skill",
+          "name": "academic-research",
+          "required": true,
+          "autoInstallable": true,
+          "healthCheck": "skills/academic-research/SKILL.md exists",
+          "dependentCapabilities": [
+            "深度研究与情报分析，覆盖学术、竞品、产业链、用户研究和市场测算。"
+          ]
+        },
+        {
+          "id": "skill.competitor-intelligence",
+          "kind": "skill",
+          "name": "competitor-intelligence",
+          "required": true,
+          "autoInstallable": true,
+          "healthCheck": "skills/competitor-intelligence/SKILL.md exists",
+          "dependentCapabilities": [
+            "深度研究与情报分析，覆盖学术、竞品、产业链、用户研究和市场测算。"
+          ]
+        },
+        {
+          "id": "skill.industry-analysis",
+          "kind": "skill",
+          "name": "industry-analysis",
+          "required": true,
+          "autoInstallable": true,
+          "healthCheck": "skills/industry-analysis/SKILL.md exists",
+          "dependentCapabilities": [
+            "深度研究与情报分析，覆盖学术、竞品、产业链、用户研究和市场测算。"
+          ]
+        },
+        {
+          "id": "skill.user-research",
+          "kind": "skill",
+          "name": "user-research",
+          "required": true,
+          "autoInstallable": true,
+          "healthCheck": "skills/user-research/SKILL.md exists",
+          "dependentCapabilities": [
+            "深度研究与情报分析，覆盖学术、竞品、产业链、用户研究和市场测算。"
+          ]
+        },
+        {
+          "id": "skill.market-sizing-analysis",
+          "kind": "skill",
+          "name": "market-sizing-analysis",
+          "required": true,
+          "autoInstallable": true,
+          "healthCheck": "skills/market-sizing-analysis/SKILL.md exists",
+          "dependentCapabilities": [
+            "深度研究与情报分析，覆盖学术、竞品、产业链、用户研究和市场测算。"
+          ]
+        },
+        {
+          "id": "skill.multi-search-engine",
+          "kind": "skill",
+          "name": "multi-search-engine",
+          "required": true,
+          "autoInstallable": true,
+          "healthCheck": "skills/multi-search-engine/SKILL.md exists",
+          "dependentCapabilities": [
+            "深度研究与情报分析，覆盖学术、竞品、产业链、用户研究和市场测算。"
+          ]
+        },
+        {
+          "id": "skill.web-search-extraction",
+          "kind": "skill",
+          "name": "web-search-extraction",
+          "required": false,
+          "autoInstallable": true,
+          "healthCheck": "skills/web-search-extraction/SKILL.md exists",
+          "dependentCapabilities": [
+            "深度研究与情报分析，覆盖学术、竞品、产业链、用户研究和市场测算。"
+          ]
+        },
+        {
+          "id": "api.dashscope-web-search",
+          "kind": "connection",
+          "name": "api.dashscope-web-search",
+          "required": false,
+          "autoInstallable": false,
+          "healthCheck": "api.dashscope-web-search.healthy",
+          "failureMessage": "可选增强未就绪时保留 Agent 基础能力并明确降级。",
+          "dependentCapabilities": [
+            "深度研究与情报分析，覆盖学术、竞品、产业链、用户研究和市场测算。"
+          ]
+        }
+      ],
+      "dependentCapabilities": [
+        "深度研究与情报分析，覆盖学术、竞品、产业链、用户研究和市场测算。"
+      ]
+    },
+    {
+      "id": "content",
+      "file": "agents/content.toml",
+      "name": "创作官",
+      "description": "新媒体内容架构与创意生产，覆盖公众号、小红书、图片提示词、视频提示词和脚本。",
+      "status": "core-ready",
+      "readiness": {
+        "minimum": "core-ready",
+        "fallback": "没有图像/视频服务时输出可直接交给外部生成器的提示词和分镜，不伪造生成结果。"
+      },
+      "requiredSkills": [
+        "xiaohongshu-writing",
+        "image-prompt-generator",
+        "video-prompt-generator"
+      ],
+      "optionalSkills": [
+        "wechat-article-creator",
+        "web-search-extraction",
+        "image-2",
+        "seedance2-0-video-gen"
+      ],
+      "blockedSkills": [],
+      "connectionDependencies": [
+        "api.dashscope-web-search",
+        "api.image-2",
+        "api.seedance"
+      ],
+      "runtimeDependencies": [
+        "runtime.python312",
+        "runtime.python312-wheelhouse"
+      ],
+      "dependencyTypes": [
+        "connection",
+        "runtime",
+        "skill"
+      ],
+      "dependencies": [
+        {
+          "id": "skill.xiaohongshu-writing",
+          "kind": "skill",
+          "name": "xiaohongshu-writing",
+          "required": true,
+          "autoInstallable": true,
+          "healthCheck": "skills/xiaohongshu-writing/SKILL.md exists",
+          "dependentCapabilities": [
+            "新媒体内容架构与创意生产，覆盖公众号、小红书、图片提示词、视频提示词和脚本。"
+          ]
+        },
+        {
+          "id": "skill.image-prompt-generator",
+          "kind": "skill",
+          "name": "image-prompt-generator",
+          "required": true,
+          "autoInstallable": true,
+          "healthCheck": "skills/image-prompt-generator/SKILL.md exists",
+          "dependentCapabilities": [
+            "新媒体内容架构与创意生产，覆盖公众号、小红书、图片提示词、视频提示词和脚本。"
+          ]
+        },
+        {
+          "id": "skill.video-prompt-generator",
+          "kind": "skill",
+          "name": "video-prompt-generator",
+          "required": true,
+          "autoInstallable": true,
+          "healthCheck": "skills/video-prompt-generator/SKILL.md exists",
+          "dependentCapabilities": [
+            "新媒体内容架构与创意生产，覆盖公众号、小红书、图片提示词、视频提示词和脚本。"
+          ]
+        },
+        {
+          "id": "skill.wechat-article-creator",
+          "kind": "skill",
+          "name": "wechat-article-creator",
+          "required": false,
+          "autoInstallable": true,
+          "healthCheck": "skills/wechat-article-creator/SKILL.md exists",
+          "dependentCapabilities": [
+            "新媒体内容架构与创意生产，覆盖公众号、小红书、图片提示词、视频提示词和脚本。"
+          ]
+        },
+        {
+          "id": "skill.web-search-extraction",
+          "kind": "skill",
+          "name": "web-search-extraction",
+          "required": false,
+          "autoInstallable": true,
+          "healthCheck": "skills/web-search-extraction/SKILL.md exists",
+          "dependentCapabilities": [
+            "新媒体内容架构与创意生产，覆盖公众号、小红书、图片提示词、视频提示词和脚本。"
+          ]
+        },
+        {
+          "id": "skill.image-2",
+          "kind": "skill",
+          "name": "image-2",
+          "required": false,
+          "autoInstallable": true,
+          "healthCheck": "skills/image-2/SKILL.md exists",
+          "dependentCapabilities": [
+            "新媒体内容架构与创意生产，覆盖公众号、小红书、图片提示词、视频提示词和脚本。"
+          ]
+        },
+        {
+          "id": "skill.seedance2-0-video-gen",
+          "kind": "skill",
+          "name": "seedance2-0-video-gen",
+          "required": false,
+          "autoInstallable": true,
+          "healthCheck": "skills/seedance2-0-video-gen/SKILL.md exists",
+          "dependentCapabilities": [
+            "新媒体内容架构与创意生产，覆盖公众号、小红书、图片提示词、视频提示词和脚本。"
+          ]
+        },
+        {
+          "id": "runtime.python312",
+          "kind": "runtime",
+          "name": "runtime.python312",
+          "required": false,
+          "autoInstallable": true,
+          "healthCheck": "runtime.python312.healthy",
+          "failureMessage": "可选增强未就绪时保留 Agent 基础能力并明确降级。",
+          "dependentCapabilities": [
+            "新媒体内容架构与创意生产，覆盖公众号、小红书、图片提示词、视频提示词和脚本。"
+          ]
+        },
+        {
+          "id": "runtime.python312-wheelhouse",
+          "kind": "runtime",
+          "name": "runtime.python312-wheelhouse",
+          "required": false,
+          "autoInstallable": true,
+          "healthCheck": "runtime.python312-wheelhouse.healthy",
+          "failureMessage": "可选增强未就绪时保留 Agent 基础能力并明确降级。",
+          "dependentCapabilities": [
+            "新媒体内容架构与创意生产，覆盖公众号、小红书、图片提示词、视频提示词和脚本。"
+          ]
+        },
+        {
+          "id": "api.dashscope-web-search",
+          "kind": "connection",
+          "name": "api.dashscope-web-search",
+          "required": false,
+          "autoInstallable": false,
+          "healthCheck": "api.dashscope-web-search.healthy",
+          "failureMessage": "可选增强未就绪时保留 Agent 基础能力并明确降级。",
+          "dependentCapabilities": [
+            "新媒体内容架构与创意生产，覆盖公众号、小红书、图片提示词、视频提示词和脚本。"
+          ]
+        },
+        {
+          "id": "api.image-2",
+          "kind": "connection",
+          "name": "api.image-2",
+          "required": false,
+          "autoInstallable": false,
+          "healthCheck": "api.image-2.healthy",
+          "failureMessage": "可选增强未就绪时保留 Agent 基础能力并明确降级。",
+          "dependentCapabilities": [
+            "新媒体内容架构与创意生产，覆盖公众号、小红书、图片提示词、视频提示词和脚本。"
+          ]
+        },
+        {
+          "id": "api.seedance",
+          "kind": "connection",
+          "name": "api.seedance",
+          "required": false,
+          "autoInstallable": false,
+          "healthCheck": "api.seedance.healthy",
+          "failureMessage": "可选增强未就绪时保留 Agent 基础能力并明确降级。",
+          "dependentCapabilities": [
+            "新媒体内容架构与创意生产，覆盖公众号、小红书、图片提示词、视频提示词和脚本。"
+          ]
+        }
+      ],
+      "dependentCapabilities": [
+        "新媒体内容架构与创意生产，覆盖公众号、小红书、图片提示词、视频提示词和脚本。"
+      ]
+    },
+    {
+      "id": "investment",
+      "file": "agents/investment.toml",
+      "name": "投资官",
+      "description": "投资研究与财富配置，覆盖 A 股、基金、宏观、创业投资和组合管理。",
+      "status": "auto-installable-runtime",
+      "readiness": {
+        "minimum": "auto-installable-runtime",
+        "fallback": "没有行情包或联网数据时只提供分析框架和风险清单，不输出虚构的实时价格、财务数据或收益承诺。"
+      },
+      "requiredSkills": [
+        "china-stock-analysis",
+        "fund-portfolio",
+        "macro-research",
+        "venture-analysis",
+        "wealth-allocation"
+      ],
+      "optionalSkills": [
+        "web-search-extraction"
+      ],
+      "blockedSkills": [],
+      "connectionDependencies": [
+        "api.dashscope-web-search"
+      ],
+      "runtimeDependencies": [
+        "runtime.python312",
+        "runtime.python312-wheelhouse"
+      ],
+      "dependencyTypes": [
+        "connection",
+        "runtime",
+        "skill"
+      ],
+      "dependencies": [
+        {
+          "id": "skill.china-stock-analysis",
+          "kind": "skill",
+          "name": "china-stock-analysis",
+          "required": true,
+          "autoInstallable": true,
+          "healthCheck": "skills/china-stock-analysis/SKILL.md exists",
+          "dependentCapabilities": [
+            "投资研究与财富配置，覆盖 A 股、基金、宏观、创业投资和组合管理。"
+          ]
+        },
+        {
+          "id": "skill.fund-portfolio",
+          "kind": "skill",
+          "name": "fund-portfolio",
+          "required": true,
+          "autoInstallable": true,
+          "healthCheck": "skills/fund-portfolio/SKILL.md exists",
+          "dependentCapabilities": [
+            "投资研究与财富配置，覆盖 A 股、基金、宏观、创业投资和组合管理。"
+          ]
+        },
+        {
+          "id": "skill.macro-research",
+          "kind": "skill",
+          "name": "macro-research",
+          "required": true,
+          "autoInstallable": true,
+          "healthCheck": "skills/macro-research/SKILL.md exists",
+          "dependentCapabilities": [
+            "投资研究与财富配置，覆盖 A 股、基金、宏观、创业投资和组合管理。"
+          ]
+        },
+        {
+          "id": "skill.venture-analysis",
+          "kind": "skill",
+          "name": "venture-analysis",
+          "required": true,
+          "autoInstallable": true,
+          "healthCheck": "skills/venture-analysis/SKILL.md exists",
+          "dependentCapabilities": [
+            "投资研究与财富配置，覆盖 A 股、基金、宏观、创业投资和组合管理。"
+          ]
+        },
+        {
+          "id": "skill.wealth-allocation",
+          "kind": "skill",
+          "name": "wealth-allocation",
+          "required": true,
+          "autoInstallable": true,
+          "healthCheck": "skills/wealth-allocation/SKILL.md exists",
+          "dependentCapabilities": [
+            "投资研究与财富配置，覆盖 A 股、基金、宏观、创业投资和组合管理。"
+          ]
+        },
+        {
+          "id": "skill.web-search-extraction",
+          "kind": "skill",
+          "name": "web-search-extraction",
+          "required": false,
+          "autoInstallable": true,
+          "healthCheck": "skills/web-search-extraction/SKILL.md exists",
+          "dependentCapabilities": [
+            "投资研究与财富配置，覆盖 A 股、基金、宏观、创业投资和组合管理。"
+          ]
+        },
+        {
+          "id": "runtime.python312",
+          "kind": "runtime",
+          "name": "runtime.python312",
+          "required": false,
+          "autoInstallable": true,
+          "healthCheck": "runtime.python312.healthy",
+          "failureMessage": "可选增强未就绪时保留 Agent 基础能力并明确降级。",
+          "dependentCapabilities": [
+            "投资研究与财富配置，覆盖 A 股、基金、宏观、创业投资和组合管理。"
+          ]
+        },
+        {
+          "id": "runtime.python312-wheelhouse",
+          "kind": "runtime",
+          "name": "runtime.python312-wheelhouse",
+          "required": false,
+          "autoInstallable": true,
+          "healthCheck": "runtime.python312-wheelhouse.healthy",
+          "failureMessage": "可选增强未就绪时保留 Agent 基础能力并明确降级。",
+          "dependentCapabilities": [
+            "投资研究与财富配置，覆盖 A 股、基金、宏观、创业投资和组合管理。"
+          ]
+        },
+        {
+          "id": "api.dashscope-web-search",
+          "kind": "connection",
+          "name": "api.dashscope-web-search",
+          "required": false,
+          "autoInstallable": false,
+          "healthCheck": "api.dashscope-web-search.healthy",
+          "failureMessage": "可选增强未就绪时保留 Agent 基础能力并明确降级。",
+          "dependentCapabilities": [
+            "投资研究与财富配置，覆盖 A 股、基金、宏观、创业投资和组合管理。"
+          ]
+        }
+      ],
+      "dependentCapabilities": [
+        "投资研究与财富配置，覆盖 A 股、基金、宏观、创业投资和组合管理。"
+      ]
+    },
+    {
+      "id": "growth",
+      "file": "agents/growth.toml",
+      "name": "增长官",
+      "description": "商业增长与变现设计，覆盖用户痛点、产品 Offer、流量、转化、留存和增长实验。",
+      "status": "core-ready",
+      "readiness": {
+        "minimum": "core-ready",
+        "fallback": "没有外部研究数据时先用用户提供的业务数据，所有市场数字和增长判断都标明假设。"
+      },
+      "requiredSkills": [
+        "painpoint-analyzer",
+        "offer-designer",
+        "traffic-hunter",
+        "conversion-optimizer",
+        "growth-analyst"
+      ],
+      "optionalSkills": [
+        "web-search-extraction"
+      ],
+      "blockedSkills": [],
+      "connectionDependencies": [
+        "api.dashscope-web-search"
+      ],
+      "runtimeDependencies": [],
+      "dependencyTypes": [
+        "connection",
+        "skill"
+      ],
+      "dependencies": [
+        {
+          "id": "skill.painpoint-analyzer",
+          "kind": "skill",
+          "name": "painpoint-analyzer",
+          "required": true,
+          "autoInstallable": true,
+          "healthCheck": "skills/painpoint-analyzer/SKILL.md exists",
+          "dependentCapabilities": [
+            "商业增长与变现设计，覆盖用户痛点、产品 Offer、流量、转化、留存和增长实验。"
+          ]
+        },
+        {
+          "id": "skill.offer-designer",
+          "kind": "skill",
+          "name": "offer-designer",
+          "required": true,
+          "autoInstallable": true,
+          "healthCheck": "skills/offer-designer/SKILL.md exists",
+          "dependentCapabilities": [
+            "商业增长与变现设计，覆盖用户痛点、产品 Offer、流量、转化、留存和增长实验。"
+          ]
+        },
+        {
+          "id": "skill.traffic-hunter",
+          "kind": "skill",
+          "name": "traffic-hunter",
+          "required": true,
+          "autoInstallable": true,
+          "healthCheck": "skills/traffic-hunter/SKILL.md exists",
+          "dependentCapabilities": [
+            "商业增长与变现设计，覆盖用户痛点、产品 Offer、流量、转化、留存和增长实验。"
+          ]
+        },
+        {
+          "id": "skill.conversion-optimizer",
+          "kind": "skill",
+          "name": "conversion-optimizer",
+          "required": true,
+          "autoInstallable": true,
+          "healthCheck": "skills/conversion-optimizer/SKILL.md exists",
+          "dependentCapabilities": [
+            "商业增长与变现设计，覆盖用户痛点、产品 Offer、流量、转化、留存和增长实验。"
+          ]
+        },
+        {
+          "id": "skill.growth-analyst",
+          "kind": "skill",
+          "name": "growth-analyst",
+          "required": true,
+          "autoInstallable": true,
+          "healthCheck": "skills/growth-analyst/SKILL.md exists",
+          "dependentCapabilities": [
+            "商业增长与变现设计，覆盖用户痛点、产品 Offer、流量、转化、留存和增长实验。"
+          ]
+        },
+        {
+          "id": "skill.web-search-extraction",
+          "kind": "skill",
+          "name": "web-search-extraction",
+          "required": false,
+          "autoInstallable": true,
+          "healthCheck": "skills/web-search-extraction/SKILL.md exists",
+          "dependentCapabilities": [
+            "商业增长与变现设计，覆盖用户痛点、产品 Offer、流量、转化、留存和增长实验。"
+          ]
+        },
+        {
+          "id": "api.dashscope-web-search",
+          "kind": "connection",
+          "name": "api.dashscope-web-search",
+          "required": false,
+          "autoInstallable": false,
+          "healthCheck": "api.dashscope-web-search.healthy",
+          "failureMessage": "可选增强未就绪时保留 Agent 基础能力并明确降级。",
+          "dependentCapabilities": [
+            "商业增长与变现设计，覆盖用户痛点、产品 Offer、流量、转化、留存和增长实验。"
+          ]
+        }
+      ],
+      "dependentCapabilities": [
+        "商业增长与变现设计，覆盖用户痛点、产品 Offer、流量、转化、留存和增长实验。"
+      ]
+    },
+    {
+      "id": "lifestyle",
+      "file": "agents/lifestyle.toml",
+      "name": "生活官",
+      "description": "健康与生活方式规划，覆盖健身、饮食、旅行、天气和个人复盘。",
+      "status": "core-ready",
+      "readiness": {
+        "minimum": "core-ready",
+        "fallback": "没有 Python 时保留计划、清单和复盘文本；没有实时网络时不声称天气、交通或价格已核验；健康建议不替代医生。"
+      },
+      "requiredSkills": [
+        "daily-reflection",
+        "weather-forecast",
+        "weather"
+      ],
+      "optionalSkills": [
+        "fitness-coach",
+        "meal-planner",
+        "travel-planner",
+        "multi-search-engine",
+        "web-search-extraction"
+      ],
+      "blockedSkills": [],
+      "connectionDependencies": [
+        "api.dashscope-web-search"
+      ],
+      "runtimeDependencies": [
+        "runtime.python312",
+        "runtime.python312-wheelhouse"
+      ],
+      "dependencyTypes": [
+        "connection",
+        "runtime",
+        "skill"
+      ],
+      "dependencies": [
+        {
+          "id": "skill.daily-reflection",
+          "kind": "skill",
+          "name": "daily-reflection",
+          "required": true,
+          "autoInstallable": true,
+          "healthCheck": "skills/daily-reflection/SKILL.md exists",
+          "dependentCapabilities": [
+            "健康与生活方式规划，覆盖健身、饮食、旅行、天气和个人复盘。"
+          ]
+        },
+        {
+          "id": "skill.weather-forecast",
+          "kind": "skill",
+          "name": "weather-forecast",
+          "required": true,
+          "autoInstallable": true,
+          "healthCheck": "skills/weather-forecast/SKILL.md exists",
+          "dependentCapabilities": [
+            "健康与生活方式规划，覆盖健身、饮食、旅行、天气和个人复盘。"
+          ]
+        },
+        {
+          "id": "skill.weather",
+          "kind": "skill",
+          "name": "weather",
+          "required": true,
+          "autoInstallable": true,
+          "healthCheck": "skills/weather/SKILL.md exists",
+          "dependentCapabilities": [
+            "健康与生活方式规划，覆盖健身、饮食、旅行、天气和个人复盘。"
+          ]
+        },
+        {
+          "id": "skill.fitness-coach",
+          "kind": "skill",
+          "name": "fitness-coach",
+          "required": false,
+          "autoInstallable": true,
+          "healthCheck": "skills/fitness-coach/SKILL.md exists",
+          "dependentCapabilities": [
+            "健康与生活方式规划，覆盖健身、饮食、旅行、天气和个人复盘。"
+          ]
+        },
+        {
+          "id": "skill.meal-planner",
+          "kind": "skill",
+          "name": "meal-planner",
+          "required": false,
+          "autoInstallable": true,
+          "healthCheck": "skills/meal-planner/SKILL.md exists",
+          "dependentCapabilities": [
+            "健康与生活方式规划，覆盖健身、饮食、旅行、天气和个人复盘。"
+          ]
+        },
+        {
+          "id": "skill.travel-planner",
+          "kind": "skill",
+          "name": "travel-planner",
+          "required": false,
+          "autoInstallable": true,
+          "healthCheck": "skills/travel-planner/SKILL.md exists",
+          "dependentCapabilities": [
+            "健康与生活方式规划，覆盖健身、饮食、旅行、天气和个人复盘。"
+          ]
+        },
+        {
+          "id": "skill.multi-search-engine",
+          "kind": "skill",
+          "name": "multi-search-engine",
+          "required": false,
+          "autoInstallable": true,
+          "healthCheck": "skills/multi-search-engine/SKILL.md exists",
+          "dependentCapabilities": [
+            "健康与生活方式规划，覆盖健身、饮食、旅行、天气和个人复盘。"
+          ]
+        },
+        {
+          "id": "skill.web-search-extraction",
+          "kind": "skill",
+          "name": "web-search-extraction",
+          "required": false,
+          "autoInstallable": true,
+          "healthCheck": "skills/web-search-extraction/SKILL.md exists",
+          "dependentCapabilities": [
+            "健康与生活方式规划，覆盖健身、饮食、旅行、天气和个人复盘。"
+          ]
+        },
+        {
+          "id": "runtime.python312",
+          "kind": "runtime",
+          "name": "runtime.python312",
+          "required": false,
+          "autoInstallable": true,
+          "healthCheck": "runtime.python312.healthy",
+          "failureMessage": "可选增强未就绪时保留 Agent 基础能力并明确降级。",
+          "dependentCapabilities": [
+            "健康与生活方式规划，覆盖健身、饮食、旅行、天气和个人复盘。"
+          ]
+        },
+        {
+          "id": "runtime.python312-wheelhouse",
+          "kind": "runtime",
+          "name": "runtime.python312-wheelhouse",
+          "required": false,
+          "autoInstallable": true,
+          "healthCheck": "runtime.python312-wheelhouse.healthy",
+          "failureMessage": "可选增强未就绪时保留 Agent 基础能力并明确降级。",
+          "dependentCapabilities": [
+            "健康与生活方式规划，覆盖健身、饮食、旅行、天气和个人复盘。"
+          ]
+        },
+        {
+          "id": "api.dashscope-web-search",
+          "kind": "connection",
+          "name": "api.dashscope-web-search",
+          "required": false,
+          "autoInstallable": false,
+          "healthCheck": "api.dashscope-web-search.healthy",
+          "failureMessage": "可选增强未就绪时保留 Agent 基础能力并明确降级。",
+          "dependentCapabilities": [
+            "健康与生活方式规划，覆盖健身、饮食、旅行、天气和个人复盘。"
+          ]
+        }
+      ],
+      "dependentCapabilities": [
+        "健康与生活方式规划，覆盖健身、饮食、旅行、天气和个人复盘。"
+      ]
+    },
+    {
+      "id": "office",
+      "file": "agents/office.toml",
+      "name": "办公官",
+      "description": "职场效率与交付管家，覆盖文档、数据、邮件、会议、表格和文件整理。",
+      "status": "core-ready",
+      "readiness": {
+        "minimum": "core-ready",
+        "fallback": "没有文件运行时就输出结构化文本、表格设计和操作步骤，不声称文件已生成或已修改。"
+      },
+      "requiredSkills": [
+        "efficiency-toolkit",
+        "email-expert",
+        "meeting-secretary"
+      ],
+      "optionalSkills": [
+        "data-assistant",
+        "docx-butler",
+        "excel-xlsx",
+        "word-docx",
+        "powerpoint-pptx"
+      ],
+      "blockedSkills": [
+        "pdf-processing-toolkit"
+      ],
+      "connectionDependencies": [],
+      "runtimeDependencies": [
+        "runtime.python312",
+        "runtime.python312-wheelhouse"
+      ],
+      "dependencyTypes": [
+        "runtime",
+        "skill"
+      ],
+      "dependencies": [
+        {
+          "id": "skill.efficiency-toolkit",
+          "kind": "skill",
+          "name": "efficiency-toolkit",
+          "required": true,
+          "autoInstallable": true,
+          "healthCheck": "skills/efficiency-toolkit/SKILL.md exists",
+          "dependentCapabilities": [
+            "职场效率与交付管家，覆盖文档、数据、邮件、会议、表格和文件整理。"
+          ]
+        },
+        {
+          "id": "skill.email-expert",
+          "kind": "skill",
+          "name": "email-expert",
+          "required": true,
+          "autoInstallable": true,
+          "healthCheck": "skills/email-expert/SKILL.md exists",
+          "dependentCapabilities": [
+            "职场效率与交付管家，覆盖文档、数据、邮件、会议、表格和文件整理。"
+          ]
+        },
+        {
+          "id": "skill.meeting-secretary",
+          "kind": "skill",
+          "name": "meeting-secretary",
+          "required": true,
+          "autoInstallable": true,
+          "healthCheck": "skills/meeting-secretary/SKILL.md exists",
+          "dependentCapabilities": [
+            "职场效率与交付管家，覆盖文档、数据、邮件、会议、表格和文件整理。"
+          ]
+        },
+        {
+          "id": "skill.data-assistant",
+          "kind": "skill",
+          "name": "data-assistant",
+          "required": false,
+          "autoInstallable": true,
+          "healthCheck": "skills/data-assistant/SKILL.md exists",
+          "dependentCapabilities": [
+            "职场效率与交付管家，覆盖文档、数据、邮件、会议、表格和文件整理。"
+          ]
+        },
+        {
+          "id": "skill.docx-butler",
+          "kind": "skill",
+          "name": "docx-butler",
+          "required": false,
+          "autoInstallable": true,
+          "healthCheck": "skills/docx-butler/SKILL.md exists",
+          "dependentCapabilities": [
+            "职场效率与交付管家，覆盖文档、数据、邮件、会议、表格和文件整理。"
+          ]
+        },
+        {
+          "id": "skill.excel-xlsx",
+          "kind": "skill",
+          "name": "excel-xlsx",
+          "required": false,
+          "autoInstallable": true,
+          "healthCheck": "skills/excel-xlsx/SKILL.md exists",
+          "dependentCapabilities": [
+            "职场效率与交付管家，覆盖文档、数据、邮件、会议、表格和文件整理。"
+          ]
+        },
+        {
+          "id": "skill.word-docx",
+          "kind": "skill",
+          "name": "word-docx",
+          "required": false,
+          "autoInstallable": true,
+          "healthCheck": "skills/word-docx/SKILL.md exists",
+          "dependentCapabilities": [
+            "职场效率与交付管家，覆盖文档、数据、邮件、会议、表格和文件整理。"
+          ]
+        },
+        {
+          "id": "skill.powerpoint-pptx",
+          "kind": "skill",
+          "name": "powerpoint-pptx",
+          "required": false,
+          "autoInstallable": true,
+          "healthCheck": "skills/powerpoint-pptx/SKILL.md exists",
+          "dependentCapabilities": [
+            "职场效率与交付管家，覆盖文档、数据、邮件、会议、表格和文件整理。"
+          ]
+        },
+        {
+          "id": "skill.pdf-processing-toolkit",
+          "kind": "skill",
+          "name": "pdf-processing-toolkit",
+          "required": false,
+          "autoInstallable": false,
+          "blocked": true,
+          "healthCheck": "blocked pending explicit compatibility/license approval",
+          "dependentCapabilities": [
+            "职场效率与交付管家，覆盖文档、数据、邮件、会议、表格和文件整理。"
+          ]
+        },
+        {
+          "id": "runtime.python312",
+          "kind": "runtime",
+          "name": "runtime.python312",
+          "required": false,
+          "autoInstallable": true,
+          "healthCheck": "runtime.python312.healthy",
+          "failureMessage": "可选增强未就绪时保留 Agent 基础能力并明确降级。",
+          "dependentCapabilities": [
+            "职场效率与交付管家，覆盖文档、数据、邮件、会议、表格和文件整理。"
+          ]
+        },
+        {
+          "id": "runtime.python312-wheelhouse",
+          "kind": "runtime",
+          "name": "runtime.python312-wheelhouse",
+          "required": false,
+          "autoInstallable": true,
+          "healthCheck": "runtime.python312-wheelhouse.healthy",
+          "failureMessage": "可选增强未就绪时保留 Agent 基础能力并明确降级。",
+          "dependentCapabilities": [
+            "职场效率与交付管家，覆盖文档、数据、邮件、会议、表格和文件整理。"
+          ]
+        }
+      ],
+      "dependentCapabilities": [
+        "职场效率与交付管家，覆盖文档、数据、邮件、会议、表格和文件整理。"
+      ]
+    }
+  ]
+}

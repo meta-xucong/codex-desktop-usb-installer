@@ -4,6 +4,7 @@ import {
   isConnectivityFailure,
   messageFailure,
   resolveFailure,
+  sanitizeDiagnosticDetail,
   userErrorMessage,
 } from "./errorCopy";
 import type { TKey } from "./i18n";
@@ -17,6 +18,7 @@ const copy: Partial<Record<TKey, string>> = {
   "error.disk_write": "无法写入磁盘。请检查磁盘权限与可用空间后重试。",
   "error.permission": "权限不足。请以合适的权限重试，或更换安装位置。",
   "error.signature": "更新包签名校验失败。已保留现有 Codex，请稍后重试或更换更新源。",
+  "error.bundle_integrity": "USB 包完整性校验失败。已保留现有 Codex，请展开详情检查具体文件后重试。",
   "error.artifact": "更新包无效或已过期。请稍后重试，或在设置中更换更新源。",
   "error.incompatible": "当前系统环境不支持此安装方式。请尝试其他安装选项。",
   "error.unsupported": "当前平台暂不支持此操作。",
@@ -59,11 +61,13 @@ describe("userErrorMessage / resolveFailure", () => {
       ["disk_write", "无法写入磁盘。请检查磁盘权限与可用空间后重试。"],
       ["permission", "权限不足。请以合适的权限重试，或更换安装位置。"],
       ["signature", "更新包签名校验失败。已保留现有 Codex，请稍后重试或更换更新源。"],
+      ["bundle_integrity", "USB 包完整性校验失败。已保留现有 Codex，请展开详情检查具体文件后重试。"],
       ["artifact", "更新包无效或已过期。请稍后重试，或在设置中更换更新源。"],
       ["incompatible", "当前系统环境不支持此安装方式。请尝试其他安装选项。"],
       ["cancelled", "下载已取消。"],
       ["operation_busy", "已有操作正在进行，请稍后再试。"],
       ["stale_expectation", "安装状态已变化,已重新检查——请再次确认。"],
+      ["post_commit_cleanup", "操作未完成。请稍后重试；若持续失败，可复制诊断信息反馈。"],
       ["unsupported_platform", "当前平台暂不支持此操作。"],
       ["internal_error", "操作未完成。请稍后重试；若持续失败，可复制诊断信息反馈。"],
       ["contract_mismatch", "操作未完成。请稍后重试；若持续失败，可复制诊断信息反馈。"],
@@ -96,5 +100,22 @@ describe("userErrorMessage / resolveFailure", () => {
       detail: null,
       recoverable: true,
     });
+  });
+
+  it("redacts transport URLs, local paths, and credential-like values in details", () => {
+    expect(
+      sanitizeDiagnosticDetail(
+        "GET https://example.test/archive.zip failed at C:\\Users\\secret\\skills with api_key=super-secret",
+      ),
+    ).toBe("GET [remote source] failed at [local path] with api_key=[redacted]");
+  });
+
+  it("maps Skill Hub conflict and rollback codes to a stable artifact message", () => {
+    expect(userErrorMessage({ code: "SKILL_REPO_USER_CONFLICT", message: "raw" }, t)).toBe(
+      "更新包无效或已过期。请稍后重试，或在设置中更换更新源。",
+    );
+    expect(userErrorMessage({ code: "SKILL_REPO_ROLLBACK_FAILED", message: "raw" }, t)).toBe(
+      "更新包无效或已过期。请稍后重试，或在设置中更换更新源。",
+    );
   });
 });

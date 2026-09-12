@@ -419,6 +419,12 @@ fn fetch_text_output(
     headers: &[&'static str],
     follow_redirects: bool,
 ) -> Result<std::process::Output, EngineError> {
+    // Metadata checks must fail fast enough for the UI to remain responsive
+    // when a machine is offline or a regional route is temporarily blocked.
+    // Package downloads use the separate long-running download limits below.
+    const CONNECT_TIMEOUT_SECONDS: &str = "10";
+    const MAX_TIME_SECONDS: &str = "15";
+    const OUTER_TIMEOUT_SECONDS: u64 = 20;
     let max_text = MAX_TEXT_BYTES.to_string();
     let mut command = hidden_command(curl_exe());
     network.apply_to_command_with_schannel_revocation(&mut command, revocation_check);
@@ -430,9 +436,9 @@ fn fetch_text_output(
         "--proto-redir",
         "=https",
         "--connect-timeout",
-        "20",
+        CONNECT_TIMEOUT_SECONDS,
         "--max-time",
-        "60",
+        MAX_TIME_SECONDS,
         "--max-filesize",
         &max_text,
     ]);
@@ -444,7 +450,7 @@ fn fetch_text_output(
     // backstop that also kills a hung curl that ignored max-time.
     run_capturing(
         command,
-        RunLimits::total(std::time::Duration::from_secs(75)),
+        RunLimits::total(std::time::Duration::from_secs(OUTER_TIMEOUT_SECONDS)),
         None,
     )
     .map_err(|e| EngineError::Io(format!("curl: {}", e.message())))

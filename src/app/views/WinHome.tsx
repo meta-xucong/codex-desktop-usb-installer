@@ -53,6 +53,7 @@ import {
   type ManualExistingCandidate,
 } from "./ManualExistingInstall";
 import { ProgressScreen, type PausedDownload } from "./ProgressScreen";
+import { SkillRepoUpdateCard } from "./SkillRepoUpdateCard";
 import { useDownloadProgress } from "./useDownloadProgress";
 import { useFocusRecheck, installIdentity } from "./useFocusRecheck";
 import { useOperationReattach } from "./useOperationReattach";
@@ -1706,6 +1707,8 @@ export function WinHome({
             )
           ) : null}
         </div>
+
+        <SkillRepoUpdateCard />
 
         {!rechecking &&
         !provenanceRecoveryPending &&

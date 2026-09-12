@@ -1,0 +1,11 @@
+{
+  "repository": "meta-xucong/skill_hub",
+  "branch": "master",
+  "githubCommitUrl": "https://api.github.com/repos/meta-xucong/skill_hub/commits/master",
+  "githubArchiveTemplate": "https://github.com/meta-xucong/skill_hub/archive/{commit}.zip",
+  "exportRoot": "/srv/codex-update-relay/export",
+  "workRoot": "/srv/codex-update-relay/work/skill-hub",
+  "stateRoot": "/srv/codex-update-relay/state",
+  "lockFile": "/srv/codex-update-relay/state/skill-hub-sync.lock",
+  "maxPublishedReleases": 5
+}

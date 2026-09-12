@@ -5,6 +5,7 @@ param(
     [string]$BundlePath = "",
     [string]$OutputPath = "",
     [string]$CapabilityPackSource = "",
+    [switch]$InternalSigned,
     [switch]$SkipSignature
 )
 
@@ -13,7 +14,7 @@ $repo = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 if ([string]::IsNullOrWhiteSpace($BundlePath)) { $BundlePath = Join-Path $repo "release\usb" }
 if ([string]::IsNullOrWhiteSpace($OutputPath)) { $OutputPath = Join-Path $repo "release\usb-final" }
 if ([string]::IsNullOrWhiteSpace($CapabilityPackSource)) {
-    $CapabilityPackSource = Join-Path (Split-Path -Parent $repo) "openclaw-codex-kit\installer-pack"
+    $CapabilityPackSource = Join-Path $repo "installer-pack"
 }
 $bundle = (Resolve-Path -LiteralPath $BundlePath).Path
 $installer = (Resolve-Path -LiteralPath $InstallerPath).Path
@@ -54,8 +55,18 @@ function Read-JsonFile([string]$Path) {
 }
 
 function Assert-NoSuccessfulStateResidue([string]$RootPath) {
+    $rootLicensePath = Join-Path $RootPath "usb-license.json"
+    if (Test-Path -LiteralPath $rootLicensePath) {
+        throw "静态发行目录不得携带 usb-license.json；请在真实 U 盘复制完成后使用签名工具写入运行期授权"
+    }
     foreach ($entry in Get-ChildItem -LiteralPath $RootPath -Recurse -Force) {
         $relative = (Get-RelativePathCompat $RootPath $entry.FullName).Replace('\', '/')
+        if ($entry.Name -ieq "usb-license.json" -and $relative -ine "usb-license.json") {
+            throw "usb-license.json 只能出现在 U 盘 bundle 根目录：$relative"
+        }
+        if ($entry.Name -ieq "usb-license.json.bak") {
+            throw "U 盘 bundle 不得包含 usb-license.json.bak 残留：$relative"
+        }
         $forbidden = $false
         foreach ($segment in $relative.Split('/')) {
             if ($segment -ieq '.staging' -or $segment -ieq 'staging' -or
@@ -136,7 +147,7 @@ if ($isUsbLauncher) {
     if (-not (Test-Path -LiteralPath $managerSource -PathType Leaf)) {
         throw "CodexUsbLauncher.exe 必须与同目录 CodexAppManager.exe 一起构建"
     }
-    if (-not $SkipSignature) {
+    if (-not $SkipSignature -and -not $InternalSigned) {
         Assert-AuthenticodePe $installer "CodexUsbLauncher.exe"
         Assert-AuthenticodePe $managerSource "CodexAppManager.exe"
     }
@@ -279,7 +290,10 @@ Assert-NoSuccessfulStateResidue $output
 
 $lines = Get-ChildItem -LiteralPath $output -File -Recurse -Force |
     Sort-Object -Property FullName |
-    Where-Object { $_.Name -ne "SHA256SUMS.txt" -and $_.Name -ine "usb-license.json" } |
+    Where-Object {
+        $relative = (Get-RelativePathCompat $output $_.FullName).Replace('\', '/')
+        $_.Name -ne "SHA256SUMS.txt" -and $relative -ine "usb-license.json"
+    } |
     ForEach-Object {
         $relative = Get-RelativePathCompat $output $_.FullName
         $relative = $relative.Replace('\', '/')

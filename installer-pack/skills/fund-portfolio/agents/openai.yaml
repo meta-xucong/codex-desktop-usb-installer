@@ -1,0 +1,6 @@
+interface:
+  display_name: "基金组合"
+  short_description: "基于最新可核验数据筛选基金，设计组合、定投与风险评估方案。"
+  default_prompt: "Use $fund-portfolio to evaluate these funds and design a risk-aware portfolio with current data."
+policy:
+  allow_implicit_invocation: false
