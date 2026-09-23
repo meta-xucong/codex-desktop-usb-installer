@@ -55,6 +55,7 @@ describe("desktop trust-boundary config", () => {
       // renderer reads the monitor scale to convert onResized's physical px.
       "core:window:allow-scale-factor",
       "dialog:allow-open",
+      "dialog:allow-confirm",
       "process:allow-restart",
     ]);
     expect(capability.permissions).not.toContain("core:default");

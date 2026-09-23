@@ -181,10 +181,13 @@ impl LockGuard {
         }
         #[cfg(windows)]
         {
+            use std::os::windows::process::CommandExt;
+
             // A live pid shows up as a CSV row quoting it; the locale-varying
             // "no tasks" info line never contains the quoted pid.
             std::process::Command::new("tasklist")
                 .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+                .creation_flags(0x0800_0000)
                 .output()
                 .map(|o| !String::from_utf8_lossy(&o.stdout).contains(&format!("\"{pid}\"")))
                 .unwrap_or(false)

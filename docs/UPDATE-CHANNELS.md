@@ -30,10 +30,10 @@ UpdateContext.bundle_root 是当前 manager 实例授权的 USB bundle 根目录
 
 | 项目 | 实现 |
 | --- | --- |
-| 源 | `auto` 依次尝试国内镜像、内置兼容 Relay（或用户配置的 Relay）、GitHub；也可显式选择其中一种 |
+| 源 | `auto` 依次尝试内置兼容 Relay（或用户配置的 Relay）、GitHub；旧镜像协议仅为历史配置兼容，不再参与自动 Codex U 盘更新 |
 | 格式 | 严格 owner/repo，仅字母、数字、-、_、. |
-| 国内镜像 API | `https://codexapp.agentsmirror.com/latest/manifest`、`latest/checksums`、`latest/win-x64` / `latest/win-arm64` |
-| 兼容 Relay API | 配置目录下的 `latest.json` 描述符；仅保留兼容用途 |
+| 历史镜像 API | `https://codexapp.agentsmirror.com/latest/manifest`、`latest/checksums`、`latest/win-x64` / `latest/win-arm64`；仅用于读取旧配置，不参与 `auto` |
+| 兼容 Relay API | 配置目录下的 `latest.json` 描述符；客户端兼容协议 1/2，仅保留兼容用途 |
 | GitHub API | https://api.github.com/repos/{repo}/releases/latest |
 | API 请求头 | Accept: application/vnd.github+json、稳定 User-Agent |
 | 资产 | 镜像：`latest/manifest`、`latest/checksums`、`latest/win-{arch}`；GitHub：当前架构的 MSIX、SHA256SUMS-windows.txt、release-manifest.json |
@@ -49,22 +49,28 @@ appVersion 不同，不能互换。镜像资产 URL 只从同源 `/latest` 路�
 会重新获取并完整比较 checked identity：repo、release id/tag、三个资产的
 id/name、package moniker、架构、MSIX version、appVersion 和 digest。
 
-## v2 capability 与 USB anchor
+## schema 3 更新能力与 USB anchor（清单顶层 schema 仍为 2）
 
 可更新 bundle 必须同时满足 root manifest.schemaVersion == 2、
 usb-manifest.schemaVersion == 2，并声明 updateCapability：
 
     {
       "codexPayload": true,
-      "schemaVersion": 2,
+      "schemaVersion": 3,
+      "anchorSchema": 3,
       "checksumFile": "SHA256SUMS.txt",
       "transactionDirectory": ".staging",
       "backupPolicy": "single-msix-listed-in-SHA256SUMS",
       "successState": "clean"
     }
 
-usb_guard 的 v2 anchor 对两个 manifest 做确定性 JSON key 排序，只移除
-明确允许变化的字段：
+这里的 `schemaVersion=3` 是 `updateCapability` 的更新协议版本，
+`anchorSchema=3` 是 `stable-update-v1` 锚点算法版本；root/USB 清单自身的
+顶层 `schemaVersion` 仍必须为 2。两侧能力声明和正式许可证的
+`fingerprint.anchorSchema` 必须都是 3 且一致。新签名器只接受这类可更新包。
+
+usb_guard 的 schema 3 anchor 对两个 manifest 做确定性 JSON key 排序，只移除
+明确允许变化的字段，并把 checksum 中的运行期槽位规范化为固定标记：
 
     manifest.json:
       codexDesktopVersion, packageVersion, releaseTag,
@@ -72,9 +78,15 @@ usb_guard 的 v2 anchor 对两个 manifest 做确定性 JSON key 排序，只移
     usb-manifest.json:
       codexInstaller.payloadSha256, codexInstaller.payloadSize
 
-其它字段、字段类型、布局、架构和产品身份都会影响 anchor。旧 v1 bundle
-继续使用旧 raw anchor，但 Codex 更新在远端请求前拒绝 v1/未知版本，要求重建
-并重新授权；不会通过更新命令自动 enroll 或重签 license。
+    SHA256SUMS.txt:
+      当前 payload、manifest、usb-manifest 和单一 backup 槽位
+      统一为 MUTABLE 标记；其它文件保留 IMMUTABLE + hash + path。
+
+其它字段、字段类型、布局、架构和产品身份都会影响 anchor。没有 backup 的
+初始包也会预留同一个 backup 槽位，因此第一次合法更新生成备份不会改变 anchor；
+多于一个 backup 行、未知文件、路径穿越和重复路径仍然 fail closed。历史 v1/v2
+anchor 只保留读取/启动兼容，Codex 更新在远端请求前拒绝，要求重建并重新授权；
+不会通过更新命令自动 enroll 或重签 license。
 
 ## Apply 事务
 
@@ -95,7 +107,15 @@ rename 前会重新读取当前版本、payload 路径、架构和 payload 状�
 5. 重新校验清单与 payload 元数据，最后清除 staging 和 writer .bak。
 
 异常会依据 old metadata snapshot 和 backup 回滚；下次 apply 会先处理未完成
-事务。check 不执行写操作；发现待恢复事务时返回明确错误。
+事务。check 不下载 payload、不部署本机、不主动发起远程更新；但若启动或上一次 apply 已留下一个可识别的持久化事务，check 会先执行一次确定性的本地恢复/收尾，再继续检查。该恢复只处理事务目录和本地清单，不改变授权、不切换更新源，也不会因恢复触发网络更新；恢复失败会返回具体阶段和文件路径。
+
+更新确认阶段的本地校验顺序为：先读取 capability 元数据并解析新源，再执行
+完整 `SHA256SUMS` 校验。完整校验返回的摘要只在本次调用链内用于构造本地
+快照，不跨越 check/apply 会话缓存，也不以文件大小或 mtime 代替摘要。真正
+提交前仍保留独立 capability、完整清单和 payload 摘要复核。这样可避免在可
+移动介质上为同一 payload 重复做无意义的全量读取，同时不放宽确认后变化的
+拒绝规则。Codex apply 的 capability、source-resolve、integrity、snapshot、
+download、commit 失败会带阶段和错误码写入日志。
 
 Windows portable fallback 使用 `<bundle>/apps/.codex-app-manager-staging/` 暂存
 MSIX 解包结果，再在提交边界原子替换 `apps/Codex`。该目录与 `.staging/`、
@@ -121,22 +141,23 @@ Settings 支持填写、保存、清空恢复默认和非法值提示。About �
 
 自动模式的实际顺序固定为：
 
-1. `https://codexapp.agentsmirror.com/` 的镜像协议（`latest/manifest`）；
-2. 内置 `https://update.404token.xyz/__codex_update__/` 的兼容 Relay 协议
+1. 内置 `https://update.404token.xyz/__codex_update__/` 的 Wangnov 兼容 Relay 协议
    （`latest.json`）；如果用户填写了自定义 Relay 地址，则使用该地址；
-3. GitHub Release API。
+2. GitHub Release API。
 
-镜像和 Relay 是两种不同的 metadata 协议，不能只把镜像 URL 改名后请求
-`latest.json`。客户端会为 Relay 统一计算有效 base URL，并将该 URL 同时用于
+历史镜像和 Relay 是两种不同的 metadata 协议，不能只把镜像 URL 改名后请求
+`latest.json`；历史镜像不会被自动模式选作 Codex U 盘更新候选。客户端会为 Relay 统一计算有效 base URL，并将该 URL 同时用于
 解析、日志 locator、check/apply stale identity 和同源资产派生，避免出现“检查时
-走了一个地址、应用时却被判定为另一来源”的不一致。任一候选源失败都会保留前面
-候选源的诊断信息；全部失败时不修改 U 盘。
+走了一个地址、应用时却被判定为另一来源”的不一致。任一候选源失败都会保留诊断
+信息；Auto 只要至少一个候选源成功解析出合法 release，就以这些成功结果判断是否
+有更新。合法源均无更新时，即使备用源失败也返回“当前已是最新”；只有没有任何
+合法源时才报告全部来源不可用。全部失败时不修改 U 盘。
 
 ## 失败语义
 
 | 场景 | 结果 |
 | --- | --- |
-| v1/未知 capability | 远端请求前拒绝，要求重建/重新授权 |
+| v1/v2/未知 Codex update capability | 远端请求前拒绝，要求重建/重新授权 |
 | source/release/asset/本地版本变化 | StaleExpectation |
 | 下载、大小、checksum、digest、签名或 identity 失败 | 清理 staged 文件并保持旧 bundle |
 | metadata 或 rename 中途失败 | 回滚 old payload + 全部 old metadata，保留可重试性 |

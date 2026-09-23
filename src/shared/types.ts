@@ -122,6 +122,8 @@ export interface DownloadProgress {
   total: number;
   /** Host the bytes come from, e.g. codexapp.agentsmirror.com. */
   source: string;
+  /** Backend lifecycle phase; present on phase transition packets. */
+  phase?: OperationPhase;
   /**
    * Backend operation id that produced this event. Present on live desktop
    * progress so a reloaded UI can reject late events from a previous op.
@@ -222,7 +224,31 @@ export interface CcswitchLaunchReport {
   usableWindowConfirmed?: boolean;
   /** USB Windows builds use child-scoped WebView2 software rendering. */
   graphicsMode?: "software-rendering" | "unknown" | string;
+  /** Signed USB binding was handed to CCSwitch without exposing the key. */
+  accountInjected?: boolean;
   message: string;
+}
+
+export interface AccountStatus {
+  bound: boolean;
+  accountName: string | null;
+  loggedIn: boolean;
+  balance: unknown;
+  usage: unknown;
+  message: string;
+}
+
+/** Result of refreshing Codex's official model_catalog_json bridge. */
+export interface NativeModelCatalogReport {
+  status: "ready" | "fresh" | "stale" | "failed" | "skipped" | string;
+  modelCount: number;
+  catalogPath: string | null;
+  fetchedAt: string | null;
+  message: string;
+  /** Number of bounded requests made to the 404token upstream. */
+  attempts?: number;
+  /** `upstream-*` when the remote gateway, rather than local files, failed. */
+  errorKind?: string | null;
 }
 
 /** Options for the offline capability-pack installer. Secrets are never
@@ -273,11 +299,37 @@ export interface CapabilityPackReport {
   message: string;
 }
 
-export type SkillRepoSourceKind = "relay" | "github";
+export type SkillRepoSourceKind = "domestic" | "relay" | "github";
+export type SkillRepoSourceLabel =
+  | "domestic-1"
+  | "domestic-2"
+  | "domestic-3"
+  | "relay"
+  | "github";
+export type SkillRepoSourceAttemptPhase = "metadata" | "archive" | "verify";
+export type SkillRepoSourceAttemptResult =
+  | "ok"
+  | "timeout"
+  | "unavailable"
+  | "http"
+  | "invalid"
+  | "hash-mismatch"
+  | "cancelled";
+
+export interface SkillRepoSourceAttempt {
+  sourceId: string;
+  sourceKind: SkillRepoSourceKind;
+  phase: SkillRepoSourceAttemptPhase;
+  result: SkillRepoSourceAttemptResult;
+  httpStatus: number | null;
+  elapsedMs: number;
+}
 
 export type SkillRepoErrorCode =
   | "SKILL_REPO_UNAVAILABLE"
   | "SKILL_REPO_TIMEOUT"
+  | "SKILL_REPO_SOURCE_UNAVAILABLE"
+  | "SKILL_REPO_ALL_SOURCES_FAILED"
   | "SKILL_REPO_SOURCE_INVALID"
   | "SKILL_REPO_STALE"
   | "SKILL_REPO_HASH_MISMATCH"
@@ -286,6 +338,8 @@ export type SkillRepoErrorCode =
   | "SKILL_REPO_USER_CONFLICT"
   | "SKILL_REPO_HOT_MODIFIED"
   | "SKILL_REPO_LEDGER_INVALID"
+  | "SKILL_REPO_BASE_RESOURCE_INVALID"
+  | "SKILL_REPO_LOCAL_IO"
   | "SKILL_REPO_LOCKED"
   | "SKILL_REPO_ROLLBACK_FAILED"
   | "SKILL_REPO_UNSUPPORTED";
@@ -300,6 +354,7 @@ export interface SkillRepoExpected {
   branch: string;
   commit: string;
   sourceKind: SkillRepoSourceKind;
+  sourceId: string;
   archiveSize: number;
   archiveSha256: string;
 }
@@ -316,6 +371,8 @@ export interface SkillRepoUpdateInfo {
   currentCommit: string | null;
   latestCommit: string;
   sourceKind: SkillRepoSourceKind;
+  sourceLabel: SkillRepoSourceLabel;
+  attempts: SkillRepoSourceAttempt[];
   archiveSize: number;
   archiveSha256: string;
   expected: SkillRepoExpected;
@@ -863,7 +920,14 @@ export interface WinBundleUninstallReport {
   /** Phase 1 finished; no final filesystem success is claimed before exit. */
   cleanupPending?: boolean;
   cleanupReportPath?: string | null;
+  cleanupHandoffId?: string | null;
   outcome: OperationOutcome;
+}
+
+export interface UninstallHandoffStatus {
+  id: string;
+  reportPath: string;
+  message: string;
 }
 
 export function emptyStepOutcome(state = "not_applicable"): StepOutcome {

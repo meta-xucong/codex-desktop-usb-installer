@@ -8,9 +8,9 @@
 | 整改后状态 | 数量 | 默认安装 | 启用方式 |
 |---|---:|---:|---|
 | `core-ready` | 25 | 是 | 安装后可直接使用 |
-| `auto-installable-runtime` | 14 | 否 | 运行时安装器完成健康检查后启用 |
+| `auto-installable-runtime` | 15 | 是 | 运行时安装器完成健康检查后启用 |
 | `guided-config` | 7 | 否 | 连接向导保存配置并通过健康检查后启用 |
-| `unsupported` | 4 | 否 | 保持禁用，给出替代路径或补齐许可证证据 |
+| `unsupported` | 3 | 是（安全降级） | 外部后端缺失时明确报告不可用 |
 
 ## Windows 基线
 
@@ -88,17 +88,17 @@ SHA-256 锁定。Seedance 不再内置模型、`20000` 积分或 `24` 小时等�
 按服务方当前规则显式填写并在计费请求前展示给用户。任务记录与生成产物写入项目 `codex-data/`（或明确
 配置的数据目录），不写入已安装 Skill。
 
-## 明确禁用的能力
+## 外部后端缺失时安全失败的能力
 
-- `canvas`：没有可验证的远程画布运行时，只提供 HTML 原型说明或替代方案。
-- `healthcheck`：主机、管理员权限、网络暴露和备份状态必须现场审计，不能由静态包伪造。
-- `node-connect`：设备配对协议和节点后端不在当前 Codex 能力包边界内。
-- `pdf-processing-toolkit`：原始元数据引用缺失的专有 `LICENSE.txt`，在再分发条款可核验前保持禁用；优先使用 Codex 已提供的 PDF 能力。
+- `canvas`：默认允许调用，但没有远程画布后端时只提供 HTML 原型并报告不可用。
+- `healthcheck`：默认允许调用，但主机、管理员权限、网络暴露和备份状态必须现场审计，不能由静态包伪造。
+- `node-connect`：默认允许调用，但设备配对协议和节点后端不在当前 Codex 能力包边界内。
+- `pdf-processing-toolkit`：已补齐自维护 `LICENSE.txt`、pypdf/pdfplumber/reportlab 离线依赖和 smoke test。
 
 ## 启用规则
 
-1. `core-ready` Skill 在默认安装集合中。
-2. `auto-installable-runtime` 只有在指定 Python 和 wheelhouse 健康检查通过后才启用。
+1. `core-ready`、`auto-installable-runtime` 和 `unsupported` Skill 在默认配置中写入 `enabled=true`；运行时和外部后端仍按实际健康状态决定能否完成操作。
+2. `auto-installable-runtime` 只有在指定 Python 和 wheelhouse 健康检查通过后才执行真实操作。
 3. `guided-config` 只有在连接字段校验、服务探针和权限确认通过后才启用。
-4. `unsupported` 始终保持禁用；Agent 必须给出安全降级，不得声称拥有该能力。
+4. `unsupported` 只在配置层面启用；Agent 必须给出安全降级，不得声称拥有缺失的外部能力。
 5. 运行时、MCP 和 API 都有单独的健康检查与失败消息，互不混用。

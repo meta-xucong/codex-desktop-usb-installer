@@ -112,11 +112,11 @@ def validate_model_catalog(catalog: object) -> list[str]:
         if field in catalog and (not isinstance(catalog[field], str) or not catalog[field].strip()):
             errors.append(f"Model catalog {field} must be a non-empty string.")
 
+    retired_ids: set[str] = set()
     retired = catalog.get("retiredModelIds")
     if not isinstance(retired, list):
         errors.append("Model catalog retiredModelIds must be an array.")
     else:
-        retired_ids: set[str] = set()
         for value in retired:
             if not isinstance(value, str) or not value.strip():
                 errors.append("Model catalog retiredModelIds entries must be non-empty strings.")
@@ -168,6 +168,11 @@ def validate_model_catalog(catalog: object) -> list[str]:
             errors.append(f"{context} reasoningLevels must be unique.")
         elif default_level not in levels:
             errors.append(f"{context} defaultReasoningLevel must be listed in reasoningLevels.")
+
+    for retired_id in retired_ids:
+        retired_entry = model_by_id.get(retired_id)
+        if retired_entry and retired_entry.get("visibility") == "list" and retired_entry.get("supportedInApi") is True:
+            errors.append(f"Retired model {retired_id} cannot remain visible and active in the model catalog.")
 
     preferred_entry = model_by_id.get(preferred.casefold()) if isinstance(preferred, str) else None
     if preferred_entry is None:
@@ -428,33 +433,71 @@ def check_audit_statuses(audit: Audit) -> None:
     data = load_json(path)
     entries = data.get("skills", [])
     status_counts: dict[str, int] = {}
+    default_statuses = {"core-ready", "auto-installable-runtime", "unsupported"}
+    guided_statuses = {"guided-config"}
     for entry in entries:
         status = str(entry.get("afterRemediationStatus", ""))
         status_counts[status] = status_counts.get(status, 0) + 1
-        if entry.get("installByDefault") and status != "core-ready":
-            audit.error(f"Non-core Skill is enabled by default: {entry.get('id')}")
+        expected_default = status in default_statuses
+        if bool(entry.get("installByDefault")) != expected_default:
+            audit.error(
+                f"Skill {entry.get('id')} installByDefault={entry.get('installByDefault')} "
+                f"does not match status policy {status}."
+            )
+        if bool(entry.get("defaultEnabled")) != expected_default:
+            audit.error(
+                f"Skill {entry.get('id')} defaultEnabled={entry.get('defaultEnabled')} "
+                f"does not match status policy {status}."
+            )
+        if status not in default_statuses | guided_statuses:
+            audit.error(f"Unknown post-remediation Skill status: {status}")
+    expected_counts = {
+        "core-ready": 25,
+        "auto-installable-runtime": 15,
+        "guided-config": 7,
+        "unsupported": 3,
+    }
+    if status_counts != expected_counts:
+        audit.error(f"Skill status counts differ from one-step policy: {status_counts}; expected {expected_counts}.")
+    enabled_entries = [entry for entry in entries if bool(entry.get("installByDefault"))]
+    if len(enabled_entries) != 43:
+        audit.error(f"One-step policy must default-enable 43 Skills, found {len(enabled_entries)}.")
+
+    for skill_id in ("canvas", "healthcheck", "node-connect"):
+        external = next((entry for entry in entries if entry.get("id") == skill_id), None)
+        if not external or external.get("afterRemediationStatus") != "unsupported" or not external.get("installByDefault"):
+            audit.error(f"{skill_id} must be config-enabled with an unsupported safe-failure status.")
+        skill_path = audit.root / "skills" / skill_id / "SKILL.md"
+        text = skill_path.read_text(encoding="utf-8").casefold() if skill_path.is_file() else ""
+        for marker in ("后端", "不可用", "不得", "不伪造"):
+            if marker not in text:
+                audit.error(f"{skill_id} Skill documentation lacks safe-failure marker: {marker}")
+
     pdf = next((entry for entry in entries if entry.get("id") == "pdf-processing-toolkit"), None)
-    if not pdf or pdf.get("afterRemediationStatus") != "unsupported":
-        audit.error("pdf-processing-toolkit must remain unsupported until redistribution evidence is approved.")
+    pdf_dir = audit.root / "skills" / "pdf-processing-toolkit"
+    pdf_path = pdf_dir / "SKILL.md"
+    license_path = pdf_dir / "LICENSE.txt"
+    smoke_path = pdf_dir / "scripts" / "pdf_tool.py"
+    if not pdf or pdf.get("status") != "requires-runtime" or pdf.get("afterRemediationStatus") != "auto-installable-runtime":
+        audit.error("pdf-processing-toolkit must be an auto-installable runtime Skill after license remediation.")
+    redistribution = pdf.get("redistribution", {}) if pdf else {}
+    if redistribution.get("status") != "maintained-original" or redistribution.get("sourceBodyIncluded") is not True:
+        audit.error("pdf-processing-toolkit must identify its maintained original implementation.")
+    if not license_path.is_file() or "mit license" not in license_path.read_text(encoding="utf-8").casefold():
+        audit.error("pdf-processing-toolkit is missing its self-maintained MIT LICENSE.txt.")
+    pdf_text = pdf_path.read_text(encoding="utf-8").casefold() if pdf_path.is_file() else ""
+    if "license.txt" not in pdf_text or "pypdf" not in pdf_text or "pdfplumber" not in pdf_text or "reportlab" not in pdf_text:
+        audit.error("pdf-processing-toolkit documentation lacks the runtime/license dependency contract.")
+    if not smoke_path.is_file():
+        audit.error("pdf-processing-toolkit PDF smoke-test script is missing.")
     else:
-        redistribution = pdf.get("redistribution", {})
-        if redistribution.get("status") != "quarantined-stub-only":
-            audit.error("pdf-processing-toolkit must declare a quarantined-stub-only redistribution status.")
-        if redistribution.get("sourceBodyIncluded") is not False:
-            audit.error("pdf-processing-toolkit must not include the imported source body.")
-        pdf_path = audit.root / "skills" / "pdf-processing-toolkit" / "SKILL.md"
-        pdf_text = pdf_path.read_text(encoding="utf-8").casefold() if pdf_path.is_file() else ""
-        marker = str(redistribution.get("publicStubMarker", "")).casefold()
-        max_bytes = redistribution.get("maxPublicStubBytes")
-        if not marker or marker not in pdf_text:
-            audit.error("pdf-processing-toolkit lacks the fixed public quarantine marker.")
-        if not isinstance(max_bytes, int) or max_bytes <= 0 or pdf_path.stat().st_size > max_bytes:
-            audit.error("pdf-processing-toolkit public quarantine stub exceeds its declared size limit.")
-        if "license" not in pdf_text and "许可证" not in pdf_text:
-            audit.error("pdf-processing-toolkit lacks an explicit redistribution warning.")
+        smoke_text = smoke_path.read_text(encoding="utf-8")
+        for marker in ("PdfReader", "pdfplumber", "reportlab", "def smoke", "def merge", "def extract", "def generate"):
+            if marker not in smoke_text:
+                audit.error(f"PDF smoke helper lacks required operation marker: {marker}")
     audit.metrics["statusCounts"] = status_counts
     if len(audit.errors) == errors_before:
-        audit.passed("Compatibility statuses and license quarantine")
+        audit.passed("Compatibility statuses, one-step Skill activation, safe unsupported fallbacks, and PDF license/runtime contract")
 
 
 def check_external_adapters(audit: Audit) -> None:

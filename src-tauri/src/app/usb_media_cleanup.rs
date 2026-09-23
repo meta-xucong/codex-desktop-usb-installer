@@ -38,6 +38,8 @@ const FILES: &[&str] = &[
     "content/README.txt",
     "content/skills/README.txt",
     "content/mcp/README.txt",
+    "resources/skill_hub_sources.json",
+    "resources/skill_repo_base_manifest.json",
 ];
 const RECOVERY: &[&str] = &[
     "CodexAppManager.exe",

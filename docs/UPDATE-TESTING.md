@@ -1,4 +1,4 @@
-# Update Testing — v2 Codex payload
+# Update Testing — schema 3 Codex payload capability
 
 状态：**实现后测试记录**。最终是否可发布以实际命令输出和独立审计为准；
 没有物理 Windows USB、arm64 v2 fixture 和真实发布下载链路时，不得宣称完整
@@ -94,23 +94,25 @@ cover license and atomic-backup handling.
 semantic separation, About Windows/authorization gate and stale pending
 cleanup, plus Tauri-boundary refusal in managerApi.
 
-## v2 fixture验收
+## schema 3 capability fixture 验收
 
-应准备一个完整的 x64 和 arm64 v2 fixture。每个 fixture 需要：
+应准备一个完整的 x64 和 arm64 schema 3 capability fixture。每个 fixture 需要：
 
 1. bundle 根有 manifest.json、usb-manifest.json、SHA256SUMS.txt；
 2. payload path 由 root manifest 的 architecture 派生；
 3. apps/Codex 不重复放置根 manifest 或 payload；
-4. usb-manifest 声明 updateCapability.schemaVersion == 2；
+4. root/usb manifest 顶层 `schemaVersion == 2`，且两侧声明
+   `updateCapability.schemaVersion == 3`、`anchorSchema == 3`；
 5. 可选一份 payload/_backup/OpenAI.Codex_<arch>_<version>.msix，
    并列入根 SHA256SUMS；
 6. 不含 .bak、.part、.tmp 或成功事务留下的 .staging / portable manager staging 残留；
 7. 运行 verify-oneclick-usb.ps1 -SkipSignature -SkipNetwork。
 
 当前仓库的 release/usb-oneclick-v0.5.24-final 是历史 schemaVersion=1
-fixture；它应被 verifier 明确拒绝，不能作为 v2 通过证据。
+fixture；它应被 verifier 明确拒绝，不能作为 schema 3 通过证据。历史 v2
+capability fixture 同样只能验证启动兼容，不能作为当前 Codex 更新通过证据。
 
-当前已基于历史 x64 payload、`release/setup` 产物和完整能力包生成
+当前已基于历史 x64 payload、`release/setup` 产物和完整能力包生成过
 `release/usb-oneclick-v2-fixture-r8`。Windows PowerShell 5.1 下构建成功，随后
 执行 `verify-oneclick-usb.ps1 -SkipSignature -SkipNetwork` 通过；MSIX 使用锁定的
 OpenAI Marketplace 证书主体，VC++/WebView2 使用 Microsoft 签名与固定哈希。

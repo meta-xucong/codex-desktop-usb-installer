@@ -1,12 +1,39 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$OutputPath = "",
     [string]$TargetDir = "",
+    [string]$SigningProfilePath = "",
+    [string]$PortableVaultPath = "",
+    [string]$PortableVaultDescriptorPath = "",
+    [string]$Sub2ApiConfigPath = "",
+    [switch]$SkipLocalKeyCheck,
+    [switch]$TargetDesktopOnly,
     [switch]$SkipBuild
 )
 
 $ErrorActionPreference = "Stop"
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+. (Join-Path $repo "tools\usb-signing-profile.ps1")
+$packageVersion = [string]((Get-Content -LiteralPath (Join-Path $repo "package.json") -Raw | ConvertFrom-Json).version)
+if ([string]::IsNullOrWhiteSpace($SigningProfilePath)) {
+    throw "正式签名器构建必须显式传入当前版本 SigningProfilePath；不会使用仓库中的固定 profile"
+}
+$signingProfile = Get-CodexUsbSigningProfile -RepoRoot $repo -ProfilePath $SigningProfilePath -RequireExplicitPath
+Assert-CodexUsbSigningProfileVersion -Profile $signingProfile -ExpectedVersion $packageVersion
+$embeddedAdminApiKeyVariable = $null
+foreach ($variable in @("CODEX_404TOKEN_ADMIN_API_KEY", "SUB2API_ADMIN_API_KEY")) {
+    if (-not [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($variable))) {
+        $embeddedAdminApiKeyVariable = $variable
+        break
+    }
+}
+$adminApiKeyEmbedded = $null -ne $embeddedAdminApiKeyVariable
+if (-not [string]::IsNullOrWhiteSpace($Sub2ApiConfigPath)) {
+    throw "正式签名器禁止通过 Sub2ApiConfigPath 旁置或复制管理员 Key；请使用 CODEX_404TOKEN_ADMIN_API_KEY 或 SUB2API_ADMIN_API_KEY 编译时内置"
+}
+if (-not $adminApiKeyEmbedded) {
+    throw "正式签名器构建未检测到编译时管理员 Key；不会生成需要操作员手填或旁置 Key 的包"
+}
 $manifestPath = Join-Path $repo "tools\usb-license-signer\Cargo.toml"
 $cargoTarget = Join-Path $repo "tools\usb-license-signer\target"
 $buildTarget = if ([string]::IsNullOrWhiteSpace($TargetDir)) {
@@ -56,6 +83,7 @@ $targetFull = $buildTarget.TrimEnd('\')
 if ($outputFull.TrimEnd('\') -ieq $repoFull -or $outputFull.TrimEnd('\') -ieq $targetFull) {
     throw "GUI 发布输出目录不能覆盖仓库根目录或 target 目录：$outputFull"
 }
+$createdOutputDir = $false
 if (Test-Path -LiteralPath $outputFull) {
     if (-not (Get-Item -LiteralPath $outputFull).PSIsContainer) {
         throw "GUI 发布输出路径不是目录：$outputFull"
@@ -65,6 +93,7 @@ if (Test-Path -LiteralPath $outputFull) {
     }
 } else {
     New-Item -ItemType Directory -Path $outputFull -Force | Out-Null
+    $createdOutputDir = $true
 }
 
 $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
@@ -73,9 +102,53 @@ $publishedReadme = Join-Path $outputFull "README.txt"
 $publishedDevelopment = Join-Path $outputFull "DEVELOPMENT.md"
 $publishedManifest = Join-Path $outputFull "manifest.json"
 $publishedSums = Join-Path $outputFull "SHA256SUMS.txt"
-Copy-Item -LiteralPath $sourceExe -Destination $publishedExe
-Copy-Item -LiteralPath $guiReadme -Destination $publishedReadme
-Copy-Item -LiteralPath $guiDevelopmentDoc -Destination $publishedDevelopment
+$publishedVault = Join-Path $outputFull "codex-usb-signing-key.vault"
+$publishedVaultDescriptor = Join-Path $outputFull "codex-usb-signing-key.vault.public.json"
+$publishedProfile = Join-Path $outputFull "usb-signing-release-profile.json"
+try {
+    if ($TargetDesktopOnly) {
+        throw "正式签名器不再支持 TargetDesktopOnly 引导包；必须携带匹配的 portable vault，避免运行时依赖某台电脑的 DPAPI 公钥"
+    }
+    if ([string]::IsNullOrWhiteSpace($PortableVaultPath)) {
+        throw "正式签名器必须携带与当前版本 profile 匹配的 portable vault；无 vault 的包不能交付"
+    }
+    Copy-Item -LiteralPath $sourceExe -Destination $publishedExe
+    Copy-Item -LiteralPath $guiReadme -Destination $publishedReadme
+    Copy-Item -LiteralPath $guiDevelopmentDoc -Destination $publishedDevelopment
+    Copy-Item -LiteralPath $signingProfile.Path -Destination $publishedProfile
+    $sub2ApiConfigIncluded = $false
+
+$localKeyVerified = $false
+Write-Warning "正式签名器使用同目录 portable vault；不读取或要求构建机/运行机的 DPAPI 公钥。实际密钥会在签名时由密码解密并与 Bundle 绑定复核。"
+
+$portableVaultIncluded = $false
+$portableVaultBindingVerified = $false
+if (-not [string]::IsNullOrWhiteSpace($PortableVaultPath)) {
+    $portableVaultFull = [System.IO.Path]::GetFullPath($PortableVaultPath)
+    if (-not (Test-Path -LiteralPath $portableVaultFull -PathType Leaf)) {
+        throw "Portable vault path does not point to a file: $portableVaultFull"
+    }
+    if ([string]::IsNullOrWhiteSpace($PortableVaultDescriptorPath)) {
+        $PortableVaultDescriptorPath = "$portableVaultFull.public.json"
+    }
+    $portableVaultDescriptorFull = [System.IO.Path]::GetFullPath($PortableVaultDescriptorPath)
+    if (-not (Test-Path -LiteralPath $portableVaultDescriptorFull -PathType Leaf)) {
+        throw "Portable vault 缺少公共绑定描述文件：$portableVaultDescriptorFull；请使用 signer 的 export-portable 重新导出，不能用文件名代替密钥匹配"
+    }
+    try {
+        $portableDescriptor = Get-Content -Raw -LiteralPath $portableVaultDescriptorFull | ConvertFrom-Json
+    } catch {
+        throw "Portable vault 公共绑定描述不是有效 JSON：$portableVaultDescriptorFull；$($_.Exception.Message)"
+    }
+    if ([string]$portableDescriptor.keyId -cne [string]$signingProfile.KeyId -or
+        ([string]$portableDescriptor.publicKeySha256).ToLowerInvariant() -cne [string]$signingProfile.PublicKeySha256) {
+        throw "Portable vault 与本版本 profile 不匹配：vault=$($portableDescriptor.keyId)/$($portableDescriptor.publicKeySha256)，profile=$($signingProfile.KeyId)/$($signingProfile.PublicKeySha256)"
+    }
+    Copy-Item -LiteralPath $portableVaultFull -Destination $publishedVault
+    Copy-Item -LiteralPath $portableVaultDescriptorFull -Destination $publishedVaultDescriptor
+    $portableVaultIncluded = $true
+    $portableVaultBindingVerified = $true
+}
 
 function Get-Sha256([string]$Path) {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -89,12 +162,36 @@ $manifest = [ordered]@{
     signingCore = "shared usb-license-signer command pipeline"
     verificationMode = "usb-internal-license-only"
     systemAuthenticodeRequired = $false
+    localKeyVerified = $localKeyVerified
+    targetDesktopOnly = $false
     privateKeyIncluded = $false
+    portableVaultIncluded = $portableVaultIncluded
+    portableVaultBindingVerified = $portableVaultBindingVerified
+    adminApiKeyEmbedded = $adminApiKeyEmbedded
+    adminApiKeySource = if ($adminApiKeyEmbedded) {
+        "compile-time-embedded"
+    } else {
+        "not-provisioned"
+    }
+    sub2ApiConfigIncluded = $sub2ApiConfigIncluded
+    expectedSigningBinding = [ordered]@{
+        keyId = $signingProfile.KeyId
+        publicKeySha256 = $signingProfile.PublicKeySha256
+        releaseVersion = $signingProfile.ReleaseVersion
+        releaseId = $signingProfile.ReleaseId
+        source = [System.IO.Path]::GetFileName($signingProfile.Path)
+        note = "The signer package never contains a raw private key. The matching encrypted portable vault is the only signing-key source and may be copied to another Windows x64 computer and unlocked with its password."
+    }
     files = [ordered]@{
         executable = Get-Sha256 $publishedExe
         readme = Get-Sha256 $publishedReadme
         development = Get-Sha256 $publishedDevelopment
+        profile = Get-Sha256 $publishedProfile
     }
+}
+if ($portableVaultIncluded) {
+    $manifest.files.portableVault = Get-Sha256 $publishedVault
+    $manifest.files.portableVaultDescriptor = Get-Sha256 $publishedVaultDescriptor
 }
 [System.IO.File]::WriteAllText(
     $publishedManifest,
@@ -107,8 +204,19 @@ $sumLines = @(
     "$(Get-Sha256 $publishedDevelopment)  DEVELOPMENT.md"
     "$(Get-Sha256 $publishedManifest)  manifest.json"
     "$(Get-Sha256 $publishedReadme)  README.txt"
+    "$(Get-Sha256 $publishedProfile)  usb-signing-release-profile.json"
 )
+if ($portableVaultIncluded) {
+    $sumLines += "$(Get-Sha256 $publishedVault)  codex-usb-signing-key.vault"
+    $sumLines += "$(Get-Sha256 $publishedVaultDescriptor)  codex-usb-signing-key.vault.public.json"
+}
 [System.IO.File]::WriteAllText($publishedSums, ($sumLines -join "`n") + "`n", $utf8NoBom)
 
-Write-Output "GUI signer package: $outputFull"
-Write-Output "Executable: $publishedExe"
+    Write-Output "GUI signer package: $outputFull"
+    Write-Output "Executable: $publishedExe"
+} catch {
+    if ($createdOutputDir -and (Test-Path -LiteralPath $outputFull -PathType Container)) {
+        Remove-Item -LiteralPath $outputFull -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    throw
+}

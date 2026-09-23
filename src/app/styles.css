@@ -61,6 +61,7 @@
   /* stacking order — one place to reason about who sits above whom */
   --z-scrim: 50;
   --z-quit-scrim: 100;
+  --z-tooltip: 1000;
 
   --window-gutter-x: 14px;
   --window-gutter-top: 14px;
@@ -472,6 +473,7 @@ input {
 
 .scroll {
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
   padding: var(--space-sm) var(--space-md) var(--space-md);
   display: flex;
@@ -1906,6 +1908,37 @@ button.themecard-art:focus-visible {
 .component-entry:hover:not(:disabled) {
   color: var(--text-soft);
 }
+
+.account-panel {
+  margin-top: 10px;
+  padding: 12px;
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+}
+.account-panel-head,
+.account-panel-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.account-panel-head {
+  justify-content: space-between;
+  font-weight: 650;
+  margin-bottom: 8px;
+}
+.account-panel-head svg { width: 16px; height: 16px; vertical-align: -3px; }
+.account-balance { color: var(--accent-deep, var(--accent)); font-weight: 600; }
+.account-input { flex: 1; min-width: 0; }
+.account-panel-message { color: var(--text-soft); font-size: var(--fs-sm); margin-top: 8px; }
+.account-panel-error { color: var(--danger); font-size: var(--fs-sm); margin-top: 8px; white-space: pre-wrap; }
+.account-login-row { margin-top: 8px; }
+.account-login-link {
+  margin-top: 8px;
+  padding: 0;
+  color: var(--text-soft);
+  font-size: var(--fs-sm);
+}
 .skill-repo-entry {
   margin: 0 0 2px;
 }
@@ -2038,12 +2071,65 @@ button.themecard-art:focus-visible {
   min-height: 34px;
   padding-block: 6px;
 }
+.skill-repo-source-summary {
+  display: grid;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--line) 75%, transparent);
+  border-radius: var(--r-md);
+  background: color-mix(in srgb, var(--surface-2) 80%, transparent);
+  color: var(--text-soft);
+  font-size: var(--fs-caption);
+  line-height: 1.45;
+}
+.skill-repo-source-selected {
+  color: var(--text);
+  font-weight: 650;
+}
+.skill-repo-source-attempts {
+  margin: 0;
+}
+.skill-repo-source-attempts summary {
+  cursor: pointer;
+  color: var(--text);
+  font-weight: 650;
+}
+.skill-repo-source-attempt-list {
+  display: grid;
+  gap: 6px;
+  margin-top: 8px;
+}
+.skill-repo-source-attempt {
+  display: grid;
+  gap: 2px;
+  padding: 7px 8px;
+  border: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+}
+.skill-repo-source-attempt-heading,
+.skill-repo-source-attempt-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+.skill-repo-source-attempt-heading {
+  color: var(--text);
+  font-weight: 650;
+}
+.skill-repo-source-attempt-meta {
+  color: var(--text-faint);
+}
 .component-sheet {
   display: flex;
   flex-direction: column;
   gap: 12px;
-  max-height: min(78vh, 700px);
-  overflow-y: auto;
+  min-width: 0;
+  max-width: 100%;
+  /* The outer Sheet owns scrolling. A second scroll container made the
+     bottom actions appear to jump behind long service forms in the compact
+     window. */
+  overflow: visible;
   padding-right: 2px;
 }
 .component-sheet-heading {
@@ -2088,6 +2174,7 @@ button.themecard-art:focus-visible {
   display: flex;
   flex: 1;
   min-width: 0;
+  flex-wrap: wrap;
   cursor: pointer;
 }
 .component-service-toggle input {
@@ -2109,6 +2196,7 @@ button.themecard-art:focus-visible {
   display: grid;
   gap: 8px;
   margin: 10px 0 2px 25px;
+  min-width: 0;
 }
 .component-field {
   display: grid;
@@ -2130,6 +2218,8 @@ button.themecard-art:focus-visible {
   padding: 9px 11px;
   font-size: var(--fs-sm);
   line-height: 1.4;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 .component-result.success {
   border-color: color-mix(in oklch, var(--success) 45%, var(--line));
@@ -2148,6 +2238,7 @@ button.themecard-art:focus-visible {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+  flex-wrap: wrap;
   border-top: 1px solid var(--line);
   padding-top: 12px;
 }
@@ -2156,9 +2247,12 @@ button.themecard-art:focus-visible {
   flex-direction: column;
   gap: 3px;
   min-width: 0;
+  flex: 1 1 100%;
 }
 .component-separate-action .btn {
-  flex: 0 0 auto;
+  flex: 0 0 100%;
+  width: 100%;
+  min-width: 0;
 }
 .linkbtn {
   appearance: none;
@@ -4259,6 +4353,90 @@ button.row.danger:hover {
   flex-wrap: wrap;
 }
 
+/* Compact Windows bundle-uninstall hierarchy. Keep the primary sheet to one
+   short line per choice; long scope/risk copy is available through the info
+   affordance or the explicit confirmation details. This also prevents the
+   CCSwitch row from squeezing its title and action into the same narrow line. */
+.uninstall-pop {
+  min-width: 0;
+}
+.uninstall-pop > .scroll {
+  min-height: 0;
+  overscroll-behavior: contain;
+  padding-bottom: var(--space-lg);
+}
+.uninstall-pop > .scroll > * {
+  flex-shrink: 0;
+}
+.uninstall-pop .list,
+.uninstall-pop .uninstall-advanced {
+  flex-shrink: 0;
+}
+.uninstall-pop .hero {
+  gap: 6px;
+}
+.uninstall-hero-help {
+  margin-top: -2px;
+}
+.uninstall-compact-row {
+  align-items: flex-start;
+  min-width: 0;
+}
+.uninstall-compact-row .rtext {
+  min-width: 0;
+}
+.uninstall-compact-row .rsub {
+  overflow-wrap: anywhere;
+}
+.uninstall-advanced {
+  margin-top: 0;
+}
+.uninstall-advanced > summary {
+  padding: 6px 2px;
+}
+.uninstall-detail-copy {
+  margin: 6px 2px 8px;
+  color: var(--text-faint);
+  font-size: var(--fs-label);
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.uninstall-advanced .list {
+  min-width: 0;
+}
+.uninstall-advanced .row {
+  min-width: 0;
+  padding: 10px 12px;
+}
+.uninstall-advanced .row .rtext {
+  min-width: 0;
+}
+.uninstall-advanced .row > .tooltip-anchor {
+  align-self: center;
+}
+.uninstall-selection {
+  display: grid;
+  gap: 6px;
+  max-height: 180px;
+  overflow-y: auto;
+  margin-top: 8px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+  text-align: start;
+}
+.uninstall-selection p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.uninstall-selection .rsub {
+  margin-top: 2px;
+}
+.uninstall-finish-button {
+  margin-top: 2px;
+}
+
 /* ── Motion: Codex-style shimmer / glow / micro-interactions ──────────────── */
 
 /* Busy-state title shimmer — a MONOCHROME loading sweep (not decorative
@@ -4751,6 +4929,22 @@ button.row.danger:hover {
   cursor: help;
   outline: none;
 }
+.tooltip-trigger {
+  display: inline-flex;
+  align-items: center;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: help;
+  outline: none;
+}
+.tooltip-anchor:focus-within {
+  outline: 2px solid var(--ring-focus);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
 .tooltip-icon {
   display: inline-flex;
   align-items: center;
@@ -4792,6 +4986,20 @@ button.row.danger:hover {
   visibility: hidden;
   transition: opacity 0.14s var(--ease), transform 0.14s var(--ease), visibility 0.14s;
 }
+.tooltip-popover.tooltip-portal {
+  position: fixed;
+  z-index: var(--z-tooltip);
+  opacity: 1;
+  visibility: visible;
+  pointer-events: none;
+  transform-origin: center;
+}
+.tooltip-popover.tooltip-portal.tooltip-top {
+  transform: translate(-50%, -100%);
+}
+.tooltip-popover.tooltip-portal.tooltip-bottom {
+  transform: translateX(-50%);
+}
 .tooltip-top .tooltip-popover {
   left: 50%;
   bottom: calc(100% + 8px);
@@ -4803,16 +5011,19 @@ button.row.danger:hover {
   transform: translate(-50%, -4px);
 }
 .tooltip-anchor:hover .tooltip-popover,
-.tooltip-anchor:focus-visible .tooltip-popover {
+.tooltip-anchor:focus-visible .tooltip-popover,
+.tooltip-anchor:focus-within .tooltip-popover {
   opacity: 1;
   visibility: visible;
 }
 .tooltip-top:hover .tooltip-popover,
-.tooltip-top:focus-visible .tooltip-popover {
+.tooltip-top:focus-visible .tooltip-popover,
+.tooltip-top:focus-within .tooltip-popover {
   transform: translate(-50%, 0);
 }
 .tooltip-bottom:hover .tooltip-popover,
-.tooltip-bottom:focus-visible .tooltip-popover {
+.tooltip-bottom:focus-visible .tooltip-popover,
+.tooltip-bottom:focus-within .tooltip-popover {
   transform: translate(-50%, 0);
 }
 .hero-info {
@@ -4831,10 +5042,18 @@ button.row.danger:hover {
   flex: 0 0 auto;
   flex-direction: row;
 }
+.component-service-toggle > .tooltip-anchor {
+  align-self: flex-start;
+  margin-top: 1px;
+}
 .component-separate-action > div {
   flex-direction: row;
   align-items: center;
   gap: 6px;
+}
+.uninstall-pop .tooltip-popover {
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 .usb-guard-status-head {
   align-items: center;

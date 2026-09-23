@@ -23,7 +23,12 @@ try {
     $env:CODEX_USB_GUARD_POLICY = $UsbPolicy
     $signedRequired = $UsbPolicy -eq "SignedRequired"
     if ($signedRequired) {
-        $signingProfile = Get-CodexUsbSigningProfile -RepoRoot $repo -ProfilePath $UsbSigningProfilePath
+        $packageVersion = [string]((Get-Content -LiteralPath (Join-Path $repo "package.json") -Raw | ConvertFrom-Json).version)
+        if ([string]::IsNullOrWhiteSpace($UsbSigningProfilePath)) {
+            throw "SignedRequired 正式构建必须显式传入当前版本 UsbSigningProfilePath；不会使用仓库中的固定 profile"
+        }
+        $signingProfile = Get-CodexUsbSigningProfile -RepoRoot $repo -ProfilePath $UsbSigningProfilePath -RequireExplicitPath
+        Assert-CodexUsbSigningProfileVersion -Profile $signingProfile -ExpectedVersion $packageVersion
         Initialize-CodexUsbSigningEnvironment -Profile $signingProfile
         $publicKeyId = [string]$env:CODEX_USB_GUARD_PUBLIC_KEY_ID
         $publicKeyB64 = [string]$env:CODEX_USB_GUARD_PUBLIC_KEY_B64
@@ -91,12 +96,11 @@ try {
     }
     $ccswitchVerifier = Join-Path $CcswitchArtifactDir "verify-product.ps1"
     if (Test-Path -LiteralPath $ccswitchVerifier -PathType Leaf) {
-        # The verifier checks both the provider endpoint and the embedded
-        # renderer marker.  The latter prevents a release built without
-        # Tauri's custom-protocol feature (and therefore dependent on
-        # localhost:3000) from entering the offline installer.
+        # The verifier checks the external provider catalog and the embedded
+        # runtime environment-patch marker before the offline installer can
+        # consume the CCSwitch artifact.
         & pwsh.exe -NoProfile -File $ccswitchVerifier -ArtifactDir $CcswitchArtifactDir -SkipNetwork
-        if ($LASTEXITCODE -ne 0) { throw "CCSwitch 产品版验证失败，拒绝打包未嵌入 renderer 的版本" }
+        if ($LASTEXITCODE -ne 0) { throw "CCSwitch 产品版验证失败，拒绝打包未验证的版本" }
     } else {
         Write-Warning "CCSwitch 产物缺少 verify-product.ps1，跳过嵌入 renderer 检查"
     }
@@ -248,6 +252,60 @@ try {
     Get-ChildItem -LiteralPath $resourceRoot | ForEach-Object {
         Copy-Item -LiteralPath $_.FullName -Destination $setupResourceRoot -Recurse -Force
     }
+    $skillHubSourcesPath = Join-Path $setupResourceRoot "skill_hub_sources.json"
+    if (-not (Test-Path -LiteralPath $skillHubSourcesPath -PathType Leaf)) {
+        throw "打包资源缺少 Skill Hub 来源目录：$skillHubSourcesPath"
+    }
+    $skillHubSources = Get-Content -LiteralPath $skillHubSourcesPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    if (-not (Test-CodexUsbJsonInteger $skillHubSources.schemaVersion) -or
+        $skillHubSources.schemaVersion -ne 1 -or [string]$skillHubSources.channel -cne "skill-hub") {
+        throw "打包资源中的 Skill Hub 来源目录 schema/channel 无效"
+    }
+    $skillHubRelay = @($skillHubSources.sources | Where-Object { [string]$_.id -ceq "ph-relay" -and [string]$_.kind -ceq "relay" })
+    $skillHubGithub = @($skillHubSources.sources | Where-Object { [string]$_.id -ceq "github" -and [string]$_.kind -ceq "github" })
+    # PowerShell unwraps a one-item pipeline result during assignment.  Do
+    # not read `.Count` from the result here: a single unexpected `base`
+    # property must be detected just as reliably on Windows PowerShell 5.1
+    # and PowerShell 7.  The GitHub source is intentionally origin-derived,
+    # so any explicit base property remains a hard packaging failure.
+    $skillHubGithubBase = $null
+    if ($skillHubGithub.Count -eq 1) {
+        $skillHubGithubBaseProperty = $skillHubGithub[0].PSObject.Properties["base"]
+        if ($null -ne $skillHubGithubBaseProperty) {
+            $skillHubGithubBase = $skillHubGithubBaseProperty.Value
+        }
+    }
+    if ($skillHubRelay.Count -ne 1 -or $skillHubRelay[0].enabled -ne $true -or [string]$skillHubRelay[0].base -cne "https://update.404token.xyz/__codex_update__/skill-hub/" -or
+        $skillHubGithub.Count -ne 1 -or $skillHubGithub[0].enabled -ne $true -or $null -ne $skillHubGithubBase) {
+        throw "打包资源中的 Skill Hub Relay/GitHub 来源身份无效"
+    }
+    Write-Output "Skill Hub 来源目录已随管理器资源打包并通过身份门禁"
+    $baseManifestPath = Join-Path $setupResourceRoot "skill_repo_base_manifest.json"
+    if (-not (Test-Path -LiteralPath $baseManifestPath -PathType Leaf)) {
+        throw "打包资源缺少基础 Skill ID 清单：$baseManifestPath"
+    }
+    $baseManifest = Get-Content -LiteralPath $baseManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $baseSourcePath = Join-Path $repo "installer-pack\manifest\skill-audit.json"
+    if (-not (Test-Path -LiteralPath $baseSourcePath -PathType Leaf)) {
+        throw "缺少基础 Skill 源清单，无法验证资源身份：$baseSourcePath"
+    }
+    $baseSourceHash = (Get-FileHash -LiteralPath $baseSourcePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $baseSkills = @($baseManifest.skills)
+    $sourceManifest = Get-Content -LiteralPath $baseSourcePath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $sourceSkills = @($sourceManifest.skills)
+    if (-not (Test-CodexUsbJsonInteger $baseManifest.schemaVersion) -or
+        $baseManifest.schemaVersion -ne 1 -or
+        [string]$baseManifest.source -cne "installer-pack/manifest/skill-audit.json" -or
+        [string]$baseManifest.sourceSha256 -cne $baseSourceHash -or
+        $baseSkills.Count -eq 0 -or $baseSkills.Count -ne $sourceSkills.Count) {
+        throw "打包资源中的基础 Skill ID 清单 schema/hash/数量无效"
+    }
+    for ($index = 0; $index -lt $sourceSkills.Count; $index++) {
+        if ([string]$baseSkills[$index].id -cne [string]$sourceSkills[$index].id) {
+            throw "打包资源中的基础 Skill ID 顺序与源清单不一致：index=$index"
+        }
+    }
+    Write-Output "基础 Skill ID 清单已随管理器资源打包并通过身份/ID 顺序门禁：$($baseSkills.Count) 个"
     Write-Output "USB 入口产物：$(Join-Path $setupDir 'CodexDesktopSetup.exe')（requireAdministrator 清单）"
     Write-Output "USB 入口别名：$usbLauncher"
     Write-Output "USB 管理器本体：$managerForUsb（requireAdministrator，入口启动或直接启动均安全）"

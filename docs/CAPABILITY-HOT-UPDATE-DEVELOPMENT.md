@@ -140,7 +140,7 @@ apply 的远端一致性检查是固定的：relay 在下载前请求 `latest.js
 
 首次运行时若 `state.json` 不存在，且基础清单校验通过，按下面 schema 创建空 ledger（`skills={}`）是合法的；已存在但缺失、损坏、版本错误或路径不一致的 ledger 必须 fail-closed。
 
-首次创建的实际字节内容固定为 `{"schemaVersion":1,"repo":"meta-xucong/skill_hub","branch":"master","lastSeenCommit":null,"lastApplyStatus":"never","lastGoodGeneration":null,"skills":{}}`（UTF-8、无 BOM、LF），随后按 state 目录内的临时文件加文件级 SHA-256 校验后原子替换。普通 Manager 不依赖 USB 才能做基础冲突判定，因此构建时从 `installer-pack/manifest/skill-audit.json` 生成只读资源 `src-tauri/resources/skill_repo_base_manifest.json`，随 Manager 永久预装；该资源只包含基础 Skill ID 和源清单 SHA-256，不复制或修改基础 Skill 内容。资源固定 schema 为 `schemaVersion=1`、`source="installer-pack/manifest/skill-audit.json"`、`sourceSha256="e6c6a610b4bab5dc9001b3846c087bdaba83fcd8c26908fd6eabc135f4ca2a9c"`、`skills[].id`，`skills[].id` 必须覆盖源清单的全部 ID 且唯一。构建阶段必须用现有根目录 `installer-pack/file-manifest.json`、`installer-pack/checksums.sha256` 校验源文件并将资源纳入普通 Manager 的 `resources/*`；运行时资源缺失、版本错误、ID 重复、源 SHA 不符或无法定位时统一返回 `SKILL_REPO_LEDGER_INVALID`，不得把 USB、用户运行时目录或猜测出的路径当作基础清单。`installer-pack` 基础能力文件本身不改。
+首次创建的实际字节内容固定为 `{"schemaVersion":1,"repo":"meta-xucong/skill_hub","branch":"master","lastSeenCommit":null,"lastApplyStatus":"never","lastGoodGeneration":null,"skills":{}}`（UTF-8、无 BOM、LF），随后按 state 目录内的临时文件加文件级 SHA-256 校验后原子替换。普通 Manager 不依赖 USB 才能做基础冲突判定，因此构建时从 `installer-pack/manifest/skill-audit.json` 生成只读资源 `src-tauri/resources/skill_repo_base_manifest.json`，随 Manager 永久预装；该资源只包含基础 Skill ID 和源清单 SHA-256，不复制或修改基础 Skill 内容。资源固定 schema 为 `schemaVersion=1`、`source="installer-pack/manifest/skill-audit.json"`、`sourceSha256="e6c6a610b4bab5dc9001b3846c087bdaba83fcd8c26908fd6eabc135f4ca2a9c"`、`skills[].id`，`skills[].id` 必须覆盖源清单的全部 ID 且唯一。构建阶段必须用现有根目录 `installer-pack/file-manifest.json`、`installer-pack/checksums.sha256` 校验源文件并将资源纳入普通 Manager 的 `resources/*`；运行时基础资源缺失、版本错误、ID 重复、源 SHA 不符或无法定位时返回 `SKILL_REPO_BASE_RESOURCE_INVALID`，不得把 USB、用户运行时目录或猜测出的路径当作基础清单；真正的热更新账本结构或内容错误才返回 `SKILL_REPO_LEDGER_INVALID`。`installer-pack` 基础能力文件本身不改。
 
 `state.json` 固定 schema：
 
@@ -288,7 +288,7 @@ Rust 结构体必须 `Serialize + Deserialize + #[serde(rename_all = "camelCase"
 
 状态转换固定为：`idle` → `checking` → `ready|uptodate|error`；`uptodate|error` 只能回到 `idle` 后重新 check；确认后 `ready` → `applying` → `success|partial|failed|blocked`；`failed|blocked` 只能在 journal 恢复成功或显式刷新后回到 `idle`；只有存在完整 `lastGoodGeneration` 时 `success|partial` → `rolling-back` → `success|blocked`。网络源变化、commit/size/hash 变化统一由 apply 返回 `Err(SKILL_REPO_STALE)` 或 `Err(SKILL_REPO_HASH_MISMATCH)`，不生成半成品 report。同一时间只允许一个 check/apply/rollback，第二个命令返回 `SKILL_REPO_LOCKED`；check 也在整个下载/解析期间持有同一 `OperationManager` 更新锁。
 
-错误码固定为：`SKILL_REPO_UNAVAILABLE`（源不可达）、`SKILL_REPO_TIMEOUT`（网络阶段超时）、`SKILL_REPO_SOURCE_INVALID`（固定源身份不符）、`SKILL_REPO_STALE`（check/apply 身份变化）、`SKILL_REPO_HASH_MISMATCH`（size/SHA 不符）、`SKILL_REPO_ARCHIVE_INVALID`（ZIP/Skill 结构不符）、`SKILL_REPO_BASE_CONFLICT`、`SKILL_REPO_USER_CONFLICT`、`SKILL_REPO_HOT_MODIFIED`、`SKILL_REPO_LEDGER_INVALID`、`SKILL_REPO_LOCKED`、`SKILL_REPO_ROLLBACK_FAILED`、`SKILL_REPO_UNSUPPORTED`。Tauri 命令统一返回 `Result<T, CommandError>`，wire shape 固定为现有 `CommandError { code: string, message: string }`，Rust/TS 业务结构统一 `#[serde(rename_all="camelCase")]`/camelCase；源错误和事务错误以 `Err(CommandError)` 返回，逐 Skill 冲突进入 report，不使其他安全 Skill 自动失败。前端只显示稳定错误码对应文案，不回显 URL、凭据或原始异常。
+错误码固定为：`SKILL_REPO_UNAVAILABLE`（源不可达）、`SKILL_REPO_TIMEOUT`（网络阶段超时）、`SKILL_REPO_SOURCE_INVALID`（固定源身份不符）、`SKILL_REPO_STALE`（check/apply 身份变化）、`SKILL_REPO_HASH_MISMATCH`（size/SHA 不符）、`SKILL_REPO_ARCHIVE_INVALID`（ZIP/Skill 结构不符）、`SKILL_REPO_BASE_CONFLICT`、`SKILL_REPO_USER_CONFLICT`、`SKILL_REPO_HOT_MODIFIED`、`SKILL_REPO_BASE_RESOURCE_INVALID`（安装器基础 Skill ID 资源缺失或不合法）、`SKILL_REPO_LEDGER_INVALID`（热更新账本结构或内容不合法）、`SKILL_REPO_LOCKED`、`SKILL_REPO_ROLLBACK_FAILED`、`SKILL_REPO_UNSUPPORTED`。Tauri 命令统一返回 `Result<T, CommandError>`，wire shape 固定为现有 `CommandError { code: string, message: string }`，Rust/TS 业务结构统一 `#[serde(rename_all="camelCase")]`/camelCase；源错误和事务错误以 `Err(CommandError)` 返回，逐 Skill 冲突进入 report，不使其他安全 Skill 自动失败。前端只显示稳定错误码对应文案，不回显 URL、凭据或原始异常。
 
 前端 API 只包装上述命令：
 
@@ -497,6 +497,12 @@ edge 部署继续使用现有 `/opt/codex-update-relay-edge/docker-compose.yml` 
 - Skill Hub 当前发布 commit 为 `794cc94ac690da9c0d919db82322699def53d2f3`；服务最近结果为 `Result=success`、`ExecMainStatus=0`；清单和 archive 公网均返回 200，非法子路径返回 404。
 - 原 Codex `export/current` 仍为 `releases/385165615`，既有 `latest.json` SHA-256 仍为 `d188269893eac4c469012bd62a337fb54d6220861f351cb84eb6ed12bf941567`；原 Codex 公网入口返回 200；证书续期 timer 和既有 Codex timer 均 active。
 - 部署中修复了两类实际主机差异：配置校验返回值遗漏 URL 字段，以及 `work`/`export` 跨文件系统导致的发布 rename 失败；公开静态目录权限已显式设为可被 edge 容器遍历。
+
+### G26 架构修订（2026-09-14）
+
+后续实现以 `docs/SKILL-HUB-MODEL-SYNC-AND-UNINSTALL-G22-DEVELOPMENT.md` 的 G26 修订契约为准：Skill Hub 默认来源固定为项目自有内容的 `Relay → GitHub fallback`，不创建、不要求 GitCode/Gitee 派生仓库、账号或 PAT。构建期和运行期允许零国内源；未来若显式增加国内扩展，必须通过同一套 HTTPS、域名、路径、ID、优先级和唯一性校验，且不能成为默认发行包的前置条件。
+
+当前运行身份还将 `sourceId` 固定写入 expected identity，以保证 check/apply 不跨来源静默切换；默认资源位于 `src-tauri/resources/skill_hub_sources.json`，只包含固定 Relay 与 GitHub。旧 receipt 中关于“需要多个国内源”或未完成来源资源构建门禁的描述属于历史记录，不代表当前验收标准。
 
 ### 代码修复与重打包 receipt（2026-09-11）
 

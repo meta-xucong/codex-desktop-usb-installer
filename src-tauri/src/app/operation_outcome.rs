@@ -63,6 +63,14 @@ impl StepOutcome {
     pub fn is_failed(&self) -> bool {
         self.state == "failed"
     }
+
+    /// Only these states are safe to treat as settled by a caller. The field
+    /// remains a string for backwards-compatible report decoding, so unknown
+    /// future values must stay non-terminal until the UI/backend understand
+    /// them explicitly.
+    pub fn is_terminal(&self) -> bool {
+        matches!(self.state.as_str(), "ok" | "skipped" | "not_applicable")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -138,6 +146,11 @@ impl OperationOutcome {
     /// True when the primary op succeeded but at least one ancillary step failed.
     pub fn is_partial(&self) -> bool {
         self.primary_ok && (self.provenance.is_failed() || self.cleanup.is_failed())
+    }
+
+    /// True only when both ancillary steps have a known settled state.
+    pub fn steps_are_terminal(&self) -> bool {
+        self.provenance.is_terminal() && self.cleanup.is_terminal()
     }
 }
 

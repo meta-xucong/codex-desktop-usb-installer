@@ -24,7 +24,9 @@ const LS_KEY = "cam.theme";
 
 function readMode(): ThemeMode {
   const v = localStorage.getItem(LS_KEY);
-  return v === "system" || v === "light" || v === "dark" ? v : "dark";
+  // A fresh manager should respect the host operating system.  An explicit
+  // user choice remains authoritative once it has been saved.
+  return v === "system" || v === "light" || v === "dark" ? v : "system";
 }
 
 function systemPrefersDark(): boolean {

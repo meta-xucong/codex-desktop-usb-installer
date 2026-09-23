@@ -265,12 +265,12 @@ export function OfflineComponentsSheet({
                 <span>
                   <strong>{t("offline.components.feishu")}</strong>
                 </span>
-                <Tooltip content={t("offline.components.feishuDesc")}>
-                  <span className="tooltip-icon" aria-label={t("themes.details")}>
-                    <Icon name="info" />
-                  </span>
-                </Tooltip>
               </label>
+              <Tooltip content={t("offline.components.feishuDesc")}>
+                <span className="tooltip-icon" aria-label={t("themes.details")}>
+                  <Icon name="info" />
+                </span>
+              </Tooltip>
             </div>
             {enabled.feishu ? (
               <div className="component-fields">
@@ -312,12 +312,12 @@ export function OfflineComponentsSheet({
                 <span>
                   <strong>{t("offline.components.dashscope")}</strong>
                 </span>
-                <Tooltip content={t("offline.components.dashscopeDesc")}>
-                  <span className="tooltip-icon" aria-label={t("themes.details")}>
-                    <Icon name="info" />
-                  </span>
-                </Tooltip>
               </label>
+              <Tooltip content={t("offline.components.dashscopeDesc")}>
+                <span className="tooltip-icon" aria-label={t("themes.details")}>
+                  <Icon name="info" />
+                </span>
+              </Tooltip>
             </div>
             {enabled["dashscope-web-search"] ? (
               <div className="component-fields">
@@ -345,12 +345,12 @@ export function OfflineComponentsSheet({
                 <span>
                   <strong>{t("offline.components.image")}</strong>
                 </span>
-                <Tooltip content={t("offline.components.imageDesc")}>
-                  <span className="tooltip-icon" aria-label={t("themes.details")}>
-                    <Icon name="info" />
-                  </span>
-                </Tooltip>
               </label>
+              <Tooltip content={t("offline.components.imageDesc")}>
+                <span className="tooltip-icon" aria-label={t("themes.details")}>
+                  <Icon name="info" />
+                </span>
+              </Tooltip>
             </div>
             {enabled["image-2"] ? (
               <div className="component-fields">
@@ -379,12 +379,12 @@ export function OfflineComponentsSheet({
                 <span>
                   <strong>{t("offline.components.seedance")}</strong>
                 </span>
-                <Tooltip content={t("offline.components.seedanceDesc")}>
-                  <span className="tooltip-icon" aria-label={t("themes.details")}>
-                    <Icon name="info" />
-                  </span>
-                </Tooltip>
               </label>
+              <Tooltip content={t("offline.components.seedanceDesc")}>
+                <span className="tooltip-icon" aria-label={t("themes.details")}>
+                  <Icon name="info" />
+                </span>
+              </Tooltip>
             </div>
             {enabled.seedance ? (
               <div className="component-fields">

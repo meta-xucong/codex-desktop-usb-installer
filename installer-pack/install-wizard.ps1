@@ -283,7 +283,10 @@ function Invoke-WizardInstall([switch]$SkipConnections) {
         }
         $installScript = Join-Path $script:KitRoot 'install-all.ps1'
         if (-not (Test-Path -LiteralPath $installScript -PathType Leaf)) { throw "安装脚本不存在: $installScript" }
-        $installArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $installScript, '-IncludeNonDefault', '-IncludeUnsupported', '-Overwrite', '-FeishuAuthMode', $feishuAuthMode, '-FeishuDomain', $feishuDomain)
+        # install-all.ps1 owns the non-default/unsupported switches when it
+        # delegates to install-to-codex.ps1. Passing them here would make the
+        # wrapper reject the call before the real installer starts.
+        $installArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', $installScript, '-FeishuAuthMode', $feishuAuthMode, '-FeishuDomain', $feishuDomain)
         if ($feishuEnabled) { $installArgs += '-EnableFeishu' } else { $installArgs += '-DisableFeishu' }
         if ($enabledSkills.Count -gt 0) { $installArgs += '-EnableSkills'; $installArgs += @($enabledSkills.ToArray()) }
         if ($enabledApiServices.Count -gt 0) { $installArgs += '-EnabledApiServices'; $installArgs += @($enabledApiServices.ToArray()) }

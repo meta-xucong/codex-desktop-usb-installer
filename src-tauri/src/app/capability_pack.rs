@@ -6,6 +6,8 @@
 //! runtime, Node runtime, or credential from the network.
 
 use std::fs;
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -18,6 +20,8 @@ const PACK_DIRECTORY: &str = "codex-starter-kit";
 const PACK_ID: &str = "codex-starter";
 const READINESS_RELATIVE: &str = ".codex/codex-agent-kit/readiness.json";
 const CONNECTION_OWNERSHIP_RELATIVE: &str = ".codex/codex-agent-kit/connection-ownership.json";
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const OWNED_CONNECTION_ENV_NAMES: &[&str] = &[
     "FEISHU_APP_ID",
     "FEISHU_APP_SECRET",
@@ -829,6 +833,8 @@ pub fn install(
             "-FeishuDomain",
             non_empty(&options.feishu_domain).unwrap_or("https://open.feishu.cn"),
         ]);
+    #[cfg(target_os = "windows")]
+    command.creation_flags(CREATE_NO_WINDOW);
 
     if options.enable_feishu {
         command.arg("-EnableFeishu");

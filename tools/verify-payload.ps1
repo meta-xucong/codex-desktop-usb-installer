@@ -63,6 +63,15 @@ $manifest = [System.IO.File]::ReadAllText($manifestPath, $utf8) | ConvertFrom-Js
 if ($manifest.packageName -ne "OpenAI.Codex") { throw "manifest.packageName 必须为 OpenAI.Codex" }
 if ($manifest.architecture -notin @("x64", "arm64")) { throw "manifest.architecture 无效" }
 
+function Test-JsonInteger([object]$Value) {
+    return $null -ne $Value -and (
+        $Value -is [sbyte] -or $Value -is [byte] -or
+        $Value -is [int16] -or $Value -is [uint16] -or
+        $Value -is [int32] -or $Value -is [uint32] -or
+        $Value -is [int64] -or $Value -is [uint64]
+    )
+}
+
 $relative = Normalize-BundleRelativePath ([string]$manifest.payload.path)
 if ([System.IO.Path]::GetExtension($relative) -ine ".msix") {
     throw "payload.path 必须指向 .msix 文件"
@@ -78,7 +87,9 @@ if (-not $payloadFull.StartsWith($rootFull, [System.StringComparison]::OrdinalIg
 }
 $item = Get-Item -LiteralPath $payload
 if ($item.PSIsContainer -or $item.Extension -ine ".msix") { throw "payload 必须是 .msix 文件" }
-if ([int64]$item.Length -ne [int64]$manifest.payload.size) { throw "MSIX 大小与 manifest 不一致" }
+$manifestPayloadSize = $manifest.payload.size
+if (-not (Test-JsonInteger $manifestPayloadSize) -or
+    [uint64]$item.Length -ne [uint64]$manifestPayloadSize) { throw "MSIX 大小与 manifest 不一致或不是严格整数" }
 $hash = (Get-FileHash -LiteralPath $payload -Algorithm SHA256).Hash.ToLowerInvariant()
 if ($hash -ne ([string]$manifest.payload.sha256).ToLowerInvariant()) { throw "MSIX SHA-256 不匹配" }
 

@@ -60,11 +60,6 @@ const CODEX_PAYLOAD_SOURCES: {
     desc: "settings.codexPayload.source.autoDesc",
   },
   {
-    kind: "mirror",
-    label: "settings.codexPayload.source.mirror",
-    desc: "settings.codexPayload.source.mirrorDesc",
-  },
-  {
     kind: "relay",
     label: "settings.codexPayload.source.relay",
     desc: "settings.codexPayload.source.relayDesc",

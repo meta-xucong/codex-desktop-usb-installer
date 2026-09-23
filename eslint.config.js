@@ -24,8 +24,16 @@ export default tseslint.config(
       "crates/",
       "website/",
       "cloudflare/",
+      // CCSwitch is a separately built upstream workspace with its own ESLint
+      // policy and generated dist tree; it is not part of this manager bundle.
+      "CCSwitch/",
+      "release/",
       "scripts/",
       "docs/",
+      // Local reverse-engineering/probe fixtures are diagnostic artifacts, not
+      // renderer sources. They intentionally contain CommonJS/Node snippets
+      // and large extracted bundles with a separate runtime policy.
+      ".analysis/",
       ".workbuddy/",
       "*.config.*",
     ],

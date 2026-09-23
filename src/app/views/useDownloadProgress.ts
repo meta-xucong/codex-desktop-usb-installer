@@ -2,7 +2,11 @@ import { useCallback, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 
 import { errorCode } from "../../services/managerApi";
-import type { DownloadProgress, OperationSnapshot } from "../../shared/types";
+import type {
+  DownloadProgress,
+  OperationPhase,
+  OperationSnapshot,
+} from "../../shared/types";
 import {
   contextualFailure,
   messageFailure,
@@ -108,12 +112,16 @@ export function useDownloadProgress(opts: {
   );
 
   /** Seed progress state from a backend snapshot (reload reattach). */
-  const applySnapshotProgress = useCallback((progress: DownloadProgress | null | undefined) => {
+  const applySnapshotProgress = useCallback((
+    progress: DownloadProgress | null | undefined,
+    phase?: OperationPhase,
+  ) => {
     if (!progress) return;
-    setDl(progress);
-    dlRef.current = progress;
+    const next = phase ? { ...progress, phase } : progress;
+    setDl(next);
+    dlRef.current = next;
     setSpeed(0);
-    dlSample.current = { t: Date.now(), bytes: progress.downloaded };
+    dlSample.current = { t: Date.now(), bytes: next.downloaded };
   }, []);
 
   const clearActiveOperation = useCallback(() => {

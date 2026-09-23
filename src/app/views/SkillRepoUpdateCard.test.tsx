@@ -8,7 +8,7 @@ import type {
   SkillRepoUpdateInfo,
 } from "../../shared/types";
 import { I18nProvider } from "../i18n";
-import { SkillRepoUpdateCard } from "./SkillRepoUpdateCard";
+import { SKILL_REPO_CHECK_UI_TIMEOUT_MS, SkillRepoUpdateCard } from "./SkillRepoUpdateCard";
 
 vi.mock("../../services/managerApi", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../services/managerApi")>();
@@ -28,7 +28,26 @@ const INFO: SkillRepoUpdateInfo = {
   schemaVersion: 1,
   currentCommit: null,
   latestCommit: "a".repeat(40),
-  sourceKind: "relay",
+  sourceKind: "domestic",
+  sourceLabel: "domestic-2",
+  attempts: [
+    {
+      sourceId: "cn-mirror-1",
+      sourceKind: "domestic",
+      phase: "metadata",
+      result: "timeout",
+      httpStatus: null,
+      elapsedMs: 8_000,
+    },
+    {
+      sourceId: "cn-mirror-2",
+      sourceKind: "domestic",
+      phase: "archive",
+      result: "ok",
+      httpStatus: 200,
+      elapsedMs: 3_200,
+    },
+  ],
   archiveSize: 12,
   archiveSha256: "b".repeat(64),
   expected: {
@@ -36,7 +55,8 @@ const INFO: SkillRepoUpdateInfo = {
     repo: "meta-xucong/skill_hub",
     branch: "master",
     commit: "a".repeat(40),
-    sourceKind: "relay",
+    sourceKind: "domestic",
+    sourceId: "cn-mirror-2",
     archiveSize: 12,
     archiveSha256: "b".repeat(64),
   },
@@ -132,10 +152,14 @@ describe("SkillRepoUpdateCard", () => {
     expect(screen.queryByText(/independently unsigned/i)).not.toBeInTheDocument();
   });
 
-  it("releases the checking state when the bridge never resolves", async () => {
+  it("surfaces a bounded timeout instead of keeping the checking state forever", async () => {
     vi.useFakeTimers();
     try {
-      api.skillRepoCheckUpdate.mockReturnValue(new Promise<never>(() => undefined));
+      let resolveCheck!: (value: SkillRepoUpdateInfo) => void;
+      const pending = new Promise<SkillRepoUpdateInfo>((resolve) => {
+        resolveCheck = resolve;
+      });
+      api.skillRepoCheckUpdate.mockReturnValue(pending);
       render(<I18nProvider><SkillRepoUpdateCard /></I18nProvider>);
 
       openDetails();
@@ -143,15 +167,111 @@ describe("SkillRepoUpdateCard", () => {
       expect(screen.getByRole("button", { name: "Checking…" })).toBeDisabled();
 
       await act(async () => {
-        vi.advanceTimersByTime(50_000);
+        vi.advanceTimersByTime(SKILL_REPO_CHECK_UI_TIMEOUT_MS);
+        await Promise.resolve();
         await Promise.resolve();
       });
 
-      expect(screen.getByRole("alert")).toHaveTextContent("The operation timed out");
+      expect(screen.getByRole("alert")).toHaveTextContent(/timed out/i);
       expect(screen.getByRole("button", { name: "Check updates" })).toBeEnabled();
+
+      await act(async () => {
+        resolveCheck(INFO);
+        await pending;
+        await Promise.resolve();
+      });
+
+      expect(screen.getByRole("alert")).toHaveTextContent(/timed out/i);
+      expect(screen.queryByText(/Current/)).not.toBeInTheDocument();
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("shows safe source category, phase, result, and elapsed time", async () => {
+    api.skillRepoCheckUpdate.mockResolvedValue(INFO);
+    render(<I18nProvider><SkillRepoUpdateCard /></I18nProvider>);
+
+    openDetails();
+    fireEvent.click(screen.getByRole("button", { name: "Check updates" }));
+    await waitFor(() => expect(screen.getByText("Selected source: Domestic source 2")).toBeInTheDocument());
+
+    const attempts = screen.getAllByTestId("skill-repo-source-attempt");
+    expect(attempts).toHaveLength(2);
+    expect(attempts[0]).toHaveTextContent(/Domestic source 1.*Metadata.*timed out.*8\.0s/s);
+    expect(attempts[1]).toHaveTextContent(/Domestic source 2.*Archive.*passed.*3\.2s.*HTTP 200/s);
+  });
+
+  it("shows all-source failures as safe retryable diagnostics", async () => {
+    api.skillRepoCheckUpdate
+      .mockRejectedValueOnce({
+        code: "SKILL_REPO_ALL_SOURCES_FAILED",
+        message: "all sources failed at https://example.test/archive.zip",
+        detail: "GET https://example.test/archive.zip failed with api_key=secret",
+        attempts: INFO.attempts,
+      })
+      .mockResolvedValueOnce(INFO);
+    render(<I18nProvider><SkillRepoUpdateCard /></I18nProvider>);
+
+    openDetails();
+    fireEvent.click(screen.getByRole("button", { name: "Check updates" }));
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(/temporarily unavailable/i));
+
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveTextContent("No local Skills were changed.");
+    expect(alert).not.toHaveTextContent("https://example.test/archive.zip");
+    expect(alert).not.toHaveTextContent("api_key=secret");
+    expect(screen.getByTestId("skill-repo-retry")).toBeEnabled();
+
+    fireEvent.click(screen.getByTestId("skill-repo-retry"));
+    await waitFor(() => expect(api.skillRepoCheckUpdate).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getByText(/Current/)).toBeInTheDocument());
+  });
+
+  it("shows the safe backend detail for an invalid source instead of hiding it", async () => {
+    api.skillRepoCheckUpdate.mockRejectedValue({
+      code: "SKILL_REPO_SOURCE_INVALID",
+      message: "source invalid",
+      detail: "stage=source-resource-validate; candidate=portable-resources; reason=Skill Hub 来源目录 JSON 无效",
+    });
+    render(<I18nProvider><SkillRepoUpdateCard /></I18nProvider>);
+
+    openDetails();
+    fireEvent.click(screen.getByRole("button", { name: "Check updates" }));
+    await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
+    expect(screen.getByRole("alert")).toHaveTextContent("The update source or confirmed version is invalid");
+
+    fireEvent.click(screen.getByText("Show details"));
+    expect(screen.getByRole("alert")).toHaveTextContent("source-resource-validate");
+    expect(screen.getByRole("alert")).toHaveTextContent("来源目录 JSON 无效");
+  });
+
+  it("copies Skill Hub diagnostics without URLs, accounts, or credentials", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    api.skillRepoCheckUpdate.mockRejectedValue({
+      code: "SKILL_REPO_ALL_SOURCES_FAILED",
+      message: "failed at https://example.test/archive.zip",
+      detail: "owner/meta-xucong/skill_hub token=secret",
+      attempts: INFO.attempts,
+    });
+    render(<I18nProvider><SkillRepoUpdateCard /></I18nProvider>);
+
+    openDetails();
+    fireEvent.click(screen.getByRole("button", { name: "Check updates" }));
+    await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("Show details"));
+    fireEvent.click(screen.getByRole("button", { name: "Copy diagnostics" }));
+    await waitFor(() => expect(writeText).toHaveBeenCalledOnce());
+
+    const copied = String(writeText.mock.calls[0]?.[0]);
+    expect(copied).toContain("cn-mirror-1");
+    expect(copied).not.toContain("https://example.test/archive.zip");
+    expect(copied).not.toContain("meta-xucong");
+    expect(copied).not.toContain("token=secret");
   });
 
   it("shows partial results with conflict and skipped counts", async () => {

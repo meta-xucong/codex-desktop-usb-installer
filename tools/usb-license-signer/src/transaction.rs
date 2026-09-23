@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use codex_usb_license::{
     fingerprints_match, new_unsigned_license, sign_license, validate_fingerprint, validate_key_id,
-    validate_license, UsbFingerprint, UsbLicense,
+    validate_license, UsbAccountBinding, UsbFingerprint, UsbLicense,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -120,11 +120,29 @@ pub fn load_existing_license(bundle_root: &Path) -> Result<ExistingLicense, Sign
     }
 }
 
+pub fn load_existing_account_binding(
+    bundle_root: &Path,
+) -> Result<Option<UsbAccountBinding>, SignerError> {
+    Ok(load_existing_license(bundle_root)?
+        .license
+        .and_then(|license| license.account_binding))
+}
+
 pub fn build_signing_candidate(
     bundle_root: &Path,
     observed: &PhysicalObservation,
     key_id: &str,
     issued_at_ms: u64,
+) -> Result<(UsbLicense, ExistingLicense), SignerError> {
+    build_signing_candidate_with_account_binding(bundle_root, observed, key_id, issued_at_ms, None)
+}
+
+pub fn build_signing_candidate_with_account_binding(
+    bundle_root: &Path,
+    observed: &PhysicalObservation,
+    key_id: &str,
+    issued_at_ms: u64,
+    account_binding: Option<UsbAccountBinding>,
 ) -> Result<(UsbLicense, ExistingLicense), SignerError> {
     validate_key_id(key_id)?;
     let existing = load_existing_license(bundle_root)?;
@@ -154,6 +172,22 @@ pub fn build_signing_candidate(
     license.fingerprint = observed.fingerprint.clone();
     license.issued_at = issued_at_ms.to_string();
     license.key_id = Some(key_id.to_string());
+    match (license.account_binding.as_ref(), account_binding) {
+        (Some(existing), Some(requested)) if existing != &requested => {
+            return Err(SignerError::ExistingLicense(
+                "existing account binding does not match the requested Sub2API account".to_string(),
+            ));
+        }
+        (Some(_), Some(_)) => {}
+        (None, Some(requested)) => {
+            codex_usb_license::validate_account_binding(&requested)?;
+            license.account_binding = Some(requested);
+        }
+        (Some(existing), None) => {
+            codex_usb_license::validate_account_binding(existing)?;
+        }
+        (None, None) => {}
+    }
     license.signature = None;
     Ok((license, existing))
 }
@@ -193,10 +227,25 @@ pub fn write_old_license_audit(
         .create_new(true)
         .open(&path)
         .map_err(|error| SignerError::io("recording old license audit bytes", &path, error))?;
-    file.write_all(old_bytes)
+    let audit_bytes = redact_license_secrets(old_bytes);
+    file.write_all(&audit_bytes)
         .and_then(|_| file.sync_all())
         .map_err(|error| SignerError::io("recording old license audit bytes", &path, error))?;
     Ok(Some(path))
+}
+
+fn redact_license_secrets(bytes: &[u8]) -> Vec<u8> {
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return bytes.to_vec();
+    };
+    let Some(device_api_key) = value.pointer_mut("/accountBinding/ccswitch/deviceApiKey") else {
+        return bytes.to_vec();
+    };
+    if !device_api_key.is_string() {
+        return bytes.to_vec();
+    }
+    *device_api_key = serde_json::Value::String("[REDACTED]".to_string());
+    serde_json::to_vec_pretty(&value).unwrap_or_else(|_| bytes.to_vec())
 }
 
 pub fn write_license_atomic(bundle_root: &Path, license: &UsbLicense) -> Result<(), SignerError> {
@@ -253,7 +302,10 @@ pub fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codex_usb_license::{UsbFingerprint, ANCHOR_SCHEMA_V2, LICENSE_SCHEMA_VERSION, PRODUCT_ID};
+    use codex_usb_license::{
+        UsbAccountBinding, UsbCcswitchBinding, UsbFingerprint, ANCHOR_SCHEMA_V2,
+        LICENSE_SCHEMA_VERSION, PRODUCT_ID,
+    };
 
     fn observation() -> PhysicalObservation {
         PhysicalObservation {
@@ -272,6 +324,23 @@ mod tests {
         }
     }
 
+    fn binding(number: &str) -> UsbAccountBinding {
+        UsbAccountBinding {
+            schema_version: 1,
+            usb_asset_id: number.to_string(),
+            account_ref: number.to_string(),
+            account_name: number.to_string(),
+            login_email: "u1@u.404token.xyz".to_string(),
+            sub2api_user_id: 23,
+            ccswitch: UsbCcswitchBinding {
+                provider_id: "404token-sub2api".to_string(),
+                credential_id: "sub2api-user-key-23".to_string(),
+                device_api_key: "sk-device-key".to_string(),
+                group_id: 7,
+            },
+        }
+    }
+
     #[test]
     fn old_unsigned_license_keeps_installation_id() {
         let root = std::env::temp_dir().join(format!("usb-license-tx-{}", Uuid::new_v4()));
@@ -283,6 +352,7 @@ mod tests {
             fingerprint: observation().fingerprint.clone(),
             issued_at: "1".to_string(),
             key_id: None,
+            account_binding: None,
             signature: None,
         };
         fs::write(license_path(&root), serde_json::to_vec(&old).unwrap()).unwrap();
@@ -313,5 +383,42 @@ mod tests {
         verify_signed_license(&readback, &observed, &key.public_key_b64()).unwrap();
         assert!(readback.signature.is_some());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn account_binding_is_injected_and_mismatch_is_fail_closed() {
+        let root = std::env::temp_dir().join(format!("usb-license-binding-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let observed = observation();
+        let first = binding("USB-0001");
+        let (candidate, _) = build_signing_candidate_with_account_binding(
+            &root,
+            &observed,
+            "test-key",
+            2,
+            Some(first.clone()),
+        )
+        .unwrap();
+        assert_eq!(candidate.account_binding, Some(first.clone()));
+        fs::write(license_path(&root), serde_json::to_vec(&candidate).unwrap()).unwrap();
+
+        let mismatch = build_signing_candidate_with_account_binding(
+            &root,
+            &observed,
+            "test-key",
+            3,
+            Some(binding("USB-0002")),
+        );
+        assert!(matches!(mismatch, Err(SignerError::ExistingLicense(_))));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn old_license_audit_redacts_device_api_key() {
+        let source = br#"{"accountBinding":{"ccswitch":{"deviceApiKey":"sk-secret"}}}"#;
+        let redacted = redact_license_secrets(source);
+        let text = String::from_utf8(redacted).unwrap();
+        assert!(!text.contains("sk-secret"));
+        assert!(text.contains("[REDACTED]"));
     }
 }

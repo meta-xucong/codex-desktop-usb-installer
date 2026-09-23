@@ -54,6 +54,37 @@ function Read-JsonFile([string]$Path) {
     return [System.IO.File]::ReadAllText($Path, $utf8) | ConvertFrom-Json
 }
 
+function Test-IntegerValue([object]$Value) {
+    return $null -ne $Value -and (
+        $Value -is [sbyte] -or $Value -is [byte] -or
+        $Value -is [int16] -or $Value -is [uint16] -or
+        $Value -is [int32] -or $Value -is [uint32] -or
+        $Value -is [int64] -or $Value -is [uint64]
+    )
+}
+
+function Get-JsonInteger([object]$Object, [string]$Name) {
+    if ($null -eq $Object) {
+        return $null
+    }
+    if ($Object -is [System.Collections.IDictionary]) {
+        if (-not $Object.Contains($Name)) {
+            return $null
+        }
+        $value = $Object[$Name]
+    } else {
+        $property = $Object.PSObject.Properties[$Name]
+        if ($null -eq $property) {
+            return $null
+        }
+        $value = $property.Value
+    }
+    if (-not (Test-IntegerValue $value)) {
+        return $null
+    }
+    return $value
+}
+
 function Assert-NoSuccessfulStateResidue([string]$RootPath) {
     $rootLicensePath = Join-Path $RootPath "usb-license.json"
     if (Test-Path -LiteralPath $rootLicensePath) {
@@ -200,8 +231,17 @@ if ($packReparse.Count -gt 0) {
 }
 $capabilityPackOutput = Join-Path $output "content\codex-starter-kit"
 New-Item -ItemType Directory -Force -Path $capabilityPackOutput | Out-Null
-foreach ($packEntry in Get-ChildItem -LiteralPath $capabilityPackSourceFull -Force) {
-    Copy-Item -LiteralPath $packEntry.FullName -Destination $capabilityPackOutput -Recurse -Force
+$packTransientDirectories = @('.git', '.pytest_cache', '__pycache__')
+foreach ($packFile in Get-ChildItem -LiteralPath $capabilityPackSourceFull -Recurse -Force -File) {
+    $packRelative = (Get-RelativePathCompat $capabilityPackSourceFull $packFile.FullName).Replace('\', '/')
+    $packSegments = $packRelative.Split('/')
+    if (@($packSegments | Where-Object { $packTransientDirectories -contains $_ }).Count -gt 0 -or
+        $packFile.Extension -ieq '.pyc') {
+        continue
+    }
+    $packDestination = Join-Path $capabilityPackOutput ($packRelative.Replace('/', '\'))
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $packDestination) | Out-Null
+    Copy-Item -LiteralPath $packFile.FullName -Destination $packDestination -Force
 }
 [System.IO.File]::WriteAllText(
     (Join-Path $output "apps\README.txt"),
@@ -263,7 +303,8 @@ if (-not (Test-Path -LiteralPath $webView2Output -PathType Leaf)) {
 [void](Add-Member -InputObject $sourceManifest -MemberType NoteProperty -Name "schemaVersion" -Value 2 -Force)
 [void](Add-Member -InputObject $sourceManifest -MemberType NoteProperty -Name "updateCapability" -Value ([ordered]@{
     codexPayload = $true
-    schemaVersion = 2
+    schemaVersion = 3
+    anchorSchema = 3
     mutableFields = @(
         "codexDesktopVersion",
         "packageVersion",
@@ -277,6 +318,11 @@ if (-not (Test-Path -LiteralPath $webView2Output -PathType Leaf)) {
     transactionDirectory = ".staging"
     successState = "clean"
 }) -Force)
+if ((Get-JsonInteger $sourceManifest "schemaVersion") -ne 2 -or
+    (Get-JsonInteger $sourceManifest.updateCapability "schemaVersion") -ne 3 -or
+    (Get-JsonInteger $sourceManifest.updateCapability "anchorSchema") -ne 3) {
+    throw "输出 root manifest 的 schema/capability 数字字段无效"
+}
 [System.IO.File]::WriteAllText(
     (Join-Path $output "manifest.json"),
     ($sourceManifest | ConvertTo-Json -Depth 8),

@@ -33,6 +33,7 @@ COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 MAX_ARCHIVE = 64 * 1024 * 1024
 MAX_METADATA = 64 * 1024
 USER_AGENT = "codex-skill-hub-relay/1"
+METADATA_KEYS = frozenset(("schemaVersion", "repo", "branch", "commit", "archive", "size", "sha256"))
 
 
 class RelayError(RuntimeError):
@@ -225,15 +226,33 @@ def current_commit(export_root: Path, config: dict[str, Any]) -> str | None:
     except RelayError:
         return None
     commit = value.get("commit")
+    size = value.get("size")
+    digest = value.get("sha256")
     if (
-        value.get("schemaVersion") != 1
+        set(value) != METADATA_KEYS
+        or value.get("schemaVersion") != 1
         or value.get("repo") != config["repo"]
         or value.get("branch") != config["branch"]
         or value.get("archive") != "archive.zip"
         or not isinstance(commit, str)
         or COMMIT_RE.fullmatch(commit) is None
+        or isinstance(size, bool)
+        or not isinstance(size, int)
+        or size < 0
+        or size > MAX_ARCHIVE
+        or not isinstance(digest, str)
+        or SHA_RE.fullmatch(digest) is None
         or link_target.name != commit
     ):
+        return None
+    archive_path = current / "archive.zip"
+    if archive_path.is_symlink() or not archive_path.is_file():
+        return None
+    try:
+        archive = archive_path.read_bytes()
+    except OSError:
+        return None
+    if len(archive) != size or sha256(archive) != digest:
         return None
     return commit
 

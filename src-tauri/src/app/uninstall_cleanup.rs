@@ -43,6 +43,8 @@ const REPORT_ISSUE_MAX_CHARS: usize = 720;
 const FINALIZER_REPORT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(windows)]
 const FINALIZER_REPORT_CONFIRM_INTERVAL: Duration = Duration::from_millis(100);
+#[cfg(windows)]
+const FINALIZER_START_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECTION_OWNERSHIP_MAX_BYTES: u64 = 64 * 1024;
 const CONNECTION_OWNERSHIP_RELATIVE: &str = ".codex/codex-agent-kit/connection-ownership.json";
 const OWNED_CONNECTION_ENV_NAMES: &[&str] = &[
@@ -267,6 +269,7 @@ struct ConnectionOwnershipRecord {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CleanupHandoff {
+    pub handoff_id: String,
     pub report_path: String,
     pub message: String,
 }
@@ -372,13 +375,42 @@ fn canonical_or_parent(path: &Path) -> Result<PathBuf, String> {
         return fs::canonicalize(path)
             .map_err(|error| format!("解析路径 {}：{error}", path.display()));
     }
-    let parent = path
-        .parent()
-        .ok_or_else(|| format!("路径没有父目录：{}", path.display()))?;
-    let name = path
-        .file_name()
-        .ok_or_else(|| format!("路径没有文件名：{}", path.display()))?;
-    Ok(canonical_root(parent)?.join(name))
+
+    // Optional cleanup targets may have more than one missing parent. Walk
+    // back to the nearest existing directory, which is the only location
+    // that can be canonicalized without creating the target path. All
+    // existing ancestors were already checked above for reparse points and
+    // traversal components; preserve the missing suffix literally so this
+    // normalization cannot broaden the deletion target.
+    let mut missing_components = Vec::new();
+    let mut existing = path;
+    loop {
+        match metadata_optional(existing)? {
+            Some(metadata) => {
+                if !metadata.is_dir() {
+                    return Err(format!(
+                        "可选清理目标的已存在祖先不是目录：{}",
+                        existing.display()
+                    ));
+                }
+                let mut canonical = fs::canonicalize(existing)
+                    .map_err(|error| format!("解析路径 {}：{error}", existing.display()))?;
+                for component in missing_components.iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(canonical);
+            }
+            None => {
+                let name = existing
+                    .file_name()
+                    .ok_or_else(|| format!("路径没有文件名：{}", path.display()))?;
+                missing_components.push(name.to_os_string());
+                existing = existing
+                    .parent()
+                    .ok_or_else(|| format!("路径没有父目录：{}", path.display()))?;
+            }
+        }
+    }
 }
 
 fn same_or_child_path(child: &Path, parent: &Path) -> bool {
@@ -1406,7 +1438,7 @@ fn finalizer_report_completed(report: &Path) -> Result<bool, String> {
     Ok(report.helper_finalization == "removed"
         && matches!(report.status.as_str(), "completed" | "partialFailure")
         && (report.phase.is_empty() || report.phase == "completed")
-        && report.exit_code.map_or(true, |code| code == 0))
+        && report.exit_code.is_none_or(|code| code == 0))
 }
 
 #[cfg(windows)]
@@ -1532,6 +1564,9 @@ fn validate_plan(
     current_exe: &Path,
     roots: &CleanupRoots,
 ) -> Result<(), String> {
+    if plan.remove_usb_media {
+        return Err("当前版本始终保留 U 盘安装包，拒绝执行介质删除计划".into());
+    }
     let nonce = uuid::Uuid::parse_str(&plan.nonce).map_err(|_| "无效清理批次")?;
     if plan.schema_version != 3 || nonce.to_string() != plan.nonce || &plan.roots != roots {
         return Err("清理计划身份/用户目录不匹配".into());
@@ -1582,6 +1617,9 @@ pub fn launch_deferred_cleanup(
     source_license: Option<crate::app::usb_guard::UsbFingerprint>,
     prior_notes: Vec<String>,
 ) -> Result<CleanupHandoff, String> {
+    if remove_usb_media {
+        return Err("当前版本始终保留 U 盘安装包，拒绝启动介质删除计划".into());
+    }
     #[cfg(not(windows))]
     {
         let _ = (
@@ -1736,7 +1774,11 @@ pub fn launch_deferred_cleanup(
                     drop(file);
                     fs::rename(&commit, helper_dir.join("commit.json"))
                         .map_err(|error| error.to_string())?;
-                    return Ok(CleanupHandoff { report_path: report.display().to_string(), message: "系统卸载已完成，清理组件已就绪。关闭安装器后清理日志、缓存、锁文件和暂存；最终结果保留在所示路径的报告。".into() });
+                    return Ok(CleanupHandoff {
+                        handoff_id: nonce.clone(),
+                        report_path: report.display().to_string(),
+                        message: "系统卸载已完成，清理组件已就绪。关闭安装器后清理日志、缓存、锁文件和暂存；最终结果保留在所示路径的报告。".into(),
+                    });
                 }
                 return Err("清理组件握手身份不匹配".into());
             }
@@ -1955,6 +1997,27 @@ exit 0
 }
 
 #[cfg(windows)]
+fn powershell_encoded_command(script: &str) -> String {
+    use base64::Engine as _;
+
+    // PowerShell's EncodedCommand contract is UTF-16LE. Passing the generated
+    // script as a single base64 argument avoids Windows command-line quoting,
+    // newline, non-ASCII path, and ampersand parsing differences that can make
+    // the detached finalizer exit before it publishes its ready marker.
+    let bytes = script
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+#[cfg(windows)]
+/// Start the detached finalizer and wait only for the handoff marker.
+///
+/// `Ok(())` means that the finalizer owns the rest of the cleanup. It does
+/// not mean that the final report is complete. The caller must release the
+/// lifetime lock and let this helper process exit so the finalizer can remove
+/// the helper image itself.
 fn schedule_self_cleanup(
     helper_dir: &Path,
     report: &Path,
@@ -1966,6 +2029,7 @@ fn schedule_self_cleanup(
     check_ancestors(helper_dir)?;
     check_ancestors(report)?;
     let script = finalizer_script(helper_dir, report, lifetime_token, true);
+    let encoded = powershell_encoded_command(&script);
     let system_root = std::env::var_os("SystemRoot").ok_or("无法确定 Windows 目录")?;
     let shell = PathBuf::from(system_root).join("System32/WindowsPowerShell/v1.0/powershell.exe");
     check_ancestors(&shell)?;
@@ -1979,8 +2043,8 @@ fn schedule_self_cleanup(
             "-NonInteractive",
             "-ExecutionPolicy",
             "Bypass",
-            "-Command",
-            &script,
+            "-EncodedCommand",
+            &encoded,
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1991,7 +2055,7 @@ fn schedule_self_cleanup(
     let ready = helper_dir.join("finalizer.ready");
     let expected = lifetime_token;
     let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(10) {
+    while start.elapsed() < FINALIZER_START_TIMEOUT {
         check_ancestors(&ready)?;
         if metadata_optional(&ready)?.is_some()
             && fs::read_to_string(&ready).map_err(|error| error.to_string())? == expected
@@ -2035,7 +2099,10 @@ fn schedule_self_cleanup(
     }
     let _ = child.kill();
     let _ = child.wait();
-    Err("临时组件收尾进程 10 秒内未确认就绪，已终止该精确子进程；保留报告并登记兜底清理，未宣称彻底完成".into())
+    Err(format!(
+        "临时组件收尾进程 {} 秒内未确认就绪，已终止该精确子进程；保留报告并登记兜底清理，未宣称彻底完成",
+        FINALIZER_START_TIMEOUT.as_secs()
+    ))
 }
 
 #[cfg(windows)]
@@ -2093,8 +2160,14 @@ fn run_helper(nonce_arg: &str) -> Result<(), String> {
     fs::rename(&pending, helper_dir.join("ready.json")).map_err(|error| error.to_string())?;
     report.phase = "cleanup".into();
     let cleanup = (|| {
-        if unsafe { WaitForSingleObject(parent.0, 120000) } != WAIT_OBJECT_0 {
-            return Err("安装器 120 秒内未退出，未执行任何数据删除".to_string());
+        // The helper has already published a verified handoff and the manager
+        // owns the only explicit commit file. Waiting on the exact parent
+        // process handle avoids a wall-clock race with a user reading the
+        // result. If the manager never exits, no target is deleted; if it
+        // exits without the commit file, the next check below still refuses
+        // deletion.
+        if unsafe { WaitForSingleObject(parent.0, u32::MAX) } != WAIT_OBJECT_0 {
+            return Err("无法等待安装器进程退出，未执行任何数据删除".to_string());
         }
         let commit = helper_dir.join("commit.json");
         check_ancestors(&commit)?;
@@ -2250,20 +2323,14 @@ fn run_helper(nonce_arg: &str) -> Result<(), String> {
         "等待收尾组件完成自清理".into()
     };
     write_report(&report_file, &report)?;
-    let finalizer_error = match schedule_self_cleanup(helper_dir, &report_file, &nonce) {
-        Ok(()) => None,
-        Err(error) => Some(error),
-    };
-    // `finalizer.ready` only means that the detached PowerShell process has
-    // taken ownership of the handoff and is waiting for this exact lifetime
-    // lock. The helper must release the lock before the durable report can be
-    // completed; confirm that report after the release instead of returning
-    // exit code 0 while the finalizer is still racing the report write.
+    let finalizer_error = schedule_self_cleanup(helper_dir, &report_file, &nonce).err();
+    // `finalizer.ready` means that the detached PowerShell process has taken
+    // ownership of the handoff and is waiting for this exact lifetime lock.
+    // Once it is ready, this helper must release the lock and exit immediately:
+    // the finalizer cannot delete CodexUninstallCleanup.exe while this process
+    // still has its own image mapped. The finalizer owns the durable report,
+    // user notification, and any reboot fallback after that point.
     drop(lifetime_lock);
-    let finalizer_error = match finalizer_error {
-        Some(error) => Some(error),
-        None => confirm_finalizer_report(&report_file).err(),
-    };
     if let Some(error) = finalizer_error {
         let fallback = schedule_helper_cleanup_on_reboot(helper_dir, &roots);
         let fallback_detail = match fallback {
@@ -2523,6 +2590,27 @@ mod tests {
     fn traversal_is_rejected() {
         assert!(check_ancestors(Path::new("relative")).is_err());
         assert!(check_ancestors(&std::env::temp_dir().join("..\\other")).is_err());
+    }
+
+    #[test]
+    fn report_root_safety_allows_absent_local_and_roaming_wangnov_parents() {
+        let root = TempRoot::new();
+        let roots = fake_roots(&root.0);
+        let local_wangnov = roots.local.join("wangnov");
+        let roaming_wangnov = roots.roaming.join("wangnov");
+
+        assert!(!local_wangnov.exists());
+        assert!(!roaming_wangnov.exists());
+        roots.ensure_report_root_safe().unwrap();
+        assert!(!local_wangnov.exists());
+        assert!(!roaming_wangnov.exists());
+
+        for target in [
+            roots.local.join("wangnov/codexappmanager"),
+            roots.roaming.join("wangnov/codexappmanager"),
+        ] {
+            assert_eq!(clean_target(&target).status, "absent");
+        }
     }
 
     fn fake_roots(root: &Path) -> CleanupRoots {
@@ -2978,6 +3066,23 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn encoded_finalizer_command_round_trips_utf16le() {
+        use base64::Engine as _;
+
+        let script = "Write-Output '中文路径 & ampersand'";
+        let encoded = powershell_encoded_command(script);
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        let units = bytes
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]));
+        let decoded = String::from_utf16(units.collect::<Vec<_>>().as_slice()).unwrap();
+        assert_eq!(decoded, script);
     }
 
     #[test]

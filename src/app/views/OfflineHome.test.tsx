@@ -1,6 +1,7 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { listen } from "@tauri-apps/api/event";
 
 import { managerApi, type UpdateInfo } from "../../services/managerApi";
 import type { OfflinePayloadReport, OfflineStageReport, UsbGuardStatus } from "../../shared/types";
@@ -23,6 +24,11 @@ vi.mock("../../services/managerApi", async (importOriginal) => {
       checkCodexPayloadUpdate: vi.fn(),
       applyCodexPayloadUpdate: vi.fn(),
       installAndLaunchCcswitch: vi.fn(),
+      refreshNativeModelCatalog: vi.fn(),
+      accountStatus: vi.fn(),
+      accountLogin: vi.fn(),
+      accountRefresh: vi.fn(),
+      accountRedeem: vi.fn(),
       capabilityPackStatus: vi.fn(),
       installCapabilityPack: vi.fn(),
       usbGuardStatus: vi.fn(),
@@ -32,6 +38,7 @@ vi.mock("../../services/managerApi", async (importOriginal) => {
 });
 
 const api = vi.mocked(managerApi);
+const listenMock = vi.mocked(listen);
 
 const PAYLOAD: OfflinePayloadReport = {
   ready: true,
@@ -130,6 +137,21 @@ describe("OfflineHome", () => {
       copiedFiles: 5,
       message: "launched",
     });
+    api.refreshNativeModelCatalog.mockResolvedValue({
+      status: "ready",
+      modelCount: 3,
+      catalogPath: "C:\\Users\\test\\.codex\\codex-usb-native-model-catalog.json",
+      fetchedAt: "unix:1",
+      message: "ready",
+    });
+    api.accountStatus.mockResolvedValue({
+      bound: false,
+      accountName: null,
+      loggedIn: false,
+      balance: null,
+      usage: null,
+      message: "此 U 盘尚未绑定 404token 账号",
+    });
     api.capabilityPackStatus.mockResolvedValue({
       available: true,
       installed: false,
@@ -195,6 +217,34 @@ describe("OfflineHome", () => {
     await waitFor(() => expect(screen.getByText("26.602.40724")).toBeInTheDocument());
   });
 
+  it("shows a spinning readiness indicator while USB authorization settles", async () => {
+    let resolveProbe: (value: OfflinePayloadReport) => void = () => undefined;
+    api.offlinePayloadProbe.mockReturnValue(
+      new Promise<OfflinePayloadReport>((resolve) => {
+        resolveProbe = resolve;
+      }),
+    );
+    api.usbGuardStatus.mockResolvedValue({
+      ...USB_GUARD,
+      status: "starting",
+      watchdog: "not-running",
+      codexAllowed: false,
+      message: "正在校验 U 盘能力包",
+    });
+
+    const { container } = renderView();
+
+    await waitFor(() => {
+      expect(screen.getByText("正在完成启动校验，完成后会自动开放安装和更新；请保持 U 盘连接。")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "一键安装" })).toBeDisabled();
+    });
+    expect(container.querySelector("[data-testid=offline-hero] .ring.spin")).not.toBeNull();
+
+    resolveProbe(PAYLOAD);
+    await waitFor(() => expect(screen.getByText("26.602.40724")).toBeInTheDocument());
+    expect(container.querySelector("[data-testid=offline-hero] .ring.spin")).not.toBeNull();
+  });
+
   it("refreshes startup authorization after the initial guard snapshot", async () => {
     api.usbGuardStatus
       .mockResolvedValueOnce({
@@ -211,6 +261,26 @@ describe("OfflineHome", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: "一键安装" })).toBeEnabled());
     expect(screen.getByRole("button", { name: "检查并安装更新" })).toBeEnabled();
     expect(api.usbGuardStatus.mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("re-reads an installation after USB authorization so a stale external snapshot cannot block it", async () => {
+    api.winStatus
+      .mockResolvedValueOnce({ status: "external", installed: USB_PORTABLE_CODEX })
+      .mockResolvedValue({ status: "managed", installed: USB_PORTABLE_CODEX });
+    api.usbGuardStatus
+      .mockResolvedValueOnce({
+        ...USB_GUARD,
+        status: "starting",
+        watchdog: "not-running",
+        codexAllowed: false,
+      })
+      .mockResolvedValue(USB_GUARD);
+
+    renderView();
+
+    await waitFor(() => expect(screen.getByText("此版本已经安装")).toBeInTheDocument());
+    expect(screen.queryByText(/Codex 已安装在其他位置/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "检查并安装更新" })).toBeEnabled();
   });
 
   it("does not claim Codex is installed until signed authorization is live", async () => {
@@ -315,6 +385,88 @@ describe("OfflineHome", () => {
     expect(await screen.findByText("Codex 已更新到最新版。")).toBeInTheDocument();
   });
 
+  it("uses the same full-screen progress view while the USB update payload downloads", async () => {
+    const user = userEvent.setup();
+    let payloadProgressHandler: ((event: { payload: unknown }) => void) | null = null;
+    listenMock.mockImplementation((event: string, handler: unknown) => {
+      if (event === "payload-update-progress") {
+        payloadProgressHandler = handler as (event: { payload: unknown }) => void;
+      }
+      return Promise.resolve(() => {});
+    });
+    const updateInfo: UpdateInfo = {
+      channel: "codex",
+      currentVersion: PAYLOAD.codexDesktopVersion,
+      latestVersion: "26.700.1",
+      releaseNotes: null,
+      sizeBytes: 4096,
+      requiresRestart: false,
+      payload: {},
+    };
+    api.usbGuardStatus.mockResolvedValue({ ...USB_GUARD, signed: true });
+    api.checkCodexPayloadUpdate.mockResolvedValue({ kind: "available", info: updateInfo });
+    api.applyCodexPayloadUpdate.mockImplementation(() => new Promise(() => {}));
+
+    renderView();
+    await user.click(await screen.findByRole("button", { name: "检查并安装更新" }));
+    await user.click(await screen.findByRole("button", { name: /^更新$/ }));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("install-progress-bar")).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "暂停" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "取消" })).not.toBeInTheDocument();
+    });
+    expect(payloadProgressHandler).not.toBeNull();
+    const emitPayloadProgress = payloadProgressHandler as unknown as (
+      event: { payload: unknown },
+    ) => void;
+    emitPayloadProgress({
+      payload: { phase: "download", bytesDone: 2048, bytesTotal: 4096 },
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("install-progress-bar")).toHaveAttribute(
+        "aria-valuenow",
+        "50",
+      ),
+    );
+  });
+
+  it("rechecks once when the confirmed Codex update becomes stale", async () => {
+    const user = userEvent.setup();
+    const firstInfo: UpdateInfo = {
+      channel: "codex",
+      currentVersion: PAYLOAD.codexDesktopVersion,
+      latestVersion: "26.700.1",
+      releaseNotes: null,
+      sizeBytes: PAYLOAD.size,
+      requiresRestart: false,
+      payload: {},
+    };
+    const refreshedInfo: UpdateInfo = {
+      ...firstInfo,
+      latestVersion: "26.700.2",
+    };
+    api.usbGuardStatus.mockResolvedValue({ ...USB_GUARD, signed: true });
+    api.checkCodexPayloadUpdate
+      .mockResolvedValueOnce({ kind: "available", info: firstInfo })
+      .mockResolvedValueOnce({ kind: "available", info: refreshedInfo });
+    api.applyCodexPayloadUpdate.mockRejectedValueOnce({
+      code: "stale_expectation",
+      message: "远端 Codex 更新信息已变化（发布版本身份已变化），请重新检查后再确认。",
+    });
+
+    renderView();
+    await user.click(await screen.findByRole("button", { name: "检查并安装更新" }));
+    await user.click(await screen.findByRole("button", { name: /^更新$/ }));
+
+    await waitFor(() => expect(api.checkCodexPayloadUpdate).toHaveBeenCalledTimes(2));
+    expect(api.applyCodexPayloadUpdate).toHaveBeenCalledTimes(1);
+    expect(
+      await screen.findByRole("heading", { name: "更新 Codex 到 26.700.2？" }),
+    ).toBeInTheDocument();
+    expect(await screen.findByText(/已刷新到 26\.700\.2/)).toBeInTheDocument();
+  });
+
   it("keeps the update entry visible but disabled for an unsigned development USB", async () => {
     api.usbGuardStatus.mockResolvedValue({
       ...USB_GUARD,
@@ -340,6 +492,10 @@ describe("OfflineHome", () => {
         installed: USB_PORTABLE_CODEX,
       });
     renderView();
+    api.offlinePayloadStage.mockResolvedValue({
+      ...STAGE,
+      payload: { ...STAGE.payload, releaseTag: "upstream-26.602.40724" },
+    });
     await waitFor(() => expect(screen.getByRole("button", { name: "一键安装" })).toBeEnabled());
     await user.click(screen.getByRole("button", { name: "一键安装" }));
     await waitFor(() => expect(api.winInstallHistoricalRelease).toHaveBeenCalled());
@@ -348,6 +504,7 @@ describe("OfflineHome", () => {
       localPath: STAGE.stagedPath,
       version: PAYLOAD.codexDesktopVersion,
       format: "msix",
+      releaseTag: `local-signed-${PAYLOAD.codexDesktopVersion}`,
     });
     expect(api.winInstallHistoricalRelease.mock.calls[0]?.[1]).toBe(true);
     expect(api.winInstallHistoricalRelease.mock.calls[0]?.[5]).toBe(true);
@@ -360,6 +517,85 @@ describe("OfflineHome", () => {
     });
     expect(api.installAndLaunchCcswitch).toHaveBeenCalledTimes(1);
     await waitFor(() => expect(screen.getByText(/Codex Switch 已从 U 盘启动/)).toBeInTheDocument());
+    await waitFor(() => expect(api.refreshNativeModelCatalog).toHaveBeenCalledWith(true));
+    expect(await screen.findByText(/已刷新 Codex 原生模型列表/)).toBeInTheDocument();
+  });
+
+  it("shows a visible failure when the native model refresh rejects", async () => {
+    const user = userEvent.setup();
+    api.winStatus.mockResolvedValue({ status: "managed", installed: USB_PORTABLE_CODEX });
+    api.refreshNativeModelCatalog
+      .mockResolvedValueOnce({
+        status: "ready",
+        modelCount: 3,
+        catalogPath: "C:\\Users\\test\\.codex\\catalog.json",
+        fetchedAt: "unix:1",
+        message: "ready",
+      })
+      .mockRejectedValue(new Error("gateway unavailable"));
+
+    renderView();
+    await waitFor(() => expect(screen.getByRole("button", { name: "刷新模型列表" })).toBeEnabled());
+    await user.click(screen.getByRole("button", { name: "刷新模型列表" }));
+
+    expect(
+      await screen.findByText(
+        "404token 上游服务器暂时无法访问（不是本地程序故障），已重试后继续使用上次目录。",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/刷新模型列表/)).toBeInTheDocument();
+  });
+
+  it("does not render an unplanned account password field in the USB home", async () => {
+    renderView();
+    await screen.findByText("26.602.40724");
+    expect(screen.queryByPlaceholderText("输入密码")).not.toBeInTheDocument();
+  });
+
+  it("redeems a code from the compact 404token account card", async () => {
+    const user = userEvent.setup();
+    api.accountStatus.mockResolvedValue({
+      bound: true,
+      accountName: "USB-0001",
+      loggedIn: true,
+      balance: 100,
+      usage: null,
+      message: "账户信息已刷新",
+    });
+    api.accountRedeem.mockResolvedValue({
+      bound: true,
+      accountName: "USB-0001",
+      loggedIn: true,
+      balance: 200,
+      usage: null,
+      message: "充值成功,余额已更新",
+    });
+
+    renderView();
+    const input = await screen.findByPlaceholderText("输入充值码");
+    await user.type(input, "RECHARGE-ABCD1234");
+    await user.click(screen.getByRole("button", { name: "一键充值" }));
+
+    expect(api.accountRedeem).toHaveBeenCalledWith("RECHARGE-ABCD1234");
+    expect(await screen.findByText("充值成功,余额已更新")).toBeInTheDocument();
+  });
+
+  it("places the first-login password field before the recharge code", async () => {
+    api.accountStatus.mockResolvedValue({
+      bound: true,
+      accountName: "USB-0001",
+      loggedIn: false,
+      balance: null,
+      usage: null,
+      message: "已绑定,请输入密码登录",
+    });
+
+    renderView();
+    const password = await screen.findByPlaceholderText("输入 404token 密码");
+    const code = await screen.findByPlaceholderText("输入充值码");
+    expect(password.compareDocumentPosition(code) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.getByRole("button", { name: "登录账户" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "一键充值" })).toBeDisabled();
   });
 
   it("stops before the USB install when the pre-install Guard recheck fails", async () => {
@@ -373,6 +609,27 @@ describe("OfflineHome", () => {
 
     await waitFor(() => expect(api.winInstallHistoricalRelease).not.toHaveBeenCalled());
     expect(api.installCapabilityPack).not.toHaveBeenCalled();
+  });
+
+  it("rechecks USB authorization before staging and reports a readiness issue", async () => {
+    const user = userEvent.setup();
+    // First call: initial shell; second call: post-probe refresh; third call:
+    // the action-boundary preflight intentionally fails.
+    api.usbGuardStatus.mockReset();
+    api.usbGuardStatus
+      .mockResolvedValueOnce(USB_GUARD)
+      .mockResolvedValueOnce(USB_GUARD)
+      .mockRejectedValueOnce(new Error("status unavailable"))
+      .mockResolvedValue(USB_GUARD);
+
+    renderView();
+    await user.click(await screen.findByRole("button", { name: "一键安装" }));
+
+    await waitFor(() =>
+      expect(screen.getByText("U 盘授权尚未就绪，请保持 U 盘连接并稍后重试。")).toBeInTheDocument(),
+    );
+    expect(api.offlinePayloadStage).not.toHaveBeenCalled();
+    expect(api.winInstallHistoricalRelease).not.toHaveBeenCalled();
   });
 
   it("reports a Codex configuration conflict separately from core capability readiness", async () => {

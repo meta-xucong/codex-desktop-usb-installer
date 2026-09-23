@@ -46,6 +46,18 @@ release/upstream/
 # duplicated executables, signed MSIX, or offline runtimes to Git history.
 release/usb-oneclick-v*/
 
+# Local investigation snapshots, cloned build inputs, and machine-specific
+# release material. These are intentionally kept outside GitHub source history.
+/.analysis/
+/.workbuddy/
+/codex-learnings/
+/CCSwitch/
+/app/resources/
+/models_cache.json
+/release-profiles/
+/src-tauri/target-g*/
+/tools/usb-license-signer/target-*/
+
 # Local validation snapshots and third-party offline prerequisite binaries are
 # reproducible inputs, not source. Their expected hashes/signers are release
 # gates in tools/build-installer.ps1.

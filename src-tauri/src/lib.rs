@@ -174,6 +174,19 @@ pub(crate) fn exit_after_confirm(app: &tauri::AppHandle) {
     app.exit(0);
 }
 
+/// The detached uninstall helper is already holding a verified handoff and
+/// waits on this exact process handle. Tauri normally exits immediately after
+/// `app.exit(0)`, but WebView2/Windows shutdown callbacks can occasionally
+/// delay the event loop. Keep a bounded native fallback so a visible
+/// "Finish and exit" click cannot leave the helper waiting forever.
+pub(crate) fn exit_after_uninstall_handoff(app: &tauri::AppHandle) {
+    exit_after_confirm(app);
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        std::process::exit(0);
+    });
+}
+
 fn native_confirm_allows_exit(policy: &QuitPolicy) -> bool {
     !matches!(policy, QuitPolicy::Block { .. })
 }
@@ -979,6 +992,8 @@ pub fn run() {
             commands::get_paused_operation_snapshot,
             commands::get_operation_completion,
             commands::confirm_quit,
+            commands::get_uninstall_handoff,
+            commands::complete_uninstall_handoff,
             commands::win_default_install_root,
             commands::win_pick_install_dir,
             commands::win_set_install_root,
@@ -1016,7 +1031,12 @@ pub fn run() {
             commands::win_adopt_path,
             commands::win_launch_codex,
             commands::usb_guard_status,
+            commands::refresh_native_model_catalog,
             commands::install_and_launch_ccswitch,
+            commands::account_status,
+            commands::account_login,
+            commands::account_refresh,
+            commands::account_redeem,
             commands::capability_pack_status,
             commands::install_capability_pack,
             commands::skill_repo_check_update,

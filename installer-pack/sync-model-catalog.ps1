@@ -78,10 +78,20 @@ foreach ($model in @($catalog.models)) {
     }
     if (-not $reasoningSeen.Contains([string]$model.defaultReasoningLevel)) { throw "Model catalog model $($model.id) defaultReasoningLevel must be listed in reasoningLevels." }
 }
+foreach ($retiredId in $retiredIds) {
+    $retiredEntry = @($catalog.models | Where-Object { [string]$_.id -eq [string]$retiredId })[0]
+    if ($null -ne $retiredEntry -and [string]$retiredEntry.visibility -eq 'list' -and $retiredEntry.supportedInApi -eq $true) {
+        throw "Retired model $retiredId cannot remain visible and active in the model catalog."
+    }
+}
 if (-not $modelIds.Contains([string]$catalog.preferredModel)) { throw 'Preferred model is absent from the model catalog.' }
 $preferredEntry = @($catalog.models | Where-Object { [string]$_.id -eq [string]$catalog.preferredModel })[0]
 if ([string]$preferredEntry.visibility -ne 'list' -or $preferredEntry.supportedInApi -ne $true) { throw 'Model catalog preferredModel must be visible (list) and supportedInApi=true.' }
-$activeIds = @($catalog.models | Where-Object { $_.supportedInApi -eq $true -and [string]$_.visibility -eq 'list' } | ForEach-Object { [string]$_.id })
+$activeIds = @($catalog.models | Where-Object {
+        $_.supportedInApi -eq $true -and
+        [string]$_.visibility -eq 'list' -and
+        -not $retiredSeen.Contains([string]$_.id)
+    } | ForEach-Object { [string]$_.id })
 $catalogById = @{}
 foreach ($model in @($catalog.models)) { $catalogById[[string]$model.id] = $model }
 $catalogText = ($catalog | ConvertTo-Json -Depth 8) + [Environment]::NewLine

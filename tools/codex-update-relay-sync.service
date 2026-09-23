@@ -2,6 +2,7 @@
 Description=Fetch and verify the Codex Windows payload relay
 Wants=network-online.target
 After=network-online.target
+OnFailure=codex-update-relay-sync-failure.service
 
 [Service]
 Type=oneshot

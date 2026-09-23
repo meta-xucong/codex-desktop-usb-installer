@@ -2,6 +2,14 @@
 
 > CONTRACT_REV: `v2.0-remediation-r1`
 >
+> **当前版本说明（G29）**：本文的 v2 更新能力与 v2 anchor 规则是历史契约，
+> 不再作为新包的实现依据。当前正式契约见
+> `docs/UPDATE-ANCHOR-STABLE-CODEX-G29-DEVELOPMENT.md` 和
+> `docs/UPDATE-CHANNELS.md`：root/USB 清单顶层仍为 schema 2，但
+> `updateCapability.schemaVersion=3`、`updateCapability.anchorSchema=3`，
+> 使用 `stable-update-v1`，新签名器只接受该能力版本。以下旧条款保留用于
+> 解释历史包为何需要重建/重新授权。
+>
 > 状态：**实现已落地，主控静态复核完成；独立审计证据不足**。本文是针对 `UPDATE-IMPLEMENTATION-SUMMARY.md` 的问题修复开发契约；代码、测试和文档已按此契约实施，但不表示真实 USB E2E 或 release approval 已完成。本文创建于 2026-09-08，最终结论记录在 `UPDATE-AUDIT.md`。
 
 ## 0. 任务记录
@@ -103,11 +111,11 @@ root `manifest.json` 仍是离线 payload 的权威版本来源，保留并更�
 
 成功状态不得在 bundle 根或 payload 中留下未处理的 `*.bak`、临时文件或未列入 `SHA256SUMS.txt` 的 backup。若保留恢复文件，必须明确加入清单并纳入下一次恢复流程；推荐把事务临时文件放在 `.staging`，成功后完整清除。
 
-### 2.3 USB guard anchor v2：只允许明确的可变字段变化
+### 2.3 【历史】USB guard anchor v2：只允许明确的可变字段变化
 
 不能简单地继续哈希两个 manifest 的原始字节，也不能把整个 manifest 从 anchor 中删除。修复采用版本化、allow-list 的 canonical anchor：
 
-1. `usb-manifest.json` 增加/使用明确的 update capability，且必须是已实现的 `schemaVersion == 2`；未知未来版本一律拒绝更新，不得用 `>= 2` 猜测兼容。
+1. 历史 v2 包使用 `usb-manifest.json` 的明确 update capability，且必须是已实现的 `schemaVersion == 2`；未知未来版本一律拒绝更新，不得用 `>= 2` 猜测兼容。**新包不再使用这条协议，必须升级到 G29 的 capability schema 3。**
 2. `usb_guard` 为 v2 bundle 计算 canonical anchor：
    - root `manifest.json` 解析为 JSON，移除且只移除 `/codexDesktopVersion`、`/packageVersion`、`/releaseTag`、`/payload/sha256`、`/payload/size`；
    - `usb-manifest.json` 解析为 JSON，移除且只移除 `/codexInstaller/payloadSha256`、`/codexInstaller/payloadSize`；
@@ -115,14 +123,14 @@ root `manifest.json` 仍是离线 payload 的权威版本来源，保留并更�
    - 用确定性的递归 key 排序 JSON 序列化，并加入文件名/长度分隔，避免拼接歧义。
 3. `UsbFingerprint`/license/lease 必须带 `anchor_schema`（旧序列化数据缺失时按 v1 解释）。v1 继续按旧 raw anchor 校验；v2 使用上述 canonical anchor。
 4. v1 bundle 不得被静默转换成 v2，也不得在没有重新生成/重签 v2 license 的情况下允许 payload apply；`payload_check_codex`/`payload_apply_codex` 在任何远端请求前都必须检查 update capability，v1/未知版本直接返回“需重建/重新授权 USB 包”的明确错误。现有 `usb_guard` 为旧功能保留的 unsigned auto-enroll 不得成为 Codex update 的回退路径；update command 不能因 license 缺失而自动 enroll 或改写 license。
-5. 新构建脚本必须生成 v2 bundle 和 v2 license/fingerprint；不能把旧 signed license 的 fingerprint 直接改写。
+5. 历史构建脚本必须生成 v2 bundle 和 v2 license/fingerprint；当前构建脚本必须生成顶层 schema 2、显式 capability/anchor schema 3 的 bundle 和许可证；不能把旧 signed license 的 fingerprint 直接改写。
 6. 修改可变字段不能改变 v2 anchor；修改 allow-list 之外的字段必须使授权失败。必须分别有“合法 payload 更新后授权仍在”和“篡改不可变字段后 fail closed”的测试。
 
-这是本任务对原 C4/C8 之外新增的安全契约；实现不得用“更新后重新自动 enroll unsigned license”绕过它。
+这是历史任务对原 C4/C8 之外新增的安全契约；当前实现进一步用 G29 的稳定 anchor 替代 v2 的发布元数据哈希，仍不得用“更新后重新自动 enroll unsigned license”绕过签名保护。
 
 ### 2.4 网络与远端可信边界
 
-check 必须无文件写入、无 payload 下载、无本机部署。apply 必须：
+正常 check 必须无 payload 下载、无本机部署、无远程 apply；唯一例外是启动/检查入口发现上一次 apply 遗留的、格式受限的持久化事务时，先执行确定性的本地恢复或收尾。该恢复不改写授权、不下载 payload、不切换来源，并将失败阶段和具体路径返回。apply 必须：
 
 1. 读取当前持久化 settings，空 repo 使用与现有安装链路一致的 `Wangnov/codex-app-mirror` 默认源，非空值严格验证为 `owner/repo`。
 2. 对 GitHub API 请求显式发送 `Accept: application/vnd.github+json`、稳定的 `User-Agent`，并保持 HTTPS-only、现有代理/超时和响应大小限制。
@@ -141,6 +149,8 @@ check 必须无文件写入、无 payload 下载、无本机部署。apply 必�
 4. Windows 上验证 OpenAI Authenticode。
 5. 读取 MSIX identity，严格校验 package name、publisher、主包 resource id、架构和 package version。
 6. 所有校验失败都删除 staged final file；`.part` 的保留/清理策略必须与文档一致，不能把“可续传”与“失败后清理”写成相反要求。
+
+USB 离线安装还要区分“来源标签”和“本地安装标签”：root `manifest.json.releaseTag` 可能被 Codex payload 热更新改成 `upstream-*` 或其他来源标识；经过完整校验的本地 MSIX 进入既有历史安装适配器时必须统一使用 `local-signed-<codexDesktopVersion>`。来源标签不一致不能被误报为“本地 MSIX 在确认后发生变化”。
 
 ### 2.6 多文件提交与恢复
 

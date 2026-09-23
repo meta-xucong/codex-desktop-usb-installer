@@ -171,6 +171,11 @@ https://<独立域名>/__codex_update__/
 
 实际字段名应在客户端实现前冻结为 Rust 类型，不允许客户端对未知路径拼接任意 URL。服务器只允许发布目标仓库中已明确列入白名单的 Windows x64 资产；不镜像源码包、日志、任意 URL 或用户上传内容。
 
+当前生产 Relay 使用 `protocol=2`。除上述顶层字段外，协议 2 必须提供
+`identity`，其中重复 `releaseId`、`tag` 和完整 `assets`。客户端同时兼容协议 1
+和协议 2，但协议 2 的顶层与嵌套身份任一不一致都会 fail closed；未知协议不会
+被猜测兼容。协议 1 示例仅代表历史/自定义 Relay 的兼容格式。
+
 若采用推荐的发布签名，`release-manifest.json` 采用固定 canonical serialization，签名覆盖 repository、releaseId/tag、架构、package moniker/version、每个 artifact 的规范路径、size 和 sha256；客户端内置公钥和算法，不接受 manifest 自带公钥作为信任根。签名验证失败时 relay 版本不可见、不可下载、不可安装。
 
 同步发布流程：

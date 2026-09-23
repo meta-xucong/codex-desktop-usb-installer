@@ -113,27 +113,35 @@ pub enum ChannelCheckOutcome {
     },
 }
 
-/// Compare dotted numeric versions segment by segment; fall back to plain
-/// string inequality when any segment is not a `u64` (never silently treat
-/// unparseable versions as "up to date").
+fn parse_numeric_version(version: &str) -> Option<Vec<u64>> {
+    version
+        .split('.')
+        .map(|segment| segment.parse::<u64>().ok())
+        .collect()
+}
+
+/// Return whether a version is safe to compare in the Codex update channel.
+/// Opaque or partially parsed remote values must never become an update
+/// candidate.
+pub fn is_numeric_version(version: &str) -> bool {
+    parse_numeric_version(version).is_some()
+}
+
+/// Compare dotted numeric versions segment by segment.
+///
+/// `Less` is reserved for two parseable versions where `latest` is newer.
+/// Existing callers use that result as the only permission to update, so an
+/// unparseable current or latest version must fail closed instead of being
+/// treated as a newer release.  The `Greater` fallback is intentionally only
+/// a compatibility sentinel for this ordering API; callers with an error
+/// boundary should report the invalid source explicitly.
 pub fn compare_versions(current: &str, latest: &str) -> std::cmp::Ordering {
-    let parse = |v: &str| -> Option<Vec<u64>> {
-        v.split('.')
-            .map(|segment| segment.parse::<u64>().ok())
-            .collect()
-    };
-    match (parse(current), parse(latest)) {
+    match (
+        parse_numeric_version(current),
+        parse_numeric_version(latest),
+    ) {
         (Some(a), Some(b)) => a.cmp(&b),
-        _ => {
-            if current == latest {
-                std::cmp::Ordering::Equal
-            } else {
-                // Deliberately one-sided: any difference means "offer update".
-                // We only need eq/less in practice; report less unless the
-                // strings are equal.
-                std::cmp::Ordering::Less
-            }
-        }
+        _ => std::cmp::Ordering::Greater,
     }
 }
 
@@ -150,14 +158,22 @@ pub fn read_usb_codex_desktop_version(usb_root: &Path) -> Result<String, AppErro
             manifest_path.display()
         ))
     })?;
-    let value: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|error| AppError::Engine(format!("解析 manifest.json 失败: {error}")))?;
+    let value: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
+        AppError::Engine(format!("source_invalid: 解析 manifest.json 失败: {error}"))
+    })?;
     let version = value
         .get("codexDesktopVersion")
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|v| !v.is_empty())
-        .ok_or_else(|| AppError::Engine("manifest.json 缺少 codexDesktopVersion".to_string()))?;
+        .ok_or_else(|| {
+            AppError::Engine("source_invalid: manifest.json 缺少 codexDesktopVersion".to_string())
+        })?;
+    if parse_numeric_version(version).is_none() {
+        return Err(AppError::Engine(format!(
+            "source_invalid: manifest.json codexDesktopVersion 无法解析: {version}"
+        )));
+    }
     Ok(version.to_string())
 }
 
@@ -222,10 +238,12 @@ mod tests {
         assert_eq!(compare_versions("26.602.40724", "26.610.51200"), Less);
         assert_eq!(compare_versions("26.610.51200", "26.602.40724"), Greater);
         assert_eq!(compare_versions("26.602.40724", "26.602.40724.1"), Less);
-        // Mixed parse failure → string inequality, never Equal.
-        assert_eq!(compare_versions("bad", "26.602.40724"), Less);
-        assert_eq!(compare_versions("26.602.40724", "bad"), Less);
-        assert_eq!(compare_versions("bad", "bad"), Equal);
+        // Any parse failure is fail-closed: only Less may authorize an
+        // update, so invalid current/latest versions must never be newer.
+        assert_eq!(compare_versions("bad", "26.602.40724"), Greater);
+        assert_eq!(compare_versions("26.602.40724", "bad"), Greater);
+        assert_eq!(compare_versions("bad", "bad"), Greater);
+        assert_eq!(compare_versions("26..602", "26.603.1"), Greater);
     }
 
     #[test]
@@ -260,6 +278,20 @@ mod tests {
         )
         .unwrap();
         assert!(read_usb_codex_desktop_version(dir.path()).is_err());
+    }
+
+    #[test]
+    fn usb_codex_desktop_version_reports_unparseable_version_as_source_invalid() {
+        let dir_path = unique_test_dir("uc-invalid-version");
+        let dir = TempDirGuard::new(dir_path);
+        std::fs::write(
+            dir.path().join("manifest.json"),
+            r#"{ "codexDesktopVersion": "26.bad.51511" }"#,
+        )
+        .unwrap();
+
+        let error = read_usb_codex_desktop_version(dir.path()).unwrap_err();
+        assert!(error.to_string().contains("source_invalid:"));
     }
 
     #[test]

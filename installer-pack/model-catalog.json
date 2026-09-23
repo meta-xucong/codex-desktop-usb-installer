@@ -92,7 +92,7 @@
     {
       "id": "gpt-5.2",
       "displayName": "GPT-5.2",
-      "visibility": "list",
+      "visibility": "hide",
       "supportedInApi": true,
       "priority": 29,
       "defaultReasoningLevel": "medium",

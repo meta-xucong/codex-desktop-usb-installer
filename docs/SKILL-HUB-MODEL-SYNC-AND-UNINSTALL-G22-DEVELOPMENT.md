@@ -32,6 +32,7 @@
 
 - `model-catalog.json` 的模型条目只能包含 `id`、`displayName`、`visibility`、`supportedInApi`、`priority`、`defaultReasoningLevel` 和 `reasoningLevels`；字符串、`list|hide`、布尔值、整数、非空推理档位数组及默认档位归属均严格校验。`preferredModel` 必须指向 `visibility=list` 且 `supportedInApi=true` 的条目；`retiredModelIds` 必须存在、为唯一的非空字符串列表，允许保留不再出现在当前活动模型列表中的历史 ID。
 - 配置中的官方已知模型若为 `hide` 或 `supportedInApi=false`，同步时迁移到 `preferredModel`；不在目录中的第三方模型保持原样。重复执行不得重复写入或重复创建迁移结果。
+- `retiredModelIds` 中仍出现在目录里的模型不得同时保持 `visibility=list` 且 `supportedInApi=true`；停用模型不计入 `activeModelCount`，避免“已迁移但仍作为可用模型展示”的矛盾。
 - `sync-model-catalog.ps1` 使用 `CmdletBinding(SupportsShouldProcess)`。`-WhatIf` 只读取并生成 `status=planned` 与 `planned` 动作清单，不写目录、配置、备份或临时 TOML 文件。
 
 ### 2.3 卸载二阶段
@@ -74,6 +75,9 @@
 - PowerShell 安装脚本的 `-WhatIf`/隔离目录测试：空配置、旧模型、活动模型、重复安装、无网络。
 - 模型同步定向验证命令：`& "$env:USERPROFILE\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe" installer-pack/test-adapter-contracts.py ModelCatalogSyncContractTests -v`；至少覆盖严格字段失败、WhatIf 无写入、官方隐藏/API 不支持模型迁移、第三方模型保留和幂等重复执行。
 - G22 卸载回归：删除管理器数据目录后仍能写报告并展示具体失败项；报告路径不回到 `io.github.wangnov.codexappmanager`；产品目录不被“打开日志”重新创建。
+- 随盘自检闭包：最终输出中的 `verify-usb.ps1` 必须只依赖包内的公开校验辅助文件和公钥配置；构建脚本必须从生成后的输出目录实际运行一次该脚本，不能只验证源码树副本。校验包不得包含私钥或运行期 `usb-license.json`。
+- 源码目录直装也必须复用同一套闭包规则：校验实际文件集合和复制 Skill 树时同样忽略 `.git`、`.pytest_cache`、`__pycache__` 与 `.pyc`，不能因为绕过打包器而把测试/缓存临时文件带入用户目录。
+- `verify-usb.ps1` 只是随盘一致性/完整性检查工具，不是独立信任根；包内 helper、profile、校验清单都属于可复制介质。正式运行期的授权边界仍由管理器编译进的公钥、签名授权文件、不可变清单和载荷校验共同决定，不能把自检脚本“通过”表述为安全信任证明。
 - 发布前在干净隔离目录构建 EXE、生成 manifest/checksum，并用同一发行目录生成本地 USB 签名产物；签名前后验证 bundle hash 一致。
 
 ## 5. 已知边界
@@ -89,3 +93,32 @@
 修复实现把报告根目录固定到 `%TEMP%\CodexAppManager\uninstall-reports`，在提交二阶段清理前捕获日志尾部，并在报告中明确写入 `phase`、`exitCode`、`retrySuggestion` 和失败条目。`open_logs_dir` 在产品日志目录不存在时只打开该独立目录，不会重新创建已卸载的管理器数据目录。报告根目录还会在启动二阶段前与全部本地清理目标做规范化路径交叉检查；U 盘目录不参与这个清理集合。
 
 G22 的验收必须同时检查：报告最终仍可读取、收尾失败包含具体文件和建议、旧版桌面报告可清理、打开日志不会复活产品目录，以及静态发行包不含 `usb-license.json`。后一文件只能由签名工具在用户复制到目标 U 盘后按当前发行包重新生成。
+
+## 7. G26 修订契约：可选目录缺失与 Skill Hub Relay 收口（2026-09-14）
+
+### 7.1 卸载二阶段
+
+`%LOCALAPPDATA%\wangnov\codexappmanager` 和 `%APPDATA%\wangnov\codexappmanager` 是可选历史目录，不存在时必须按 `absent` 处理，不能阻止清理助手启动。路径安全检查仍必须检查所有已存在的祖先，拒绝符号链接/重解析点、跳转路径和越界目标；只放宽“缺失父目录”的读取方式，不放宽删除范围。
+
+必须新增真实新机回归：两个 `wangnov` 父目录均不存在时，报告根目录仍可建立在 `%TEMP%\CodexAppManager\uninstall-reports`，二阶段助手可以完成握手；已存在的重解析祖先仍拒绝。
+
+### 7.2 Skill Hub 来源链
+
+Skill Hub 只使用项目自己的 `meta-xucong/skill_hub` 内容源，采用与 Codex 本体相同的 Relay 模式：
+
+```text
+meta-xucong/skill_hub
+        -> update.404token.xyz Relay
+        -> GitHub fallback
+```
+
+GitCode/Gitee 派生仓库不是本项目的生产前置条件，不创建、不要求账号/PAT、不写入安装包。国内代码托管源如果未来重新接入，只能作为经过公网验证的可选扩展；每个已配置的国内源仍必须通过严格的 HTTPS、域名、路径、ID、优先级和唯一性校验，testFixture 字段不得为启用状态。禁用或缺少国内源不得阻塞 Relay/GitHub 构建和运行。
+
+构建门禁改为：来源目录至少包含一个合法、启用的 Relay 和一个合法、启用的 GitHub fallback；国内源数量为零也必须通过。运行时仍可优先尝试显式配置的国内源，但默认发行资源不携带 `.invalid` 占位源。
+
+### 7.3 本轮验收
+
+- 卸载：缺失可选父目录、已有目录、重解析祖先、报告路径独立性和二阶段握手回归；
+- Skill Hub：Relay-only 资源解析、GitHub fallback、可选国内源校验、旧 GitCode/Gitee 工具不再进入主链；
+- 构建：`build.rs`、Rust 来源解析、资源 JSON 和文档一致；
+- 全量 Rust/前端/发布契约测试，以及差异和格式检查均绑定到修复后的版本。

@@ -6,7 +6,7 @@ import { outcomeIsPartial } from "../../shared/types";
 import { resolveFailure } from "../errorCopy";
 import { Icon } from "../icons";
 import { useI18n } from "../i18n";
-import { NavBar, Ring, Toggle, StatusBanner } from "../components";
+import { NavBar, Ring, Toggle, StatusBanner, Tooltip } from "../components";
 import { codexHomeDisplay } from "../paths";
 import { currentPlatform } from "../platform";
 import { Sheet } from "../Sheet";
@@ -104,8 +104,9 @@ export function Uninstall({
   const [keepData, setKeepData] = useState(true);
   const [purgeCodexData, setPurgeCodexData] = useState(false);
   const [purgeCcswitchData, setPurgeCcswitchData] = useState(false);
-  const [removeUsbMedia, setRemoveUsbMedia] = useState(false);
   const [cleanupPending, setCleanupPending] = useState(false);
+  const [cleanupHandoffId, setCleanupHandoffId] = useState<string | null>(null);
+  const [handoffBusy, setHandoffBusy] = useState(false);
   const [needsFinalCleanup, setNeedsFinalCleanup] = useState(false);
   const [busy, setBusy] = useState(false);
   const [done, setDone] = useState<string | null>(null);
@@ -131,7 +132,6 @@ export function Uninstall({
   const keepDataTitleId = useId();
   const purgeCodexTitleId = useId();
   const purgeCcswitchTitleId = useId();
-  const removeMediaTitleId = useId();
 
   const refreshProbe = useCallback(async () => {
     setProbe("loading");
@@ -149,6 +149,27 @@ export function Uninstall({
     void refreshProbe();
   }, [refreshProbe]);
 
+  // The helper handoff lives in the native process, not in this component.
+  // Re-query it once so a renderer reload/remount cannot strand the only
+  // visible exit action.
+  useEffect(() => {
+    if (!bundledWindows) return;
+    let active = true;
+    void managerApi.getUninstallHandoff().then((handoff) => {
+      if (!active || !handoff) return;
+      setCleanupPending(true);
+      setCleanupHandoffId(handoff.id);
+      setDone(t("uninstall.bundle.exiting"));
+      setDoneDetail(`${handoff.message}\n${handoff.reportPath}`);
+    }).catch(() => {
+      // The normal uninstall action still reports its own failure. A status
+      // probe is only a renderer-recovery convenience and must not replace it.
+    });
+    return () => {
+      active = false;
+    };
+  }, [bundledWindows, t]);
+
   const run = async () => {
     setConfirmStep(0);
     setBusy(true);
@@ -158,12 +179,15 @@ export function Uninstall({
     setPartialOutcome(null);
     setNeedsFinalCleanup(false);
     setDoneDetail(null);
+    setCleanupPending(false);
+    setCleanupHandoffId(null);
+    setHandoffBusy(false);
     try {
       // mac keeps ~/.codex via keepCodexHome; win purges via purgeUserData (the
       // inverse) — both surface the backend message as the source of truth.
       if (win) {
         const r = bundledWindows
-          ? await managerApi.winUninstallBundle(true, purgeCodexData, purgeCcswitchData, removeUsbMedia)
+          ? await managerApi.winUninstallBundle(true, purgeCodexData, purgeCcswitchData)
           : await managerApi.winUninstall(true, !keepData);
         if (!r.success || !r.outcome.primaryOk) {
           setError(t("uninstall.failed"));
@@ -173,8 +197,18 @@ export function Uninstall({
           ].filter(Boolean).join("\n"));
           return;
         }
-        if ("cleanupPending" in r && r.cleanupPending && !outcomeIsPartial(r.outcome) && r.outcome.recoveryActions.length === 0) {
+        if ("cleanupPending" in r && r.cleanupPending && !outcomeNeedsAttention(r.outcome)) {
+          const handoffId = "cleanupHandoffId" in r ? r.cleanupHandoffId?.trim() ?? "" : "";
+          if (!handoffId) {
+            setError(t("uninstall.bundle.handoffMissing"));
+            setErrorDetail([
+              r.message,
+              "cleanupReportPath" in r ? r.cleanupReportPath : null,
+            ].filter(Boolean).join("\n"));
+            return;
+          }
           setCleanupPending(true);
+          setCleanupHandoffId(handoffId);
           setDone(t("uninstall.bundle.exiting"));
           setDoneDetail(`${r.message}\n${"cleanupReportPath" in r ? r.cleanupReportPath ?? "" : ""}`);
           return;
@@ -242,10 +276,33 @@ export function Uninstall({
     }
   };
 
+  const finishUninstallHandoff = async () => {
+    if (!cleanupPending || !cleanupHandoffId?.trim() || handoffBusy) {
+      if (cleanupPending && !cleanupHandoffId?.trim()) {
+        setError(t("uninstall.bundle.handoffMissing"));
+      }
+      return;
+    }
+    setHandoffBusy(true);
+    setError(null);
+    setErrorDetail(null);
+    try {
+      // The helper is waiting for this exact manager process. Keep the result
+      // visible until the user acknowledges it, then use the guarded native
+      // exit path so final cleanup can proceed.
+      await managerApi.completeUninstallHandoff(cleanupHandoffId);
+    } catch (cause) {
+      const failure = resolveFailure(cause, t);
+      setError(failure.message);
+      setErrorDetail(failure.detail);
+      setHandoffBusy(false);
+    }
+  };
+
   // First confirm → run when keeping data; otherwise escalate to a second,
   // explicit data-erasure confirm before doing anything destructive.
   const onFirstConfirm = () => {
-    if (bundledWindows ? !purgeCodexData && !purgeCcswitchData && !removeUsbMedia : keepData) {
+    if (bundledWindows ? !purgeCodexData && !purgeCcswitchData : keepData) {
       void run();
     } else {
       setConfirmStep(2);
@@ -255,7 +312,7 @@ export function Uninstall({
   const dataPaths = codexHome;
   const selectedSharedData = purgeCodexData || purgeCcswitchData;
   const bundleSelection = (
-    <div>
+    <div className="uninstall-selection">
       <p><strong>{t(purgeCodexData ? "uninstall.bundle.codexErase" : "uninstall.bundle.codexKeep")}</strong>
         <span className="rsub mono path" style={DATA_PATH_STYLE}>{CODEX_WINDOWS_DATA_PATHS}</span>
         {!purgeCodexData ? <span className="rsub">{t("uninstall.bundle.codexKeepNote")}</span> : null}
@@ -263,7 +320,7 @@ export function Uninstall({
       <p><strong>{t(purgeCcswitchData ? "uninstall.bundle.ccswitchErase" : "uninstall.bundle.ccswitchKeep")}</strong>
         <span className="rsub mono path" style={DATA_PATH_STYLE}>{CCSWITCH_DATA_PATHS}</span>
       </p>
-      <p>{t(removeUsbMedia ? "uninstall.bundle.mediaEraseConfirm" : "uninstall.bundle.mediaKeep")}</p>
+      <p>{t("uninstall.bundle.mediaKeep")}</p>
     </div>
   );
   const errorBanner = error ? (
@@ -294,11 +351,11 @@ export function Uninstall({
     ? probe !== "loading" && probe !== "error"
     : probe === "managed";
   return (
-    <div className="pop">
+    <div className={`pop${bundledWindows ? " uninstall-pop" : ""}`}>
       <NavBar
         title={t(bundledWindows ? "uninstall.bundle.heading" : "uninstall.heading")}
         onBack={onBack}
-        disableBack={busy || retryBusy || cleanupPending}
+        disableBack={busy || retryBusy || cleanupPending || handoffBusy}
       />
       <div className="scroll view" inert={confirmStep > 0 ? true : undefined}>
         {done ? (
@@ -319,6 +376,21 @@ export function Uninstall({
                 <summary>{t("home.error.details")}</summary>
                 <pre className="errdetails">{doneDetail}</pre>
               </details>
+            ) : null}
+            {cleanupPending ? (
+              <>
+                <StatusBanner tone="info">{t("uninstall.bundle.pendingNote")}</StatusBanner>
+                <button
+                  className="btn primary big uninstall-finish-button"
+                  onClick={() => void finishUninstallHandoff()}
+                  disabled={handoffBusy}
+                >
+                  {handoffBusy ? <Icon name="loader" className="spinicon" /> : <Icon name="check" />}
+                  {handoffBusy
+                    ? t("uninstall.bundle.finishing")
+                    : t("uninstall.bundle.finishExit")}
+                </button>
+              </>
             ) : null}
             {partialOutcome ? (
               <>
@@ -370,7 +442,7 @@ export function Uninstall({
                 {t("uninstall.bundle.continueFinalCleanup")}
               </button>
             ) : null}
-            <button className="btn ghost big" onClick={onBack} disabled={busy || retryBusy || cleanupPending}>
+            <button className="btn ghost big" onClick={onBack} disabled={busy || retryBusy || cleanupPending || handoffBusy}>
               {t("nav.back")}
             </button>
           </>
@@ -382,8 +454,15 @@ export function Uninstall({
                 {t(bundledWindows ? "uninstall.bundle.heading" : "uninstall.heading")}
               </div>
               <div className="desc">
-                {t(bundledWindows ? "uninstall.bundle.warn" : "uninstall.warn")}
+                {t(bundledWindows ? "uninstall.bundle.shortWarn" : "uninstall.warn")}
               </div>
+              {bundledWindows ? (
+                <Tooltip content={t("uninstall.bundle.warn")}>
+                  <span className="tooltip-icon uninstall-hero-help" aria-label={t("themes.details")}>
+                    <Icon name="info" />
+                  </span>
+                </Tooltip>
+              ) : null}
             </section>
 
             {probe === "loading" ? (
@@ -417,11 +496,16 @@ export function Uninstall({
 
             <div className="list">
               {bundledWindows ? (
-                <div className="row">
+                <div className="row uninstall-compact-row">
                   <span className="rtext">
                     <span className="rtitle">{t("uninstall.bundle.cleanupScope")}</span>
-                    <span className="rsub">{t("uninstall.bundle.cleanupNote")}</span>
+                    <span className="rsub">{t("uninstall.bundle.cleanupShort")}</span>
                   </span>
+                  <Tooltip content={t("uninstall.bundle.cleanupNote")}>
+                    <span className="tooltip-icon" aria-label={t("themes.details")}>
+                      <Icon name="info" />
+                    </span>
+                  </Tooltip>
                 </div>
               ) : null}
               {!bundledWindows ? <div className="row">
@@ -442,36 +526,46 @@ export function Uninstall({
 
             {bundledWindows ? (
               <div className="list">
-                <div className="row data-path-row">
+                <div className="row uninstall-compact-row data-path-row">
                   <span className="rtext">
                     <span className="rtitle">{t("uninstall.bundle.programPath")}</span>
                     <span className="rsub mono path">{CCSWITCH_INSTALL_DISPLAY}</span>
-                    <span className="rsub">{t("uninstall.bundle.programAffects")}</span>
                   </span>
+                  <Tooltip content={t("uninstall.bundle.programAffects")}>
+                    <span className="tooltip-icon" aria-label={t("themes.details")}>
+                      <Icon name="info" />
+                    </span>
+                  </Tooltip>
                 </div>
               </div>
             ) : null}
 
             {bundledWindows ? (
-              <details className="manual-existing-meta">
+              <details className="manual-existing-meta uninstall-advanced">
                 <summary>{t("uninstall.bundle.advanced")}</summary>
-                <p>{t("uninstall.bundle.sharedRisk")}</p>
+                <p className="uninstall-detail-copy">{t("uninstall.bundle.sharedRisk")}</p>
                 <div className="list">
                   <div className={`row data-path-row${purgeCodexData ? " danger" : ""}`}>
                     <span className="rtext">
                       <span className="rtitle" id={purgeCodexTitleId}>{t("uninstall.bundle.purgeCodex")}</span>
-                      <span className="rsub">{t("uninstall.bundle.codexRisk")}</span>
-                      <span className="rsub mono path" style={DATA_PATH_STYLE}>{CODEX_WINDOWS_DATA_PATHS}</span>
                     </span>
+                    <Tooltip content={`${t("uninstall.bundle.codexRisk")}\n\n${CODEX_WINDOWS_DATA_PATHS}`}>
+                      <span className="tooltip-icon" aria-label={t("themes.details")}>
+                        <Icon name="info" />
+                      </span>
+                    </Tooltip>
                     <Toggle ariaLabelledBy={purgeCodexTitleId} checked={purgeCodexData}
                       onChange={setPurgeCodexData} disabled={busy || !canUninstall} />
                   </div>
                   <div className={`row data-path-row${purgeCcswitchData ? " danger" : ""}`}>
                     <span className="rtext">
                       <span className="rtitle" id={purgeCcswitchTitleId}>{t("uninstall.bundle.purgeCcswitch")}</span>
-                      <span className="rsub">{t("uninstall.bundle.ccswitchRisk")}</span>
-                      <span className="rsub mono path" style={DATA_PATH_STYLE}>{CCSWITCH_DATA_PATHS}</span>
                     </span>
+                    <Tooltip content={`${t("uninstall.bundle.ccswitchRisk")}\n\n${CCSWITCH_DATA_PATHS}`}>
+                      <span className="tooltip-icon" aria-label={t("themes.details")}>
+                        <Icon name="info" />
+                      </span>
+                    </Tooltip>
                     <Toggle ariaLabelledBy={purgeCcswitchTitleId} checked={purgeCcswitchData}
                       onChange={setPurgeCcswitchData} disabled={busy || !canUninstall} />
                   </div>
@@ -510,18 +604,6 @@ export function Uninstall({
               </div>
             ) : null}
 
-            {bundledWindows ? (
-              <div className="list">
-                <div className="row">
-                  <span className="rtext">
-                    <span className="rtitle" id={removeMediaTitleId}>{t("uninstall.bundle.removeMedia")}</span>
-                    <span className="rsub">{t("uninstall.bundle.removeMediaNote")}</span>
-                  </span>
-                  <Toggle checked={removeUsbMedia} onChange={setRemoveUsbMedia}
-                    ariaLabelledBy={removeMediaTitleId} disabled={busy || !canUninstall} />
-                </div>
-              </div>
-            ) : null}
             {errorBanner}
 
             <div className="actions">
@@ -581,11 +663,11 @@ export function Uninstall({
       >
         <Ring icon="trash" variant="danger" />
         <h3 id={confirm2TitleId}>
-          {t(bundledWindows && !selectedSharedData && removeUsbMedia ? "uninstall.bundle.mediaConfirmTitle" : bundledWindows ? "uninstall.bundle.confirm2.title" : "uninstall.confirm2.title")}
+          {t(bundledWindows ? "uninstall.bundle.confirm2.title" : "uninstall.confirm2.title")}
         </h3>
         <p id={confirm2BodyId}>
           {bundledWindows
-            ? t(selectedSharedData ? "uninstall.bundle.confirm2.selected" : "uninstall.bundle.mediaOnlyConfirm")
+            ? t(selectedSharedData ? "uninstall.bundle.confirm2.selected" : "uninstall.bundle.mediaKeep")
             : t("uninstall.confirm2.body", { path: codexHome })}
         </p>
         {bundledWindows ? bundleSelection : null}
@@ -594,7 +676,7 @@ export function Uninstall({
             {t("uninstall.cancel")}
           </button>
           <button className="btn danger" onClick={() => void run()} disabled={confirmStep !== 2 || busy || retryBusy}>
-            {t(bundledWindows && !selectedSharedData && removeUsbMedia ? "uninstall.bundle.mediaConfirmButton" : bundledWindows ? "uninstall.bundle.purgeConfirm" : "uninstall.purgeConfirm")}
+            {t(bundledWindows ? "uninstall.bundle.purgeConfirm" : "uninstall.purgeConfirm")}
           </button>
         </div>
       </Sheet>

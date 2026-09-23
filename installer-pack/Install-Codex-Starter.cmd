@@ -5,9 +5,9 @@ rem stripped PowerShell.Utility module that hides Get-FileHash from powershell.e
 set "PSModulePath=%SystemRoot%\System32\WindowsPowerShell\v1.0\Modules;%ProgramFiles%\WindowsPowerShell\Modules;%USERPROFILE%\Documents\WindowsPowerShell\Modules"
 if /I "%CODEX_STARTER_NONINTERACTIVE%"=="1" goto :noninteractive
 if not "%~1"=="" goto :noninteractive
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0install-wizard.ps1"
+powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "%~dp0install-wizard.ps1"
 exit /b %ERRORLEVEL%
 
 :noninteractive
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0install-all.ps1" %*
+powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "%~dp0install-all.ps1" %*
 exit /b %ERRORLEVEL%

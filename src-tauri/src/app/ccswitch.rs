@@ -38,6 +38,11 @@ const CCSWITCH_RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\
 const CCSWITCH_RUN_VALUE: &str = "CC Switch";
 const WEBVIEW2_ARGUMENTS_ENV: &str = "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS";
 const WEBVIEW2_DISABLE_GPU_ARG: &str = "--disable-gpu";
+const CCSWITCH_USB_BACKGROUND_ENV: &str = "CODEX_USB_CCSWITCH_BACKGROUND";
+const CCSWITCH_404TOKEN_DEVICE_KEY_ENV: &str = "CCSWITCH_404TOKEN_DEVICE_KEY";
+const CCSWITCH_404TOKEN_ACCOUNT_ENV: &str = "CCSWITCH_404TOKEN_ACCOUNT";
+const CCSWITCH_404TOKEN_GROUP_ENV: &str = "CCSWITCH_404TOKEN_GROUP_ID";
+const CCSWITCH_404TOKEN_PROVIDER_ENV: &str = "CCSWITCH_404TOKEN_PROVIDER";
 
 /// Files copied when they exist beside the product executable.  Only the EXE
 /// is required at runtime; the catalog and notices make the local install
@@ -88,6 +93,10 @@ pub struct CcswitchLaunchReport {
     pub usable_window_confirmed: bool,
     #[serde(default)]
     pub graphics_mode: String,
+    /// Whether the signed USB binding was handed to the child process.
+    /// The key itself is never returned to the renderer or written to logs.
+    #[serde(default)]
+    pub account_injected: bool,
     pub message: String,
 }
 
@@ -121,6 +130,7 @@ fn report_missing(message: impl Into<String>) -> CcswitchLaunchReport {
         data_scope: "unknown".to_string(),
         usable_window_confirmed: false,
         graphics_mode: "unknown".to_string(),
+        account_injected: false,
         message: message.into(),
     }
 }
@@ -138,6 +148,34 @@ fn webview2_software_rendering_arguments(existing: Option<&str>) -> String {
     } else {
         format!("{existing} {WEBVIEW2_DISABLE_GPU_ARG}")
     }
+}
+
+fn ccswitch_account_environment(
+    binding: Option<&codex_usb_license::UsbAccountBinding>,
+) -> Vec<(&'static str, String)> {
+    let Some(binding) = binding else {
+        return Vec::new();
+    };
+    if binding.ccswitch.provider_id != "404token-sub2api"
+        || binding.ccswitch.device_api_key.trim().is_empty()
+    {
+        return Vec::new();
+    }
+    vec![
+        (
+            CCSWITCH_404TOKEN_DEVICE_KEY_ENV,
+            binding.ccswitch.device_api_key.clone(),
+        ),
+        (CCSWITCH_404TOKEN_ACCOUNT_ENV, binding.account_ref.clone()),
+        (
+            CCSWITCH_404TOKEN_GROUP_ENV,
+            binding.ccswitch.group_id.to_string(),
+        ),
+        (
+            CCSWITCH_404TOKEN_PROVIDER_ENV,
+            binding.ccswitch.provider_id.clone(),
+        ),
+    ]
 }
 
 fn io_error(path: &Path, error: impl std::fmt::Display) -> AppError {
@@ -324,6 +362,20 @@ fn find_source(executable: &Path, resource_dir: Option<&Path>) -> Option<PathBuf
         .find(|candidate| is_regular_file(candidate))
 }
 
+fn same_windows_path(left: &Path, right: &Path) -> bool {
+    let left = left
+        .to_string_lossy()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase();
+    let right = right
+        .to_string_lossy()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase();
+    left == right
+}
+
 pub fn local_install_dir() -> Result<PathBuf, AppError> {
     if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
         return Ok(PathBuf::from(local_app_data)
@@ -380,6 +432,14 @@ fn paths_absent(paths: &[PathBuf]) -> Result<bool, AppError> {
         }
     }
     Ok(true)
+}
+
+/// A directory at the conventional path without this product's ownership
+/// marker is intentionally preserved.  It may belong to a standalone
+/// CCSwitch installation, so it must not be deleted; its presence therefore
+/// is not a failed postcondition for this product's uninstall.
+fn local_install_cleanup_settled(local_install_present: bool, managed_marker: bool) -> bool {
+    !local_install_present || !managed_marker
 }
 
 fn remove_path_retry(path: &Path) -> Result<bool, AppError> {
@@ -730,9 +790,13 @@ pub fn uninstall(purge_user_data: bool) -> Result<CcswitchUninstallReport, AppEr
     let local_install_absent = !path_exists_checked(&install_dir)?;
     let data_absent = paths_absent(&data_paths)?;
     let marker_absent = !path_exists_checked(&usb_marker_path()?)?;
-    let success = local_install_absent && (!purge_user_data || data_absent) && marker_absent;
+    let local_install_settled =
+        local_install_cleanup_settled(!local_install_absent, managed_marker);
+    let success = local_install_settled && (!purge_user_data || data_absent) && marker_absent;
     let message = if !success {
         "CCSwitch 程序已部分清理，请关闭占用文件的进程后重试。".to_string()
+    } else if local_install_present && !managed_marker {
+        "CCSwitch 本产品已卸载；检测到其他 CCSwitch 安装，已按安全策略保留。".to_string()
     } else if installed_before || removed_autostart || purged_user_data {
         if purge_user_data {
             "CCSwitch 已卸载并清除配置。".to_string()
@@ -829,17 +893,43 @@ pub fn install_and_launch(app: &AppHandle) -> Result<CcswitchLaunchReport, AppEr
     let executable = std::env::current_exe()
         .map_err(|error| AppError::Internal(format!("无法确定安装器路径: {error}")))?;
     let resource_dir = app.path().resource_dir().ok();
+    log::info!(
+        "CCSwitch launch requested manager={} resource_dir={} candidates={:?}",
+        executable.display(),
+        resource_dir
+            .as_deref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        source_candidates(&executable, resource_dir.as_deref())
+            .iter()
+            .map(|path| format!(
+                "{}{}",
+                path.display(),
+                if is_regular_file(path) { " [file]" } else { "" }
+            ))
+            .collect::<Vec<_>>()
+    );
     let Some(source) = find_source(&executable, resource_dir.as_deref()) else {
         return Ok(report_missing(
             "未找到 ccswitch\\CodexSwitch.exe；Codex 已安装，但 CCSwitch 未自动启动",
         ));
     };
+    log::info!("CCSwitch source selected path={}", source.display());
     verify_source_executable(&source)?;
+    log::info!("CCSwitch source hash verified path={}", source.display());
     let runtime =
         crate::app::runtime::ensure_bundled_vc_runtime(&executable, resource_dir.as_deref())?;
     if !runtime.ready {
         return Err(AppError::Engine(runtime.message));
     }
+    log::info!(
+        "CCSwitch VC runtime ready installed_now={} installer={}",
+        runtime.installed_now,
+        runtime
+            .installer_path
+            .as_deref()
+            .unwrap_or("system runtime")
+    );
     let usb_mode = crate::app::usb_guard::guard_required();
     let (target, working_dir, copied_files, installed, launch_mode) = if usb_mode {
         let target_dir = source
@@ -869,20 +959,88 @@ pub fn install_and_launch(app: &AppHandle) -> Result<CcswitchLaunchReport, AppEr
     let inherited_webview2_arguments = std::env::var(WEBVIEW2_ARGUMENTS_ENV).ok();
     let webview2_arguments =
         webview2_software_rendering_arguments(inherited_webview2_arguments.as_deref());
-    let child = Command::new(&target)
+    // A valid USB lease is enough to launch CCSwitch.  Account binding is an
+    // optional hand-off: if an older/unsigned license or a transient license
+    // read prevents it, keep the launch usable and surface the exact reason in
+    // the backend log/report instead of aborting before spawning the app.
+    let account_binding = match crate::app::usb_guard::authorized_account_binding() {
+        Ok(binding) => binding,
+        Err(error) => {
+            log::error!(
+                "CCSwitch account binding unavailable; launching without injection: {error}"
+            );
+            None
+        }
+    };
+    let account_environment = ccswitch_account_environment(account_binding.as_ref());
+    let account_injected = !account_environment.is_empty();
+    log::info!(
+        "CCSwitch launch mode={} target={} account_injected={}",
+        launch_mode,
+        target.display(),
+        account_injected
+    );
+
+    // An earlier USB bundle may still own CCSwitch's single-instance window.
+    // The ownership marker is exact and lets us close only that prior managed
+    // root; unrelated standalone CCSwitch installations remain untouched.
+    if let Some(previous_source) = read_usb_managed_source() {
+        if let Some(previous_root) = previous_source.parent() {
+            if !same_windows_path(previous_root, &working_dir)
+                && codex_win_engine::processes_running_for_root(previous_root).unwrap_or(false)
+            {
+                log::info!(
+                    "closing previous USB CCSwitch root before relaunch root={}",
+                    previous_root.display()
+                );
+                codex_win_engine::close_processes_for_root(10, previous_root).map_err(|error| {
+                    AppError::Engine(format!("无法关闭旧版 USB CCSwitch 进程：{error}"))
+                })?;
+            }
+        }
+    }
+
+    // A previous launch from this exact bundle can own CCSwitch's single
+    // instance listener and keep the old process environment (and therefore
+    // the old/missing API key). Close only processes physically loaded from
+    // this managed root before starting a fresh child. Unrelated CCSwitch
+    // installations are never touched.
+    if codex_win_engine::processes_running_for_root(&working_dir).unwrap_or(false) {
+        codex_win_engine::close_processes_for_root(10, &working_dir).map_err(|error| {
+            AppError::Engine(format!("无法关闭同一套件中的旧 CCSwitch 进程：{error}"))
+        })?;
+    }
+
+    let mut command = Command::new(&target);
+    command
         .current_dir(&working_dir)
         // This marker is informational for the product build and is ignored
         // by CCSwitch itself; it avoids inventing an unsupported CLI flag for
         // its data directory. Tauri/Windows continue to resolve app data from
         // the user's profile, not from the removable working directory.
         .env("CODEX_USB_CCSWITCH_MODE", launch_mode)
+        // The bundled USB edition is a background configurator: its provider
+        // bootstrap runs before the window becomes interactive, then the
+        // manager hides the main window while leaving the tray process alive.
+        .env(
+            CCSWITCH_USB_BACKGROUND_ENV,
+            if account_injected { "1" } else { "0" },
+        )
         // The target-machine report proved that this WebView2 renderer stalls
         // with hardware acceleration on Windows 10/Intel graphics. Keep the
         // workaround scoped to this child instead of changing a machine/user
         // environment variable used by unrelated WebView2 applications.
-        .env(WEBVIEW2_ARGUMENTS_ENV, &webview2_arguments)
-        .spawn()
-        .map_err(|error| io_error(&target, error))?;
+        .env(WEBVIEW2_ARGUMENTS_ENV, &webview2_arguments);
+    for (name, value) in &account_environment {
+        command.env(name, value);
+    }
+    let child = command.spawn().map_err(|error| {
+        log::error!(
+            "CCSwitch process spawn failed target={} error={error}",
+            target.display()
+        );
+        io_error(&target, error)
+    })?;
     // The USB guard records the exact child PID.  Unplug handling can then
     // terminate only this managed CCSwitch instance instead of using a global
     // `/IM CodexSwitch.exe` kill that might affect another installation.
@@ -893,7 +1051,7 @@ pub fn install_and_launch(app: &AppHandle) -> Result<CcswitchLaunchReport, AppEr
     }
 
     let window =
-        codex_win_engine::wait_for_usable_window_for_root(&working_dir, Duration::from_secs(20))
+        codex_win_engine::wait_for_usable_window_for_root(&working_dir, Duration::from_secs(45))
             .map_err(|error| AppError::Engine(format!("检查 CCSwitch 窗口失败：{error}")))?;
     let Some(window) = window else {
         // Do not leave a headless single-instance process behind: the next
@@ -903,14 +1061,14 @@ pub fn install_and_launch(app: &AppHandle) -> Result<CcswitchLaunchReport, AppEr
             let _ = codex_win_engine::close_processes_for_root(5, &working_dir);
         }
         return Err(AppError::Engine(
-            "CCSwitch 已启动但 20 秒内没有出现可操作窗口；已关闭本次隐藏进程，请查看日志"
+            "CCSwitch 已启动但 45 秒内没有出现可操作窗口；可能有旧版/其他 CCSwitch 占用单实例 localhost 端口。已关闭本次隐藏进程，请先关闭所有 CCSwitch 后重试，并查看日志"
                 .to_string(),
         ));
     };
 
     // As with Electron, an HWND can exist briefly before the WebView renderer
     // fatally exits. Do not turn that transient window into a false success.
-    std::thread::sleep(Duration::from_secs(2));
+    std::thread::sleep(Duration::from_secs(3));
     let stable_window =
         codex_win_engine::wait_for_usable_window_for_root(&working_dir, Duration::ZERO)
             .map_err(|error| AppError::Engine(format!("复核 CCSwitch 窗口失败：{error}")))?;
@@ -919,31 +1077,33 @@ pub fn install_and_launch(app: &AppHandle) -> Result<CcswitchLaunchReport, AppEr
             let _ = codex_win_engine::close_processes_for_root(5, &working_dir);
         }
         return Err(AppError::Engine(
-            "CCSwitch 窗口出现后未能稳定保留；已关闭本次异常进程，请查看日志".to_string(),
+            "CCSwitch 窗口出现后未能稳定保留；可能有旧版/其他 CCSwitch 占用单实例 localhost 端口。已关闭本次异常进程，请先关闭所有 CCSwitch 后重试，并查看日志".to_string(),
         ));
     };
 
-    // Explicit configuration hand-off: put the manager out of the way, then
-    // re-assert the verified CCSwitch window at the top. SetForegroundWindow
-    // can be policy-limited, but minimizing the launching foreground process
-    // plus HWND_TOP makes the configurator visible without making it permanently
-    // always-on-top.
-    if let Some(manager_window) = app.get_webview_window("main") {
-        if let Err(error) = manager_window.minimize() {
-            log::warn!("CCSwitch is ready but manager window could not minimize: {error}");
-        }
-    }
-    let focused = codex_win_engine::wait_for_usable_window_for_root(&working_dir, Duration::ZERO)
-        .ok()
-        .flatten()
-        .unwrap_or(stable_window);
+    // Explicit configuration hand-off: keep the manager visible so the user
+    // can see the completed installation and its final status. When a signed
+    // USB binding is present, hide CCSwitch into its tray after its sizeable
+    // window has been observed and kept stable. This makes the automatic
+    // provider hand-off invisible while retaining a tray entry for deliberate
+    // user access.
+    let hidden_windows = if account_injected {
+        codex_win_engine::hide_windows_for_root(&working_dir).map_err(|error| {
+            AppError::Engine(format!("CCSwitch 已注入授权，但无法收至托盘：{error}"))
+        })?
+    } else {
+        0
+    };
+    let focused = stable_window;
     log::info!(
-        "CCSwitch usable window confirmed pid={} size={}x{} initially_visible={} foreground_accepted={} webview2_args={}",
+        "CCSwitch usable window confirmed pid={} size={}x{} initially_visible={} foreground_accepted={} hidden_windows={} account_injected={} webview2_args={}",
         focused.pid,
         focused.width,
         focused.height,
         window.was_visible,
         focused.foreground_accepted,
+        hidden_windows,
+        account_injected,
         webview2_arguments
     );
 
@@ -958,8 +1118,14 @@ pub fn install_and_launch(app: &AppHandle) -> Result<CcswitchLaunchReport, AppEr
         data_scope: "user-profile".to_string(),
         usable_window_confirmed: true,
         graphics_mode: "software-rendering".to_string(),
+        account_injected,
         message: if usb_mode {
-            "Codex Switch 已从 U 盘启动并显示配置窗口；配置保存在本机用户目录，请输入 API Key 完成配置".to_string()
+            if !account_injected {
+                "Codex Switch 已从 U 盘启动并显示配置窗口；当前 U 盘没有可用的 404token 绑定，请重新签名".to_string()
+            } else {
+                "Codex Switch 已从 U 盘启动并自动注入 404token 授权，已收至系统托盘后台运行"
+                    .to_string()
+            }
         } else {
             "Codex Switch 已复制到本机、启动并显示配置窗口，请输入 API Key 完成配置".to_string()
         },
@@ -969,10 +1135,11 @@ pub fn install_and_launch(app: &AppHandle) -> Result<CcswitchLaunchReport, AppEr
 #[cfg(test)]
 mod tests {
     use super::{
-        autostart_targets, local_install_is_managed, source_candidates, verify_source_executable,
-        webview2_software_rendering_arguments, CCSWITCH_EXECUTABLE, CCSWITCH_MANAGED_MARKER,
-        CCSWITCH_SOURCE_DIR,
+        autostart_targets, ccswitch_account_environment, local_install_is_managed,
+        source_candidates, verify_source_executable, webview2_software_rendering_arguments,
+        CCSWITCH_EXECUTABLE, CCSWITCH_MANAGED_MARKER, CCSWITCH_SOURCE_DIR,
     };
+    use codex_usb_license::{UsbAccountBinding, UsbCcswitchBinding};
     use std::fs;
     use std::path::PathBuf;
 
@@ -997,6 +1164,52 @@ mod tests {
                     .join(CCSWITCH_SOURCE_DIR)
                     .join(CCSWITCH_EXECUTABLE)
         }));
+    }
+
+    #[test]
+    fn account_binding_is_reduced_to_child_environment_contract() {
+        let binding = UsbAccountBinding {
+            schema_version: 1,
+            usb_asset_id: "USB-0001".into(),
+            account_ref: "USB-0001".into(),
+            account_name: "USB-0001".into(),
+            login_email: "u1@u.404token.xyz".into(),
+            sub2api_user_id: 1,
+            ccswitch: UsbCcswitchBinding {
+                provider_id: "404token-sub2api".into(),
+                credential_id: "key-1".into(),
+                device_api_key: "sk-secret".into(),
+                group_id: 7,
+            },
+        };
+        let environment = ccswitch_account_environment(Some(&binding));
+        assert_eq!(environment.len(), 4);
+        assert!(environment.iter().any(|(name, value)| {
+            *name == "CCSWITCH_404TOKEN_DEVICE_KEY" && value == "sk-secret"
+        }));
+        assert!(environment
+            .iter()
+            .any(|(name, value)| { *name == "CCSWITCH_404TOKEN_ACCOUNT" && value == "USB-0001" }));
+    }
+
+    #[test]
+    fn invalid_or_missing_binding_does_not_inject_environment() {
+        assert!(ccswitch_account_environment(None).is_empty());
+        let binding = UsbAccountBinding {
+            schema_version: 1,
+            usb_asset_id: "USB-0001".into(),
+            account_ref: "USB-0001".into(),
+            account_name: "USB-0001".into(),
+            login_email: "u1@u.404token.xyz".into(),
+            sub2api_user_id: 1,
+            ccswitch: UsbCcswitchBinding {
+                provider_id: "other".into(),
+                credential_id: "key-1".into(),
+                device_api_key: "sk-secret".into(),
+                group_id: 7,
+            },
+        };
+        assert!(ccswitch_account_environment(Some(&binding)).is_empty());
     }
 
     #[test]
@@ -1090,5 +1303,13 @@ mod tests {
             let error = super::existence_from_probe(Err(Error::from(kind))).unwrap_err();
             assert_eq!(error.kind(), kind);
         }
+    }
+
+    #[test]
+    fn unowned_external_install_is_preserved_without_failing_our_uninstall() {
+        assert!(super::local_install_cleanup_settled(false, false));
+        assert!(super::local_install_cleanup_settled(true, false));
+        assert!(super::local_install_cleanup_settled(false, true));
+        assert!(!super::local_install_cleanup_settled(true, true));
     }
 }

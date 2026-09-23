@@ -17,12 +17,16 @@ const copy: Partial<Record<TKey, string>> = {
   "error.disk_space": "磁盘空间不足，请清理后重试。",
   "error.disk_write": "无法写入磁盘。请检查磁盘权限与可用空间后重试。",
   "error.permission": "权限不足。请以合适的权限重试，或更换安装位置。",
+  "error.usbAuthorization": "U 盘授权尚未就绪。请保持 U 盘连接并稍后重试；当前 Codex 未改动。",
   "error.signature": "更新包签名校验失败。已保留现有 Codex，请稍后重试或更换更新源。",
   "error.bundle_integrity": "USB 包完整性校验失败。已保留现有 Codex，请展开详情检查具体文件后重试。",
   "error.artifact": "更新包无效或已过期。请稍后重试，或在设置中更换更新源。",
   "error.incompatible": "当前系统环境不支持此安装方式。请尝试其他安装选项。",
   "error.unsupported": "当前平台暂不支持此操作。",
   "error.generic": "操作未完成。请稍后重试；若持续失败，可复制诊断信息反馈。",
+  "skillRepo.allSourcesFailed": "更新源暂时不可用，未修改本地能力包。请重试。",
+  "skillRepo.sourceInvalid": "更新来源或确认版本无效。请重新检查；展开详情可查看具体原因。",
+  "skillRepo.baseResourceInvalid": "安装器基础资源不可用，请重新复制完整安装包后重试。",
   "home.stale.rechecked": "安装状态已变化,已重新检查——请再次确认。",
   "progress.cancelled": "下载已取消。",
 };
@@ -60,6 +64,7 @@ describe("userErrorMessage / resolveFailure", () => {
       ["disk_space", "磁盘空间不足，请清理后重试。"],
       ["disk_write", "无法写入磁盘。请检查磁盘权限与可用空间后重试。"],
       ["permission", "权限不足。请以合适的权限重试，或更换安装位置。"],
+      ["usb_authorization", "U 盘授权尚未就绪。请保持 U 盘连接并稍后重试；当前 Codex 未改动。"],
       ["signature", "更新包签名校验失败。已保留现有 Codex，请稍后重试或更换更新源。"],
       ["bundle_integrity", "USB 包完整性校验失败。已保留现有 Codex，请展开详情检查具体文件后重试。"],
       ["artifact", "更新包无效或已过期。请稍后重试，或在设置中更换更新源。"],
@@ -71,6 +76,11 @@ describe("userErrorMessage / resolveFailure", () => {
       ["unsupported_platform", "当前平台暂不支持此操作。"],
       ["internal_error", "操作未完成。请稍后重试；若持续失败，可复制诊断信息反馈。"],
       ["contract_mismatch", "操作未完成。请稍后重试；若持续失败，可复制诊断信息反馈。"],
+      ["SKILL_REPO_SOURCE_UNAVAILABLE", "无法连接更新服务器。请检查网络后重试。"],
+      ["SKILL_REPO_ALL_SOURCES_FAILED", "更新源暂时不可用，未修改本地能力包。请重试。"],
+      ["SKILL_REPO_SOURCE_INVALID", "更新来源或确认版本无效。请重新检查；展开详情可查看具体原因。"],
+      ["SKILL_REPO_BASE_RESOURCE_INVALID", "安装器基础资源不可用，请重新复制完整安装包后重试。"],
+      ["SKILL_REPO_LOCAL_IO", "无法写入磁盘。请检查磁盘权限与可用空间后重试。"],
     ];
     for (const [code, message] of cases) {
       expect(userErrorMessage({ code, message: `opaque ${code}` }, t)).toBe(message);

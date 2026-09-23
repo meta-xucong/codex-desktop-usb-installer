@@ -281,10 +281,11 @@ CODEX_USB_GUARD_PUBLIC_KEY_ID
 CODEX_USB_GUARD_POLICY=SignedRequired
 ~~~
 
-正式构建不从当前电脑的 DPAPI 公钥描述文件自动选择发行密钥。发行公钥固定记录在
-`tools/usb-signing-release-profile.json`（只含公钥，不含私钥），构建和 verify 脚本默认
-读取该 profile；环境变量为空时自动加载，环境变量已设置但摘要不一致时直接失败。密钥
-轮换必须先更新受控 profile，再重新编译管理器、生成 Bundle 并在对应签名机签名。
+正式构建不从当前电脑的 DPAPI 公钥描述文件自动选择发行密钥。发行公钥必须从当前版本
+显式传入的 release profile 读取（只含公钥，不含私钥）；正式脚本省略 profile 参数时直接
+失败，不再回退到仓库中的固定 profile。环境变量为空时只临时初始化为该版本 profile，环境
+变量已设置但摘要不一致时直接失败。密钥轮换或版本绑定变化必须先生成新的版本 profile，
+再重新编译管理器、生成 Bundle 和签名器，并在匹配的 portable vault 环境签名。
 
 为支持轮换，可增加仅包含公钥的编译期 keyring；现有变量作为 active key 兼容入口。每个 keyId 映射到一个公钥和状态：
 
@@ -569,18 +570,17 @@ sign 命令成功必须同时满足：
 正式管理器构建时只注入发行 profile 中的公钥和 keyId。不要把当前电脑自动生成的 DPAPI 公钥当作发行公钥：
 
 ~~~powershell
-# 默认读取 tools/usb-signing-release-profile.json；不需要手工填公钥
-pwsh ./tools/build-installer.ps1 -UsbPolicy SignedRequired
+$profile = './release-profiles/usb-v0.5.24-g28.json'
+pwsh ./tools/build-installer.ps1 -UsbPolicy SignedRequired -UsbSigningProfilePath $profile
 $installer = './release/setup/CodexUsbLauncher.exe'
 $manager = './release/setup/CodexAppManager.exe'
 $inputBundle = './release/usb-oneclick-v0.5.24-uninstall-finalizer-fix-20260910'
 if (-not (Test-Path -LiteralPath $inputBundle)) { throw "缺少构建输入 Bundle：$inputBundle" }
-pwsh ./tools/build-oneclick-usb-layout.ps1 -InstallerPath $installer -ManagerPath $manager -BundlePath $inputBundle -OutputPath ./release/usb-oneclick-v0.5.24-signed-ready
+pwsh ./tools/build-oneclick-usb-layout.ps1 -InstallerPath $installer -ManagerPath $manager -BundlePath $inputBundle -OutputPath ./release/usb-oneclick-v0.5.24-signed-ready -UsbSigningProfilePath $profile
 ~~~
 
-如果是受控密钥轮换或历史包复核，才显式使用 `-UsbSigningProfilePath` 指向另一份已审阅的
-公开 profile；禁止直接把本机 `%LOCALAPPDATA%\CodexUsbLicenseSigner\keys\*.public.json`
-复制进构建环境冒充发行配置。
+每次发行都必须显式使用该版本已审阅的公开 profile；禁止直接把本机
+`%LOCALAPPDATA%\CodexUsbLicenseSigner\keys\*.public.json` 复制进构建环境冒充发行配置。
 
 然后重新把最终构建输出复制到目标 NTFS U 盘，再执行签名器。不要先签名、再替换管理器、入口、Manifest、Payload 或 SHA256SUMS；任何不可变发行文件变化都必须重新构建、复制和签名。
 
@@ -601,7 +601,7 @@ pwsh ./tools/build-oneclick-usb-layout.ps1 -InstallerPath $installer -ManagerPat
 
 正式包不能先签 USB License 再替换程序文件。顺序固定为：
 
-1. 以 SignedRequired、公钥和预期 keyId 构建 Manager；
+1. 以 SignedRequired、当前版本 profile、公钥和预期 keyId 构建 Manager；
 2. 完成 Launcher、Manager 和项目拥有的 PE 层 Authenticode；
 3. 生成最终 Manifest、usb-manifest 和 SHA256SUMS；
 4. 使用没有 -SkipSignature 的严格 Bundle 验证；

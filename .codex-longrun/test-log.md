@@ -228,3 +228,122 @@
 - command: `release/usb-oneclick/verify-usb.ps1 -BundlePath release/usb-oneclick -SkipNetwork`; `tools/verify-oneclick-usb.ps1 -BundlePath release/usb-oneclick -SkipNetwork -SkipSignature`; `tools/verify-usb-launcher.ps1` for both entry and manager with `requireAdministrator`
 - result: passed; payload/CCSwitch hashes and package metadata valid; both PE manifests requireAdministrator
 - next: clean Windows 10/11 + NTFS removable-volume acceptance
+
+## 2026-09-21 G39.4 complete delivery rebuild
+
+- `cargo test --manifest-path tools/usb-license-signer/Cargo.toml --all-targets`: 45 library tests + 4 GUI tests passed after correcting the stale config-precedence assertion for compile-time embedded admin credentials.
+- `cargo fmt --manifest-path tools/usb-license-signer/Cargo.toml --all -- --check`: passed.
+- Signer release build passed; manifest reports `adminApiKeyEmbedded=true`, `adminApiKeySource=compile-time-embedded`, `sub2ApiConfigIncluded=false`, and portable vault included.
+- Signer startup smoke passed: process remained alive for 3 seconds and showed `Codex U 盘签名授权`; embedded credential presence/length/hash matched the trusted prior signer without printing the secret.
+- `tools/build-installer.ps1 ... -UsbPolicy SignedRequired ...`: passed; renderer, manager, PE `requireAdministrator`, Skill Hub/base resource and CCSwitch resource gates passed.
+- `tools/build-oneclick-usb-layout.ps1 ... -UsbPolicy SignedRequired ... -InternalSigned`: passed; complete package generated.
+- `release/usb-oneclick-g39.4-20260921-r6-final/verify-usb.ps1 -InternalSigned -SkipNetwork`: passed; MSIX identity/hash, payload, both CCSwitch copies, prerequisites, manager binding and package checks passed.
+- `tools/verify-usb-signing-pair.ps1` with the new signer GUI and current profile: passed; portable vault/profile/bundle bindings match.
+- Final hashes: signer `D772C72FBFA42BD3EE6F305581CD8CBB0BB0E3339A714C0FBDE4C7837EDE63AC`; manager `73ECE3B4D507E2F10C5B789D6B33CB7EC93C980200F14BF07DA13FB2BA6F6D18`; launcher `A9CE2475D6F2912AEB00A604DA68CFCD8D2BA0A1291A0C3BC8A0BF4F2903C464`; CCSwitch `2725C147176A5E8F3A4EAC3A380B5D68FBDA08F64978A0427ECFC670CBFF5312`; USB archive `A254BC05B8A1C42B8BFCB32D7FD29829A09AF2A2CB95D3487E5E69F916C79766`; signer archive `4D972E1A06F864EAB630C35CB5F71080E82CB710DE4972056B3E6E6414F37ADA`.
+- Archive listing confirmed the USB archive contains both EXEs, root/embedded CCSwitch, `usb-manifest.json` and verification script; signer archive contains EXE, portable vault, current profile, manifest and checksum file.
+
+## 2026-09-21 G39.5/r7 final verification
+
+- `cargo test --manifest-path tools/usb-license-signer/Cargo.toml --all-targets`: passed, 48 library + 4 GUI tests.
+- `cargo clippy --manifest-path tools/usb-license-signer/Cargo.toml --all-targets -- -D warnings`: passed; signer rustfmt check passed.
+- Manager `cargo test --manifest-path src-tauri/Cargo.toml --lib`: passed, 436/436; manager rustfmt check passed.
+- CCSwitch frontend: `pnpm format:check`, `pnpm typecheck`, and serial `pnpm test:unit -- --run`: passed, 37 files / 223 tests. Serial execution is intentional because App integration tests share a local MSW/DOM runtime.
+- Nested CCSwitch Rust `cargo test --locked --lib`: 1,092 passed; one external port-15721 single-instance failure remained, and the separate Windows temp-path test passed on isolated rerun.
+- Rebuilt package checks: packaged `verify-usb.ps1 -InternalSigned -SkipNetwork`, `tools/verify-oneclick-usb.ps1 -InternalSigned -SkipNetwork`, `tools/verify-usb-signing-pair.ps1`, manifest/hash cross-check, no-admin-sidecar scan, and PE administrator-manifest checks passed.
+- Final ZIP hashes: USB `7543DB9021A35CD30E19EF0B29799EAAA572931C479CBC93054E71C1B7E20DAE`; signer `99BF9EECF25CC0AD0F129A02545DBD0DB45BB9D78A03D5161942E781BE643DE3`.
+- Product EXEs report `NotSigned` under Windows Authenticode by design; internal Ed25519 USB signing is the release policy, while the OpenAI MSIX and Microsoft prerequisite installers remain Authenticode-verified.
+
+## 2026-09-22 G39.5/r8 implementation and package verification
+
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check`: passed.
+- `cargo test --manifest-path src-tauri/Cargo.toml --lib app::model_catalog`: passed, 7/7.
+- `cargo test --manifest-path src-tauri/Cargo.toml --lib app::install_tx`: passed, 13/13.
+- `cargo test --manifest-path src-tauri/Cargo.toml --lib commands::tests`: passed, 27/27.
+- `cargo test --manifest-path crates/codex-win-engine/Cargo.toml windows_process::tests`: passed, 4/4.
+- `cargo test --manifest-path crates/codex-win-engine/Cargo.toml download::tests`: passed, 7/7.
+- `cargo test --manifest-path crates/codex-win-engine/Cargo.toml portable::tests`: passed, 28 passed, 1 intentionally ignored real-MSIX environment test.
+- `cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc --features custom-protocol`: passed; one existing `same_identity` dead-code warning.
+- `npm run check`: passed; focused Vitest (`OfflineHome`, `WinHome`, download/operation hooks): 4 files / 82 tests passed.
+- `npm run lint`: passed after excluding the separately governed `CCSwitch/` and generated `release/` trees from the manager ESLint scope.
+- `npm test -- --run src`: passed, 32 files / 361 tests.
+- `git diff --check`: passed; existing line-ending normalization warnings only.
+- `tools/build-installer.ps1 -CcswitchArtifactDir release/ccswitch-product-g39.5-20260921-r7 -UsbPolicy SignedRequired -UsbSigningProfilePath <r7-profile> -SkipNpmInstall -SkipTests`: passed; renderer build, optimized Windows manager, `requireAdministrator` manifests and resource gates passed.
+- `tools/build-oneclick-usb-layout.ps1 ... -OutputPath release/usb-oneclick-g39.5-20260922-r8-model-catalog -InternalSigned`: passed; MSIX identity/hash and manager/profile binding passed.
+- New package `verify-usb.ps1 -InternalSigned -SkipNetwork`: passed; `verify-payload.ps1`: passed; `tools/verify-oneclick-usb.ps1` with the bundled r8 profile: passed; `tools/verify-usb-signing-pair.ps1`: passed.
+- CCSwitch product verifier: passed; root and embedded CCSwitch SHA-256 both `D9656D97BF0EB663A5EA090D965573C86B7774633D1E2D00971B4428C7BB5A55`.
+
+## 2026-09-22 G39.5/r8 final regression and package
+
+- `cargo test --manifest-path tools/usb-license-signer/Cargo.toml --all-targets -- --test-threads=1`: 48 core tests passed; GUI target passed; signer clippy `-D warnings` and rustfmt check passed.
+- Direct same-process signer rebuild verified one `admin-` production credential candidate in the final EXE and matched its hash to the prior validated embedded signer; no credential value was printed. Final manifest reports `adminApiKeyEmbedded=true`, `compile-time-embedded`; no `sub2api-config.json` exists.
+- First nested-PowerShell signer build was rejected from delivery because its manifest marker did not match the EXE bytes; the build was repeated directly in the current PowerShell process and the final EXE passed the binary embedding check. This is recorded as a fixed build-pipeline issue, not a release artifact.
+- `cargo test --manifest-path src-tauri/Cargo.toml --lib -- --test-threads=1`: 445 passed, 3 ignored. `cargo test --manifest-path crates/codex-win-engine/Cargo.toml --lib -- --test-threads=1`: 179 passed, 1 intentionally ignored real-MSIX test after replacing pre-mount `Join-Path` resolution with lexical `[System.IO.Path]::Combine` in the generated USB AppX script.
+- `npm run check`, `npm run lint`, `npm test -- --run src`: passed; frontend 32 files / 361 tests. Windows x64/custom-protocol target check and rustfmt checks passed; the only warning remains the pre-existing `same_identity` dead-code warning.
+- `tools/build-installer.ps1` and `tools/build-oneclick-usb-layout.ps1` rebuilt the final manager and `release/usb-oneclick-g39.5-20260922-r8-final`. Package/payload/one-click/signing-pair/CCSwitch/PE-manifest gates all passed.
+- Final package inventory: USB 289 files / 1,317,441,470 bytes; signer 8 files / 5,035,151 bytes. Signer startup remained alive after 3 seconds with title `Codex U 盘签名授权`.
+- Archives: `release/CodexUsb-OneClick-G39.5-v0.5.24-20260922-r8-final.zip` = 1,260,625,783 bytes, SHA-256 `30b41e18851343e0e90a10e62414c8739060a8e1c1576088dfcc68e4a92170c0`; `release/CodexUsb-LicenseSigner-G39.5-v0.5.24-20260922-r7-final-embedded.zip` = 2,278,707 bytes, SHA-256 `e090a9551de844e82e62a6cc238df7b6535cd634968692c6f07a3602445695a4`. ZIP central-directory checks confirmed all required entries.
+- Physical NTFS U-disk, real 404token registration, Codex native model menu, 360-on/off install attribution, update and uninstall remain target-device acceptance items; the unrelated external CCSwitch process on port 15721 was not terminated.
+
+## 2026-09-22 G39.5/r12 install-stall and second-stage-uninstall repair
+
+- `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check`: passed.
+- `cargo test --manifest-path src-tauri/Cargo.toml --lib -- --test-threads=1`: passed, 447/447; 3 intentionally ignored. The new UTF-16LE encoded-finalizer round-trip, uninstall transaction reconciliation, persistent handoff generation, and portable fallback phase paths are covered.
+- `cargo check --manifest-path src-tauri/Cargo.toml --tests --target x86_64-pc-windows-msvc --features custom-protocol`: passed; only the pre-existing `same_identity` dead-code warning remains.
+- `npm.cmd test -- --run src`: passed, 32 files / 364 tests; `npm.cmd run check`, `npm.cmd run lint`, and `git diff --check` passed.
+- `tools/build-installer.ps1 -UsbPolicy SignedRequired -UsbSigningProfilePath release/usb-signing-release-profile-g39.5-20260922-r12-install-recovery.json -SkipNpmInstall -SkipTests`: passed; production renderer, manager, launcher, resource, policy-binding and PE `requireAdministrator` gates passed.
+- `tools/build-oneclick-usb-layout.ps1 ... -OutputPath release/usb-oneclick-g39.5-20260922-r12-install-recovery -InternalSigned`: passed; package has 289 files / 1,317,353,472 bytes. Manager `B3DBAC10DFC27BD2A2858A28882E8E969716E77AF394BD53D247041B35C18A8D`, launcher `A9CE2475D6F2912AEB00A604DA68CFCD8D2BA0A1291A0C3BC8A0BF4F2903C464`, payload `AB0FEACC74E982742736DA4A7F1D2B59E9FABAA3641606545D3064927DA02B1E`.
+- Packaged `verify-usb.ps1 -InternalSigned -SkipNetwork`, `tools/verify-payload.ps1`, `tools/verify-oneclick-usb.ps1`, `tools/verify-usb-signing-pair.ps1`, both PE manifest checks, CCSwitch/resource checks and archive central-directory checks: all passed.
+- USB ZIP: `release/CodexUsb-OneClick-G39.5-v0.5.24-20260922-r12-install-recovery.zip`, 1,260,593,407 bytes, SHA-256 `08AE0767D39524C532F76ACA3FF04A62FB5D93F44968464BFC25AB35731EEE91`.
+- Signer package: `release/usb-license-signer-gui-v0.5.24-g39.5-r12-20260922-install-recovery` and ZIP SHA-256 `888F555EEA3282593CC149ED2BE07E66844D2312589AD4E11131FBF0B89F656C`; signer source was unchanged this round, so the previously verified embedded signer executable was retained while its release profile/manifest/vault binding was refreshed.
+- Physical NTFS U-disk sign/install/update/uninstall and real file-lock/finalizer acceptance remain target-device checks; they were not claimed from this development workspace.
+
+## 2026-09-22 G39.5/r13 portable extraction root-cause repair
+
+- `cargo fmt --manifest-path crates/codex-win-engine/Cargo.toml -- --check`: passed after the optimized extraction change.
+- `cargo test --manifest-path crates/codex-win-engine/Cargo.toml --lib -- --test-threads=1`: 180 passed / 1 intentionally ignored real-MSIX test. New fixture `portable_payload_extraction_copies_only_declared_app_tree` passed and verifies only the manifest-declared app tree is written.
+- The formerly ignored real-package hook was also run with the r13 `OpenAI.Codex_x64.msix`: `portable::tests::real_usb_payload_extracts_transactionally --ignored` passed in 49.29s on local storage, without launching Codex or registering AppX.
+- `cargo check --manifest-path src-tauri/Cargo.toml --tests --target x86_64-pc-windows-msvc --features custom-protocol`: passed; only the pre-existing `same_identity` dead-code warning remains.
+- `cargo test --manifest-path src-tauri/Cargo.toml --lib -- --test-threads=1`: 447 passed / 3 intentionally ignored.
+- `npm.cmd test -- --run src`: 32 files / 364 tests passed. `npm.cmd run check`, `npm.cmd run lint`, and `git diff --check`: passed.
+- `tools/build-installer.ps1 -UsbPolicy SignedRequired -UsbSigningProfilePath release/usb-signing-release-profile-g39.5-20260922-r13-portable-extract.json -SkipNpmInstall -SkipTests`: passed; production manager/launcher and embedded administrator manifests rebuilt.
+- `tools/build-oneclick-usb-layout.ps1 ... -OutputPath release/usb-oneclick-g39.5-20260922-r13-portable-extract -InternalSigned`: passed; 289 files / 1,317,364,224 bytes. Manager `C1464191A9EB3A84283CF77B311173DC7E6FCDEDE373BFEAF37001C2AD3DF677`, launcher `A9CE2475D6F2912AEB00A604DA68CFCD8D2BA0A1291A0C3BC8A0BF4F2903C464`, payload `AB0FEACC74E982742736DA4A7F1D2B59E9FABAA3641606545D3064927DA02B1E`.
+- Package/payload/one-click/signing-pair/CCSwitch/PE manifest checks and ZIP central-directory checks passed. USB ZIP `799393F47F0207CD21458617546C3767B64CF103BF366A0EFDBBF2B2261B0A83`; signer ZIP `7BF8ACCE06E29ABA890FF7FE20883303C307D853AD76345B774AE9541217CFAD`.
+- Physical NTFS U-disk sign/install/update/uninstall and real slow-media timing remain target-device checks; the optimized path is covered by synthetic extraction and full regression, not a physical USB run in this workspace.
+
+## 2026-09-22 G39.5/r15 CCSwitch auto-provisioning and upstream retry
+
+- CCSwitch source rebuilt with USB environment bootstrap, idempotent 3-attempt provider save/switch retry, background startup and exact-root window hiding. Renderer build and `pnpm.cmd tauri build --no-bundle --ci` passed; product verifier passed. New CCSwitch SHA-256: `927AF2AA40E2F5E1B08ECEF90C9BA8063DFB9667007E4F7AF12395463E867378`.
+- Native model catalog backend now uses three bounded gateway attempts (8s connect / 20s request / 500ms+1s backoff), preserves stale catalog, classifies upstream authorization/response/unavailable errors and exposes explicit Chinese/English upstream messages. Frontend auto-refresh watchdog is 60s.
+- `npx vitest run src/app/views/OfflineHome.test.tsx src/services/managerApi.test.ts`: 2 files / 60 tests passed. `cargo test --manifest-path src-tauri/Cargo.toml app::model_catalog --lib`: 7/7. `cargo test --manifest-path src-tauri/Cargo.toml app::ccswitch --lib`: 9/9. `cargo test --manifest-path crates/codex-win-engine/Cargo.toml windows_process --lib`: 5 normal + 1 helper test passed. `npm run check`: passed. `npm run test:release`: 56/56. `npm run test:offline-bundle`: passed. Existing `npm run lint`/full Rust release build were already passed before this packaging turn.
+- `tools/build-oneclick-usb-layout.ps1` generated `release/usb-oneclick-g39.5-20260922-r15-upstream-retry-tray` (289 files, 1,317,450,042 bytes). Manager SHA-256 `2E6E02CE3DBD43412EFC7DBCE16C8C68A5B11890F6742272C0B0ACCCCD829C38`; launcher `A9CE2475D6F2912AEB00A604DA68CFCD8D2BA0A1291A0C3BC8A0BF4F2903C464`; payload `AB0FEACC74E982742736DA4A7F1D2B59E9FABAA3641606545D3064927DA02B1E`.
+- Packaged `verify-usb.ps1 -InternalSigned -SkipNetwork`, repository `verify-oneclick-usb.ps1` with bundled profile, `verify-usb-signing-pair.ps1` against the r14 portable-vault signer, packaged payload, CCSwitch product verifier, PE manifest and SHA-256 manifest checks all passed. The repository verifier requires the explicit bundled profile path by design.
+
+## 2026-09-22 G39.5/r14 extraction progress and recharge
+
+- `cargo fmt`（engine/manager）通过；新增解压进度 fixture 通过。
+- `cargo test --manifest-path crates/codex-win-engine/Cargo.toml --lib -- --test-threads=1`: 180 passed / 1 ignored；另外用 r14 真实 MSIX 执行 `real_usb_payload_extracts_transactionally --ignored` 通过，30.91 秒。
+- `cargo test --manifest-path src-tauri/Cargo.toml --lib -- --test-threads=1`: 447 passed / 3 ignored。
+- `npm.cmd test -- --run src`: 32 files / 365 tests；新增绑定账户充值码成功提示测试通过。
+- `npm.cmd run check`、`npm.cmd run lint`、Windows x64/custom-protocol target check、`git diff --check`: 通过；仅保留既有 `same_identity` dead-code warning。
+- `tools/build-installer.ps1 -CcswitchArtifactDir release/ccswitch-product-g39.5-20260922-r9-unified-api -UsbPolicy SignedRequired -UsbSigningProfilePath release/usb-signing-release-profile-g39.5-20260922-r14-progress-recharge.json -SkipNpmInstall -SkipTests`: 通过。
+- `tools/build-oneclick-usb-layout.ps1 ... -OutputPath release/usb-oneclick-g39.5-20260922-r14-progress-recharge -InternalSigned`: 通过；289 文件 / 1,317,433,148 字节。包内 `verify-usb.ps1`、`tools/verify-oneclick-usb.ps1`、`tools/verify-usb-signing-pair.ps1` 均通过。
+- Manager `DC75E35C0C1A050235E5211E3879E3573C29CAD81D1FE6399ED11F885DF85262`；launcher `A9CE2475D6F2912AEB00A604DA68CFCD8D2BA0A1291A0C3BC8A0BF4F2903C464`；payload `AB0FEACC74E982742736DA4A7F1D2B59E9FABAA3641606545D3064927DA02B1E`。
+- Signer 目录 `release/usb-license-signer-gui-v0.5.24-g39.5-r14-20260922-progress-recharge`：8 文件 / 5,032,684 字节；EXE `F922D125C0334187D8B31F667596D34944F8BEC2C718355DAB75505F534C74F2`。本轮签名器源码未变更，复用已验证嵌入式二进制并刷新 profile/manifest/vault 绑定。
+
+## 2026-09-22 G39.5/r16 404token account retry closure
+
+- `cargo test --manifest-path tools/usb-license-signer/Cargo.toml --all-targets -- --test-threads=1`: 49 library tests + 4 GUI tests passed. New `create_user_recovers_an_ambiguous_timeout_without_a_duplicate_post` fixture confirms a 503 after accepted `create-user` is recovered by identity lookup and does not issue a duplicate create POST.
+- `cargo test --manifest-path src-tauri/Cargo.toml app::account --lib`: 10/10 passed, including transient 503 recovery, exhausted connection retry with upstream wording, stable redeem idempotency key, and retry classification. Full manager `cargo test --manifest-path src-tauri/Cargo.toml --lib`: 451 passed / 3 ignored.
+- `npm run check`: passed. Targeted renderer regression `npx vitest run src/app/views/OfflineHome.test.tsx src/services/managerApi.test.ts`: 2 files / 60 tests passed. `npm run test:release`: 2 files / 56 tests passed. `npm run test:offline-bundle`: passed. A blind `npm test` still reports the pre-existing 37 CCSwitch source-test alias-resolution failures (433 tests passed / 1 skipped); this is unrelated to the manager/account change and the release workflow intentionally runs the root test set.
+- `cargo build --release --manifest-path tools/usb-license-signer/Cargo.toml --bin usb-license-signer-gui --target-dir tools/usb-license-signer/target-g39.5-r16-account-retry-compile`: passed as a source compile without embedding a replacement production administrator credential.
+- `tools/build-installer.ps1 ... -UsbPolicy SignedRequired -UsbSigningProfilePath release/usb-signing-release-profile-g39.5-r14-progress-recharge.json -SkipNpmInstall -SkipTests`: passed; manager PE `requireAdministrator` manifest and static upstream retry strings present in `release/setup/CodexAppManager.exe`.
+- `tools/build-oneclick-usb-layout.ps1 ... -OutputPath release/usb-oneclick-g39.5-20260922-r16-account-retry-manager -InternalSigned`: passed. `release/usb-oneclick.../verify-usb.ps1 -InternalSigned -SkipNetwork`, `tools/verify-oneclick-usb.ps1 ... -InternalSigned -SkipNetwork`, and `tools/verify-usb-signing-pair.ps1 -SignerGuiPath ... -ProfilePath ...` all passed. Package has 289 files / 1,317,521,722 bytes and manager SHA-256 `95711EE5FEA0BB375789075BF3FFDFF40C2C92E58F4F700C62A72ADA3888BDC0`.
+
+## 2026-09-22 G39.5/r16 final watchdog/package rebuild
+
+- `npm run check`: passed.
+- `npm run lint`: passed.
+- `npx vitest run src/app/views/OfflineHome.test.tsx src/services/managerApi.test.ts`: 2 files / 60 tests passed after changing `NATIVE_MODEL_REFRESH_TIMEOUT_MS` to 75 seconds.
+- `tools/build-installer.ps1 ... -UsbPolicy SignedRequired -UsbSigningProfilePath release/usb-signing-release-profile-g39.5-r14-progress-recharge.json -SkipNpmInstall -SkipTests`: passed; optimized manager release build and requireAdministrator manifest passed.
+- `tools/build-oneclick-usb-layout.ps1 ... -OutputPath release/usb-oneclick-g39.5-20260922-r16-account-retry-manager-final -InternalSigned`: passed; 289 files / 1,317,521,722 bytes.
+- Final directory verifier, repository one-click verifier, and `tools/verify-usb-signing-pair.ps1` all passed. Manager SHA-256 `9C216EAC5AF7EB2761699B4908003CE7DE8D4E592A82D4DD5CE7D10759A52BD8`; CCSwitch SHA-256 `927AF2AA40E2F5E1B08ECEF90C9BA8063DFB9667007E4F7AF12395463E867378`; payload SHA-256 `AB0FEACC74E982742736DA4A7F1D2B59E9FABAA3641606545D3064927DA02B1E`.

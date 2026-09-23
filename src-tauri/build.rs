@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::env;
 use std::fs;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -10,9 +11,10 @@ const BASE_SOURCE_RELATIVE: &str = "../installer-pack/manifest/skill-audit.json"
 const BASE_FILE_MANIFEST_RELATIVE: &str = "../installer-pack/file-manifest.json";
 const BASE_CHECKSUMS_RELATIVE: &str = "../installer-pack/checksums.sha256";
 const BASE_RESOURCE_RELATIVE: &str = "resources/skill_repo_base_manifest.json";
+const SKILL_HUB_SOURCES_RELATIVE: &str = "resources/skill_hub_sources.json";
 const BASE_SOURCE_PATH: &str = "manifest/skill-audit.json";
 const BASE_RESOURCE_SOURCE: &str = "installer-pack/manifest/skill-audit.json";
-const BASE_SOURCE_SHA256: &str = "e6c6a610b4bab5dc9001b3846c087bdaba83fcd8c26908fd6eabc135f4ca2a9c";
+const BASE_SOURCE_SHA256: &str = "949853010ebfe498c829a20936a3bfd1b2d4f15484de7c648f71bbc26e489e0b";
 
 fn main() {
     for path in [
@@ -20,11 +22,13 @@ fn main() {
         BASE_FILE_MANIFEST_RELATIVE,
         BASE_CHECKSUMS_RELATIVE,
         BASE_RESOURCE_RELATIVE,
+        SKILL_HUB_SOURCES_RELATIVE,
     ] {
         println!("cargo:rerun-if-changed={path}");
     }
 
     validate_base_manifest();
+    validate_skill_hub_sources();
 
     for name in [
         "CARGO_FEATURE_SIGNED_REQUIRED",
@@ -98,6 +102,152 @@ fn validate_base_manifest() {
     let resource_bytes = read_required_file(&resource_path, "基础 Skill 静态资源");
     let resource = parse_json(&resource_bytes, "基础 Skill 静态资源");
     validate_resource(&resource, &source_ids, &resource_bytes);
+}
+
+fn validate_skill_hub_sources() {
+    let manifest_dir = required_manifest_dir();
+    let path = manifest_dir.join(SKILL_HUB_SOURCES_RELATIVE);
+    let bytes = read_required_file(&path, "Skill Hub 来源目录");
+    let value = parse_json(&bytes, "Skill Hub 来源目录");
+    if value.get("schemaVersion").and_then(Value::as_u64) != Some(1)
+        || value.get("channel").and_then(Value::as_str) != Some("skill-hub")
+    {
+        panic!("H-SKILL-01 Skill Hub 来源目录 schema/channel 无效");
+    }
+    let sources = value
+        .get("sources")
+        .and_then(Value::as_array)
+        .filter(|sources| !sources.is_empty())
+        .unwrap_or_else(|| panic!("H-SKILL-01 Skill Hub 来源目录缺少 sources"));
+
+    let mut ids = HashSet::new();
+    let mut priorities = HashSet::new();
+    let mut bases = HashSet::new();
+    let mut relay_count = 0usize;
+    let mut github_count = 0usize;
+
+    for (index, source) in sources.iter().enumerate() {
+        let id = source
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("H-SKILL-01 sources[{index}] 缺少 id"));
+        let kind = source
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("H-SKILL-01 sources[{index}] 缺少 kind"));
+        let priority = source
+            .get("priority")
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| panic!("H-SKILL-01 sources[{index}] 缺少 priority"));
+        let enabled = source
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or_else(|| panic!("H-SKILL-01 sources[{index}] 缺少 enabled"));
+        let test_fixture = source
+            .get("testFixture")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        if id.is_empty()
+            || id.len() > 64
+            || !id
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            || !ids.insert(id.to_string())
+            || priority == 0
+            || !priorities.insert(priority)
+        {
+            panic!("H-SKILL-01 sources[{index}] 的 id/priority 无效或重复");
+        }
+
+        match kind {
+            "domestic" => {
+                let suffix = id
+                    .strip_prefix("cn-mirror-")
+                    .filter(|suffix| {
+                        !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit())
+                    })
+                    .unwrap_or_else(|| panic!("H-SKILL-01 国内来源 ID 无效: {id}"));
+                let _ = suffix;
+                let base = source
+                    .get("base")
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| panic!("H-SKILL-01 国内来源缺少 base: {id}"));
+                validate_skill_hub_base(base, true, test_fixture, id);
+                if enabled && test_fixture {
+                    panic!("H-SKILL-01 testFixture 不能启用为生产来源: {id}");
+                }
+                if !bases.insert(base.to_string()) {
+                    panic!("H-SKILL-01 静态来源 base 重复: {id}");
+                }
+            }
+            "relay" => {
+                relay_count += 1;
+                if id != "ph-relay"
+                    || !enabled
+                    || test_fixture
+                    || source.get("base").and_then(Value::as_str)
+                        != Some("https://update.404token.xyz/__codex_update__/skill-hub/")
+                {
+                    panic!("H-SKILL-01 Relay 来源身份无效");
+                }
+                let base = source
+                    .get("base")
+                    .and_then(Value::as_str)
+                    .expect("H-SKILL-01 Relay 缺少 base");
+                validate_skill_hub_base(base, true, false, id);
+                if !bases.insert(base.to_string()) {
+                    panic!("H-SKILL-01 静态来源 base 重复: {id}");
+                }
+            }
+            "github" => {
+                github_count += 1;
+                if id != "github" || !enabled || test_fixture || source.get("base").is_some() {
+                    panic!("H-SKILL-01 GitHub 来源身份无效");
+                }
+            }
+            _ => panic!("H-SKILL-01 来源 kind 不支持: {kind}"),
+        }
+    }
+
+    if relay_count != 1 || github_count != 1 {
+        panic!("H-SKILL-01 来源目录必须有一个合法启用的 Relay 和一个合法启用的 GitHub");
+    }
+}
+
+fn validate_skill_hub_base(base: &str, require_skill_hub_path: bool, test_fixture: bool, id: &str) {
+    if base.len() > 512
+        || !base.starts_with("https://")
+        || !base.ends_with("/skill-hub/")
+        || base.contains(['?', '#', '@'])
+    {
+        panic!("H-SKILL-01 来源 base 边界无效: {id}");
+    }
+    let authority_and_path = &base["https://".len()..];
+    let (authority, path) = authority_and_path
+        .split_once('/')
+        .unwrap_or_else(|| panic!("H-SKILL-01 来源 base 缺少路径: {id}"));
+    if require_skill_hub_path && !path.ends_with("skill-hub/") {
+        panic!("H-SKILL-01 来源 base 路径无效: {id}");
+    }
+    if authority.is_empty()
+        || authority.contains(':')
+        || authority.contains("..")
+        || !authority.contains('.')
+        || authority.parse::<IpAddr>().is_ok()
+    {
+        panic!("H-SKILL-01 来源必须使用 HTTPS 公网域名: {id}");
+    }
+    let reserved = authority == "example"
+        || authority.ends_with(".example")
+        || authority.ends_with(".invalid")
+        || authority.ends_with(".test");
+    if reserved != test_fixture {
+        panic!("H-SKILL-01 保留域名必须显式标记 testFixture: {id}");
+    }
+    if test_fixture && !id.starts_with("cn-mirror-") {
+        panic!("H-SKILL-01 testFixture 只能用于国内来源: {id}");
+    }
 }
 
 fn required_manifest_dir() -> PathBuf {

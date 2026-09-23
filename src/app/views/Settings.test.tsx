@@ -298,6 +298,13 @@ describe("Settings runtime contract", () => {
     const sourceGroup = screen.getByRole("radiogroup", {
       name: CATALOG["zh-CN"]["settings.codexPayload.source.header"],
     });
+    expect(
+      within(sourceGroup).queryByRole("radio", {
+        name: new RegExp(
+          `^${CATALOG["zh-CN"]["settings.codexPayload.source.mirror"]}`,
+        ),
+      }),
+    ).not.toBeInTheDocument();
     const relayUrl = screen.getByRole("textbox", {
       name: CATALOG["zh-CN"]["settings.codexPayload.relayUrl"],
     });
@@ -418,32 +425,20 @@ describe("Settings runtime contract", () => {
     expect(screen.getByRole("button", { name: "清除管理记录" })).toBeInTheDocument();
   });
 
-  it("ignores a late hydrate after the user already edited", async () => {
-    const user = userEvent.setup();
+  it("hides the legacy Codex mirror source choice", async () => {
     const load = deferred<AppSettings>();
     api.getSettings.mockReturnValueOnce(load.promise);
-    // First paint uses defaults; we still lock with inert, so wait for hydrate then edit,
-    // and separately verify the saver path via a second delayed hydrate is a unit concern.
-    // Here: hydrate once, edit source, ensure saved value sticks.
     renderSettings();
     load.resolve(settings({ source: "auto" }));
     await waitFor(() => expect(screen.queryByText("正在加载设置…")).not.toBeInTheDocument());
 
-    await user.click(
-      within(screen.getByRole("radiogroup", { name: "来源策略" })).getByRole("radio", {
-        name: /^国内镜像/,
-      }),
-    );
-    await waitFor(() =>
-      expect(api.setSettings).toHaveBeenCalledWith(
-        expect.objectContaining({ codexPayloadSourceKind: "mirror" }),
-      ),
-    );
+    const sourceGroup = screen.getByRole("radiogroup", { name: "来源策略" });
     expect(
-      within(screen.getByRole("radiogroup", { name: "来源策略" })).getByRole("radio", {
-        name: /^国内镜像/,
-      }),
-    ).toHaveAttribute("aria-checked", "true");
+      within(sourceGroup).queryByRole("radio", { name: /^国内镜像/ }),
+    ).not.toBeInTheDocument();
+    expect(within(sourceGroup).getByRole("radio", { name: /^自动/ })).toBeInTheDocument();
+    expect(within(sourceGroup).getByRole("radio", { name: /^Relay/ })).toBeInTheDocument();
+    expect(within(sourceGroup).getByRole("radio", { name: /^GitHub/ })).toBeInTheDocument();
   });
 
   it.each(SAFETY_FLOW_LANGS)(

@@ -49,6 +49,8 @@ pub enum SignerError {
     OutcomeUnknown(String),
     #[error("local report error: {0}")]
     Report(String),
+    #[error("Sub2API error: {0}")]
+    Sub2Api(String),
 }
 
 impl SignerError {

@@ -20,6 +20,7 @@ if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
 $arguments = @(
     '-NoProfile',
     '-ExecutionPolicy', 'Bypass',
+    '-WindowStyle', 'Hidden',
     '-File', $installer,
     '-PackRoot', $packRoot,
     '-IncludeNonDefault',

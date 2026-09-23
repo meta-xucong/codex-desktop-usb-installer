@@ -4,6 +4,7 @@ import type {
   DownloadProgress,
   HistoricalInstallSelection,
   HistoricalResumeExpectation,
+  OperationPhase,
   OperationResumeContext,
 } from "../../shared/types";
 import type { FailureSurface } from "../errorCopy";
@@ -50,6 +51,7 @@ export function ProgressScreen({
   onResume,
   onPause,
   onCancel,
+  showControls = true,
 }: {
   scene: string;
   scopeRef: RefObject<HTMLDivElement | null>;
@@ -68,6 +70,8 @@ export function ProgressScreen({
   onResume: () => void;
   onPause: () => void;
   onCancel: () => void;
+  /** Hide pause/cancel for update channels that expose progress but no stop API. */
+  showControls?: boolean;
 }) {
   const { t } = useI18n();
 
@@ -85,11 +89,22 @@ export function ProgressScreen({
       : 0;
   const pct = known ? Math.round(paused ? snapPct : dlPct) : null;
   const barPct = paused ? snapPct : dlPct;
+  const phaseCode: OperationPhase =
+    snap?.phase ??
+    (!paused && snap && snap.total > 0 && snap.downloaded >= snap.total
+      ? "finishing"
+      : snap
+        ? "downloading"
+        : "preparing");
+  const installStarted = ["verifying", "applying", "committing", "finishing"].includes(
+    phaseCode,
+  );
   // Bytes are in → the uninterruptible install phase (gate/quit/atomic swap on
   // mac, sideload/extract on Windows). Say so and drop the dead buttons rather
   // than leave them greyed for no visible reason.
   const finishing =
-    !paused && Boolean(snap && snap.total > 0 && snap.downloaded >= snap.total);
+    !paused &&
+    (installStarted || Boolean(snap && snap.total > 0 && snap.downloaded >= snap.total));
   const uninterruptible = failure?.code === "download_stop_uninterruptible";
   // Pause only makes sense mid-transfer; cancel is the "abandon" out and works
   // through the preparing phase too (a backend abort checkpoint honors it), but
@@ -98,17 +113,24 @@ export function ProgressScreen({
     !paused &&
     !uninterruptible &&
     Boolean(dl && dl.total > 0 && dl.downloaded < dl.total) &&
+    !installStarted &&
     !downloadStopBusy;
   const canCancel =
-    !paused && !finishing && !uninterruptible && !downloadStopBusy;
+    !paused && !finishing && !installStarted && !uninterruptible && !downloadStopBusy;
 
   const phase = paused
     ? t("progress.paused.title")
-    : finishing
-      ? t("progress.finishing")
-      : snap
-        ? t("progress.downloadingFrom", { source: snap.source })
-        : t("progress.preparing");
+    : phaseCode === "downloading" && snap
+      ? t("progress.downloadingFrom", { source: snap.source })
+      : phaseCode === "preparing" || phaseCode === "idle"
+        ? t("progress.preparing")
+        : phaseCode === "verifying"
+          ? t("progress.verifying")
+          : phaseCode === "applying"
+            ? t("progress.applying")
+            : phaseCode === "committing"
+              ? t("progress.committing")
+              : t("progress.finishing");
 
   return (
     <div className="pop">
@@ -149,6 +171,7 @@ export function ProgressScreen({
             aria-valuemax={100}
             aria-valuenow={pct ?? undefined}
             aria-valuetext={pct !== null ? `${pct}% · ${phase}` : phase}
+            data-testid="install-progress-bar"
           >
             <div
               className={`bar-fill${pct === null ? " indeterminate" : ""}`}
@@ -161,39 +184,41 @@ export function ProgressScreen({
               {!paused && dlSpeed > 0 ? ` · ${mib(dlSpeed)}/s` : ""}
             </div>
           ) : null}
-          <div className="progress-actions">
-            {paused ? (
+          {showControls ? (
+            <div className="progress-actions">
+              {paused ? (
+                <button
+                  className="btn primary"
+                  onClick={onResume}
+                  disabled={downloadStopBusy}
+                >
+                  <Icon name="play" />
+                  {t("progress.resume")}
+                </button>
+              ) : (
+                <button
+                  className="btn ghost"
+                  onClick={onPause}
+                  disabled={!canPause}
+                >
+                  <Icon name="pause" />
+                  {downloadStop === "pause"
+                    ? t("progress.pausePending")
+                    : t("progress.pause")}
+                </button>
+              )}
               <button
-                className="btn primary"
-                onClick={onResume}
-                disabled={downloadStopBusy}
+                className="btn danger"
+                onClick={onCancel}
+                disabled={downloadStopBusy || (!paused && !canCancel)}
               >
-                <Icon name="play" />
-                {t("progress.resume")}
+                <Icon name="close" />
+                {downloadStop === "cancel"
+                  ? t("progress.cancelPending")
+                  : t("progress.cancel")}
               </button>
-            ) : (
-              <button
-                className="btn ghost"
-                onClick={onPause}
-                disabled={!canPause}
-              >
-                <Icon name="pause" />
-                {downloadStop === "pause"
-                  ? t("progress.pausePending")
-                  : t("progress.pause")}
-              </button>
-            )}
-            <button
-              className="btn danger"
-              onClick={onCancel}
-              disabled={downloadStopBusy || (!paused && !canCancel)}
-            >
-              <Icon name="close" />
-              {downloadStop === "cancel"
-                ? t("progress.cancelPending")
-                : t("progress.cancel")}
-            </button>
-          </div>
+            </div>
+          ) : null}
         </div>
       </div>
     </div>

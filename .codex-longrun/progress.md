@@ -125,3 +125,126 @@
 - 2026-09-03：重建 v0.5.5 正式 U 盘目录并同步 23 个非 MSIX 文件；`verify-usb.ps1 -SkipNetwork`、`verify-oneclick-usb.ps1 -SkipNetwork -SkipSignature`、两个 PE `requireAdministrator` 清单校验均通过。入口 SHA-256 `d834c4c6708a17c7d06838ff0f969b26b0202d94b44b16498d80b0404a41ffe4`，管理器 SHA-256 `7b1554329feb82822821bd8f11b43907df3d63d3987b727494cca8e9108e66f3`，MSIX SHA-256 `ab0feacc74e982742736da4a7f1d2b59e9fabaa3641606545d3064927da02b1e`。真实 Windows AppX 卸载仍需目标机验收。
 - 2026-09-03：根据 v0.5.5 日志继续收口安装/卸载：USB 管理器及 PowerShell 子进程现在同时验证 `TokenElevation`、完整/默认 `TokenElevationType` 和有效 Administrators SID；安装错盘回滚、数据卷冲突清理与显式卸载共用窄兼容逻辑，遇 `0x80073CFA` 或旧模块缺少 `PreserveApplicationData` 参数时只对同一当前用户包去掉该标记重试，普通权限/策略错误仍失败，并对包内数据不保证保留给出告警。
 - 2026-09-03：新增缺少 Preserve 参数的安装回滚与卸载模拟回归；引擎 `cargo test` 122/122、src-tauri `cargo test` 187/187、Windows MSVC target `cargo check`、TypeScript/lint、前端 29 文件/275 测试、发布 2 文件/56 测试、离线 bundle 均通过。重新构建 v0.5.6 并从 next18 同步正式 `release/usb-oneclick`（24 文件/23 校验项）；入口 SHA-256 `d834c4c6708a17c7d06838ff0f969b26b0202d94b44b16498d80b0404a41ffe4`，管理器 `b89c4ad5e4e6595fa5e38ef6e49c337673f2f15e7827bfb514eca5521760a830`，真实 MSIX `ab0feacc74e982742736da4a7f1d2b59e9fabaa3641606545d3064927da02b1e`；正式校验和两个 PE `requireAdministrator` 检查通过。真实 Windows AppXVolume/UAC 仍需目标机验收。
+
+## 2026-09-21 G39.4 complete delivery rebuild
+
+- Signer audit confirmed the single `注册账号并签名` action, removable-volume serial display, generated `USB-xxxx` asset number display, automatic administrator credential loading, fixed `unified-api-internal` group, one group-scoped API key, and server-conflict retry allocation.
+- Recovered the trusted production administrator credential only in the build process from the existing embedded signer; the new signer embeds it, while no raw key or `sub2api-config.json` is published beside the EXE.
+- Generated `release-profiles/usb-v0.5.24-g39.4-20260921-r6-key216.json`; rebuilt the manager/launcher with `SignedRequired`; bundle and signer bind to `releaseId=g39.4-20260921-r6`, `keyId=prod-2026-01`, and public-key digest `216ae3583c6895d0cd00338b8e9624c1a91941a1d62637705420d3fdad545c80`.
+- Complete USB directory: `release/usb-oneclick-g39.4-20260921-r6-final`; signer directory: `release/usb-license-signer-gui-v0.5.24-g39.4-r6-20260921-embedded`.
+- Archives: `release/CodexUsb-OneClick-G39.4-v0.5.24-20260921-r6.zip` and `release/CodexUsb-LicenseSigner-G39.4-v0.5.24-20260921-r6-embedded.zip`.
+- Physical NTFS U-disk sign/install/uninstall acceptance remains device-bound. CCSwitch isolated launch was not repeated because an unrelated external single-instance process already owns port 15721; final root/embedded payloads match the previously runtime-tested CCSwitch hash.
+
+## 2026-09-21 G39.5/r7 final delivery rebuild
+
+- Corrected the CCSwitch production build path to use the Tauri bundled release build, eliminating the stale development/localhost page that caused `localhost` connection refusal after installation. New CCSwitch SHA-256: `D9656D97BF0EB663A5EA090D965573C86B7774633D1E2D00971B4428C7BB5A55`.
+- Rebuilt the final manager/launcher and copied the updated product into the complete package. Final manager SHA-256: `33A21F29B8F5289A5FEC17D3FC71ABB1A0DDF959EAC899F0A746883DCC0F54B1`.
+- Final complete USB directory: `release/usb-oneclick-g39.5-20260921-r7-final-rebuilt` (289 files, 1,317,242,814 bytes). The older sibling `...-final` is an intermediate artifact and must not be used.
+- Final signer directory: `release/usb-license-signer-gui-v0.5.24-g39.5-r7-20260921-embedded`; admin credential is compile-time embedded, no `sub2api-config.json` sidecar is shipped, and the single `注册账号并签名` workflow remains in place.
+- The USB verifier, full one-click verifier, signing-pair verifier, manifest/hash cross-check and forbidden-secret scan all passed. Signer tests passed 48 library + 4 GUI tests; signer clippy and rustfmt checks passed. Manager tests passed 436/436; CCSwitch frontend passed 223/223 serially.
+- The nested CCSwitch Rust suite passed 1,092 tests; one test was blocked by the unrelated pre-existing CCSwitch process occupying localhost port 15721, and the one Windows temp-path flaky test passed when rerun alone. This remains an external workstation condition, not a package verification failure.
+- Physical NTFS U-disk registration/sign/install/update/uninstall and isolated CCSwitch GUI startup remain target-device acceptance items; no admin key or credential value was printed into the log.
+
+## 2026-09-22 G39.5/r8 model-catalog and field-repair implementation
+
+- Implemented the native Codex model catalog bridge through the confirmed official `model_catalog_json` configuration field. The manager fetches `https://404token.xyz/v1/models` with the signed device key, preserves all vendors, merges only stable/latest/valid-date aliases, keeps the raw upstream slug, and never writes the API key to catalog/config/logs.
+- Added background refresh and a manual `刷新模型列表` action to the offline USB UI, plus safe stale-cache behavior, provider binding checks, managed-config conflict detection, malformed-block protection, and uninstall cleanup limited to this bridge's identity-marked files.
+- Added two progress surfaces: real byte download progress and an indeterminate install-stage bar with localized verifying/applying/committing labels. Added bounded curl retry, portable extraction retry, console-window hiding for the managed Codex process tree, and uninstall transaction reconciliation.
+- Re-ran targeted checks: model catalog 7/7, install transaction 13/13, command layer 27/27, Windows process 4/4, download 7/7, portable extraction 28 passed + 1 intentionally ignored real-MSIX test, TypeScript, formatter, focused frontend 82/82, and `git diff --check` all passed. Windows x64/custom-protocol target check passed with one pre-existing dead-code warning.
+- Rebuilt `release/usb-oneclick-g39.5-20260922-r8-model-catalog`; package verifier, payload verifier, full one-click verifier, signing-pair verifier, manifest/hash cross-check, CCSwitch product verifier, and administrator PE manifest checks passed. The existing r7 embedded-key signer was reused because signer source was unchanged and the current shell intentionally did not expose the administrator Key.
+- Remaining acceptance is physical: copy the r8 directory and the validated r7 embedded-key signer directory to an NTFS removable drive, then run registration/sign/install/launch/model-refresh/update/uninstall with 360 state recorded. This workspace cannot prove those device-bound Windows and 404token production steps.
+
+## 2026-09-22 G39.5/r8 final regression and delivery
+
+- Full manager regression passed: `cargo test --manifest-path src-tauri/Cargo.toml --lib -- --test-threads=1` = 445 passed, 3 ignored; frontend = 32 files / 361 tests; `npm run check`, `npm run lint`, manager/engine rustfmt and Windows x64 target check passed.
+- The engine full suite initially exposed 17 fixture failures because the host has no `E:` drive and `Join-Path` resolves a not-yet-mounted drive before AppX registration. Replaced only the generated lexical path combinations with `[System.IO.Path]::Combine`; after the fix engine = 179 passed, 1 intentionally ignored real-MSIX test.
+- Rebuilt `release/setup` and final complete directory `release/usb-oneclick-g39.5-20260922-r8-final`; final directory has 289 files / 1,317,441,470 bytes. Final hashes: launcher `a9ce2475d6f2912aeb00a604da68cfcd8d2ba0a1291a0c3bc8a0bf4f2903c464`, manager `d49089db8406546fe7b3b60bec954a7abf576efbff650a2772a17a1ab17cf5ccf`, CCSwitch `d9656d97bf0eb663a5ea090d965573c86b7774633d1e2d00971b4428c7bb5a55`, MSIX `ab0feacc74e982742736da4a7f1d2b59e9fabaa3641606545d3064927da02b1e`.
+- Rebuilt the signer in the same PowerShell process as Cargo so `CODEX_404TOKEN_ADMIN_API_KEY` reaches `option_env!`; verified the EXE contains the same embedded credential hash as the prior validated signer. Final signer directory: `release/usb-license-signer-gui-v0.5.24-g39.5-r7-20260922-final-embedded`, 8 files / 5,035,151 bytes, EXE SHA-256 `6dac6e4fbf4edf826bb166624eea64b63bfc4ca507459e94d36c7073ff7dd792`.
+- Final package, payload, one-click, signing-pair, CCSwitch, PE-manifest and startup smoke gates passed. ZIP archives were generated and their central directories contain all required entries: USB SHA-256 `30b41e18851343e0e90a10e62414c8739060a8e1c1576088dfcc68e4a92170c0`, signer SHA-256 `e090a9551de844e82e62a6cc238df7b6535cd634968692c6f07a3602445695a4`.
+- Remaining acceptance is physical: copy the final directory pair to an NTFS removable drive and run registration/sign/install/launch/model-refresh/update/uninstall with 360 state recorded. The external CCSwitch process owning port 15721 must be closed before an isolated GUI smoke; it was not touched automatically.
+
+## 2026-09-22 G39.5/r9 unified-api-internal catalog and package sync
+
+- Synchronized the non-secret CCSwitch provider catalog name to `404TOKEN（unified-api-internal）` and removed the fixed `fallbackModels` list; runtime discovery remains `/v1/models` with one injected API key.
+- Tightened the CCSwitch product verifier and patch smoke checks to require the unified group label, runtime model source, no model whitelist/fallback list, and an API key requirement; strict-mode PowerShell property access is handled safely.
+- Rebuilt `release/ccswitch-product-g39.5-20260922-r9-unified-api` from the existing patched binary (SHA-256 `D9656D97BF0EB663A5EA090D965573C86B7774633D1E2D00971B4428C7BB5A55`), then rebuilt the manager and complete U-disk directory `release/usb-oneclick-g39.5-20260922-r9-unified-api-final2` (289 files).
+- r9 CCSwitch static/network verification passed: `/health` returned 200 and unauthenticated `/v1/models` returned 401. Manager/USB `SignedRequired` binding, payload, one-click, CCSwitch, PE-manifest, and signing-pair preflight all passed with the existing validated embedded-key signer.
+- Generated ZIP `release/CodexUsb-OneClick-G39.5-v0.5.24-20260922-r9-unified-api.zip` (SHA-256 `97E8D19425F7DB650BA22D2D7B2D60BCED7BFFC62B0D0A071F7379180EC31BB6`) with the complete r9 directory as its top-level entry; archive listing contains the launcher, manager, CCSwitch catalog, payload, and verification files.
+- Target-device registration/sign/install/launch/model-refresh/update/uninstall and isolated CCSwitch GUI smoke remain external acceptance items; no real administrator/API credential was used or printed.
+
+## 2026-09-22 G39.5/r10 USB installer UX and startup-state repair
+
+- Removed the duplicate indeterminate install-stage bar from both the shared install progress screen and the USB payload-update surface; each operation now presents one progress bar with the phase text carrying the install/finishing state.
+- Made native model refresh bounded and observable: the gateway request uses an 8-second connect / 20-second total native timeout, the renderer has a 20-second watchdog, installation completion triggers a forced refresh, and ready/stale/skipped/failed outcomes are shown in a dedicated status banner.
+- Fixed the restart race that labeled the current USB Codex as installed elsewhere: path normalization accepts Windows device prefixes, the renderer treats a matching current USB portable tree as owned even when the first status snapshot is stale, and it re-reads `win_status` after USB authorization becomes live.
+- Removed the unplanned 404token account password card from the USB home screen; the account backend remains isolated and unused by the one-click flow.
+- Regression evidence: offline UI 32/32; root frontend suite `npx vitest run src` 364/364; `npm run check`, production renderer build, focused ESLint, model catalog Rust tests 7/7; the full root `npm test` invocation also scanned the independent CCSwitch tree and reported 37 pre-existing alias/dependency-import failures, while its root tests still passed.
+- Rebuilt 289-file `release/usb-oneclick-g39.5-20260922-r10-ui-model-status-final`; manager SHA-256 is `07B6D46BDF6292EFD7F7D435077DACF6549A3A5A3AE49AACE7981879F486C4D0`. ZIP `release/CodexUsb-OneClick-G39.5-v0.5.24-20260922-r10-ui-model-status.zip` has SHA-256 `98DCACC8FF39E1F9C5F9A0CBE07F94599FCF1F6DE3BC04EE7AC080B5B378BEA0`. USB, one-click, CCSwitch static/network, PE-manifest and signing-pair gates passed.
+- Physical NTFS U-disk registration/sign/install/model-refresh/update/uninstall and isolated CCSwitch GUI smoke remain target-device acceptance items.
+
+## 2026-09-22 G39.5/r11 fresh EXE and signer delivery
+
+- Generated a new formal USB signing profile `release/usb-signing-release-profile-g39.5-20260922-r11.json` bound to `releaseId=g39.5-20260922-r11`, `keyId=prod-2026-01`, and public-key digest `216ae3583c6895d0cd00338b8e9624c1a91941a1d62637705420d3fdad545c80`.
+- Rebuilt the requireAdministrator USB installer/manager from the current renderer and Rust sources. New manager SHA-256: `4F894F455364C4E0EF82A977550F8F8F2D7F56E29624A57B8CE4518B65B2755A`; launcher/setup SHA-256: `A9CE2475D6F2912AEB00A604DA68CFCD8D2BA0A1291A0C3BC8A0BF4F2903C464`.
+- Rebuilt the GUI signer in a fresh Cargo target and output directory: `release/usb-license-signer-gui-v0.5.24-g39.5-r11-20260922-fresh`; its manifest confirms compile-time embedded administrator credential, matching portable vault, and r11 release binding. Signer EXE SHA-256: `F922D125C0334187D8B31F667596D34944F8BEC2C718355DAB75505F534C74F2`.
+- Generated the complete fresh USB directory `release/usb-oneclick-g39.5-20260922-r11-fresh` (289 files, 1,317,438,744 bytes) and archive `release/CodexUsb-OneClick-G39.5-v0.5.24-20260922-r11-fresh.zip` (1,259,250,753 bytes; SHA-256 `CF754FDB4953E7AB7CC8D72087C71D06DCA0BF65EEFF582F852C1286957ED818`). Payload SHA-256 remains `AB0FEACC74E982742736DA4A7F1D2B59E9FABAA3641606545D3064927DA02B1E`.
+- Packaged the signer separately as `release/CodexUsb-LicenseSigner-G39.5-v0.5.24-20260922-r11-fresh.zip` (2,200,833 bytes; SHA-256 `16BFB98F22592237874F51D8E7A8789EB70FBB7B36A5DD38A3F9AF844EC6B359`; 9 entries).
+- Fresh r11 static and network gates passed: package/payload/one-click verification, CCSwitch product verification, `/health` 200, unauthenticated `/v1/models` 401, PE `requireAdministrator` checks, signing-pair preflight, profile/portable-vault binding, and archive generation.
+- Physical NTFS U-disk registration/sign/install/model-refresh/update/uninstall and isolated CCSwitch GUI smoke remain target-device acceptance items.
+
+## 2026-09-22 G39.5/r12 install-stall and second-stage-uninstall repair
+
+- 修复 Windows 便携回退安装在“正在替换程序文件”阶段长时间假死的问题：MSIX 解压/复制尚未发生首次安装根目录替换前，状态保持为可中断的 Applying；只有真正进入 MSIX 注册或原子替换边界后才进入 Committing，因此慢速 U 盘期间可见正确阶段且不会被错误阻止关闭。
+- 修复二阶段卸载交接竞态：已授权的卸载 handoff 在 Tauri/WebView2 延迟退出期间保留代次 ID，重复完成调用保持幂等；显式完成后增加有界退出看门狗，避免管理器窗口无法退出而只能强关。
+- 修复 Windows finalizer 启动命令的编码/引号脆弱性：Detached PowerShell 现在使用 UTF-16LE `-EncodedCommand`，启动确认等待从 10 秒扩大为 30 秒；复杂路径、中文路径和特殊字符不再使 finalizer 在写入 ready 标记前退出。
+- 修复“主卸载已移除安装根但旧 NewInstalled 事务仍阻塞二阶段”的恢复策略：当新路径和备份均不存在时，仅清理已落地的 bookkeeping journal，不重放任何文件移动；不完整或仍有恢复路径的事务继续保留并阻断。
+- 全量 Rust 回归：447 passed / 3 ignored；Windows x64/custom-protocol target check、TypeScript、ESLint、diff check 通过。
+- 生成新的正式绑定 profile `release/usb-signing-release-profile-g39.5-20260922-r12-install-recovery.json`；重建 manager/launcher 和完整 U 盘目录 `release/usb-oneclick-g39.5-20260922-r12-install-recovery`（289 文件，1,317,353,472 字节）。Manager SHA-256 `B3DBAC10DFC27BD2A2858A28882E8E969716E77AF394BD53D247041B35C18A8D`，入口 SHA-256 `A9CE2475D6F2912AEB00A604DA68CFCD8D2BA0A1291A0C3BC8A0BF4F2903C464`，MSIX SHA-256 `AB0FEACC74E982742736DA4A7F1D2B59E9FABAA3641606545D3064927DA02B1E`。
+- 刷新签名器发布目录 `release/usb-license-signer-gui-v0.5.24-g39.5-r12-20260922-install-recovery`，保留已验证的嵌入式签名器二进制（本轮签名器源码未改动），更新 profile/manifest/vault 绑定；签名器 SHA-256 `F922D125C0334187D8B31F667596D34944F8BEC2C718355DAB75505F534C74F2`。
+- 完整 U 盘 ZIP `release/CodexUsb-OneClick-G39.5-v0.5.24-20260922-r12-install-recovery.zip` SHA-256 `08AE0767D39524C532F76ACA3FF04A62FB5D93F44968464BFC25AB35731EEE91`；签名器 ZIP `release/CodexUsb-LicenseSigner-G39.5-v0.5.24-20260922-r12-install-recovery.zip` SHA-256 `888F555EEA3282593CC149ED2BE07E66844D2312589AD4E11131FBF0B89F656C`。包、载荷、完整一键验证、签名配对、PE requireAdministrator 清单、ZIP 中心目录均通过。
+- 物理 NTFS U 盘注册/签名/安装/更新/卸载仍需在测试机执行；本工作区不能替代真实 U 盘和 Windows AppX/文件锁环境验收。
+
+## 2026-09-22 G39.5/r13 portable extraction root-cause repair
+
+- 根因已从日志和实际 MSIX 结构确认：旧便携回退先把整个 802 MB 压缩包解压到 U 盘 `staging/extracted`（约 1.96 GB），再把 `app` 目录完整复制到 `staging/payload`，同一批大文件在慢速 U 盘上被写两遍；这段路径没有解压进度事件，所以界面长期停在“正在替换程序文件”，日志也停在 `committing` 前，容易被误判为事务死锁。
+- `prepare_portable_payload` 现在读取 `AppxManifest.xml` 的权威 `Application@Executable`，只把其所在目录树直接流式解压到一次性事务 payload；真实包的 `app/ChatGPT.exe` 因此只写一遍约 1.96 GB。保留无 Application 声明时的完整解压兼容回退，并对每 128 MiB/512 文件记录进度、校验每个文件长度和最终入口存在性。
+- 新增 `portable_payload_extraction_copies_only_declared_app_tree` 回归，证明包外 `assets` 不会被写入且不再创建完整 `extracted` 中间树；引擎全量测试 180 passed / 1 ignored，管理器回归 447 passed / 3 ignored。
+- 重新生成 profile `release/usb-signing-release-profile-g39.5-20260922-r13-portable-extract.json`，重建 manager/launcher 和完整目录 `release/usb-oneclick-g39.5-20260922-r13-portable-extract`（289 文件，1,317,364,224 bytes）。Manager SHA-256 `C1464191A9EB3A84283CF77B311173DC7E6FCDEDE373BFEAF37001C2AD3DF677`，launcher `A9CE2475D6F2912AEB00A604DA68CFCD8D2BA0A1291A0C3BC8A0BF4F2903C464`，MSIX `AB0FEACC74E982742736DA4A7F1D2B59E9FABAA3641606545D3064927DA02B1E`。
+- 签名器源码本轮未变更，复用已验证的嵌入式二进制并刷新 r13 profile/manifest/vault 绑定；签名器 EXE `F922D125C0334187D8B31F667596D34944F8BEC2C718355DAB75505F534C74F2`。USB ZIP `release/CodexUsb-OneClick-G39.5-v0.5.24-20260922-r13-portable-extract.zip`（1,260,595,938 bytes，SHA-256 `799393F47F0207CD21458617546C3767B64CF103BF366A0EFDBBF2B2261B0A83`）；签名器 ZIP `release/CodexUsb-LicenseSigner-G39.5-v0.5.24-20260922-r13-portable-extract.zip`（2,277,755 bytes，SHA-256 `7BF8ACCE06E29ABA890FF7FE20883303C307D853AD76345B774AE9541217CFAD`）。
+- 包、payload、完整 one-click、签名配对、CCSwitch、PE `requireAdministrator` 清单、ZIP 中心目录、TypeScript/ESLint、前端 364 测试、管理器 447 测试和引擎 180 测试均通过；另外用真实 r13 MSIX 运行了原先忽略的便携事务测试（本地存储 49.29 秒，通过且不启动 Codex/注册 AppX）。物理 NTFS U 盘安装仍需测试机验收。
+
+## 2026-09-22 G39.5/r14 extraction progress and one-click recharge
+
+- 接受“当前确实是慢速 U 盘，不重复按卡死审查”的补充信息；把优化范围收敛到可观测进度和写入效率。
+- 便携解压新增按 ZIP 应用文件总字节数的实时回调，安装页沿用同一条进度事件显示真实百分比/已写入字节；Applying 阶段的进度事件不会再把操作回退成 Downloading。
+- 解压改为可复用 1 MiB 缓冲区、按 4 MiB 或 200 ms 节流上报，并保留逐文件长度校验、入口存在校验和事务清理；这避免在慢速介质上产生过密 UI 事件，同时减少小块写入开销。
+- 安装管理器挂载紧凑的 404token 账户卡片：默认只显示充值码输入和“一键充值”，未登录时才按需展开密码；充值使用现有用户 JWT `/api/v1/redeem`，管理员密钥不进入管理器，400/409 会显示可操作的失败提示。
+- Rust 引擎 180/1 ignored、管理器 447/3 ignored、前端 32 文件/365 测试、TypeScript、ESLint、Windows x64 target check、格式和 diff check 均通过；新增解压进度单测通过。
+- 新正式包目录：`release/usb-oneclick-g39.5-20260922-r14-progress-recharge`（289 文件，1,317,433,148 字节），管理器 SHA-256 `DC75E35C0C1A050235E5211E3879E3573C29CAD81D1FE6399ED11F885DF85262`，入口沿用 `A9CE2475D6F2912AEB00A604DA68CFCD8D2BA0A1291A0C3BC8A0BF4F2903C464`，载荷沿用 `AB0FEACC74E982742736DA4A7F1D2B59E9FABAA3641606545D3064927DA02B1E`。
+- 新签名器目录：`release/usb-license-signer-gui-v0.5.24-g39.5-r14-20260922-progress-recharge`（8 文件，5,032,684 字节），复用已验证的嵌入式签名器二进制，SHA-256 `F922D125C0334187D8B31F667596D34944F8BEC2C718355DAB75505F534C74F2`；包/载荷/一键/签名配对/PE 清单校验通过。
+- 仍需测试机做真实 NTFS U 盘慢速安装、充值码成功/失败和管理员网络条件验收；本工作区没有冒充完成这些设备绑定步骤。
+
+## 2026-09-22 G39.5/r15 CCSwitch auto-provisioning and upstream model-refresh resilience
+
+- 根因确认：旧包虽然在管理器进程层面拿到了 U 盘绑定，但 CCSwitch 仍是旧二进制，未消费 `CCSWITCH_404TOKEN_DEVICE_KEY`，所以安装后不会自动写入/激活 CCSwitch 的 Codex provider；模型刷新也只有单次请求，404token 间歇性不可达时界面只显示笼统失败。
+- CCSwitch 源码已补齐 USB bootstrap：启动阶段读取管理器的短生命周期环境变量，在 SQLite 初始化后幂等写入并切换 `404token-sub2api` provider，保存/切换事务最多重试 3 次；USB 授权成功后由管理器隐藏主窗口并保留托盘进程，用户不再被弹到首页手动填 Key。新 CCSwitch 产物 SHA-256：`927AF2AA40E2F5E1B08ECEF90C9BA8063DFB9667007E4F7AF12395463E867378`。
+- 模型目录刷新改为 3 次有界重试（连接 8 秒、单次请求 20 秒、指数退避），401/403 明确提示“404token 上游拒绝授权”，超时/网络/无效响应明确提示“404token 上游不可达/返回无效，不是本地程序问题”，并保留旧目录；前端自动刷新等待窗口同步到 60 秒并显示上游故障提示。
+- 重新编译正式管理器并生成非 ZIP U 盘目录：`release/usb-oneclick-g39.5-20260922-r15-upstream-retry-tray`，289 文件、约 1,317,450,042 字节；管理器 SHA-256 `2E6E02CE3DBD43412EFC7DBCE16C8C68A5B11890F6742272C0B0ACCCCD829C38`，入口 `A9CE2475D6F2912AEB00A604DA68CFCD8D2BA0A1291A0C3BC8A0BF4F2903C464`，CCSwitch 根/嵌入副本均为 `927AF2AA40E2F5E1B08ECEF90C9BA8063DFB9667007E4F7AF12395463E867378`，MSIX 仍为 `AB0FEACC74E982742736DA4A7F1D2B59E9FABAA3641606545D3064927DA02B1E`。
+- 当前包继续使用已验证的 r14 SignedRequired 公钥/profile，与配套签名器 `release/usb-license-signer-gui-v0.5.24-g39.5-r14-20260922-progress-recharge` 做正式 pair 校验通过；本轮签名器源码未改变，因此没有冒险生成未带管理员 Key 的新签名器。
+- 回归证据：OfflineHome/managerApi 60/60；模型目录 7/7；CCSwitch manager 9/9；Windows window engine 5+1 helper；TypeScript check、release tests 56/56、offline bundle test、CCSwitch 静态验证、包内/仓库 one-click、payload、PE requireAdministrator、签名 pair 均通过。
+- 仍需测试机做真实 NTFS U 盘注册/签名/安装后 CCSwitch 托盘与真实 404token 模型刷新验收；本工作区不能替代设备绑定和上游生产网络条件。
+
+## 2026-09-22 G39.5/r16 404token account retry closure
+
+- 签名器 `Sub2ApiClient` 为安全建号补上稳定 `usb-provision-USB-*` 幂等键；`create-user` 遇到传输/超时/5xx/无效响应时，最多 3 次有界恢复，重发前先按同一 USB 编号/邮箱查询，若服务器已经落库则直接续作登录和用户 API key，避免重复建号；管理员分组和 USB 用户查询也采用 3 次安全 GET 重试。
+- 管理器 404token 登录、余额、用量、充值请求统一采用 3 次有界重试（8 秒连接、30 秒单次请求、500ms/1s 退避）；充值请求携带不含充值码明文的稳定 `Idempotency-Key`，并把最终网络错误明确标为 404token 上游不可达，不再让用户误判为本地安装失败；余额成功但用量失败时明确显示上游用量暂不可用。
+- 新增 signer 本地 HTTP recovery fixture（服务器已接受建号但返回 503 时不重复 POST）、幂等键断言，以及管理器 transient HTTP/网络耗尽夹具、重试分类和充值幂等键测试。
+- 当前源代码 release 编译通过；管理器重新构建并生成 `release/usb-oneclick-g39.5-20260922-r16-account-retry-manager`（289 文件，1,317,521,722 bytes），Manager SHA-256 `95711EE5FEA0BB375789075BF3FFDFF40C2C92E58F4F700C62A72ADA3888BDC0`。包内 verify-usb、仓库 one-click（InternalSigned）、payload、CCSwitch、PE manifest 和 signing-pair 校验均通过。
+- 生产签名器 EXE 本轮没有用未配置管理员 Key 的构建覆盖现有版本；源代码和无密钥 release 编译已验证，正式 signer 替换必须在保有原管理员 Key 的安全构建环境中执行。现有已验证 signer 保持不变，避免破坏已实测可用的真实建号链路。
+
+## 2026-09-22 G39.5/r16 final watchdog/package rebuild
+
+- 审计发现模型刷新最坏耗时是 3 次 20 秒请求加 500ms/1s 退避，共约 61.5 秒；前端 watchdog 从 60 秒调为 75 秒，避免把 404token 上游最终诊断误报为本地超时。
+- watchdog 改动后 `npm run check`、`npm run lint` 和 OfflineHome/managerApi 60/60 回归通过。
+- 重新构建 `release/setup/CodexAppManager.exe`，并生成最终非 ZIP 目录 `release/usb-oneclick-g39.5-20260922-r16-account-retry-manager-final`（289 文件，1,317,521,722 bytes）；Manager SHA-256 `9C216EAC5AF7EB2761699B4908003CE7DE8D4E592A82D4DD5CE7D10759A52BD8`。
+- 包内/仓库 one-click、payload、CCSwitch、PE 清单和签名配对校验全部通过；最终目录继续使用已验证的 r14 signer/profile pair。

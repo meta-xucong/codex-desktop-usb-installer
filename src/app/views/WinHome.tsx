@@ -1288,8 +1288,10 @@ export function WinHome({
     launchInFlightRef.current = true;
     setActionError(null);
     const generation = beginOperation("launch");
+    const codexLocale =
+      lang === "zh-CN" || lang === "zh-TW" ? lang : undefined;
     void managerApi
-      .winLaunch()
+      .winLaunch(codexLocale)
       .catch((cause) => {
         if (ownsOperation(generation)) setActionError(resolveFailure(cause, t));
       })

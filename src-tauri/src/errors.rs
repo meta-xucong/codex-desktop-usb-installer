@@ -41,6 +41,7 @@ pub enum ErrorKind {
     DiskSpace,
     DiskWrite,
     Permission,
+    UsbAuthorization,
     Signature,
     BundleIntegrity,
     Artifact,
@@ -61,6 +62,7 @@ impl ErrorKind {
             Self::DiskSpace => "disk_space",
             Self::DiskWrite => "disk_write",
             Self::Permission => "permission",
+            Self::UsbAuthorization => "usb_authorization",
             Self::Signature => "signature",
             Self::BundleIntegrity => "bundle_integrity",
             Self::Artifact => "artifact",
@@ -122,6 +124,22 @@ pub fn classify(message: &str) -> ErrorKind {
         || m.contains("拒绝访问")
     {
         return ErrorKind::Permission;
+    }
+    // A live lease/watchdog failure is an authorization-readiness problem,
+    // not proof that the package signature is invalid.  The old catch-all USB
+    // branch below turned `usb_license_gate` into the misleading
+    // "signature check failed" banner shown by the manager.  Keep explicit
+    // license/Authenticode failures in the signature bucket, but give lease
+    // and helper races their own stable code so the UI can tell the user to
+    // keep the USB connected and retry.
+    if m.contains("usb_watchdog_not_ready")
+        || m.contains("usb_watchdog_not_running")
+        || m.contains("未检测到有效 u 盘租约")
+        || m.contains("当前没有有效的 u 盘租约")
+        || (m.contains("usb_license_gate")
+            && (m.contains("helper=false") || m.contains("lease=false")))
+    {
+        return ErrorKind::UsbAuthorization;
     }
     if m.contains("usb_license_")
         || m.contains("usb_fingerprint_")
@@ -210,7 +228,7 @@ pub fn classify(message: &str) -> ErrorKind {
 }
 
 impl AppError {
-    fn code(&self) -> &'static str {
+    pub(crate) fn code(&self) -> &'static str {
         match self {
             Self::UnsupportedPlatform => "unsupported_platform",
             // Engine errors carry the real category — inferred from the opaque
@@ -326,6 +344,17 @@ mod tests {
         );
         assert_eq!(
             classify("codesign verification failed: invalid signature"),
+            ErrorKind::Signature
+        );
+        assert_eq!(
+            classify(
+                "update engine error: usb_license_gate phase=offline-payload-stage failed: \
+                 未检测到有效 U 盘租约或看门狗（status=authorized watchdog=running lease=true helper=false）"
+            ),
+            ErrorKind::UsbAuthorization
+        );
+        assert_eq!(
+            classify("usb_license_invalid phase=startup: Ed25519 signature verification failed"),
             ErrorKind::Signature
         );
         assert_eq!(

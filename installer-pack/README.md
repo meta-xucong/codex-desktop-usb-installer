@@ -25,32 +25,32 @@
 | 状态 | 数量 | 含义 |
 |---|---:|---|
 | `core-ready` | 25 | 复制后即可使用工作流说明和 Codex 原生能力，默认安装 |
-| `auto-installable-runtime` | 14 | 需要安装包提供的 Python 3.12、离线 wheelhouse 和本机健康检查 |
+| `auto-installable-runtime` | 15 | 需要安装包提供的 Python 3.12、离线 wheelhouse 和本机健康检查；包含 PDF 工具 |
 | `guided-config` | 7 | 需要用户在连接向导中配置 API、MCP 或网络服务 |
-| `unsupported` | 4 | 当前没有可验证的兼容入口或再分发依据，保持禁用 |
+| `unsupported` | 3 | 配置层面默认启用，但外部后端缺失时必须安全失败并明确报告 |
 
-默认脚本安装 25 个核心 Skill 和 7 个 Agent。安装其余可配置/可补运行时的 Skill（合计 46 个，仍排除 4 个
-unsupported）使用 `-IncludeNonDefault`；需要一键装入全部 50 个 Skill 时，使用安装包根目录的向导或
+默认脚本安装 43 个可直接使用、可自动准备运行时或可安全降级的 Skill 和 7 个 Agent；7 个 guided-config
+Skill 仍然复制到一键安装包中但保持关闭，待用户填入凭据或 MCP 配置。需要一键装入全部 50 个 Skill 时，使用安装包根目录的向导或
 `install-all.ps1`。
 
 ```powershell
 .\scripts\install-to-codex.ps1 -IncludeNonDefault
 ```
 
-只有在人工接受许可证和兼容风险后，才可再加 `-IncludeUnsupported` 将隔离审计源码也装入 Skill 根目录；
-它必须与 `-IncludeNonDefault` 同时使用。保留在能力包中不等于可安全启用或可合法再分发。
+`-IncludeUnsupported` 仍可控制是否复制三个外部后端 Skill；一键安装路径会复制它们并在配置中启用，
+但缺少后端时只返回不可用状态，不会伪造成功。PDF 已改为本项目自行维护的 MIT 工具实现。
 
 完整逐项清单见 [`manifest/skill-audit.json`](manifest/skill-audit.json)，其中每个 Skill 都有原始状态、
 整改后状态、依赖类型、版本、健康检查、启用条件和失败降级说明。
 
 ## 已知限制
 
-- 14 个 `auto-installable-runtime` Skill 所需的 CPython 3.12、52-wheel 离线依赖闭包、Node.js 20 和 Feishu npm
+- 15 个 `auto-installable-runtime` Skill 所需的 CPython 3.12、52-wheel 离线依赖闭包、Node.js 20 和 Feishu npm
   closure 已进入安装包；安装器会在目标机完成哈希校验、隔离环境安装和健康检查。
 - 7 个 `guided-config` Skill 需要真实凭据、模型、端点、飞书租户权限或本地锁定 npm cache；默认不启用，本轮也没有
   使用真实租户或付费 API 做端到端调用。
-- `canvas`、`healthcheck`、`node-connect`、`pdf-processing-toolkit` 共 4 个 Skill 保持禁用，分别受缺失运行时、
-  受控系统权限、设备后端协议和不可核验再分发许可限制。
+- `canvas`、`healthcheck`、`node-connect` 3 个外部 Skill 会写入启用配置，但没有后端或权限时必须明确安全失败；
+  `pdf-processing-toolkit` 已补齐自维护许可证、离线依赖和读写/提取/生成 smoke test。
 - 当前完整验收平台是 Windows x64、CPython 3.12 和 Codex CLI 0.147.0；Linux、macOS、Windows ARM64 及其他
   Python ABI 尚未进入发布矩阵。
 - 外部行情、基金、政策、公告和第三方网关会变化；离线契约测试不等于真实数据源、真实权限、计费和生产环境验收。

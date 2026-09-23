@@ -1,0 +1,15 @@
+[Unit]
+Description=Record a failed Codex relay sync for operator visibility
+
+[Service]
+Type=oneshot
+User=codexrelay
+Group=codexrelay
+ExecStart=/bin/sh -c 'logger -t codex-update-relay-sync "sync failed; inspect /srv/codex-update-relay/state/status.json and journalctl -u codex-update-relay-sync.service"'
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+RestrictAddressFamilies=AF_UNIX
+ReadWritePaths=/srv/codex-update-relay
+UMask=0022

@@ -1,4 +1,6 @@
-# Render absolute paths after installation. Keep unmet capabilities disabled until health checks pass.
+# Render absolute paths after installation. The installer-generated fragment includes all 50 Skills;
+# core-ready, auto-installable-runtime and unsupported entries default to enabled=true, while guided
+# credential/MCP entries remain disabled until their connection health checks pass.
 [[skills.config]]
 path = "__ABSOLUTE_SKILL_ROOT__\\image-2\\SKILL.md"
 enabled = false

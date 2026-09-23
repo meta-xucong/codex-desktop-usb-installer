@@ -1,8 +1,9 @@
 //! Independent, unsigned Skill Hub update layer.
 //!
 //! This module deliberately does not depend on USB guards, capability-pack
-//! installation, or the Codex payload updater.  The only shared primitive is
-//! the manager's OperationManager lock, supplied by the command boundary.
+//! installation, or the Codex payload updater.  It shares the manager's
+//! persisted proxy setting and OperationManager lock, supplied/read at the
+//! command boundary.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, OpenOptions};
@@ -13,33 +14,152 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Manager};
+use tokio::task::JoinSet;
+use url::Url;
 use uuid::Uuid;
 use zip::ZipArchive;
 
 use crate::app::oplock::OperationManager;
+use crate::app::settings_store::{AppSettings, ProxyMode};
+use crate::app::url_guard::validate_custom_proxy;
 use crate::errors::CommandError;
 
 const REPO: &str = "meta-xucong/skill_hub";
 const BRANCH: &str = "master";
-const RELAY_META: &str = "https://update.404token.xyz/__codex_update__/skill-hub/latest.json";
-const RELAY_ARCHIVE: &str = "https://update.404token.xyz/__codex_update__/skill-hub/archive.zip";
+const SOURCE_RESOURCE: &str = "skill_hub_sources.json";
+const BASE_MANIFEST_RESOURCE: &str = "skill_repo_base_manifest.json";
+const EMBEDDED_SOURCE_DIRECTORY: &[u8] = include_bytes!("../../resources/skill_hub_sources.json");
+const EMBEDDED_BASE_MANIFEST: &[u8] =
+    include_bytes!("../../resources/skill_repo_base_manifest.json");
+const RELAY_BASE: &str = "https://update.404token.xyz/__codex_update__/skill-hub/";
 const GITHUB_COMMITS: &str = "https://api.github.com/repos/meta-xucong/skill_hub/commits/master";
 const GITHUB_ARCHIVE: &str = "https://github.com/meta-xucong/skill_hub/archive/";
 const MAX_ARCHIVE: usize = 64 * 1024 * 1024;
 const MAX_ENTRIES: usize = 4096;
 const MAX_UNPACKED: usize = 256 * 1024 * 1024;
 const MAX_FILE: usize = 32 * 1024 * 1024;
-const NETWORK_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const NETWORK_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const NETWORK_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const NETWORK_METADATA_TIMEOUT: Duration = Duration::from_secs(8);
+const NETWORK_ARCHIVE_TIMEOUT: Duration = Duration::from_secs(20);
 const NETWORK_OPERATION_TIMEOUT: Duration = Duration::from_secs(45);
 const BASE_MANIFEST_SHA256: &str =
-    "e6c6a610b4bab5dc9001b3846c087bdaba83fcd8c26908fd6eabc135f4ca2a9c";
+    "949853010ebfe498c829a20936a3bfd1b2d4f15484de7c648f71bbc26e489e0b";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SourceKind {
+    Domestic,
     Relay,
     Github,
+}
+
+impl SourceKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Domestic => "domestic",
+            Self::Relay => "relay",
+            Self::Github => "github",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SkillRepoAttemptPhase {
+    Metadata,
+    Archive,
+    Verify,
+}
+
+impl SkillRepoAttemptPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Metadata => "metadata",
+            Self::Archive => "archive",
+            Self::Verify => "verify",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SkillRepoAttemptResult {
+    Ok,
+    Timeout,
+    Unavailable,
+    Http,
+    Invalid,
+    HashMismatch,
+    Cancelled,
+}
+
+impl SkillRepoAttemptResult {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Timeout => "timeout",
+            Self::Unavailable => "unavailable",
+            Self::Http => "http",
+            Self::Invalid => "invalid",
+            Self::HashMismatch => "hash-mismatch",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillRepoSourceAttempt {
+    pub source_id: String,
+    pub source_kind: SourceKind,
+    pub phase: SkillRepoAttemptPhase,
+    pub result: SkillRepoAttemptResult,
+    pub http_status: Option<u16>,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SkillHubSourceEntry {
+    id: String,
+    kind: SourceKind,
+    base: Option<String>,
+    priority: u32,
+    enabled: bool,
+    #[serde(default)]
+    test_fixture: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SkillHubSourceDirectory {
+    schema_version: u8,
+    channel: String,
+    sources: Vec<SkillHubSourceEntry>,
+}
+
+impl SkillHubSourceDirectory {
+    fn source(&self, source_id: &str) -> Option<&SkillHubSourceEntry> {
+        self.sources.iter().find(|source| source.id == source_id)
+    }
+
+    fn enabled_domestic(&self) -> Vec<SkillHubSourceEntry> {
+        let mut sources = self
+            .sources
+            .iter()
+            .filter(|source| source.enabled && source.kind == SourceKind::Domestic)
+            .cloned()
+            .collect::<Vec<_>>();
+        sources.sort_by_key(|source| (source.priority, source.id.clone()));
+        sources
+    }
+
+    fn enabled_source(&self, kind: SourceKind) -> Option<SkillHubSourceEntry> {
+        self.sources
+            .iter()
+            .find(|source| source.enabled && source.kind == kind)
+            .cloned()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +170,7 @@ pub struct SkillRepoExpected {
     pub branch: String,
     pub commit: String,
     pub source_kind: SourceKind,
+    pub source_id: String,
     pub archive_size: u64,
     pub archive_sha256: String,
 }
@@ -61,6 +182,7 @@ pub struct SkillRepoUpdateInfo {
     pub current_commit: Option<String>,
     pub latest_commit: String,
     pub source_kind: SourceKind,
+    pub source_label: String,
     pub archive_size: u64,
     pub archive_sha256: String,
     pub expected: SkillRepoExpected,
@@ -68,6 +190,7 @@ pub struct SkillRepoUpdateInfo {
     pub installable_count: u32,
     pub conflict_count: u32,
     pub skipped_count: u32,
+    pub attempts: Vec<SkillRepoSourceAttempt>,
     pub warning: Option<String>,
 }
 
@@ -245,6 +368,7 @@ struct HotError {
     code: &'static str,
     message: String,
     detail: Option<String>,
+    attempts: Vec<SkillRepoSourceAttempt>,
 }
 
 impl HotError {
@@ -253,6 +377,7 @@ impl HotError {
             code,
             message: message.into(),
             detail: None,
+            attempts: Vec::new(),
         }
     }
 
@@ -260,14 +385,28 @@ impl HotError {
         self.detail = Some(detail.into());
         self
     }
+
+    fn with_attempts(mut self, attempts: &[SkillRepoSourceAttempt]) -> Self {
+        self.attempts = attempts.to_vec();
+        self
+    }
 }
 
 impl From<HotError> for CommandError {
     fn from(value: HotError) -> Self {
+        let detail = if value.attempts.is_empty() {
+            value.detail
+        } else {
+            serde_json::to_string(&serde_json::json!({
+                "attempts": value.attempts,
+                "detail": value.detail,
+            }))
+            .ok()
+        };
         Self {
             code: value.code.to_string(),
             message: value.message,
-            detail: value.detail,
+            detail,
         }
     }
 }
@@ -275,6 +414,15 @@ impl From<HotError> for CommandError {
 fn invalid(message: impl Into<String>) -> HotError {
     HotError::new("SKILL_REPO_ARCHIVE_INVALID", message)
 }
+
+fn local_io_error(context: &str, error: impl std::fmt::Display) -> HotError {
+    HotError::new(
+        "SKILL_REPO_LOCAL_IO",
+        "本地 Skill Hub 数据写入失败，请检查权限和磁盘空间后重试。",
+    )
+    .with_detail(format!("{context}: {error}"))
+}
+
 fn io_error(context: &str, error: impl std::fmt::Display) -> HotError {
     HotError::new(
         "SKILL_REPO_LEDGER_INVALID",
@@ -294,6 +442,344 @@ fn state_dir() -> Result<PathBuf, HotError> {
 }
 fn target_root() -> Result<PathBuf, HotError> {
     Ok(home_dir()?.join(".agents").join("skills"))
+}
+
+fn source_invalid(message: impl Into<String>) -> HotError {
+    HotError::new("SKILL_REPO_SOURCE_INVALID", message)
+}
+
+fn valid_source_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+fn reserved_fixture_host(host: &str) -> bool {
+    host == "example"
+        || host.ends_with(".example")
+        || host.ends_with(".invalid")
+        || host.ends_with(".test")
+}
+
+fn validate_source_base(source: &SkillHubSourceEntry) -> Result<(), HotError> {
+    let Some(base) = source.base.as_deref() else {
+        return Err(source_invalid("静态 Skill Hub 来源缺少 base"));
+    };
+    if base.len() > 512 || !base.ends_with("/skill-hub/") {
+        return Err(source_invalid("Skill Hub 来源路径边界无效"));
+    }
+    let url = Url::parse(base).map_err(|_| source_invalid("Skill Hub 来源 URL 无效"))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| source_invalid("Skill Hub 来源缺少公网域名"))?;
+    if url.scheme() != "https"
+        || url.username() != ""
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.port().is_some()
+        || host.contains("..")
+        || host.parse::<std::net::IpAddr>().is_ok()
+        || !host.contains('.')
+    {
+        return Err(source_invalid(
+            "Skill Hub 来源必须是无凭据的 HTTPS 公网域名",
+        ));
+    }
+    if reserved_fixture_host(host) {
+        if source.kind != SourceKind::Domestic || !source.test_fixture {
+            return Err(source_invalid("保留测试域名只能用于显式 domestic fixture"));
+        }
+    } else if source.test_fixture {
+        return Err(source_invalid("测试 fixture 必须使用保留域名"));
+    }
+    Ok(())
+}
+
+fn validate_source_directory(directory: &SkillHubSourceDirectory) -> Result<(), HotError> {
+    if directory.schema_version != 1
+        || directory.channel != "skill-hub"
+        || directory.sources.is_empty()
+    {
+        return Err(source_invalid("Skill Hub 来源目录 schema 无效"));
+    }
+    let mut ids = HashSet::new();
+    let mut priorities = HashSet::new();
+    let mut relay_count = 0usize;
+    let mut github_count = 0usize;
+    let mut static_bases = HashSet::new();
+
+    for source in &directory.sources {
+        if !valid_source_id(&source.id)
+            || !ids.insert(source.id.clone())
+            || source.priority == 0
+            || !priorities.insert(source.priority)
+        {
+            return Err(source_invalid("Skill Hub 来源 ID 或 priority 重复/无效"));
+        }
+        match source.kind {
+            SourceKind::Domestic => {
+                let Some(suffix) = source.id.strip_prefix("cn-mirror-") else {
+                    return Err(source_invalid("国内来源 ID 必须是 cn-mirror-N"));
+                };
+                if suffix.is_empty() || !suffix.chars().all(|c| c.is_ascii_digit()) {
+                    return Err(source_invalid("国内来源 ID 序号无效"));
+                }
+                validate_source_base(source)?;
+                if source.enabled && source.test_fixture {
+                    return Err(source_invalid("测试 fixture 不能启用为生产来源"));
+                }
+                if let Some(base) = &source.base {
+                    if !static_bases.insert(base.clone()) {
+                        return Err(source_invalid("Skill Hub 静态来源 base 重复"));
+                    }
+                }
+            }
+            SourceKind::Relay => {
+                relay_count += 1;
+                if source.id != "ph-relay"
+                    || !source.enabled
+                    || source.test_fixture
+                    || source.base.as_deref() != Some(RELAY_BASE)
+                {
+                    return Err(source_invalid("菲律宾 Relay 来源目录身份无效"));
+                }
+                validate_source_base(source)?;
+                if let Some(base) = &source.base {
+                    if !static_bases.insert(base.clone()) {
+                        return Err(source_invalid("Skill Hub 静态来源 base 重复"));
+                    }
+                }
+            }
+            SourceKind::Github => {
+                github_count += 1;
+                if source.id != "github"
+                    || !source.enabled
+                    || source.test_fixture
+                    || source.base.is_some()
+                {
+                    return Err(source_invalid("GitHub 来源目录身份无效"));
+                }
+            }
+        }
+    }
+
+    if relay_count != 1 || github_count != 1 {
+        return Err(source_invalid(
+            "Skill Hub 来源目录必须包含一个合法启用的 Relay 和一个合法启用的 GitHub",
+        ));
+    }
+    Ok(())
+}
+
+fn parse_source_directory(bytes: &[u8]) -> Result<SkillHubSourceDirectory, HotError> {
+    let directory: SkillHubSourceDirectory = serde_json::from_slice(bytes)
+        .map_err(|_| source_invalid("Skill Hub 来源目录 JSON 无效"))?;
+    validate_source_directory(&directory)?;
+    Ok(directory)
+}
+
+fn source_resource_candidates(app: &AppHandle) -> Vec<(String, PathBuf)> {
+    let mut candidates = Vec::new();
+    let mut add = |label: &str, path: PathBuf| {
+        if !candidates.iter().any(|(_, existing)| existing == &path) {
+            candidates.push((label.to_string(), path));
+        }
+    };
+
+    // The USB build is a portable layout. Prefer the resources directory next
+    // to the actual running manager so a stale Cargo/Tauri resource directory
+    // cannot win over the release files the user launched.
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(parent) = executable.parent() {
+            add(
+                "portable-resources",
+                parent.join("resources").join(SOURCE_RESOURCE),
+            );
+            add("portable-sibling", parent.join(SOURCE_RESOURCE));
+        }
+    }
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        add("tauri-resource-dir", resource_dir.join(SOURCE_RESOURCE));
+    }
+    candidates
+}
+
+fn source_resource_error(
+    message: impl Into<String>,
+    stage: &str,
+    label: &str,
+    path: Option<&Path>,
+) -> HotError {
+    let path_text = path
+        .map(|value| value.display().to_string())
+        .unwrap_or_else(|| "<embedded>".into());
+    source_invalid(message).with_detail(format!(
+        "stage={stage}; candidate={label}; path={path_text}"
+    ))
+}
+
+fn source_directory(app: &AppHandle) -> Result<SkillHubSourceDirectory, HotError> {
+    let candidates = source_resource_candidates(app);
+    for (label, path) in &candidates {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(source_resource_error(
+                    "读取 Skill Hub 来源目录属性失败",
+                    "source-resource-stat",
+                    label,
+                    Some(path),
+                )
+                .with_detail(format!(
+                    "stage=source-resource-stat; candidate={label}; path={}; error={error}",
+                    path.display()
+                )))
+            }
+        };
+        if metadata_is_reparse(&metadata) {
+            return Err(source_resource_error(
+                "Skill Hub 来源目录不能是符号链接或重解析点",
+                "source-resource-reparse",
+                label,
+                Some(path),
+            ));
+        }
+        if !metadata.is_file() {
+            return Err(source_resource_error(
+                "Skill Hub 来源目录不是普通文件",
+                "source-resource-type",
+                label,
+                Some(path),
+            ));
+        }
+        let bytes = safe_read_file(path, "读取 Skill Hub 来源目录失败").map_err(|error| {
+            source_resource_error(
+                "读取 Skill Hub 来源目录失败",
+                "source-resource-read",
+                label,
+                Some(path),
+            )
+            .with_detail(format!(
+                "stage=source-resource-read; candidate={label}; path={}; error={}",
+                path.display(),
+                error.message
+            ))
+        })?;
+        log::info!(
+            "skill_hub_source_resource_loaded candidate={} bytes={}",
+            label,
+            bytes.len()
+        );
+        return parse_source_directory(&bytes).map_err(|error| {
+            let reason = error.message.clone();
+            log::warn!(
+                "skill_hub_source_resource_invalid candidate={} reason={}",
+                label,
+                reason
+            );
+            error.with_detail(format!(
+                "stage=source-resource-validate; candidate={label}; path={}; reason={reason}",
+                path.display()
+            ))
+        });
+    }
+
+    // The source directory is release-owned and compiled from the same file
+    // validated by build.rs. A missing copied resource is therefore a package
+    // staging defect, not a reason to make the whole Skill Hub unavailable.
+    log::warn!(
+        "skill_hub_source_resource_missing candidates={} fallback=embedded",
+        candidates
+            .iter()
+            .map(|(label, _)| label.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    parse_source_directory(EMBEDDED_SOURCE_DIRECTORY).map_err(|error| {
+        let reason = error.message.clone();
+        error.with_detail(format!(
+            "stage=embedded-source-validate; candidate=embedded; reason={reason}"
+        ))
+    })
+}
+
+fn base_manifest_resource_candidates_for(
+    executable: Option<&Path>,
+    resource_dir: Option<&Path>,
+) -> Vec<(String, PathBuf)> {
+    let mut candidates = Vec::new();
+    let mut add = |label: &str, path: PathBuf| {
+        if !candidates.iter().any(|(_, existing)| existing == &path) {
+            candidates.push((label.to_string(), path));
+        }
+    };
+
+    // A USB release is launched directly from its root. Prefer its own
+    // resources over a stale Tauri resource directory left by an installed
+    // copy of the manager on the same machine.
+    if let Some(parent) = executable.and_then(Path::parent) {
+        add(
+            "portable-resources",
+            parent.join("resources").join(BASE_MANIFEST_RESOURCE),
+        );
+        add("portable-sibling", parent.join(BASE_MANIFEST_RESOURCE));
+    }
+    if let Some(resource_dir) = resource_dir {
+        add(
+            "tauri-resource-dir",
+            resource_dir.join(BASE_MANIFEST_RESOURCE),
+        );
+    }
+    candidates
+}
+
+fn base_manifest_resource_candidates(app: &AppHandle) -> Vec<(String, PathBuf)> {
+    let executable = std::env::current_exe().ok();
+    let resource_dir = app.path().resource_dir().ok();
+    base_manifest_resource_candidates_for(executable.as_deref(), resource_dir.as_deref())
+}
+
+fn source_label(source: &SkillHubSourceEntry) -> String {
+    match source.kind {
+        SourceKind::Domestic => source
+            .id
+            .strip_prefix("cn-mirror-")
+            .map(|suffix| format!("domestic-{suffix}"))
+            .unwrap_or_else(|| "domestic".into()),
+        SourceKind::Relay => "relay".into(),
+        SourceKind::Github => "github".into(),
+    }
+}
+
+fn record_attempt(
+    attempts: &mut Vec<SkillRepoSourceAttempt>,
+    source: &SkillHubSourceEntry,
+    phase: SkillRepoAttemptPhase,
+    result: SkillRepoAttemptResult,
+    http_status: Option<u16>,
+    started: Instant,
+) {
+    let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    log::info!(
+        "skill_hub_attempt source_id={} kind={} phase={} result={} http_status={} elapsed_ms={elapsed_ms}",
+        source.id,
+        source.kind.as_str(),
+        phase.as_str(),
+        result.as_str(),
+        http_status.map_or_else(|| "none".into(), |status| status.to_string())
+    );
+    attempts.push(SkillRepoSourceAttempt {
+        source_id: source.id.clone(),
+        source_kind: source.kind,
+        phase,
+        result,
+        http_status,
+        elapsed_ms,
+    });
 }
 
 fn sha256(bytes: &[u8]) -> String {
@@ -489,7 +975,9 @@ fn sync_directory(path: &Path) -> Result<(), HotError> {
     ensure_directory(path, "flush 目录失败")?;
     #[cfg(windows)]
     {
-        use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, GetLastError, GENERIC_WRITE, INVALID_HANDLE_VALUE,
+        };
         use windows_sys::Win32::Storage::FileSystem::{
             CreateFileW, FlushFileBuffers, FILE_FLAG_BACKUP_SEMANTICS,
             FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
@@ -499,7 +987,10 @@ fn sync_directory(path: &Path) -> Result<(), HotError> {
         let handle = unsafe {
             CreateFileW(
                 wide.as_ptr(),
-                GENERIC_READ,
+                // FlushFileBuffers requires GENERIC_WRITE. Opening a
+                // directory read-only makes normal NTFS directory flushes
+                // fail with ERROR_ACCESS_DENIED (5).
+                GENERIC_WRITE,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 std::ptr::null(),
                 OPEN_EXISTING,
@@ -508,14 +999,26 @@ fn sync_directory(path: &Path) -> Result<(), HotError> {
             )
         };
         if handle == INVALID_HANDLE_VALUE {
-            return Err(io_error("打开目录 flush 句柄失败", path.display()));
+            let error = unsafe { GetLastError() };
+            return Err(local_io_error(
+                "打开目录 flush 句柄失败",
+                format!("win32_error={error}; path={}", path.display()),
+            ));
         }
         let flushed = unsafe { FlushFileBuffers(handle) } != 0;
+        let error = if flushed {
+            0
+        } else {
+            unsafe { GetLastError() }
+        };
         unsafe {
             CloseHandle(handle);
         }
         if !flushed {
-            return Err(io_error("FlushFileBuffers 失败", path.display()));
+            return Err(local_io_error(
+                "FlushFileBuffers 失败",
+                format!("win32_error={error}; path={}", path.display()),
+            ));
         }
         ensure_safe_parent(path)?;
         Ok(())
@@ -524,7 +1027,7 @@ fn sync_directory(path: &Path) -> Result<(), HotError> {
     {
         std::fs::File::open(path)
             .and_then(|file| file.sync_all())
-            .map_err(|error| io_error("flush 目录失败", error))?;
+            .map_err(|error| local_io_error("flush 目录失败", error))?;
         ensure_safe_parent(path)?;
         Ok(())
     }
@@ -864,36 +1367,107 @@ fn write_atomic_json<T: Serialize>(path: &Path, value: &T) -> Result<(), HotErro
     Ok(())
 }
 
-fn base_manifest(app: &AppHandle) -> Result<BaseManifest, HotError> {
-    let path = app
-        .path()
-        .resource_dir()
-        .ok()
-        .map(|p| p.join("skill_repo_base_manifest.json"))
-        .ok_or_else(|| io_error("基础 Skill ID 资源缺失", "skill_repo_base_manifest.json"))?;
-    let metadata = metadata_required(&path, "基础 Skill ID 资源缺失")?;
-    if !metadata.is_file() {
-        return Err(io_error(
-            "基础 Skill ID 资源缺失",
-            "skill_repo_base_manifest.json 不是普通文件",
-        ));
-    }
-    let bytes = safe_read_file(&path, "读取基础 Skill ID 资源失败")?;
-    let manifest: BaseManifest =
-        serde_json::from_slice(&bytes).map_err(|e| io_error("基础 Skill ID 资源格式无效", e))?;
+fn base_resource_error(context: &str, error: impl std::fmt::Display) -> HotError {
+    HotError::new(
+        "SKILL_REPO_BASE_RESOURCE_INVALID",
+        "安装器基础资源不可用，请重新复制完整安装包后重试。",
+    )
+    .with_detail(format!("{context}: {error}"))
+}
+
+fn parse_base_manifest_bytes(bytes: &[u8]) -> Result<BaseManifest, HotError> {
+    let manifest: BaseManifest = serde_json::from_slice(bytes)
+        .map_err(|error| base_resource_error("基础 Skill ID 资源格式无效", error))?;
     if manifest.schema_version != 1
         || manifest.source != "installer-pack/manifest/skill-audit.json"
         || manifest.source_sha256 != BASE_MANIFEST_SHA256
     {
-        return Err(io_error("基础 Skill ID 资源身份无效", "schema/source"));
+        return Err(base_resource_error(
+            "基础 Skill ID 资源身份无效",
+            "schema/source/hash",
+        ));
     }
     let mut ids = HashSet::new();
     for item in &manifest.skills {
         if !valid_id(&item.id) || !ids.insert(item.id.clone()) {
-            return Err(io_error("基础 Skill ID 资源包含重复或非法 ID", &item.id));
+            return Err(base_resource_error(
+                "基础 Skill ID 资源包含重复或非法 ID",
+                &item.id,
+            ));
         }
     }
     Ok(manifest)
+}
+
+fn base_manifest(app: &AppHandle) -> Result<BaseManifest, HotError> {
+    let candidates = base_manifest_resource_candidates(app);
+    for (label, path) in &candidates {
+        let metadata = match metadata_optional(path) {
+            Ok(Some(metadata)) => metadata,
+            Ok(None) => continue,
+            Err(error) => {
+                let reason = error
+                    .detail
+                    .clone()
+                    .unwrap_or_else(|| error.message.clone());
+                return Err(
+                    base_resource_error("读取基础 Skill ID 资源属性失败", reason).with_detail(
+                        format!(
+                            "stage=base-resource-stat; candidate={label}; path={}; error={}",
+                            path.display(),
+                            error.message
+                        ),
+                    ),
+                );
+            }
+        };
+        if !metadata.is_file() {
+            return Err(base_resource_error(
+                "基础 Skill ID 资源不是普通文件",
+                format!("candidate={label}; path={}", path.display()),
+            ));
+        }
+        let bytes = safe_read_file(path, "读取基础 Skill ID 资源失败").map_err(|error| {
+            base_resource_error(
+                "读取基础 Skill ID 资源失败",
+                format!(
+                    "candidate={label}; path={}; error={}",
+                    path.display(),
+                    error.message
+                ),
+            )
+        })?;
+        log::info!(
+            "skill_hub_base_manifest_loaded candidate={} path={} bytes={}",
+            label,
+            path.display(),
+            bytes.len()
+        );
+        return parse_base_manifest_bytes(&bytes).map_err(|error| {
+            let reason = error.message.clone();
+            error.with_detail(format!(
+                "stage=base-resource-validate; candidate={label}; path={}; reason={}",
+                path.display(),
+                reason
+            ))
+        });
+    }
+
+    log::warn!(
+        "skill_hub_base_manifest_missing candidates={} fallback=embedded",
+        candidates
+            .iter()
+            .map(|(label, _)| label.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    parse_base_manifest_bytes(EMBEDDED_BASE_MANIFEST).map_err(|error| {
+        let reason = error.message.clone();
+        error.with_detail(format!(
+            "stage=embedded-base-resource-validate; candidate=embedded; reason={}",
+            reason
+        ))
+    })
 }
 
 fn valid_id(id: &str) -> bool {
@@ -1099,12 +1673,34 @@ fn validate_frontmatter(id: &str, bytes: &[u8]) -> Result<(), HotError> {
     }
     let mut seen = HashSet::new();
     let mut name = None;
-    let mut desc = None;
+    let mut desc: Option<String> = None;
+    let mut description_block = false;
     let mut closed = false;
     for line in lines {
         if line == "---" {
             closed = true;
             break;
+        }
+        if description_block {
+            // The Skill Hub uses the standard YAML folded scalar form for
+            // longer descriptions (`description: >-` followed by indented
+            // lines).  Keep this parser deliberately small and deterministic:
+            // only an indented continuation of the already-seen description
+            // key is accepted; arbitrary YAML is still not evaluated.
+            if line.is_empty() {
+                continue;
+            }
+            if line.contains('\t') || !line.starts_with(' ') {
+                description_block = false;
+            } else {
+                if let Some(value) = desc.as_mut() {
+                    if !value.is_empty() {
+                        value.push('\n');
+                    }
+                    value.push_str(line.trim());
+                }
+                continue;
+            }
         }
         if line.contains('\t') || line.is_empty() {
             if !line.is_empty() {
@@ -1136,13 +1732,25 @@ fn validate_frontmatter(id: &str, bytes: &[u8]) -> Result<(), HotError> {
             return Err(invalid("frontmatter key/value 无效"));
         }
         if key == "name" {
-            name = Some(value);
+            name = Some(value.to_string());
         }
         if key == "description" {
-            desc = Some(value.trim());
+            if matches!(value, ">" | ">-" | ">+" | "|" | "|-" | "|+") {
+                desc = Some(String::new());
+                description_block = true;
+            } else {
+                desc = Some(value.trim().to_string());
+            }
         }
     }
-    if !closed || name != Some(id) || desc.map(str::is_empty).unwrap_or(true) {
+    if !closed
+        || name.as_deref() != Some(id)
+        || desc
+            .as_deref()
+            .map(str::trim)
+            .map(str::is_empty)
+            .unwrap_or(true)
+    {
         return Err(invalid(format!("frontmatter 与 Skill ID 不匹配: {id}")));
     }
     Ok(())
@@ -1167,7 +1775,10 @@ fn validate_payload_file(path: &str, bytes: &[u8]) -> Result<(), HotError> {
     Ok(())
 }
 
-fn parse_archive(bytes: &[u8]) -> Result<Vec<CandidateSkill>, HotError> {
+fn parse_archive(
+    bytes: &[u8],
+    expected_commit: Option<&str>,
+) -> Result<Vec<CandidateSkill>, HotError> {
     if bytes.len() > MAX_ARCHIVE {
         return Err(invalid("归档超过 64 MiB"));
     }
@@ -1233,6 +1844,11 @@ fn parse_archive(bytes: &[u8]) -> Result<Vec<CandidateSkill>, HotError> {
     {
         return Err(invalid("GitHub ZIP 前缀无效"));
     }
+    if let Some(expected_commit) = expected_commit {
+        if prefix[10..] != *expected_commit {
+            return Err(invalid("GitHub ZIP 前缀 commit 与 metadata 不一致"));
+        }
+    }
     let mut skills: BTreeMap<String, BTreeMap<String, Vec<u8>>> = BTreeMap::new();
     for (path, data) in entries {
         if matches!(
@@ -1270,14 +1886,80 @@ fn parse_archive(bytes: &[u8]) -> Result<Vec<CandidateSkill>, HotError> {
     Ok(out)
 }
 
-fn client() -> Result<reqwest::Client, HotError> {
-    reqwest::Client::builder()
+fn proxy_mode_label(mode: ProxyMode) -> &'static str {
+    match mode {
+        ProxyMode::System => "system",
+        ProxyMode::Direct => "direct",
+        ProxyMode::Custom => "custom",
+    }
+}
+
+fn ensure_rustls_crypto_provider() -> Result<(), HotError> {
+    if rustls::crypto::CryptoProvider::get_default().is_some() {
+        return Ok(());
+    }
+
+    // reqwest 0.13's rustls-no-provider feature leaves provider selection to
+    // the application.  Install the bundled ring provider before building a
+    // client; otherwise Client::build() panics and the UI only sees its
+    // watchdog timeout.  The second check handles a concurrent initializer
+    // that won the install race.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    if rustls::crypto::CryptoProvider::get_default().is_some() {
+        return Ok(());
+    }
+
+    log::error!("skill_hub_tls_provider_unavailable");
+    Err(HotError::new(
+        "SKILL_REPO_UNAVAILABLE",
+        "Skill Hub 网络加密组件初始化失败，请重试",
+    )
+    .with_detail("stage=tls-provider; reason=unavailable"))
+}
+
+fn client(settings: &AppSettings) -> Result<reqwest::Client, HotError> {
+    ensure_rustls_crypto_provider()?;
+    let mut builder = reqwest::Client::builder();
+    match settings.proxy_mode {
+        // reqwest's system-proxy feature reads the Windows/macOS system
+        // proxy for this mode.  This is the same default used by the Codex
+        // payload updater.
+        ProxyMode::System => {}
+        ProxyMode::Direct => {
+            builder = builder.no_proxy();
+        }
+        ProxyMode::Custom => {
+            let proxy_url = validate_custom_proxy(&settings.custom_proxy_url).map_err(|error| {
+                log::warn!("skill_hub_network_config_invalid proxy_mode=custom reason={error}");
+                HotError::new(
+                    "SKILL_REPO_UNAVAILABLE",
+                    "Skill Hub 网络代理设置无效，请检查设置后重试",
+                )
+                .with_detail("stage=network-config; reason=invalid-custom-proxy")
+            })?;
+            let proxy = reqwest::Proxy::all(&proxy_url).map_err(|_| {
+                log::warn!("skill_hub_network_config_invalid proxy_mode=custom reason=builder");
+                HotError::new(
+                    "SKILL_REPO_UNAVAILABLE",
+                    "Skill Hub 网络代理设置无效，请检查设置后重试",
+                )
+                .with_detail("stage=network-config; reason=proxy-builder")
+            })?;
+            builder = builder.proxy(proxy);
+        }
+    }
+    log::info!(
+        "skill_hub_network_config proxy_mode={}",
+        proxy_mode_label(settings.proxy_mode)
+    );
+    builder
         .user_agent("codex-app-manager-skill-hub/1")
         .redirect(reqwest::redirect::Policy::limited(3))
-        // Do not let a mainland DNS/TCP black hole keep the UI spinner alive
-        // while the relay fallback is waiting for a full request timeout.
         .connect_timeout(NETWORK_CONNECT_TIMEOUT)
-        .timeout(NETWORK_REQUEST_TIMEOUT)
+        // Keep the request itself bounded even if a transport path does not
+        // surface its stall through the phase timeout. The caller also has a
+        // resolve deadline, so this is a second independent safety net.
+        .timeout(NETWORK_OPERATION_TIMEOUT)
         .build()
         .map_err(|_| HotError::new("SKILL_REPO_UNAVAILABLE", "Skill Hub 网络客户端初始化失败"))
 }
@@ -1285,126 +1967,178 @@ fn client() -> Result<reqwest::Client, HotError> {
 fn network_timeout() -> HotError {
     HotError::new(
         "SKILL_REPO_TIMEOUT",
-        "Skill Hub 请求超过 45 秒；已记录 relay/GitHub 来源尝试，请检查网络后重试",
+        "Skill Hub 网络阶段超时，请检查网络后重试",
     )
+}
+
+fn attempt_result_for_error(error: &HotError) -> SkillRepoAttemptResult {
+    match error.code {
+        "SKILL_REPO_TIMEOUT" => SkillRepoAttemptResult::Timeout,
+        "SKILL_REPO_SOURCE_INVALID" | "SKILL_REPO_ARCHIVE_INVALID" => {
+            SkillRepoAttemptResult::Invalid
+        }
+        "SKILL_REPO_SOURCE_UNAVAILABLE"
+            if error
+                .detail
+                .as_deref()
+                .and_then(|detail| detail.strip_prefix("http_status="))
+                .and_then(|status| status.parse::<u16>().ok())
+                .is_some() =>
+        {
+            SkillRepoAttemptResult::Http
+        }
+        _ => SkillRepoAttemptResult::Unavailable,
+    }
+}
+
+fn phase_timeout(phase: SkillRepoAttemptPhase) -> Duration {
+    match phase {
+        SkillRepoAttemptPhase::Metadata | SkillRepoAttemptPhase::Verify => NETWORK_METADATA_TIMEOUT,
+        SkillRepoAttemptPhase::Archive => NETWORK_ARCHIVE_TIMEOUT,
+    }
+}
+
+fn static_source_url(source: &SkillHubSourceEntry, file: &str) -> Result<String, HotError> {
+    source
+        .base
+        .as_ref()
+        .map(|base| format!("{base}{file}"))
+        .ok_or_else(|| source_invalid("静态 Skill Hub 来源缺少 base"))
 }
 
 async fn get_bytes(
     client: &reqwest::Client,
+    source: &SkillHubSourceEntry,
     url: &str,
     max: usize,
-    github: bool,
-    phase: &'static str,
-    attempt: u8,
+    phase: SkillRepoAttemptPhase,
+    deadline: tokio::time::Instant,
+    attempts: &mut Vec<SkillRepoSourceAttempt>,
 ) -> Result<Vec<u8>, HotError> {
-    let source = if github { "github" } else { "relay" };
     let started = Instant::now();
-    log::info!(
-        "skill_hub_attempt phase={phase} source={source} attempt={attempt} operation=download"
-    );
-    let response = client.get(url).send().await.map_err(|error| {
-        if error.is_timeout() {
-            log::warn!(
-                "skill_hub_attempt phase={phase} source={source} attempt={attempt} result=timeout elapsed_ms={}",
-                started.elapsed().as_millis()
-            );
-            HotError::new(
-                "SKILL_REPO_TIMEOUT",
-                "Skill Hub 网络请求超时，请检查网络后重试",
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        record_attempt(
+            attempts,
+            source,
+            phase,
+            SkillRepoAttemptResult::Timeout,
+            None,
+            started,
+        );
+        return Err(network_timeout());
+    }
+    let budget = remaining.min(phase_timeout(phase));
+    let result = tokio::time::timeout(budget, async {
+        let response = client.get(url).send().await.map_err(|error| {
+            if error.is_timeout() {
+                HotError::new("SKILL_REPO_TIMEOUT", "Skill Hub 网络请求超时").with_detail(format!(
+                    "stage=network-request; source_id={}; reason=timeout",
+                    source.id
+                ))
+            } else {
+                HotError::new("SKILL_REPO_SOURCE_UNAVAILABLE", "Skill Hub 来源不可用").with_detail(
+                    format!(
+                        "stage=network-request; source_id={}; reason=transport",
+                        source.id
+                    ),
+                )
+            }
+        })?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(HotError::new(
+                "SKILL_REPO_SOURCE_UNAVAILABLE",
+                "Skill Hub 来源返回 HTTP 错误",
             )
-            .with_detail(format!("phase={phase}; source={source}; attempt={attempt}; transport=timeout"))
-        } else {
-            log::warn!(
-                "skill_hub_attempt phase={phase} source={source} attempt={attempt} result=transport_error elapsed_ms={}",
-                started.elapsed().as_millis()
-            );
-            HotError::new(
-                "SKILL_REPO_UNAVAILABLE",
-                "Skill Hub 暂时无法连接，请检查网络后重试",
-            )
-            .with_detail(format!("phase={phase}; source={source}; attempt={attempt}; transport=unavailable"))
+            .with_detail(format!("http_status={}", status.as_u16())));
         }
-    })?;
-    if !response.status().is_success() {
-        log::warn!(
-            "skill_hub_attempt phase={phase} source={source} attempt={attempt} result=http_error status={} elapsed_ms={}",
-            response.status().as_u16(),
-            started.elapsed().as_millis()
-        );
-        return Err(HotError::new(
-            "SKILL_REPO_UNAVAILABLE",
-            format!("HTTP {}", response.status()),
-        )
-        .with_detail(format!(
-            "phase={phase}; source={source}; attempt={attempt}; http_status={}",
-            response.status().as_u16()
-        )));
-    }
-    if !github && response.url().as_str() != url {
-        log::warn!(
-            "skill_hub_attempt phase={phase} source={source} attempt={attempt} result=unexpected_redirect elapsed_ms={}",
-            started.elapsed().as_millis()
-        );
-        return Err(
-            HotError::new("SKILL_REPO_SOURCE_INVALID", "relay 文件禁止 HTTP 重定向").with_detail(
-                format!("phase={phase}; source={source}; attempt={attempt}; redirect=rejected"),
-            ),
-        );
-    }
-    if github
-        && !matches!(
-            response.url().host_str(),
-            Some("api.github.com") | Some("github.com") | Some("codeload.github.com")
-        )
-    {
-        log::warn!(
-            "skill_hub_attempt phase={phase} source={source} attempt={attempt} result=redirect_rejected elapsed_ms={}",
-            started.elapsed().as_millis()
-        );
-        return Err(
-            HotError::new("SKILL_REPO_SOURCE_INVALID", "GitHub 重定向目标不允许").with_detail(
-                format!("phase={phase}; source={source}; attempt={attempt}; redirect=rejected"),
-            ),
-        );
-    }
-    let bytes = response.bytes().await.map_err(|error| {
-        if error.is_timeout() {
-            log::warn!(
-                "skill_hub_attempt phase={phase} source={source} attempt={attempt} result=read_timeout elapsed_ms={}",
-                started.elapsed().as_millis()
+        if source.kind != SourceKind::Github && response.url().as_str() != url {
+            return Err(
+                source_invalid("静态 Skill Hub 来源禁止重定向").with_detail(format!(
+                    "stage=network-response; source_id={}; reason=redirect",
+                    source.id
+                )),
             );
-            HotError::new("SKILL_REPO_TIMEOUT", "Skill Hub 下载超时，请检查网络后重试")
-                .with_detail(format!("phase={phase}; source={source}; attempt={attempt}; read=timeout"))
-        } else {
-            log::warn!(
-                "skill_hub_attempt phase={phase} source={source} attempt={attempt} result=read_error elapsed_ms={}",
-                started.elapsed().as_millis()
-            );
-            HotError::new(
-                "SKILL_REPO_UNAVAILABLE",
-                "Skill Hub 响应读取失败，请稍后重试",
-            )
-            .with_detail(format!("phase={phase}; source={source}; attempt={attempt}; read=error"))
         }
-    })?;
-    if bytes.len() > max {
-        log::warn!(
-            "skill_hub_attempt phase={phase} source={source} attempt={attempt} result=response_too_large bytes={} elapsed_ms={}",
-            bytes.len(),
-            started.elapsed().as_millis()
-        );
-        return Err(invalid("远端响应超限"));
+        if source.kind == SourceKind::Github
+            && !matches!(
+                response.url().host_str(),
+                Some("api.github.com") | Some("github.com") | Some("codeload.github.com")
+            )
+        {
+            return Err(source_invalid("GitHub 重定向目标不允许")
+                .with_detail("stage=network-response; source_id=github; reason=redirect-host"));
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > max as u64)
+        {
+            return Err(invalid("远端响应超限"));
+        }
+        let bytes = response.bytes().await.map_err(|error| {
+            if error.is_timeout() {
+                HotError::new("SKILL_REPO_TIMEOUT", "Skill Hub 响应读取超时").with_detail(format!(
+                    "stage=network-response; source_id={}; reason=timeout",
+                    source.id
+                ))
+            } else {
+                HotError::new("SKILL_REPO_SOURCE_UNAVAILABLE", "Skill Hub 响应读取失败")
+                    .with_detail(format!(
+                        "stage=network-response; source_id={}; reason=transport",
+                        source.id
+                    ))
+            }
+        })?;
+        if bytes.len() > max {
+            return Err(invalid("远端响应超限"));
+        }
+        Ok((bytes.to_vec(), Some(status.as_u16())))
+    })
+    .await;
+
+    match result {
+        Ok(Ok((bytes, status))) => {
+            record_attempt(
+                attempts,
+                source,
+                phase,
+                SkillRepoAttemptResult::Ok,
+                status,
+                started,
+            );
+            Ok(bytes)
+        }
+        Ok(Err(error)) => {
+            let result = attempt_result_for_error(&error);
+            let http_status = error
+                .detail
+                .as_deref()
+                .and_then(|detail| detail.strip_prefix("http_status="))
+                .and_then(|status| status.parse::<u16>().ok());
+            record_attempt(attempts, source, phase, result, http_status, started);
+            Err(error)
+        }
+        Err(_) => {
+            record_attempt(
+                attempts,
+                source,
+                phase,
+                SkillRepoAttemptResult::Timeout,
+                None,
+                started,
+            );
+            Err(network_timeout())
+        }
     }
-    log::info!(
-        "skill_hub_attempt phase={phase} source={source} attempt={attempt} result=ok bytes={} elapsed_ms={}",
-        bytes.len(),
-        started.elapsed().as_millis()
-    );
-    Ok(bytes.to_vec())
 }
 
-fn expected_from_meta(meta: &[u8], source: SourceKind) -> Result<SkillRepoExpected, HotError> {
+fn expected_from_meta(
+    meta: &[u8],
+    source: &SkillHubSourceEntry,
+) -> Result<SkillRepoExpected, HotError> {
     #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct Meta {
         #[serde(rename = "schemaVersion")]
         schema_version: u8,
@@ -1415,198 +2149,609 @@ fn expected_from_meta(meta: &[u8], source: SourceKind) -> Result<SkillRepoExpect
         size: u64,
         sha256: String,
     }
-    let m: Meta = serde_json::from_slice(meta)
-        .map_err(|e| HotError::new("SKILL_REPO_SOURCE_INVALID", e.to_string()))?;
+    let m: Meta = serde_json::from_slice(meta).map_err(|_| {
+        source_invalid("Skill Hub metadata JSON 无效").with_detail(format!(
+            "stage=remote-metadata; source_id={}; reason=json",
+            source.id
+        ))
+    })?;
     if m.schema_version != 1
         || m.repo != REPO
         || m.branch != BRANCH
         || m.archive != "archive.zip"
-        || m.commit.len() != 40
-        || !m.commit.chars().all(|c| c.is_ascii_hexdigit())
-        || m.sha256.len() != 64
+        || !commit_valid(&m.commit)
+        || !digest_valid(&m.sha256)
+        || m.size == 0
+        || m.size > MAX_ARCHIVE as u64
     {
-        return Err(HotError::new(
-            "SKILL_REPO_SOURCE_INVALID",
-            "relay metadata 身份无效",
-        ));
+        return Err(
+            source_invalid("Skill Hub metadata 身份无效").with_detail(format!(
+                "stage=remote-metadata; source_id={}; reason=identity",
+                source.id
+            )),
+        );
     }
     Ok(SkillRepoExpected {
         schema_version: 1,
         repo: m.repo,
         branch: m.branch,
-        commit: m.commit,
-        source_kind: source,
+        commit: m.commit.to_lowercase(),
+        source_kind: source.kind,
+        source_id: source.id.clone(),
         archive_size: m.size,
         archive_sha256: m.sha256.to_lowercase(),
     })
 }
 
-async fn github_commit(client: &reqwest::Client) -> Result<String, HotError> {
-    let bytes = get_bytes(client, GITHUB_COMMITS, 64 * 1024, true, "metadata", 1).await?;
-    let v: serde_json::Value = serde_json::from_slice(&bytes)
-        .map_err(|e| HotError::new("SKILL_REPO_SOURCE_INVALID", e.to_string()))?;
+async fn source_metadata(
+    client: &reqwest::Client,
+    source: &SkillHubSourceEntry,
+    phase: SkillRepoAttemptPhase,
+    deadline: tokio::time::Instant,
+    attempts: &mut Vec<SkillRepoSourceAttempt>,
+) -> Result<SkillRepoExpected, HotError> {
+    let started = Instant::now();
+    let url = static_source_url(source, "latest.json")?;
+    let bytes = get_bytes(client, source, &url, 64 * 1024, phase, deadline, attempts).await?;
+    match expected_from_meta(&bytes, source) {
+        Ok(expected) => Ok(expected),
+        Err(error) => {
+            record_attempt(
+                attempts,
+                source,
+                phase,
+                SkillRepoAttemptResult::Invalid,
+                None,
+                started,
+            );
+            Err(error)
+        }
+    }
+}
+
+async fn github_commit(
+    client: &reqwest::Client,
+    source: &SkillHubSourceEntry,
+    phase: SkillRepoAttemptPhase,
+    deadline: tokio::time::Instant,
+    attempts: &mut Vec<SkillRepoSourceAttempt>,
+) -> Result<String, HotError> {
+    let started = Instant::now();
+    let bytes = get_bytes(
+        client,
+        source,
+        GITHUB_COMMITS,
+        64 * 1024,
+        phase,
+        deadline,
+        attempts,
+    )
+    .await?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| {
+        source_invalid("GitHub metadata JSON 无效")
+            .with_detail("stage=github-commit; source_id=github; reason=json")
+    })?;
     let sha = v
         .get("sha")
         .and_then(|x| x.as_str())
         .unwrap_or_default()
         .to_lowercase();
-    if sha.len() != 40 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(HotError::new(
-            "SKILL_REPO_SOURCE_INVALID",
-            "GitHub commit 无效",
-        ));
+    if !commit_valid(&sha) {
+        record_attempt(
+            attempts,
+            source,
+            phase,
+            SkillRepoAttemptResult::Invalid,
+            None,
+            started,
+        );
+        return Err(source_invalid("GitHub commit 无效")
+            .with_detail("stage=github-commit; source_id=github; reason=sha"));
     }
     Ok(sha)
 }
 
-async fn resolve_latest(
-    client: &reqwest::Client,
-) -> Result<(SkillRepoExpected, Vec<u8>), HotError> {
-    log::info!("skill_hub_event phase=resolve source_order=relay,github retry=0");
-    if let Ok(meta) = get_bytes(client, RELAY_META, 64 * 1024, false, "metadata", 1).await {
-        if let Ok(exp) = expected_from_meta(&meta, SourceKind::Relay) {
-            if let Ok(archive) =
-                get_bytes(client, RELAY_ARCHIVE, MAX_ARCHIVE, false, "archive", 1).await
-            {
-                if archive.len() as u64 == exp.archive_size
-                    && sha256(&archive) == exp.archive_sha256
-                {
-                    let parsed =
-                        get_bytes(client, RELAY_META, 64 * 1024, false, "metadata-confirm", 2)
-                            .await
-                            .and_then(|m| expected_from_meta(&m, SourceKind::Relay));
-                    if parsed.as_ref().map(|x| x == &exp).unwrap_or(false) {
-                        log::info!("skill_hub_event phase=resolve source=relay attempt=1 result=ok retry=0");
-                        return Ok((exp, archive));
-                    }
-                    log::warn!("skill_hub_event phase=resolve source=relay attempt=1 result=metadata_changed retry=0");
-                } else {
-                    log::warn!("skill_hub_event phase=resolve source=relay attempt=1 result=archive_hash_mismatch retry=0");
-                }
-            } else {
-                log::warn!("skill_hub_event phase=resolve source=relay attempt=1 result=archive_unavailable retry=0");
-            }
-        } else {
-            log::warn!("skill_hub_event phase=resolve source=relay attempt=1 result=metadata_invalid retry=0");
-        }
-    } else {
-        log::warn!("skill_hub_event phase=resolve source=relay attempt=1 result=metadata_unavailable retry=0");
-    }
-    log::info!("skill_hub_event phase=resolve source=github attempt=1 result=fallback retry=1");
-    let commit = github_commit(client).await?;
-    let url = format!("{GITHUB_ARCHIVE}{commit}.zip");
-    let archive = get_bytes(client, &url, MAX_ARCHIVE, true, "archive", 1).await?;
-    let exp = SkillRepoExpected {
-        schema_version: 1,
-        repo: REPO.into(),
-        branch: BRANCH.into(),
-        commit: commit.clone(),
-        source_kind: SourceKind::Github,
-        archive_size: archive.len() as u64,
-        archive_sha256: sha256(&archive),
-    };
-    let after = github_commit(client).await?;
-    if after != commit {
-        return Err(HotError::new(
-            "SKILL_REPO_STALE",
-            "GitHub commit 在下载期间变化",
-        ));
-    }
-    log::info!("skill_hub_event phase=resolve source=github attempt=1 result=ok retry=1");
-    Ok((exp, archive))
+#[derive(Debug, Clone)]
+struct StaticCandidate {
+    source: SkillHubSourceEntry,
+    expected: SkillRepoExpected,
 }
 
-async fn resolve_latest_with_deadline(
-    client: &reqwest::Client,
-) -> Result<(SkillRepoExpected, Vec<u8>), HotError> {
-    match tokio::time::timeout(NETWORK_OPERATION_TIMEOUT, resolve_latest(client)).await {
-        Ok(result) => result,
-        Err(_) => {
-            log::warn!(
-                "skill_hub_event phase=resolve source=all attempt=0 result=operation_timeout retry=1 budget_ms={}",
-                NETWORK_OPERATION_TIMEOUT.as_millis()
+#[derive(Debug)]
+struct MetadataProbe {
+    source: SkillHubSourceEntry,
+    expected: Result<SkillRepoExpected, HotError>,
+    attempts: Vec<SkillRepoSourceAttempt>,
+}
+
+#[derive(Debug)]
+struct ResolvedSkillRepo {
+    expected: SkillRepoExpected,
+    archive: Vec<u8>,
+    attempts: Vec<SkillRepoSourceAttempt>,
+}
+
+#[derive(Debug)]
+struct DownloadedSkillRepo {
+    archive: Vec<u8>,
+    attempts: Vec<SkillRepoSourceAttempt>,
+}
+
+fn retain_consistent_domestic_candidates(
+    candidates: Vec<StaticCandidate>,
+    attempts: &mut Vec<SkillRepoSourceAttempt>,
+) -> Vec<StaticCandidate> {
+    let Some(reference) = candidates.first().map(|candidate| {
+        (
+            candidate.expected.commit.clone(),
+            candidate.expected.archive_size,
+            candidate.expected.archive_sha256.clone(),
+        )
+    }) else {
+        return Vec::new();
+    };
+
+    candidates
+        .into_iter()
+        .filter_map(|candidate| {
+            let identity = (
+                candidate.expected.commit.clone(),
+                candidate.expected.archive_size,
+                candidate.expected.archive_sha256.clone(),
             );
-            Err(network_timeout())
-        }
+            if identity == reference {
+                return Some(candidate);
+            }
+
+            record_attempt(
+                attempts,
+                &candidate.source,
+                SkillRepoAttemptPhase::Verify,
+                SkillRepoAttemptResult::Invalid,
+                None,
+                Instant::now(),
+            );
+            log::warn!(
+                "skill_hub_event phase=resolve source_id={} result=metadata_mismatch",
+                candidate.source.id
+            );
+            None
+        })
+        .collect()
+}
+
+async fn probe_domestic_source(
+    client: reqwest::Client,
+    source: SkillHubSourceEntry,
+    deadline: tokio::time::Instant,
+) -> MetadataProbe {
+    let mut attempts = Vec::new();
+    let expected = source_metadata(
+        &client,
+        &source,
+        SkillRepoAttemptPhase::Metadata,
+        deadline,
+        &mut attempts,
+    )
+    .await;
+    MetadataProbe {
+        source,
+        expected,
+        attempts,
     }
 }
 
-async fn download_expected(
-    client: &reqwest::Client,
+fn verify_archive(
+    source: &SkillHubSourceEntry,
     expected: &SkillRepoExpected,
-) -> Result<Vec<u8>, HotError> {
-    if expected.repo != REPO || expected.branch != BRANCH || expected.commit.len() != 40 {
-        return Err(HotError::new(
-            "SKILL_REPO_SOURCE_INVALID",
-            "expected identity 无效",
-        ));
-    }
-    let bytes = match expected.source_kind {
-        SourceKind::Relay => {
-            let before = get_bytes(client, RELAY_META, 64 * 1024, false, "metadata-confirm", 1)
-                .await
-                .and_then(|m| expected_from_meta(&m, SourceKind::Relay))?;
-            if before != *expected {
-                return Err(HotError::new("SKILL_REPO_STALE", "relay metadata 已变化"));
-            }
-            get_bytes(client, RELAY_ARCHIVE, MAX_ARCHIVE, false, "archive", 2).await?
-        }
-        SourceKind::Github => {
-            let before = github_commit(client).await?;
-            if before != expected.commit {
-                return Err(HotError::new("SKILL_REPO_STALE", "GitHub commit 已变化"));
-            }
-            get_bytes(
-                client,
-                &format!("{GITHUB_ARCHIVE}{}.zip", expected.commit),
-                MAX_ARCHIVE,
-                true,
-                "archive",
-                2,
-            )
-            .await?
-        }
-    };
-    if bytes.len() as u64 != expected.archive_size || sha256(&bytes) != expected.archive_sha256 {
+    archive: &[u8],
+    attempts: &mut Vec<SkillRepoSourceAttempt>,
+) -> Result<(), HotError> {
+    let started = Instant::now();
+    if archive.len() as u64 != expected.archive_size || sha256(archive) != expected.archive_sha256 {
+        record_attempt(
+            attempts,
+            source,
+            SkillRepoAttemptPhase::Verify,
+            SkillRepoAttemptResult::HashMismatch,
+            None,
+            started,
+        );
         return Err(HotError::new(
             "SKILL_REPO_HASH_MISMATCH",
             "归档 size/SHA-256 不匹配",
         ));
     }
-    match expected.source_kind {
-        SourceKind::Relay => {
-            let after = get_bytes(client, RELAY_META, 64 * 1024, false, "metadata-confirm", 3)
-                .await
-                .and_then(|m| expected_from_meta(&m, SourceKind::Relay))?;
-            if after != *expected {
-                return Err(HotError::new(
-                    "SKILL_REPO_STALE",
-                    "relay metadata 在下载后变化",
-                ));
-            }
-        }
-        SourceKind::Github => {
-            if github_commit(client).await? != expected.commit {
-                return Err(HotError::new(
-                    "SKILL_REPO_STALE",
-                    "GitHub commit 在下载后变化",
-                ));
+    record_attempt(
+        attempts,
+        source,
+        SkillRepoAttemptPhase::Verify,
+        SkillRepoAttemptResult::Ok,
+        None,
+        started,
+    );
+    Ok(())
+}
+
+async fn fetch_static_candidate(
+    client: &reqwest::Client,
+    source: &SkillHubSourceEntry,
+    expected: &SkillRepoExpected,
+    deadline: tokio::time::Instant,
+    attempts: &mut Vec<SkillRepoSourceAttempt>,
+) -> Result<Vec<u8>, HotError> {
+    let archive_url = static_source_url(source, "archive.zip")?;
+    let archive = get_bytes(
+        client,
+        source,
+        &archive_url,
+        MAX_ARCHIVE,
+        SkillRepoAttemptPhase::Archive,
+        deadline,
+        attempts,
+    )
+    .await?;
+    verify_archive(source, expected, &archive, attempts)?;
+    let confirmed = source_metadata(
+        client,
+        source,
+        SkillRepoAttemptPhase::Verify,
+        deadline,
+        attempts,
+    )
+    .await?;
+    if confirmed != *expected {
+        record_attempt(
+            attempts,
+            source,
+            SkillRepoAttemptPhase::Verify,
+            SkillRepoAttemptResult::Invalid,
+            None,
+            Instant::now(),
+        );
+        return Err(HotError::new(
+            "SKILL_REPO_STALE",
+            "Skill Hub 来源 metadata 在下载期间变化",
+        ));
+    }
+    Ok(archive)
+}
+
+async fn resolve_github(
+    client: &reqwest::Client,
+    source: &SkillHubSourceEntry,
+    deadline: tokio::time::Instant,
+    attempts: &mut Vec<SkillRepoSourceAttempt>,
+) -> Result<(SkillRepoExpected, Vec<u8>), HotError> {
+    let commit = github_commit(
+        client,
+        source,
+        SkillRepoAttemptPhase::Metadata,
+        deadline,
+        attempts,
+    )
+    .await?;
+    let url = format!("{GITHUB_ARCHIVE}{commit}.zip");
+    let archive = get_bytes(
+        client,
+        source,
+        &url,
+        MAX_ARCHIVE,
+        SkillRepoAttemptPhase::Archive,
+        deadline,
+        attempts,
+    )
+    .await?;
+    let expected = SkillRepoExpected {
+        schema_version: 1,
+        repo: REPO.into(),
+        branch: BRANCH.into(),
+        commit: commit.clone(),
+        source_kind: SourceKind::Github,
+        source_id: source.id.clone(),
+        archive_size: archive.len() as u64,
+        archive_sha256: sha256(&archive),
+    };
+    verify_archive(source, &expected, &archive, attempts)?;
+    let after = github_commit(
+        client,
+        source,
+        SkillRepoAttemptPhase::Verify,
+        deadline,
+        attempts,
+    )
+    .await?;
+    if after != commit {
+        record_attempt(
+            attempts,
+            source,
+            SkillRepoAttemptPhase::Verify,
+            SkillRepoAttemptResult::Invalid,
+            None,
+            Instant::now(),
+        );
+        return Err(HotError::new(
+            "SKILL_REPO_STALE",
+            "GitHub commit 在下载期间变化",
+        ));
+    }
+    Ok((expected, archive))
+}
+
+async fn resolve_latest(
+    client: &reqwest::Client,
+    directory: &SkillHubSourceDirectory,
+    deadline: tokio::time::Instant,
+) -> Result<ResolvedSkillRepo, HotError> {
+    let mut source_order = directory
+        .enabled_domestic()
+        .iter()
+        .map(|source| source.id.clone())
+        .collect::<Vec<_>>();
+    source_order.extend(
+        [SourceKind::Relay, SourceKind::Github]
+            .into_iter()
+            .filter_map(|kind| directory.enabled_source(kind).map(|source| source.id)),
+    );
+    log::info!(
+        "skill_hub_event phase=resolve source_order={} retry=0",
+        source_order.join(",")
+    );
+
+    let mut attempts = Vec::new();
+    let mut probes = JoinSet::new();
+    for source in directory.enabled_domestic() {
+        let client = client.clone();
+        probes.spawn(probe_domestic_source(client, source, deadline));
+    }
+    let mut candidates = Vec::new();
+    while let Some(result) = probes.join_next().await {
+        if let Ok(probe) = result {
+            attempts.extend(probe.attempts);
+            if let Ok(expected) = probe.expected {
+                candidates.push(StaticCandidate {
+                    source: probe.source,
+                    expected,
+                });
             }
         }
     }
-    Ok(bytes)
+    candidates.sort_by_key(|candidate| (candidate.source.priority, candidate.source.id.clone()));
+
+    candidates = retain_consistent_domestic_candidates(candidates, &mut attempts);
+
+    for candidate in candidates {
+        match fetch_static_candidate(
+            client,
+            &candidate.source,
+            &candidate.expected,
+            deadline,
+            &mut attempts,
+        )
+        .await
+        {
+            Ok(archive) => {
+                log::info!(
+                    "skill_hub_selected source_id={} kind={} commit={}",
+                    candidate.source.id,
+                    candidate.source.kind.as_str(),
+                    candidate.expected.commit
+                );
+                return Ok(ResolvedSkillRepo {
+                    expected: candidate.expected,
+                    archive,
+                    attempts,
+                });
+            }
+            Err(error) => log::warn!(
+                "skill_hub_event phase=resolve source_id={} result=source_failed code={}",
+                candidate.source.id,
+                error.code
+            ),
+        }
+    }
+
+    if let Some(source) = directory.enabled_source(SourceKind::Relay) {
+        if let Ok(expected) = source_metadata(
+            client,
+            &source,
+            SkillRepoAttemptPhase::Metadata,
+            deadline,
+            &mut attempts,
+        )
+        .await
+        {
+            if let Ok(archive) =
+                fetch_static_candidate(client, &source, &expected, deadline, &mut attempts).await
+            {
+                log::info!(
+                    "skill_hub_selected source_id={} kind={} commit={}",
+                    source.id,
+                    source.kind.as_str(),
+                    expected.commit
+                );
+                return Ok(ResolvedSkillRepo {
+                    expected,
+                    archive,
+                    attempts,
+                });
+            }
+        }
+    }
+
+    if let Some(source) = directory.enabled_source(SourceKind::Github) {
+        log::info!("skill_hub_event phase=resolve source_id=github result=fallback");
+        if let Ok((expected, archive)) =
+            resolve_github(client, &source, deadline, &mut attempts).await
+        {
+            log::info!(
+                "skill_hub_selected source_id={} kind={} commit={}",
+                source.id,
+                source.kind.as_str(),
+                expected.commit
+            );
+            return Ok(ResolvedSkillRepo {
+                expected,
+                archive,
+                attempts,
+            });
+        }
+    }
+
+    Err(HotError::new(
+        "SKILL_REPO_ALL_SOURCES_FAILED",
+        "所有 Skill Hub 更新来源均不可用，未修改本地能力包",
+    )
+    .with_attempts(&attempts))
+}
+
+async fn resolve_latest_with_deadline(
+    client: &reqwest::Client,
+    directory: &SkillHubSourceDirectory,
+) -> Result<ResolvedSkillRepo, HotError> {
+    let deadline = tokio::time::Instant::now() + NETWORK_OPERATION_TIMEOUT;
+    resolve_latest(client, directory, deadline).await
+}
+
+async fn download_expected(
+    client: &reqwest::Client,
+    directory: &SkillHubSourceDirectory,
+    expected: &SkillRepoExpected,
+    deadline: tokio::time::Instant,
+) -> Result<DownloadedSkillRepo, HotError> {
+    let mut attempts = Vec::new();
+    let result = async {
+        if !expected_identity_valid(expected) {
+            return Err(invalid_expected_identity());
+        }
+        let source = directory
+            .source(&expected.source_id)
+            .filter(|source| source.enabled)
+            .cloned()
+            .ok_or_else(|| source_invalid("expected sourceId 不在当前来源目录"))?;
+        if source.kind != expected.source_kind {
+            return Err(source_invalid("expected sourceId/sourceKind 不一致"));
+        }
+        let archive = match source.kind {
+            SourceKind::Domestic | SourceKind::Relay => {
+                let before = source_metadata(
+                    client,
+                    &source,
+                    SkillRepoAttemptPhase::Metadata,
+                    deadline,
+                    &mut attempts,
+                )
+                .await?;
+                if before != *expected {
+                    record_attempt(
+                        &mut attempts,
+                        &source,
+                        SkillRepoAttemptPhase::Verify,
+                        SkillRepoAttemptResult::Invalid,
+                        None,
+                        Instant::now(),
+                    );
+                    return Err(HotError::new(
+                        "SKILL_REPO_STALE",
+                        "确认的来源 metadata 已变化，请重新检查",
+                    ));
+                }
+                let url = static_source_url(&source, "archive.zip")?;
+                let archive = get_bytes(
+                    client,
+                    &source,
+                    &url,
+                    MAX_ARCHIVE,
+                    SkillRepoAttemptPhase::Archive,
+                    deadline,
+                    &mut attempts,
+                )
+                .await?;
+                verify_archive(&source, expected, &archive, &mut attempts)?;
+                let after = source_metadata(
+                    client,
+                    &source,
+                    SkillRepoAttemptPhase::Verify,
+                    deadline,
+                    &mut attempts,
+                )
+                .await?;
+                if after != *expected {
+                    record_attempt(
+                        &mut attempts,
+                        &source,
+                        SkillRepoAttemptPhase::Verify,
+                        SkillRepoAttemptResult::Invalid,
+                        None,
+                        Instant::now(),
+                    );
+                    return Err(HotError::new(
+                        "SKILL_REPO_STALE",
+                        "同源 metadata 在下载后变化，请重新检查",
+                    ));
+                }
+                archive
+            }
+            SourceKind::Github => {
+                let before = github_commit(
+                    client,
+                    &source,
+                    SkillRepoAttemptPhase::Metadata,
+                    deadline,
+                    &mut attempts,
+                )
+                .await?;
+                if before != expected.commit {
+                    return Err(HotError::new(
+                        "SKILL_REPO_STALE",
+                        "确认的 GitHub commit 已变化，请重新检查",
+                    ));
+                }
+                let url = format!("{GITHUB_ARCHIVE}{}.zip", expected.commit);
+                let archive = get_bytes(
+                    client,
+                    &source,
+                    &url,
+                    MAX_ARCHIVE,
+                    SkillRepoAttemptPhase::Archive,
+                    deadline,
+                    &mut attempts,
+                )
+                .await?;
+                verify_archive(&source, expected, &archive, &mut attempts)?;
+                let after = github_commit(
+                    client,
+                    &source,
+                    SkillRepoAttemptPhase::Verify,
+                    deadline,
+                    &mut attempts,
+                )
+                .await?;
+                if after != expected.commit {
+                    return Err(HotError::new(
+                        "SKILL_REPO_STALE",
+                        "GitHub commit 在下载后变化，请重新检查",
+                    ));
+                }
+                archive
+            }
+        };
+        Ok(DownloadedSkillRepo {
+            archive,
+            attempts: attempts.clone(),
+        })
+    }
+    .await;
+    result.map_err(|error: HotError| error.with_attempts(&attempts))
 }
 
 async fn download_expected_with_deadline(
     client: &reqwest::Client,
+    directory: &SkillHubSourceDirectory,
     expected: &SkillRepoExpected,
-) -> Result<Vec<u8>, HotError> {
-    tokio::time::timeout(
-        NETWORK_OPERATION_TIMEOUT,
-        download_expected(client, expected),
-    )
-    .await
-    .map_err(|_| network_timeout())?
+) -> Result<DownloadedSkillRepo, HotError> {
+    let deadline = tokio::time::Instant::now() + NETWORK_OPERATION_TIMEOUT;
+    download_expected(client, directory, expected, deadline).await
 }
 
 fn plan_item(
@@ -1683,11 +2828,15 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<(), HotError> {
 }
 
 fn commit_valid(value: &str) -> bool {
-    value.len() == 40 && value.chars().all(|c| c.is_ascii_hexdigit())
+    value.len() == 40
+        && value == value.to_ascii_lowercase()
+        && value.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 fn digest_valid(value: &str) -> bool {
-    value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit())
+    value.len() == 64
+        && value == value.to_ascii_lowercase()
+        && value.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 fn scoped_id_valid(value: &str) -> bool {
@@ -1729,8 +2878,27 @@ fn expected_identity_valid(expected: &SkillRepoExpected) -> bool {
         && expected.repo == REPO
         && expected.branch == BRANCH
         && commit_valid(&expected.commit)
+        && source_identity_matches_kind(&expected.source_id, expected.source_kind)
+        && expected.archive_size > 0
         && expected.archive_size <= MAX_ARCHIVE as u64
         && digest_valid(&expected.archive_sha256)
+}
+
+fn source_identity_matches_kind(source_id: &str, kind: SourceKind) -> bool {
+    valid_source_id(source_id)
+        && match kind {
+            SourceKind::Domestic => source_id.strip_prefix("cn-mirror-").is_some_and(|suffix| {
+                !suffix.is_empty() && suffix.chars().all(|value| value.is_ascii_digit())
+            }),
+            SourceKind::Relay => source_id == "ph-relay",
+            SourceKind::Github => source_id == "github",
+        }
+}
+
+fn invalid_expected_identity() -> HotError {
+    source_invalid("Skill Hub 更新确认身份无效或已过期").with_detail(
+        "stage=expected-identity; expected 必须来自当前 check 结果，且 sourceId/sourceKind、仓库、分支、commit、size、SHA-256 必须完整一致",
+    )
 }
 
 fn validate_state_file(state: &StateFile) -> Result<(), HotError> {
@@ -2854,10 +4022,7 @@ fn apply_archive(
     app: &AppHandle,
 ) -> Result<SkillRepoApplyReport, HotError> {
     if !expected_identity_valid(&expected) {
-        return Err(HotError::new(
-            "SKILL_REPO_SOURCE_INVALID",
-            "expected identity 无效",
-        ));
+        return Err(invalid_expected_identity());
     }
     let mut state = read_state()?;
     let base = base_manifest(app)?;
@@ -3186,15 +4351,52 @@ pub async fn check_update(
         );
     }
     recover_pending().map_err(CommandError::from)?;
-    let client = client().map_err(CommandError::from)?;
-    let (expected, archive) = resolve_latest_with_deadline(&client)
-        .await
-        .map_err(CommandError::from)?;
+    let directory = source_directory(app).map_err(CommandError::from)?;
+    let settings = AppSettings::load();
+    let client = client(&settings).map_err(CommandError::from)?;
+    log::info!(
+        "skill_hub_check_start network_timeout_ms={} proxy_mode={}",
+        NETWORK_OPERATION_TIMEOUT.as_millis(),
+        proxy_mode_label(settings.proxy_mode)
+    );
+    // `resolve_latest_with_deadline` bounds every source phase. This outer
+    // deadline covers an unexpected future that fails to honor one of those
+    // phase limits, so the command can never leave the renderer awaiting it
+    // indefinitely. The two-second grace is only for joining already-finished
+    // source tasks and does not extend any individual network request.
+    let resolved = tokio::time::timeout(
+        NETWORK_OPERATION_TIMEOUT + Duration::from_secs(2),
+        resolve_latest_with_deadline(&client, &directory),
+    )
+    .await
+    .map_err(|_| {
+        log::error!(
+            "skill_hub_check_timeout stage=resolve timeout_ms={}",
+            (NETWORK_OPERATION_TIMEOUT + Duration::from_secs(2)).as_millis()
+        );
+        CommandError::from(network_timeout().with_detail(format!(
+            "stage=resolve-deadline; timeout_ms={}",
+            (NETWORK_OPERATION_TIMEOUT + Duration::from_secs(2)).as_millis()
+        )))
+    })?
+    .map_err(CommandError::from)?;
+    let ResolvedSkillRepo {
+        expected,
+        archive,
+        attempts,
+    } = resolved;
     let staging = state_dir()
         .map_err(CommandError::from)?
         .join("staging")
         .join(Uuid::new_v4().to_string());
-    safe_create_dir_all(&staging, "创建 check staging 失败").map_err(CommandError::from)?;
+    if let Err(error) = safe_create_dir_all(&staging, "创建 check staging 失败") {
+        // Directory creation can succeed before the durability check fails.
+        // Best-effort cleanup prevents an empty UUID staging directory from
+        // accumulating after a local I/O error; the original error remains
+        // the user-visible failure.
+        let _ = safe_remove_dir_all(&staging, "清理失败的 check staging 失败");
+        return Err(error.into());
+    }
     let result = (|| -> Result<SkillRepoUpdateInfo, CommandError> {
         safe_write_new_file(
             &staging.join("archive.zip"),
@@ -3202,7 +4404,8 @@ pub async fn check_update(
             "写入 check staging 失败",
         )
         .map_err(CommandError::from)?;
-        let skills = parse_archive(&archive).map_err(CommandError::from)?;
+        let skills = parse_archive(&archive, Some(&expected.commit))
+            .map_err(|error| CommandError::from(error.with_attempts(&attempts)))?;
         let state = read_state().map_err(CommandError::from)?;
         let base = base_manifest(app).map_err(CommandError::from)?;
         let ids = base
@@ -3226,6 +4429,10 @@ pub async fn check_update(
             current_commit: current.clone(),
             latest_commit: expected.commit.clone(),
             source_kind: expected.source_kind,
+            source_label: directory
+                .source(&expected.source_id)
+                .map(source_label)
+                .unwrap_or_else(|| expected.source_id.clone()),
             archive_size: expected.archive_size,
             archive_sha256: expected.archive_sha256.clone(),
             expected: expected.clone(),
@@ -3233,6 +4440,7 @@ pub async fn check_update(
             installable_count: installable,
             conflict_count: conflicts,
             skipped_count: 0,
+            attempts,
             // Skill Hub is an intentionally independent capability overlay. It
             // does not change the signed Codex bundle or USB authorization, so
             // its normal update result is not a warning state.
@@ -3262,12 +4470,22 @@ pub async fn apply_update(
         );
     }
     recover_pending().map_err(CommandError::from)?;
-    let client = client().map_err(CommandError::from)?;
-    let archive = download_expected_with_deadline(&client, &expected)
+    let directory = source_directory(app).map_err(CommandError::from)?;
+    let settings = AppSettings::load();
+    let client = client(&settings).map_err(CommandError::from)?;
+    log::info!(
+        "skill_hub_apply_start network_timeout_ms={} proxy_mode={}",
+        NETWORK_OPERATION_TIMEOUT.as_millis(),
+        proxy_mode_label(settings.proxy_mode)
+    );
+    let downloaded = download_expected_with_deadline(&client, &directory, &expected)
         .await
         .map_err(CommandError::from)?;
-    let skills = parse_archive(&archive).map_err(CommandError::from)?;
-    apply_archive(expected, skills, app).map_err(CommandError::from)
+    let attempts = downloaded.attempts;
+    let skills = parse_archive(&downloaded.archive, Some(&expected.commit))
+        .map_err(|error| CommandError::from(error.with_attempts(&attempts)))?;
+    apply_archive(expected, skills, app)
+        .map_err(|error| CommandError::from(error.with_attempts(&attempts)))
 }
 
 pub async fn rollback(
@@ -3464,6 +4682,438 @@ mod tests {
         output.into_inner()
     }
 
+    fn source_entry(
+        id: &str,
+        kind: SourceKind,
+        base: Option<&str>,
+        priority: u32,
+        enabled: bool,
+        test_fixture: bool,
+    ) -> SkillHubSourceEntry {
+        SkillHubSourceEntry {
+            id: id.into(),
+            kind,
+            base: base.map(str::to_string),
+            priority,
+            enabled,
+            test_fixture,
+        }
+    }
+
+    fn source_directory_fixture(enabled_domestic: bool) -> SkillHubSourceDirectory {
+        SkillHubSourceDirectory {
+            schema_version: 1,
+            channel: "skill-hub".into(),
+            sources: vec![
+                source_entry(
+                    "cn-mirror-1",
+                    SourceKind::Domestic,
+                    Some("https://cn-mirror-1.example/skill-hub/"),
+                    10,
+                    enabled_domestic,
+                    true,
+                ),
+                source_entry(
+                    "cn-mirror-2",
+                    SourceKind::Domestic,
+                    Some("https://cn-mirror-2.example/skill-hub/"),
+                    20,
+                    enabled_domestic,
+                    true,
+                ),
+                source_entry(
+                    "cn-mirror-3",
+                    SourceKind::Domestic,
+                    Some("https://cn-mirror-3.example/skill-hub/"),
+                    30,
+                    enabled_domestic,
+                    true,
+                ),
+                source_entry(
+                    "ph-relay",
+                    SourceKind::Relay,
+                    Some(RELAY_BASE),
+                    40,
+                    true,
+                    false,
+                ),
+                source_entry("github", SourceKind::Github, None, 50, true, false),
+            ],
+        }
+    }
+
+    #[test]
+    fn source_directory_accepts_relay_and_github_without_domestic_sources() {
+        let directory =
+            parse_source_directory(include_bytes!("../../resources/skill_hub_sources.json"))
+                .expect("relay and GitHub source directory");
+        assert_eq!(directory.sources.len(), 2);
+        assert!(directory.enabled_domestic().is_empty());
+        assert_eq!(
+            directory.source("ph-relay").map(|source| source.kind),
+            Some(SourceKind::Relay)
+        );
+        assert_eq!(
+            directory.source("github").map(|source| source.kind),
+            Some(SourceKind::Github)
+        );
+    }
+
+    #[test]
+    fn embedded_source_directory_is_the_same_validated_release_resource() {
+        let directory = parse_source_directory(EMBEDDED_SOURCE_DIRECTORY)
+            .expect("embedded source directory must satisfy the release contract");
+        assert_eq!(directory.channel, "skill-hub");
+        assert_eq!(
+            directory.source("ph-relay").map(|source| source.kind),
+            Some(SourceKind::Relay)
+        );
+        assert_eq!(
+            directory.source("github").map(|source| source.kind),
+            Some(SourceKind::Github)
+        );
+    }
+
+    #[test]
+    fn portable_base_manifest_candidates_precede_tauri_resource_directory() {
+        let candidates = base_manifest_resource_candidates_for(
+            Some(Path::new("usb-bundle/CodexAppManager.exe")),
+            Some(Path::new("installed-manager/resources")),
+        );
+        assert_eq!(
+            candidates[0],
+            (
+                "portable-resources".into(),
+                PathBuf::from("usb-bundle/resources/skill_repo_base_manifest.json")
+            )
+        );
+        assert_eq!(
+            candidates[1],
+            (
+                "portable-sibling".into(),
+                PathBuf::from("usb-bundle/skill_repo_base_manifest.json")
+            )
+        );
+        assert_eq!(
+            candidates[2],
+            (
+                "tauri-resource-dir".into(),
+                PathBuf::from("installed-manager/resources/skill_repo_base_manifest.json")
+            )
+        );
+    }
+
+    #[test]
+    fn embedded_base_manifest_is_a_valid_release_resource() {
+        let manifest = parse_base_manifest_bytes(EMBEDDED_BASE_MANIFEST)
+            .expect("embedded base manifest must satisfy the release contract");
+        assert_eq!(manifest.schema_version, 1);
+        assert_eq!(manifest.source_sha256, BASE_MANIFEST_SHA256);
+        assert!(!manifest.skills.is_empty());
+    }
+
+    #[test]
+    fn invalid_base_manifest_uses_a_distinct_resource_error() {
+        let error = parse_base_manifest_bytes(b"{}").expect_err("invalid base manifest");
+        assert_eq!(error.code, "SKILL_REPO_BASE_RESOURCE_INVALID");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_directory_flush_uses_a_writable_handle() {
+        let path = std::env::temp_dir().join(format!(
+            "codex-skill-hub-directory-flush-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&path).expect("temporary directory");
+        let result = sync_directory(&path);
+        let _ = fs::remove_dir_all(&path);
+        assert!(result.is_ok(), "directory flush failed: {result:?}");
+    }
+
+    #[test]
+    fn expected_identity_requires_fixed_source_id_and_kind_pair() {
+        let mut expected = SkillRepoExpected {
+            schema_version: 1,
+            repo: REPO.into(),
+            branch: BRANCH.into(),
+            commit: "a".repeat(40),
+            source_kind: SourceKind::Relay,
+            source_id: "ph-relay".into(),
+            archive_size: 1,
+            archive_sha256: "b".repeat(64),
+        };
+        assert!(expected_identity_valid(&expected));
+
+        expected.source_id = "github".into();
+        assert!(!expected_identity_valid(&expected));
+        let error = invalid_expected_identity();
+        assert_eq!(error.code, "SKILL_REPO_SOURCE_INVALID");
+        assert!(error
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("expected-identity")));
+    }
+
+    #[test]
+    fn source_directory_accepts_one_optional_domestic_source() {
+        let directory = SkillHubSourceDirectory {
+            schema_version: 1,
+            channel: "skill-hub".into(),
+            sources: vec![
+                source_entry(
+                    "cn-mirror-1",
+                    SourceKind::Domestic,
+                    Some("https://mirror-one.example-cn.com/skill-hub/"),
+                    10,
+                    true,
+                    false,
+                ),
+                source_entry(
+                    "ph-relay",
+                    SourceKind::Relay,
+                    Some(RELAY_BASE),
+                    40,
+                    true,
+                    false,
+                ),
+                source_entry("github", SourceKind::Github, None, 50, true, false),
+            ],
+        };
+
+        assert!(validate_source_directory(&directory).is_ok());
+        assert_eq!(directory.enabled_domestic().len(), 1);
+    }
+
+    #[test]
+    fn source_directory_accepts_two_real_domestic_sources_with_optional_third() {
+        let mut directory = source_directory_fixture(true);
+        directory.sources[0].base = Some("https://mirror-one.example-cn.com/skill-hub/".into());
+        directory.sources[1].base = Some("https://mirror-two.example-cn.com/skill-hub/".into());
+        directory.sources[0].test_fixture = false;
+        directory.sources[1].test_fixture = false;
+        directory.sources[0].enabled = true;
+        directory.sources[1].enabled = true;
+        directory.sources[2].enabled = false;
+        assert!(validate_source_directory(&directory).is_ok());
+    }
+
+    #[test]
+    fn source_directory_rejects_duplicate_or_unapproved_entries() {
+        let mut directory = source_directory_fixture(true);
+        directory.sources[1].id = directory.sources[0].id.clone();
+        assert!(validate_source_directory(&directory).is_err());
+
+        let mut directory = source_directory_fixture(false);
+        directory.sources[0].test_fixture = false;
+        assert!(validate_source_directory(&directory).is_err());
+
+        let mut directory = source_directory_fixture(true);
+        directory.sources[0].enabled = true;
+        assert!(validate_source_directory(&directory).is_err());
+    }
+
+    #[test]
+    fn source_directory_rejects_enabled_domestic_fixture() {
+        let mut directory = source_directory_fixture(true);
+        directory
+            .sources
+            .retain(|source| !matches!(source.id.as_str(), "cn-mirror-2" | "cn-mirror-3"));
+        directory.sources[0].enabled = true;
+        assert!(validate_source_directory(&directory).is_err());
+    }
+
+    #[test]
+    fn mismatched_domestic_candidates_are_dropped_before_archive_fetch() {
+        let directory = source_directory_fixture(true);
+        let expected_for = |source_id: &str, commit: char, digest: char| {
+            let source = directory.source(source_id).unwrap().clone();
+            StaticCandidate {
+                source,
+                expected: SkillRepoExpected {
+                    schema_version: 1,
+                    repo: REPO.into(),
+                    branch: BRANCH.into(),
+                    commit: commit.to_string().repeat(40),
+                    source_kind: SourceKind::Domestic,
+                    source_id: source_id.into(),
+                    archive_size: 1,
+                    archive_sha256: digest.to_string().repeat(64),
+                },
+            }
+        };
+        let mut attempts = Vec::new();
+        let retained = retain_consistent_domestic_candidates(
+            vec![
+                expected_for("cn-mirror-1", 'a', 'b'),
+                expected_for("cn-mirror-2", 'c', 'd'),
+                expected_for("cn-mirror-3", 'a', 'b'),
+            ],
+            &mut attempts,
+        );
+
+        assert_eq!(
+            retained
+                .iter()
+                .map(|candidate| candidate.source.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["cn-mirror-1", "cn-mirror-3"]
+        );
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].source_id, "cn-mirror-2");
+        assert_eq!(attempts[0].result, SkillRepoAttemptResult::Invalid);
+    }
+
+    #[test]
+    fn metadata_fixes_source_identity_without_accepting_download_url() {
+        let directory = source_directory_fixture(true);
+        let source = directory.source("cn-mirror-1").unwrap();
+        let meta = format!(
+            r#"{{"schemaVersion":1,"repo":"{REPO}","branch":"{BRANCH}","commit":"{}","archive":"archive.zip","size":1,"sha256":"{}"}}"#,
+            "a".repeat(40),
+            "b".repeat(64)
+        );
+        let expected = expected_from_meta(meta.as_bytes(), source).expect("metadata");
+        assert_eq!(expected.source_id, "cn-mirror-1");
+        assert_eq!(expected.source_kind, SourceKind::Domestic);
+        assert!(expected_identity_valid(&expected));
+        assert!(!serde_json::to_string(&expected)
+            .unwrap()
+            .contains("archive.zip"));
+
+        let with_extra = format!(
+            r#"{{"schemaVersion":1,"repo":"{REPO}","branch":"{BRANCH}","commit":"{}","archive":"archive.zip","size":1,"sha256":"{}","extra":true}}"#,
+            "a".repeat(40),
+            "b".repeat(64)
+        );
+        assert!(expected_from_meta(with_extra.as_bytes(), source).is_err());
+
+        let invalid = expected_from_meta(b"{}", source).expect_err("invalid metadata");
+        assert!(invalid
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("remote-metadata")));
+
+        let uppercase_commit = format!(
+            r#"{{"schemaVersion":1,"repo":"{REPO}","branch":"{BRANCH}","commit":"{}","archive":"archive.zip","size":1,"sha256":"{}"}}"#,
+            "A".repeat(40),
+            "b".repeat(64)
+        );
+        assert!(expected_from_meta(uppercase_commit.as_bytes(), source).is_err());
+    }
+
+    #[test]
+    fn structured_attempts_are_redacted() {
+        let source = source_directory_fixture(true)
+            .source("cn-mirror-1")
+            .unwrap()
+            .clone();
+        let mut attempts = Vec::new();
+        record_attempt(
+            &mut attempts,
+            &source,
+            SkillRepoAttemptPhase::Metadata,
+            SkillRepoAttemptResult::Timeout,
+            None,
+            Instant::now(),
+        );
+        let json = serde_json::to_string(&attempts).unwrap();
+        assert!(json.contains("cn-mirror-1"));
+        assert!(json.contains("metadata"));
+        assert!(!json.contains("https://"));
+        assert!(!json.contains("archive.zip"));
+    }
+
+    #[test]
+    fn http_source_errors_are_distinguished_from_transport_failures() {
+        let http = HotError::new("SKILL_REPO_SOURCE_UNAVAILABLE", "source returned an error")
+            .with_detail("http_status=503");
+        assert_eq!(
+            attempt_result_for_error(&http),
+            SkillRepoAttemptResult::Http
+        );
+
+        let transport = HotError::new("SKILL_REPO_SOURCE_UNAVAILABLE", "source unavailable")
+            .with_detail("dns lookup failed");
+        assert_eq!(
+            attempt_result_for_error(&transport),
+            SkillRepoAttemptResult::Unavailable
+        );
+    }
+
+    #[test]
+    fn skill_hub_client_uses_the_persisted_proxy_mode_without_leaking_url() {
+        let mut settings = AppSettings::default();
+
+        settings.proxy_mode = ProxyMode::System;
+        assert!(client(&settings).is_ok());
+
+        settings.proxy_mode = ProxyMode::Direct;
+        assert!(client(&settings).is_ok());
+
+        settings.proxy_mode = ProxyMode::Custom;
+        settings.custom_proxy_url = "socks5h://127.0.0.1:7890".into();
+        assert!(client(&settings).is_ok());
+
+        settings.custom_proxy_url = "not a proxy".into();
+        let error = client(&settings).expect_err("invalid custom proxy must be rejected");
+        assert_eq!(error.code, "SKILL_REPO_UNAVAILABLE");
+        assert_eq!(
+            error.detail.as_deref(),
+            Some("stage=network-config; reason=invalid-custom-proxy")
+        );
+        assert!(!error
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("not a proxy"));
+    }
+
+    #[test]
+    #[ignore = "requires live Skill Hub relay connectivity"]
+    fn live_skill_hub_relay_round_trip_uses_current_native_client() {
+        let directory: SkillHubSourceDirectory =
+            serde_json::from_slice(EMBEDDED_SOURCE_DIRECTORY).expect("embedded source directory");
+        validate_source_directory(&directory).expect("embedded source directory is valid");
+        let source = directory
+            .source("ph-relay")
+            .expect("embedded source directory contains the relay")
+            .clone();
+        let http = client(&AppSettings::default()).expect("native Skill Hub client");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        let (expected, archive, attempts) = runtime
+            .block_on(async {
+                let deadline = tokio::time::Instant::now() + NETWORK_OPERATION_TIMEOUT;
+                let mut attempts = Vec::new();
+                let expected = source_metadata(
+                    &http,
+                    &source,
+                    SkillRepoAttemptPhase::Metadata,
+                    deadline,
+                    &mut attempts,
+                )
+                .await?;
+                let archive =
+                    fetch_static_candidate(&http, &source, &expected, deadline, &mut attempts)
+                        .await?;
+                Ok::<_, HotError>((expected, archive, attempts))
+            })
+            .expect("relay metadata, archive and revalidation");
+
+        assert_eq!(expected.source_id, "ph-relay");
+        assert_eq!(expected.source_kind, SourceKind::Relay);
+        assert!(!expected.commit.is_empty());
+        assert!(!parse_archive(&archive, Some(&expected.commit))
+            .expect("relay archive is a valid Skill archive")
+            .is_empty());
+        assert!(attempts.iter().any(|attempt| {
+            attempt.source_id == "ph-relay" && attempt.result == SkillRepoAttemptResult::Ok
+        }));
+    }
+
     fn ledger_record(file_id: &str) -> FileRecord {
         FileRecord {
             path: "skill.md".into(),
@@ -3506,7 +5156,14 @@ mod tests {
             ),
             (collision_duplicate.as_str(), b"duplicate", false),
         ]);
-        assert!(parse_archive(&collision).is_err());
+        assert!(parse_archive(&collision, None).is_err());
+
+        let valid = zip_fixture(&[(
+            collision_skill.as_str(),
+            b"---\nname: demo\ndescription: x\n---\n",
+            false,
+        )]);
+        assert!(parse_archive(&valid, Some(&"f".repeat(40))).is_err());
 
         let binary_skill = format!("{prefix}demo/SKILL.md");
         let binary_payload = format!("{prefix}demo/payload.bin");
@@ -3518,7 +5175,7 @@ mod tests {
             ),
             (binary_payload.as_str(), b"MZ\0\0", false),
         ]);
-        assert!(parse_archive(&binary).is_err());
+        assert!(parse_archive(&binary, None).is_err());
     }
 
     #[test]
@@ -3526,6 +5183,10 @@ mod tests {
         let b = b"---\nname: demo\ndescription: x\n---\nbody";
         assert!(validate_frontmatter("demo", b).is_ok());
         assert!(validate_frontmatter("other", b).is_err());
+        let multiline = b"---\nname: demo\ndescription: >-\n  first line\n  second line\nversion: 1.0.0\n---\nbody";
+        assert!(validate_frontmatter("demo", multiline).is_ok());
+        let empty_multiline = b"---\nname: demo\ndescription: >-\n---\nbody";
+        assert!(validate_frontmatter("demo", empty_multiline).is_err());
         assert!(validate_frontmatter("demo", b"---\nname:demo\ndescription: x\n---\n").is_err());
         assert!(validate_frontmatter(
             "demo",
@@ -3570,7 +5231,8 @@ mod tests {
             branch: BRANCH.into(),
             commit: "a".repeat(40),
             source_kind: SourceKind::Github,
-            archive_size: 0,
+            source_id: "github".into(),
+            archive_size: 1,
             archive_sha256: "b".repeat(64),
         };
         let journal = Journal {

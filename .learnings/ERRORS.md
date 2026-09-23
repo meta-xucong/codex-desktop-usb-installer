@@ -25,6 +25,215 @@ SyntaxError: Unexpected token '?'
 
 ---
 
+## [ERR-20260916-G29] update-anchor-must-bind-the-authorized-slot-not-its-current-occupancy
+
+**Logged**: 2026-09-16
+**Priority**: critical
+**Status**: fixed in source; local release verification passed; target-machine verification pending
+**Area**: codex-payload-update / usb-signing / release-packaging
+
+### Summary
+
+Codex payload update changed the payload, release metadata, SHA256SUMS and may
+create the first backup file. If the USB license anchor hashes those changing
+bytes, a legitimate update invalidates its own authorization. A first draft of
+the stable representation also treated an absent backup row differently from
+an occupied backup row, which would reproduce the same failure after the first
+update.
+
+### Root Cause
+
+The top-level manifest schema was overloaded as the cryptographic algorithm
+selector, and the checksum canonicalization omitted dynamic rows only when
+they were present. That made the update lifecycle depend on whether the
+initial package already had a backup file. Separately, a stale Relay result
+could terminate Auto source selection before a newer later source was tried.
+
+### Fix
+
+- New packages keep root/USB top-level `schemaVersion=2`, but explicitly declare
+  `updateCapability.schemaVersion=3` and `anchorSchema=3` on both manifests.
+- `stable-update-v1` canonicalizes payload, both manifests and the single
+  backup slot to fixed `MUTABLE` markers; all other checksum rows remain
+  `IMMUTABLE hash path`. The backup slot marker is emitted even when empty.
+- The updater computes the projected anchor before the first destructive rename
+  and verifies the same anchor, license digest, installation id and key id
+  after commit; failures go through rollback.
+- Auto source selection continues after unreachable/invalid/stale/equal sources
+  and only accepts a newer candidate; explicit source selection never silently
+  falls back.
+- Build, verifier and portable signer require the same explicit capability
+  schema and versioned public profile; old v1/v2 anchors remain launch/read
+  compatible but are refused by the Codex update channel.
+
+### Prevention
+
+Every release update must test both “no backup before first update” and
+“one backup already present” against the same anchor. Never infer the anchor
+algorithm from the document top-level schema, never copy a profile by filename,
+and never stop Auto selection merely because one source is healthy but stale.
+
+### Verification
+
+Stable-anchor crate tests: 12/12; manager full lib tests: 415 passed, 2
+ignored; signer tests: 32/32; frontend: 419 passed, 1 skipped; compatibility
+audit: 50 Skills/7 Agents; adapter contracts: 42/42; PowerShell AST: 8/8.
+The fresh G29 release package and portable signer passed local self-verification
+and profile-pair verification. The physical USB was not modified. Target-machine
+sign/real apply remain release-boundary checks.
+
+---
+
+## [ERR-20260915-G24] codex-payload-apply-repeated-local-hash
+
+**Logged**: 2026-09-15
+**Priority**: high
+**Status**: resolved in source; physical USB verification pending
+**Area**: codex-payload-update
+
+### Summary
+
+G24 reported that Codex payload update spent minutes on a 774 MB removable-drive payload and then
+showed “更新信息已过期” without downloading. The report attributed this to a destructive token TTL,
+but the current source's Codex payload command does not arm or validate that token; the tested g28
+binary and source therefore need to be treated as potentially mismatched.
+
+### Root Cause
+
+The source performed repeated full payload reads in one check/apply path: capability validation,
+SHA256SUMS verification, local snapshot construction, and commit preflight. On a USB volume this
+created several GB of redundant I/O before source resolution/download, amplifying any confirmation
+window or stale-state problem and leaving early failures poorly observable.
+
+### Fix
+
+- Added metadata-only capability preflight for update check/apply, then resolve the remote identity
+  before the expensive full local integrity pass.
+- Added a per-call verified digest table from `SHA256SUMS`; snapshots reuse only that immediately
+  preceding full verification result. No digest is cached across check/apply sessions, and size/mtime
+  are never treated as a security substitute.
+- Kept full capability/integrity checks and an independent payload hash at the commit boundary.
+- Added capability, source-resolve, integrity, snapshot, commit, and command error stage/code logs;
+  added a preparing progress event.
+- Documented the binary/source mismatch and the rule that a future destructive-token integration
+  must use a long-operation lease/heartbeat rather than silently weakening validation.
+
+### Prevention
+
+Before packaging a new manager, run the Codex channel tests and inspect an apply log for ordered
+`stage=source-resolve`, `stage=integrity`, `stage=snapshot`, `stage=download`, and `stage=commit`
+records. Never diagnose a token-expiry report from strings alone: first confirm that the tested EXE
+and source use the same command path. Do not add cross-session hash caching to hide slow removable
+media.
+
+### Verification
+
+`cargo fmt --all -- --check`, `cargo clippy --lib -- -D warnings`, `cargo test --lib`: passed;
+401 tests passed, 2 ignored. A new regression test verifies digest-table snapshot equivalence and
+fail-closed behavior when a required digest is missing. Real signed USB/g28 binary reproduction is
+not claimed by source-level tests.
+
+---
+
+## [ERR-20260915-G28] interactive-signing-desktop-differs-from-build-host
+
+**Logged**: 2026-09-15
+**Priority**: critical
+**Status**: in_progress
+**Area**: usb-signing / release-configuration
+
+### Summary
+
+G27 Bundle 使用了 Codex 构建宿主诊断出的 `4d1407…`，但用户实际双击签名器的 Windows
+桌面读取到 `216ae3…`。G27 Bundle 深度校验通过、License 缺失，拒签原因仍是公钥绑定不一致。
+
+### Root Cause
+
+Windows DPAPI 结果被错误地按“当前 Codex 执行环境”代表“用户实际签名桌面”。构建宿主、服务
+会话、管理员进程和交互式桌面可能不是同一个安全上下文；相同 keyId 不能证明是同一把私钥。
+
+### Fix
+
+- 正式 profile 恢复到用户现场真实交互式签名桌面的 `216ae358…`；
+- G28 重新生成管理器、Bundle 和签名器发布目录；
+- 发布说明明确区分“公共绑定构建证明”和“交互式签名机可用证明”；
+- 真实桌面必须从 G28 新目录运行 `--diagnose-key`，并完成 sign/readback/verify；
+- 不再用 Codex 宿主的本地 DPAPI 结果自动旋转生产 profile。
+
+### Prevention
+
+构建机没有签名机私钥时只能使用受控 profile 构建公共绑定，manifest 必须注明尚未完成目标
+桌面验收。交付前必须收集实际签名桌面的诊断证据；旧 Bundle、旧日志和旧窗口一律不算证据。
+
+### Related Files
+
+- `tools/usb-signing-release-profile.json`
+- `docs/USB-SIGNER-INTERACTIVE-KEY-BINDING-G28-DEVELOPMENT.md`
+- `tools/build-usb-license-signer-gui.ps1`
+- `tools/verify-usb-signing-pair.ps1`
+
+---
+
+## [ERR-20260915-G27] published-gui-key-binding-was-not-directly-verified
+
+**Logged**: 2026-09-15
+**Priority**: critical
+**Status**: resolved
+**Area**: usb-signing / release-gate
+
+### Summary
+
+用户使用最新签名工具时仍看到“签名环境不满足”。现场日志中的 GUI 公钥摘要为
+`216ae358…`，而待签 Bundle 与当前命令行密钥诊断为 `4d140722…`。此前发布校验只跑
+了 CLI `init-key`，因此“CLI 可用”被错误地当成了“用户双击的 GUI 可用”。
+
+### Root Cause
+
+历史 GUI、旧进程状态、CLI 和新源码可能来自不同发布目录或运行时上下文。静态 Bundle
+校验、Cargo 构建成功、独立 CLI `init-key` 成功都不能证明即将交付的 GUI 会读取同一把
+密钥。相同 `keyId` 也不能替代公钥摘要比较。
+
+### Fix
+
+- 增加 GUI 隐藏诊断入口 `--diagnose-key <临时 JSON>`，复用桌面 GUI 的实际密钥解析管线，
+  只输出 `keyId` 和公钥摘要，不输出私钥；
+- `build-usb-license-signer-gui.ps1` 默认对已复制的发布 EXE 执行诊断，与 canonical profile
+  不一致时 fail-closed；
+- `verify-usb-signing-pair.ps1` 支持 `-SignerGuiPath`，正式配对校验优先检查发布 GUI；
+- 以当前新 GUI 实时诊断得到的 `4d140722…` 恢复 canonical profile；旧 `216ae358…` 包和
+  日志只保留为历史不兼容证据；
+- 发布说明和回归清单明确要求关闭旧窗口、从最新目录只启动一个 GUI。
+
+### Prevention
+
+每次换包或换签名工具都必须完成 GUI、Bundle、管理器三方 `keyId + publicKeySha256`
+比较；不得只看 CLI、旧日志或静态清单。未通过 GUI 诊断的目录不能作为正式签名工具交付。
+
+### Related Files
+
+- `tools/usb-license-signer/src/bin/usb-license-signer-gui.rs`
+- `tools/usb-license-signer/src/gui.rs`
+- `tools/build-usb-license-signer-gui.ps1`
+- `tools/verify-usb-signing-pair.ps1`
+- `docs/USB-SIGNER-KEY-BINDING-G27-DEVELOPMENT.md`
+
+### Additional G27 finding
+
+The first implementation invoked the Windows-subsystem GUI with PowerShell `&` and read the
+diagnostic file immediately. The process exit could be observed before the file was flushed,
+causing a false “diagnostic failed” result. The build and pair-preflight scripts now use
+`Start-Process -Wait -PassThru` and require both exit code zero and a present JSON file.
+
+### Resolution
+
+Resolved 2026-09-15: the new signer package passed the GUI diagnostic gate, pair preflight,
+static Bundle verification, signer tests, main Rust tests, capability-pack audit, and the
+historical-key negative case. The release script also removes only a newly created partial
+output directory when a gate fails, preventing a failed artifact from being mistaken for a
+complete release.
+
+---
+
 ## [ERR-20260913-G22] stage2-finalizer-self-reference
 
 **Logged**: 2026-09-13T04:40:00+08:00
@@ -45,6 +254,43 @@ finalizer 把最终报告写回已被清理的 `%LOCALAPPDATA%\io.github.wangnov
 
 独立临时报告根目录、目标交叉检查、明确阶段/退出码/失败路径/重试建议，以及日志目录缺失时的 fallback；
 新增 G22 回归测试并在发行包中拒绝运行期授权残留。
+
+---
+
+## [ERR-20260913-G23-SIGNING-PAIR] usb-package-has-no-matching-local-signer
+
+**Logged**: 2026-09-13T21:30:00+08:00
+**Priority**: critical
+**Status**: resolved
+**Area**: infra
+
+### Summary
+
+r11 U 盘包完整性检查通过，但当前签名电脑无法满足签名条件。
+
+### Error
+
+```text
+Bundle 要求：prod-2026-01 / 216ae358…
+当前 DPAPI：prod-2026-01 / 4d140722…
+结果：签名器在写入 usb-license.json 前拒绝
+```
+
+### Context
+
+- 只读 `inspect`：Bundle 深度校验通过、签名绑定为 `216ae358…`、License 状态为 `missing`。
+- 当前机器 `init-key`：DPAPI 公钥摘要为 `4d140722…`。
+- U 盘没有被写入错误许可证；该拒绝是预期的 fail-closed 行为。
+
+### Suggested Fix
+
+在持有 `216ae358…` 对应 DPAPI 私钥的签名电脑上签名；交付前运行 `tools/verify-usb-signing-pair.ps1`，禁止只凭“构建成功”交付。不得改清单摘要或删除 DPAPI 文件绕过检查。
+
+### Metadata
+
+- Reproducible: yes
+- Related Files: tools/verify-usb-signing-pair.ps1, tools/usb-signing-release-profile.json, docs/USB-SIGNING-KEY-BINDING-G22.md
+- See Also: ERR-20260913-G22
 
 ---
 
@@ -669,3 +915,292 @@ The signed U-disk manager initially disabled both “one-click install” and �
 Every asynchronous USB startup consumer must test the initial `starting` state, a later authorized transition, and the failure/timeout paths. See `docs/USB-STARTUP-READINESS-G23.md`.
 
 ---
+
+## [ERR-20260913-G24] machine-bound-signer-cannot-be-copied
+
+**Logged**: 2026-09-13T23:55:00+08:00
+**Priority**: critical
+**Status**: resolved
+**Area**: usb-signing
+
+### Summary
+
+The previous signer depended on the current Windows user's DPAPI key. Copying only the EXE to
+another computer could not sign, while copying a raw private key would have destroyed the security
+boundary.
+
+### Root Cause
+
+The signing key had machine/user protection but no portable encrypted transfer format. A package
+could be buildable and still be signable only on a different hidden machine, producing repeated
+`keyId`-same-but-public-digest-different failures.
+
+### Fix
+
+- Rotate the canonical profile to the current T14S public key `4d140722…` and rebuild manager/
+  Bundle artifacts;
+- add AES-256-GCM + Argon2id `codex-usb-signing-key.vault` with create-only writes;
+- add GUI native password prompt and shared in-memory password pipeline;
+- add release manifest/hash support for optional vault inclusion;
+- keep DPAPI only as the first-use migration source on the matching signing computer.
+
+### Prevention
+
+Run `tools/verify-usb-signing-pair.ps1` before delivery. Copy the complete signer folder including
+the vault; never place a raw seed in EXE, Bundle, command line, environment variables, or reports.
+Historical `216ae3…` and current `4d1407…` packages must remain explicitly separated.
+
+### Verification
+
+Rust 26 tests, GUI 3 tests, clippy with `-D warnings`, static Bundle verification, public-key pair
+preflight, installer-pack audit (50 Skills/7 Agents), and cross-directory portable-vault positive/
+wrong-password tests all passed.
+
+---
+
+## [ERR-20260914-G25] stale-signer-window-shows-old-key-binding
+
+**Logged**: 2026-09-14T10:45:00+08:00
+**Priority**: high
+**Status**: resolved
+**Area**: usb-signing-gui
+
+### Summary
+
+The same signer EXE could be opened more than once. An older window could retain a
+previous inspection result (for example the historical `216ae3…` binding) while a
+new window had already validated the current `4d1407…` Bundle. The user saw the
+old window's disabled signing state and reported that the environment was invalid.
+
+### Root Cause
+
+The GUI had a transaction mutex for signing/key access, but it did not have a
+process-wide GUI instance guard. The inspection state was intentionally held in
+each window and was not shared or invalidated when another window started.
+
+### Fix
+
+- Added a named Windows GUI instance mutex.
+- Added a window-class fallback check for older signer builds that do not yet
+  hold the new mutex; the second launch explains that the existing window must be
+  closed before opening the current release.
+- Kept the fail-closed key comparison unchanged: `keyId + publicKeySha256`
+  must still match before signing.
+
+### Prevention
+
+When a signing check appears stale, close every signer window and start exactly
+one EXE from the newest release directory. Verify the displayed binding against
+`tools/verify-usb-signing-pair.ps1`; do not rotate or delete the DPAPI key to
+make an old Bundle appear valid.
+
+### Verification
+
+Current F: Bundle: deep inspection passed, `SignedRequired` binding is
+`4d140722…`, local DPAPI key is `4d140722…`, and the fresh GUI startup log
+reported `canSign=true`. The U 盘 was not modified during diagnosis.
+
+---
+
+## [ERR-20260914-G26] uninstall-preflight-rejected-missing-optional-parent
+
+**Logged**: 2026-09-14
+**Priority**: high
+**Status**: resolved
+**Area**: uninstall-cleanup / skill-hub-routing
+
+### Summary
+
+二阶段卸载器在全新用户目录上仍可能把“可选的历史 `wangnov` 目录尚未创建”误判为路径不安全，因而没有启动 finalizer。同期 Skill Hub 资源曾误带 GitCode/Gitee 派生镜像设计，给默认安装链增加了不必要的仓库、账号和发布前置条件。
+
+### Root Cause
+
+`canonical_or_parent` 只规范化目标的直接父目录；当多个可选父级同时不存在时，安全预检直接失败。Skill Hub 的构建期和运行期来源门禁也曾按国内镜像数量设计，和实际约定的“自有仓库 → Relay → GitHub fallback”不一致。
+
+### Fix
+
+- 路径安全检查向上寻找最近存在的普通目录，再按原缺失组件补回逻辑路径；不创建缺失目录、不放宽重解析点/越界检查，并新增 local/roaming `wangnov` 双缺失回归。
+- 默认来源资源只保留固定 Relay 和 GitHub fallback；构建期与运行期都允许零国内源，GitCode/Gitee 派生仓库工具不再进入主链。
+- 保留来源尝试、阶段、结果和脱敏诊断，Relay 失败后才进入 GitHub，下载前后继续校验同一版本与 SHA-256。
+
+### Prevention
+
+新机卸载回归必须覆盖可选目录不存在、目录已存在、重解析祖先和报告目录独立性；来源链变更必须同时更新资源 JSON、`build.rs`、运行时解析和契约测试。禁止把测试占位域名或新托管仓库当作默认发布前置条件。
+
+### Verification
+
+`cargo test --manifest-path src-tauri/Cargo.toml --locked`：400 passed，2 ignored；Skill Hub 定向测试 18 passed；前端 416 passed、1 skipped；`npm run check`、`npm run lint`、`npm run build`、Rust 格式检查和 Relay Python/契约测试均通过。公网现场检查确认 Relay metadata/archive 路由可达，网络偶发超时仍由超时与 GitHub fallback 处理。
+
+---
+
+## [ERR-20260915-G25] skill-hub-source-invalid-was-not-actionable
+
+**Logged**: 2026-09-15
+**Priority**: high
+**Status**: fixed in source; existing packaged USB audit passed; fresh EXE rebuild pending
+**Area**: skill-hub-routing / release-packaging
+
+### Summary
+
+Skill Hub displayed `SKILL_REPO_SOURCE_INVALID` and only “后端没有返回可公开的进一步详情”, so a user could not tell whether the local release resource, remote metadata, or the network was at fault.
+
+### Root Cause
+
+The runtime loader depended on one Tauri `resource_dir()` path and collapsed missing/read failures into a detail-less source error. The same stable code was also reused for remote metadata and stale apply identities. The release scripts copied the resource but did not make its presence, fixed Relay/GitHub identity, and SHA256SUMS coverage an explicit U 盘 acceptance gate.
+
+### Fix
+
+- Added deterministic portable/Tauri source-resource candidates and a compile-time canonical fallback used only when all external candidates are absent.
+- Existing but malformed/reparse resources still fail closed with a stage/candidate/reason detail; no malformed file is silently replaced.
+- Tightened `expected` source ID/kind pairing and exposed a specific confirmation-identity detail.
+- The UI now displays safe backend details for all Skill Hub failures instead of unconditionally hiding every `SKILL_REPO_*` detail.
+- Added build/USB verifier gates for `resources/skill_hub_sources.json`, fixed Relay/GitHub identity, and SHA256SUMS coverage; added cleanup allowlist entries for both static Skill Hub resources.
+
+### Prevention
+
+Every new source or relay change must be tested at three boundaries: compiled fallback, packaged EXE resource directory, and generated USB bundle. A generic source-invalid code is not enough; logs and the disclosure UI must identify the phase without exposing credentials or user paths.
+
+### Verification
+
+Rust 403 passed with 2 ignored (405 collected), Skill Hub 20/20, frontend 417/417 with one skipped, TypeScript,
+lint, production renderer build, PowerShell parser checks, and the new verifier against the existing
+g28 USB bundle passed. A live Relay probe returned metadata/archive HTTP 200 with matching size and
+SHA-256, and GitHub API returned HTTP 200. A fresh signed EXE/USB physical smoke test remains a
+separate release step.
+
+---
+
+## [ERR-20260916-G30] usb-lease-readiness-misreported-as-signature-failure
+
+**Logged**: 2026-09-16
+**Priority**: critical
+**Status**: fixed in source and G30 package; target-machine smoke test pending
+**Area**: USB Guard / offline Codex install
+
+### Summary
+
+A signed USB bundle reached `offline-payload-stage` while the persisted status
+said `authorized/running`, but the live lease or `CodexUsbGuard.exe` lock was
+not ready. The backend correctly rejected the protected operation; the UI
+incorrectly showed “更新包签名校验失败”.
+
+### Root Cause
+
+`spawn()` was treated as helper readiness, `status.json` was trusted as a live
+authorization snapshot, and the UI staged before doing an action-boundary
+guard refresh. The error classifier also mapped lease/watchdog markers into
+the cryptographic signature bucket.
+
+### Resolution
+
+The manager now stops stale helpers even when their bytes are unchanged, waits
+up to five seconds for the helper lock, masks stale authorized snapshots,
+retries a transient authorization state for a bounded three seconds, and
+rechecks authorization before MSIX staging. A stable `usb_authorization` code
+separates lease/watchdog readiness from real license or Authenticode failures.
+
+### Prevention
+
+Never use `status.json` or `spawn()` alone as proof of USB authorization. Keep
+the backend gate fail-closed, test the first-click startup race, and preserve
+the distinction between signature, bundle-integrity, and live-lease errors.
+
+### Verification
+
+Added Rust classification/status-state tests and frontend tests proving that
+preflight failure does not create a staged payload. Full local regression,
+G30 package verification, and signing-pair preflight pass; the physical USB
+and target Windows test remain external evidence.
+
+---
+
+## [ERR-20260916-G33] skill-hub-watchdog-masked-rustls-provider-panic
+
+**Logged**: 2026-09-16
+**Priority**: critical
+**Status**: fixed in source and G33 package; target-machine smoke test pending
+**Area**: skill-hub-network / update-source-compatibility
+
+### Summary
+
+Skill Hub 的“检查更新”可能一直显示检查中，最后只给 renderer watchdog 超时；同时 Codex 更新会把已确认的镜像“无更新”错误覆盖成备用源不可用。修复网络客户端后，开发机真实探针又发现远端归档使用合法的多行 YAML description，旧 frontmatter 解析器仍会把有效 Skill 判为格式错误。
+
+### Root Cause
+
+依赖树因 Tauri updater 启用 `reqwest` 的 `rustls-no-provider`，Skill Hub 独立 client 构建前没有安装 crypto provider，`Client::build()` 直接 panic，native invoke 不一定向 renderer settle。另一个问题是 Codex Relay 生产 metadata 已升级到 protocol 2，而客户端只接受 protocol 1；Auto 聚合也把后续 Relay/GitHub 失败当成整体失败。网络恢复后，内容层的严格 frontmatter 解析又与生产 Skill Hub 的 `description: >-` 多行标量不兼容。
+
+### Resolution
+
+- 直接依赖并安装 Rustls `ring` provider，provider 竞争初始化可安全收敛，异常改为有阶段信息的 `SKILL_REPO_UNAVAILABLE`，禁止 panic。
+- Skill Hub check/apply 读取持久化 system/direct/custom proxy，并保留有界请求/renderer 超时。
+- Relay 接受 protocol 1/2；protocol 2 必须校验嵌套 release/tag/完整 assets 身份一致。
+- Auto 只要有合法源证明 no-newer，就不再被备用源失败覆盖。
+- frontmatter 解析器增加受限 YAML 多行 description 支持，只放宽已验证的块标量，不执行通用 YAML 或放宽归档安全边界。
+
+### Prevention
+
+任何升级 reqwest、Tauri updater 或 Rustls 的变更，必须先跑 client-construction 测试；任何 Relay metadata schema 变化必须用真实生产 shape 的 resolver 测试；“无更新”必须和“所有源不可用”分别验收；Skill Hub 内容契约变更必须用当前远端归档做一次 metadata、archive、复核和解析的原生探针，不能只测 HTTP 200/哈希。
+
+### Verification
+
+Rust 全量 `421 passed, 3 ignored`，Skill Hub 定向 21 passed，Codex 定向 42 passed；签名器 32 passed；前端全量 `421 passed, 1 skipped`，TypeScript、lint、renderer build、cargo fmt 通过。当前 Rust client 的 Relay metadata/archive/复核/解析探针通过，公网 Relay protocol 2、Skill Hub metadata/archive HTTP 200 且 archive size/SHA-256 匹配；新 EXE 与签名器配对自检通过。真实大陆网络、目标机和物理 U 盘仍待现场验收。
+
+---
+
+## [ERR-20260917-G34] skill-hub-windows-directory-flush-misclassified
+
+**Logged**: 2026-09-17
+**Priority**: high
+**Status**: fixed in source and G34 package; physical target-machine validation pending
+**Area**: skill-hub-local-persistence
+
+### Summary
+
+Skill Hub 远端 metadata、archive 和 verify 已成功后，Windows 本地 staging 初始化仍可能失败，界面却显示“更新包无效或已过期”。现场详情中的 `[local path]` 是前端脱敏占位符，不是网络地址。
+
+### Root Cause
+
+目录持久化代码使用 `CreateFileW` 的 `GENERIC_READ` 打开 NTFS 目录，再调用 `FlushFileBuffers`。Windows 对该组合返回 `ERROR_ACCESS_DENIED (5)`；同一目录使用 `GENERIC_WRITE` 可正常刷新。旧代码还把这个 OS I/O 错误包装为 `SKILL_REPO_LEDGER_INVALID`，造成错误分类和错误文案。
+
+### Resolution
+
+目录刷新改用 `GENERIC_WRITE`，捕获并保留 Win32 错误码；本地目录打开/flush 错误使用 `SKILL_REPO_LOCAL_IO`，前端映射为磁盘权限/空间提示并允许重试。check staging 初始化失败时做尽力清理，并增加真实 Windows 临时目录回归测试。
+
+### Prevention
+
+涉及目录 durability 的 Windows API 修改必须在 NTFS 临时目录上走真实 `sync_directory` 测试；不能以网络请求成功推断本地 apply 成功。`SKILL_REPO_LEDGER_INVALID` 仅用于清单语义错误，权限、句柄和磁盘错误必须使用独立本地 I/O 错误码。发布前必须从同一当前源码生成 manager、U 盘包和匹配签名器，禁止复用历史 manager/profile。
+
+本次重打包还发现签名器构建脚本曾以 BOM-less UTF-8 保存；Windows PowerShell 5.1 按 ANSI 解析中文字符串时会把脚本判为语法错误。脚本已修为结构明确并保存为 UTF-8 BOM；以后所有发行脚本都必须在 Windows PowerShell 5.1 下执行一次 `-File` 解析冒烟。
+
+---
+
+## [ERR-20260917-G35] skill-hub-base-resource-uses-wrong-runtime-root
+
+**Logged**: 2026-09-17
+**Priority**: high
+**Status**: fixed in source; G35 package and signer pair validation passed
+**Area**: skill-hub-portable-resource-resolution
+
+### Summary
+
+U 盘版 Skill Hub 安装/检查仍报“基础 Skill ID 资源缺失”，并显示
+`SKILL_REPO_LEDGER_INVALID`。G34 包内实际已有基础清单，说明失败发生在运行时定位而不是文件内容或远端下载。
+
+### Root Cause
+
+Skill Hub 来源目录已经按便携 EXE 同级资源优先解析，但 `base_manifest()` 仍只拼接
+Tauri `resource_dir()`。便携入口在部分机器上得到的是本机安装/缓存资源目录，该目录没有
+`skill_repo_base_manifest.json`；不存在路径又被通用 `io_error()` 误标为 ledger 无效。
+
+### Resolution
+
+基础清单现在按“EXE 同级 resources → EXE 同级文件 → Tauri resource_dir → 编译内置副本”解析。
+外部文件存在但身份无效时 fail closed，并返回独立的
+`SKILL_REPO_BASE_RESOURCE_INVALID`；所有外部候选缺失时使用 build.rs 已校验的内置副本。
+安装包构建同时检查基础清单的 source/hash/ID 顺序，阻止只打包管理器而漏掉资源。
+
+### Prevention
+
+便携功能不能只依赖 Tauri `resource_dir()`，每个发行资源都必须有同级 EXE 候选和编译内置/明确缺失策略。
+发布门禁必须检查最终输出目录，而不是只检查仓库或中间构建目录。`SKILL_REPO_LEDGER_INVALID`
+只用于热更新账本语义错误；发行资源错误必须使用独立稳定错误码。

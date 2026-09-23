@@ -53,6 +53,7 @@ describe("skill-hub relay contract", () => {
     assert.match(source, /EXPECTED_GITHUB_COMMIT_URL = "https:\/\/api\.github\.com\/repos\/meta-xucong\/skill_hub\/commits\/master"/);
     assert.match(source, /EXPECTED_GITHUB_ARCHIVE_TEMPLATE = "https:\/\/github\.com\/meta-xucong\/skill_hub\/archive\/\{commit\}\.zip"/);
     assert.match(source, /EXPECTED_EXPORT_ROOT = "\/srv\/codex-update-relay\/export"/);
+    assert.match(source, /METADATA_KEYS = frozenset\(\("schemaVersion", "repo", "branch", "commit", "archive", "size", "sha256"\)\)/);
     assert.match(source, /ALLOWED_GITHUB_HOSTS = frozenset\(\{"api\.github\.com", "github\.com", "codeload\.github\.com"\}\)/);
     assert.match(source, /self\.count > self\.limit/);
     assert.match(source, /validate_github_url\(newurl\)/);
@@ -64,6 +65,9 @@ describe("skill-hub relay contract", () => {
     assert.match(source, /export_root = config\["exportRoot"\] \/ "skill-hub"/);
     assert.match(source, /link_target = Path\(os\.readlink\(current\)\)/);
     assert.match(source, /link_target\.is_absolute\(\) or link_target\.parent != Path\("releases"\)/);
+    assert.match(source, /set\(value\) != METADATA_KEYS/);
+    assert.match(source, /archive_path = current \/ "archive\.zip"/);
+    assert.match(source, /len\(archive\) != size or sha256\(archive\) != digest/);
     assert.match(source, /current_tmp\.symlink_to\(Path\("releases"\) \/ commit, target_is_directory=True\)/);
     assert.match(source, /os\.replace\(current_tmp, export_root \/ "current"\)/);
     assert.match(source, /validate_metadata\(read_json\(temporary \/ "latest\.json"\), expected\)/);
@@ -74,12 +78,15 @@ describe("skill-hub relay contract", () => {
   });
 
   it("keeps the existing Codex payload route and exposes only the two Skill Hub files", () => {
+    assert.match(edge, /listen 443 ssl;/);
     assert.match(edge, /alias \/srv\/codex-update-relay\/export\/current\//);
     assert.match(edge, /location \^~ \/__codex_update__\/releases\/\s*\{\s*return 404;/s);
     assert.equal((edge.match(/location = \/__codex_update__\/skill-hub\/latest\.json \{/g) ?? []).length, 1);
     assert.equal((edge.match(/location = \/__codex_update__\/skill-hub\/archive\.zip \{/g) ?? []).length, 1);
     assert.match(edge, /location = \/__codex_update__\/skill-hub\/latest\.json \{[\s\S]*?alias \/srv\/codex-update-relay\/export\/skill-hub\/current\/latest\.json;[\s\S]*?default_type application\/json;/);
     assert.match(edge, /location = \/__codex_update__\/skill-hub\/archive\.zip \{[\s\S]*?alias \/srv\/codex-update-relay\/export\/skill-hub\/current\/archive\.zip;/);
+    assert.match(edge, /location = \/__codex_update__\/skill-hub\/latest\.json \{[\s\S]*?limit_except GET HEAD \{ deny all; \}/);
+    assert.match(edge, /location = \/__codex_update__\/skill-hub\/archive\.zip \{[\s\S]*?limit_except GET HEAD \{ deny all; \}/);
     assert.match(edge, /location \^~ \/__codex_update__\/skill-hub\/ \{\s*return 404;\s*\}/s);
     assert.doesNotMatch(edge, /location \^~ \/__codex_update__\/skill-hub\/ \{[\s\S]*?alias/);
   });

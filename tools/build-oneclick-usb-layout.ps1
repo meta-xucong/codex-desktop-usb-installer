@@ -14,6 +14,7 @@ param(
 $ErrorActionPreference = "Stop"
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 . (Join-Path $repo "tools\usb-signing-profile.ps1")
+$signingProfile = $null
 $releaseVersion = [string]((Get-Content -LiteralPath (Join-Path $repo "package.json") -Raw | ConvertFrom-Json).version)
 if ([string]::IsNullOrWhiteSpace($releaseVersion)) {
     throw "package.json 缺少发布版本号"
@@ -46,7 +47,11 @@ if ($SkipSignature -and $UsbPolicy -eq "SignedRequired" -and -not $InternalSigne
 }
 
 if ($UsbPolicy -eq "SignedRequired") {
-    $signingProfile = Get-CodexUsbSigningProfile -RepoRoot $repo -ProfilePath $UsbSigningProfilePath
+    if ([string]::IsNullOrWhiteSpace($UsbSigningProfilePath)) {
+        throw "SignedRequired 正式 U 盘包必须显式传入当前版本 UsbSigningProfilePath；不会使用仓库中的固定 profile"
+    }
+    $signingProfile = Get-CodexUsbSigningProfile -RepoRoot $repo -ProfilePath $UsbSigningProfilePath -RequireExplicitPath
+    Assert-CodexUsbSigningProfileVersion -Profile $signingProfile -ExpectedVersion $releaseVersion
     Initialize-CodexUsbSigningEnvironment -Profile $signingProfile
     $publicKeyId = [string]$env:CODEX_USB_GUARD_PUBLIC_KEY_ID
     $publicKeyB64 = [string]$env:CODEX_USB_GUARD_PUBLIC_KEY_B64
@@ -74,12 +79,16 @@ if ($UsbPolicy -eq "SignedRequired") {
     $publicKeySha256 = (($publicKeyDigestBytes | ForEach-Object { $_.ToString('x2') }) -join '')
     $signingBinding = [ordered]@{
         policy = "SignedRequired"
+        releaseVersion = [string]$signingProfile.ReleaseVersion
+        releaseId = [string]$signingProfile.ReleaseId
         keyId = $publicKeyId
         publicKeySha256 = $publicKeySha256
     }
 } else {
     $signingBinding = [ordered]@{
         policy = "DevelopmentAutoEnroll"
+        releaseVersion = $null
+        releaseId = $null
         keyId = $null
         publicKeySha256 = $null
     }
@@ -106,6 +115,43 @@ function Read-JsonFile([string]$Path) {
     }
     $utf8 = [System.Text.UTF8Encoding]::new($false, $true)
     return [System.IO.File]::ReadAllText($Path, $utf8) | ConvertFrom-Json
+}
+
+function Get-JsonPropertyValue($Object, [string]$Name) {
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $null }
+    return $property.Value
+}
+
+function Test-IntegerValue([object]$Value) {
+    return $null -ne $Value -and (
+        $Value -is [sbyte] -or $Value -is [byte] -or
+        $Value -is [int16] -or $Value -is [uint16] -or
+        $Value -is [int32] -or $Value -is [uint32] -or
+        $Value -is [int64] -or $Value -is [uint64]
+    )
+}
+
+function Get-JsonInteger([object]$Object, [string]$Name) {
+    if ($null -eq $Object) {
+        return $null
+    }
+    if ($Object -is [System.Collections.IDictionary]) {
+        if (-not $Object.Contains($Name)) {
+            return $null
+        }
+        $value = $Object[$Name]
+    } else {
+        $property = $Object.PSObject.Properties[$Name]
+        if ($null -eq $property) {
+            return $null
+        }
+        $value = $property.Value
+    }
+    if (-not (Test-IntegerValue $value)) {
+        return $null
+    }
+    return $value
 }
 
 function Assert-AuthenticodePe([string]$Path, [string]$Label) {
@@ -222,7 +268,7 @@ function Assert-NoSuccessfulStateResidue([string]$RootPath) {
 $output = (Resolve-Path -LiteralPath $OutputPath).Path
 $manifestPath = Join-Path $output "manifest.json"
 $manifest = Read-JsonFile $manifestPath
-if ($manifest.schemaVersion -is [string] -or [int64]$manifest.schemaVersion -ne 2) {
+if ((Get-JsonInteger $manifest "schemaVersion") -ne 2) {
     throw "输出 root manifest 必须声明 schemaVersion=2"
 }
 $architecture = [string]$manifest.architecture
@@ -244,8 +290,8 @@ $backupDirectory = if ([string]::IsNullOrWhiteSpace($payloadDirectoryRelative)) 
 $rootUpdateCapability = $manifest.updateCapability
 if ($null -eq $rootUpdateCapability -or
     $rootUpdateCapability.codexPayload -ne $true -or
-    $rootUpdateCapability.schemaVersion -is [string] -or
-    [int64]$rootUpdateCapability.schemaVersion -ne 2) {
+    (Get-JsonInteger $rootUpdateCapability "schemaVersion") -ne 3 -or
+    (Get-JsonInteger $rootUpdateCapability "anchorSchema") -ne 3) {
     throw "输出 root manifest 未声明 Codex payload update capability"
 }
 if ((Get-Item -LiteralPath $manager).Name -ine "CodexAppManager.exe") {
@@ -262,17 +308,52 @@ Copy-Item -LiteralPath $manager -Destination (Join-Path $output "CodexAppManager
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "verify-payload.ps1") -Destination (Join-Path $output "verify-payload.ps1") -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "verify-oneclick-usb.ps1") -Destination (Join-Path $output "verify-usb.ps1") -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "verify-usb-launcher.ps1") -Destination (Join-Path $output "verify-usb-launcher.ps1") -Force
+$verificationOutput = Join-Path $output "verification"
+New-Item -ItemType Directory -Force -Path $verificationOutput | Out-Null
+Copy-Item -LiteralPath (Join-Path $repo "tools\usb-signing-profile.ps1") -Destination (Join-Path $verificationOutput "usb-signing-profile.ps1") -Force
+$utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+if ($null -ne $signingProfile) {
+    # Only emit the public verification fields. Never copy the source profile
+    # verbatim: a future local signing profile may contain private or
+    # operational metadata that must not enter a portable release directory.
+    $verificationProfileJson = [ordered]@{
+        schemaVersion = 1
+        profile = "production"
+        releaseVersion = [string]$signingProfile.ReleaseVersion
+        releaseId = [string]$signingProfile.ReleaseId
+        keyId = [string]$signingProfile.KeyId
+        publicKeyB64 = [string]$signingProfile.PublicKeyB64
+        publicKeySha256 = [string]$signingProfile.PublicKeySha256
+    } | ConvertTo-Json -Depth 4
+    [System.IO.File]::WriteAllText(
+        (Join-Path $verificationOutput "usb-signing-release-profile.json"),
+        $verificationProfileJson,
+        $utf8NoBom
+    )
+}
 $launcherVerifier = Join-Path $output "verify-usb-launcher.ps1"
 & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $launcherVerifier -Path (Join-Path $output "CodexAppManager.exe") -ExpectedLevel requireAdministrator
 if ($LASTEXITCODE -ne 0) {
     throw "CodexAppManager.exe 未通过 USB requireAdministrator 清单验证"
 }
 # Tauri deliberately does not ship PowerShell files through the Windows
-# resource bundle.  Keep the product verifier in the user-visible root
-# ccswitch directory so offline diagnostics still work on a blank machine.
-$ccswitchVerifier = Join-Path (Split-Path -Parent $repo) "release\ccswitch-product\verify-product.ps1"
-if (Test-Path -LiteralPath $ccswitchVerifier -PathType Leaf) {
-    Copy-Item -LiteralPath $ccswitchVerifier -Destination (Join-Path $output "ccswitch\verify-product.ps1") -Force
+# resource bundle. Keep the verifier in the user-visible root ccswitch
+# directory so offline diagnostics still work on a blank machine. Prefer the
+# current source/resource verifier; an older sibling release must not silently
+# overwrite a newer CCSwitch contract.
+$ccswitchVerifierCandidates = @(
+    (Join-Path $repo "src-tauri\resources\ccswitch\verify-product.ps1"),
+    (Join-Path $output "resources\ccswitch\verify-product.ps1"),
+    (Join-Path (Split-Path -Parent $repo) "release\ccswitch-product\verify-product.ps1")
+)
+$ccswitchVerifier = $ccswitchVerifierCandidates |
+    Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+    Select-Object -First 1
+if ($ccswitchVerifier) {
+    $ccswitchVerifierDestination = Join-Path $output "ccswitch\verify-product.ps1"
+    if ((Resolve-Path -LiteralPath $ccswitchVerifier).Path -ine (Resolve-Path -LiteralPath $ccswitchVerifierDestination).Path) {
+        Copy-Item -LiteralPath $ccswitchVerifier -Destination $ccswitchVerifierDestination -Force
+    }
 }
 
 $installerItem = Get-Item -LiteralPath (Join-Path $output "CodexDesktopSetup.exe")
@@ -288,6 +369,37 @@ $ccswitchItem = Get-Item -LiteralPath (Join-Path $output "ccswitch\CodexSwitch.e
 $embeddedCcswitchItem = Get-Item -LiteralPath (Join-Path $output "resources\ccswitch\CodexSwitch.exe")
 $vcRedistItem = Get-Item -LiteralPath (Join-Path $output "resources\prerequisites\vc_redist.x64.exe")
 $webView2Item = Get-Item -LiteralPath (Join-Path $output "resources\prerequisites\MicrosoftEdgeWebView2RuntimeInstallerX64.exe")
+$skillHubSourcesItem = Get-Item -LiteralPath (Join-Path $output "resources\skill_hub_sources.json") -ErrorAction Stop
+$skillHubSources = Read-JsonFile $skillHubSourcesItem.FullName
+if ((Get-JsonInteger $skillHubSources "schemaVersion") -ne 1 -or [string]$skillHubSources.channel -cne "skill-hub") {
+    throw "U 盘包中的 Skill Hub 来源目录 schema/channel 无效"
+}
+$skillHubRelay = @($skillHubSources.sources | Where-Object { [string]$_.id -ceq "ph-relay" -and [string]$_.kind -ceq "relay" })
+$skillHubGithub = @($skillHubSources.sources | Where-Object { [string]$_.id -ceq "github" -and [string]$_.kind -ceq "github" })
+if ($skillHubRelay.Count -ne 1 -or $skillHubRelay[0].enabled -ne $true -or [string]$skillHubRelay[0].base -cne "https://update.404token.xyz/__codex_update__/skill-hub/" -or
+    $skillHubGithub.Count -ne 1 -or $skillHubGithub[0].enabled -ne $true -or $null -ne (Get-JsonPropertyValue $skillHubGithub[0] "base")) {
+    throw "U 盘包中的 Skill Hub Relay/GitHub 来源身份无效"
+}
+$baseManifestItem = Get-Item -LiteralPath (Join-Path $output "resources\skill_repo_base_manifest.json") -ErrorAction Stop
+$baseManifest = Read-JsonFile $baseManifestItem.FullName
+$baseSourcePath = Join-Path $output "content\codex-starter-kit\manifest\skill-audit.json"
+$baseSourceItem = Get-Item -LiteralPath $baseSourcePath -ErrorAction Stop
+$baseSourceHash = (Get-FileHash -LiteralPath $baseSourceItem.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+$baseSkills = @($baseManifest.skills)
+$sourceManifest = Read-JsonFile $baseSourceItem.FullName
+$sourceSkills = @($sourceManifest.skills)
+if ((Get-JsonInteger $baseManifest "schemaVersion") -ne 1 -or
+    [string]$baseManifest.source -cne "installer-pack/manifest/skill-audit.json" -or
+    [string]$baseManifest.sourceSha256 -cne $baseSourceHash -or
+    $baseSkills.Count -eq 0 -or $baseSkills.Count -ne $sourceSkills.Count) {
+    throw "U 盘包中的基础 Skill ID 清单 schema/hash/数量无效"
+}
+for ($index = 0; $index -lt $sourceSkills.Count; $index++) {
+    if ([string]$baseSkills[$index].id -cne [string]$sourceSkills[$index].id) {
+        throw "U 盘包中的基础 Skill ID 顺序与源清单不一致：index=$index"
+    }
+}
+Write-Output "基础 Skill ID 清单已随 U 盘包打包并通过身份/ID 顺序门禁：$($baseSkills.Count) 个"
 if (-not $SkipSignature -and -not $InternalSigned) {
     Assert-AuthenticodePe $ccswitchItem.FullName "CCSwitch"
     Assert-AuthenticodePe $embeddedCcswitchItem.FullName "embedded CCSwitch"
@@ -309,7 +421,8 @@ $usbManifest = [ordered]@{
     status = "oneclick"
     updateCapability = [ordered]@{
         codexPayload = $true
-        schemaVersion = 2
+        schemaVersion = 3
+        anchorSchema = 3
         mutableFields = @(
             "manifest.json/codexDesktopVersion",
             "manifest.json/packageVersion",
@@ -450,7 +563,9 @@ $usbManifest = [ordered]@{
         "This route never calls StagePackageAsync, RegisterPackageAsync, Add-AppxPackage, Add-AppxVolume or Move-AppxPackage and never creates <USB>/WindowsApps or <USB>/WpSystem.",
         "A legacy exact OpenAI.Codex MSIX left by an earlier product version may be removed through supported Windows APIs after the USB portable tree is ready; no WindowsApps ACL or private package database is edited.",
         "Before CCSwitch launch, it checks VCRUNTIME140.dll/VCRUNTIME140_1.dll/MSVCP140.dll; if missing, it verifies and runs the bundled Microsoft VC++ x64 installer offline, then launches CodexSwitch.exe directly from the USB with child-scoped WebView2 software rendering and requires a stable sizeable window.",
-        "On first launch Codex Switch opens the 404TOKEN setup dialog; enter the user's API Key and click Save and enable. No key is included in this bundle.",
+        "On first launch the manager passes the signed USB account binding to CCSwitch; CCSwitch automatically saves and enables the 404TOKEN unified-api-internal provider, so the user does not enter or save an API Key manually. A missing binding is reported as a re-sign requirement.",
+        "If an older CCSwitch process already owns its single-instance localhost port, close that old process and use the manager retry entry; the manager reports the conflict instead of treating a refused localhost connection as a successful launch.",
+        "In the CCSwitch Codex provider editor, Refresh models calls the current provider's /v1/models endpoint. It keeps every vendor, collapses only stable/latest/valid-date release aliases, and preserves the selected raw upstream model ID.",
         "Codex is launched only by the authorized USB manager with CODEX_HOME fixed to %USERPROFILE%/.codex. It first uses software rendering and automatically retries the proven no-sandbox fallback only if no stable usable window appears. Removing the USB triggers the existing five-second guarded shutdown.",
         "Ordinary uninstall removes <bundle>/apps/Codex and preserves local user data. Advanced purge remains a separate explicit confirmation. Source-media deletion is allowed only after the runtime tree has been removed, immutable release files still match SHA256SUMS.txt, and usb-license.json plus its atomic backup match the active lease fingerprint and handoff snapshot."
     )
@@ -469,7 +584,12 @@ $usbManifest = [ordered]@{
         "Unsigned development bundles auto-enroll on first run; strict anti-copy releases require a pre-provisioned signed usb-license.json."
     )
 }
-$utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+if ((Get-JsonInteger $usbManifest "schemaVersion") -ne 2 -or
+    (Get-JsonInteger $usbManifest.updateCapability "schemaVersion") -ne 3 -or
+    (Get-JsonInteger $usbManifest.updateCapability "anchorSchema") -ne 3 -or
+    (Get-JsonInteger $usbManifest.sourceMediaCleanup "planSchema") -ne 3) {
+    throw "输出 usb-manifest 的 schema/capability 数字字段无效"
+}
 [System.IO.File]::WriteAllText((Join-Path $output "usb-manifest.json"), ($usbManifest | ConvertTo-Json -Depth 8), $utf8NoBom)
 
 $readme = Get-Content -LiteralPath (Join-Path $repo "docs\USB-INSTALL-USER-GUIDE.txt") -Raw -Encoding UTF8
@@ -489,6 +609,29 @@ $lines = Get-ChildItem -LiteralPath $output -File -Recurse -Force |
         "$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $relative"
     }
 [System.IO.File]::WriteAllLines((Join-Path $output "SHA256SUMS.txt"), $lines, $utf8NoBom)
+
+# The verifier is part of the deliverable. Run the copied version from the
+# generated bundle, not the source-tree script, so a missing bundled helper or
+# profile fails the build instead of surfacing only after the USB is moved.
+$standaloneVerifier = Join-Path $output "verify-usb.ps1"
+$standaloneVerifyArgs = @(
+    "-NoProfile",
+    "-ExecutionPolicy", "Bypass",
+    "-File", $standaloneVerifier,
+    "-SkipNetwork"
+)
+if ($UsbPolicy -eq "SignedRequired") {
+    $standaloneVerifyArgs += @(
+        "-InternalSigned",
+        "-UsbSigningProfilePath", (Join-Path $verificationOutput "usb-signing-release-profile.json")
+    )
+} elseif ($SkipSignature) {
+    $standaloneVerifyArgs += "-SkipSignature"
+}
+$standaloneVerification = & powershell.exe @standaloneVerifyArgs 2>&1 | Out-String
+if ($LASTEXITCODE -ne 0) {
+    throw "生成后的随盘 verify-usb.ps1 自检失败：$standaloneVerification"
+}
 
 Write-Output "已生成 Codex 一键 U 盘目录：$output"
 Write-Output "入口：$(Join-Path $output 'CodexDesktopSetup.exe')"

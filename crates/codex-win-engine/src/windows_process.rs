@@ -33,6 +33,33 @@ fn window_dimensions_are_usable(width: i32, height: i32) -> bool {
     width >= 320 && height >= 200
 }
 
+#[cfg(any(windows, test))]
+fn is_codex_startup_failure_dialog(class_name: &str, title: &str) -> bool {
+    // Electron's `dialog.showMessageBox({type: "error"})` is a native
+    // `#32770` dialog.  The Codex bootstrap uses the product name as its
+    // title, so the title is a reliable signal even when the detail text is
+    // rendered in a child STATIC control that EnumWindows cannot see.
+    if !class_name.eq_ignore_ascii_case("#32770") {
+        return false;
+    }
+    let title = title.trim();
+    if title.eq_ignore_ascii_case("chatgpt") || title.eq_ignore_ascii_case("codex") {
+        return true;
+    }
+    let normalized = title.to_lowercase();
+    [
+        "failed to start",
+        "startup failed",
+        "package identity",
+        "no package identity",
+        "程序包标识符",
+        "没有程序包",
+        "启动失败",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+}
+
 fn normalize_windows_path_text(value: &str) -> String {
     let mut normalized = value.replace('/', "\\").to_lowercase();
     if let Some(rest) = normalized.strip_prefix(r"\\?\unc\") {
@@ -71,6 +98,7 @@ fn path_is_within_root(candidate: &Path, root: &Path) -> bool {
 
 #[cfg(windows)]
 mod imp {
+    use std::collections::{HashMap, HashSet};
     use std::ffi::OsString;
     use std::mem::size_of;
     use std::os::windows::ffi::OsStringExt;
@@ -94,13 +122,15 @@ mod imp {
         PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
-        PostMessageW, SetForegroundWindow, SetWindowPos, ShowWindow, HWND_TOP, SWP_NOSIZE,
-        SWP_SHOWWINDOW, SW_RESTORE, WM_CLOSE,
+        EnumWindows, GetClassNameW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
+        GetWindowThreadProcessId, IsIconic, IsWindowVisible, PostMessageW, SetForegroundWindow,
+        SetWindowPos, ShowWindow, HWND_TOP, SWP_NOSIZE, SWP_SHOWWINDOW, SW_HIDE, SW_RESTORE,
+        WM_CLOSE,
     };
 
     use super::{
-        path_is_within_root, window_dimensions_are_usable, EngineError, UsableWindowReport,
+        is_codex_startup_failure_dialog, path_is_within_root, window_dimensions_are_usable,
+        EngineError, UsableWindowReport,
     };
 
     const PROCESS_SYNCHRONIZE: u32 = 0x0010_0000;
@@ -269,6 +299,195 @@ mod imp {
         pids: *const u32,
         pid_count: usize,
         candidate: Option<WindowCandidate>,
+        startup_failure_dialog: Option<String>,
+    }
+
+    struct ConsoleHideContext {
+        pids: *const u32,
+        pid_count: usize,
+        hidden: usize,
+    }
+
+    struct WindowHideContext {
+        pids: *const u32,
+        pid_count: usize,
+        hidden: usize,
+    }
+
+    fn window_text(hwnd: HWND) -> String {
+        let length = unsafe { GetWindowTextLengthW(hwnd) };
+        if length <= 0 {
+            return String::new();
+        }
+        // Error dialogs are short, but cap the allocation in case a hostile
+        // process exposes an unbounded window title to the readiness probe.
+        let length = (length as usize).min(4096);
+        let mut buffer = vec![0_u16; length + 1];
+        let copied = unsafe { GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32) };
+        if copied <= 0 {
+            String::new()
+        } else {
+            String::from_utf16_lossy(&buffer[..copied as usize])
+        }
+    }
+
+    unsafe extern "system" fn hide_console_window(hwnd: HWND, raw_context: LPARAM) -> i32 {
+        if raw_context == 0 {
+            return 1;
+        }
+        // SAFETY: the caller passes a live stack context to synchronous
+        // EnumWindows; the PID slice remains valid for the callback duration.
+        let context = unsafe { &mut *(raw_context as *mut ConsoleHideContext) };
+        let pids = unsafe { std::slice::from_raw_parts(context.pids, context.pid_count) };
+        let mut pid = 0_u32;
+        unsafe {
+            GetWindowThreadProcessId(hwnd, &mut pid);
+        }
+        if !pids.contains(&pid) {
+            return 1;
+        }
+        let mut class_name = [0u16; 64];
+        let length =
+            unsafe { GetClassNameW(hwnd, class_name.as_mut_ptr(), class_name.len() as i32) };
+        if length <= 0 {
+            return 1;
+        }
+        let class_name = String::from_utf16_lossy(&class_name[..length as usize]);
+        if class_name.eq_ignore_ascii_case("ConsoleWindowClass") {
+            unsafe {
+                ShowWindow(hwnd, SW_HIDE);
+            }
+            context.hidden += 1;
+        }
+        1
+    }
+
+    fn hide_console_windows_for_pids(pids: &[u32]) -> usize {
+        if pids.is_empty() {
+            return 0;
+        }
+        let mut context = ConsoleHideContext {
+            pids: pids.as_ptr(),
+            pid_count: pids.len(),
+            hidden: 0,
+        };
+        // SAFETY: callback and context are synchronous and no pointer escapes.
+        unsafe {
+            EnumWindows(
+                Some(hide_console_window),
+                (&mut context as *mut ConsoleHideContext) as LPARAM,
+            );
+        }
+        context.hidden
+    }
+
+    /// Hide only Win32 console windows belonging to the managed process tree.
+    ///
+    /// Chromium can start a console-backed helper after the main window has
+    /// already passed the stable-window check. A short post-launch sweep
+    /// closes that race without hiding the real Codex application window.
+    /// Console HWNDs are owned by `conhost.exe` on modern Windows, so include
+    /// descendants of the managed processes by parent-PID ancestry instead of
+    /// matching only the executable path.
+    pub fn hide_console_windows_for_root(root: &Path) -> Result<usize, EngineError> {
+        let root_pids = target_processes_under_root(root)?
+            .into_iter()
+            .filter(TargetProcess::is_running)
+            .map(|target| target.pid)
+            .collect::<Vec<_>>();
+        if root_pids.is_empty() {
+            return Ok(0);
+        }
+
+        // Build a point-in-time PID -> parent map. A conhost process may not
+        // live under the USB directory, but its parent chain still leads back
+        // to ChatGPT.exe or resources/codex.exe.
+        let snapshot = OwnedHandle::new(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) })
+            .ok_or_else(|| last_error("create process snapshot for console suppression"))?;
+        let mut entry = PROCESSENTRY32W {
+            dwSize: size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut parents = HashMap::<u32, u32>::new();
+        if unsafe { Process32FirstW(snapshot.raw(), &mut entry) } != 0 {
+            loop {
+                parents.insert(entry.th32ProcessID, entry.th32ParentProcessID);
+                if unsafe { Process32NextW(snapshot.raw(), &mut entry) } == 0 {
+                    break;
+                }
+            }
+        }
+
+        let roots = root_pids.iter().copied().collect::<HashSet<_>>();
+        let mut console_pids = roots.clone();
+        for pid in parents.keys().copied() {
+            let mut current = pid;
+            for _ in 0..64 {
+                if roots.contains(&current) {
+                    console_pids.insert(pid);
+                    break;
+                }
+                let Some(parent) = parents.get(&current).copied() else {
+                    break;
+                };
+                if parent == 0 || parent == current {
+                    break;
+                }
+                current = parent;
+            }
+        }
+        let console_pids = console_pids.into_iter().collect::<Vec<_>>();
+        Ok(hide_console_windows_for_pids(&console_pids))
+    }
+
+    unsafe extern "system" fn hide_application_window(hwnd: HWND, raw_context: LPARAM) -> i32 {
+        if raw_context == 0 {
+            return 1;
+        }
+        // SAFETY: the caller passes a live stack context to synchronous
+        // EnumWindows; the PID slice remains valid for the callback duration.
+        let context = unsafe { &mut *(raw_context as *mut WindowHideContext) };
+        let pids = unsafe { std::slice::from_raw_parts(context.pids, context.pid_count) };
+        let mut pid = 0_u32;
+        unsafe {
+            GetWindowThreadProcessId(hwnd, &mut pid);
+        }
+        if !pids.contains(&pid) || unsafe { IsWindowVisible(hwnd) } == 0 {
+            return 1;
+        }
+        unsafe {
+            ShowWindow(hwnd, SW_HIDE);
+        }
+        context.hidden += 1;
+        1
+    }
+
+    /// Hide all visible top-level windows belonging to processes loaded from
+    /// `root`. This is used after a successful CCSwitch bootstrap: its tray
+    /// process remains alive while the configuration window stays out of the
+    /// user's way.
+    pub fn hide_windows_for_root(root: &Path) -> Result<usize, EngineError> {
+        let pids = target_processes_under_root(root)?
+            .into_iter()
+            .filter(TargetProcess::is_running)
+            .map(|target| target.pid)
+            .collect::<Vec<_>>();
+        if pids.is_empty() {
+            return Ok(0);
+        }
+        let mut context = WindowHideContext {
+            pids: pids.as_ptr(),
+            pid_count: pids.len(),
+            hidden: 0,
+        };
+        // SAFETY: callback and context are synchronous and no pointer escapes.
+        unsafe {
+            EnumWindows(
+                Some(hide_application_window),
+                (&mut context as *mut WindowHideContext) as LPARAM,
+            );
+        }
+        Ok(context.hidden)
     }
 
     unsafe extern "system" fn find_usable_window(hwnd: HWND, raw_context: LPARAM) -> i32 {
@@ -284,6 +503,20 @@ mod imp {
             GetWindowThreadProcessId(hwnd, &mut pid);
         }
         if !pids.contains(&pid) {
+            return 1;
+        }
+        let mut class_name = [0_u16; 128];
+        let class_length =
+            unsafe { GetClassNameW(hwnd, class_name.as_mut_ptr(), class_name.len() as i32) };
+        let class_name = if class_length > 0 {
+            String::from_utf16_lossy(&class_name[..class_length as usize])
+        } else {
+            String::new()
+        };
+        if is_codex_startup_failure_dialog(&class_name, &window_text(hwnd)) {
+            if context.startup_failure_dialog.is_none() {
+                context.startup_failure_dialog = Some(window_text(hwnd));
+            }
             return 1;
         }
         if unsafe { IsIconic(hwnd) } != 0 {
@@ -376,10 +609,17 @@ mod imp {
                 .map(|target| target.pid)
                 .collect::<Vec<_>>();
             if !pids.is_empty() {
+                let hidden = hide_console_windows_for_pids(&pids);
+                if hidden > 0 {
+                    log::info!(
+                        "hidden console window(s) created by managed Codex process tree count={hidden}"
+                    );
+                }
                 let mut context = WindowSearchContext {
                     pids: pids.as_ptr(),
                     pid_count: pids.len(),
                     candidate: None,
+                    startup_failure_dialog: None,
                 };
                 // SAFETY: callback and context remain valid for this synchronous
                 // call; no pointer escapes EnumWindows.
@@ -388,6 +628,11 @@ mod imp {
                         Some(find_usable_window),
                         (&mut context as *mut WindowSearchContext) as LPARAM,
                     );
+                }
+                if let Some(title) = context.startup_failure_dialog {
+                    return Err(EngineError::Io(format!(
+                        "Codex 启动失败：检测到错误对话框（标题={title}，可能是便携版缺少 MSIX 程序包标识符）"
+                    )));
                 }
                 if let Some(candidate) = context.candidate {
                     // SW_RESTORE also makes a hidden/minimized explicit-launch
@@ -596,7 +841,8 @@ mod imp {
 
 #[cfg(windows)]
 pub use imp::{
-    close_processes_for_root, processes_running_for_root, wait_for_usable_window_for_root,
+    close_processes_for_root, hide_console_windows_for_root, hide_windows_for_root,
+    processes_running_for_root, wait_for_usable_window_for_root,
 };
 
 #[cfg(windows)]
@@ -613,6 +859,16 @@ pub(crate) fn close_codex_processes_for_root(
 #[cfg(not(windows))]
 pub fn close_processes_for_root(_timeout_secs: u64, _root: &Path) -> Result<(), EngineError> {
     Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn hide_windows_for_root(_root: &Path) -> Result<usize, EngineError> {
+    Ok(0)
+}
+
+#[cfg(not(windows))]
+pub fn hide_console_windows_for_root(_root: &Path) -> Result<usize, EngineError> {
+    Ok(0)
 }
 
 #[cfg(not(windows))]
@@ -680,5 +936,16 @@ mod tests {
         assert!(!window_dimensions_are_usable(14, 14));
         assert!(!window_dimensions_are_usable(319, 600));
         assert!(window_dimensions_are_usable(914, 638));
+    }
+
+    #[test]
+    fn recognizes_codex_startup_error_dialog_without_rejecting_normal_windows() {
+        assert!(is_codex_startup_failure_dialog("#32770", "ChatGPT"));
+        assert!(is_codex_startup_failure_dialog("#32770", "程序包标识符"));
+        assert!(!is_codex_startup_failure_dialog(
+            "Chrome_WidgetWin_1",
+            "ChatGPT"
+        ));
+        assert!(!is_codex_startup_failure_dialog("#32770", "另一个应用"));
     }
 }

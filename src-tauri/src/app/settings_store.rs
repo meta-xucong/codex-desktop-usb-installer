@@ -40,10 +40,9 @@ pub enum ProxyMode {
 }
 
 /// Preferred source for the Codex desktop payload channel. `Auto` tries the
-/// domestic mirror first, then the built-in compatibility relay (or a
-/// user-configured relay), and finally GitHub. The actual source used by a
-/// check is embedded in the signed update identity, so apply never silently
-/// switches source after confirmation.
+/// built-in compatibility relay (or a user-configured relay), and then GitHub.
+/// The actual source used by a check is embedded in the signed update identity,
+/// so apply never silently switches source after confirmation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CodexPayloadSourceKind {
@@ -138,13 +137,13 @@ fn default_codex_payload_source_kind_string() -> String {
     CodexPayloadSourceKind::Auto.as_str().to_string()
 }
 
-/// The public mirror serves the Codex payload channel at `/latest/manifest`,
-/// `/latest/checksums`, and `/latest/win-{arch}`. It is intentionally distinct
-/// from the manager self-update feed at `/manager/latest.json`.
+/// Legacy mirror-protocol base retained so older settings can be read and
+/// migrated. Automatic Codex USB updates do not query this protocol; they use
+/// the Wangnov-compatible Relay/GitHub chain below.
 pub const DEFAULT_CODEX_PAYLOAD_BASE_URL: &str = "https://codexapp.agentsmirror.com/";
-/// Built-in compatibility relay used by the automatic payload source after
-/// the public mirror is unavailable. Keep this separate from the mirror URL:
-/// the two endpoints expose different metadata contracts.
+/// Built-in Wangnov-compatible Relay used by the automatic payload source.
+/// Keep this separate from the legacy mirror URL: the two endpoints expose
+/// different metadata contracts.
 pub(crate) const LEGACY_CODEX_PAYLOAD_BASE_URL: &str =
     "https://update.404token.xyz/__codex_update__/";
 
@@ -447,8 +446,14 @@ impl AppSettings {
         if self.codex_payload_base_url.is_empty() || legacy_base {
             self.codex_payload_base_url = default_codex_payload_base_url();
             if legacy_base && self.codex_payload_source_kind == CodexPayloadSourceKind::Relay {
-                self.codex_payload_source_kind = CodexPayloadSourceKind::Mirror;
+                self.codex_payload_source_kind = CodexPayloadSourceKind::Auto;
             }
+        }
+        // The mirror protocol remains parseable and resolvable for explicit
+        // legacy compatibility, but it is no longer an automatic Codex USB
+        // payload candidate. Migrate persisted mirror selections to Auto.
+        if self.codex_payload_source_kind == CodexPayloadSourceKind::Mirror {
+            self.codex_payload_source_kind = CodexPayloadSourceKind::Auto;
         }
         // Empty custom modes are not a real runtime choice (update paths fall
         // back silently). Coerce so UI selection, disk, and runtime agree.
@@ -592,10 +597,14 @@ mod tests {
         )
         .unwrap();
         let (mut settings, _, _) = mirror.into_settings();
-        settings.normalize();
         assert_eq!(
             settings.codex_payload_source_kind,
             CodexPayloadSourceKind::Mirror
+        );
+        settings.normalize();
+        assert_eq!(
+            settings.codex_payload_source_kind,
+            CodexPayloadSourceKind::Auto
         );
         assert_eq!(
             settings.codex_payload_base_url,
@@ -631,7 +640,7 @@ mod tests {
         settings.normalize();
         assert_eq!(
             settings.codex_payload_source_kind,
-            CodexPayloadSourceKind::Mirror
+            CodexPayloadSourceKind::Auto
         );
         assert_eq!(
             settings.codex_payload_base_url,

@@ -126,7 +126,7 @@ if ([string]::IsNullOrWhiteSpace($basePython)) {
     $pythonRoot = Join-Path (Join-Path $profileFull 'AppData\Local') 'Programs\Python\Python312'
     $kitPythonRoot = Join-Path $runtimeRoot 'cpython-3.12.10'
     $argumentList = @('/quiet', 'InstallAllUsers=0', 'PrependPath=0', 'Include_test=0', ('TargetDir="{0}"' -f $pythonRoot))
-    $process = Start-Process -FilePath $pythonInstaller -ArgumentList $argumentList -Wait -PassThru
+    $process = Start-Process -FilePath $pythonInstaller -ArgumentList $argumentList -WindowStyle Hidden -Wait -PassThru
     if (@(0, 3010) -notcontains [int]$process.ExitCode) { throw "Python installer failed with exit code $($process.ExitCode)." }
     $installedPython = $null
     foreach ($candidate in @((Join-Path $pythonRoot 'python.exe'), (Join-Path $kitPythonRoot 'python.exe'))) {

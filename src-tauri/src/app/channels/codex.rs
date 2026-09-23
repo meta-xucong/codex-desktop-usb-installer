@@ -25,7 +25,8 @@ use crate::app::settings_store::{
     AppSettings, CodexPayloadSourceKind, LEGACY_CODEX_PAYLOAD_BASE_URL,
 };
 use crate::app::update_channel::{
-    compare_versions, read_usb_codex_desktop_version, ChannelKind, UpdateContext, UpdateInfo,
+    compare_versions, is_numeric_version, read_usb_codex_desktop_version, ChannelKind,
+    UpdateContext, UpdateInfo,
 };
 use crate::errors::AppError;
 
@@ -40,6 +41,13 @@ const USB_LICENSE_NAME: &str = "usb-license.json";
 const TRANSACTION_VERSION: u32 = 1;
 const SOURCE_METADATA_ATTEMPTS: usize = 2;
 const SOURCE_METADATA_RETRY_DELAY_MS: u64 = 450;
+// Auto only probes the Wangnov-compatible Codex payload chain.  Keep the
+// public mirror branch below for explicit legacy configurations, but never
+// treat its protocol as an automatic USB update candidate.
+const AUTO_SOURCE_ORDER: [CodexPayloadSourceKind; 2] = [
+    CodexPayloadSourceKind::Relay,
+    CodexPayloadSourceKind::Github,
+];
 static CODEX_UPDATE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Deserialize)]
@@ -69,9 +77,11 @@ struct RelayLatest {
     release_id: u64,
     repository: String,
     tag: String,
+    #[serde(default)]
+    identity: Option<RelayIdentity>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 struct RelayAssets {
     checksums: RelayAsset,
     #[serde(rename = "release-manifest")]
@@ -80,13 +90,23 @@ struct RelayAssets {
     windows_msix: RelayAsset,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 struct RelayAsset {
+    #[serde(default)]
+    id: Option<u64>,
     path: String,
     sha256: String,
     size: u64,
     #[serde(rename = "githubDigest", default)]
     github_digest: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RelayIdentity {
+    assets: RelayAssets,
+    #[serde(rename = "releaseId")]
+    release_id: u64,
+    tag: String,
 }
 
 #[derive(Debug, Clone)]
@@ -613,12 +633,25 @@ fn resolve_mirror_latest(
     }
     let msix_sha = find_msix_sha256(&checksums_text, &release.package_moniker)
         .map_err(|error| AppError::Engine(format!("解析 Codex 镜像 checksums 失败：{error}")))?;
-    let manifest_sha = sha256_bytes(manifest_text.as_bytes());
     let checksums_sha = sha256_bytes(checksums_text.as_bytes());
-    // The mirror manifest has no GitHub release id. A digest-derived stable
-    // id still gives check/apply a strong stale-identity comparison without
-    // inventing a mutable numeric release identifier.
-    let release_id = u64::from_str_radix(&manifest_sha[..16], 16).unwrap_or(0);
+    let selected_checksum_identity_sha =
+        mirror_selected_checksum_identity_sha256(&release.package_moniker, &msix_sha);
+    // The mirror manifest has no GitHub release id. Derive the identity from
+    // stable release facts rather than the raw manifest bytes: latest aliases
+    // may be regenerated with a new generatedAt/ETag while serving the same
+    // package. The package/checksum/identity checks below still bind the
+    // actual download to the exact release facts.
+    let stable_manifest_sha = mirror_stable_identity_sha256(
+        &manifest_text,
+        architecture,
+        &release.version,
+        &release.package_version,
+        &release.package_moniker,
+        msix_size,
+        &msix_sha,
+        &selected_checksum_identity_sha,
+    )?;
+    let release_id = u64::from_str_radix(&stable_manifest_sha[..16], 16).unwrap_or(0);
     let release_tag = format!(
         "mirror-{}-{}",
         release.version.trim(),
@@ -644,8 +677,12 @@ fn resolve_mirror_latest(
             app_version: release.version.clone(),
             msix_size,
             msix_sha256: Some(msix_sha.clone()),
-            checksums_sha256: Some(checksums_sha.clone()),
-            manifest_sha256: Some(manifest_sha),
+            // Bind the selected Windows checksum record, not unrelated
+            // macOS/ARM entries that may be added to the same checksums file.
+            checksums_sha256: Some(selected_checksum_identity_sha),
+            // This field is the stable mirror identity for this source kind,
+            // not the volatile raw hash of /latest/manifest.
+            manifest_sha256: Some(stable_manifest_sha),
             github_digest: None,
         },
         app_version: release.version,
@@ -662,6 +699,78 @@ fn resolve_mirror_latest(
     })
 }
 
+fn mirror_selected_checksum_identity_sha256(package_moniker: &str, msix_sha256: &str) -> String {
+    sha256_bytes(
+        format!("codex-mirror-checksum-identity-v1|{package_moniker}|{msix_sha256}").as_bytes(),
+    )
+}
+
+/// Build a deterministic mirror identity from the fields that affect the
+/// selected Windows payload.  The public mirror's latest manifest is an alias
+/// and may contain operational metadata (generation time, cache validators,
+/// upstream timestamps) that is allowed to change without changing the
+/// package.  Those fields must not invalidate a confirmation between check and
+/// apply.  Conversely, a version, package identity, size, selected checksum,
+/// or manifest schema change must produce a new identity.
+fn mirror_stable_identity_sha256(
+    manifest_text: &str,
+    architecture: &str,
+    app_version: &str,
+    msix_version: &str,
+    package_moniker: &str,
+    msix_size: u64,
+    msix_sha256: &str,
+    checksums_sha256: &str,
+) -> Result<String, AppError> {
+    let manifest: serde_json::Value = serde_json::from_str(manifest_text)
+        .map_err(|error| AppError::Engine(format!("解析 Codex 镜像 manifest 失败：{error}")))?;
+    let schema_version = manifest
+        .get("schemaVersion")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let canonical = serde_json::json!({
+        "identitySchema": 1,
+        "manifestSchemaVersion": schema_version,
+        "architecture": architecture,
+        "appVersion": app_version,
+        "msixVersion": msix_version,
+        "packageMoniker": package_moniker,
+        "msixSize": msix_size,
+        "msixSha256": msix_sha256,
+        "checksumsSha256": checksums_sha256,
+    });
+    let bytes = serde_json::to_vec(&canonical)
+        .map_err(|error| AppError::Engine(format!("序列化 Codex 镜像稳定身份失败：{error}")))?;
+    Ok(sha256_bytes(&bytes))
+}
+
+fn validate_relay_descriptor(descriptor: &RelayLatest) -> Result<(), AppError> {
+    match descriptor.protocol {
+        // Protocol 1 is retained for already deployed/custom relay instances.
+        1 => Ok(()),
+        // The production relay currently publishes protocol 2.  It repeats
+        // the release identity under `identity`; require the duplicate fields
+        // to agree before any asset URL is derived from the descriptor.
+        2 => {
+            let identity = descriptor.identity.as_ref().ok_or_else(|| {
+                AppError::Engine("Codex relay 协议 2 缺少 identity 发布身份，已拒绝".to_string())
+            })?;
+            if identity.release_id != descriptor.release_id
+                || identity.tag != descriptor.tag
+                || identity.assets != descriptor.assets
+            {
+                return Err(AppError::Engine(
+                    "Codex relay 协议 2 的 identity 与顶层发布身份不一致，已拒绝".to_string(),
+                ));
+            }
+            Ok(())
+        }
+        protocol => Err(AppError::Engine(format!(
+            "Codex relay 协议版本不受支持：{protocol}"
+        ))),
+    }
+}
+
 fn resolve_relay_latest(
     asset_fetch: &dyn Fn(&str) -> Result<String, AppError>,
     base_url: &str,
@@ -672,12 +781,7 @@ fn resolve_relay_latest(
     let latest_text = asset_fetch(&latest_url)?;
     let descriptor: RelayLatest = serde_json::from_str(&latest_text)
         .map_err(|error| AppError::Engine(format!("解析 Codex relay latest.json 失败：{error}")))?;
-    if descriptor.protocol != 1 {
-        return Err(AppError::Engine(format!(
-            "Codex relay 协议版本不受支持：{}",
-            descriptor.protocol
-        )));
-    }
+    validate_relay_descriptor(&descriptor)?;
     if !descriptor.architecture.eq_ignore_ascii_case(architecture) {
         return Err(AppError::Engine(format!(
             "Codex relay 架构与当前目标不一致：{}",
@@ -844,6 +948,87 @@ fn source_locator_for(settings: &AppSettings, source_kind: CodexPayloadSourceKin
     }
 }
 
+/// Source failures are deliberately reduced to stable categories before they
+/// are put in a log or returned as an aggregate error.  Resolver errors may
+/// contain URLs from a configured source, so the raw message must not cross
+/// that boundary.
+fn source_error_category(error: &AppError) -> &'static str {
+    let message = error.to_string();
+    if message.contains("source_unreachable:") {
+        return "source_unreachable";
+    }
+    if message.contains("source_invalid:") {
+        return "source_invalid";
+    }
+    match crate::errors::classify(&message) {
+        crate::errors::ErrorKind::Network | crate::errors::ErrorKind::Timeout => {
+            "source_unreachable"
+        }
+        _ => "source_invalid",
+    }
+}
+
+fn source_error_detail(source_kind: CodexPayloadSourceKind, error: &AppError) -> String {
+    format!(
+        "source={} reason={} code={}",
+        source_kind.as_str(),
+        source_error_category(error),
+        error.code()
+    )
+}
+
+fn source_error_for_caller(source_kind: CodexPayloadSourceKind, error: &AppError) -> AppError {
+    let category = source_error_category(error);
+    AppError::Engine(format!(
+        "{category}: Codex {} source metadata resolution failed (code={})",
+        source_kind.as_str(),
+        error.code()
+    ))
+}
+
+fn redacted_source_locator(_locator: &str) -> &'static str {
+    "<redacted>"
+}
+
+fn source_version_reason(current: &str, latest: &str) -> Option<&'static str> {
+    if !is_numeric_version(current) || !is_numeric_version(latest) {
+        return Some("source_invalid");
+    }
+    match compare_versions(current, latest) {
+        std::cmp::Ordering::Less => None,
+        std::cmp::Ordering::Equal => Some("source_no_newer"),
+        std::cmp::Ordering::Greater => Some("source_stale"),
+    }
+}
+
+fn source_version_error(
+    source_kind: CodexPayloadSourceKind,
+    current: &str,
+    latest: &str,
+) -> AppError {
+    let reason = source_version_reason(current, latest).unwrap_or("source_invalid");
+    AppError::Engine(format!(
+        "{reason}: Codex {} source does not provide a newer release",
+        source_kind.as_str()
+    ))
+}
+
+fn validate_resolved_release_versions(release: &ResolvedRelease) -> Result<(), AppError> {
+    if !is_numeric_version(&release.app_version)
+        || !is_numeric_version(&release.identity.app_version)
+    {
+        return Err(AppError::Engine(
+            "source_invalid: release appVersion 必须是点分非负整数版本".to_string(),
+        ));
+    }
+    if !is_numeric_version(&release.identity.msix_version) {
+        return Err(AppError::Engine(
+            "source_invalid: MSIX package version 必须是点分非负整数版本".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn source_error_is_retryable(error: &AppError) -> bool {
     matches!(
         crate::errors::classify(&error.to_string()),
@@ -866,7 +1051,7 @@ where
         CodexPayloadSourceKind,
     ) -> Result<ResolvedRelease, AppError>,
 {
-    let locator = source_locator_for(settings, source_kind);
+    let locator = redacted_source_locator(&source_locator_for(settings, source_kind));
     let mut last_error = None;
     for attempt in 1..=SOURCE_METADATA_ATTEMPTS {
         log::info!(
@@ -878,6 +1063,7 @@ where
         );
         match resolve(settings, architecture, network, source_kind) {
             Ok(release) => {
+                validate_resolved_release_versions(&release)?;
                 log::info!(
                     "codex payload source resolved source={} version={} package={} locator={}",
                     source_kind.as_str(),
@@ -890,13 +1076,14 @@ where
             Err(error) => {
                 let retryable = source_error_is_retryable(&error);
                 log::warn!(
-                    "codex payload source failed stage=metadata source={} attempt={}/{} retryable={} locator={} error={}",
+                    "codex payload source failed stage=metadata source={} attempt={}/{} retryable={} locator={} reason={} code={}",
                     source_kind.as_str(),
                     attempt,
                     SOURCE_METADATA_ATTEMPTS,
                     retryable,
                     locator,
-                    error
+                    source_error_category(&error),
+                    error.code()
                 );
                 last_error = Some(error);
                 if !retryable || attempt == SOURCE_METADATA_ATTEMPTS {
@@ -908,9 +1095,15 @@ where
             }
         }
     }
-    Err(last_error.unwrap_or_else(|| {
-        AppError::Internal(format!("Codex 更新源未执行：{}", source_kind.as_str()))
-    }))
+    Err(last_error
+        .as_ref()
+        .map(|error| source_error_for_caller(source_kind, error))
+        .unwrap_or_else(|| {
+            AppError::Engine(format!(
+                "source_invalid: Codex {} source did not return metadata",
+                source_kind.as_str()
+            ))
+        }))
 }
 
 fn relay_base_url_for(settings: &AppSettings) -> String {
@@ -925,11 +1118,13 @@ fn resolve_preferred_source(
     settings: &AppSettings,
     architecture: &str,
     network: &NetworkConfig,
-) -> Result<ResolvedRelease, AppError> {
+    current_version: &str,
+) -> Result<Option<ResolvedRelease>, AppError> {
     resolve_preferred_source_with(
         settings,
         architecture,
         network,
+        current_version,
         |settings, architecture, network, source_kind| {
             resolve_source(settings, architecture, network, source_kind)
         },
@@ -940,8 +1135,9 @@ fn resolve_preferred_source_with<F>(
     settings: &AppSettings,
     architecture: &str,
     network: &NetworkConfig,
+    current_version: &str,
     mut resolve: F,
-) -> Result<ResolvedRelease, AppError>
+) -> Result<Option<ResolvedRelease>, AppError>
 where
     F: FnMut(
         &AppSettings,
@@ -952,51 +1148,90 @@ where
 {
     match settings.codex_payload_source_kind {
         CodexPayloadSourceKind::Auto => {
-            let mirror_result = resolve_source_with_retry(
-                settings,
-                architecture,
-                network,
-                CodexPayloadSourceKind::Mirror,
-                &mut resolve,
-            );
-            match mirror_result {
-                Ok(release) => Ok(release),
-                Err(mirror_error) => {
-                    log::warn!("Codex 国内镜像不可用，准备回退：{mirror_error}");
-                    let mut fallback_errors = vec![format!("镜像：{mirror_error}")];
-                    let relay_result = resolve_source_with_retry(
-                        settings,
-                        architecture,
-                        network,
-                        CodexPayloadSourceKind::Relay,
-                        &mut resolve,
-                    );
-                    match relay_result {
-                        Ok(release) => return Ok(release),
-                        Err(relay_error) => {
-                            log::warn!("Codex 兼容 Relay 不可用，回退 GitHub：{relay_error}");
-                            fallback_errors.push(format!("兼容 Relay：{relay_error}"));
+            let mut source_errors = false;
+            let mut valid_source = false;
+            let mut diagnostics = Vec::new();
+            for source_kind in AUTO_SOURCE_ORDER {
+                match resolve_source_with_retry(
+                    settings,
+                    architecture,
+                    network,
+                    source_kind,
+                    &mut resolve,
+                ) {
+                    Ok(release) => {
+                        // A successfully parsed release is valid evidence even
+                        // when it is equal to or older than the local version.
+                        // A later fallback failure must not erase that evidence.
+                        valid_source = true;
+                        if let Some(reason) =
+                            source_version_reason(current_version, &release.app_version)
+                        {
+                            log::warn!(
+                                "codex payload source skipped source={} reason={}",
+                                source_kind.as_str(),
+                                reason
+                            );
+                            diagnostics.push(format!(
+                                "source={} reason={}",
+                                source_kind.as_str(),
+                                reason
+                            ));
+                            continue;
                         }
+                        log::info!(
+                            "codex payload source selected source={} reason=newer",
+                            source_kind.as_str()
+                        );
+                        return Ok(Some(release));
                     }
-                    let github_result = resolve_source_with_retry(
-                        settings,
-                        architecture,
-                        network,
-                        CodexPayloadSourceKind::Github,
-                        &mut resolve,
-                    );
-                    match github_result {
-                        Ok(release) => Ok(release),
-                        Err(github_error) => Err(AppError::Engine(format!(
-                            "Codex 更新源均不可用；{}；GitHub：{github_error}",
-                            fallback_errors.join("；")
-                        ))),
+                    Err(error) => {
+                        source_errors = true;
+                        let detail = source_error_detail(source_kind, &error);
+                        log::warn!("codex payload source skipped {detail}");
+                        diagnostics.push(detail);
                     }
                 }
             }
+            log::info!(
+                "codex payload auto source exhausted result={} diagnostics={}",
+                if valid_source || !source_errors {
+                    "no-update"
+                } else {
+                    "error"
+                },
+                diagnostics.join(";")
+            );
+            if !valid_source && source_errors {
+                Err(AppError::Engine(format!(
+                    "Codex 更新源均不可用；{}",
+                    diagnostics.join("；")
+                )))
+            } else {
+                Ok(None)
+            }
         }
         source_kind => {
-            resolve_source_with_retry(settings, architecture, network, source_kind, &mut resolve)
+            let release = resolve_source_with_retry(
+                settings,
+                architecture,
+                network,
+                source_kind,
+                &mut resolve,
+            )?;
+            if let Some(reason) = source_version_reason(current_version, &release.app_version) {
+                log::warn!(
+                    "codex payload source rejected source={} reason={}",
+                    source_kind.as_str(),
+                    reason
+                );
+                return Err(source_version_error(
+                    source_kind,
+                    current_version,
+                    &release.app_version,
+                ));
+            }
+            Ok(Some(release))
         }
     }
 }
@@ -1127,6 +1362,22 @@ fn require_sha256(value: Option<&serde_json::Value>, label: &str) -> Result<Stri
 }
 
 fn require_capability(bundle_root: &Path) -> Result<LocalBundle, AppError> {
+    require_capability_impl(bundle_root, true)
+}
+
+/// Read and validate the immutable capability metadata without doing the
+/// expensive payload hash.  Update check/apply use this before resolving the
+/// remote source so a stale or unreachable source does not wait behind a
+/// removable-drive full-file read.  The caller must perform the full
+/// SHA256SUMS verification before treating the bundle as trusted.
+fn require_capability_metadata(bundle_root: &Path) -> Result<LocalBundle, AppError> {
+    require_capability_impl(bundle_root, false)
+}
+
+fn require_capability_impl(
+    bundle_root: &Path,
+    verify_payload_hash: bool,
+) -> Result<LocalBundle, AppError> {
     reject_reparse(bundle_root)?;
     for name in [ROOT_MANIFEST_NAME, USB_MANIFEST_NAME, SHA256SUMS_NAME] {
         reject_reparse_chain(&bundle_root.join(name))?;
@@ -1140,7 +1391,7 @@ fn require_capability(bundle_root: &Path) -> Result<LocalBundle, AppError> {
         )? != 2
     {
         return Err(AppError::Engine(
-            "此 U 盘包不是支持 Codex 更新的 v2 包，请重建并重新授权".to_string(),
+            "此 U 盘包不是支持 Codex 更新的清单格式，请重建并重新授权".to_string(),
         ));
     }
     let root_capability = manifest
@@ -1151,7 +1402,11 @@ fn require_capability(bundle_root: &Path) -> Result<LocalBundle, AppError> {
         || exact_u64(
             root_capability.get("schemaVersion"),
             "root updateCapability.schemaVersion",
-        )? != 2
+        )? != 3
+        || exact_u64(
+            root_capability.get("anchorSchema"),
+            "root updateCapability.anchorSchema",
+        )? != 3
     {
         return Err(AppError::Engine(
             "root manifest 的 Codex 更新能力声明不受支持".to_string(),
@@ -1165,7 +1420,11 @@ fn require_capability(bundle_root: &Path) -> Result<LocalBundle, AppError> {
         || exact_u64(
             capability.get("schemaVersion"),
             "updateCapability.schemaVersion",
-        )? != 2
+        )? != 3
+        || exact_u64(
+            capability.get("anchorSchema"),
+            "usb updateCapability.anchorSchema",
+        )? != 3
         || capability.get("checksumFile").and_then(|v| v.as_str()) != Some(SHA256SUMS_NAME)
         || capability
             .get("transactionDirectory")
@@ -1216,6 +1475,10 @@ fn require_capability(bundle_root: &Path) -> Result<LocalBundle, AppError> {
         .filter(|value| matches!(*value, "x64" | "arm64"))
         .ok_or_else(|| AppError::Engine("root manifest.architecture 无效".to_string()))?
         .to_string();
+    // The stable anchor has a mutable backup marker, but the physical backup
+    // slot still has a strict shape. Enforce it in the cheap capability path
+    // so check cannot offer an update that apply will reject later.
+    crate::app::usb_bundle::validate_backup_layout(bundle_root, &payload_relative, &architecture)?;
     if usb_manifest
         .pointer("/codexInstaller/payload")
         .and_then(serde_json::Value::as_str)
@@ -1241,12 +1504,14 @@ fn require_capability(bundle_root: &Path) -> Result<LocalBundle, AppError> {
             "当前 payload 大小与 manifest 不一致".to_string(),
         ));
     }
-    let actual_payload_sha = sha256_file(&payload_path)
-        .map_err(|error| AppError::Engine(format!("计算当前 payload SHA256 失败: {error}")))?;
-    if !actual_payload_sha.eq_ignore_ascii_case(&manifest_payload_sha) {
-        return Err(AppError::Engine(
-            "当前 payload SHA256 与 manifest 不一致".to_string(),
-        ));
+    if verify_payload_hash {
+        let actual_payload_sha = sha256_file(&payload_path)
+            .map_err(|error| AppError::Engine(format!("计算当前 payload SHA256 失败: {error}")))?;
+        if !actual_payload_sha.eq_ignore_ascii_case(&manifest_payload_sha) {
+            return Err(AppError::Engine(
+                "当前 payload SHA256 与 manifest 不一致".to_string(),
+            ));
+        }
     }
     let installer = usb_manifest
         .pointer("/codexInstaller")
@@ -1276,6 +1541,7 @@ fn require_capability(bundle_root: &Path) -> Result<LocalBundle, AppError> {
     })
 }
 
+#[cfg(test)]
 fn local_bundle_snapshot(
     bundle_root: &Path,
     local: &LocalBundle,
@@ -1306,6 +1572,60 @@ fn local_bundle_snapshot(
     })
 }
 
+/// Build a local snapshot from the digest table produced by the immediately
+/// preceding full SHA256SUMS verification.  This intentionally does not
+/// accept a digest from a previous check/apply invocation.
+fn local_bundle_snapshot_from_digests(
+    bundle_root: &Path,
+    local: &LocalBundle,
+    digests: &BTreeMap<String, String>,
+) -> Result<LocalBundleSnapshot, AppError> {
+    let root_manifest = bundle_root.join(ROOT_MANIFEST_NAME);
+    let usb_manifest = bundle_root.join(USB_MANIFEST_NAME);
+    let checksums = bundle_root.join(SHA256SUMS_NAME);
+    for path in [
+        &root_manifest,
+        &usb_manifest,
+        &checksums,
+        &local.payload_path,
+    ] {
+        reject_reparse_chain(path)?;
+    }
+    Ok(LocalBundleSnapshot {
+        current_version: local.current_version.clone(),
+        payload_relative: local.payload_relative.clone(),
+        architecture: local.architecture.clone(),
+        payload_sha256: verified_digest(digests, &local.payload_relative, "payload")?,
+        root_manifest_sha256: verified_digest(digests, ROOT_MANIFEST_NAME, ROOT_MANIFEST_NAME)?,
+        usb_manifest_sha256: verified_digest(digests, USB_MANIFEST_NAME, USB_MANIFEST_NAME)?,
+        // SHA256SUMS must not list itself, so it cannot come from the digest
+        // table and is intentionally read once as a small metadata file.
+        checksums_sha256: sha256_file(&checksums).map_err(|error| {
+            AppError::Engine(format!("计算 {SHA256SUMS_NAME} SHA256 失败: {error}"))
+        })?,
+    })
+}
+
+fn verified_digest(
+    digests: &BTreeMap<String, String>,
+    relative: &str,
+    label: &str,
+) -> Result<String, AppError> {
+    digests
+        .get(relative)
+        .cloned()
+        .or_else(|| {
+            digests
+                .iter()
+                .find(|(candidate, _)| candidate.eq_ignore_ascii_case(relative))
+                .map(|(_, digest)| digest.clone())
+        })
+        .ok_or_else(|| {
+            AppError::Engine(format!("完整性校验未返回 {label} 的摘要，拒绝生成本地快照"))
+        })
+}
+
+#[cfg(test)]
 fn codex_update_payload(
     bundle_root: &Path,
     local: &LocalBundle,
@@ -1318,26 +1638,61 @@ fn codex_update_payload(
     .map_err(|error| AppError::Engine(format!("序列化 codex 更新快照失败: {error}")))
 }
 
+fn codex_update_payload_with_digests(
+    bundle_root: &Path,
+    local: &LocalBundle,
+    identity: &CodexPayloadIdentity,
+    digests: &BTreeMap<String, String>,
+) -> Result<serde_json::Value, AppError> {
+    serde_json::to_value(CodexUpdatePayload {
+        identity: identity.clone(),
+        local_snapshot: Some(local_bundle_snapshot_from_digests(
+            bundle_root,
+            local,
+            digests,
+        )?),
+    })
+    .map_err(|error| AppError::Engine(format!("序列化 codex 更新快照失败: {error}")))
+}
+
 fn parse_codex_update_payload(value: &serde_json::Value) -> Result<CodexUpdatePayload, AppError> {
     serde_json::from_value(value.clone()).map_err(|error| {
         AppError::StaleExpectation(format!("更新确认对象无效，请重新检查：{error}"))
     })
 }
 
-fn verify_bundle_integrity(bundle_root: &Path) -> Result<(), AppError> {
+fn verify_bundle_integrity_with_digests(
+    bundle_root: &Path,
+) -> Result<BTreeMap<String, String>, AppError> {
     let sums_path = bundle_root.join(SHA256SUMS_NAME);
     reject_reparse_chain(&sums_path)?;
     let sums = fs::read(&sums_path)
         .map_err(|error| AppError::Engine(format!("读取 {SHA256SUMS_NAME} 失败: {error}")))?;
-    verify_sha256_sums(bundle_root, &sums, &BTreeMap::new())
+    verify_sha256_sums_with_digests(bundle_root, &sums, &BTreeMap::new())
 }
 
+#[cfg(test)]
 fn require_local_snapshot(
     bundle_root: &Path,
     local: &LocalBundle,
     expected: &LocalBundleSnapshot,
 ) -> Result<(), AppError> {
     let actual = local_bundle_snapshot(bundle_root, local)?;
+    if &actual != expected {
+        return Err(AppError::StaleExpectation(
+            "本地 USB payload 或清单在确认后发生变化，请重新检查后再确认。".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_local_snapshot_from_digests(
+    bundle_root: &Path,
+    local: &LocalBundle,
+    expected: &LocalBundleSnapshot,
+    digests: &BTreeMap<String, String>,
+) -> Result<(), AppError> {
+    let actual = local_bundle_snapshot_from_digests(bundle_root, local, digests)?;
     if &actual != expected {
         return Err(AppError::StaleExpectation(
             "本地 USB payload 或清单在确认后发生变化，请重新检查后再确认。".to_string(),
@@ -1749,6 +2104,14 @@ fn verify_sha256_sums(
     sums: &[u8],
     overrides: &BTreeMap<String, Vec<u8>>,
 ) -> Result<(), AppError> {
+    verify_sha256_sums_with_digests(root, sums, overrides).map(|_| ())
+}
+
+fn verify_sha256_sums_with_digests(
+    root: &Path,
+    sums: &[u8],
+    overrides: &BTreeMap<String, Vec<u8>>,
+) -> Result<BTreeMap<String, String>, AppError> {
     let text = std::str::from_utf8(sums)
         .map_err(|error| AppError::Engine(format!("SHA256SUMS 不是 UTF-8: {error}")))?;
     let mut listed = BTreeMap::new();
@@ -1768,6 +2131,7 @@ fn verify_sha256_sums(
         }
         listed.insert(relative, hash.to_ascii_lowercase());
     }
+    let mut verified = BTreeMap::new();
     for (relative, expected_hash) in &listed {
         let path = root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
         reject_reparse_chain(&path)?;
@@ -1784,6 +2148,10 @@ fn verify_sha256_sums(
                 "SHA256SUMS 哈希不匹配：{relative}"
             )));
         }
+        // The value is known to match the normalized expected hash. Keeping
+        // the actual value here lets the caller construct a snapshot without
+        // reading the same large payload a second time.
+        verified.insert(relative.clone(), actual);
     }
     let mut files = Vec::new();
     collect_files(root, "", &mut files)?;
@@ -1799,7 +2167,7 @@ fn verify_sha256_sums(
             )));
         }
     }
-    Ok(())
+    Ok(verified)
 }
 
 fn verify_metadata_values(
@@ -1883,11 +2251,58 @@ fn update_metadata(
     Ok((root_bytes, usb_bytes))
 }
 
+fn identity_mismatch_reason(
+    expected: &CodexPayloadIdentity,
+    fresh: &CodexPayloadIdentity,
+) -> Option<&'static str> {
+    if expected.source_kind != fresh.source_kind || expected.source_locator != fresh.source_locator
+    {
+        return Some("更新源已变化");
+    }
+    if expected.release_id != fresh.release_id || expected.release_tag != fresh.release_tag {
+        return Some("发布版本身份已变化");
+    }
+    if expected.package_moniker != fresh.package_moniker
+        || expected.architecture != fresh.architecture
+        || expected.msix_version != fresh.msix_version
+        || expected.app_version != fresh.app_version
+    {
+        return Some("MSIX 包身份或版本已变化");
+    }
+    if expected.msix_size != fresh.msix_size
+        || expected.msix_sha256 != fresh.msix_sha256
+        || expected.github_digest != fresh.github_digest
+    {
+        return Some("MSIX 摘要或大小已变化");
+    }
+    if expected.checksums_sha256 != fresh.checksums_sha256
+        || expected.manifest_sha256 != fresh.manifest_sha256
+    {
+        return Some("发布清单或校验文件已变化");
+    }
+    if expected.msix_asset_id != fresh.msix_asset_id
+        || expected.msix_asset_name != fresh.msix_asset_name
+        || expected.sha256_asset_id != fresh.sha256_asset_id
+        || expected.sha256_asset_name != fresh.sha256_asset_name
+        || expected.manifest_asset_id != fresh.manifest_asset_id
+        || expected.manifest_asset_name != fresh.manifest_asset_name
+        || expected.repo != fresh.repo
+    {
+        return Some("更新资产身份已变化");
+    }
+    None
+}
+
 fn same_identity(expected: &CodexPayloadIdentity, fresh: &CodexPayloadIdentity) -> bool {
-    expected == fresh
+    identity_mismatch_reason(expected, fresh).is_none()
 }
 
 fn require_newer_version(current: &str, latest: &str) -> Result<(), AppError> {
+    if !is_numeric_version(current) || !is_numeric_version(latest) {
+        return Err(AppError::StaleExpectation(
+            "远端或本地版本格式无效，拒绝更新。".to_string(),
+        ));
+    }
     if compare_versions(current, latest) == std::cmp::Ordering::Less {
         Ok(())
     } else {
@@ -1921,27 +2336,75 @@ pub fn check(ctx: &UpdateContext) -> Result<Option<UpdateInfo>, AppError> {
     // durable transaction before observing the version; refusing to check
     // would strand the user in a state that the next check cannot repair.
     recover_pending_transactions(&ctx.bundle_root)?;
-    let local = require_capability(&ctx.bundle_root)?;
-    verify_bundle_integrity(&ctx.bundle_root)?;
+    // Read only the capability metadata first. The full removable-drive
+    // integrity pass is intentionally delayed until after remote resolution,
+    // so an unavailable source is not hidden behind a long local hash.
+    let local = require_capability_metadata(&ctx.bundle_root).map_err(|error| {
+        log::error!(
+            "codex payload update check failed stage=capability code={} error={}",
+            error.code(),
+            error
+        );
+        error
+    })?;
     log::info!(
-        "codex payload update check start architecture={} current={} source={} proxy={}",
+        "codex payload update check start stage=capability architecture={} current={} source={} proxy={}",
         local.architecture,
         local.current_version,
         ctx.settings.codex_payload_source_kind.as_str(),
         ctx.settings.proxy_mode.as_str()
     );
     let network = network_from_settings(&ctx.settings);
-    let fresh = match resolve_preferred_source(&ctx.settings, &local.architecture, &network) {
+    let fresh = match resolve_preferred_source(
+        &ctx.settings,
+        &local.architecture,
+        &network,
+        &local.current_version,
+    ) {
         Ok(fresh) => fresh,
         Err(error) => {
             log::error!(
-                "codex payload update check failed stage=metadata architecture={} current={} error={}",
+                "codex payload update check failed stage=metadata architecture={} current={} code={} error={}",
                 local.architecture,
                 local.current_version,
+                error.code(),
                 error
             );
             return Err(error);
         }
+    };
+    log::info!(
+        "codex payload update check stage=integrity start architecture={} current={}",
+        local.architecture,
+        local.current_version
+    );
+    let verified_digests = match verify_bundle_integrity_with_digests(&ctx.bundle_root) {
+        Ok(digests) => digests,
+        Err(error) => {
+            log::error!(
+                "codex payload update check failed stage=integrity current={} code={} error={}",
+                local.current_version,
+                error.code(),
+                error
+            );
+            return Err(error);
+        }
+    };
+    let payload_sha = verified_digest(&verified_digests, &local.payload_relative, "payload")?;
+    let payload_size = fs::metadata(&local.payload_path)
+        .map_err(|error| AppError::Engine(format!("读取 payload 大小失败: {error}")))?
+        .len();
+    verify_metadata_values(&ctx.bundle_root, &payload_sha, payload_size)?;
+    log::info!(
+        "codex payload update check stage=integrity completed files={}",
+        verified_digests.len()
+    );
+    let Some(fresh) = fresh else {
+        log::info!(
+            "codex payload update check completed stage=compare result=no-update reason=source_no_newer current={}",
+            local.current_version
+        );
+        return Ok(None);
     };
     if compare_versions(&local.current_version, &fresh.app_version) != std::cmp::Ordering::Less {
         log::info!(
@@ -1959,7 +2422,12 @@ pub fn check(ctx: &UpdateContext) -> Result<Option<UpdateInfo>, AppError> {
         fresh.identity.source_kind.as_str(),
         fresh.msix.size
     );
-    let payload = codex_update_payload(&ctx.bundle_root, &local, &fresh.identity)?;
+    let payload = codex_update_payload_with_digests(
+        &ctx.bundle_root,
+        &local,
+        &fresh.identity,
+        &verified_digests,
+    )?;
     Ok(Some(UpdateInfo {
         channel: ChannelKind::Codex,
         current_version: local.current_version,
@@ -2017,17 +2485,28 @@ pub fn apply(
             "更新确认对象无效，请重新检查后再确认。".to_string(),
         ));
     }
-    let local = require_capability(&ctx.bundle_root)?;
-    verify_bundle_integrity(&ctx.bundle_root)?;
+    // Capability metadata is cheap enough to establish the local channel
+    // identity, but the full payload read is deliberately postponed until
+    // after the fresh remote identity has been resolved.
+    let local = require_capability_metadata(&ctx.bundle_root).map_err(|error| {
+        log::error!(
+            "codex payload update apply failed stage=capability code={} error={}",
+            error.code(),
+            error
+        );
+        error
+    })?;
     let expected_payload = parse_codex_update_payload(&expected.payload)?;
     let expected_identity = expected_payload.identity;
     let expected_snapshot = expected_payload.local_snapshot.ok_or_else(|| {
         AppError::StaleExpectation("更新确认缺少本地 USB 快照，请重新检查后再确认。".to_string())
     })?;
-    require_local_snapshot(&ctx.bundle_root, &local, &expected_snapshot)?;
-    if !source_matches_settings(&ctx.settings, &expected_identity)?
-        || expected.current_version != local.current_version
-    {
+    let source_matches = source_matches_settings(&ctx.settings, &expected_identity)?;
+    if !source_matches || expected.current_version != local.current_version {
+        log::warn!(
+            "codex payload update apply rejected stage=source-lock reason=source_identity_changed source={}",
+            expected_identity.source_kind.as_str()
+        );
         return Err(AppError::StaleExpectation(
             "更新源或本地版本已变化，请重新检查后再确认。".to_string(),
         ));
@@ -2039,23 +2518,96 @@ pub fn apply(
                         source_kind: CodexPayloadSourceKind| {
         resolve_source(settings, architecture, network, source_kind)
     };
+    log::info!(
+        "codex payload update apply stage=source-resolve start architecture={} current={}",
+        local.architecture,
+        local.current_version
+    );
     let fresh = resolve_source_with_retry(
         &ctx.settings,
         &local.architecture,
         &network,
         expected_identity.source_kind,
         &mut resolver,
-    )?;
-    if !same_identity(&expected_identity, &fresh.identity)
-        || fresh.app_version != expected.latest_version
-    {
+    )
+    .map_err(|error| {
+        log::error!(
+            "codex payload update apply failed stage=source-resolve current={} code={} error={}",
+            local.current_version,
+            error.code(),
+            error
+        );
+        error
+    })?;
+    log::info!(
+        "codex payload update apply stage=source-resolve completed latest={} source={}",
+        fresh.app_version,
+        fresh.identity.source_kind.as_str()
+    );
+    if let Some(reason) = identity_mismatch_reason(&expected_identity, &fresh.identity) {
+        log::warn!(
+            "codex payload update apply rejected stage=source-resolve reason=source_identity_changed source={} detail={}",
+            expected_identity.source_kind.as_str(),
+            reason
+        );
+        return Err(AppError::StaleExpectation(format!(
+            "远端 Codex 更新信息已变化（{reason}），请重新检查后再确认。"
+        )));
+    }
+    if fresh.app_version != expected.latest_version {
         return Err(AppError::StaleExpectation(
-            "远端 Codex 版本或资产身份已变化，请重新检查后再确认。".to_string(),
+            "远端 Codex 显示版本已变化，请重新检查后再确认。".to_string(),
         ));
     }
     require_newer_version(&local.current_version, &fresh.app_version)?;
     require_https_url(&fresh.msix.url, "MSIX 下载地址")?;
     require_https_url(&fresh.checksums.url, "SHA256SUMS 下载地址")?;
+    log::info!(
+        "codex payload update apply stage=integrity start payload={}",
+        local.payload_relative
+    );
+    let verified_digests =
+        verify_bundle_integrity_with_digests(&ctx.bundle_root).map_err(|error| {
+            log::error!(
+                "codex payload update apply failed stage=integrity current={} code={} error={}",
+                local.current_version,
+                error.code(),
+                error
+            );
+            error
+        })?;
+    let payload_sha = verified_digest(&verified_digests, &local.payload_relative, "payload")?;
+    let payload_size = fs::metadata(&local.payload_path)
+        .map_err(|error| AppError::Engine(format!("读取 payload 大小失败: {error}")))?
+        .len();
+    verify_metadata_values(&ctx.bundle_root, &payload_sha, payload_size).map_err(|error| {
+        log::error!(
+            "codex payload update apply failed stage=integrity-metadata current={} code={} error={}",
+            local.current_version,
+            error.code(),
+            error
+        );
+        error
+    })?;
+    require_local_snapshot_from_digests(
+        &ctx.bundle_root,
+        &local,
+        &expected_snapshot,
+        &verified_digests,
+    )
+    .map_err(|error| {
+        log::error!(
+            "codex payload update apply failed stage=snapshot current={} code={} error={}",
+            local.current_version,
+            error.code(),
+            error
+        );
+        error
+    })?;
+    log::info!(
+        "codex payload update apply stage=integrity completed files={}",
+        verified_digests.len()
+    );
     reject_reparse_chain(&ctx.bundle_root)?;
     let staging = ctx.bundle_root.join(STAGING_DIR);
     if staging.exists() {
@@ -2090,9 +2642,10 @@ pub fn apply(
     );
     if let Err(error) = result {
         log::error!(
-            "codex payload update failed stage=download-verify-commit current={} expected_latest={} error={}",
+            "codex payload update failed stage=download-verify-commit current={} expected_latest={} code={} error={}",
             expected.current_version,
             expected.latest_version,
+            error.code(),
             error
         );
         if matches!(error, AppError::Committed(_)) {
@@ -2288,7 +2841,7 @@ fn apply_transaction_with_transport(
         Some(&local.architecture),
     )
     .map_err(|error| AppError::Engine(format!("MSIX identity 校验失败: {error}")))?;
-    if !identity.publisher.to_ascii_lowercase().contains("openai") {
+    if !is_expected_codex_manifest_publisher(&identity.publisher) {
         return Err(AppError::Engine("MSIX publisher 不是 OpenAI".to_string()));
     }
     let signed_moniker = codex_win_engine::canonical_codex_package_moniker(&identity)
@@ -2318,6 +2871,21 @@ fn apply_transaction_with_transport(
     })
 }
 
+/// The signed Store MSIX uses Microsoft's marketplace publisher subject in
+/// the manifest rather than the human-readable `OpenAI` organization name.
+/// Authenticode verification above remains the trust anchor; this check only
+/// makes sure the manifest agrees with one of the two known OpenAI publisher
+/// forms before the package moniker is compared with the release manifest.
+fn is_expected_codex_manifest_publisher(publisher: &str) -> bool {
+    let normalized = publisher.trim().to_ascii_lowercase();
+    normalized.contains("openai")
+        || normalized == codex_win_engine::OPENAI_MARKETPLACE_PUBLISHER_SUBJECT
+        || normalized.starts_with(&format!(
+            "{},",
+            codex_win_engine::OPENAI_MARKETPLACE_PUBLISHER_SUBJECT
+        ))
+}
+
 /// Commit a fully verified staged payload to the USB bundle.  Keeping this
 /// phase separate from network/download verification makes the destructive
 /// boundary deterministic and directly testable without a live GitHub asset.
@@ -2337,10 +2905,28 @@ fn commit_staged_payload(input: StagedCommit<'_>) -> Result<(), AppError> {
     let root_manifest_path = root.join(ROOT_MANIFEST_NAME);
     let usb_manifest_path = root.join(USB_MANIFEST_NAME);
     let sums_path = root.join(SHA256SUMS_NAME);
-    let latest_local = require_capability(root)?;
-    verify_bundle_integrity(root)?;
+    // The full SHA256SUMS pass below is the authoritative pre-commit payload
+    // read. Keep the final standalone payload hash immediately before the
+    // rename as the independent TOCTOU boundary check.
+    let latest_local = require_capability_metadata(root)?;
+    log::info!(
+        "codex payload update stage=commit-preflight start payload={}",
+        latest_local.payload_relative
+    );
+    let verified_digests = verify_bundle_integrity_with_digests(root)?;
+    let verified_payload_sha =
+        verified_digest(&verified_digests, &latest_local.payload_relative, "payload")?;
+    let verified_payload_size = fs::metadata(&latest_local.payload_path)
+        .map_err(|error| AppError::Engine(format!("读取 payload 大小失败: {error}")))?
+        .len();
+    verify_metadata_values(root, &verified_payload_sha, verified_payload_size)?;
     if let Some(expected_snapshot) = parse_codex_update_payload(&expected.payload)?.local_snapshot {
-        require_local_snapshot(root, &latest_local, &expected_snapshot)?;
+        require_local_snapshot_from_digests(
+            root,
+            &latest_local,
+            &expected_snapshot,
+            &verified_digests,
+        )?;
     }
     if latest_local.current_version != expected.current_version
         || latest_local.payload_relative != local.payload_relative
@@ -2351,6 +2937,10 @@ fn commit_staged_payload(input: StagedCommit<'_>) -> Result<(), AppError> {
             "本地 USB payload 在更新期间发生变化，请重新检查后再确认。".to_string(),
         ));
     }
+    log::info!(
+        "codex payload update stage=commit-preflight integrity-completed files={}",
+        verified_digests.len()
+    );
     let old_payload_sha = sha256_file(&latest_local.payload_path)
         .map_err(|error| AppError::Engine(error.to_string()))?;
     let manifest_sha = latest_local
@@ -2375,17 +2965,68 @@ fn commit_staged_payload(input: StagedCommit<'_>) -> Result<(), AppError> {
     } else {
         reject_reparse_chain(backup_dir.parent().unwrap_or(root))?;
     }
+    crate::app::usb_bundle::validate_backup_layout(
+        root,
+        &latest_local.payload_relative,
+        &latest_local.architecture,
+    )?;
     reject_reparse_chain(tx)?;
+    let staged_size = fs::metadata(staged)
+        .map_err(|error| AppError::Engine(format!("读取 staged MSIX 大小失败: {error}")))?
+        .len();
+    if staged_size == 0 || staged_size > MAX_PACKAGE_BYTES {
+        return Err(AppError::Engine("staged MSIX 大小无效".to_string()));
+    }
+    if let Some(expected_sha) = fresh.msix.expected_sha256.as_deref() {
+        if !actual_sha.eq_ignore_ascii_case(expected_sha) {
+            return Err(AppError::StaleExpectation(
+                "staged MSIX 摘要与确认结果不一致，请重新检查后再试。".to_string(),
+            ));
+        }
+    }
+    let (next_root, next_usb) = update_metadata(
+        &latest_local,
+        &fresh.identity,
+        &fresh.app_version,
+        actual_sha,
+        staged_size,
+    )?;
+    let current_sums = fs::read(&sums_path)
+        .map_err(|error| AppError::Engine(format!("读取当前 {SHA256SUMS_NAME} 失败: {error}")))?;
+    let precommit_authorization =
+        crate::app::usb_guard::require_signed_codex_bundle("codex-payload-precommit")?;
+    if let Some(authorization) = &precommit_authorization {
+        if authorization.fingerprint.anchor_schema != crate::app::usb_guard::ANCHOR_SCHEMA_V3 {
+            return Err(AppError::StaleExpectation(
+                "当前 U 盘包使用旧更新锚点，必须重新打包并重新授权后才能更新。".to_string(),
+            ));
+        }
+        let projected_anchor = crate::app::usb_guard::stable_anchor_sha256_from_bytes(
+            &next_root,
+            &next_usb,
+            &current_sums,
+        )?;
+        if !projected_anchor.eq_ignore_ascii_case(&authorization.fingerprint.anchor_sha256) {
+            return Err(AppError::StaleExpectation(format!(
+                "anchor_precommit_failed：预提交锚点 {} 与授权锚点 {} 不一致；未修改 U 盘。",
+                &projected_anchor[..12],
+                &authorization.fingerprint.anchor_sha256[..12]
+            )));
+        }
+        log::info!(
+            "codex payload update stage=anchor-precommit verified schema={} anchor={}",
+            authorization.fingerprint.anchor_schema,
+            authorization.fingerprint.anchor_sha256
+        );
+    }
     // The authorization snapshot must be re-observed before any transaction
     // directory mutation or backup move.  The later check immediately before
     // replacing the live payload remains necessary because the preparation
     // work itself can take long enough for the removable volume to change.
-    if let Some(authorization) =
-        crate::app::usb_guard::require_signed_codex_bundle("codex-payload-precommit")?
-    {
+    if let Some(authorization) = &precommit_authorization {
         let expected_root = fs::canonicalize(root)
             .map_err(|error| AppError::Engine(format!("解析 Codex bundle 根目录失败：{error}")))?;
-        let authorized_root = fs::canonicalize(authorization.bundle_root).map_err(|error| {
+        let authorized_root = fs::canonicalize(&authorization.bundle_root).map_err(|error| {
             AppError::Engine(format!("解析授权 USB bundle 根目录失败：{error}"))
         })?;
         if expected_root != authorized_root {
@@ -2437,12 +3078,10 @@ fn commit_staged_payload(input: StagedCommit<'_>) -> Result<(), AppError> {
     // Re-observe immediately before the first destructive rename. The earlier
     // check protects the read/verify phase; this one closes the final
     // drive-letter/replacement window after download and metadata preparation.
-    if let Some(authorization) =
-        crate::app::usb_guard::require_signed_codex_bundle("codex-payload-precommit")?
-    {
+    if let Some(authorization) = &precommit_authorization {
         let expected_root = fs::canonicalize(root)
             .map_err(|error| AppError::Engine(format!("解析 Codex bundle 根目录失败：{error}")))?;
-        let authorized_root = fs::canonicalize(authorization.bundle_root).map_err(|error| {
+        let authorized_root = fs::canonicalize(&authorization.bundle_root).map_err(|error| {
             AppError::Engine(format!("解析授权 USB bundle 根目录失败：{error}"))
         })?;
         if expected_root != authorized_root {
@@ -2461,13 +3100,11 @@ fn commit_staged_payload(input: StagedCommit<'_>) -> Result<(), AppError> {
     let payload_size = fs::metadata(&latest_local.payload_path)
         .map_err(|error| AppError::Engine(error.to_string()))?
         .len();
-    let (next_root, next_usb) = update_metadata(
-        &latest_local,
-        &fresh.identity,
-        &fresh.app_version,
-        actual_sha,
-        payload_size,
-    )?;
+    if payload_size != staged_size {
+        return Err(AppError::Engine(
+            "替换后的 payload 大小与预提交 staged 大小不一致".to_string(),
+        ));
+    }
     let mut overrides = BTreeMap::new();
     overrides.insert(ROOT_MANIFEST_NAME.to_string(), next_root.clone());
     overrides.insert(USB_MANIFEST_NAME.to_string(), next_usb.clone());
@@ -2492,9 +3129,36 @@ fn commit_staged_payload(input: StagedCommit<'_>) -> Result<(), AppError> {
     replace_file(&tx.join("next").join(USB_MANIFEST_NAME), &usb_manifest_path)?;
     write_transaction_state(tx, "usb-manifest-committed")?;
     replace_file(&tx.join("next").join(SHA256SUMS_NAME), &sums_path)?;
-    write_transaction_state(tx, "committed")?;
     verify_sha256_sums(root, &next_sums, &BTreeMap::new())?;
     verify_metadata_values(root, actual_sha, payload_size)?;
+    if let Some(precommit) = &precommit_authorization {
+        let postcommit =
+            crate::app::usb_guard::require_signed_codex_bundle("codex-payload-postcommit")?
+                .ok_or_else(|| {
+                    AppError::Engine(
+                        "anchor_postcommit_failed：正式更新完成后未能重新取得 USB 授权".to_string(),
+                    )
+                })?;
+        if postcommit.fingerprint.anchor_schema != precommit.fingerprint.anchor_schema
+            || !postcommit
+                .fingerprint
+                .anchor_sha256
+                .eq_ignore_ascii_case(&precommit.fingerprint.anchor_sha256)
+            || postcommit.license_digest != precommit.license_digest
+            || postcommit.installation_id != precommit.installation_id
+            || postcommit.key_id != precommit.key_id
+        {
+            return Err(AppError::Engine(
+                "anchor_postcommit_failed：更新后授权锚点或许可证快照发生变化".to_string(),
+            ));
+        }
+        log::info!(
+            "codex payload update stage=anchor-postcommit verified schema={} anchor={}",
+            postcommit.fingerprint.anchor_schema,
+            postcommit.fingerprint.anchor_sha256
+        );
+    }
+    write_transaction_state(tx, "committed")?;
     fs::remove_dir_all(tx).map_err(|error| {
         AppError::Committed(format!("无法清理已提交事务目录 {}：{error}", tx.display()))
     })?;
@@ -2552,13 +3216,13 @@ mod tests {
             "codexDesktopVersion": "1.0.0",
             "packageVersion": "1.0.0.0",
             "architecture": "x64",
-            "updateCapability": {"codexPayload": true, "schemaVersion": 2},
+            "updateCapability": {"codexPayload": true, "schemaVersion": 3, "anchorSchema": 3},
             "payload": {"path": "payload/OpenAI.Codex_x64.msix", "sha256": payload_hash, "size": payload.len()}
         });
         let usb = serde_json::json!({
             "schemaVersion": 2,
             "updateCapability": {
-                "codexPayload": true, "schemaVersion": 2,
+                "codexPayload": true, "schemaVersion": 3, "anchorSchema": 3,
                 "checksumFile": "SHA256SUMS.txt", "transactionDirectory": ".staging",
                 "backupDirectory": "payload/_backup",
                 "backupPolicy": "single-msix-listed-in-SHA256SUMS", "successState": "clean"
@@ -2752,6 +3416,22 @@ mod tests {
         )
         .unwrap();
         assert!(require_local_snapshot(&root, &local, &snapshot).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn verified_digest_table_builds_the_same_snapshot_without_a_second_payload_read() {
+        let root = v2_fixture();
+        let local = require_capability_metadata(&root).unwrap();
+        let digests = verify_bundle_integrity_with_digests(&root).unwrap();
+        let from_verified = local_bundle_snapshot_from_digests(&root, &local, &digests).unwrap();
+        let independently_read =
+            local_bundle_snapshot(&root, &require_capability(&root).unwrap()).unwrap();
+        assert_eq!(from_verified, independently_read);
+
+        let mut incomplete = digests;
+        incomplete.remove(&local.payload_relative);
+        assert!(local_bundle_snapshot_from_digests(&root, &local, &incomplete).is_err());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2955,6 +3635,23 @@ mod tests {
         }
     }
 
+    fn fake_source_release(
+        source_kind: CodexPayloadSourceKind,
+        app_version: &str,
+    ) -> ResolvedRelease {
+        let mut release = fake_resolved_release();
+        release.identity.source_kind = source_kind;
+        release.identity.source_locator = match source_kind {
+            CodexPayloadSourceKind::Mirror => DEFAULT_CODEX_PAYLOAD_BASE_URL.to_string(),
+            CodexPayloadSourceKind::Relay => LEGACY_CODEX_PAYLOAD_BASE_URL.to_string(),
+            CodexPayloadSourceKind::Github => repo_api_url(DEFAULT_CODEX_PAYLOAD_REPO),
+            CodexPayloadSourceKind::Auto => "auto".to_string(),
+        };
+        release.identity.app_version = app_version.to_string();
+        release.app_version = app_version.to_string();
+        release
+    }
+
     fn fake_update_info(root: &Path, local: &LocalBundle) -> UpdateInfo {
         let release = fake_resolved_release();
         UpdateInfo {
@@ -2976,6 +3673,17 @@ mod tests {
             processor_architecture: "x64".into(),
             resource_id: None,
         }
+    }
+
+    #[test]
+    fn accepts_openai_store_marketplace_manifest_publisher() {
+        assert!(is_expected_codex_manifest_publisher(
+            "CN=50BDFD77-8903-4850-9FFE-6E8522F64D5B"
+        ));
+        assert!(is_expected_codex_manifest_publisher("CN=OpenAI, O=OpenAI"));
+        assert!(!is_expected_codex_manifest_publisher(
+            "CN=Contoso, O=Contoso"
+        ));
     }
 
     fn fake_transport(
@@ -3133,6 +3841,50 @@ mod tests {
     }
 
     #[test]
+    fn mirror_identity_ignores_volatile_manifest_metadata_but_binds_payload_facts() {
+        let base = DEFAULT_CODEX_PAYLOAD_BASE_URL;
+        let resolve = |manifest: String, checksums: String| {
+            let fetched = |url: &str| {
+                if url.ends_with("latest/manifest") {
+                    Ok(manifest.clone())
+                } else if url.ends_with("latest/checksums") {
+                    Ok(checksums.clone())
+                } else {
+                    Err(AppError::Engine(format!("unexpected URL: {url}")))
+                }
+            };
+            resolve_mirror_latest(&fetched, base, "x64").unwrap()
+        };
+
+        let original = mirror_manifest_json("x64");
+        let first_checksums = format!(
+            "{}  OpenAI.Codex_2.0.0.0_x64__2p2nqsd0c76g0.Msix\n",
+            "a".repeat(64)
+        );
+        let first = resolve(original.clone(), first_checksums.clone());
+        let mut volatile: serde_json::Value = serde_json::from_str(&original).unwrap();
+        volatile["generatedAt"] = serde_json::json!("2026-09-17T03:01:00Z");
+        volatile["sources"]["windows"]["lastModified"] =
+            serde_json::json!("Thu, 17 Sep 2026 03:01:46 GMT");
+        let second = resolve(volatile.to_string(), first_checksums.clone());
+        assert_eq!(first.identity, second.identity);
+
+        let mut changed: serde_json::Value = serde_json::from_str(&original).unwrap();
+        changed["sources"]["windows"]["architectures"]["x64"]["contentLength"] =
+            serde_json::json!(124);
+        let third = resolve(changed.to_string(), first_checksums.clone());
+        assert_ne!(first.identity, third.identity);
+
+        let irrelevant_asset = format!(
+            "{}  OpenAI.Codex_2.0.0.0_x64__2p2nqsd0c76g0.Msix\n{}  unrelated.delta\n",
+            "a".repeat(64),
+            "b".repeat(64)
+        );
+        let fourth = resolve(original, irrelevant_asset);
+        assert_eq!(first.identity, fourth.identity);
+    }
+
+    #[test]
     fn source_metadata_retry_retries_only_transient_transport_failures() {
         let settings = AppSettings::default();
         let network = NetworkConfig::direct();
@@ -3162,6 +3914,31 @@ mod tests {
         .unwrap();
         assert_eq!(attempts.get(), 2);
         assert_eq!(resolved.app_version, "2.0.0");
+    }
+
+    #[test]
+    fn source_metadata_rejects_invalid_app_and_package_versions() {
+        let settings = AppSettings::default();
+        let network = NetworkConfig::direct();
+        for (invalid_app, invalid_package) in [("bad", "2.0.0.0"), ("2.0.0", "bad")] {
+            let mut release = fake_resolved_release();
+            release.app_version = invalid_app.to_string();
+            release.identity.app_version = invalid_app.to_string();
+            release.identity.msix_version = invalid_package.to_string();
+            let mut resolver =
+                |_: &AppSettings, _: &str, _: &NetworkConfig, _: CodexPayloadSourceKind| {
+                    Ok(release.clone())
+                };
+            let error = resolve_source_with_retry(
+                &settings,
+                "x64",
+                &network,
+                CodexPayloadSourceKind::Mirror,
+                &mut resolver,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("source_invalid"));
+        }
     }
 
     #[test]
@@ -3239,6 +4016,143 @@ mod tests {
     }
 
     #[test]
+    fn resolve_relay_latest_accepts_production_protocol_2_shape() {
+        let base = "https://update.404token.xyz/__codex_update__/";
+        let manifest = release_manifest_json("x64");
+        let manifest_sha = sha256_bytes(manifest.as_bytes());
+        let assets = serde_json::json!({
+            "checksums": {
+                "id": 11,
+                "path": "SHA256SUMS-windows.txt",
+                "sha256": "a".repeat(64),
+                "size": 12,
+                "githubDigest": format!("sha256:{}", "a".repeat(64))
+            },
+            "release-manifest": {
+                "id": 12,
+                "path": "release-manifest.json",
+                "sha256": manifest_sha,
+                "size": manifest.len()
+            },
+            "windows-msix": {
+                "id": 13,
+                "path": "OpenAI.Codex_2.0.0.0_x64__2p2nqsd0c76g0.Msix",
+                "sha256": "c".repeat(64),
+                "size": 56,
+                "githubDigest": format!("sha256:{}", "c".repeat(64))
+            }
+        });
+        let descriptor = serde_json::json!({
+            "protocol": 2,
+            "architecture": "x64",
+            "releaseId": 77,
+            "repository": "Wangnov/codex-app-mirror",
+            "tag": "codex-app-2.0.0",
+            "assets": assets,
+            "identity": {
+                "releaseId": 77,
+                "tag": "codex-app-2.0.0",
+                "assets": serde_json::json!({
+                    "checksums": {
+                        "id": 11,
+                        "path": "SHA256SUMS-windows.txt",
+                        "sha256": "a".repeat(64),
+                        "size": 12,
+                        "githubDigest": format!("sha256:{}", "a".repeat(64))
+                    },
+                    "release-manifest": {
+                        "id": 12,
+                        "path": "release-manifest.json",
+                        "sha256": manifest_sha,
+                        "size": manifest.len()
+                    },
+                    "windows-msix": {
+                        "id": 13,
+                        "path": "OpenAI.Codex_2.0.0.0_x64__2p2nqsd0c76g0.Msix",
+                        "sha256": "c".repeat(64),
+                        "size": 56,
+                        "githubDigest": format!("sha256:{}", "c".repeat(64))
+                    }
+                }),
+                "publishedAt": "2026-09-16T00:00:00Z"
+            }
+        })
+        .to_string();
+        let fetched = |url: &str| {
+            if url.ends_with("latest.json") {
+                Ok(descriptor.clone())
+            } else if url.ends_with("release-manifest.json") {
+                Ok(manifest.clone())
+            } else {
+                Err(AppError::Engine(format!("unexpected URL: {url}")))
+            }
+        };
+
+        let resolved = resolve_relay_latest(&fetched, base, "x64").unwrap();
+        assert_eq!(resolved.identity.release_id, 77);
+        assert_eq!(resolved.identity.release_tag, "codex-app-2.0.0");
+        assert_eq!(resolved.identity.app_version, "2.0.0");
+        assert_eq!(resolved.msix.size, 56);
+    }
+
+    #[test]
+    fn relay_protocol_2_requires_a_matching_nested_identity() {
+        let assets = serde_json::json!({
+            "checksums": {
+                "id": 11,
+                "path": "SHA256SUMS-windows.txt",
+                "sha256": "a".repeat(64),
+                "size": 12
+            },
+            "release-manifest": {
+                "id": 12,
+                "path": "release-manifest.json",
+                "sha256": "b".repeat(64),
+                "size": 34
+            },
+            "windows-msix": {
+                "id": 13,
+                "path": "OpenAI.Codex_2.0.0.0_x64__2p2nqsd0c76g0.Msix",
+                "sha256": "c".repeat(64),
+                "size": 56,
+                "githubDigest": format!("sha256:{}", "c".repeat(64))
+            }
+        });
+        let mut descriptor: RelayLatest = serde_json::from_value(serde_json::json!({
+            "protocol": 2,
+            "architecture": "x64",
+            "releaseId": 77,
+            "repository": "Wangnov/codex-app-mirror",
+            "tag": "codex-app-2.0.0",
+            "assets": assets.clone(),
+            "identity": {
+                "releaseId": 77,
+                "tag": "codex-app-2.0.0",
+                "assets": assets
+            }
+        }))
+        .unwrap();
+
+        assert!(validate_relay_descriptor(&descriptor).is_ok());
+
+        descriptor.identity.as_mut().unwrap().tag = "codex-app-other".into();
+        assert!(validate_relay_descriptor(&descriptor).is_err());
+
+        descriptor.identity.as_mut().unwrap().tag = descriptor.tag.clone();
+        descriptor
+            .identity
+            .as_mut()
+            .unwrap()
+            .assets
+            .windows_msix
+            .size += 1;
+        assert!(validate_relay_descriptor(&descriptor).is_err());
+
+        descriptor.identity = None;
+        assert!(validate_relay_descriptor(&descriptor).is_err());
+    }
+
+    #[test]
     fn auto_source_falls_back_to_github_without_mixing_identity() {
         let settings = AppSettings {
             codex_payload_source_kind: CodexPayloadSourceKind::Auto,
@@ -3246,27 +4160,76 @@ mod tests {
         };
         let network = NetworkConfig::direct();
         let mut attempts = Vec::new();
-        let resolved =
-            resolve_preferred_source_with(&settings, "x64", &network, |_, _, _, source_kind| {
+        let resolved = resolve_preferred_source_with(
+            &settings,
+            "x64",
+            &network,
+            "1.0.0",
+            |_, _, _, source_kind| {
                 attempts.push(source_kind);
                 match source_kind {
                     CodexPayloadSourceKind::Mirror => {
-                        Err(AppError::Engine("mirror unavailable".to_string()))
+                        panic!("auto source must not resolve the legacy mirror")
                     }
-                    CodexPayloadSourceKind::Relay => {
-                        Err(AppError::Engine("relay unavailable".to_string()))
-                    }
+                    CodexPayloadSourceKind::Relay => Ok(fake_source_release(source_kind, "1.0.0")),
                     CodexPayloadSourceKind::Github => Ok(fake_resolved_release()),
                     CodexPayloadSourceKind::Auto => {
                         Err(AppError::Internal("unexpected auto source".to_string()))
                     }
                 }
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         assert_eq!(
             attempts,
             vec![
-                CodexPayloadSourceKind::Mirror,
+                CodexPayloadSourceKind::Relay,
+                CodexPayloadSourceKind::Github
+            ]
+        );
+        assert_eq!(
+            resolved.unwrap().identity.source_kind,
+            CodexPayloadSourceKind::Github
+        );
+    }
+
+    #[test]
+    fn auto_source_skips_stale_relay_and_selects_a_newer_later_candidate() {
+        let settings = AppSettings {
+            codex_payload_source_kind: CodexPayloadSourceKind::Auto,
+            ..AppSettings::default()
+        };
+        let network = NetworkConfig::direct();
+        let mut attempts = Vec::new();
+        let resolved = resolve_preferred_source_with(
+            &settings,
+            "x64",
+            &network,
+            "26.908.0",
+            |_, _, _, source_kind| {
+                attempts.push(source_kind);
+                match source_kind {
+                    CodexPayloadSourceKind::Mirror => {
+                        panic!("auto source must not resolve the legacy mirror")
+                    }
+                    CodexPayloadSourceKind::Relay => {
+                        Ok(fake_source_release(source_kind, "26.903.0"))
+                    }
+                    CodexPayloadSourceKind::Github => {
+                        Ok(fake_source_release(source_kind, "26.909.0"))
+                    }
+                    CodexPayloadSourceKind::Auto => {
+                        Err(AppError::Internal("unexpected auto source".to_string()))
+                    }
+                }
+            },
+        )
+        .unwrap()
+        .expect("a later newer candidate should be selected");
+
+        assert_eq!(
+            attempts,
+            vec![
                 CodexPayloadSourceKind::Relay,
                 CodexPayloadSourceKind::Github
             ]
@@ -3275,6 +4238,174 @@ mod tests {
             resolved.identity.source_kind,
             CodexPayloadSourceKind::Github
         );
+        assert_eq!(resolved.app_version, "26.909.0");
+    }
+
+    #[test]
+    fn auto_source_with_all_stale_candidates_returns_no_update() {
+        let settings = AppSettings {
+            codex_payload_source_kind: CodexPayloadSourceKind::Auto,
+            ..AppSettings::default()
+        };
+        let network = NetworkConfig::direct();
+        let mut attempts = Vec::new();
+        let resolved = resolve_preferred_source_with(
+            &settings,
+            "x64",
+            &network,
+            "26.908.0",
+            |_, _, _, source_kind| {
+                attempts.push(source_kind);
+                let version = match source_kind {
+                    CodexPayloadSourceKind::Mirror => {
+                        panic!("auto source must not resolve the legacy mirror")
+                    }
+                    CodexPayloadSourceKind::Github => "26.908.0",
+                    CodexPayloadSourceKind::Relay => "26.903.0",
+                    CodexPayloadSourceKind::Auto => "0.0.0",
+                };
+                Ok(fake_source_release(source_kind, version))
+            },
+        )
+        .unwrap();
+
+        assert!(resolved.is_none());
+        assert_eq!(
+            attempts,
+            vec![
+                CodexPayloadSourceKind::Relay,
+                CodexPayloadSourceKind::Github
+            ]
+        );
+    }
+
+    #[test]
+    fn auto_source_keeps_no_update_when_later_fallbacks_fail() {
+        let settings = AppSettings {
+            codex_payload_source_kind: CodexPayloadSourceKind::Auto,
+            ..AppSettings::default()
+        };
+        let network = NetworkConfig::direct();
+        let mut attempts = Vec::new();
+        let resolved = resolve_preferred_source_with(
+            &settings,
+            "x64",
+            &network,
+            "26.908.0",
+            |_, _, _, source_kind| {
+                attempts.push(source_kind);
+                match source_kind {
+                    CodexPayloadSourceKind::Mirror => {
+                        panic!("auto source must not resolve the legacy mirror")
+                    }
+                    CodexPayloadSourceKind::Relay => {
+                        Ok(fake_source_release(source_kind, "26.903.0"))
+                    }
+                    CodexPayloadSourceKind::Github => {
+                        Err(AppError::Engine("github unavailable".to_string()))
+                    }
+                    CodexPayloadSourceKind::Auto => {
+                        Err(AppError::Internal("unexpected auto source".to_string()))
+                    }
+                }
+            },
+        )
+        .unwrap();
+
+        assert!(resolved.is_none());
+        assert_eq!(
+            attempts,
+            vec![
+                CodexPayloadSourceKind::Relay,
+                CodexPayloadSourceKind::Github
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_relay_stale_does_not_fallback_to_another_source() {
+        let settings = AppSettings {
+            codex_payload_source_kind: CodexPayloadSourceKind::Relay,
+            ..AppSettings::default()
+        };
+        let network = NetworkConfig::direct();
+        let mut attempts = Vec::new();
+        let result = resolve_preferred_source_with(
+            &settings,
+            "x64",
+            &network,
+            "26.908.0",
+            |_, _, _, source_kind| {
+                attempts.push(source_kind);
+                match source_kind {
+                    CodexPayloadSourceKind::Relay => {
+                        Ok(fake_source_release(source_kind, "26.903.0"))
+                    }
+                    _ => panic!("explicit Relay must not resolve another source"),
+                }
+            },
+        );
+
+        let error = result.expect_err("explicit stale source must be reported");
+        assert!(
+            error.to_string().contains("source_stale:"),
+            "actual explicit-source error: {error}"
+        );
+        assert_eq!(attempts, vec![CodexPayloadSourceKind::Relay]);
+    }
+
+    #[test]
+    fn explicit_github_does_not_fallback_to_another_source() {
+        let settings = AppSettings {
+            codex_payload_source_kind: CodexPayloadSourceKind::Github,
+            ..AppSettings::default()
+        };
+        let network = NetworkConfig::direct();
+        let mut attempts = Vec::new();
+        let resolved = resolve_preferred_source_with(
+            &settings,
+            "x64",
+            &network,
+            "1.0.0",
+            |_, _, _, source_kind| {
+                attempts.push(source_kind);
+                match source_kind {
+                    CodexPayloadSourceKind::Github => Ok(fake_source_release(source_kind, "2.0.0")),
+                    _ => panic!("explicit GitHub must not resolve another source"),
+                }
+            },
+        )
+        .unwrap()
+        .expect("explicit GitHub should resolve its own candidate");
+
+        assert_eq!(attempts, vec![CodexPayloadSourceKind::Github]);
+        assert_eq!(
+            resolved.identity.source_kind,
+            CodexPayloadSourceKind::Github
+        );
+        assert_eq!(resolved.app_version, "2.0.0");
+    }
+
+    #[test]
+    fn source_error_classification_and_logs_do_not_expose_tokens() {
+        let token = "relay-secret-token";
+        let error = AppError::Engine(format!(
+            "curl failed for https://relay.example.test/{token}?token={token} exit=7"
+        ));
+        assert_eq!(source_error_category(&error), "source_unreachable");
+        let detail = source_error_detail(CodexPayloadSourceKind::Relay, &error);
+        assert!(detail.contains("reason=source_unreachable"));
+        assert!(!detail.contains(token));
+        assert_eq!(
+            redacted_source_locator(&format!("https://relay.example.test/{token}")),
+            "<redacted>"
+        );
+
+        let invalid = AppError::Engine("response JSON is invalid".to_string());
+        assert_eq!(source_error_category(&invalid), "source_invalid");
+        let safe_error = source_error_for_caller(CodexPayloadSourceKind::Relay, &error);
+        assert_eq!(source_error_category(&safe_error), "source_unreachable");
+        assert!(!safe_error.to_string().contains(token));
     }
 
     #[test]
@@ -3406,11 +4537,13 @@ mod tests {
         let mut release = fake_resolved_release();
         release.msix.size = payload.len() as u64;
         let checksums = format!("{payload_sha}  {}.Msix\n", release.identity.package_moniker);
+        let mut store_identity = fake_identity();
+        store_identity.publisher = "CN=50BDFD77-8903-4850-9FFE-6E8522F64D5B".into();
         let transport = fake_transport(
             Ok(payload.clone()),
             Ok(checksums),
             Ok(()),
-            Ok(fake_identity()),
+            Ok(store_identity),
         );
         let progress_events = std::cell::RefCell::new(Vec::new());
 

@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "channel": "skill-hub",
+  "sources": [
+    {
+      "id": "ph-relay",
+      "kind": "relay",
+      "base": "https://update.404token.xyz/__codex_update__/skill-hub/",
+      "priority": 40,
+      "enabled": true
+    },
+    {
+      "id": "github",
+      "kind": "github",
+      "priority": 50,
+      "enabled": true
+    }
+  ]
+}

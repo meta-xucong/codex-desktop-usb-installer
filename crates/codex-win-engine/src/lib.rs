@@ -61,8 +61,9 @@ pub use portable::{
     cleanup_portable_metadata, cleanup_stale_portable_shortcuts, close_codex_gracefully_for_root,
     codex_running_for_root, inject_portable_fault, install_portable_from_msix,
     install_portable_from_msix_with_observer, install_portable_from_msix_with_observer_options,
-    installed_app_exe, purge_codex_user_data, remove_directory_all_with_retry,
-    rename_directory_with_retry, uninstall_portable, validate_cleanup_path, PortableBoundary,
+    install_portable_from_msix_with_observer_options_and_progress, installed_app_exe,
+    purge_codex_user_data, remove_directory_all_with_retry, rename_directory_with_retry,
+    uninstall_portable, validate_cleanup_path, PortableBoundary, PortableExtractionProgress,
     PortableFault, PortableInstallOptions, PortableInstallReport, PortableUninstallReport,
 };
 pub use sys::{
@@ -83,8 +84,8 @@ pub use sys::{
 /// manager-owned root. Used for CCSwitch as well as Codex; no process-name-only
 /// termination is exposed to callers.
 pub use windows_process::{
-    close_processes_for_root, processes_running_for_root, wait_for_usable_window_for_root,
-    UsableWindowReport,
+    close_processes_for_root, hide_console_windows_for_root, hide_windows_for_root,
+    processes_running_for_root, wait_for_usable_window_for_root, UsableWindowReport,
 };
 // Failure-kind constants for structured MSIX health outcomes.
 pub use sys::msix_failure;

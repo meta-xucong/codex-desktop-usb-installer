@@ -3,13 +3,17 @@ use crate::{bundle, key_blob, media, path_security, transaction, windows};
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::error::SignerError;
 use bundle::{deep_verify_bundle_with_mode, read_signing_binding, AuthenticodeMode};
-use codex_usb_license::validate_key_id;
-use key_blob::{auto_resolve_key, default_key_blob_path, read_dpapi_key_blob, ProtectedKey};
+use codex_usb_license::{validate_key_id, UsbAccountBinding, ANCHOR_SCHEMA_V3};
+use key_blob::{
+    auto_resolve_key, default_key_blob_path, default_portable_vault_path, read_dpapi_key_blob,
+    read_portable_key_vault, write_portable_key_vault, write_portable_key_vault_descriptor,
+    ProtectedKey,
+};
 use media::{
     observe_target, scan_removable_candidates, sole_candidate_is_target, PhysicalObservation,
 };
@@ -19,11 +23,12 @@ use path_security::{
 use serde::Serialize;
 use serde_json::{json, Value};
 use transaction::{
-    build_signing_candidate, digest_bytes, inspect_license, license_path, load_existing_license,
-    now_ms, read_back_license, sign_candidate, verify_signed_license, write_license_atomic,
-    write_old_license_audit,
+    build_signing_candidate_with_account_binding, digest_bytes, inspect_license, license_path,
+    load_existing_license, now_ms, read_back_license, sign_candidate, verify_signed_license,
+    write_license_atomic, write_old_license_audit,
 };
 use windows::{acquire_signing_mutex, atomic_replace, ensure_local_path};
+use zeroize::Zeroizing;
 
 const PRIVATE_KEY_ENV_NAMES: &[&str] = &[
     "CODEX_USB_SIGNER_PRIVATE_KEY",
@@ -40,6 +45,9 @@ struct Arguments {
     confirm: Option<String>,
     report: Option<PathBuf>,
     key_blob: Option<PathBuf>,
+    portable_vault: Option<PathBuf>,
+    password_stdin: bool,
+    output: Option<PathBuf>,
     public_key_b64: Option<String>,
     skip_authenticode: bool,
 }
@@ -69,6 +77,8 @@ struct SignOutput {
     payload_size: u64,
     authenticode_mode: &'static str,
     old_license_audit_path: Option<String>,
+    account_asset_id: Option<String>,
+    sub2api_user_id: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -89,16 +99,80 @@ pub fn run_with_args<I>(arguments: I) -> Result<Value, SignerError>
 where
     I: IntoIterator<Item = OsString>,
 {
+    run_with_context(arguments, None, None)
+}
+
+/// Run a command with a password held by the caller in memory. The password
+/// is never placed in command-line arguments, environment variables, logs, or
+/// JSON output. This is the native GUI path for the portable vault.
+pub fn run_with_portable_password<I>(arguments: I, password: &str) -> Result<Value, SignerError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    run_with_context(arguments, Some(password), None)
+}
+
+/// Run the signing command with an account binding held in memory. The
+/// administrator credential is never passed through this interface.
+pub fn run_with_portable_password_and_account<I>(
+    arguments: I,
+    password: &str,
+    account_binding: UsbAccountBinding,
+) -> Result<Value, SignerError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    run_with_context(arguments, Some(password), Some(account_binding))
+}
+
+fn run_with_context<I>(
+    arguments: I,
+    supplied_password: Option<&str>,
+    account_binding: Option<UsbAccountBinding>,
+) -> Result<Value, SignerError>
+where
+    I: IntoIterator<Item = OsString>,
+{
     reject_private_key_environment_inputs()?;
     let parsed = parse_args(arguments)?;
+    let password_command = matches!(
+        parsed.command.as_str(),
+        "sign" | "verify" | "export-portable" | "inspect-portable"
+    );
+    if parsed.password_stdin && !password_command {
+        return Err(SignerError::InvalidArgument(
+            "--password-stdin is valid only for sign, verify, export-portable, or inspect-portable"
+                .to_string(),
+        ));
+    }
+    if supplied_password.is_some() && !password_command {
+        return Err(SignerError::InvalidArgument(
+            "a portable password is valid only for sign, verify, export-portable, or inspect-portable"
+                .to_string(),
+        ));
+    }
+    if supplied_password.is_some() && parsed.password_stdin {
+        return Err(SignerError::InvalidArgument(
+            "provide a portable password either in memory or through --password-stdin, not both"
+                .to_string(),
+        ));
+    }
+    let stdin_password = if parsed.password_stdin {
+        Some(read_password_from_stdin()?)
+    } else {
+        None
+    };
+    let password = supplied_password.or(stdin_password.as_ref().map(|value| value.as_str()));
     match parsed.command.as_str() {
         "scan" => run_scan(&parsed),
         "inspect" => run_inspect(&parsed),
-        "sign" => run_sign(&parsed),
-        "verify" => run_verify(&parsed),
+        "sign" => run_sign(&parsed, password, account_binding.as_ref()),
+        "verify" => run_verify(&parsed, password),
         "init-key" => run_init_key(&parsed),
+        "export-portable" => run_export_portable(&parsed, password),
+        "inspect-portable" => run_inspect_portable(&parsed, password),
         _ => Err(SignerError::InvalidArgument(format!(
-            "unknown command {}; use scan, inspect, sign, verify, or init-key",
+            "unknown command {}; use scan, inspect, sign, verify, init-key, export-portable, or inspect-portable",
             parsed.command
         ))),
     }
@@ -155,6 +229,16 @@ where
             "--confirm" => parsed.confirm = Some(value()?),
             "--report" => parsed.report = Some(PathBuf::from(value()?)),
             "--key-blob" => parsed.key_blob = Some(PathBuf::from(value()?)),
+            "--portable-vault" => parsed.portable_vault = Some(PathBuf::from(value()?)),
+            "--password-stdin" => {
+                if inline_value.is_some() {
+                    return Err(SignerError::InvalidArgument(
+                        "--password-stdin does not accept a value".to_string(),
+                    ));
+                }
+                parsed.password_stdin = true;
+            }
+            "--output" => parsed.output = Some(PathBuf::from(value()?)),
             "--public-key-b64" => parsed.public_key_b64 = Some(value()?),
             "--skip-authenticode" => {
                 if inline_value.is_some() {
@@ -197,7 +281,151 @@ fn run_init_key(arguments: &Arguments) -> Result<Value, SignerError> {
     }))
 }
 
+fn run_export_portable(
+    arguments: &Arguments,
+    password: Option<&str>,
+) -> Result<Value, SignerError> {
+    if arguments.portable_vault.is_some() && arguments.output.is_some() {
+        return Err(SignerError::InvalidArgument(
+            "export-portable accepts either --portable-vault or --output, not both".to_string(),
+        ));
+    }
+    if arguments.drive.is_some()
+        || arguments.bundle_relative_path.is_some()
+        || arguments.key_id.is_some()
+        || arguments.confirm.is_some()
+        || arguments.report.is_some()
+        || arguments.key_blob.is_some()
+        || arguments.public_key_b64.is_some()
+        || arguments.skip_authenticode
+    {
+        return Err(SignerError::InvalidArgument(
+            "export-portable accepts only --portable-vault, --output, and a password".to_string(),
+        ));
+    }
+    let password = password.ok_or_else(|| {
+        SignerError::KeyBlob(
+            "export-portable requires a password; use --password-stdin or the GUI".to_string(),
+        )
+    })?;
+    let path = arguments
+        .portable_vault
+        .clone()
+        .or_else(|| arguments.output.clone())
+        .unwrap_or(default_portable_vault_path()?);
+    let resolved = auto_resolve_key()?;
+    write_portable_key_vault(&path, &resolved.key, password)?;
+    let descriptor_path = write_portable_key_vault_descriptor(&path, &resolved.key)?;
+    Ok(json!({
+        "command": "export-portable",
+        "status": "success",
+        "keyId": resolved.key.key_id,
+        "publicKeyB64": resolved.key.public_key_b64(),
+        "publicKeySha256": resolved.key.public_key_sha256(),
+        "portableVaultPath": path.display().to_string(),
+        "portableVaultDescriptorPath": descriptor_path.display().to_string(),
+    }))
+}
+
+fn run_inspect_portable(
+    arguments: &Arguments,
+    password: Option<&str>,
+) -> Result<Value, SignerError> {
+    if arguments.portable_vault.is_none()
+        || arguments.output.is_some()
+        || arguments.drive.is_some()
+        || arguments.bundle_relative_path.is_some()
+        || arguments.key_id.is_some()
+        || arguments.confirm.is_some()
+        || arguments.report.is_some()
+        || arguments.key_blob.is_some()
+        || arguments.public_key_b64.is_some()
+        || arguments.skip_authenticode
+    {
+        return Err(SignerError::InvalidArgument(
+            "inspect-portable requires only --portable-vault and a password".to_string(),
+        ));
+    }
+    let password = password.ok_or_else(|| {
+        SignerError::KeyBlob(
+            "inspect-portable requires a password; use --password-stdin".to_string(),
+        )
+    })?;
+    let path = arguments.portable_vault.as_deref().expect("checked above");
+    let key = read_portable_key_vault(path, password)?;
+    Ok(json!({
+        "command": "inspect-portable",
+        "verified": true,
+        "keyId": key.key_id,
+        "publicKeyB64": key.public_key_b64(),
+        "publicKeySha256": key.public_key_sha256(),
+        "portableVaultPath": path.display().to_string(),
+    }))
+}
+
+/// Provision the default vault beside the currently running signer. The GUI
+/// calls this after the user has entered a password and after its inspection
+/// has confirmed that the local DPAPI key matches the Bundle binding.
+pub fn provision_default_portable_vault(password: &str) -> Result<Value, SignerError> {
+    let path = default_portable_vault_path()?;
+    let resolved = auto_resolve_key()?;
+    write_portable_key_vault(&path, &resolved.key, password)?;
+    let descriptor_path = write_portable_key_vault_descriptor(&path, &resolved.key)?;
+    Ok(json!({
+        "command": "provision-portable",
+        "status": "success",
+        "keyId": resolved.key.key_id,
+        "publicKeyB64": resolved.key.public_key_b64(),
+        "publicKeySha256": resolved.key.public_key_sha256(),
+        "portableVaultPath": path.display().to_string(),
+        "portableVaultDescriptorPath": descriptor_path.display().to_string(),
+    }))
+}
+
+/// Provision the default portable vault only when the current machine key is
+/// the exact key bound to the inspected Bundle. This prevents a first-use
+/// bootstrap on an unrelated computer from silently creating an unusable
+/// portable vault.
+pub fn provision_default_portable_vault_for_binding(
+    password: &str,
+    expected_key_id: &str,
+    expected_public_key_sha256: &str,
+) -> Result<Value, SignerError> {
+    let path = default_portable_vault_path()?;
+    let resolved = auto_resolve_key()?;
+    let binding = bundle::SigningBinding {
+        policy: "SignedRequired".to_string(),
+        key_id: expected_key_id.to_string(),
+        public_key_sha256: expected_public_key_sha256.to_string(),
+    };
+    ensure_key_matches_binding(&binding, &resolved.key)?;
+    write_portable_key_vault(&path, &resolved.key, password)?;
+    let descriptor_path = write_portable_key_vault_descriptor(&path, &resolved.key)?;
+    Ok(json!({
+        "command": "provision-portable",
+        "status": "success",
+        "keyId": resolved.key.key_id,
+        "publicKeyB64": resolved.key.public_key_b64(),
+        "publicKeySha256": resolved.key.public_key_sha256(),
+        "portableVaultPath": path.display().to_string(),
+        "portableVaultDescriptorPath": descriptor_path.display().to_string(),
+    }))
+}
+
 fn run_inspect(arguments: &Arguments) -> Result<Value, SignerError> {
+    if arguments.key_id.is_some()
+        || arguments.key_blob.is_some()
+        || arguments.portable_vault.is_some()
+        || arguments.password_stdin
+        || arguments.output.is_some()
+        || arguments.public_key_b64.is_some()
+        || arguments.confirm.is_some()
+    {
+        return Err(SignerError::InvalidArgument(
+            "inspect accepts only --drive, --bundle-relative-path, --skip-authenticode, and --report"
+                .to_string(),
+        ));
+    }
     let (drive, relative) = target_arguments(arguments)?;
     let observation = observe_target(&drive, &relative)?;
     let license = inspect_license(&observation.bundle_path, Some(&observation.fingerprint))?;
@@ -252,7 +480,11 @@ fn inspect_deep_verify_with_mode(
         })
 }
 
-fn run_sign(arguments: &Arguments) -> Result<Value, SignerError> {
+fn run_sign(
+    arguments: &Arguments,
+    password: Option<&str>,
+    account_binding: Option<&UsbAccountBinding>,
+) -> Result<Value, SignerError> {
     let _signing_mutex = acquire_signing_mutex()?;
     let (drive, relative) = target_arguments(arguments)?;
     let confirm = required_string(arguments.confirm.as_deref(), "--confirm")?;
@@ -267,23 +499,45 @@ fn run_sign(arguments: &Arguments) -> Result<Value, SignerError> {
     sole_candidate_is_target(&candidates, &drive, &relative)?;
     let before = observe_target(&drive, &relative)?;
     let preflight = deep_verify_bundle_with_mode(&before.bundle_path, authenticode)?;
+    if preflight.anchor_schema != ANCHOR_SCHEMA_V3 {
+        return Err(SignerError::BundleVerification(
+            "该 Bundle 使用旧签名锚点，只能验证不能重新签名；请使用 schema 3 安装包".to_string(),
+        ));
+    }
     let binding = read_signing_binding(&before.bundle_path)?;
     let old_inspection = inspect_license(&before.bundle_path, Some(&before.fingerprint))?;
-    let key_context = if let Some(key_id) = arguments.key_id.as_deref() {
+    let key = if let Some(vault_path) = arguments.portable_vault.as_deref() {
+        if arguments.key_id.is_some() || arguments.key_blob.is_some() {
+            return Err(SignerError::InvalidArgument(
+                "--portable-vault cannot be combined with --key-id or --key-blob".to_string(),
+            ));
+        }
+        let password = password.ok_or_else(|| {
+            SignerError::KeyBlob(
+                "portable vault signing requires a password; use the GUI prompt or --password-stdin"
+                    .to_string(),
+            )
+        })?;
+        ensure_local_path(vault_path, &drive)?;
+        let key = read_portable_key_vault(vault_path, password)?;
+        // Older portable vaults predate the public sidecar.  A successful
+        // password unlock is sufficient to create the non-secret descriptor
+        // locally; the actual key-to-Bundle comparison below remains the
+        // signing gate.
+        write_portable_key_vault_descriptor(vault_path, &key)?;
+        key
+    } else if let Some(key_id) = arguments.key_id.as_deref() {
         validate_key_id(key_id)?;
         let key_blob_path = arguments
             .key_blob
             .clone()
             .unwrap_or(default_key_blob_path(key_id)?);
         ensure_local_path(&key_blob_path, &drive)?;
-        let key = read_dpapi_key_blob(&key_blob_path, key_id)?;
-        (key_blob_path, key)
+        read_dpapi_key_blob(&key_blob_path, key_id)?
     } else {
         let resolved = auto_resolve_key()?;
-        (resolved.path, resolved.key)
+        resolved.key
     };
-    let _key_blob_path = key_context.0;
-    let key = key_context.1;
     let key_id = key.key_id.clone();
     ensure_key_matches_binding(&binding, &key)?;
     eprintln!(
@@ -319,8 +573,13 @@ fn run_sign(arguments: &Arguments) -> Result<Value, SignerError> {
         });
     }
 
-    let (mut candidate, old_license) =
-        build_signing_candidate(&before.bundle_path, &before, &key_id, now_ms())?;
+    let (mut candidate, old_license) = build_signing_candidate_with_account_binding(
+        &before.bundle_path,
+        &before,
+        &key_id,
+        now_ms(),
+        account_binding.cloned(),
+    )?;
     let audit_directory = default_audit_directory(&drive)?;
     let old_audit = write_old_license_audit(&old_license.bytes, &audit_directory)?;
     sign_candidate(&mut candidate, &key)?;
@@ -364,6 +623,14 @@ fn run_sign(arguments: &Arguments) -> Result<Value, SignerError> {
         payload_size: postflight.payload_size,
         authenticode_mode: authenticode_mode_label(authenticode),
         old_license_audit_path: old_audit.map(|path| path.display().to_string()),
+        account_asset_id: readback
+            .account_binding
+            .as_ref()
+            .map(|binding| binding.usb_asset_id.clone()),
+        sub2api_user_id: readback
+            .account_binding
+            .as_ref()
+            .map(|binding| binding.sub2api_user_id),
     })
     .map_err(|error| SignerError::Report(format!("serializing sign report failed: {error}")))?;
     if let Some(report) = arguments.report.as_deref() {
@@ -471,7 +738,7 @@ fn normalized_path_text(path: &Path) -> String {
     }
 }
 
-fn run_verify(arguments: &Arguments) -> Result<Value, SignerError> {
+fn run_verify(arguments: &Arguments, password: Option<&str>) -> Result<Value, SignerError> {
     let (drive, relative) = target_arguments(arguments)?;
     let observation = observe_target(&drive, &relative)?;
     let authenticode = authenticode_mode(arguments);
@@ -507,7 +774,23 @@ fn run_verify(arguments: &Arguments) -> Result<Value, SignerError> {
         }
         public_key.to_string()
     } else {
-        let key = if arguments.key_id.is_none() && arguments.key_blob.is_none() {
+        let key = if let Some(vault_path) = arguments.portable_vault.as_deref() {
+            if arguments.key_id.is_some() || arguments.key_blob.is_some() {
+                return Err(SignerError::InvalidArgument(
+                    "--portable-vault cannot be combined with --key-id or --key-blob".to_string(),
+                ));
+            }
+            let password = password.ok_or_else(|| {
+                SignerError::KeyBlob(
+                    "portable vault verification requires a password; use the GUI prompt or --password-stdin"
+                        .to_string(),
+                )
+            })?;
+            ensure_local_path(vault_path, &drive)?;
+            let key = read_portable_key_vault(vault_path, password)?;
+            write_portable_key_vault_descriptor(vault_path, &key)?;
+            key
+        } else if arguments.key_id.is_none() && arguments.key_blob.is_none() {
             auto_resolve_key()?.key
         } else {
             let path = arguments
@@ -594,6 +877,9 @@ fn reject_unused(arguments: &Arguments, allowed: &[&str]) -> Result<(), SignerEr
         || arguments.confirm.is_some()
         || arguments.report.is_some()
         || arguments.key_blob.is_some()
+        || arguments.portable_vault.is_some()
+        || arguments.password_stdin
+        || arguments.output.is_some()
         || arguments.public_key_b64.is_some()
         || arguments.skip_authenticode
     {
@@ -695,8 +981,26 @@ fn reject_private_key_environment_inputs() -> Result<(), SignerError> {
     Ok(())
 }
 
+fn read_password_from_stdin() -> Result<Zeroizing<String>, SignerError> {
+    let mut value = String::new();
+    std::io::stdin()
+        .read_to_string(&mut value)
+        .map_err(|error| {
+            SignerError::KeyBlob(format!("reading portable password failed: {error}"))
+        })?;
+    while value.ends_with(['\r', '\n']) {
+        value.pop();
+    }
+    if value.is_empty() {
+        return Err(SignerError::KeyBlob(
+            "portable signing password from stdin is empty".to_string(),
+        ));
+    }
+    Ok(Zeroizing::new(value))
+}
+
 fn usage() -> &'static str {
-    "usb-license-signer scan\nusb-license-signer inspect --drive E: --bundle-relative-path CodexUsb [--skip-authenticode] [--report PATH]\nusb-license-signer sign --drive E: --bundle-relative-path CodexUsb --confirm \"SIGN <volumeSerial>-<anchorSha256-first12>\" [--key-id ID --key-blob PATH] [--skip-authenticode] [--report PATH]\nusb-license-signer verify --drive E: --bundle-relative-path CodexUsb [--key-id ID --key-blob PATH | --public-key-b64 BASE64] [--skip-authenticode] [--report PATH]\nusb-license-signer init-key\nGUI/自动流程：不传 key 参数时自动发现或初始化本机 DPAPI 密钥；init-key 只输出公钥信息"
+    "usb-license-signer scan\nusb-license-signer inspect --drive E: --bundle-relative-path CodexUsb [--skip-authenticode] [--report PATH]\nusb-license-signer sign --drive E: --bundle-relative-path CodexUsb --confirm \"SIGN <volumeSerial>-<anchorSha256-first12>\" [--portable-vault PATH --password-stdin | --key-id ID --key-blob PATH] [--skip-authenticode] [--report PATH]\nusb-license-signer verify --drive E: --bundle-relative-path CodexUsb [--portable-vault PATH --password-stdin | --key-id ID --key-blob PATH | --public-key-b64 BASE64] [--skip-authenticode] [--report PATH]\nusb-license-signer init-key\nusb-license-signer export-portable [--portable-vault PATH | --output PATH] --password-stdin\nusb-license-signer inspect-portable --portable-vault PATH --password-stdin\nGUI/自动流程：默认使用旁置加密便携密钥库；首次使用可从当前电脑 DPAPI 密钥生成便携库"
 }
 
 #[cfg(test)]

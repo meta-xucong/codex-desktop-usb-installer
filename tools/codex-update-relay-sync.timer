@@ -2,8 +2,8 @@
 Description=Periodic Codex Windows payload relay sync
 
 [Timer]
-OnBootSec=5min
-OnUnitActiveSec=6h
+OnCalendar=*-*-* 00/6:00:00
+AccuracySec=1min
 RandomizedDelaySec=30min
 Persistent=true
 Unit=codex-update-relay-sync.service

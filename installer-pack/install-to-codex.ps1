@@ -54,6 +54,13 @@ function Resolve-PackOwnedFile([string]$RelativePath) {
     if (-not $candidate.StartsWith($packRootFull, [StringComparison]::OrdinalIgnoreCase)) { throw "Pack path escapes root: $RelativePath" }
     return $candidate
 }
+function Test-PackTransientPath([string]$RelativePath) {
+    $segments = @($RelativePath -split '[\\/]')
+    foreach ($segment in $segments) {
+        if ($segment -in @('.git', '.pytest_cache', '__pycache__')) { return $true }
+    }
+    return ([IO.Path]::GetExtension($RelativePath) -ieq '.pyc')
+}
 $canonicalTextExtensions = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 foreach ($extension in @('.cmd', '.env', '.in', '.json', '.lock', '.md', '.ps1', '.py', '.sha256', '.toml', '.txt', '.yaml', '.yml')) {
     [void]$canonicalTextExtensions.Add($extension)
@@ -108,7 +115,7 @@ if ($checksumPaths.Count -ne $expectedChecksumPaths.Count) { throw 'Pack checksu
 foreach ($relative in $expectedChecksumPaths) {
     if (-not $checksumPaths.Contains($relative)) { throw "Pack checksum is missing a manifest target: $relative" }
 }
-$actualPackFiles = @(Get-ChildItem -LiteralPath $PackRoot -Recurse -File -Force | ForEach-Object { $_.FullName.Substring($PackRoot.Length).TrimStart('\').Replace('\','/') } | Where-Object { $_ -ne 'checksums.sha256' })
+$actualPackFiles = @(Get-ChildItem -LiteralPath $PackRoot -Recurse -File -Force | ForEach-Object { $_.FullName.Substring($PackRoot.Length).TrimStart('\').Replace('\','/') } | Where-Object { $_ -ne 'checksums.sha256' -and -not (Test-PackTransientPath $_) })
 if ($actualPackFiles.Count -ne $checksumPaths.Count) { throw 'Capability pack contains missing or unlisted files.' }
 foreach ($relative in $actualPackFiles) {
     if (-not $checksumPaths.Contains($relative)) { throw "Capability pack contains an unlisted file: $relative" }
@@ -291,6 +298,7 @@ foreach ($skillName in $skillNames) {
     $installed.Add([pscustomobject]@{ kind = 'skill-tree'; path = $destination; sha256 = $null })
     foreach ($file in @(Get-ChildItem -LiteralPath $source -Recurse -File -Force)) {
         $relativeFile = $file.FullName.Substring($source.Length).TrimStart('\')
+        if (Test-PackTransientPath $relativeFile) { continue }
         $targetFile = Join-Path $destination $relativeFile
         New-Item -ItemType Directory -Force -Path (Split-Path -Parent $targetFile) | Out-Null
         Copy-Item -LiteralPath $file.FullName -Destination $targetFile -Force
@@ -383,7 +391,7 @@ $runtimeState = [ordered]@{
     secretsStored = $false
 }
 try {
-    $runtimeArguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $runtimeScript, '-PackRoot', $PackRoot, '-TargetUserProfile', $userProfile)
+    $runtimeArguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', $runtimeScript, '-PackRoot', $PackRoot, '-TargetUserProfile', $userProfile)
     if ($feishuEnabled) { $runtimeArguments += '-EnableFeishu' }
     $runtimeOutput = (& $powershellCommand.Source @runtimeArguments 2>&1 | Out-String)
     $runtimeExitCode = $LASTEXITCODE
@@ -396,6 +404,23 @@ try {
 $runtimeDiagnostic = Write-Diagnostic $runtimeDiagnosticPath ($runtimeOutput + "`nstatus=" + [string]$runtimeState.status + "`nerror=" + [string]$runtimeState.error)
 $runtimeStatePath = Join-Path $ownershipRoot 'runtime-state.json'
 Write-JsonNoBom $runtimeStatePath $runtimeState 8
+
+$pdfSmokeScript = Join-Path $PackRoot 'skills\pdf-processing-toolkit\scripts\pdf_tool.py'
+$pdfSmokeDiagnosticPath = Join-Path $diagnosticsRoot 'pdf-smoke.log'
+$pdfSmokeOutput = ''
+$pdfSmokeStatus = [ordered]@{ status = 'skipped'; script = $pdfSmokeScript; reason = 'Bundled Python runtime is not healthy.' }
+if ([string]$runtimeState.python.health -eq 'passed' -and (Test-Path -LiteralPath $pdfSmokeScript -PathType Leaf)) {
+    try {
+        $pdfSmokeOutput = & ([string]$runtimeState.python.executable) $pdfSmokeScript smoke 2>&1 | Out-String
+        if ($LASTEXITCODE -ne 0 -or $pdfSmokeOutput -notmatch 'pdf smoke: passed') { throw 'PDF smoke test did not report passed.' }
+        $pdfSmokeStatus = [ordered]@{ status = 'passed'; script = $pdfSmokeScript; reason = '' }
+    } catch {
+        $pdfSmokeStatus = [ordered]@{ status = 'failed'; script = $pdfSmokeScript; reason = Redact-Diagnostic (($pdfSmokeOutput + "`n" + $_.Exception.Message).Trim()) }
+    }
+} elseif (-not (Test-Path -LiteralPath $pdfSmokeScript -PathType Leaf)) {
+    $pdfSmokeStatus = [ordered]@{ status = 'failed'; script = $pdfSmokeScript; reason = 'Bundled PDF smoke-test script is missing.' }
+}
+$pdfSmokeDiagnostic = Write-Diagnostic $pdfSmokeDiagnosticPath ($pdfSmokeOutput + "`nstatus=" + [string]$pdfSmokeStatus.status + "`nreason=" + [string]$pdfSmokeStatus.reason)
 
 $runtimeBinFiles = @()
 if ([string]$runtimeState.python.health -eq 'passed') {
@@ -410,7 +435,7 @@ if ([string]$runtimeState.node.health -eq 'passed') {
     Write-AsciiFile (Join-Path $ownershipRoot 'bin\npm.cmd') ('@echo off' + $newline + '"%~dp0..\runtime\node-v20.20.0-win-x64\node.exe" "%~dp0..\runtime\node-v20.20.0-win-x64\node_modules\npm\bin\npm-cli.js" %*' + $newline)
     $runtimeBinFiles += @((Join-Path $ownershipRoot 'bin\node.cmd'), (Join-Path $ownershipRoot 'bin\npm.cmd'))
 }
-foreach ($runtimeOwnedPath in @($runtimeStatePath) + $runtimeBinFiles) {
+foreach ($runtimeOwnedPath in @($runtimeStatePath, $pdfSmokeDiagnosticPath) + $runtimeBinFiles) {
     if (Test-Path -LiteralPath $runtimeOwnedPath -PathType Leaf) {
         $runtimeHash = (Get-FileHash -LiteralPath $runtimeOwnedPath -Algorithm SHA256).Hash.ToLowerInvariant()
         if (-not (Test-CurrentOwnership $runtimeOwnedPath 'runtime')) { $installed.Add([pscustomobject]@{ kind = 'runtime'; path = $runtimeOwnedPath; sha256 = $runtimeHash }) }
@@ -429,7 +454,7 @@ if ([string]::IsNullOrWhiteSpace($feishuPackageCacheForRender)) {
     $feishuPackageCacheForRender = Join-Path $ownershipRoot 'runtime\feishu'
 }
 $renderArguments = @(
-    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $PackRoot 'render-codex-config.ps1'),
+    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', (Join-Path $PackRoot 'render-codex-config.ps1'),
     '-OutputPath', $generatedConfig,
     '-SkillRoot', $skillTarget,
     '-FeishuWrapperPath', $wrapperTarget,
@@ -450,13 +475,15 @@ if (@($EnableSkills).Count -gt 0) {
 $configMerger = Join-Path $PackRoot 'configure-codex.ps1'
 $configDiagnosticPath = Join-Path $diagnosticsRoot 'config-merge.log'
 $configOutput = ''
+$renderStatus = [ordered]@{ status = 'not-run'; totalSkills = 0; enabledSkillCount = 0; disabledSkillCount = 0; enabledSkills = @(); disabledSkills = @(); reason = 'Configuration renderer did not complete.' }
 $configStatus = [ordered]@{ status = 'partial'; merged = $false; reason = 'Configuration stage did not complete.' }
 try {
     $renderOutput = & $powershellCommand.Source @renderArguments 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) { throw "Codex configuration rendering failed." }
+    $renderStatus = $renderOutput | ConvertFrom-Json
     $configOutput = $renderOutput
     $configArguments = @(
-        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $configMerger,
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', $configMerger,
         '-GeneratedFragment', $generatedConfig,
         '-TargetUserProfile', $userProfile,
         '-KitHome', $ownershipRoot
@@ -468,6 +495,10 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Codex configuration merge failed." }
     $configStatus = $configOutput | ConvertFrom-Json
 } catch {
+    if ([string]$renderStatus.status -eq 'not-run') {
+        $renderStatus.status = 'failed'
+        $renderStatus.reason = Redact-Diagnostic (($configOutput + "`n" + $_.Exception.Message).Trim())
+    }
     $configStatus.reason = Redact-Diagnostic (($configOutput + "`n" + $_.Exception.Message).Trim())
 }
 $configDiagnostic = Write-Diagnostic $configDiagnosticPath ($configOutput + "`nstatus=" + [string]$configStatus.status + "`nreason=" + [string]$configStatus.reason)
@@ -481,7 +512,7 @@ $modelSyncOutput = ''
 $modelSyncStatus = [ordered]@{ schemaVersion = 1; status = 'failed'; migration = 'not-run'; preferredModel = ''; currentModel = $null; configChanged = $false; reason = 'Model sync did not complete.' }
 try {
     $modelSyncArguments = @(
-        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $modelSyncScript,
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', $modelSyncScript,
         '-PackRoot', $PackRoot,
         '-TargetUserProfile', $userProfile,
         '-KitHome', $ownershipRoot
@@ -543,25 +574,28 @@ $expectedAgentCount = @($agentFiles).Count
 $coreReady = $installedSkillCount -ge $expectedSkillCount -and $installedAgentCount -ge $expectedAgentCount
 $coreStatus = if ($coreReady) { 'ready' } else { 'partial' }
 $runtimeReady = Test-RuntimeReady $runtimeState
+$pdfReady = [string]$pdfSmokeStatus.status -eq 'passed'
 $configReady = [string]$configStatus.status -notin @('failed', 'partial', 'conflict')
 $modelReady = [string]$modelSyncStatus.status -eq 'ready'
-$overallStatus = if (-not $coreReady) { 'failed' } elseif ($runtimeReady -and $configReady -and $modelReady) { 'ready' } else { 'partial' }
+$overallStatus = if (-not $coreReady) { 'failed' } elseif ($runtimeReady -and $pdfReady -and $configReady -and $modelReady) { 'ready' } else { 'partial' }
 $diagnostics = [ordered]@{
     path = (Join-Path $diagnosticsRoot 'capability-pack.log')
     runtime = $runtimeDiagnosticPath
+    pdfSmoke = $pdfSmokeDiagnosticPath
     config = $configDiagnosticPath
     modelSync = $modelSyncDiagnosticPath
 }
 $diagnosticText = @(
     "runtime status=$([string]$runtimeState.status)",
     "runtime health=$([string]$runtimeState.python.health)/$([string]$runtimeState.node.health)/$([string]$runtimeState.feishu.health)",
+    "pdf smoke status=$([string]$pdfSmokeStatus.status)",
     "config status=$([string]$configStatus.status)",
     "model sync status=$([string]$modelSyncStatus.status) preferred=$([string]$modelSyncStatus.preferredModel) migration=$([string]$modelSyncStatus.migration)",
     "runtime log=$runtimeDiagnosticPath",
     "config log=$configDiagnosticPath"
 ) -join [Environment]::NewLine
 $diagnosticPath = Write-Diagnostic ([string]$diagnostics.path) $diagnosticText
-foreach ($diagnosticFile in @($runtimeDiagnosticPath, $configDiagnosticPath, $modelSyncDiagnosticPath, [string]$diagnostics.path)) {
+foreach ($diagnosticFile in @($runtimeDiagnosticPath, $pdfSmokeDiagnosticPath, $configDiagnosticPath, $modelSyncDiagnosticPath, [string]$diagnostics.path)) {
     if (Test-Path -LiteralPath $diagnosticFile -PathType Leaf) {
         $diagnosticHash = (Get-FileHash -LiteralPath $diagnosticFile -Algorithm SHA256).Hash.ToLowerInvariant()
         if (-not (Test-CurrentOwnership $diagnosticFile 'diagnostic')) { $installed.Add([pscustomobject]@{ kind = 'diagnostic'; path = $diagnosticFile; sha256 = $diagnosticHash }) }
@@ -595,7 +629,9 @@ $readiness = [ordered]@{
         modelSync = Test-CurrentOwnership (Join-Path $ownershipRoot 'bin\sync-model-catalog.ps1') 'model-sync'
     }
     runtime = $runtimeState
+    pdf = $pdfSmokeStatus
     config = $configStatus
+    skillActivation = $renderStatus
     modelSync = $modelSyncStatus
     overallStatus = $overallStatus
     diagnostics = $diagnostics

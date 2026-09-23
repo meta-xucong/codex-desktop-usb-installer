@@ -20,6 +20,57 @@ pub enum AuthenticodeSubject {
     Contains(&'static str),
 }
 
+/// Keep the native GUI single-instance even when a user double-clicks the
+/// signer repeatedly or starts it from a second copy of the release folder.
+/// A stale second window can otherwise keep showing an older key-binding
+/// result while a fresh instance has already passed the current check.
+#[cfg(target_os = "windows")]
+pub struct GuiInstanceMutex {
+    handle: windows_sys::Win32::Foundation::HANDLE,
+}
+
+#[cfg(target_os = "windows")]
+pub fn acquire_gui_instance_mutex() -> Result<Option<GuiInstanceMutex>, SignerError> {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
+    use windows_sys::Win32::System::Threading::CreateMutexW;
+
+    const ERROR_ALREADY_EXISTS: u32 = 183;
+    let name = wide("Local\\CodexUsbLicenseSigner.Gui");
+    let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+    if handle.is_null() {
+        return Err(SignerError::PathRejected(format!(
+            "cannot create GUI instance mutex: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        unsafe {
+            CloseHandle(handle);
+        }
+        return Ok(None);
+    }
+    Ok(Some(GuiInstanceMutex { handle }))
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for GuiInstanceMutex {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+
+        unsafe {
+            CloseHandle(self.handle);
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub struct GuiInstanceMutex;
+
+#[cfg(not(target_os = "windows"))]
+pub fn acquire_gui_instance_mutex() -> Result<Option<GuiInstanceMutex>, SignerError> {
+    Ok(Some(GuiInstanceMutex))
+}
+
 /// Serialize signing transactions across GUI/CLI processes on this Windows
 /// user session. The lock covers the complete observe/authorize/write/readback
 /// transaction, not just the final file replacement.
@@ -86,6 +137,21 @@ fn wide(value: &str) -> Vec<u16> {
         .encode_wide()
         .chain(std::iter::once(0))
         .collect()
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gui_instance_mutex_allows_only_one_owner() {
+        let first = acquire_gui_instance_mutex()
+            .expect("GUI instance mutex should be creatable")
+            .expect("the test should own the first GUI instance mutex");
+        let second = acquire_gui_instance_mutex().expect("second mutex probe should succeed");
+        assert!(second.is_none());
+        drop(first);
+    }
 }
 
 #[cfg(target_os = "windows")]

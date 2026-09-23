@@ -23,7 +23,7 @@
 - 7 个按功能命名的 Agent TOML
 - Windows 10/11 优先的安装、打包和验证脚本
 - MCP/API 清单、连接字段、无密钥配置模板和环境依赖说明
-- 25 个核心默认安装项、完整依赖闭包与 SHA-256 文件清单
+- 43 个默认启用 Skill（含 15 个离线运行时 Skill 和 3 个安全降级 Skill）、完整依赖闭包与 SHA-256 文件清单
 - Python 运行时直接输入、CPython 3.12 安装器、52-wheel 离线 wheelhouse、Node/Feishu 介质、逐文件哈希和 Windows per-user 安装契约
 
 ## 明确不纳入
@@ -37,5 +37,5 @@
 
 每个 Skill 必须在 `manifest/skill-audit.json` 中声明原始状态、整改后状态、依赖对象、启用条件和健康检查。
 每个 Agent 必须在 `manifest/agent-audit.json` 中声明必需 Skill、可选 Skill、运行时依赖、连接依赖和降级路径。
-无法在当前 Codex 环境确认的能力会标记为 `auto-installable-runtime`、`guided-config` 或 `unsupported`，
-不会以“已经可用”的形式进入默认安装集合。
+无法在当前 Codex 环境确认的能力会标记为 `auto-installable-runtime`、`guided-config` 或 `unsupported`。
+`unsupported` 可以进入默认配置以便模型明确说明边界，但缺失外部后端时必须安全失败，不能以“已经可用”冒充真实能力。

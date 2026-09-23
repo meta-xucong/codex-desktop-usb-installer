@@ -10,7 +10,9 @@
 //! non-Payload rows of SHA256SUMS, so replacing the checksum file cannot be
 //! paired with replacement of an immutable bundle file. This module owns the
 //! release-tree check so the runtime guard and the Codex payload channel use
-//! the same boundary.
+//! the same boundary. The top-level manifest format remains schema 2; the
+//! update capability carries the explicit cryptographic anchor schema so a
+//! document-format revision cannot silently change the signing algorithm.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -117,6 +119,45 @@ fn is_reparse(path: &Path) -> Result<bool, AppError> {
         .map_err(|error| bundle_error(format!("读取链接属性失败 {}：{error}", path.display())))?
         .file_type()
         .is_symlink())
+}
+
+/// Check the existing ancestor chain of a bundle-relative path without
+/// walking the whole removable drive.  This closes the junction-at-parent
+/// case for the cheap capability path while keeping check startup bounded.
+fn reject_reparse_ancestors(root: &Path, path: &Path) -> Result<(), AppError> {
+    let original_root = root;
+    let root = fs::canonicalize(original_root)
+        .map_err(|error| bundle_error(format!("解析 bundle 根目录失败：{error}")))?;
+    let relative = path
+        .strip_prefix(original_root)
+        .map_err(|_| bundle_error(format!("bundle 路径不得越过根目录：{}", path.display())))?;
+    let mut current = root.join(relative);
+    loop {
+        match fs::symlink_metadata(&current) {
+            Ok(_) if is_reparse(&current)? => {
+                return Err(bundle_error(format!(
+                    "bundle 路径不得包含重解析点：{}",
+                    current.display()
+                )))
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(bundle_error(format!(
+                    "读取 bundle 路径属性失败 {}：{error}",
+                    current.display()
+                )))
+            }
+        }
+        if current == root {
+            break;
+        }
+        current = current
+            .parent()
+            .ok_or_else(|| bundle_error("bundle 路径缺少根目录祖先"))?
+            .to_path_buf();
+    }
+    Ok(())
 }
 
 fn reject_reparse_tree(root: &Path) -> Result<(), AppError> {
@@ -239,6 +280,85 @@ fn is_mutable_runtime_path(relative: &str) -> bool {
         || lower.starts_with(".staging/")
 }
 
+/// Validate the one backup slot owned by the Codex payload updater.  The
+/// checksum verifier intentionally treats backup files as immutable release
+/// files, so allowing an arbitrary subtree here would let a path that the
+/// stable anchor compresses to the same `MUTABLE backup` marker escape the
+/// release contract.
+pub fn validate_backup_layout(
+    root: &Path,
+    payload_relative: &str,
+    architecture: &str,
+) -> Result<(), AppError> {
+    if !matches!(architecture, "x64" | "arm64") {
+        return Err(bundle_error(format!(
+            "backup 校验收到无效架构：{architecture}"
+        )));
+    }
+    let payload_relative = relative_path(payload_relative)?;
+    let payload_parent = payload_relative.rsplit_once('/').map(|(parent, _)| parent);
+    let backup_relative = payload_parent
+        .map(|parent| format!("{parent}/_backup"))
+        .unwrap_or_else(|| "_backup".to_string());
+    let backup_directory = root.join(backup_relative.replace('/', std::path::MAIN_SEPARATOR_STR));
+    reject_reparse_ancestors(root, &backup_directory)?;
+    if !backup_directory.exists() {
+        return Ok(());
+    }
+    if is_reparse(&backup_directory)? || !backup_directory.is_dir() {
+        return Err(bundle_error(format!(
+            "backup 目录不是普通目录：{backup_relative}"
+        )));
+    }
+    let entries = fs::read_dir(&backup_directory)
+        .map_err(|error| bundle_error(format!("读取 backup 目录失败：{error}")))?;
+    let mut count = 0_u8;
+    for entry in entries {
+        let entry = entry.map_err(|error| bundle_error(format!("读取 backup 项失败：{error}")))?;
+        let path = entry.path();
+        if is_reparse(&path)? {
+            return Err(bundle_error(format!(
+                "backup 目录不得包含重解析项：{}",
+                path.display()
+            )));
+        }
+        let file_type = entry
+            .file_type()
+            .map_err(|error| bundle_error(format!("读取 backup 项类型失败：{error}")))?;
+        if !file_type.is_file() {
+            return Err(bundle_error(
+                "backup 目录只能包含一个直接子文件，不能包含子目录",
+            ));
+        }
+        count = count.saturating_add(1);
+        if count > 1 {
+            return Err(bundle_error("backup 目录最多只能包含一个直接子文件"));
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        let prefix = format!("OpenAI.Codex_{architecture}_");
+        let Some(version) = name
+            .strip_prefix(&prefix)
+            .and_then(|value| value.strip_suffix(".msix"))
+        else {
+            return Err(bundle_error(format!("backup 文件名无效：{name}")));
+        };
+        if version.is_empty()
+            || !version.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_')
+            })
+        {
+            return Err(bundle_error(format!("backup 文件名无效：{name}")));
+        }
+        let size = fs::metadata(&path)
+            .map_err(|error| bundle_error(format!("读取 backup 文件大小失败：{error}")))?
+            .len();
+        if size == 0 {
+            return Err(bundle_error("backup 文件不能为空"));
+        }
+    }
+    Ok(())
+}
+
 fn verify_sums(
     root: &Path,
     payload_relative: &str,
@@ -359,6 +479,60 @@ fn verify_manifest_contract(
             "usb-manifest 必须是 codex-usb-oneclick schemaVersion=2",
         ));
     }
+    let root_schema = manifest
+        .get("schemaVersion")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| bundle_error("root manifest schemaVersion 无效"))?;
+    let usb_schema = usb_manifest
+        .get("schemaVersion")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| bundle_error("usb-manifest schemaVersion 无效"))?;
+    let anchor_schema = declared_anchor_schema(&usb_manifest, usb_schema)?;
+    for (label, value) in [
+        (
+            "root updateCapability.anchorSchema",
+            manifest.pointer("/updateCapability/anchorSchema"),
+        ),
+        (
+            "usb updateCapability.anchorSchema",
+            usb_manifest.pointer("/updateCapability/anchorSchema"),
+        ),
+    ] {
+        if let Some(value) = value {
+            let value = value
+                .as_u64()
+                .ok_or_else(|| bundle_error(format!("{label} 必须是无符号整数")))?;
+            if value != anchor_schema as u64 {
+                return Err(bundle_error(format!(
+                    "{label} 与 anchorSchema 不一致：{value} != {anchor_schema}"
+                )));
+            }
+        }
+    }
+    for (label, value) in [
+        (
+            "root updateCapability.schemaVersion",
+            manifest.pointer("/updateCapability/schemaVersion"),
+        ),
+        (
+            "usb updateCapability.schemaVersion",
+            usb_manifest.pointer("/updateCapability/schemaVersion"),
+        ),
+    ] {
+        if let Some(value) = value {
+            let value = value
+                .as_u64()
+                .ok_or_else(|| bundle_error(format!("{label} 必须是无符号整数")))?;
+            if value != anchor_schema as u64 {
+                return Err(bundle_error(format!(
+                    "{label} 与 anchorSchema 不一致：{value} != {anchor_schema}"
+                )));
+            }
+        }
+    }
+    if root_schema != 2 || usb_schema != 2 {
+        return Err(bundle_error("bundle 顶层 manifest schema 必须是 2"));
+    }
     if manifest
         .pointer("/updateCapability/codexPayload")
         .and_then(serde_json::Value::as_bool)
@@ -393,12 +567,12 @@ fn verify_manifest_contract(
     if !payload_relative.to_ascii_lowercase().ends_with(".msix") {
         return Err(bundle_error("payload.path 必须指向 MSIX"));
     }
+    let architecture = manifest
+        .get("architecture")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| bundle_error("root manifest 缺少 architecture"))?;
+    validate_backup_layout(root, &payload_relative, architecture)?;
     let payload = listed_path(root, &payload_relative)?;
-    let anchor_schema = usb_manifest
-        .get("schemaVersion")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| bundle_error("usb-manifest schemaVersion 无效"))?
-        as u32;
     Ok((
         anchor_schema,
         payload,
@@ -427,6 +601,24 @@ fn required_u64(value: &serde_json::Value, pointer: &str) -> Result<u64, AppErro
     required_value(value, pointer)?
         .as_u64()
         .ok_or_else(|| bundle_error(format!("清单字段必须是无符号整数：{pointer}")))
+}
+
+fn declared_anchor_schema(
+    manifest: &serde_json::Value,
+    top_level_schema: u64,
+) -> Result<u32, AppError> {
+    let schema = match manifest.pointer("/updateCapability/anchorSchema") {
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| bundle_error("updateCapability.anchorSchema 必须是无符号整数"))?,
+        None => top_level_schema,
+    };
+    if schema != codex_usb_license::ANCHOR_SCHEMA_V2 as u64
+        && schema != codex_usb_license::ANCHOR_SCHEMA_V3 as u64
+    {
+        return Err(bundle_error(format!("不支持的更新锚点 schema：{schema}")));
+    }
+    Ok(schema as u32)
 }
 
 fn required_hash(value: &serde_json::Value, pointer: &str) -> Result<String, AppError> {
@@ -477,6 +669,7 @@ fn hash_and_size(path: &Path) -> Result<(String, u64), AppError> {
     Ok((sha256_file(path)?, size))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn verify_file_metadata(
     root: &Path,
     ledger: &VerifiedFileLedger,
@@ -916,6 +1109,33 @@ mod tests {
     }
 
     #[test]
+    fn backup_layout_accepts_one_direct_msix_and_rejects_arbitrary_subtrees() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-usb-backup-layout-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let backup = root.join("payload/_backup");
+        fs::create_dir_all(&backup).unwrap();
+
+        fs::write(backup.join("OpenAI.Codex_x64_1.0.0.msix"), b"old").unwrap();
+        assert!(validate_backup_layout(&root, "payload/current.msix", "x64").is_ok());
+
+        fs::write(backup.join("extra.msix"), b"extra").unwrap();
+        assert!(validate_backup_layout(&root, "payload/current.msix", "x64").is_err());
+        fs::remove_file(backup.join("extra.msix")).unwrap();
+
+        fs::remove_file(backup.join("OpenAI.Codex_x64_1.0.0.msix")).unwrap();
+        fs::create_dir_all(backup.join("nested")).unwrap();
+        assert!(validate_backup_layout(&root, "payload/current.msix", "x64").is_err());
+        fs::remove_dir_all(backup.join("nested")).unwrap();
+
+        fs::write(backup.join("evil.bin"), b"not a release backup").unwrap();
+        assert!(validate_backup_layout(&root, "payload/current.msix", "x64").is_err());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn rejects_nested_license_and_backup_residue() {
         let root =
             std::env::temp_dir().join(format!("codex-usb-bundle-test-{}", std::process::id()));
@@ -949,6 +1169,21 @@ mod tests {
         .unwrap();
         assert!(verify_bundle_integrity(&root, false).is_err());
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn explicit_anchor_schema_is_typed_and_not_silently_downgraded() {
+        assert_eq!(
+            declared_anchor_schema(&json!({"updateCapability": {"anchorSchema": 3}}), 2,).unwrap(),
+            codex_usb_license::ANCHOR_SCHEMA_V3
+        );
+        assert!(
+            declared_anchor_schema(&json!({"updateCapability": {"anchorSchema": "3"}}), 2,)
+                .is_err()
+        );
+        assert!(
+            declared_anchor_schema(&json!({"updateCapability": {"anchorSchema": 99}}), 2,).is_err()
+        );
     }
 
     #[test]

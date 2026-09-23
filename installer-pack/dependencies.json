@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
   "id": "codex-starter",
-  "version": "1.2.1",
+  "version": "1.3.0",
   "policy": "No secrets, caches, history, databases, drafts or user content.",
   "system": [
     {
@@ -1204,9 +1204,10 @@
       "path": "skills/canvas",
       "status": "unsupported/disabled",
       "afterRemediationStatus": "unsupported",
-      "installByDefault": false,
+      "installByDefault": true,
       "enableWhen": [
-        "disabled"
+        "skill-installed",
+        "external.host-specific-canvas-runtime"
       ],
       "dependencyTypes": [
         "external"
@@ -1217,15 +1218,15 @@
       "dependentCapabilities": [
         "HTML 原型说明"
       ],
-      "healthCheck": "negative test: no compatible automatic entry point; must remain disabled",
-      "notes": "保持禁用：当前能力包没有可验证的远程 Canvas 节点/画布运行时；仅提供替代建议。"
+      "healthCheck": "safe-failure contract: missing Canvas backend is reported explicitly",
+      "notes": "配置层面默认启用；缺少外部 Canvas 后端时安全失败，不伪造外部画布操作。"
     },
     {
       "id": "china-stock-analysis",
       "path": "skills/china-stock-analysis",
       "status": "requires-runtime",
       "afterRemediationStatus": "auto-installable-runtime",
-      "installByDefault": false,
+      "installByDefault": true,
       "enableWhen": [
         "skill-installed",
         "runtime-healthy"
@@ -1321,7 +1322,7 @@
       "path": "skills/data-assistant",
       "status": "requires-runtime",
       "afterRemediationStatus": "auto-installable-runtime",
-      "installByDefault": false,
+      "installByDefault": true,
       "enableWhen": [
         "skill-installed",
         "runtime-healthy"
@@ -1350,7 +1351,7 @@
       "path": "skills/docx-butler",
       "status": "requires-runtime",
       "afterRemediationStatus": "auto-installable-runtime",
-      "installByDefault": false,
+      "installByDefault": true,
       "enableWhen": [
         "skill-installed",
         "runtime-healthy"
@@ -1418,7 +1419,7 @@
       "path": "skills/excel-xlsx",
       "status": "requires-runtime",
       "afterRemediationStatus": "auto-installable-runtime",
-      "installByDefault": false,
+      "installByDefault": true,
       "enableWhen": [
         "skill-installed",
         "runtime-healthy"
@@ -1532,7 +1533,7 @@
       "path": "skills/fitness-coach",
       "status": "requires-runtime",
       "afterRemediationStatus": "auto-installable-runtime",
-      "installByDefault": false,
+      "installByDefault": true,
       "enableWhen": [
         "skill-installed",
         "runtime-healthy"
@@ -1556,7 +1557,7 @@
       "path": "skills/fund-portfolio",
       "status": "requires-runtime",
       "afterRemediationStatus": "auto-installable-runtime",
-      "installByDefault": false,
+      "installByDefault": true,
       "enableWhen": [
         "skill-installed",
         "runtime-healthy"
@@ -1605,9 +1606,10 @@
       "path": "skills/healthcheck",
       "status": "unsupported/disabled",
       "afterRemediationStatus": "unsupported",
-      "installByDefault": false,
+      "installByDefault": true,
       "enableWhen": [
-        "disabled"
+        "skill-installed",
+        "external.windows-security-admin-tools"
       ],
       "dependencyTypes": [
         "external"
@@ -1618,8 +1620,8 @@
       "dependentCapabilities": [
         "主机安全检查说明"
       ],
-      "healthCheck": "negative test: no compatible automatic entry point; must remain disabled",
-      "notes": "保持禁用：主机加固涉及管理员权限、策略和外部设备状态，不能用静态 Skill 冒充审计结果。"
+      "healthCheck": "safe-failure contract: missing Windows security backend or permission is reported explicitly",
+      "notes": "配置层面默认启用；缺少安全工具或权限时安全失败，不伪造审计结果。"
     },
     {
       "id": "image-2",
@@ -1699,7 +1701,7 @@
       "path": "skills/macro-research",
       "status": "requires-runtime",
       "afterRemediationStatus": "auto-installable-runtime",
-      "installByDefault": false,
+      "installByDefault": true,
       "enableWhen": [
         "skill-installed",
         "runtime-healthy"
@@ -1751,7 +1753,7 @@
       "path": "skills/meal-planner",
       "status": "requires-runtime",
       "afterRemediationStatus": "auto-installable-runtime",
-      "installByDefault": false,
+      "installByDefault": true,
       "enableWhen": [
         "skill-installed",
         "runtime-healthy"
@@ -1819,9 +1821,10 @@
       "path": "skills/node-connect",
       "status": "unsupported/disabled",
       "afterRemediationStatus": "unsupported",
-      "installByDefault": false,
+      "installByDefault": true,
       "enableWhen": [
-        "disabled"
+        "skill-installed",
+        "external.device-pairing-runtime"
       ],
       "dependencyTypes": [
         "external"
@@ -1832,8 +1835,8 @@
       "dependentCapabilities": [
         "连接问题排查说明"
       ],
-      "healthCheck": "negative test: no compatible automatic entry point; must remain disabled",
-      "notes": "保持禁用：设备配对协议与节点后端不在本能力包可验证边界内。"
+      "healthCheck": "safe-failure contract: missing device pairing backend is reported explicitly",
+      "notes": "配置层面默认启用；缺少设备配对后端时安全失败，不将网页可达或二维码存在误报为已配对。"
     },
     {
       "id": "offer-designer",
@@ -1878,11 +1881,10 @@
     {
       "id": "pdf-processing-toolkit",
       "path": "skills/pdf-processing-toolkit",
-      "status": "unsupported/disabled",
-      "afterRemediationStatus": "unsupported",
-      "installByDefault": false,
+      "status": "requires-runtime",
+      "afterRemediationStatus": "auto-installable-runtime",
+      "installByDefault": true,
       "enableWhen": [
-        "license-evidence-approved",
         "skill-installed",
         "runtime-healthy"
       ],
@@ -1901,15 +1903,15 @@
         "合并拆分",
         "表单与生成"
       ],
-      "healthCheck": "frontmatter and provenance warning; must remain disabled without license evidence",
-      "notes": "原始 frontmatter 声称 Proprietary 且引用缺失的 LICENSE.txt；在再分发条款可核验前保持 unsupported。"
+      "healthCheck": "PDF read, text extraction, write/merge, and generation smoke test using bundled Python",
+      "notes": "本项目自行维护的 PDF 工具，许可证和 smoke test 已随包提供；第三方依赖仍按各自许可证使用。"
     },
     {
       "id": "powerpoint-pptx",
       "path": "skills/powerpoint-pptx",
       "status": "requires-runtime",
       "afterRemediationStatus": "auto-installable-runtime",
-      "installByDefault": false,
+      "installByDefault": true,
       "enableWhen": [
         "skill-installed",
         "runtime-healthy"
@@ -2072,7 +2074,7 @@
       "path": "skills/travel-planner",
       "status": "requires-runtime",
       "afterRemediationStatus": "auto-installable-runtime",
-      "installByDefault": false,
+      "installByDefault": true,
       "enableWhen": [
         "skill-installed",
         "runtime-healthy"
@@ -2122,7 +2124,7 @@
       "path": "skills/venture-analysis",
       "status": "requires-runtime",
       "afterRemediationStatus": "auto-installable-runtime",
-      "installByDefault": false,
+      "installByDefault": true,
       "enableWhen": [
         "skill-installed",
         "runtime-healthy"
@@ -2170,7 +2172,7 @@
       "path": "skills/wealth-allocation",
       "status": "requires-runtime",
       "afterRemediationStatus": "auto-installable-runtime",
-      "installByDefault": false,
+      "installByDefault": true,
       "enableWhen": [
         "skill-installed",
         "runtime-healthy"
@@ -2304,7 +2306,7 @@
       "path": "skills/wechat-article-creator",
       "status": "requires-runtime",
       "afterRemediationStatus": "auto-installable-runtime",
-      "installByDefault": false,
+      "installByDefault": true,
       "enableWhen": [
         "skill-installed",
         "runtime-healthy"
@@ -2332,7 +2334,7 @@
       "path": "skills/word-docx",
       "status": "requires-runtime",
       "afterRemediationStatus": "auto-installable-runtime",
-      "installByDefault": false,
+      "installByDefault": true,
       "enableWhen": [
         "skill-installed",
         "runtime-healthy"

@@ -1131,7 +1131,7 @@ impl ThemeService {
         settings: &AppSettings,
         theme_ref: &str,
     ) -> Result<(), AppError> {
-        self.restart_debuggable_and_inject(settings, theme_ref, NativeSync::Hot)
+        self.restart_debuggable_and_inject(settings, theme_ref, NativeSync::Hot, None)
             .await
     }
 
@@ -1144,6 +1144,20 @@ impl ThemeService {
         &self,
         settings: &AppSettings,
         theme_ref: &str,
+    ) -> Result<(), AppError> {
+        self.apply_with_restart_and_locale(settings, theme_ref, None)
+            .await
+    }
+
+    /// Full apply variant used by the Windows manager's normal launch path.
+    /// The locale is carried through the one restart that opens Codex with a
+    /// CDP port, so choosing 简体中文 in the manager also applies to a
+    /// persisted theme launch.
+    pub async fn apply_with_restart_and_locale(
+        &self,
+        settings: &AppSettings,
+        theme_ref: &str,
+        codex_locale: Option<&str>,
     ) -> Result<(), AppError> {
         if !theme_supported() {
             return Err(AppError::UnsupportedPlatform);
@@ -1173,13 +1187,18 @@ impl ThemeService {
                 Err(error) => {
                     log::warn!("热应用失败，降级为停机写 config.toml: {error}");
                     return self
-                        .file_apply_flow(settings, &dir, &theme_id, &native)
+                        .file_apply_flow(settings, &dir, &theme_id, &native, codex_locale)
                         .await;
                 }
             }
         }
-        self.restart_debuggable_and_inject(settings, theme_ref, NativeSync::HotThenFile)
-            .await
+        self.restart_debuggable_and_inject(
+            settings,
+            theme_ref,
+            NativeSync::HotThenFile,
+            codex_locale,
+        )
+        .await
     }
 
     async fn restart_debuggable_and_inject(
@@ -1187,6 +1206,7 @@ impl ThemeService {
         settings: &AppSettings,
         theme_ref: &str,
         sync: NativeSync,
+        codex_locale: Option<&str>,
     ) -> Result<(), AppError> {
         if !theme_supported() {
             return Err(AppError::UnsupportedPlatform);
@@ -1208,10 +1228,17 @@ impl ThemeService {
         // Plain relaunch into CDP mode — the native layer is synced hot after
         // the debug port is up, so nothing here races Codex's config persist.
         let disable_self_updates = settings.disable_codex_self_updates;
+        let codex_locale = codex_locale.map(str::to_owned);
+        let launch_locale = codex_locale.clone();
         tauri::async_runtime::spawn_blocking(move || -> Result<(), AppError> {
             let installed = installed_codex_path()?;
             quit_codex(&installed)?;
-            launch_codex_with_cdp(&installed, THEME_CDP_PORT, disable_self_updates)
+            launch_codex_with_cdp(
+                &installed,
+                THEME_CDP_PORT,
+                disable_self_updates,
+                launch_locale.as_deref(),
+            )
         })
         .await
         .map_err(|e| AppError::Internal(format!("主题应用任务失败: {e}")))??;
@@ -1231,7 +1258,7 @@ impl ThemeService {
                 Err(error) if matches!(sync, NativeSync::HotThenFile) => {
                     log::warn!("热应用失败，降级为停机写 config.toml: {error}");
                     return self
-                        .file_apply_flow(settings, &dir, &theme_id, native)
+                        .file_apply_flow(settings, &dir, &theme_id, native, codex_locale.as_deref())
                         .await;
                 }
                 Err(error) => return Err(error),
@@ -1261,11 +1288,13 @@ impl ThemeService {
         dir: &Path,
         theme_id: &str,
         native: &CodexTheme,
+        codex_locale: Option<&str>,
     ) -> Result<(), AppError> {
         let disable_self_updates = settings.disable_codex_self_updates;
         let previous_active = settings.codex_theme.clone();
         let native_clone = native.clone();
         let id = theme_id.to_string();
+        let codex_locale = codex_locale.map(str::to_owned);
 
         // Blocking half: quit, settle, write-under-transaction, relaunch.
         let mut tx =
@@ -1311,7 +1340,12 @@ impl ThemeService {
                 })();
                 match staged_write {
                     Ok(()) => {
-                        launch_codex_with_cdp(&installed, THEME_CDP_PORT, disable_self_updates)?;
+                        launch_codex_with_cdp(
+                            &installed,
+                            THEME_CDP_PORT,
+                            disable_self_updates,
+                            codex_locale.as_deref(),
+                        )?;
                         let _ = tx.set_phase(Phase::CodexLaunched);
                         Ok(tx)
                     }
@@ -1494,6 +1528,7 @@ fn launch_codex_with_cdp(
     installed: &std::path::Path,
     port: u16,
     disable_self_updates: bool,
+    _codex_locale: Option<&str>,
 ) -> Result<(), AppError> {
     if disable_self_updates {
         crate::app::codex_self_update::sync_setting(true)?;
@@ -1562,6 +1597,7 @@ fn launch_codex_with_cdp(
     installed: &std::path::Path,
     port: u16,
     disable_self_updates: bool,
+    codex_locale: Option<&str>,
 ) -> Result<(), AppError> {
     if disable_self_updates {
         crate::app::codex_self_update::sync_setting(true)?;
@@ -1598,6 +1634,7 @@ fn launch_codex_with_cdp(
             } else {
                 None
             },
+            locale_override: codex_locale.map(str::to_string),
             portable_launch_policy: launch_policy,
         },
     )
@@ -1610,7 +1647,7 @@ fn launch_codex_with_cdp(
 
 #[cfg(target_os = "windows")]
 fn launch_codex_plain() -> Result<(), AppError> {
-    crate::app::win_update::launch_codex(&windows_domain_settings())
+    crate::app::win_update::launch_codex(&windows_domain_settings(), None)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -1633,6 +1670,7 @@ fn launch_codex_with_cdp(
     _installed: &std::path::Path,
     _port: u16,
     _disable_self_updates: bool,
+    _codex_locale: Option<&str>,
 ) -> Result<(), AppError> {
     Err(AppError::UnsupportedPlatform)
 }
@@ -1648,6 +1686,7 @@ fn launch_codex_plain() -> Result<(), AppError> {
 pub async fn launch_with_active_theme(
     service: &ThemeService,
     settings: &AppSettings,
+    codex_locale: Option<&str>,
 ) -> Result<bool, AppError> {
     let Some(theme_ref) = settings.codex_theme.clone() else {
         return Ok(false);
@@ -1655,7 +1694,10 @@ pub async fn launch_with_active_theme(
     if !theme_supported() {
         return Ok(false);
     }
-    match service.apply_with_restart(settings, &theme_ref).await {
+    match service
+        .apply_with_restart_and_locale(settings, &theme_ref, codex_locale)
+        .await
+    {
         Ok(()) => Ok(true),
         Err(error) => {
             // A broken/missing theme must never brick the launch button:

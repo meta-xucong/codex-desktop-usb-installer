@@ -5,9 +5,13 @@ import {
   useLayoutEffect,
   useRef,
   useState,
+  cloneElement,
+  isValidElement,
+  type ReactElement,
   type KeyboardEvent,
   type ReactNode,
 } from "react";
+import { createPortal } from "react-dom";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
 
@@ -35,14 +39,77 @@ export function Tooltip({
   side?: "top" | "bottom";
 }) {
   const id = useId();
+  const anchorRef = useRef<HTMLSpanElement>(null);
+  const [open, setOpen] = useState(false);
+  const [placement, setPlacement] = useState<"top" | "bottom">(side);
+  const [position, setPosition] = useState({ top: 0, left: 0 });
+  const trigger = isValidElement(children)
+    ? cloneElement(
+        children as ReactElement<{ tabIndex?: number; "aria-describedby"?: string }>,
+        {
+          tabIndex: (children.props as { tabIndex?: number }).tabIndex ?? 0,
+          "aria-describedby": id,
+        },
+      )
+    : (
+      <button type="button" className="tooltip-trigger" aria-describedby={id}>
+        {children}
+      </button>
+    );
+  const updatePosition = useCallback(() => {
+    const anchor = anchorRef.current;
+    if (!anchor || typeof window === "undefined") return;
+    const rect = anchor.getBoundingClientRect();
+    const margin = 8;
+    const topFits = rect.top > 76;
+    const nextPlacement = side === "top" && !topFits ? "bottom" : side;
+    const center = rect.left + rect.width / 2;
+    setPlacement(nextPlacement);
+    setPosition({
+      left: Math.max(16, Math.min(window.innerWidth - 16, center)),
+      top: nextPlacement === "top" ? rect.top - margin : rect.bottom + margin,
+    });
+  }, [side]);
+
+  useLayoutEffect(() => {
+    if (!open) return;
+    updatePosition();
+    const handleViewportChange = () => updatePosition();
+    window.addEventListener("resize", handleViewportChange);
+    window.addEventListener("scroll", handleViewportChange, true);
+    return () => {
+      window.removeEventListener("resize", handleViewportChange);
+      window.removeEventListener("scroll", handleViewportChange, true);
+    };
+  }, [open, updatePosition]);
+
   return (
     <span
+      ref={anchorRef}
       className={`tooltip-anchor tooltip-${side}`}
+      onMouseEnter={() => setOpen(true)}
+      onMouseLeave={() => setOpen(false)}
+      onFocus={() => setOpen(true)}
+      onBlur={() => setOpen(false)}
     >
-      {children}
-      <span id={id} className="tooltip-popover" role="tooltip">
-        {content}
-      </span>
+      {trigger}
+      {/* Keep the description in the accessibility tree even while the visual
+          portal is closed. This also preserves the compact screen's existing
+          status text for keyboard/screen-reader users without reintroducing
+          overflow clipping in the installer card. */}
+      <span id={id} className="sr-only">{content}</span>
+      {open && typeof document !== "undefined"
+        ? createPortal(
+            <span
+              className={`tooltip-popover tooltip-portal tooltip-${placement}`}
+              role="tooltip"
+              style={{ top: position.top, left: position.left }}
+            >
+              {content}
+            </span>,
+            document.body,
+          )
+        : null}
     </span>
   );
 }

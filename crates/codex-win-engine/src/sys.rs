@@ -80,11 +80,25 @@ pub struct LaunchOptions {
     /// account/session/config state onto the removable program volume.
     /// Managed Skill/MCP payloads are a separate USB content concern.
     pub codex_home: Option<PathBuf>,
+    /// Optional Electron locale override passed to portable Codex launches.
+    /// The USB manager currently uses this for `zh-CN`/`zh-TW`, where the
+    /// bundled webview translations are enabled before the process starts.
+    pub locale_override: Option<String>,
     pub portable_launch_policy: PortableLaunchPolicy,
 }
 
 const CODEX_SELF_UPDATE_ENV_KEY: &str = "CODEX_SPARKLE_ENABLED";
 const CODEX_SELF_UPDATE_ENV_DISABLED: &str = "false";
+const CODEX_LOCALE_OVERRIDE_ENV_KEY: &str = "ELECTRON_LOCALE_OVERRIDE";
+
+fn normalized_locale_override(locale: Option<&str>) -> Option<&str> {
+    locale.map(str::trim).filter(|locale| {
+        matches!(
+            locale.to_ascii_lowercase().as_str(),
+            "zh-cn" | "zh-tw" | "zh-hans" | "zh-hant"
+        )
+    })
+}
 
 fn remote_debugging_arguments(port: u16) -> [String; 2] {
     [
@@ -2059,7 +2073,11 @@ fn install_msix_script_with_volume_and_identity(
       throw "USB AppX volume $mountPoint uses filesystem '$fileSystem'; NTFS is required for MSIX AppX volumes"
     }}
   }}
-  $packageStorePath = Join-Path $mountPoint 'WindowsApps'
+  # Keep this as a lexical path combine. Join-Path resolves the provider and
+  # rejects a not-yet-mounted drive letter before Add-AppxVolume gets a chance
+  # to register it; the latter is a normal state for a fresh removable volume
+  # and is also how the PowerShell fixture models the USB target.
+  $packageStorePath = [System.IO.Path]::Combine($mountPoint, 'WindowsApps')
   if (-not (Test-Path -LiteralPath $packageStorePath)) {{
     New-Item -ItemType Directory -Path $packageStorePath -Force | Out-Null
   }}
@@ -2273,7 +2291,7 @@ fn install_msix_script_with_volume_and_identity(
       return @{{state='empty';raw=$raw;effective=$null;detail='InstallLocation is empty'}}
     }}
     $info = Get-CodexPackagePathInfo $raw ([string]$package.PackageFullName) $packageStorePath
-    $expected = Join-Path $packageStorePath ([string]$package.PackageFullName)
+    $expected = [System.IO.Path]::Combine($packageStorePath, [string]$package.PackageFullName)
     if (-not [string]::IsNullOrWhiteSpace([string]$info.effectivePath) -and
         ([string]$info.effectivePath).TrimEnd('\') -ieq $expected.TrimEnd('\')) {{
       return @{{state='target-usb';raw=$raw;effective=[string]$info.effectivePath;detail=[string]$info.state}}
@@ -4933,6 +4951,9 @@ fn configure_portable_launch_command(
     if let Some(codex_home) = options.codex_home.as_ref() {
         command.env("CODEX_HOME", codex_home);
     }
+    if let Some(locale) = normalized_locale_override(options.locale_override.as_deref()) {
+        command.env(CODEX_LOCALE_OVERRIDE_ENV_KEY, locale);
+    }
     command.args(portable_compatibility_arguments(
         software_rendering,
         no_sandbox,
@@ -4941,6 +4962,42 @@ fn configure_portable_launch_command(
         command.args(remote_debugging_arguments(port));
     }
     command
+}
+
+#[cfg(windows)]
+fn schedule_console_window_suppression(root: &Path) {
+    // The renderer can create a console-backed helper just after the main
+    // window becomes stable.  Sweep briefly after launch and hide only
+    // `ConsoleWindowClass` windows under this managed root; the Codex GUI is
+    // never targeted by this helper.
+    let root = root.to_path_buf();
+    std::thread::spawn(move || {
+        for _ in 0..16 {
+            let _ = crate::windows_process::hide_console_windows_for_root(&root);
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+    });
+}
+
+#[cfg(windows)]
+fn cleanup_failed_portable_launch(root: &Path, launch_error: EngineError) -> EngineError {
+    // A startup failure dialog is reported from inside the readiness probe.
+    // That probe returns early, so keep the same bounded process-tree cleanup
+    // used by the timeout path before a no-sandbox retry can begin. Otherwise
+    // the first broken Electron tree would make the retry observe the stale
+    // dialog and fail for the wrong reason.
+    match crate::windows_process::processes_running_for_root(root) {
+        Ok(true) => match crate::windows_process::close_processes_for_root(5, root) {
+            Ok(()) => launch_error,
+            Err(cleanup_error) => EngineError::Io(format!(
+                "{launch_error}; 清理失败启动进程时出错：{cleanup_error}"
+            )),
+        },
+        Ok(false) => launch_error,
+        Err(check_error) => EngineError::Io(format!(
+            "{launch_error}; 无法确认失败启动进程是否已退出：{check_error}"
+        )),
+    }
 }
 
 #[cfg(windows)]
@@ -4953,21 +5010,34 @@ fn launch_portable_with_usable_window(
     const WINDOW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
     const STABILITY_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
 
+    // Existing USB installs may have been created by a manager version that
+    // did not yet neutralize the packaged Windows updater.  Repair that one
+    // file before spawning Electron; this is idempotent and keeps the fix
+    // effective for both first install and in-place payload updates.
+    let _ = crate::portable::ensure_portable_codex_startup_compatibility(root)?;
+
     let mut command = configure_portable_launch_command(exe, options, true, no_sandbox);
     command.stdout(Stdio::null()).stderr(Stdio::null());
     let mut child = command
         .spawn()
         .map_err(|error| EngineError::Io(format!("launch Codex: {error}")))?;
 
-    let first = crate::windows_process::wait_for_usable_window_for_root(root, WINDOW_TIMEOUT)?;
+    let first = match crate::windows_process::wait_for_usable_window_for_root(root, WINDOW_TIMEOUT)
+    {
+        Ok(report) => report,
+        Err(error) => return Err(cleanup_failed_portable_launch(root, error)),
+    };
     if let Some(window) = first {
         // A transient HWND followed by Chromium's fatal GPU shutdown is not a
         // successful launch. Re-check after a short stability window.
         std::thread::sleep(STABILITY_WINDOW);
-        let stable = crate::windows_process::wait_for_usable_window_for_root(
+        let stable = match crate::windows_process::wait_for_usable_window_for_root(
             root,
             std::time::Duration::ZERO,
-        )?;
+        ) {
+            Ok(report) => report,
+            Err(error) => return Err(cleanup_failed_portable_launch(root, error)),
+        };
         if let Some(stable) = stable {
             if child.try_wait().ok().flatten().is_none() {
                 std::mem::forget(child);
@@ -4985,6 +5055,7 @@ fn launch_portable_with_usable_window(
                 window.was_visible,
                 stable.foreground_accepted
             );
+            schedule_console_window_suppression(root);
             return Ok(CodexLaunchReport {
                 launch_mode: launch_mode.to_string(),
                 usable_window_confirmed: true,
@@ -5032,6 +5103,17 @@ pub fn launch_codex_with_options(
                 root.display()
             ))
         })?;
+        // Keep older non-USB/standard portable roots safe as well.  The patch
+        // is no-op for a package whose bootstrap does not use the MSIX
+        // updater, and is applied before either launch strategy below.
+        crate::portable::ensure_portable_codex_startup_compatibility(root)?;
+        // The locale patch is deliberately launch-time: the manager's
+        // language can change without reinstalling the payload, and the
+        // fixed-width edit is idempotent for existing USB installs.
+        let _ = crate::portable::ensure_portable_codex_locale_compatibility(
+            root,
+            options.locale_override.as_deref(),
+        )?;
         #[cfg(windows)]
         if options.portable_launch_policy != PortableLaunchPolicy::Standard {
             let first_no_sandbox =
@@ -5063,6 +5145,9 @@ pub fn launch_codex_with_options(
         if let Some(codex_home) = options.codex_home.as_ref() {
             command.env("CODEX_HOME", codex_home);
         }
+        if let Some(locale) = normalized_locale_override(options.locale_override.as_deref()) {
+            command.env(CODEX_LOCALE_OVERRIDE_ENV_KEY, locale);
+        }
         if let Some(port) = options.remote_debugging_port {
             command.args(remote_debugging_arguments(port));
         }
@@ -5089,11 +5174,18 @@ pub fn launch_codex_with_options(
                 "launching MSIX Codex with updater disabled via persisted user environment"
             );
         }
-        if let Some(port) = options.remote_debugging_port {
-            let arguments = remote_debugging_arguments(port).join(" ");
-            launch_msix_app_with_arguments(installed, &arguments)?;
-        } else {
+        let mut arguments = options
+            .remote_debugging_port
+            .map(remote_debugging_arguments)
+            .map(|args| args.to_vec())
+            .unwrap_or_default();
+        if let Some(locale) = normalized_locale_override(options.locale_override.as_deref()) {
+            arguments.push(format!("--lang={locale}"));
+        }
+        if arguments.is_empty() {
             launch_msix_app()?;
+        } else {
+            launch_msix_app_with_arguments(installed, &arguments.join(" "))?;
         }
         Ok(CodexLaunchReport {
             launch_mode: "msix".to_string(),

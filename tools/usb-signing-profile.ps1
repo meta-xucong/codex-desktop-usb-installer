@@ -1,18 +1,45 @@
 Set-StrictMode -Version Latest
 
+function Test-CodexUsbJsonInteger {
+    param([object]$Value)
+
+    return $null -ne $Value -and (
+        $Value -is [sbyte] -or $Value -is [byte] -or
+        $Value -is [int16] -or $Value -is [uint16] -or
+        $Value -is [int32] -or $Value -is [uint32] -or
+        $Value -is [int64] -or $Value -is [uint64]
+    )
+}
+
+function Get-CodexUsbProfileField {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Object,
+        [Parameter(Mandatory = $true)]
+        [string]$Name
+    )
+
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property) {
+        return $null
+    }
+    return $property.Value
+}
+
 function Get-CodexUsbSigningProfile {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
         [string]$RepoRoot,
-        [string]$ProfilePath = ""
+        [string]$ProfilePath = "",
+        [switch]$RequireExplicitPath
     )
 
     if ([string]::IsNullOrWhiteSpace($ProfilePath)) {
-        $ProfilePath = Join-Path $RepoRoot "tools\usb-signing-release-profile.json"
+        throw "必须显式传入当前版本 USB signing profile；不能回退到仓库中的固定 profile"
     }
     if (-not (Test-Path -LiteralPath $ProfilePath -PathType Leaf)) {
-        throw "Missing canonical USB release signing profile: $ProfilePath; refusing to package with an arbitrary local key"
+        throw "Missing versioned USB release signing profile: $ProfilePath; refusing to package with an arbitrary local key"
     }
 
     try {
@@ -20,8 +47,17 @@ function Get-CodexUsbSigningProfile {
     } catch {
         throw "USB release signing profile is not valid JSON: $ProfilePath; $($_.Exception.Message)"
     }
-    if ([int]$profile.schemaVersion -ne 1 -or [string]$profile.profile -ne "production") {
+    if (-not (Test-CodexUsbJsonInteger $profile.schemaVersion) -or
+        $profile.schemaVersion -ne 1 -or [string]$profile.profile -ne "production") {
         throw "USB release signing profile has an invalid schema or profile: $ProfilePath"
+    }
+
+    $releaseVersion = ([string](Get-CodexUsbProfileField -Object $profile -Name "releaseVersion")).Trim()
+    $releaseId = ([string](Get-CodexUsbProfileField -Object $profile -Name "releaseId")).Trim()
+    if ($RequireExplicitPath -and
+        ($releaseVersion -notmatch '^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9._-]+)?$' -or
+         $releaseId -notmatch '^[A-Za-z0-9._-]{1,128}$')) {
+        throw "版本化 USB signing profile 必须包含合法 releaseVersion 和 releaseId：$ProfilePath"
     }
 
     $keyId = [string]$profile.keyId
@@ -54,6 +90,9 @@ function Get-CodexUsbSigningProfile {
         KeyId = $keyId
         PublicKeyB64 = $publicKeyB64
         PublicKeySha256 = $computedDigest
+        ReleaseVersion = $releaseVersion
+        ReleaseId = $releaseId
+        Explicit = $RequireExplicitPath.IsPresent
     }
 }
 
@@ -94,6 +133,23 @@ function Initialize-CodexUsbSigningEnvironment {
     $configuredDigest = (($digestBytes | ForEach-Object { $_.ToString('x2') }) -join '')
     if ($configuredKeyId -cne [string]$Profile.KeyId -or
         $configuredDigest -cne [string]$Profile.PublicKeySha256) {
-        throw "Configured release key does not match the canonical profile: configured keyId=$configuredKeyId / digest=$configuredDigest; profile keyId=$($Profile.KeyId) / digest=$($Profile.PublicKeySha256). Do not package with another machine's DPAPI key"
+        throw "Configured release key does not match the supplied version profile: configured keyId=$configuredKeyId / digest=$configuredDigest; profile keyId=$($Profile.KeyId) / digest=$($Profile.PublicKeySha256). Do not replace a release profile with the current machine's DPAPI key"
+    }
+}
+
+function Assert-CodexUsbSigningProfileVersion {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        $Profile,
+        [Parameter(Mandatory = $true)]
+        [string]$ExpectedVersion
+    )
+
+    if ([string]::IsNullOrWhiteSpace([string]$Profile.ReleaseVersion)) {
+        throw "版本化 USB signing profile 缺少 releaseVersion；拒绝把未标版本的 profile 用于正式构建"
+    }
+    if ([string]$Profile.ReleaseVersion -cne $ExpectedVersion) {
+        throw "USB signing profile releaseVersion 与当前包版本不一致：profile=$($Profile.ReleaseVersion)，package=$ExpectedVersion"
     }
 }

@@ -13,7 +13,26 @@ $ErrorActionPreference = "Stop"
 if ([string]::IsNullOrWhiteSpace($BundlePath)) { $BundlePath = $PSScriptRoot }
 $root = (Resolve-Path -LiteralPath $BundlePath).Path
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-. (Join-Path $repo "tools\usb-signing-profile.ps1")
+$bundledVerificationDir = Join-Path $PSScriptRoot "verification"
+$bundledProfileHelper = Join-Path $bundledVerificationDir "usb-signing-profile.ps1"
+$repositoryProfileHelper = Join-Path $repo "tools\usb-signing-profile.ps1"
+if (Test-Path -LiteralPath $bundledProfileHelper -PathType Leaf) {
+    . $bundledProfileHelper
+} elseif (Test-Path -LiteralPath $repositoryProfileHelper -PathType Leaf) {
+    # Source-tree verification keeps the existing developer workflow. A
+    # generated USB bundle uses the public-only helper copied under
+    # verification\ so the script remains self-contained after the bundle is
+    # moved to another drive or computer.
+    . $repositoryProfileHelper
+} else {
+    throw "缺少 USB 签名校验辅助脚本：$bundledProfileHelper 或 $repositoryProfileHelper"
+}
+if ([string]::IsNullOrWhiteSpace($UsbSigningProfilePath)) {
+    $bundledProfile = Join-Path $bundledVerificationDir "usb-signing-release-profile.json"
+    if (Test-Path -LiteralPath $bundledProfile -PathType Leaf) {
+        $UsbSigningProfilePath = $bundledProfile
+    }
+}
 
 function Assert-Condition([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw "验证失败：$Message" }
@@ -25,6 +44,45 @@ function Read-JsonFile([string]$Path) {
     # BOM-less UTF-8. Release metadata is UTF-8, so decode it explicitly.
     $utf8 = [System.Text.UTF8Encoding]::new($false, $true)
     return [System.IO.File]::ReadAllText($Path, $utf8) | ConvertFrom-Json
+}
+
+function Get-JsonPropertyValue($Object, [string]$Name) {
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property) {
+        return $null
+    }
+    return $property.Value
+}
+
+function Test-IntegerValue([object]$Value) {
+    return $null -ne $Value -and (
+        $Value -is [sbyte] -or $Value -is [byte] -or
+        $Value -is [int16] -or $Value -is [uint16] -or
+        $Value -is [int32] -or $Value -is [uint32] -or
+        $Value -is [int64] -or $Value -is [uint64]
+    )
+}
+
+function Get-JsonInteger([object]$Object, [string]$Name) {
+    if ($null -eq $Object) {
+        return $null
+    }
+    if ($Object -is [System.Collections.IDictionary]) {
+        if (-not $Object.Contains($Name)) {
+            return $null
+        }
+        $value = $Object[$Name]
+    } else {
+        $property = $Object.PSObject.Properties[$Name]
+        if ($null -eq $property) {
+            return $null
+        }
+        $value = $property.Value
+    }
+    if (-not (Test-IntegerValue $value)) {
+        return $null
+    }
+    return $value
 }
 
 function Normalize-BundleRelativePath([string]$RelativePath) {
@@ -56,6 +114,61 @@ function Get-RelativePathCompat([string]$BasePath, [string]$FilePath) {
     $full = [System.IO.Path]::GetFullPath($FilePath)
     Assert-Condition $full.StartsWith($base, [System.StringComparison]::OrdinalIgnoreCase) "文件不在 bundle 根目录内：$FilePath"
     return $full.Substring($base.Length)
+}
+
+function Assert-SkillHubSourceResource([string]$RootPath) {
+    $relative = "resources/skill_hub_sources.json"
+    $path = Join-Path $RootPath ($relative.Replace('/', '\'))
+    Assert-Condition (Test-Path -LiteralPath $path -PathType Leaf) "缺少 Skill Hub 来源目录：$relative"
+    $item = Get-Item -LiteralPath $path -Force
+    Assert-Condition (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0) "Skill Hub 来源目录不能是链接或联接点：$relative"
+    $source = Read-JsonFile $path
+    Assert-Condition ((Get-JsonInteger $source "schemaVersion") -eq 1 -and [string]$source.channel -ceq "skill-hub") "Skill Hub 来源目录 schema/channel 无效"
+    $sources = @($source.sources)
+    Assert-Condition ($sources.Count -ge 2) "Skill Hub 来源目录至少需要 Relay 与 GitHub"
+    $relay = @($sources | Where-Object { [string]$_.id -ceq "ph-relay" -and [string]$_.kind -ceq "relay" })
+    $github = @($sources | Where-Object { [string]$_.id -ceq "github" -and [string]$_.kind -ceq "github" })
+    Assert-Condition ($relay.Count -eq 1 -and $relay[0].enabled -eq $true -and [string]$relay[0].base -ceq "https://update.404token.xyz/__codex_update__/skill-hub/") "Skill Hub Relay 来源身份或地址无效"
+    Assert-Condition ($github.Count -eq 1 -and $github[0].enabled -eq $true -and $null -eq (Get-JsonPropertyValue $github[0] "base")) "Skill Hub GitHub 回退来源身份无效"
+    $ids = @($sources | ForEach-Object { [string]$_.id })
+    Assert-Condition (@($ids | Select-Object -Unique).Count -eq $ids.Count) "Skill Hub 来源 ID 重复"
+    $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+    $sumPath = Join-Path $RootPath "SHA256SUMS.txt"
+    Assert-Condition (Test-Path -LiteralPath $sumPath -PathType Leaf) "缺少 SHA256SUMS.txt，无法核对 Skill Hub 来源目录"
+    $sumMatch = @(Get-Content -LiteralPath $sumPath | Where-Object {
+        $_ -match "^$hash\s+resources/skill_hub_sources\.json$"
+    })
+    Assert-Condition ($sumMatch.Count -eq 1) "SHA256SUMS.txt 未覆盖当前 Skill Hub 来源目录"
+}
+
+function Assert-SkillHubBaseManifestResource([string]$RootPath) {
+    $relative = "resources/skill_repo_base_manifest.json"
+    $path = Join-Path $RootPath ($relative.Replace('/', '\'))
+    Assert-Condition (Test-Path -LiteralPath $path -PathType Leaf) "缺少基础 Skill ID 清单：$relative"
+    $item = Get-Item -LiteralPath $path -Force
+    Assert-Condition (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0) "基础 Skill ID 清单不能是链接或联接点：$relative"
+    $base = Read-JsonFile $path
+    $sourceRelative = "content/codex-starter-kit/manifest/skill-audit.json"
+    $sourcePath = Join-Path $RootPath ($sourceRelative.Replace('/', '\'))
+    Assert-Condition (Test-Path -LiteralPath $sourcePath -PathType Leaf) "缺少基础 Skill 源清单：$sourceRelative"
+    $source = Read-JsonFile $sourcePath
+    $sourceHash = (Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $baseSkills = @($base.skills)
+    $sourceSkills = @($source.skills)
+    Assert-Condition ((Get-JsonInteger $base "schemaVersion") -eq 1 -and
+        [string]$base.source -ceq "installer-pack/manifest/skill-audit.json" -and
+        [string]$base.sourceSha256 -ceq $sourceHash -and
+        $baseSkills.Count -gt 0 -and $baseSkills.Count -eq $sourceSkills.Count) "基础 Skill ID 清单 schema/hash/数量无效"
+    for ($index = 0; $index -lt $sourceSkills.Count; $index++) {
+        Assert-Condition ([string]$baseSkills[$index].id -ceq [string]$sourceSkills[$index].id) "基础 Skill ID 顺序与源清单不一致：index=$index"
+    }
+    $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+    $sumPath = Join-Path $RootPath "SHA256SUMS.txt"
+    Assert-Condition (Test-Path -LiteralPath $sumPath -PathType Leaf) "缺少 SHA256SUMS.txt，无法核对基础 Skill ID 清单"
+    $sumMatch = @(Get-Content -LiteralPath $sumPath | Where-Object {
+        $_ -match "^$hash\s+resources/skill_repo_base_manifest\.json$"
+    })
+    Assert-Condition ($sumMatch.Count -eq 1) "SHA256SUMS.txt 未覆盖基础 Skill ID 清单"
 }
 
 # A directory or reparse point with the mutable license name must not be
@@ -127,14 +240,16 @@ $launcherVerifierPath = Join-Path $root "verify-usb-launcher.ps1"
 $manifest = Read-JsonFile $manifestPath
 $usbManifest = Read-JsonFile $usbManifestPath
 
-Assert-Condition ($manifest.schemaVersion -isnot [string] -and [int64]$manifest.schemaVersion -eq 2) "根 manifest 必须声明 schemaVersion=2"
+Assert-Condition ((Get-JsonInteger $manifest "schemaVersion") -eq 2) "根 manifest 必须声明 schemaVersion=2"
 $rootUpdateCapability = $manifest.updateCapability
 Assert-Condition ($null -ne $rootUpdateCapability -and $rootUpdateCapability.codexPayload -eq $true) "根 manifest 未声明 Codex payload update capability"
-Assert-Condition ($rootUpdateCapability.schemaVersion -isnot [string] -and [int64]$rootUpdateCapability.schemaVersion -eq 2) "根 manifest 的 update capability 必须声明 schemaVersion=2"
-Assert-Condition ($usbManifest.schemaVersion -isnot [string] -and [int64]$usbManifest.schemaVersion -eq 2) "联合清单必须声明 schemaVersion=2"
+Assert-Condition ((Get-JsonInteger $rootUpdateCapability "schemaVersion") -eq 3) "根 manifest 的 update capability 必须声明 schemaVersion=3"
+Assert-Condition ((Get-JsonInteger $rootUpdateCapability "anchorSchema") -eq 3) "根 manifest 的 update capability 必须声明 anchorSchema=3"
+Assert-Condition ((Get-JsonInteger $usbManifest "schemaVersion") -eq 2) "联合清单必须声明 schemaVersion=2"
 $updateCapability = $usbManifest.updateCapability
 Assert-Condition ($null -ne $updateCapability -and $updateCapability.codexPayload -eq $true) "联合清单未声明 Codex payload update capability"
-Assert-Condition ($updateCapability.schemaVersion -isnot [string] -and [int64]$updateCapability.schemaVersion -eq 2) "update capability 必须声明 schemaVersion=2"
+Assert-Condition ((Get-JsonInteger $updateCapability "schemaVersion") -eq 3) "update capability 必须声明 schemaVersion=3"
+Assert-Condition ((Get-JsonInteger $updateCapability "anchorSchema") -eq 3) "update capability 必须声明 anchorSchema=3"
 Assert-Condition ($updateCapability.checksumFile -eq "SHA256SUMS.txt") "update capability 的 SHA256 清单路径不正确"
 Assert-Condition ($updateCapability.transactionDirectory -eq ".staging") "update capability 的事务目录不正确"
 Assert-Condition ($updateCapability.backupPolicy -eq "single-msix-listed-in-SHA256SUMS") "update capability 的 backup 策略不正确"
@@ -155,9 +270,12 @@ if ($InternalSigned) {
 if ($SkipSignature) {
     Assert-Condition ($signingPolicy -in @("SignedRequired", "DevelopmentAutoEnroll")) "usbGuard.signing.policy 无效：$signingPolicy"
 } else {
-    Assert-Condition ($signingPolicy -eq "SignedRequired") "正式校验只接受 SignedRequired 签名策略"
+    Assert-Condition ($signingPolicy -in @("SignedRequired", "DevelopmentAutoEnroll")) "正式校验只接受 SignedRequired 或 DevelopmentAutoEnroll 签名策略"
 }
 if ($signingPolicy -eq "SignedRequired") {
+    if ([string]::IsNullOrWhiteSpace($UsbSigningProfilePath)) {
+        throw "SignedRequired Bundle 缺少随包版本 signing profile；不会回退到仓库中的固定 profile"
+    }
     $signingProfile = Get-CodexUsbSigningProfile -RepoRoot $repo -ProfilePath $UsbSigningProfilePath
     Initialize-CodexUsbSigningEnvironment -Profile $signingProfile
     $signingKeyId = [string]$signingBinding.keyId
@@ -183,6 +301,8 @@ if ($signingPolicy -eq "SignedRequired") {
     }
     $configuredDigest = (($configuredDigestBytes | ForEach-Object { $_.ToString('x2') }) -join '')
     Assert-Condition ($configuredDigest -ieq $signingDigest) "Bundle signing 公钥摘要与当前构建配置不一致"
+    Assert-Condition ([string](Get-JsonPropertyValue $signingBinding "releaseVersion") -ceq [string]$signingProfile.ReleaseVersion) "Bundle signing releaseVersion 与随包 profile 不一致"
+    Assert-Condition ([string](Get-JsonPropertyValue $signingBinding "releaseId") -ceq [string]$signingProfile.ReleaseId) "Bundle signing releaseId 与随包 profile 不一致"
 }
 Assert-Condition ($usbManifest.programLayout.mode -eq "verified-msix-extraction") "Codex 程序必须使用验签 MSIX 解包模式"
 Assert-Condition ($usbManifest.programLayout.codexRoot -eq "apps/Codex") "Codex U 盘程序目录声明不正确"
@@ -226,7 +346,7 @@ if ($InternalSigned) {
     Assert-Condition ($usbManifest.usbGuard.verification.productAuthenticode -eq "not-required-internal-license-mode") "内部授权模式不应把自有 EXE 声明为 Authenticode 必需"
     Assert-Condition ($usbManifest.usbGuard.verification.externalAuthenticode -eq "required-openai-msix-and-microsoft-prerequisites") "内部授权模式必须声明外部可信输入 Authenticode 必需"
 }
-Assert-Condition ([int]$usbManifest.sourceMediaCleanup.planSchema -eq 3) "安装介质二阶段计划版本不正确"
+Assert-Condition ((Get-JsonInteger $usbManifest.sourceMediaCleanup "planSchema") -eq 3) "安装介质二阶段计划版本不正确"
 Assert-Condition ($usbManifest.sourceMediaCleanup.runtimeLicenseMode -eq "typed-manager-mutable-metadata") "运行期许可文件不得再被当作未知发行文件"
 Assert-Condition ($usbManifest.sourceMediaCleanup.authorization -eq "active-lease-fingerprint+volume+immutable-manifest+license-snapshot") "安装介质清理授权证据不完整"
 Assert-Condition ($usbManifest.sourceMediaCleanup.deleteOrder -eq "payload-first-license-and-retry-entry-last") "安装介质清理顺序不得提前删除重试身份"
@@ -290,6 +410,8 @@ Assert-Condition (Test-Path -LiteralPath $ccswitch -PathType Leaf) "缺少根目
 Assert-Condition (Test-Path -LiteralPath $embeddedCcswitch -PathType Leaf) "安装器资源中缺少 resources\ccswitch\CodexSwitch.exe"
 Assert-Condition (Test-Path -LiteralPath $vcRedist -PathType Leaf) "缺少 resources\prerequisites\vc_redist.x64.exe"
 Assert-Condition (Test-Path -LiteralPath $webView2 -PathType Leaf) "缺少 WebView2 x64 完整离线安装包；空白机将无法显示安装界面"
+Assert-SkillHubSourceResource $root
+Assert-SkillHubBaseManifestResource $root
 Assert-Condition (Test-Path -LiteralPath $appsReadme -PathType Leaf) "缺少 apps 程序目录契约"
 Assert-Condition (Test-Path -LiteralPath $contentReadme -PathType Leaf) "缺少 content 托管内容目录契约"
 Assert-Condition (Test-Path -LiteralPath $skillsReadme -PathType Leaf) "缺少 content/skills 目录契约"
@@ -303,14 +425,14 @@ foreach ($packFile in @("pack.json", "dependencies.json", "file-manifest.json", 
     Assert-Condition (Test-Path -LiteralPath (Join-Path $capabilityPack $packFile) -PathType Leaf) "能力包缺少 $packFile"
 }
 $packJson = Get-Content -LiteralPath (Join-Path $capabilityPack "pack.json") -Raw | ConvertFrom-Json
-Assert-Condition ([int]$packJson.schemaVersion -eq 2 -and $packJson.id -eq "codex-starter") "能力包 pack.json 身份或 schema 不正确"
+Assert-Condition ((Get-JsonInteger $packJson "schemaVersion") -eq 2 -and $packJson.id -eq "codex-starter") "能力包 pack.json 身份或 schema 不正确"
 Assert-Condition (-not (Test-Path -LiteralPath (Join-Path $root "WindowsApps"))) "发行包不得预建 WindowsApps"
 Assert-Condition (-not (Test-Path -LiteralPath (Join-Path $root "WpSystem"))) "发行包不得预建 WpSystem"
 $actualWebView2Hash = (Get-FileHash -LiteralPath $webView2 -Algorithm SHA256).Hash
 Assert-Condition ($actualWebView2Hash -ieq $expectedWebView2Hash) "WebView2 安装包哈希不匹配"
 Assert-Condition ($usbManifest.webView2Runtime.file -eq "resources/prerequisites/MicrosoftEdgeWebView2RuntimeInstallerX64.exe") "联合清单中的 WebView2 路径不正确"
 Assert-Condition ($usbManifest.webView2Runtime.sha256 -ieq $expectedWebView2Hash) "联合清单中的 WebView2 哈希不正确"
-Assert-Condition ([int64]$usbManifest.webView2Runtime.size -eq (Get-Item -LiteralPath $webView2).Length) "联合清单中的 WebView2 大小不正确"
+Assert-Condition ((Get-JsonInteger $usbManifest.webView2Runtime "size") -eq (Get-Item -LiteralPath $webView2).Length) "联合清单中的 WebView2 大小不正确"
 Assert-Condition ($usbManifest.webView2Runtime.beforeUi -eq $true) "WebView2 必须在创建安装界面前预检"
 $launcherVerification = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $launcherVerifierPath -Path $installer 2>&1 | Out-String
 if ($LASTEXITCODE -ne 0) {
@@ -324,7 +446,7 @@ $actualVcRedistHash = (Get-FileHash -LiteralPath $vcRedist -Algorithm SHA256).Ha
 Assert-Condition ($actualVcRedistHash -ieq $expectedVcRedistHash) "VC++ 运行库哈希不匹配：$actualVcRedistHash != $expectedVcRedistHash"
 Assert-Condition ($usbManifest.vcRuntime.file -eq "resources/prerequisites/vc_redist.x64.exe") "联合清单的 VC++ 运行库路径不正确"
 Assert-Condition ($usbManifest.vcRuntime.sha256 -ieq $expectedVcRedistHash) "联合清单中的 VC++ 运行库哈希不正确"
-Assert-Condition ([int64]$usbManifest.vcRuntime.size -eq (Get-Item -LiteralPath $vcRedist).Length) "联合清单中的 VC++ 运行库大小不正确"
+Assert-Condition ((Get-JsonInteger $usbManifest.vcRuntime "size") -eq (Get-Item -LiteralPath $vcRedist).Length) "联合清单中的 VC++ 运行库大小不正确"
 
 # Cross-check the generated metadata against the files that were just
 # inspected. This catches a stale usb-manifest/SHA256SUMS pair after a partial
@@ -339,18 +461,18 @@ $ccswitchHash = (Get-FileHash -LiteralPath $ccswitch -Algorithm SHA256).Hash.ToL
 $embeddedCcswitchHash = (Get-FileHash -LiteralPath $embeddedCcswitch -Algorithm SHA256).Hash.ToLowerInvariant()
 Assert-Condition ($usbManifest.codexInstaller.file -eq "CodexDesktopSetup.exe") "联合清单的入口文件名不正确"
 Assert-Condition ($usbManifest.codexInstaller.sha256 -ieq $installerHash) "联合清单中的入口哈希与实际文件不一致"
-Assert-Condition ([int64]$usbManifest.codexInstaller.size -eq $installerItem.Length) "联合清单中的入口大小与实际文件不一致"
+Assert-Condition ((Get-JsonInteger $usbManifest.codexInstaller "size") -eq $installerItem.Length) "联合清单中的入口大小与实际文件不一致"
 Assert-Condition ($usbManifest.codexInstaller.architecture -eq $architecture) "联合清单中的 MSIX 架构不正确"
 Assert-Condition ($usbManifest.codexInstaller.payload -eq $payloadRelative) "联合清单的 MSIX 路径不正确"
 Assert-Condition ($usbManifest.codexInstaller.payloadSha256 -ieq $payloadReport.sha256) "联合清单中的 MSIX 哈希与实际文件不一致"
-Assert-Condition ([int64]$usbManifest.codexInstaller.payloadSize -eq [int64]$payloadReport.size) "联合清单中的 MSIX 大小与实际文件不一致"
+Assert-Condition ((Get-JsonInteger $usbManifest.codexInstaller "payloadSize") -eq $payloadReport.size) "联合清单中的 MSIX 大小与实际文件不一致"
 Assert-Condition ($usbManifest.manager.file -eq "CodexAppManager.exe") "联合清单中的管理器本体路径不正确"
 Assert-Condition ($usbManifest.manager.role -eq "requireAdministrator USB Tauri manager started by the launcher or directly") "联合清单未声明 USB 管理器 requireAdministrator 边界"
 Assert-Condition ($usbManifest.manager.sha256 -ieq $managerHash) "联合清单中的管理器本体哈希与实际文件不一致"
-Assert-Condition ([int64]$usbManifest.manager.size -eq $managerItem.Length) "联合清单中的管理器本体大小与实际文件不一致"
+Assert-Condition ((Get-JsonInteger $usbManifest.manager "size") -eq $managerItem.Length) "联合清单中的管理器本体大小与实际文件不一致"
 Assert-Condition ($usbManifest.ccswitch.executable -eq "ccswitch/CodexSwitch.exe") "联合清单的 CCSwitch 路径不正确"
 Assert-Condition ($usbManifest.ccswitch.sha256 -ieq $ccswitchHash) "联合清单中的 CCSwitch 哈希与实际文件不一致"
-Assert-Condition ([int64]$usbManifest.ccswitch.size -eq $ccswitchItem.Length) "联合清单中的 CCSwitch 大小与实际文件不一致"
+Assert-Condition ((Get-JsonInteger $usbManifest.ccswitch "size") -eq $ccswitchItem.Length) "联合清单中的 CCSwitch 大小与实际文件不一致"
 Assert-Condition ($usbManifest.ccswitch.embeddedExecutable -eq "resources/ccswitch/CodexSwitch.exe") "联合清单的嵌入 CCSwitch 路径不正确"
 Assert-Condition ($embeddedCcswitchHash -ieq $ccswitchHash) "根目录与资源中的 CCSwitch 载荷不一致"
 if (-not $SkipSignature) {

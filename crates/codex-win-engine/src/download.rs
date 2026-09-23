@@ -530,34 +530,37 @@ fn download_to_with_progress_bounded_with_network_policy(
             }
             return Err(EngineError::Io(first_err));
         }
-        if should_resume {
-            let _ = std::fs::remove_file(&part);
-            log::warn!(
-                "Windows resume failed; retrying fresh source={source} first_err={first_err}"
-            );
-            run_curl_with_redirect_policy(
-                url,
-                &part,
-                false,
-                max_bytes,
-                on_progress,
-                network,
-                follow_redirects,
-            )
-            .map_err(|second_err| {
-                if is_cancelled_error(&second_err) {
-                    if DOWNLOAD_DISCARD.load(Ordering::SeqCst) {
-                        let _ = std::fs::remove_file(&part);
-                    }
-                    return EngineError::Io(second_err);
+        // A first download can leave a short `.part` file when curl stalls or
+        // the proxy closes the connection.  Returning that error immediately
+        // made the manager report a permanent update failure even though a
+        // clean retry was safe.  Both resumed and first-attempt downloads now
+        // get exactly one bounded fresh attempt; the partial is never reused
+        // after the failed request.
+        let retry_kind = if should_resume { "resume" } else { "initial" };
+        let _ = std::fs::remove_file(&part);
+        log::warn!(
+            "Windows {retry_kind} download failed; retrying fresh source={source} first_err={first_err}"
+        );
+        run_curl_with_redirect_policy(
+            url,
+            &part,
+            false,
+            max_bytes,
+            on_progress,
+            network,
+            follow_redirects,
+        )
+        .map_err(|second_err| {
+            if is_cancelled_error(&second_err) {
+                if DOWNLOAD_DISCARD.load(Ordering::SeqCst) {
+                    let _ = std::fs::remove_file(&part);
                 }
-                EngineError::Io(format!(
-                    "resume failed ({first_err}); fresh download failed ({second_err})"
-                ))
-            })?;
-        } else {
-            return Err(EngineError::Io(first_err));
-        }
+                return EngineError::Io(second_err);
+            }
+            EngineError::Io(format!(
+                "{retry_kind} download failed ({first_err}); fresh download failed ({second_err})"
+            ))
+        })?;
     }
 
     if dest.exists() {

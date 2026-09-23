@@ -1,6 +1,8 @@
 {
   "schemaVersion": 1,
   "profile": "production",
+  "releaseVersion": "0.5.24",
+  "releaseId": "g32-codex-26.908.70816-20260916",
   "keyId": "prod-2026-01",
   "publicKeyB64": "Vn+Kzai6rtqaF0mS5BASVyxLOsTOkoXbtcCfs1veJO8=",
   "publicKeySha256": "216ae3583c6895d0cd00338b8e9624c1a91941a1d62637705420d3fdad545c80"

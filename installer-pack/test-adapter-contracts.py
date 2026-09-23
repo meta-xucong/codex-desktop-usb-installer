@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 import uuid
 from contextlib import contextmanager
@@ -31,6 +32,8 @@ STOCK_DATA_FETCHER_SCRIPT = ROOT / "skills" / "china-stock-analysis" / "scripts"
 FINANCIAL_ANALYZER_SCRIPT = ROOT / "skills" / "china-stock-analysis" / "scripts" / "financial_analyzer.py"
 STOCK_REPORT_TEMPLATE = ROOT / "skills" / "china-stock-analysis" / "templates" / "analysis_report.md"
 CONFIGURE_SCRIPT = ROOT / "configure-codex.ps1"
+RENDER_SCRIPT = ROOT / "render-codex-config.ps1"
+PDF_TOOL_SCRIPT = ROOT / "skills" / "pdf-processing-toolkit" / "scripts" / "pdf_tool.py"
 MODEL_SYNC_SCRIPT = ROOT / "sync-model-catalog.ps1"
 POWERSHELL = shutil.which("powershell.exe") or shutil.which("pwsh.exe") or shutil.which("pwsh")
 MACRO_CYCLE_SCRIPT = ROOT / "skills" / "macro-research" / "scripts" / "cycle_analyzer.py"
@@ -203,6 +206,72 @@ class CodexConfigureContractTests(unittest.TestCase):
             self.assertEqual(config_path.read_text(encoding="utf-8"), modified)
 
 
+@unittest.skipUnless(POWERSHELL, "PowerShell is required for Skill activation contract tests")
+class SkillActivationContractTests(unittest.TestCase):
+    expected_guided = {
+        "feishu-doc",
+        "feishu-drive",
+        "feishu-perm",
+        "feishu-wiki",
+        "image-2",
+        "seedance2-0-video-gen",
+        "web-search-extraction",
+    }
+
+    def test_renderer_emits_43_enabled_and_7_guided_entries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "generated.toml"
+            completed = subprocess.run(
+                [
+                    POWERSHELL,
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(RENDER_SCRIPT),
+                    "-OutputPath",
+                    str(output),
+                    "-SkillRoot",
+                    str(ROOT / "skills"),
+                    "-TargetUserProfile",
+                    str(root / "profile"),
+                    "-PythonExe",
+                    sys.executable,
+                    "-Overwrite",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            self.assertEqual(completed.returncode, 0, completed.stdout + "\n" + completed.stderr)
+            status = json.loads(completed.stdout.lstrip("\ufeff"))
+            self.assertEqual(status["totalSkills"], 50)
+            self.assertEqual(status["enabledSkillCount"], 43)
+            self.assertEqual(status["disabledSkillCount"], 7)
+            self.assertEqual(set(status["disabledSkills"]), self.expected_guided)
+            config = tomllib.loads(output.read_text(encoding="utf-8-sig"))
+            entries = config["skills"]["config"]
+            self.assertEqual(len(entries), 50)
+            self.assertEqual(sum(1 for entry in entries if entry["enabled"]), 43)
+            self.assertEqual(sum(1 for entry in entries if not entry["enabled"]), 7)
+
+    @unittest.skipUnless(PDF_TOOL_SCRIPT.is_file(), "Bundled PDF helper is missing")
+    def test_pdf_smoke_uses_read_extract_write_and_generate_paths(self):
+        completed = subprocess.run(
+            [sys.executable, str(PDF_TOOL_SCRIPT), "smoke"],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + "\n" + completed.stderr)
+        self.assertIn("pdf smoke: passed", completed.stdout)
+
+
 @unittest.skipUnless(POWERSHELL, "PowerShell is required for model catalog synchronization contract tests")
 class ModelCatalogSyncContractTests(unittest.TestCase):
     def catalog(self):
@@ -340,6 +409,25 @@ class ModelCatalogSyncContractTests(unittest.TestCase):
             self.assertEqual(result["configChanged"], False)
             self.assertEqual(config_path.read_text(encoding="utf-8"), first_config)
             self.assertEqual((kit_home / "model-catalog.json").read_text(encoding="utf-8"), first_catalog)
+
+    def test_retired_visible_active_model_is_rejected(self):
+        catalog = self.catalog()
+        catalog["models"].append(
+            {
+                "id": "gpt-5.2",
+                "displayName": "GPT-5.2",
+                "visibility": "list",
+                "supportedInApi": True,
+                "priority": 29,
+                "defaultReasoningLevel": "medium",
+                "reasoningLevels": ["low", "medium", "high"],
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            completed, result, _, _ = self.invoke(Path(directory), catalog)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIsNone(result)
+            self.assertIn("retired model", (completed.stdout + completed.stderr).lower())
 
 
 class ImageAdapterTests(unittest.TestCase):

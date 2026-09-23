@@ -11,12 +11,17 @@ import type {
   CodexThemeSummary,
   CommandError,
   CcswitchLaunchReport,
+  AccountStatus,
   CcswitchUninstallReport,
   CapabilityPackInstallOptions,
   CapabilityPackReport,
   SkillRepoApplyReport,
   SkillRepoExpected,
   SkillRepoRollbackReport,
+  SkillRepoSourceAttempt,
+  SkillRepoSourceAttemptPhase,
+  SkillRepoSourceAttemptResult,
+  SkillRepoSourceKind,
   SkillRepoUpdateInfo,
   CodexUpdatePlatform,
   ConfigHealth,
@@ -30,6 +35,7 @@ import type {
   MacPerformReport,
   MacUninstallReport,
   MacUpdateReport,
+  NativeModelCatalogReport,
   OfflinePayloadReport,
   OfflineStageReport,
   OperationKind,
@@ -44,6 +50,7 @@ import type {
   WindowModeReport,
   WinUninstallReport,
   WinBundleUninstallReport,
+  UninstallHandoffStatus,
   WinUpdateReport,
   UsbGuardStatus,
 } from "../shared/types";
@@ -130,7 +137,8 @@ function normalizedProxyMode(value: unknown): AppSettings["proxyMode"] {
 function normalizedCodexPayloadSourceKind(
   value: unknown,
 ): AppSettings["codexPayloadSourceKind"] {
-  return value === "mirror" || value === "relay" || value === "github" || value === "auto"
+  if (value === "mirror") return "auto";
+  return value === "relay" || value === "github" || value === "auto"
     ? value
     : "auto";
 }
@@ -262,6 +270,104 @@ function isCommandError(cause: unknown): cause is CommandError {
   }
   const maybe = cause as Partial<Record<keyof CommandError, unknown>>;
   return typeof maybe.message === "string" || typeof maybe.code === "string";
+}
+
+const SKILL_REPO_SOURCE_IDS = new Set([
+  "cn-mirror-1",
+  "cn-mirror-2",
+  "cn-mirror-3",
+  "ph-relay",
+  "github",
+]);
+const SKILL_REPO_SOURCE_KINDS = new Set<SkillRepoSourceKind>([
+  "domestic",
+  "relay",
+  "github",
+]);
+const SKILL_REPO_ATTEMPT_PHASES = new Set<SkillRepoSourceAttemptPhase>([
+  "metadata",
+  "archive",
+  "verify",
+]);
+const SKILL_REPO_ATTEMPT_RESULTS = new Set<SkillRepoSourceAttemptResult>([
+  "ok",
+  "timeout",
+  "unavailable",
+  "http",
+  "invalid",
+  "hash-mismatch",
+  "cancelled",
+]);
+
+function isSkillRepoRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object";
+}
+
+function safeSkillRepoAttempt(value: unknown): SkillRepoSourceAttempt | null {
+  if (!isSkillRepoRecord(value)) return null;
+  const sourceId = value.sourceId;
+  const sourceKind = value.sourceKind;
+  const phase = value.phase;
+  const result = value.result;
+  const httpStatus = value.httpStatus;
+  const elapsedMs = value.elapsedMs;
+  if (
+    typeof sourceId !== "string" ||
+    !SKILL_REPO_SOURCE_IDS.has(sourceId) ||
+    typeof sourceKind !== "string" ||
+    !SKILL_REPO_SOURCE_KINDS.has(sourceKind as SkillRepoSourceKind) ||
+    typeof phase !== "string" ||
+    !SKILL_REPO_ATTEMPT_PHASES.has(phase as SkillRepoSourceAttemptPhase) ||
+    typeof result !== "string" ||
+    !SKILL_REPO_ATTEMPT_RESULTS.has(result as SkillRepoSourceAttemptResult) ||
+    typeof elapsedMs !== "number" ||
+    !Number.isFinite(elapsedMs) ||
+    elapsedMs < 0
+  ) {
+    return null;
+  }
+  return {
+    sourceId,
+    sourceKind: sourceKind as SkillRepoSourceKind,
+    phase: phase as SkillRepoSourceAttemptPhase,
+    result: result as SkillRepoSourceAttemptResult,
+    httpStatus:
+      typeof httpStatus === "number" &&
+      Number.isInteger(httpStatus) &&
+      httpStatus >= 100 &&
+      httpStatus <= 599
+        ? httpStatus
+        : null,
+    elapsedMs: Math.round(elapsedMs),
+  };
+}
+
+/** Keep only the fixed, non-sensitive Skill Hub attempt fields from IPC data. */
+export function sanitizeSkillRepoAttempts(value: unknown): SkillRepoSourceAttempt[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((attempt) => {
+    const safe = safeSkillRepoAttempt(attempt);
+    return safe ? [safe] : [];
+  });
+}
+
+/** Read and sanitize a structured Skill Hub attempt chain from a command error. */
+export function skillRepoAttempts(cause: unknown): SkillRepoSourceAttempt[] {
+  if (!isSkillRepoRecord(cause)) return [];
+  if (Array.isArray(cause.attempts)) {
+    return sanitizeSkillRepoAttempts(cause.attempts);
+  }
+  if (typeof cause.detail === "string") {
+    try {
+      const detail = JSON.parse(cause.detail) as unknown;
+      if (isSkillRepoRecord(detail) && Array.isArray(detail.attempts)) {
+        return sanitizeSkillRepoAttempts(detail.attempts);
+      }
+    } catch {
+      // Detail is still handled by the normal redacted error disclosure.
+    }
+  }
+  return [];
 }
 
 export function errorMessage(cause: unknown): string {
@@ -1326,6 +1432,21 @@ export const managerApi = {
     }
     return invoke<void>("confirm_quit");
   },
+  // The USB uninstall helper waits for this manager process.  The renderer
+  // calls the dedicated command only after it has shown the pending result;
+  // unlike confirmQuit, it cannot be used without an armed uninstall handoff.
+  getUninstallHandoff(): Promise<UninstallHandoffStatus | null> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve(null);
+    }
+    return invoke<UninstallHandoffStatus | null>("get_uninstall_handoff");
+  },
+  completeUninstallHandoff(handoffId: string): Promise<void> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve();
+    }
+    return invoke<void>("complete_uninstall_handoff", { handoffId });
+  },
   winPickInstallDir(): Promise<string | null> {
     if (!hasTauriRuntime()) {
       return Promise.resolve(localSettings().installRoot);
@@ -1694,13 +1815,12 @@ export const managerApi = {
     });
   },
   /** Windows USB build: remove Codex and the locally copied CCSwitch bundle
-   * in one guarded operation. The two purge flags are intentionally separate
-   * at the command boundary so future UI flows can preserve either data set. */
+   * in one guarded operation. The USB installation kit is always retained so
+   * the drive remains immediately reusable for a future reinstall. */
   async winUninstallBundle(
     confirm: boolean,
     purgeUserData: boolean,
     purgeCcswitchData: boolean,
-    removeUsbMedia = false,
   ): Promise<WinBundleUninstallReport> {
     if (!hasTauriRuntime()) {
       if (!confirm) {
@@ -1725,7 +1845,10 @@ export const managerApi = {
       token,
       purgeUserData,
       purgeCcswitchData,
-      removeUsbMedia,
+      // Keep the offline kit available for reinstall. The optional backend
+      // field remains for compatibility with older managers, but current
+      // callers must never authorize source-media deletion.
+      removeUsbMedia: false,
     });
   },
   winStatus(): Promise<WinInstallStatus> {
@@ -1778,11 +1901,13 @@ export const managerApi = {
     return invoke<WinInstallStatus>("win_adopt_path", { path });
   },
   // Open the installed Codex — explicit user action (mirrors macLaunch).
-  winLaunch(): Promise<void> {
+  winLaunch(locale?: string): Promise<void> {
     if (!hasTauriRuntime()) {
       return Promise.resolve();
     }
-    return invoke<void>("win_launch_codex");
+    return locale
+      ? invoke<void>("win_launch_codex", { locale })
+      : invoke<void>("win_launch_codex");
   },
   /** Launch the bundled Codex Switch configurator (USB-direct in the offline bundle). */
   installAndLaunchCcswitch(): Promise<CcswitchLaunchReport> {
@@ -1798,6 +1923,46 @@ export const managerApi = {
       });
     }
     return invoke<CcswitchLaunchReport>("install_and_launch_ccswitch");
+  },
+  /** Refresh Codex's official native model catalog from the signed gateway. */
+  refreshNativeModelCatalog(force = false): Promise<NativeModelCatalogReport> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({
+        status: "skipped",
+        modelCount: 0,
+        catalogPath: null,
+        fetchedAt: null,
+        message: "browser preview: native model catalog is unavailable",
+      });
+    }
+    return invoke<NativeModelCatalogReport>("refresh_native_model_catalog", {
+      force,
+    });
+  },
+  accountStatus(): Promise<AccountStatus> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({
+        bound: false,
+        accountName: null,
+        loggedIn: false,
+        balance: null,
+        usage: null,
+        message: "browser preview: account unavailable",
+      });
+    }
+    return invoke<AccountStatus>("account_status");
+  },
+  accountLogin(password: string): Promise<AccountStatus> {
+    if (!hasTauriRuntime()) return browserSkillRepoUnavailable();
+    return invoke<AccountStatus>("account_login", { password });
+  },
+  accountRefresh(): Promise<AccountStatus> {
+    if (!hasTauriRuntime()) return browserSkillRepoUnavailable();
+    return invoke<AccountStatus>("account_refresh");
+  },
+  accountRedeem(code: string): Promise<AccountStatus> {
+    if (!hasTauriRuntime()) return browserSkillRepoUnavailable();
+    return invoke<AccountStatus>("account_redeem", { code });
   },
   /** Inspect the bundled offline Skills/MCP/Agents capability pack. */
   capabilityPackStatus(): Promise<CapabilityPackReport> {
@@ -1854,7 +2019,10 @@ export const managerApi = {
     if (!hasTauriRuntime()) {
       return browserSkillRepoUnavailable();
     }
-    return invoke<SkillRepoUpdateInfo>("skill_repo_check_update");
+    return invoke<SkillRepoUpdateInfo>("skill_repo_check_update").then((info) => ({
+      ...info,
+      attempts: sanitizeSkillRepoAttempts(info.attempts),
+    }));
   },
   /** Apply the exact identity returned by skillRepoCheckUpdate. */
   skillRepoApplyUpdate(expected: SkillRepoExpected): Promise<SkillRepoApplyReport> {

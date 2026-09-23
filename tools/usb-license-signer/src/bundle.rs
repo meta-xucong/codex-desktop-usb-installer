@@ -3,7 +3,7 @@ use std::fs::{self, File};
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 
-use codex_usb_license::{anchor_sha256, bundle_anchor_schema, validate_key_id};
+use codex_usb_license::{anchor_sha256, bundle_anchor_schema, validate_key_id, ANCHOR_SCHEMA_V3};
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 use serde::Serialize;
@@ -97,6 +97,18 @@ pub fn verify_bundle(
     let usb_manifest = read_json(&usb_manifest_path)?;
     validate_root_manifest(&manifest)?;
     validate_usb_manifest(&usb_manifest)?;
+    let root_anchor = required_u64(&manifest, "/updateCapability/anchorSchema")?;
+    let usb_anchor = required_u64(&usb_manifest, "/updateCapability/anchorSchema")?;
+    if root_anchor != ANCHOR_SCHEMA_V3 as u64 || usb_anchor != ANCHOR_SCHEMA_V3 as u64 {
+        return Err(SignerError::bundle(
+            "only schema 3 update bundles may be signed by this release signer",
+        ));
+    }
+    if root_anchor != usb_anchor {
+        return Err(SignerError::bundle(
+            "root and USB update anchor schemas do not match",
+        ));
+    }
 
     let architecture = required_string(&manifest, "/architecture")?;
     let payload_relative =
@@ -414,7 +426,8 @@ fn validate_update_capability(value: &Value, label: &str) -> Result<(), SignerEr
         return Err(SignerError::bundle(format!("{label} must be an object")));
     }
     require_bool_equals(value, "/codexPayload", true)?;
-    require_u64_equals(value, "/schemaVersion", 2)?;
+    require_u64_equals(value, "/schemaVersion", 3)?;
+    require_u64_equals(value, "/anchorSchema", 3)?;
     require_string_equals(value, "/checksumFile", "SHA256SUMS.txt")?;
     require_string_equals(value, "/transactionDirectory", ".staging")?;
     require_string_equals(value, "/backupPolicy", "single-msix-listed-in-SHA256SUMS")?;
@@ -601,7 +614,7 @@ fn verify_msix_payload(
     }
     let manifest_bytes =
         manifest_bytes.ok_or_else(|| SignerError::bundle("MSIX is missing AppxManifest.xml"))?;
-    let (identity, application) = parse_msix_manifest(&manifest_bytes)?;
+    let (identity, applications) = parse_msix_manifest(&manifest_bytes)?;
     if identity.0 != "OpenAI.Codex" {
         return Err(SignerError::bundle(format!(
             "MSIX Identity is not OpenAI.Codex: {}",
@@ -622,7 +635,7 @@ fn verify_msix_payload(
             )));
         }
     }
-    if application.is_empty() {
+    if applications.is_empty() {
         return Err(SignerError::bundle(
             "MSIX is missing a desktop Application executable",
         ));
@@ -637,12 +650,16 @@ fn verify_msix_payload(
 
 type MsixIdentity = (String, String, Option<String>);
 
-fn parse_msix_manifest(bytes: &[u8]) -> Result<(MsixIdentity, String), SignerError> {
+fn parse_msix_manifest(bytes: &[u8]) -> Result<(MsixIdentity, Vec<String>), SignerError> {
     let mut reader = Reader::from_reader(Cursor::new(bytes));
     reader.config_mut().trim_text(true);
     let mut buffer = Vec::new();
     let mut identity = None;
-    let mut application = None;
+    // Current Codex MSIX packages legitimately declare more than one full-trust
+    // desktop application (the main UI and the command runner).  Keep every
+    // executable for structural validation, while still requiring at least one
+    // Application element below.
+    let mut applications = Vec::new();
     loop {
         match reader.read_event_into(&mut buffer) {
             Ok(Event::Start(start)) | Ok(Event::Empty(start)) => {
@@ -659,12 +676,7 @@ fn parse_msix_manifest(bytes: &[u8]) -> Result<(MsixIdentity, String), SignerErr
                     let version = xml_attribute(&start, b"Version").ok();
                     identity = Some((package_name, processor_architecture, version));
                 } else if name == b"Application" {
-                    if application.is_some() {
-                        return Err(SignerError::bundle(
-                            "MSIX AppxManifest.xml contains multiple Application elements",
-                        ));
-                    }
-                    application = Some(xml_attribute(&start, b"Executable")?);
+                    applications.push(xml_attribute(&start, b"Executable")?);
                 }
             }
             Ok(Event::Eof) => break,
@@ -678,9 +690,10 @@ fn parse_msix_manifest(bytes: &[u8]) -> Result<(MsixIdentity, String), SignerErr
         buffer.clear();
     }
     let identity = identity.ok_or_else(|| SignerError::bundle("MSIX missing Identity element"))?;
-    let application =
-        application.ok_or_else(|| SignerError::bundle("MSIX missing Application element"))?;
-    Ok((identity, application))
+    if applications.is_empty() {
+        return Err(SignerError::bundle("MSIX missing Application element"));
+    }
+    Ok((identity, applications))
 }
 
 fn local_name(name: &[u8]) -> &[u8] {
@@ -746,6 +759,19 @@ fn validate_backup_directory(
         let name = entry.file_name().to_string_lossy().to_string();
         let prefix = format!("OpenAI.Codex_{architecture}_");
         if !name.starts_with(&prefix) || !name.to_ascii_lowercase().ends_with(".msix") {
+            return Err(SignerError::bundle(format!(
+                "payload backup filename is invalid: {name}"
+            )));
+        }
+        let version = name
+            .strip_prefix(&prefix)
+            .and_then(|value| value.strip_suffix(".msix"))
+            .unwrap_or_default();
+        if version.is_empty()
+            || !version.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_')
+            })
+        {
             return Err(SignerError::bundle(format!(
                 "payload backup filename is invalid: {name}"
             )));
@@ -1170,6 +1196,46 @@ mod tests {
             } }
         }))
         .is_err());
+    }
+
+    #[test]
+    fn msix_manifest_accepts_multiple_desktop_applications() {
+        let manifest = br#"
+            <Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+                     xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10">
+                <Identity Name="OpenAI.Codex" ProcessorArchitecture="x64" Version="26.917.8451.0" />
+                <Applications>
+                    <Application Id="App" Executable="app/ChatGPT.exe" EntryPoint="Windows.FullTrustApplication" />
+                    <Application Id="CodexCoreCommandRunner" Executable="app/resources/codex-command-runner.exe" EntryPoint="Windows.FullTrustApplication" />
+                </Applications>
+            </Package>
+        "#;
+
+        let (identity, applications) = parse_msix_manifest(manifest).unwrap();
+        assert_eq!(identity.0, "OpenAI.Codex");
+        assert_eq!(identity.1, "x64");
+        assert_eq!(identity.2.as_deref(), Some("26.917.8451.0"));
+        assert_eq!(
+            applications,
+            vec![
+                "app/ChatGPT.exe".to_string(),
+                "app/resources/codex-command-runner.exe".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn msix_manifest_still_rejects_multiple_identity_elements() {
+        let manifest = br#"
+            <Package>
+                <Identity Name="OpenAI.Codex" ProcessorArchitecture="x64" Version="1.0.0.0" />
+                <Identity Name="OpenAI.Codex" ProcessorArchitecture="x64" Version="1.0.0.0" />
+                <Application Id="App" Executable="app/ChatGPT.exe" />
+            </Package>
+        "#;
+
+        let error = parse_msix_manifest(manifest).unwrap_err();
+        assert!(error.to_string().contains("multiple Identity elements"));
     }
 
     fn test_root(name: &str) -> PathBuf {

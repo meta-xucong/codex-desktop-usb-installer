@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -92,8 +92,432 @@ struct PreparedPortable {
     identity: MsixIdentity,
 }
 
+/// Progress reported while the verified MSIX archive is being unpacked into
+/// the transactional portable payload.  The byte total is calculated from the
+/// ZIP central directory before the first write, so the UI can show a real
+/// percentage even when the destination is a slow removable drive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortableExtractionProgress {
+    pub completed_bytes: u64,
+    pub total_bytes: u64,
+    pub files_completed: u64,
+}
+
+pub type PortableExtractionProgressObserver<'a> =
+    dyn Fn(PortableExtractionProgress) -> Result<(), EngineError> + 'a;
+
 fn io_err(context: &str, err: impl ToString) -> EngineError {
     EngineError::Io(format!("{context}: {}", err.to_string()))
+}
+
+const EXTRACT_FILE_CREATE_RETRIES: usize = 3;
+const EXTRACTION_COPY_BUFFER_BYTES: usize = 1024 * 1024;
+const EXTRACTION_PROGRESS_BYTES: u64 = 4 * 1024 * 1024;
+const EXTRACTION_PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
+
+// Codex's packaged Electron shell queries the Windows MSIX package identity
+// during bootstrap and initializes the in-app updater before it starts the
+// actual UI.  A payload extracted from MSIX and launched from a USB directory
+// has no package identity, so the native call can throw
+// `APPMODEL_ERROR_NO_PACKAGE` and leave the user with a black window and a
+// "ChatGPT failed to start" dialog.  The manager owns updates for a portable
+// tree; package-dependent updater bootstrap must therefore be skipped for this
+// launch form.
+//
+// Keep the replacement the same length as the minified call.  ASAR stores file
+// contents at fixed offsets, so an in-place patch preserves the archive header
+// and every other file offset without rebuilding (or re-signing) the payload.
+const CODEX_ASAR_UPDATER_MARKER: &[u8] = b"getCurrentPackageFamily";
+const CODEX_ASAR_UPDATER_CALLS: &[&[u8]] = &[
+    b"await o.initialize();",
+    // Keep a few minifier-safe fallbacks for upstream builds that rename the
+    // destructured sparkle manager binding while leaving the bootstrap shape
+    // unchanged.
+    b"await t.initialize();",
+    b"await e.initialize();",
+    b"await i.initialize();",
+];
+const CODEX_ASAR_UPDATER_PATCH_PREFIX: &[u8] = b"await 0/*USB*/;";
+const CODEX_ASAR_PACKAGE_FAMILY_CALL: &[u8] = b"OT()?.getCurrentPackageFamily()";
+const CODEX_ASAR_PACKAGE_FAMILY_PATCH_PREFIX: &[u8] = b"void 0/*USB*/";
+
+// The bundled Electron bridge starts the native Codex app-server with
+// Node's `child_process.spawn`.  On Windows `resources/codex.exe` is a
+// console-subsystem binary, so the spawn must carry `windowsHide: true` at
+// the actual child-creation boundary.  `stdio: "pipe"` is equivalent to the
+// original three-element pipe array and is one byte shorter than the complete
+// replacement, which lets us patch the minified ASAR in place without moving
+// offsets or invalidating the signed MSIX archive before extraction.
+const CODEX_ASAR_CONSOLE_SPAWN_CALLS: &[(&[u8], &[u8])] = &[
+    (
+        b"stdio:[`pipe`,`pipe`,`pipe`],env:this.options.env",
+        b"stdio:\"pipe\",windowsHide:!0,env:this.options.env",
+    ),
+    (
+        b"stdio:[\"pipe\",\"pipe\",\"pipe\"],env:this.options.env",
+        b"stdio:\"pipe\",windowsHide:!0,env:this.options.env",
+    ),
+    (
+        b"stdio:['pipe','pipe','pipe'],env:this.options.env",
+        b"stdio:\"pipe\",windowsHide:!0,env:this.options.env",
+    ),
+];
+const CODEX_ASAR_CONSOLE_SPAWN_SENTINEL: &[u8] =
+    b"stdio:\"pipe\",windowsHide:!0,env:this.options.env";
+
+// Codex ships the translated webview bundles, but several desktop releases
+// gate loading them behind a remote `enable_i18n` flag whose local fallback is
+// false.  The USB build must not depend on that flag being available (the
+// machine may be offline), so enable the bundled translations in-place.  Every
+// replacement is exactly the same width as the original minified expression;
+// this keeps the ASAR offsets valid and avoids rebuilding/re-signing it.
+const CODEX_ASAR_I18N_CALLS: &[(&[u8], &[u8])] = &[
+    (b"get(`enable_i18n`, false)", b"get(`enable_i18n`, true )"),
+    (b"get(`enable_i18n`,false)", b"get(`enable_i18n`,true )"),
+    (
+        b"get(\"enable_i18n\", false)",
+        b"get(\"enable_i18n\", true )",
+    ),
+    (b"get(\"enable_i18n\",false)", b"get(\"enable_i18n\",true )"),
+    (b"get('enable_i18n', false)", b"get('enable_i18n', true )"),
+    (b"get('enable_i18n',false)", b"get('enable_i18n',true )"),
+    (b"get(`enable_i18n`,!1)", b"get(`enable_i18n`,!0)"),
+    (b"get(\"enable_i18n\",!1)", b"get(\"enable_i18n\",!0)"),
+    (b"get('enable_i18n',!1)", b"get('enable_i18n',!0)"),
+];
+fn requests_chinese_codex_locale(locale: Option<&str>) -> bool {
+    locale
+        .map(str::trim)
+        .filter(|locale| !locale.is_empty())
+        .is_some_and(|locale| locale.to_ascii_lowercase().starts_with("zh"))
+}
+
+fn find_bytes_in_file(path: &Path, needle: &[u8]) -> io::Result<Option<u64>> {
+    if needle.is_empty() {
+        return Ok(Some(0));
+    }
+    let file = fs::File::open(path)?;
+    let mut reader = BufReader::with_capacity(EXTRACTION_COPY_BUFFER_BYTES, file);
+    let mut carry = Vec::with_capacity(needle.len().saturating_sub(1));
+    let mut chunk = vec![0_u8; EXTRACTION_COPY_BUFFER_BYTES];
+    let mut file_offset = 0_u64;
+    loop {
+        let read = reader.read(&mut chunk)?;
+        if read == 0 {
+            return Ok(None);
+        }
+        let carry_len = carry.len();
+        let mut haystack = Vec::with_capacity(carry_len + read);
+        haystack.extend_from_slice(&carry);
+        haystack.extend_from_slice(&chunk[..read]);
+        if let Some(index) = haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+        {
+            return Ok(Some(
+                file_offset.saturating_sub(carry_len as u64) + index as u64,
+            ));
+        }
+        let keep = needle.len().saturating_sub(1).min(haystack.len());
+        carry.clear();
+        carry.extend_from_slice(&haystack[haystack.len() - keep..]);
+        file_offset = file_offset.saturating_add(read as u64);
+    }
+}
+
+fn patch_asar_bytes_in_place(
+    app_asar: &Path,
+    offset: u64,
+    replacement: &[u8],
+) -> Result<(), EngineError> {
+    let mut last_error = None;
+    for attempt in 0..=EXTRACT_FILE_CREATE_RETRIES {
+        let result = (|| {
+            let mut file = fs::OpenOptions::new().write(true).open(app_asar)?;
+            file.seek(SeekFrom::Start(offset))?;
+            file.write_all(replacement)?;
+            file.flush()?;
+            Ok::<(), io::Error>(())
+        })();
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if attempt < EXTRACT_FILE_CREATE_RETRIES
+                    && matches!(
+                        error.kind(),
+                        io::ErrorKind::Interrupted
+                            | io::ErrorKind::PermissionDenied
+                            | io::ErrorKind::WouldBlock
+                    ) =>
+            {
+                last_error = Some(error);
+                thread::sleep(extraction_file_retry_delay(attempt));
+            }
+            Err(error) => {
+                return Err(io_err("write Codex app.asar portable startup patch", error));
+            }
+        }
+    }
+    Err(io_err(
+        "write Codex app.asar portable startup patch",
+        last_error.expect("retry loop must retain the last error"),
+    ))
+}
+
+fn patch_first_fixed_width_call(
+    app_asar: &Path,
+    call: &[u8],
+    replacement_prefix: &[u8],
+    label: &str,
+) -> Result<bool, EngineError> {
+    let Some(offset) = find_bytes_in_file(app_asar, call)
+        .map_err(|error| EngineError::Io(format!("scan Codex app.asar for {label}: {error}")))?
+    else {
+        return Ok(false);
+    };
+    if replacement_prefix.len() > call.len() {
+        return Err(EngineError::Msix(format!(
+            "portable Codex startup patch for {label} is wider than the original call"
+        )));
+    }
+    let mut replacement = vec![b' '; call.len()];
+    replacement[..replacement_prefix.len()].copy_from_slice(replacement_prefix);
+    patch_asar_bytes_in_place(app_asar, offset, &replacement)?;
+    log::info!(
+        "portable Codex startup compatibility patch applied path={} offset={} reason={label}",
+        app_asar.display(),
+        offset
+    );
+    Ok(true)
+}
+
+fn patch_codex_console_spawn(app_asar: &Path) -> Result<bool, EngineError> {
+    if find_bytes_in_file(app_asar, CODEX_ASAR_CONSOLE_SPAWN_SENTINEL)
+        .map_err(|error| io_err("scan Codex app.asar for console-silence patch", error))?
+        .is_some()
+    {
+        return Ok(false);
+    }
+
+    for (call, replacement) in CODEX_ASAR_CONSOLE_SPAWN_CALLS {
+        if find_bytes_in_file(app_asar, call)
+            .map_err(|error| io_err("scan Codex app.asar for app-server spawn", error))?
+            .is_some()
+        {
+            return patch_first_fixed_width_call(
+                app_asar,
+                call,
+                replacement,
+                "app-server-console-window",
+            );
+        }
+    }
+
+    log::warn!(
+        "portable Codex app-server spawn did not match a known console-silence patch shape path={}",
+        app_asar.display()
+    );
+    Ok(false)
+}
+
+/// Make an extracted Codex tree safe to launch without an MSIX package
+/// identity.  This is intentionally idempotent and best-effort for payloads
+/// that have already moved to a newer upstream bootstrap shape: the native
+/// window check below still rejects a fatal startup dialog instead of reporting
+/// a false success.
+pub fn ensure_portable_codex_startup_compatibility(
+    install_root: &Path,
+) -> Result<bool, EngineError> {
+    let app_asar = install_root.join("resources").join("app.asar");
+    if !app_asar.is_file() {
+        return Ok(false);
+    }
+
+    // This patch is independent from the unpackaged-MSIX updater patch below:
+    // newer Codex builds can change or remove the updater bootstrap while the
+    // app-server spawn remains the source of a visible console window.
+    let mut patched = patch_codex_console_spawn(&app_asar)?;
+
+    // Only touch a Codex archive that actually contains the package-identity
+    // updater.  This keeps the patch scoped to the known failure mechanism.
+    if find_bytes_in_file(&app_asar, CODEX_ASAR_UPDATER_MARKER)
+        .map_err(|error| io_err("scan Codex app.asar for portable startup marker", error))?
+        .is_none()
+    {
+        return Ok(patched);
+    }
+
+    // Check the fixed-width package-query sentinel before scanning for the
+    // original call.  This keeps subsequent launches bounded to the first few
+    // megabytes of app.asar instead of repeatedly reading the whole archive
+    // from a slow removable drive.
+    if find_bytes_in_file(&app_asar, CODEX_ASAR_PACKAGE_FAMILY_PATCH_PREFIX)
+        .map_err(|error| {
+            io_err(
+                "scan Codex app.asar for existing package-family patch",
+                error,
+            )
+        })?
+        .is_some()
+    {
+        return Ok(patched);
+    }
+
+    let updater_patched = patch_first_fixed_width_call(
+        &app_asar,
+        CODEX_ASAR_PACKAGE_FAMILY_CALL,
+        CODEX_ASAR_PACKAGE_FAMILY_PATCH_PREFIX,
+        "unpackaged-msix-package-family-query",
+    )?;
+    patched |= updater_patched;
+
+    // The unguarded bootstrap query is the failure that prevents an unpackaged
+    // Codex process from reaching its main window. Once it is repaired there
+    // is no reason to scan the rest of a 300+ MB archive for an optional,
+    // older updater initializer.
+    if patched {
+        return Ok(true);
+    }
+
+    // A patched updater call is detected without rebuilding the archive on
+    // every launch; the minified bootstrap call is near the beginning of the
+    // archive and the exact sentinel is unique to this compatibility patch.
+    if find_bytes_in_file(&app_asar, b"await 0/*USB*/;")
+        .map_err(|error| io_err("scan Codex app.asar for existing startup patch", error))?
+        .is_some()
+    {
+        return Ok(patched);
+    }
+
+    let mut updater_call = None;
+    for call in CODEX_ASAR_UPDATER_CALLS {
+        if let Some(offset) = find_bytes_in_file(&app_asar, call)
+            .map_err(|error| io_err("scan Codex app.asar for updater initialization", error))?
+        {
+            updater_call = Some((offset, call.len()));
+            break;
+        }
+    }
+    let Some((offset, call_len)) = updater_call else {
+        log::warn!(
+            "portable Codex package-identity updater marker is present but the expected bootstrap call was not found path={}",
+            app_asar.display()
+        );
+        return Ok(patched);
+    };
+
+    if call_len < CODEX_ASAR_UPDATER_PATCH_PREFIX.len() {
+        return Err(EngineError::Msix(
+            "portable Codex startup patch has an invalid fixed-width replacement".to_string(),
+        ));
+    }
+    let mut replacement = vec![b' '; call_len];
+    replacement[..CODEX_ASAR_UPDATER_PATCH_PREFIX.len()]
+        .copy_from_slice(CODEX_ASAR_UPDATER_PATCH_PREFIX);
+    patch_asar_bytes_in_place(&app_asar, offset, &replacement)?;
+    patched = true;
+    log::info!(
+        "portable Codex startup compatibility patch applied path={} offset={} reason=unpackaged-msix-updater",
+        app_asar.display(),
+        offset
+    );
+    Ok(patched)
+}
+
+/// Enable Codex's bundled webview translations for a Chinese launch.
+///
+/// Upstream desktop builds have shipped the `zh-CN` resources while using a
+/// false local fallback for the remote `enable_i18n` flag.  That leaves the
+/// complete UI in English when the machine cannot fetch the feature config.
+/// The USB launcher owns the extracted payload, so it can safely flip that
+/// boolean with the same fixed-width, idempotent ASAR edit used by the
+/// unpackaged MSIX compatibility fix.  A build with a different bundle shape
+/// is left untouched and continues to launch in its native fallback language.
+pub fn ensure_portable_codex_locale_compatibility(
+    install_root: &Path,
+    locale: Option<&str>,
+) -> Result<bool, EngineError> {
+    if !requests_chinese_codex_locale(locale) {
+        return Ok(false);
+    }
+    let app_asar = install_root.join("resources").join("app.asar");
+    if !app_asar.is_file() {
+        return Ok(false);
+    }
+
+    for (call, replacement) in CODEX_ASAR_I18N_CALLS {
+        if call.len() != replacement.len() {
+            return Err(EngineError::Msix(
+                "portable Codex i18n patch changed ASAR width".to_string(),
+            ));
+        }
+        if find_bytes_in_file(&app_asar, call)
+            .map_err(|error| io_err("scan Codex app.asar for i18n fallback", error))?
+            .is_some()
+        {
+            let patched = patch_first_fixed_width_call(
+                &app_asar,
+                call,
+                replacement,
+                "bundled-i18n-default-fallback",
+            )?;
+            if patched {
+                return Ok(true);
+            }
+        }
+    }
+
+    log::warn!(
+        "portable Codex Chinese locale requested but no compatible enable_i18n fallback was found path={}",
+        app_asar.display()
+    );
+    Ok(false)
+}
+
+fn extraction_file_retry_delay(attempt: usize) -> Duration {
+    // Security tools and indexers can briefly hold a newly-created file. Keep
+    // this finite and short: a real ACL denial must still surface promptly.
+    Duration::from_millis(match attempt {
+        0 => 100,
+        1 => 250,
+        _ => 500,
+    })
+}
+
+fn create_extracted_file(path: &Path) -> Result<fs::File, EngineError> {
+    let mut last_error = None;
+    for attempt in 0..=EXTRACT_FILE_CREATE_RETRIES {
+        match fs::File::create(path) {
+            Ok(file) => return Ok(file),
+            Err(error)
+                if attempt < EXTRACT_FILE_CREATE_RETRIES
+                    && matches!(
+                        error.kind(),
+                        io::ErrorKind::Interrupted
+                            | io::ErrorKind::PermissionDenied
+                            | io::ErrorKind::WouldBlock
+                    ) =>
+            {
+                log::warn!(
+                    "portable extraction file create retry path={} attempt={} error={error}",
+                    path.display(),
+                    attempt + 1
+                );
+                last_error = Some(error);
+                std::thread::sleep(extraction_file_retry_delay(attempt));
+            }
+            Err(error) => {
+                return Err(io_err(
+                    &format!("create extracted file {}", path.display()),
+                    error,
+                ));
+            }
+        }
+    }
+    Err(io_err(
+        &format!("create extracted file {}", path.display()),
+        last_error.expect("retry loop must retain the last error"),
+    ))
 }
 
 fn cleanup_portable_work_dir(work_dir: &Path) -> Result<(), EngineError> {
@@ -322,8 +746,7 @@ fn extract_msix(msix_path: &Path, dest: &Path) -> Result<String, EngineError> {
         if let Some(parent) = out_path.parent() {
             fs::create_dir_all(parent).map_err(|e| io_err("create extracted parent", e))?;
         }
-        let mut out =
-            fs::File::create(&out_path).map_err(|e| io_err("create extracted file", e))?;
+        let mut out = create_extracted_file(&out_path)?;
         let expected_len = file.size();
         let extracted_len =
             std::io::copy(&mut file, &mut out).map_err(|e| io_err("extract file", e))?;
@@ -531,6 +954,7 @@ pub fn installed_app_exe(install_root: &Path) -> Option<PathBuf> {
 fn prepare_portable_payload(
     msix_path: &Path,
     work_dir: &Path,
+    progress: Option<&PortableExtractionProgressObserver<'_>>,
 ) -> Result<PreparedPortable, EngineError> {
     let extracted = work_dir.join("extracted");
     let payload = work_dir.join("payload");
@@ -540,18 +964,229 @@ fn prepare_portable_payload(
     if payload.exists() {
         fs::remove_dir_all(&payload).map_err(|e| io_err("clear payload dir", e))?;
     }
-    fs::create_dir_all(&extracted).map_err(|e| io_err("create extracted dir", e))?;
+    fs::create_dir_all(&payload).map_err(|e| io_err("create payload dir", e))?;
 
-    let manifest_xml = extract_msix(msix_path, &extracted)?;
+    // The previous implementation unpacked the complete MSIX to
+    // `work_dir/extracted` and then copied the executable directory to
+    // `work_dir/payload`. For the real Codex package that meant roughly 1.96
+    // GB of app files were written to a removable drive twice, with no
+    // observable progress between the two writes. Prefer the manifest's
+    // authoritative executable path and stream only its containing tree
+    // directly into the transactional payload. This keeps the old full
+    // extraction path as a compatibility fallback for malformed/minimal
+    // manifests that do not declare an Application executable.
+    let package_file = fs::File::open(msix_path).map_err(|e| io_err("open MSIX", e))?;
+    let mut package = zip::ZipArchive::new(package_file)
+        .map_err(|e| EngineError::Msix(format!("open zip: {e}")))?;
+    let mut manifest_entry = package
+        .by_name("AppxManifest.xml")
+        .map_err(|e| EngineError::Msix(format!("read AppxManifest.xml: {e}")))?;
+    let mut manifest_xml = String::new();
+    manifest_entry
+        .read_to_string(&mut manifest_xml)
+        .map_err(|e| io_err("decode AppxManifest.xml", e))?;
+    drop(manifest_entry);
+
     let identity = parse_appx_manifest_xml(&manifest_xml)?;
-    let exe = find_app_exe(&extracted, &manifest_xml)?;
-    let exe_dir = exe.parent().ok_or_else(|| {
-        EngineError::Msix("app entry executable had no parent directory".to_string())
-    })?;
+    if let Some(declared) = crate::msix::parse_appx_application_executable(&manifest_xml) {
+        let declared_relative: PathBuf = declared.replace('\\', "/").split('/').collect();
+        let app_prefix = declared_relative.parent().unwrap_or_else(|| Path::new(""));
 
-    copy_dir_all(exe_dir, &payload)?;
+        let mut selected_entries = 0usize;
+        let mut selected_bytes = 0u64;
+        for idx in 0..package.len() {
+            let entry = package
+                .by_index(idx)
+                .map_err(|e| EngineError::Msix(format!("read zip entry {idx}: {e}")))?;
+            let Some(enclosed) = entry.enclosed_name() else {
+                continue;
+            };
+            if enclosed.starts_with(app_prefix) {
+                selected_entries += 1;
+                if !entry.is_dir() {
+                    selected_bytes = selected_bytes.saturating_add(entry.size());
+                }
+            }
+        }
+        log::info!(
+            "portable extraction started route=declared-app package={} destination={} entries={} bytes={} declared_executable={}",
+            msix_path.display(),
+            payload.display(),
+            selected_entries,
+            selected_bytes,
+            declared
+        );
+
+        if let Some(observer) = progress {
+            observer(PortableExtractionProgress {
+                completed_bytes: 0,
+                total_bytes: selected_bytes,
+                files_completed: 0,
+            })?;
+        }
+
+        let mut extracted_files = 0usize;
+        let mut extracted_bytes = 0u64;
+        let mut last_logged_bytes = 0u64;
+        let mut last_logged_files = 0usize;
+        let mut last_reported_bytes = 0u64;
+        let mut last_reported_at = Instant::now();
+        let mut copy_buffer = vec![0u8; EXTRACTION_COPY_BUFFER_BYTES];
+        let mut declared_entry_found = false;
+        for idx in 0..package.len() {
+            let mut entry = package
+                .by_index(idx)
+                .map_err(|e| EngineError::Msix(format!("read zip entry {idx}: {e}")))?;
+            let Some(enclosed) = entry.enclosed_name() else {
+                continue;
+            };
+            if !enclosed.starts_with(app_prefix) {
+                continue;
+            }
+            if enclosed == declared_relative {
+                declared_entry_found = true;
+            }
+            let relative = enclosed.strip_prefix(app_prefix).map_err(|_| {
+                EngineError::Msix("MSIX app entry path was not under its app directory".to_string())
+            })?;
+            let output = payload.join(relative);
+            if entry.is_dir() {
+                fs::create_dir_all(&output).map_err(|e| io_err("create extracted dir", e))?;
+                continue;
+            }
+            if let Some(parent) = output.parent() {
+                fs::create_dir_all(parent).map_err(|e| io_err("create extracted parent", e))?;
+            }
+            let expected_len = entry.size();
+            let mut out = create_extracted_file(&output)?;
+            // `std::io::copy` uses a small internal buffer.  A reusable 1 MiB
+            // buffer reduces syscall overhead on a USB target while allowing
+            // us to publish progress during large individual files instead of
+            // waiting for the next file boundary.
+            let mut extracted_len = 0u64;
+            loop {
+                let read = entry
+                    .read(&mut copy_buffer)
+                    .map_err(|e| io_err("extract app file", e))?;
+                if read == 0 {
+                    break;
+                }
+                out.write_all(&copy_buffer[..read])
+                    .map_err(|e| io_err("write extracted app file", e))?;
+                extracted_len = extracted_len.saturating_add(read as u64);
+                extracted_bytes = extracted_bytes.saturating_add(read as u64);
+                if let Some(observer) = progress {
+                    if extracted_bytes.saturating_sub(last_reported_bytes)
+                        >= EXTRACTION_PROGRESS_BYTES
+                        || last_reported_at.elapsed() >= EXTRACTION_PROGRESS_INTERVAL
+                    {
+                        observer(PortableExtractionProgress {
+                            completed_bytes: extracted_bytes,
+                            total_bytes: selected_bytes,
+                            files_completed: extracted_files as u64,
+                        })?;
+                        last_reported_bytes = extracted_bytes;
+                        last_reported_at = Instant::now();
+                    }
+                }
+            }
+            out.flush()
+                .map_err(|e| io_err("flush extracted app file", e))?;
+            if extracted_len != expected_len {
+                return Err(EngineError::Msix(format!(
+                    "MSIX app entry extraction was incomplete: {} (expected={expected_len}, actual={extracted_len})",
+                    enclosed.display()
+                )));
+            }
+            drop(out);
+            let destination_len = fs::metadata(&output)
+                .map_err(|e| io_err("read extracted app file metadata", e))?
+                .len();
+            if destination_len != expected_len {
+                return Err(EngineError::Msix(format!(
+                    "MSIX app entry was written incompletely: {} (expected={expected_len}, actual={destination_len})",
+                    enclosed.display()
+                )));
+            }
+            extracted_files += 1;
+            if let Some(observer) = progress {
+                observer(PortableExtractionProgress {
+                    completed_bytes: extracted_bytes,
+                    total_bytes: selected_bytes,
+                    files_completed: extracted_files as u64,
+                })?;
+                last_reported_bytes = extracted_bytes;
+                last_reported_at = Instant::now();
+            }
+            if extracted_bytes.saturating_sub(last_logged_bytes) >= 128 * 1024 * 1024
+                || extracted_files.saturating_sub(last_logged_files) >= 512
+            {
+                log::info!(
+                    "portable extraction progress route=declared-app destination={} files={} bytes={} total_bytes={}",
+                    payload.display(),
+                    extracted_files,
+                    extracted_bytes,
+                    selected_bytes
+                );
+                last_logged_bytes = extracted_bytes;
+                last_logged_files = extracted_files;
+            }
+        }
+        if !declared_entry_found {
+            return Err(EngineError::Msix(format!(
+                "MSIX manifest declares entry executable '{declared}' but it is missing from the payload"
+            )));
+        }
+        if let Some(observer) = progress {
+            observer(PortableExtractionProgress {
+                completed_bytes: extracted_bytes,
+                total_bytes: selected_bytes,
+                files_completed: extracted_files as u64,
+            })?;
+        }
+        log::info!(
+            "portable extraction completed route=declared-app destination={} files={} bytes={}",
+            payload.display(),
+            extracted_files,
+            extracted_bytes
+        );
+    } else {
+        log::info!(
+            "portable extraction started route=full-package-fallback package={} destination={}",
+            msix_path.display(),
+            payload.display()
+        );
+        fs::create_dir_all(&extracted).map_err(|e| io_err("create extracted dir", e))?;
+        let extracted_manifest = extract_msix(msix_path, &extracted)?;
+        let exe = find_app_exe(&extracted, &extracted_manifest)?;
+        let exe_dir = exe.parent().ok_or_else(|| {
+            EngineError::Msix("app entry executable had no parent directory".to_string())
+        })?;
+        copy_dir_all(exe_dir, &payload)?;
+        log::info!(
+            "portable extraction completed route=full-package-fallback destination={}",
+            payload.display()
+        );
+    }
+
     fs::write(payload.join("AppxManifest.xml"), manifest_xml)
         .map_err(|e| io_err("write portable AppxManifest.xml", e))?;
+
+    // Apply the unpackaged-launch compatibility fix before the transactional
+    // payload is moved into place.  The operation is idempotent and is also
+    // repeated lazily at launch so an already-installed tree upgraded by an
+    // older manager is repaired without requiring a second reinstall.
+    if let Err(error) = ensure_portable_codex_startup_compatibility(&payload) {
+        // Windows Defender/indexers can briefly hold a freshly extracted
+        // 200–300 MB ASAR.  Do not roll back an otherwise verified install for
+        // that transient lock; launch performs the same bounded repair before
+        // it starts the app and will surface a precise error if it remains
+        // impossible to patch.
+        log::warn!(
+            "portable Codex startup compatibility patch deferred path={} error={error}",
+            payload.display()
+        );
+    }
 
     Ok(PreparedPortable {
         payload_dir: payload,
@@ -1159,6 +1794,7 @@ fn health_check_portable_install(
     if !launch {
         return Ok(false);
     }
+    ensure_portable_codex_startup_compatibility(install_root)?;
     // Spawn alone is not enough: a broken payload can exit immediately after
     // CreateProcess succeeds. Require a short liveness window, then leave the
     // process running (this path is the post-install relaunch).
@@ -1345,6 +1981,25 @@ pub fn install_portable_from_msix_with_observer_options(
     options: PortableInstallOptions,
     observer: &mut PortableObserver<'_>,
 ) -> Result<PortableInstallReport, EngineError> {
+    install_portable_from_msix_with_observer_options_and_progress(
+        msix_path,
+        install_root,
+        options,
+        observer,
+        None,
+    )
+}
+
+/// Portable installer variant that reports bytes while the verified archive is
+/// unpacked.  The ordinary API above intentionally remains unchanged for
+/// callers that do not need UI progress.
+pub fn install_portable_from_msix_with_observer_options_and_progress(
+    msix_path: &Path,
+    install_root: &Path,
+    options: PortableInstallOptions,
+    observer: &mut PortableObserver<'_>,
+    progress: Option<&PortableExtractionProgressObserver<'_>>,
+) -> Result<PortableInstallReport, EngineError> {
     let install_parent = install_root.parent().unwrap_or(install_root);
     fs::create_dir_all(install_parent).map_err(|e| io_err("create install parent", e))?;
     let operation_id = uuid::Uuid::new_v4();
@@ -1356,7 +2011,7 @@ pub fn install_portable_from_msix_with_observer_options(
     }
     fs::create_dir_all(&work_dir).map_err(|e| io_err("create portable staging", e))?;
 
-    let prepared = match prepare_portable_payload(msix_path, &work_dir) {
+    let prepared = match prepare_portable_payload(msix_path, &work_dir, progress) {
         Ok(prepared) => prepared,
         Err(error) => {
             return Err(match cleanup_portable_work_dir(&work_dir) {
@@ -1911,6 +2566,104 @@ mod tests {
     }
 
     #[test]
+    fn portable_startup_patch_is_fixed_width_and_idempotent() {
+        let root = temp_test_dir("startup-patch");
+        let resources = root.join("resources");
+        fs::create_dir_all(&resources).unwrap();
+        let app_asar = resources.join("app.asar");
+        let original = b"header getCurrentPackageFamily bootstrap OT()?.getCurrentPackageFamily() await o.initialize(); trailer";
+        fs::write(&app_asar, original).unwrap();
+
+        assert!(ensure_portable_codex_startup_compatibility(&root).unwrap());
+        let patched = fs::read(&app_asar).unwrap();
+        assert_eq!(patched.len(), original.len());
+        assert!(!patched
+            .windows(CODEX_ASAR_PACKAGE_FAMILY_CALL.len())
+            .any(|window| window == CODEX_ASAR_PACKAGE_FAMILY_CALL));
+        assert!(patched
+            .windows(CODEX_ASAR_PACKAGE_FAMILY_PATCH_PREFIX.len())
+            .any(|window| window == CODEX_ASAR_PACKAGE_FAMILY_PATCH_PREFIX));
+        assert!(!ensure_portable_codex_startup_compatibility(&root).unwrap());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn portable_console_spawn_patch_is_fixed_width_and_idempotent() {
+        let root = temp_test_dir("console-spawn-patch");
+        let resources = root.join("resources");
+        fs::create_dir_all(&resources).unwrap();
+        let app_asar = resources.join("app.asar");
+        let original = b"header stdio:[`pipe`,`pipe`,`pipe`],env:this.options.env trailer";
+        fs::write(&app_asar, original).unwrap();
+
+        assert!(ensure_portable_codex_startup_compatibility(&root).unwrap());
+        let patched = fs::read(&app_asar).unwrap();
+        assert_eq!(patched.len(), original.len());
+        assert!(!patched
+            .windows(CODEX_ASAR_CONSOLE_SPAWN_CALLS[0].0.len())
+            .any(|window| window == CODEX_ASAR_CONSOLE_SPAWN_CALLS[0].0));
+        assert!(patched
+            .windows(CODEX_ASAR_CONSOLE_SPAWN_SENTINEL.len())
+            .any(|window| window == CODEX_ASAR_CONSOLE_SPAWN_SENTINEL));
+        assert!(!ensure_portable_codex_startup_compatibility(&root).unwrap());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn portable_updater_patch_is_fixed_width_when_package_query_is_absent() {
+        let root = temp_test_dir("updater-patch");
+        let resources = root.join("resources");
+        fs::create_dir_all(&resources).unwrap();
+        let app_asar = resources.join("app.asar");
+        let original = b"header getCurrentPackageFamily bootstrap await o.initialize(); trailer";
+        fs::write(&app_asar, original).unwrap();
+
+        assert!(ensure_portable_codex_startup_compatibility(&root).unwrap());
+        let patched = fs::read(&app_asar).unwrap();
+        assert_eq!(patched.len(), original.len());
+        assert!(!patched
+            .windows(CODEX_ASAR_UPDATER_CALLS[0].len())
+            .any(|window| window == CODEX_ASAR_UPDATER_CALLS[0]));
+        assert!(patched
+            .windows(CODEX_ASAR_UPDATER_PATCH_PREFIX.len())
+            .any(|window| window == CODEX_ASAR_UPDATER_PATCH_PREFIX));
+        assert!(!ensure_portable_codex_startup_compatibility(&root).unwrap());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn portable_i18n_patch_enables_bundled_chinese_and_is_idempotent() {
+        let root = temp_test_dir("i18n-patch");
+        let resources = root.join("resources");
+        fs::create_dir_all(&resources).unwrap();
+        let app_asar = resources.join("app.asar");
+        let original =
+            b"other get(`enable_i18n`,!0) webview zh-CN get(`enable_i18n`,!1) locale bundle";
+        fs::write(&app_asar, original).unwrap();
+
+        assert!(ensure_portable_codex_locale_compatibility(&root, Some("zh-CN")).unwrap());
+        let patched = fs::read(&app_asar).unwrap();
+        assert_eq!(patched.len(), original.len());
+        assert!(!patched
+            .windows(b"get(`enable_i18n`,!1)".len())
+            .any(|window| window == b"get(`enable_i18n`,!1)"));
+        assert!(
+            patched
+                .windows(b"get(`enable_i18n`,!0)".len())
+                .filter(|window| *window == b"get(`enable_i18n`,!0)")
+                .count()
+                >= 2
+        );
+        assert!(!ensure_portable_codex_locale_compatibility(&root, Some("zh-CN")).unwrap());
+        assert!(!ensure_portable_codex_locale_compatibility(&root, Some("en")).unwrap());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn portable_shell_ownership_record_merges_paths_without_credentials() {
         let _env_lock = test_env_lock();
         let root = temp_test_dir("shell-ownership");
@@ -1942,6 +2695,54 @@ mod tests {
             None => std::env::remove_var("LOCALAPPDATA"),
         }
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn portable_payload_extraction_copies_only_declared_app_tree() {
+        let root = temp_test_dir("optimized-extract");
+        let package = root.join("fixture.msix");
+        let work = root.join("work");
+        fs::create_dir_all(&work).unwrap();
+
+        let file = fs::File::create(&package).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+        let manifest = r#"<Package><Identity Name="OpenAI.Codex" Publisher="CN=X" Version="1.0.0.0" ProcessorArchitecture="x64"/><Applications><Application Id="App" Executable="app/ChatGPT.exe"/></Applications></Package>"#;
+        zip.start_file("AppxManifest.xml", options).unwrap();
+        zip.write_all(manifest.as_bytes()).unwrap();
+        zip.start_file("assets/not-copied.bin", options).unwrap();
+        zip.write_all(b"no").unwrap();
+        zip.start_file("app/ChatGPT.exe", options).unwrap();
+        zip.write_all(b"entry").unwrap();
+        zip.start_file("app/resources/helper.bin", options).unwrap();
+        zip.write_all(b"helper").unwrap();
+        zip.finish().unwrap();
+
+        let progress = RefCell::new(Vec::new());
+        let prepared = prepare_portable_payload(
+            &package,
+            &work,
+            Some(&|update| {
+                progress.borrow_mut().push(update);
+                Ok(())
+            }),
+        )
+        .unwrap();
+        assert!(prepared.payload_dir.join("ChatGPT.exe").is_file());
+        assert!(prepared.payload_dir.join("resources/helper.bin").is_file());
+        assert!(!prepared.payload_dir.join("assets/not-copied.bin").exists());
+        assert!(prepared.payload_dir.join("AppxManifest.xml").is_file());
+        assert!(!work.join("extracted").exists());
+        let progress = progress.into_inner();
+        assert!(!progress.is_empty());
+        assert_eq!(progress.first().unwrap().completed_bytes, 0);
+        assert_eq!(progress.last().unwrap().completed_bytes, 11);
+        assert_eq!(progress.last().unwrap().total_bytes, 11);
+        assert_eq!(progress.last().unwrap().files_completed, 2);
+        assert!(progress
+            .windows(2)
+            .all(|window| window[1].completed_bytes >= window[0].completed_bytes));
+        fs::remove_dir_all(root).unwrap();
     }
 
     /// Release QA hook: exercises the exact USB extraction/transaction path

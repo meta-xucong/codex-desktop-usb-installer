@@ -8,6 +8,8 @@
 
 use std::fs::{self, File};
 use std::io::Read;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 #[cfg(windows)]
 use std::process::Command;
@@ -22,6 +24,8 @@ use crate::errors::AppError;
 
 const MANIFEST_FILE_NAME: &str = "manifest.json";
 const TEMP_INSTALLER_DIR: &str = "CodexDesktopInstaller";
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Manifest written by `tools/collect-payload.ps1` and shipped at the root of
 /// the USB layout.  All fields are intentionally explicit: a user machine
@@ -442,6 +446,7 @@ fn current_windows_build_number() -> Result<u32, AppError> {
             "-Command",
             "[Environment]::OSVersion.Version.Build",
         ])
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map_err(|error| engine_error(format!("读取 Windows Build 失败: {error}")))?;
     if !output.status.success() {
@@ -659,11 +664,12 @@ pub fn probe_offline_payload(
     let architecture = normalized_architecture_name(&bundle.manifest.architecture)
         .ok_or_else(|| engine_error("manifest architecture 无效"))?
         .to_string();
-    let release_tag = bundle
-        .manifest
-        .release_tag
-        .clone()
-        .unwrap_or_else(|| format!("local-signed-{}", bundle.manifest.codex_desktop_version));
+    // The root manifest tag records payload provenance and may be changed by
+    // the Codex payload hot-update channel (for example, `upstream-*`). The
+    // historical local-installer contract uses its own stable namespace. Do
+    // not pass the provenance tag into resolve_windows_local_package(), which
+    // intentionally returns `local-signed-*` for a verified local MSIX.
+    let release_tag = format!("local-signed-{}", bundle.manifest.codex_desktop_version);
     let warning = if embedded_version.is_none() {
         Some(
             "未读取到 resources/app.asar 的应用版本；安装阶段仍会再次执行完整 MSIX 校验。"
@@ -1087,7 +1093,7 @@ mod tests {
                 size: fs::metadata(msix).unwrap().len(),
             },
             package_version: Some("26.602.3474.0".to_string()),
-            release_tag: Some("local-signed-26.602.40724".to_string()),
+            release_tag: Some("upstream-26.602.40724".to_string()),
             source: Some("test-fixture".to_string()),
         }
     }
@@ -1138,6 +1144,7 @@ mod tests {
         assert!(report.hash_verified);
         assert_eq!(report.package_name, "OpenAI.Codex");
         assert_eq!(report.package_version, "26.602.3474.0");
+        assert_eq!(report.release_tag, "local-signed-26.602.40724");
         assert_eq!(report.app_entry.as_deref(), Some("app/Codex.exe"));
         assert!(!report.app_version_verified);
         assert!(

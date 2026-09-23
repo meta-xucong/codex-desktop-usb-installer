@@ -17,14 +17,14 @@ use codex_win_engine::{
     detect_installed_codex, detect_portable_install,
     download_to_with_progress_bounded_with_network, fetch_text_with_network, find_msix_sha256,
     install_msix_sideload_with_observer, install_msix_to_volume_with_observer,
-    install_portable_from_msix_with_observer, install_portable_from_msix_with_observer_options,
-    limits::MAX_PACKAGE_BYTES, parse_manifest, pause_active_download, plan_update,
-    precheck_msix_dependencies, probe_capabilities, purge_codex_user_data,
-    read_codex_app_version_from_msix, read_msix_identity, sha256_file, uninstall_portable,
-    validate_codex_identity, verify_msix_health_with_options, verify_openai_authenticode,
-    version_key, AuthenticodeReport, CapabilityState, EngineError, InstalledWindowsCodex,
-    MsixHealthReport, MsixIdentity, MsixMachineStateReport, MsixRemoveReport, MsixSideloadReport,
-    NetworkConfig, PortableBoundary, PortableInstallOptions, PortableInstallReport,
+    install_portable_from_msix_with_observer_options_and_progress, limits::MAX_PACKAGE_BYTES,
+    parse_manifest, pause_active_download, plan_update, precheck_msix_dependencies,
+    probe_capabilities, purge_codex_user_data, read_codex_app_version_from_msix,
+    read_msix_identity, sha256_file, uninstall_portable, validate_codex_identity,
+    verify_msix_health_with_options, verify_openai_authenticode, version_key, AuthenticodeReport,
+    CapabilityState, EngineError, InstalledWindowsCodex, MsixHealthReport, MsixIdentity,
+    MsixMachineStateReport, MsixRemoveReport, MsixSideloadReport, NetworkConfig, PortableBoundary,
+    PortableExtractionProgress, PortableInstallOptions, PortableInstallReport,
     PortableUninstallReport, WinCapabilityReport, WinInstallRoute, WindowsRelease,
     WindowsUpdatePlan,
 };
@@ -1377,6 +1377,7 @@ pub fn install_windows_historical_release(
         settings,
         stage,
         current_status.installed,
+        Some(progress),
         phase,
         evidence,
         policy_transition,
@@ -1714,6 +1715,7 @@ pub fn perform_windows_update_with_install_mode_network_and_phase(
         settings,
         stage,
         current_installed,
+        Some(progress),
         phase,
         evidence,
         None,
@@ -1732,6 +1734,7 @@ fn perform_verified_windows_stage_tail(
     settings: &AppSettings,
     stage: WinStageReport,
     current_installed: Option<InstalledWindowsCodex>,
+    progress: Option<&dyn Fn(DownloadProgress)>,
     phase: Option<&PhaseHook<'_>>,
     evidence: Option<&EvidenceHook<'_>>,
     policy_transition: Option<SelfUpdatePolicyTransition>,
@@ -1784,21 +1787,20 @@ fn perform_verified_windows_stage_tail(
     // this decides whether that checked process remains open afterward.
     let was_running = existing_codex_was_running(settings, current_installed.as_ref())?;
 
-    // Point of no return. Honor a cancel one last time BEFORE closing Codex or
-    // sideloading — closes the gap after staging where a fully-cached MSIX skips
-    // the download loop (so its cancel flag never arms) yet still reaches here.
-    // Completion classification remains independent from this quit phase and
-    // changes only when the evidence hook records a real or ambiguous mutation.
-    set_phase(OperationPhase::Committing);
-    // Linearized with every native/window quit path by OperationManager.
-    check_win_update_abort()?;
-
     if stage.route == "portable-fallback" {
         if !allow_portable_fallback {
             return Err(AppError::Engine(
                 "离线固定 MSIX 模式不允许切换到便携版".to_string(),
             ));
         }
+        // Portable fallback still has to unpack and copy the complete MSIX
+        // before the first install-root rename. Keep that work in the
+        // interruptible Applying phase; entering Committing here made a slow
+        // USB extraction look like a frozen "replacing files" operation and
+        // blocked every normal close request for the whole copy.
+        set_phase(OperationPhase::Applying);
+        // Linearized with every native/window quit path by OperationManager.
+        check_win_update_abort()?;
         log::warn!("Windows route changed to portable fallback from_route=msix-sideload to_route=portable-fallback");
         close_existing_codex_before_portable_fallback(settings, current_installed.as_ref())?;
         return install_portable_after_stage(
@@ -1809,12 +1811,21 @@ fn perform_verified_windows_stage_tail(
             was_running,
             current_installed,
             usb_portable,
+            progress,
             phase,
             evidence,
             policy_transition,
             before_commit,
         );
     }
+
+    // The MSIX sideload path reaches its point of no return only immediately
+    // before the deployment call can mutate package registration.  Keep the
+    // original hard close boundary for that path, but do not share it with the
+    // portable pre-commit extraction above.
+    set_phase(OperationPhase::Committing);
+    // Linearized with every native/window quit path by OperationManager.
+    check_win_update_abort()?;
 
     let staged_path = stage
         .staged_path
@@ -1836,6 +1847,11 @@ fn perform_verified_windows_stage_tail(
     validate_fixed_msix_dependencies(&precheck, allow_portable_fallback)?;
     if precheck.should_route_portable() && allow_portable_fallback {
         log::warn!("Windows route changed to portable fallback from_route=msix-sideload to_route=portable-fallback");
+        // Dependency inspection proved that no AppX mutation is needed. The
+        // following portable extraction is still pre-rename work, so expose it
+        // as Applying rather than leaving the UI/quit policy in Committing.
+        set_phase(OperationPhase::Applying);
+        check_win_update_abort()?;
         // We're switching to portable, but the running build must be stopped first.
         close_existing_codex_before_portable_fallback(settings, current_installed.as_ref())?;
         let mut stage = stage;
@@ -1851,6 +1867,7 @@ fn perform_verified_windows_stage_tail(
             was_running,
             current_installed,
             usb_portable,
+            progress,
             phase,
             evidence,
             policy_transition,
@@ -2263,6 +2280,7 @@ fn perform_verified_windows_stage_tail(
                 was_running,
                 current_installed,
                 usb_portable,
+                progress,
                 phase,
                 evidence,
                 None,
@@ -2374,6 +2392,7 @@ fn perform_verified_windows_stage_tail(
         was_running,
         current_installed,
         usb_portable,
+        progress,
         phase,
         evidence,
         policy_transition,
@@ -2401,6 +2420,7 @@ fn install_portable_after_stage(
     relaunch: bool,
     previous_installed: Option<InstalledWindowsCodex>,
     usb_portable: bool,
+    progress: Option<&dyn Fn(DownloadProgress)>,
     phase: Option<&PhaseHook<'_>>,
     evidence: Option<&EvidenceHook<'_>>,
     policy_transition: Option<SelfUpdatePolicyTransition>,
@@ -2534,22 +2554,33 @@ fn install_portable_after_stage(
             | PortableBoundary::RollbackCompleted { .. } => unreachable!("handled above"),
         }
     };
-    let portable_result = if usb_portable {
-        install_portable_from_msix_with_observer_options(
-            msix_path.as_path(),
-            install_root_path.as_path(),
-            PortableInstallOptions::usb_offline(),
-            &mut observer,
-        )
-    } else {
-        install_portable_from_msix_with_observer(
-            msix_path.as_path(),
-            install_root_path.as_path(),
-            true,
-            relaunch,
-            &mut observer,
-        )
+    let extraction_progress = |update: PortableExtractionProgress| {
+        if let Some(hook) = progress {
+            hook(DownloadProgress {
+                downloaded: update.completed_bytes,
+                total: update.total_bytes,
+                source: "U盘文件解压".to_string(),
+            });
+        }
+        Ok(())
     };
+    let portable_options = if usb_portable {
+        PortableInstallOptions::usb_offline()
+    } else {
+        PortableInstallOptions {
+            close_running: true,
+            launch_health_check: true,
+            relaunch,
+            create_shell_metadata: true,
+        }
+    };
+    let portable_result = install_portable_from_msix_with_observer_options_and_progress(
+        msix_path.as_path(),
+        install_root_path.as_path(),
+        portable_options,
+        &mut observer,
+        Some(&extraction_progress),
+    );
     let portable = portable_result.map_err(|err| {
         log::error!(
             "Windows portable install failed install_root={} error={err}",
@@ -2962,7 +2993,7 @@ pub(crate) fn remember_usb_no_sandbox_compatibility(codex_version: &str) {
 /// `detect_installed_codex` — so we launch exactly the build the UI is showing,
 /// never a stale MSIX that lingers behind a managed portable install.
 /// Fully-qualified engine call to avoid shadowing this function's name.
-pub fn launch_codex(settings: &AppSettings) -> Result<(), AppError> {
+pub fn launch_codex(settings: &AppSettings, codex_locale: Option<&str>) -> Result<(), AppError> {
     if usb_appx_recovery_pending() {
         return Err(AppError::Engine(
             "上次安装或数据恢复尚未完成，请先在 U 盘安装器中继续完成安装；恢复期间暂不启动 Codex，以免改写待恢复数据".into(),
@@ -2977,6 +3008,29 @@ pub fn launch_codex(settings: &AppSettings) -> Result<(), AppError> {
     }
     let path = &installed.path;
     log::info!("Windows launch Codex path={path}");
+    // Codex loads `model_catalog_json` when its app-server starts and keeps the
+    // resulting list in memory.  If the manager refreshed the catalog while a
+    // managed Codex process was already open, launching again would otherwise
+    // signal that old single-instance process and leave the stale model menu
+    // visible.  Consume the explicit reload marker by restarting only this
+    // manager-owned portable tree; unrelated Codex installations are never
+    // touched.
+    if crate::app::model_catalog::restart_required() {
+        match codex_win_engine::processes_running_for_root(Path::new(path)) {
+            Ok(true) => {
+                log::info!(
+                    "restarting managed Codex before applying refreshed native model catalog root={}"
+                    , path
+                );
+                close_codex_gracefully_for_root(30, Path::new(path)).map_err(engine_err)?;
+            }
+            Ok(false) => {}
+            Err(error) => log::warn!(
+                "could not inspect managed Codex before model catalog reload root={} error={error}",
+                path
+            ),
+        }
+    }
     let codex_home = if usb_mode {
         Some(usb_guard::local_data_paths()?.codex_home)
     } else {
@@ -3000,10 +3054,14 @@ pub fn launch_codex(settings: &AppSettings) -> Result<(), AppError> {
             disable_codex_self_updates: settings.disable_codex_self_updates || usb_mode,
             remote_debugging_port: None,
             codex_home,
+            locale_override: codex_locale.map(str::to_string),
             portable_launch_policy: launch_policy,
         },
     )
     .map_err(|e| AppError::Engine(e.to_string()))?;
+    if crate::app::model_catalog::restart_required() {
+        crate::app::model_catalog::clear_restart_required();
+    }
     if usb_mode && report.no_sandbox {
         remember_usb_no_sandbox_compatibility(&installed.version);
     }

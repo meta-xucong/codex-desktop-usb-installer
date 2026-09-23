@@ -9,6 +9,7 @@ use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_updater::UpdaterExt;
 
+use crate::app::account::AccountStatus;
 use crate::app::atomic_file;
 use crate::app::capability_pack::{
     install as install_capability_pack_impl, status as capability_pack_status_impl,
@@ -34,6 +35,7 @@ use crate::app::mac_update::{
     HistoricalMacEvidence, HistoricalMacExpectation, InstalledCodex, MacInstallStatus,
     MacPerformReport, MacStageReport, MacUninstallReport, MacUpdateReport, PerformExpectation,
 };
+use crate::app::model_catalog::NativeModelCatalogReport;
 use crate::app::offline_payload::{
     cleanup_staged_payload, probe_offline_payload, stage_offline_payload, OfflinePayloadReport,
     OfflineStageReport,
@@ -83,7 +85,7 @@ use crate::app::window_mode::{self, WindowMode, WindowModeReport};
 use crate::domain::settings::AppSettings as DomainAppSettings;
 use crate::domain::target::{Architecture, OperatingSystem, Target};
 use crate::errors::{classify, AppError, CommandError, ErrorKind};
-use crate::state::ManagerState;
+use crate::state::{ManagerState, UninstallHandoff};
 
 fn normalize_windows_source_base(raw: &str) -> Option<String> {
     let mut base = raw.trim().trim_end_matches('/').to_string();
@@ -503,9 +505,11 @@ pub async fn manager_check_update(
 #[tauri::command]
 pub async fn manager_install_update(
     app: AppHandle,
+    state: State<'_, ManagerState>,
     expected_version: String,
     expected_current_version: String,
 ) -> Result<(), CommandError> {
+    reject_uninstall_handoff(&state)?;
     log::info!(
         "manager update install start expected_version={} expected_current_version={}",
         expected_version,
@@ -575,6 +579,7 @@ pub async fn payload_apply_codex(
     if !matches!(state.target.os, OperatingSystem::Windows) {
         return Err(AppError::UnsupportedPlatform.into());
     }
+    reject_uninstall_handoff(&state)?;
     let bundle_root = crate::app::usb_guard::authorized_signed_bundle_identity()?.0;
     let settings = PersistedAppSettings::load();
     let ctx = crate::app::update_channel::UpdateContext {
@@ -593,11 +598,25 @@ pub async fn payload_apply_codex(
             }),
         );
     };
-    tauri::async_runtime::spawn_blocking(move || {
+    let _ = app.emit(
+        "payload-update-progress",
+        serde_json::json!({
+            "channel": "codex",
+            "phase": "preparing",
+        }),
+    );
+    let update_result = tauri::async_runtime::spawn_blocking(move || {
         crate::app::channels::codex::apply(&ctx, &info, &progress)
     })
     .await
-    .map_err(|e| AppError::Internal(format!("join: {e}")))??;
+    .map_err(|e| AppError::Internal(format!("join: {e}")))?;
+    if let Err(error) = update_result {
+        log::error!(
+            "codex payload update command failed stage=command code={} error={error}",
+            error.code()
+        );
+        return Err(error.into());
+    }
     let _ = app.emit(
         "payload-update-progress",
         serde_json::json!({
@@ -651,6 +670,7 @@ const MIN_PORTABLE_FREE_SPACE_BYTES: u64 = 1_073_741_824;
 const INSTALL_LOCATION_PROBE_PREFIX: &str = ".codex-manager-install-test-";
 
 fn begin_guard(state: &ManagerState, kind: OperationKind) -> Result<OperationGuard, CommandError> {
+    reject_uninstall_handoff(state)?;
     state
         .operations
         .begin(kind)
@@ -662,6 +682,15 @@ fn begin_guard(state: &ManagerState, kind: OperationKind) -> Result<OperationGua
             AppError::from(err)
         })
         .map_err(Into::into)
+}
+
+fn reject_uninstall_handoff(state: &ManagerState) -> Result<(), CommandError> {
+    if state.uninstall_handoff_active() {
+        return Err(
+            AppError::Busy("卸载清理正在等待管理器退出，请先完成并退出".to_string()).into(),
+        );
+    }
+    Ok(())
 }
 
 struct DetachedGuard {
@@ -681,6 +710,7 @@ impl DetachedGuard {
         token: OperationToken,
         completion_tracking: bool,
     ) -> Result<Self, CommandError> {
+        reject_uninstall_handoff(state)?;
         let operations = state.operations.clone();
         operations
             .validate(&token)
@@ -698,6 +728,7 @@ impl DetachedGuard {
         token: OperationToken,
         phase: OperationPhase,
     ) -> Result<Self, CommandError> {
+        reject_uninstall_handoff(state)?;
         let operations = state.operations.clone();
         operations
             .validate_with_phase(&token, phase)
@@ -760,6 +791,32 @@ struct DownloadProgressEvent {
     total: u64,
     source: String,
     operation_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase: Option<OperationPhase>,
+}
+
+fn emit_op_phase(
+    app: &AppHandle,
+    operations: &OperationManager,
+    token: &OperationToken,
+    channel: &str,
+    phase: OperationPhase,
+) {
+    let _ = operations.set_phase(token, phase);
+    let snapshot = operations.snapshot();
+    let progress = snapshot
+        .filter(|snapshot| snapshot.id == token.0)
+        .and_then(|snapshot| snapshot.progress);
+    let _ = app.emit(
+        channel,
+        DownloadProgressEvent {
+            downloaded: progress.as_ref().map(|p| p.downloaded).unwrap_or(0),
+            total: progress.as_ref().map(|p| p.total).unwrap_or(0),
+            source: progress.map(|p| p.source).unwrap_or_default(),
+            operation_id: token.0.clone(),
+            phase: Some(phase),
+        },
+    );
 }
 
 fn emit_op_download_progress(
@@ -777,10 +834,29 @@ fn emit_op_download_progress(
         source: source.clone(),
     };
     let _ = operations.set_progress(token, progress);
-    // Bytes in flight ⇒ downloading phase (unless already past it).
-    if total > 0 && downloaded < total {
+    // Bytes in flight normally mean Downloading, but portable extraction also
+    // uses this event channel while the operation is already Applying.  Do
+    // not regress the durable phase or the UI will lose its install wording
+    // and re-enable download controls during a non-interruptible write.
+    let current_phase = operations
+        .snapshot()
+        .filter(|snapshot| snapshot.id == token.0)
+        .map(|snapshot| snapshot.phase);
+    if total > 0
+        && downloaded < total
+        && matches!(
+            current_phase,
+            None | Some(
+                OperationPhase::Idle | OperationPhase::Preparing | OperationPhase::Downloading
+            )
+        )
+    {
         let _ = operations.set_phase(token, OperationPhase::Downloading);
     }
+    let phase = operations
+        .snapshot()
+        .filter(|snapshot| snapshot.id == token.0)
+        .map(|snapshot| snapshot.phase);
     let _ = app.emit(
         channel,
         DownloadProgressEvent {
@@ -788,6 +864,7 @@ fn emit_op_download_progress(
             total,
             source,
             operation_id: token.0.clone(),
+            phase,
         },
     );
 }
@@ -1171,6 +1248,7 @@ pub async fn offline_payload_stage(
     if !matches!(state.target.os, OperatingSystem::Windows) {
         return Err(AppError::UnsupportedPlatform.into());
     }
+    reject_uninstall_handoff(&state)?;
     crate::app::usb_guard::require_signed_codex_bundle("offline-payload-stage")?;
     let executable = std::env::current_exe()
         .map_err(|error| AppError::Internal(format!("无法确定安装器路径: {error}")))?;
@@ -1193,10 +1271,14 @@ pub async fn offline_payload_stage(
 /// backend validates the path is below `%TEMP%\\CodexDesktopInstaller` before
 /// deleting anything.
 #[tauri::command]
-pub async fn offline_payload_cleanup(staged_path: String) -> Result<(), CommandError> {
+pub async fn offline_payload_cleanup(
+    state: State<'_, ManagerState>,
+    staged_path: String,
+) -> Result<(), CommandError> {
     if !cfg!(target_os = "windows") {
         return Err(AppError::UnsupportedPlatform.into());
     }
+    reject_uninstall_handoff(&state)?;
     tauri::async_runtime::spawn_blocking(move || cleanup_staged_payload(Path::new(&staged_path)))
         .await
         .map_err(|error| AppError::Internal(format!("join: {error}")))?
@@ -1337,6 +1419,9 @@ pub async fn mac_perform_update(
     let phase_token = op.token_clone();
     let progress_token = phase_token.clone();
     let progress_ops = ops.clone();
+    let phase_app = progress_app.clone();
+    let phase_ops = ops.clone();
+    let phase_event_token = phase_token.clone();
     let result = match tauri::async_runtime::spawn_blocking(move || {
         let report = move |p: crate::app::mac_update::DownloadProgress| {
             if let Some(token) = progress_token.as_ref() {
@@ -1353,9 +1438,15 @@ pub async fn mac_perform_update(
                 let _ = progress_app.emit("mac://download-progress", p);
             }
         };
-        let phase_hook = |phase: OperationPhase| {
-            if let Some(token) = phase_token.as_ref() {
-                let _ = ops.set_phase(token, phase);
+        let phase_hook = move |phase: OperationPhase| {
+            if let Some(token) = phase_event_token.as_ref() {
+                emit_op_phase(
+                    &phase_app,
+                    &phase_ops,
+                    token,
+                    "mac://download-progress",
+                    phase,
+                );
             }
         };
         perform_macos_update_with_network_and_phase(
@@ -1463,7 +1554,7 @@ pub async fn mac_launch_codex(state: State<'_, ManagerState>) -> Result<(), Comm
     let settings = PersistedAppSettings::load();
     if settings.codex_theme.is_some() && state.operations.snapshot().is_none() {
         let themed =
-            crate::app::codex_theme::launch_with_active_theme(&state.codex_theme, &settings)
+            crate::app::codex_theme::launch_with_active_theme(&state.codex_theme, &settings, None)
                 .await?;
         if themed {
             return Ok(());
@@ -1516,6 +1607,8 @@ pub async fn mac_install(
     let progress_ops = ops.clone();
     let phase_token = token.clone();
     let phase_ops = ops.clone();
+    let phase_app = app.clone();
+    let phase_event_token = phase_token.clone();
     let result = match tauri::async_runtime::spawn_blocking(move || {
         let report = move |p: crate::app::mac_update::DownloadProgress| {
             emit_op_download_progress(
@@ -1528,8 +1621,14 @@ pub async fn mac_install(
                 p.source,
             );
         };
-        let phase_hook = |phase: OperationPhase| {
-            let _ = phase_ops.set_phase(&phase_token, phase);
+        let phase_hook = move |phase: OperationPhase| {
+            emit_op_phase(
+                &phase_app,
+                &phase_ops,
+                &phase_event_token,
+                "mac://download-progress",
+                phase,
+            );
         };
         install_macos_with_network_and_phase_for_target(
             &report,
@@ -1625,6 +1724,9 @@ pub async fn mac_install_historical_release(
     let phase_token = op.token_clone();
     let progress_token = phase_token.clone();
     let progress_ops = ops.clone();
+    let phase_app = progress_app.clone();
+    let phase_ops = ops.clone();
+    let phase_event_token = phase_token.clone();
     let expected = HistoricalMacExpectation {
         current_path: expected_current_path,
         current_build: expected_current_build,
@@ -1690,9 +1792,15 @@ pub async fn mac_install_historical_release(
                 );
             }
         };
-        let phase_hook = |phase: OperationPhase| {
-            if let Some(token) = phase_token.as_ref() {
-                let _ = ops.set_phase(token, phase);
+        let phase_hook = move |phase: OperationPhase| {
+            if let Some(token) = phase_event_token.as_ref() {
+                emit_op_phase(
+                    &phase_app,
+                    &phase_ops,
+                    token,
+                    "mac://download-progress",
+                    phase,
+                );
             }
         };
         let evidence_hook = |evidence: HistoricalMacEvidence| {
@@ -1779,6 +1887,7 @@ pub fn mac_pause_download(
     if !cfg!(target_os = "macos") {
         return Err(AppError::UnsupportedPlatform.into());
     }
+    reject_uninstall_handoff(&state)?;
     Ok(state
         .operations
         .request_pause(&OperationToken(operation_id), pause_macos_download))
@@ -1794,6 +1903,7 @@ pub fn mac_cancel_download(
     if !cfg!(target_os = "macos") {
         return Err(AppError::UnsupportedPlatform.into());
     }
+    reject_uninstall_handoff(&state)?;
     Ok(state
         .operations
         .request_cancellation(&OperationToken(operation_id), cancel_macos_download))
@@ -1807,6 +1917,7 @@ pub fn mac_discard_download(state: State<'_, ManagerState>) -> Result<(), Comman
     if !cfg!(target_os = "macos") {
         return Err(AppError::UnsupportedPlatform.into());
     }
+    reject_uninstall_handoff(&state)?;
     discard_macos_download()?;
     state.operations.clear_paused_snapshot();
     Ok(())
@@ -2021,6 +2132,7 @@ pub fn retry_ancillary(
     confirm: Option<bool>,
     token: Option<OperationToken>,
 ) -> Result<AncillaryRetryReport, CommandError> {
+    reject_uninstall_handoff(&state)?;
     let actions = &request.actions;
     let path = request.path.as_deref();
     let purge = request.purge_user_data
@@ -2065,6 +2177,7 @@ pub fn begin_operation(
     state: State<'_, ManagerState>,
     kind: OperationKind,
 ) -> Result<OperationToken, CommandError> {
+    reject_uninstall_handoff(&state)?;
     state
         .operations
         .begin_detached(kind)
@@ -2083,6 +2196,7 @@ pub fn arm_destructive(
     state: State<'_, ManagerState>,
     kind: OperationKind,
 ) -> Result<OperationToken, CommandError> {
+    reject_uninstall_handoff(&state)?;
     if !matches!(kind, OperationKind::Update | OperationKind::Uninstall) {
         return Err(
             AppError::Internal("仅 update/uninstall 操作可使用破坏性令牌".to_string()).into(),
@@ -2181,6 +2295,71 @@ pub fn confirm_quit(
         return Err(AppError::Busy(reason.clone()).into());
     }
     crate::exit_after_confirm(&app);
+    Ok(())
+}
+
+/// The Windows USB uninstaller returns a truthful `cleanup_pending` handoff
+/// before the manager can exit.  The renderer calls this only after showing
+/// that result to the user.  Do not turn this into a general-purpose exit
+/// command: an armed in-process handoff is the proof that a helper is waiting
+/// for this exact manager lifetime.
+#[tauri::command]
+pub fn get_uninstall_handoff(state: State<'_, ManagerState>) -> Option<UninstallHandoffStatus> {
+    state
+        .uninstall_handoff()
+        .map(|handoff| UninstallHandoffStatus {
+            id: handoff.id,
+            report_path: handoff.report_path,
+            message: handoff.message,
+        })
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UninstallHandoffStatus {
+    pub id: String,
+    pub report_path: String,
+    pub message: String,
+}
+
+/// Acknowledge the exact pending helper handoff and request a controlled exit.
+/// The ID check is deliberately separate from the OS exit request: stale or
+/// duplicated renderer events must not consume a newer handoff.
+#[tauri::command]
+pub fn complete_uninstall_handoff(
+    app: tauri::AppHandle,
+    state: State<'_, ManagerState>,
+    handoff_id: String,
+) -> Result<(), CommandError> {
+    if handoff_id.trim().is_empty() {
+        return Err(AppError::Busy("卸载清理交接标识无效，请重新打开卸载页面".to_string()).into());
+    }
+    if !state.uninstall_handoff_matches(&handoff_id) {
+        return Err(AppError::Busy("卸载清理交接不存在、已过期或已完成".to_string()).into());
+    }
+    let policy = crate::confirmed_quit_policy_for(&app);
+    if let QuitPolicy::Block {
+        phase,
+        reason_code,
+        reason,
+        kind,
+    } = &policy
+    {
+        log::warn!(
+            "uninstall handoff exit blocked phase={} reason_code={reason_code} kind={kind:?} reason={reason}",
+            phase.as_str()
+        );
+        crate::dispatch_shell_event(
+            &app,
+            crate::app::shell::ShellEvent::QuitBlocked(policy.clone()),
+        );
+        return Err(AppError::Busy(reason.clone()).into());
+    }
+    if !state.authorize_uninstall_handoff(&handoff_id) {
+        return Err(AppError::Busy("卸载清理交接不存在、已过期或已完成".to_string()).into());
+    }
+    log::info!("Windows uninstall handoff acknowledged by user");
+    crate::exit_after_uninstall_handoff(&app);
     Ok(())
 }
 
@@ -2360,6 +2539,7 @@ pub async fn win_auto_stage_update(
     if !matches!(state.target.os, OperatingSystem::Windows) {
         return Err(AppError::UnsupportedPlatform.into());
     }
+    reject_uninstall_handoff(&state)?;
     if enabled {
         crate::app::usb_guard::require_signed_codex_bundle("win-auto-stage-update")?;
     }
@@ -2403,6 +2583,7 @@ pub fn win_pause_download(
     if !matches!(state.target.os, OperatingSystem::Windows) {
         return Err(AppError::UnsupportedPlatform.into());
     }
+    reject_uninstall_handoff(&state)?;
     Ok(state
         .operations
         .request_pause(&OperationToken(operation_id), pause_windows_download))
@@ -2418,6 +2599,7 @@ pub fn win_cancel_download(
     if !matches!(state.target.os, OperatingSystem::Windows) {
         return Err(AppError::UnsupportedPlatform.into());
     }
+    reject_uninstall_handoff(&state)?;
     Ok(state
         .operations
         .request_cancellation(&OperationToken(operation_id), cancel_windows_download))
@@ -2430,6 +2612,7 @@ pub fn win_discard_download(state: State<'_, ManagerState>) -> Result<(), Comman
     if !matches!(state.target.os, OperatingSystem::Windows) {
         return Err(AppError::UnsupportedPlatform.into());
     }
+    reject_uninstall_handoff(&state)?;
     discard_windows_download()?;
     state.operations.clear_paused_snapshot();
     Ok(())
@@ -2445,7 +2628,12 @@ pub fn get_autostart(app: tauri::AppHandle) -> Result<bool, CommandError> {
 
 /// Enable/disable launch at login. The user opts in explicitly from Settings.
 #[tauri::command]
-pub fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<(), CommandError> {
+pub fn set_autostart(
+    app: tauri::AppHandle,
+    state: State<'_, ManagerState>,
+    enabled: bool,
+) -> Result<(), CommandError> {
+    reject_uninstall_handoff(&state)?;
     let mgr = app.autolaunch();
     let result = if enabled { mgr.enable() } else { mgr.disable() };
     result.map_err(|e| AppError::Internal(format!("autostart: {e}")).into())
@@ -2460,6 +2648,7 @@ pub fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<(), Command
 /// the operation lock — a themed relaunch racing an updater's quit/swap would
 /// interleave two owners of the Codex process lifecycle.
 fn ensure_theme_may_restart_codex(state: &ManagerState) -> Result<(), CommandError> {
+    reject_uninstall_handoff(state)?;
     crate::app::usb_guard::require_signed_codex_bundle("codex-theme-restart")?;
     if state.operations.snapshot().is_some() {
         return Err(AppError::Engine("有正在进行的操作，请稍后再试".to_string()).into());
@@ -2487,6 +2676,7 @@ pub async fn codex_theme_try_on(
     state: State<'_, ManagerState>,
     theme_ref: String,
 ) -> Result<crate::app::codex_theme::ThemeStatusReport, CommandError> {
+    reject_uninstall_handoff(&state)?;
     crate::app::usb_guard::require_signed_codex_bundle("codex-theme-try-on")?;
     let settings = PersistedAppSettings::load();
     state.codex_theme.try_on(&settings, &theme_ref).await?;
@@ -2512,7 +2702,11 @@ pub async fn codex_theme_try_on_restart(
 /// Persist the selection (the daemon keeps whatever is currently injected;
 /// future launches through the manager apply it automatically).
 #[tauri::command]
-pub fn codex_theme_keep(theme_ref: String) -> Result<(), CommandError> {
+pub fn codex_theme_keep(
+    state: State<'_, ManagerState>,
+    theme_ref: String,
+) -> Result<(), CommandError> {
+    reject_uninstall_handoff(&state)?;
     crate::app::usb_guard::require_signed_codex_bundle("codex-theme-keep")?;
     let mut settings = PersistedAppSettings::load();
     let dir = crate::app::codex_theme::resolve_theme_for_keep(&settings, &theme_ref)?;
@@ -2529,7 +2723,11 @@ pub fn codex_theme_keep(theme_ref: String) -> Result<(), CommandError> {
 /// selection (turn it off first — never silently un-theme a running Codex);
 /// dev-checkout copies are never touched (delete only the store copy).
 #[tauri::command]
-pub fn codex_theme_delete(theme_ref: String) -> Result<(), CommandError> {
+pub fn codex_theme_delete(
+    state: State<'_, ManagerState>,
+    theme_ref: String,
+) -> Result<(), CommandError> {
+    reject_uninstall_handoff(&state)?;
     let settings = PersistedAppSettings::load();
     if settings.codex_theme.as_deref() == Some(theme_ref.as_str()) {
         return Err(AppError::Engine("请先关闭该主题再删除".to_string()).into());
@@ -2563,7 +2761,9 @@ pub async fn codex_theme_apply(
 #[tauri::command]
 pub async fn codex_theme_import(
     app: tauri::AppHandle,
+    state: State<'_, ManagerState>,
 ) -> Result<Option<codex_theme_engine::theme::ThemeSummary>, CommandError> {
+    reject_uninstall_handoff(&state)?;
     let picked = tauri::async_runtime::spawn_blocking(move || {
         app.dialog()
             .file()
@@ -2583,8 +2783,10 @@ pub async fn codex_theme_import(
 /// Install a `.codexskin` from an explicit path (drag-and-drop delivery).
 #[tauri::command]
 pub async fn codex_theme_import_path(
+    state: State<'_, ManagerState>,
     path: String,
 ) -> Result<codex_theme_engine::theme::ThemeSummary, CommandError> {
+    reject_uninstall_handoff(&state)?;
     tauri::async_runtime::spawn_blocking(move || import_codexskin_at(Path::new(&path)))
         .await
         .map_err(|e| AppError::Internal(format!("join: {e}")))?
@@ -2645,8 +2847,10 @@ pub async fn codex_theme_catalog_preview(
 /// Download, sha256-verify and install one catalog skin.
 #[tauri::command]
 pub async fn codex_theme_install_online(
+    state: State<'_, ManagerState>,
     skin_id: String,
 ) -> Result<codex_theme_engine::theme::ThemeSummary, CommandError> {
+    reject_uninstall_handoff(&state)?;
     tauri::async_runtime::spawn_blocking(move || {
         crate::app::codex_theme::install_from_catalog(&skin_id)
     })
@@ -2664,6 +2868,7 @@ pub async fn codex_theme_pick_store_dir(
     app: tauri::AppHandle,
     state: State<'_, ManagerState>,
 ) -> Result<Option<crate::app::codex_theme::StoreMigrationReport>, CommandError> {
+    reject_uninstall_handoff(&state)?;
     let settings = PersistedAppSettings::load();
     let current = crate::app::codex_theme::store_dir(&settings)?;
     let start_dir = current.clone();
@@ -2713,7 +2918,8 @@ pub async fn codex_theme_pick_store_dir(
 
 /// Reveal the current skin store in Finder/Explorer.
 #[tauri::command]
-pub fn codex_theme_open_store() -> Result<(), CommandError> {
+pub fn codex_theme_open_store(state: State<'_, ManagerState>) -> Result<(), CommandError> {
+    reject_uninstall_handoff(&state)?;
     let dir = crate::app::codex_theme::store_dir(&PersistedAppSettings::load())?;
     let _ = std::fs::create_dir_all(&dir);
     open_dir_platform(&dir).map_err(|e| AppError::Internal(format!("打开主题目录失败: {e}")).into())
@@ -2726,6 +2932,7 @@ pub async fn codex_theme_off(
     state: State<'_, ManagerState>,
     full: bool,
 ) -> Result<crate::app::codex_theme::ThemeStatusReport, CommandError> {
+    reject_uninstall_handoff(&state)?;
     if full {
         ensure_theme_may_restart_codex(&state)?;
         state.codex_theme.off_full().await?;
@@ -2749,6 +2956,7 @@ pub async fn codex_theme_off(
 pub async fn codex_theme_cancel(
     state: State<'_, ManagerState>,
 ) -> Result<crate::app::codex_theme::ThemeStatusReport, CommandError> {
+    reject_uninstall_handoff(&state)?;
     crate::app::usb_guard::require_signed_codex_bundle("codex-theme-cancel")?;
     state.codex_theme.cancel_try_on().await?;
     let settings = PersistedAppSettings::load();
@@ -3020,18 +3228,29 @@ pub async fn win_adopt(state: State<'_, ManagerState>) -> Result<WinInstallStatu
 /// cannot freeze the WebView while the OS is cold-starting Codex. Errors still
 /// surface to the UI after the blocking work finishes.
 #[tauri::command]
-pub async fn win_launch_codex(state: State<'_, ManagerState>) -> Result<(), CommandError> {
+pub async fn win_launch_codex(
+    state: State<'_, ManagerState>,
+    locale: Option<String>,
+) -> Result<(), CommandError> {
     if !matches!(state.target.os, OperatingSystem::Windows) {
         return Err(AppError::UnsupportedPlatform.into());
     }
     crate::app::usb_guard::require_signed_codex_bundle("win-launch-codex")?;
     let persisted = PersistedAppSettings::load();
+    let codex_locale = locale
+        .as_deref()
+        .map(str::trim)
+        .filter(|locale| matches!(*locale, "zh-CN" | "zh-TW"))
+        .map(str::to_owned);
     let before_codex = crate::app::usb_guard::snapshot_processes("Codex.exe");
     let before_chatgpt = crate::app::usb_guard::snapshot_processes("ChatGPT.exe");
     if persisted.codex_theme.is_some() && state.operations.snapshot().is_none() {
-        let themed =
-            crate::app::codex_theme::launch_with_active_theme(&state.codex_theme, &persisted)
-                .await?;
+        let themed = crate::app::codex_theme::launch_with_active_theme(
+            &state.codex_theme,
+            &persisted,
+            codex_locale.as_deref(),
+        )
+        .await?;
         if themed {
             tauri::async_runtime::spawn_blocking(move || {
                 std::thread::sleep(std::time::Duration::from_millis(500));
@@ -3042,7 +3261,7 @@ pub async fn win_launch_codex(state: State<'_, ManagerState>) -> Result<(), Comm
     }
     let settings = windows_domain_settings_for_persisted(&state);
     tauri::async_runtime::spawn_blocking(move || {
-        let result = crate::app::win_update::launch_codex(&settings);
+        let result = crate::app::win_update::launch_codex(&settings, codex_locale.as_deref());
         if result.is_ok() {
             std::thread::sleep(std::time::Duration::from_millis(500));
             crate::app::usb_guard::register_new_codex_processes(&before_codex, &before_chatgpt);
@@ -3061,6 +3280,18 @@ pub fn usb_guard_status() -> UsbGuardStatus {
     crate::app::usb_guard::current_status()
 }
 
+/// Refresh the official Codex native model catalog from the signed USB
+/// account's unified gateway. The operation is best-effort at the UI layer;
+/// an unavailable gateway does not prevent Codex from launching.
+#[tauri::command]
+pub async fn refresh_native_model_catalog(
+    force: bool,
+) -> Result<NativeModelCatalogReport, CommandError> {
+    crate::app::model_catalog::refresh(force)
+        .await
+        .map_err(Into::into)
+}
+
 /// Windows-only: install the bundled Codex Switch configurator and start it.
 ///
 /// The USB build keeps `ccswitch/CodexSwitch.exe` beside the setup executable;
@@ -3073,12 +3304,39 @@ pub fn usb_guard_status() -> UsbGuardStatus {
 #[tauri::command]
 pub async fn install_and_launch_ccswitch(
     app: AppHandle,
+    state: State<'_, ManagerState>,
 ) -> Result<CcswitchLaunchReport, CommandError> {
+    reject_uninstall_handoff(&state)?;
     crate::app::usb_guard::require_usb_content_access("ccswitch-launch")?;
     tauri::async_runtime::spawn_blocking(move || install_and_launch_ccswitch_impl(&app))
         .await
         .map_err(|e| AppError::Internal(format!("join: {e}")))?
         .map_err(Into::into)
+}
+
+/// Read the signed USB account binding and the in-memory 404token session.
+#[tauri::command]
+pub fn account_status() -> Result<AccountStatus, CommandError> {
+    crate::app::account::status().map_err(Into::into)
+}
+
+/// Login with the password belonging to the signed USB account. The password
+/// is consumed by this call and is never persisted or returned to the UI.
+#[tauri::command]
+pub async fn account_login(password: String) -> Result<AccountStatus, CommandError> {
+    crate::app::account::login(password)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn account_refresh() -> Result<AccountStatus, CommandError> {
+    crate::app::account::refresh().await.map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn account_redeem(code: String) -> Result<AccountStatus, CommandError> {
+    crate::app::account::redeem(code).await.map_err(Into::into)
 }
 
 /// Inspect the bundled Codex capability pack without changing the local
@@ -3119,6 +3377,7 @@ pub async fn skill_repo_check_update(
     app: AppHandle,
     state: State<'_, ManagerState>,
 ) -> Result<SkillRepoUpdateInfo, CommandError> {
+    reject_uninstall_handoff(&state)?;
     let operations = state.operations.clone();
     check_skill_repo_update(&app, &operations).await
 }
@@ -3130,6 +3389,7 @@ pub async fn skill_repo_apply_update(
     state: State<'_, ManagerState>,
     expected: SkillRepoExpected,
 ) -> Result<SkillRepoApplyReport, CommandError> {
+    reject_uninstall_handoff(&state)?;
     let operations = state.operations.clone();
     apply_skill_repo_update(&app, &operations, expected).await
 }
@@ -3140,6 +3400,7 @@ pub async fn skill_repo_rollback(
     app: AppHandle,
     state: State<'_, ManagerState>,
 ) -> Result<SkillRepoRollbackReport, CommandError> {
+    reject_uninstall_handoff(&state)?;
     let operations = state.operations.clone();
     rollback_skill_repo_update(&app, &operations).await
 }
@@ -3209,6 +3470,9 @@ pub async fn win_perform_update(
     let phase_token = op.token_clone();
     let progress_token = phase_token.clone();
     let progress_ops = ops.clone();
+    let phase_app = progress_app.clone();
+    let phase_ops = ops.clone();
+    let phase_event_token = phase_token.clone();
     let report = tauri::async_runtime::spawn_blocking(move || {
         let report = move |p: WinDownloadProgress| {
             if let Some(token) = progress_token.as_ref() {
@@ -3225,9 +3489,15 @@ pub async fn win_perform_update(
                 let _ = progress_app.emit("win://download-progress", p);
             }
         };
-        let phase_hook = |phase: OperationPhase| {
-            if let Some(token) = phase_token.as_ref() {
-                let _ = ops.set_phase(token, phase);
+        let phase_hook = move |phase: OperationPhase| {
+            if let Some(token) = phase_event_token.as_ref() {
+                emit_op_phase(
+                    &phase_app,
+                    &phase_ops,
+                    token,
+                    "win://download-progress",
+                    phase,
+                );
             }
         };
         let evidence_hook = |evidence: OperationEvidence| {
@@ -3383,6 +3653,9 @@ pub async fn win_install_historical_release(
     let phase_token = op.token_clone();
     let progress_token = phase_token.clone();
     let progress_ops = ops.clone();
+    let phase_app = progress_app.clone();
+    let phase_ops = ops.clone();
+    let phase_event_token = phase_token.clone();
     let previous_block_updates = PersistedAppSettings::load().disable_codex_self_updates;
     let policy_transition =
         (previous_block_updates != block_updates).then_some(SelfUpdatePolicyTransition {
@@ -3401,10 +3674,11 @@ pub async fn win_install_historical_release(
         };
         let resolved = if let Some(path) = local_path.as_ref() {
             let resolved = resolve_windows_local_package(path, architecture)?;
-            if resolved.release_tag != release_tag || resolved.name != asset_name {
-                return Err(AppError::StaleExpectation(
-                    "本地 MSIX 在确认后发生变化，请重新选择并确认".to_string(),
-                ));
+            if resolved.name != asset_name {
+                return Err(AppError::StaleExpectation(format!(
+                    "本地 MSIX 文件名在确认后发生变化（确认时 {}，现在 {}），请重新选择并确认",
+                    asset_name, resolved.name
+                )));
             }
             resolved
         } else {
@@ -3448,9 +3722,15 @@ pub async fn win_install_historical_release(
                 );
             }
         };
-        let phase_hook = |phase: OperationPhase| {
-            if let Some(token) = phase_token.as_ref() {
-                let _ = ops.set_phase(token, phase);
+        let phase_hook = move |phase: OperationPhase| {
+            if let Some(token) = phase_event_token.as_ref() {
+                emit_op_phase(
+                    &phase_app,
+                    &phase_ops,
+                    token,
+                    "win://download-progress",
+                    phase,
+                );
             }
         };
         let evidence_hook = |evidence: OperationEvidence| {
@@ -3562,12 +3842,22 @@ pub async fn win_uninstall(
     let _op = DetachedGuard::validate_with_phase(&state, token, OperationPhase::Committing)?;
     // Remove-AppxPackage / portable tree removal must not be killed mid-call.
     let settings = windows_domain_settings_for_persisted(&state);
-    tauri::async_runtime::spawn_blocking(move || {
+    let transaction_scope = PathBuf::from(settings.install_root.clone());
+    let mut report = tauri::async_runtime::spawn_blocking(move || {
+        if let Err(error) =
+            crate::app::install_tx::reconcile_for_uninstall_scoped(Some(&transaction_scope))
+        {
+            log::warn!("pre-uninstall install transaction reconciliation skipped: {error}");
+        }
         uninstall_windows_codex(&settings, confirm, purge_user_data)
     })
     .await
     .map_err(|e| AppError::Internal(format!("join: {e}")))?
-    .map_err(Into::into)
+    .map_err(CommandError::from)?;
+    if report.outcome.primary_ok {
+        append_native_model_catalog_cleanup(&mut report);
+    }
+    Ok(report)
 }
 
 /// Result of the fixed USB build's combined cleanup.  Codex and CCSwitch are
@@ -3589,8 +3879,31 @@ pub struct WinBundleUninstallReport {
     /// the manager's open files after process exit. Never label this "all clean".
     pub cleanup_pending: bool,
     pub cleanup_report_path: Option<String>,
+    /// Opaque helper nonce required by the explicit exit acknowledgement.
+    #[serde(default)]
+    pub cleanup_handoff_id: Option<String>,
     #[serde(default)]
     pub outcome: OperationOutcome,
+}
+
+fn append_native_model_catalog_cleanup(report: &mut WinUninstallReport) {
+    match crate::app::model_catalog::cleanup() {
+        Ok(true) => report
+            .notes
+            .push("已清理本管理器生成的 Codex 原生模型目录".to_string()),
+        Ok(false) => {}
+        Err(error) => {
+            let detail = format!("Codex 原生模型目录清理未完成：{error}");
+            report.notes.push(detail.clone());
+            report.outcome.cleanup = StepOutcome::failed(detail.clone());
+            report.outcome.push_warning(detail.clone());
+            report.outcome.push_recovery(recovery::CLEANUP_METADATA);
+            report.message = format!(
+                "{}（主卸载已完成，但模型目录清理未完成；请查看详情）",
+                report.message
+            );
+        }
+    }
 }
 
 fn combine_bundle_uninstall(
@@ -3695,6 +4008,7 @@ fn combine_bundle_uninstall(
         purged_ccswitch_data,
         cleanup_pending: false,
         cleanup_report_path: None,
+        cleanup_handoff_id: None,
         outcome,
     }
 }
@@ -3743,6 +4057,7 @@ fn bundle_can_start_final_cleanup(report: &WinBundleUninstallReport) -> bool {
     report.success
         && report.outcome.primary_ok
         && !report.outcome.is_partial()
+        && report.outcome.steps_are_terminal()
         && report.outcome.recovery_actions.is_empty()
 }
 
@@ -3750,10 +4065,21 @@ fn bundle_can_start_final_cleanup(report: &WinBundleUninstallReport) -> bool {
 /// notes. `success` describes primary work; only the detached finalizer can
 /// report that the manager's own files have actually been removed.
 fn finish_bundle_uninstall_report(report: &mut WinBundleUninstallReport) {
+    // An unknown/pending ancillary state is not a successful uninstall. Keep
+    // the raw state in the report, but turn the aggregate result into an
+    // actionable failure instead of allowing it to reach the pending-exit
+    // branch or be mislabeled as primaryCompleted.
+    if report.success && !report.cleanup_pending && !report.outcome.steps_are_terminal() {
+        report.success = false;
+        report
+            .outcome
+            .push_warning("卸载收尾状态尚未完成，未启动最终清理");
+    }
     let phase = if !report.outcome.primary_ok {
         "primaryFailed"
     } else if !report.success
         || report.outcome.is_partial()
+        || !report.outcome.steps_are_terminal()
         || !report.outcome.recovery_actions.is_empty()
     {
         "partialFailure"
@@ -3762,7 +4088,10 @@ fn finish_bundle_uninstall_report(report: &mut WinBundleUninstallReport) {
     } else {
         "primaryCompleted"
     };
-    if !report.success || report.outcome.is_partial() || !report.outcome.recovery_actions.is_empty()
+    if !report.success
+        || report.outcome.is_partial()
+        || !report.outcome.steps_are_terminal()
+        || !report.outcome.recovery_actions.is_empty()
     {
         let mut details = vec![report.message.clone()];
         if !report.outcome.recovery_actions.is_empty() {
@@ -3803,13 +4132,13 @@ fn finish_bundle_uninstall_report(report: &mut WinBundleUninstallReport) {
 }
 
 /// Windows USB build: remove the manager-owned Codex installation and the
-/// locally copied CCSwitch program in one guarded operation.  Both operations
+/// locally copied CCSwitch program in one guarded operation. Both operations
 /// are idempotent; if one side is already absent, the other side is still
-/// attempted.  User data is retained unless the corresponding purge flag is
-/// explicitly enabled by the UI.
+/// attempted. User data is retained unless the corresponding purge flag is
+/// explicitly enabled by the UI. The offline USB installation kit is always
+/// preserved so the drive remains reusable for a future reinstall.
 #[tauri::command]
 pub async fn win_uninstall_bundle(
-    app: tauri::AppHandle,
     state: State<'_, ManagerState>,
     confirm: bool,
     token: OperationToken,
@@ -3827,43 +4156,34 @@ pub async fn win_uninstall_bundle(
     }
     let _op = DetachedGuard::validate_with_phase(&state, token, OperationPhase::Committing)?;
     let settings = windows_domain_settings_for_persisted(&state);
+    let transaction_scope = PathBuf::from(settings.install_root.clone());
     let remove_usb_media = remove_usb_media.unwrap_or(false);
-    // Capture/check the source before any uninstall mutation. No renderer path
-    // is accepted. Source-media erasure has its own explicit UI confirmation.
-    let source_license = if remove_usb_media {
-        // Capture the process-owned lease identity before primary uninstall
-        // stops the watchdog. The detached helper receives this stable
-        // fingerprint; it never treats a path string or filename as proof that
-        // the manager-created license is safe to erase.
-        let authorization =
-            crate::app::usb_guard::require_signed_codex_bundle("remove-usb-media-preflight")?
-                .ok_or_else(|| {
-                    AppError::Engine("删除 U 盘介质需要当前 USB bundle 授权".to_string())
-                })?;
-        let bundle = authorization.bundle_root;
-        let fingerprint = authorization.fingerprint;
-        let runtime_root = crate::app::usb_guard::usb_codex_root(&bundle);
-        let runtime_root = runtime_root.is_dir().then_some(runtime_root);
-        let preflight_fingerprint = fingerprint.clone();
-        // The complete offline kit exceeds 1 GB; keep its read-only hash scan
-        // off the async runtime so status/cancel UI remains responsive.
-        tauri::async_runtime::spawn_blocking(move || {
-            crate::app::usb_media_cleanup::preflight_bundle_before_uninstall(
-                &bundle,
-                runtime_root.as_deref(),
-                &preflight_fingerprint,
-            )
-        })
-        .await
-        .map_err(|e| AppError::Internal(format!("安装介质预检任务失败: {e}")))?
-        .map_err(AppError::Internal)?;
-        Some(fingerprint)
-    } else {
-        None
-    };
+    if remove_usb_media {
+        // Older renderers exposed a destructive "erase USB kit" toggle. Keep
+        // accepting the optional field for protocol compatibility, but never
+        // honor it: deleting the kit would violate the product guarantee that
+        // an intact USB drive can always perform a fresh reinstall.
+        return Err(AppError::Engine(
+            "为保证 U 盘可随时重装，当前版本不支持删除 U 盘安装包；安装包已保留。".to_string(),
+        )
+        .into());
+    }
+    // Source-media cleanup is intentionally disabled. The USB kit is the
+    // reinstall path and must remain intact for the lifetime of the drive.
+    let source_license: Option<crate::app::usb_guard::UsbFingerprint> = None;
     let report = tauri::async_runtime::spawn_blocking(move || {
+        if let Err(error) = crate::app::install_tx::reconcile_for_uninstall_scoped(Some(
+            &transaction_scope,
+        )) {
+            log::warn!("pre-uninstall USB install transaction reconciliation skipped: {error}");
+        }
         let mut codex =
             uninstall_windows_codex_for_usb_bundle(&settings, confirm, purge_user_data);
+        if let Ok(codex_report) = &mut codex {
+            if codex_report.outcome.primary_ok {
+                append_native_model_catalog_cleanup(codex_report);
+            }
+        }
         let mut cleanup_claim = None;
         let mut cleanup_claim_note = None;
 
@@ -4054,10 +4374,36 @@ pub async fn win_uninstall_bundle(
                     report.notes.push(format!("安装策略事务仍待处理：{error}"));
                     report.outcome.cleanup = StepOutcome::failed(error.to_string());
                 }
-                if let Err(error) = crate::app::install_tx::clear_completed_for_uninstall() {
-                    report.success = false;
-                    report.notes.push(format!("安装文件事务仍待处理：{error}"));
-                    report.outcome.cleanup = StepOutcome::failed(error.to_string());
+                // The primary uninstall may remove the install root that was
+                // still present during the preflight reconciliation.  Retry
+                // this bookkeeping-only pass now, so a landed transaction
+                // whose recovery paths are both gone can be closed before the
+                // completed-journal cleanup runs.
+                if report.success {
+                    match crate::app::install_tx::reconcile_for_uninstall_scoped(Some(
+                        &transaction_scope,
+                    )) {
+                        Ok(reconciled) if reconciled > 0 => report.notes.push(format!(
+                            "已在卸载后核对并关闭 {reconciled} 个已落地安装事务"
+                        )),
+                        Ok(_) => {}
+                        Err(error) => {
+                            report.success = false;
+                            report
+                                .notes
+                                .push(format!("卸载后安装文件事务核对未完成：{error}"));
+                            report.outcome.cleanup = StepOutcome::failed(error.to_string());
+                        }
+                    }
+                }
+                if report.success {
+                    if let Err(error) = crate::app::install_tx::clear_completed_for_uninstall_scoped(
+                        Some(&transaction_scope),
+                    ) {
+                        report.success = false;
+                        report.notes.push(format!("安装文件事务仍待处理：{error}"));
+                        report.outcome.cleanup = StepOutcome::failed(error.to_string());
+                    }
                 }
             }
         }
@@ -4072,6 +4418,7 @@ pub async fn win_uninstall_bundle(
                 Ok(handoff) => {
                     crate::app::usb_guard::suppress_status_for_uninstall();
                     report.cleanup_pending = true;
+                    report.cleanup_handoff_id = Some(handoff.handoff_id.clone());
                     report.cleanup_report_path = Some(handoff.report_path);
                     report.message = handoff.message;
                     report.outcome.cleanup =
@@ -4090,12 +4437,25 @@ pub async fn win_uninstall_bundle(
     .await
     .map_err(|e| AppError::Internal(format!("join: {e}")))?;
     if report.cleanup_pending {
-        // Return the truthful handoff state before exiting. The helper already
-        // holds the session mutex and waits on this exact process handle.
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(800));
-            crate::exit_after_confirm(&app);
-        });
+        // Return the truthful handoff state and keep the manager alive until
+        // the renderer has shown it. The helper already holds the session
+        // mutex and waits on this exact process handle; a fixed-delay exit
+        // would turn this intermediate state into a silent close.
+        let handoff_id = report.cleanup_handoff_id.clone().ok_or_else(|| {
+            AppError::Internal("清理交接缺少唯一标识，已保留清理报告".to_string())
+        })?;
+        let report_path = report.cleanup_report_path.clone().unwrap_or_default();
+        if !state.arm_uninstall_handoff(UninstallHandoff {
+            id: handoff_id,
+            report_path,
+            message: report.message.clone(),
+        }) {
+            return Err(AppError::Busy(
+                "已有卸载清理交接正在等待退出，请先完成当前交接".to_string(),
+            )
+            .into());
+        }
+        log::info!("Windows uninstall handoff ready; awaiting user acknowledgement");
     }
     Ok(report)
 }
@@ -4117,6 +4477,7 @@ mod tests {
     use crate::app::win_update::OperationEvidence;
     use crate::domain::target::{Architecture, OperatingSystem, Target};
     use crate::errors::AppError;
+    use crate::state::{ManagerState, UninstallHandoff};
     use std::fs;
     use std::sync::atomic::AtomicU8;
 
@@ -4170,6 +4531,46 @@ mod tests {
             .into(),
             notes: vec![],
         }
+    }
+
+    #[test]
+    fn pending_uninstall_handoff_blocks_new_write_commands() {
+        let state = ManagerState::new();
+        assert!(super::reject_uninstall_handoff(&state).is_ok());
+        assert!(!state.arm_uninstall_handoff(UninstallHandoff {
+            id: "  ".into(),
+            report_path: "report.json".into(),
+            message: "invalid".into(),
+        }));
+        assert!(state.arm_uninstall_handoff(UninstallHandoff {
+            id: "handoff".into(),
+            report_path: "report.json".into(),
+            message: "waiting".into(),
+        }));
+        assert!(super::reject_uninstall_handoff(&state).is_err());
+        assert_eq!(
+            state.uninstall_handoff().map(|handoff| handoff.id),
+            Some("handoff".into())
+        );
+    }
+
+    #[test]
+    fn nonterminal_bundle_steps_cannot_start_final_cleanup() {
+        let mut report = super::combine_bundle_uninstall(
+            Ok(uninstall_fixture(true)),
+            Ok(switch_uninstall_fixture(true)),
+            false,
+            false,
+        );
+        report.outcome.cleanup = super::StepOutcome {
+            state: "pending".into(),
+            detail: Some("helper has not committed".into()),
+        };
+        assert!(!super::bundle_can_start_final_cleanup(&report));
+        super::finish_bundle_uninstall_report(&mut report);
+        assert!(!report.success);
+        assert!(report.message.contains("尚未完成"));
+        assert!(report.message.contains("helper has not committed"));
     }
 
     #[test]

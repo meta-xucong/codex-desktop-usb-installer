@@ -1,29 +1,50 @@
 {
-  "objective": "完成 Skill Hub 可诊断更新链路和上游模型同步/预装方案：先写开发文档，落代码，独立只读审计，测试回归；把最终代码发布到授权 GitHub 仓库；打包最新 EXE 并生成匹配的本地 USB 签名产物。保留现有用户改动，直到完成或真实阻断。",
-  "current_phase": "Delivery complete; target-machine acceptance pending",
-  "phase_status": "complete",
-  "completed_phases": ["Discover project structure", "Freeze development contract", "Implement Skill Hub diagnostics, model policy, and G22 uninstall hardening", "Build and verify EXE, USB bundle, capability pack, and signer", "Independent audit, artifact rebuild, commit, and GitHub push"],
+  "objective": "完成 G39.5 USB 一键安装交付：修复 CCSwitch 生产启动、统一 API 分组和单 Key 注册契约、原生模型目录刷新、安装器进度与启动状态体验，重建正式绑定 profile、CCSwitch、管理器、完整 U 盘目录及压缩包，并完成可复现验证。",
+  "current_phase": "G39.5/r16 404token account retry closure",
+  "phase_status": "in_progress",
+  "completed_phases": ["Discover project structure", "Freeze development contract", "Implement Skill Hub diagnostics, model policy, and G22 uninstall hardening", "Build and verify EXE, USB bundle, capability pack, and signer", "Independent audit, artifact rebuild, commit, and GitHub push", "Audit and rebuild G39.4 signer with embedded administrator credential", "Rebuild formally bound manager, CCSwitch and complete USB package", "Create and verify final USB and signer archives", "Implement and verify G39.5/r8 field repairs and native Codex model catalog bridge", "Rebuild and verify G39.5/r8 complete USB package", "Final G39.5/r8 regression, engine fixture repair, embedded-key signer rebuild, and archive verification", "G39.5/r9 unified-api-internal catalog sync, static/network verification, and complete USB package rebuild", "G39.5/r10 USB installer UX, model-refresh status, startup-state repair, and complete package rebuild", "G39.5/r11 fresh EXE, signer, profile binding, and complete package rebuild", "G39.5/r12 install-stall and second-stage-uninstall repair, regression, and complete package rebuild", "G39.5/r13 portable extraction root-cause repair, regression, and complete package rebuild", "G39.5/r14 real extraction progress, slow-media write optimization, and one-click recharge", "G39.5/r15 CCSwitch auto-provisioning, tray startup, upstream model-refresh retry, and complete package rebuild"],
   "next_actions": [
-    "Run target-machine physical USB acceptance for the r4 bundle",
+    "Run real sign/install/CCSwitch-tray/model-refresh/update/uninstall/recharge acceptance on a clean NTFS removable drive using release/usb-oneclick-g39.5-20260922-r16-account-retry-manager-final and the existing validated signer",
+    "Rebuild and replace the production signer with the r16 signer source only in a secure environment that provides the original compile-time administrator Key; do not ship the no-key compile artifact",
+    "If retesting CCSwitch on this workstation, first close the pre-existing external D:/AI/cc-switch instance so the single-instance smoke is isolated",
     "Record target-machine evidence if any device-specific regression is found"
   ],
   "tests_run": [
-    "Frontend full Vitest: 411 passed, 1 skipped",
+    "CCSwitch frontend serial Vitest: 223 passed across 37 files",
     "npm run build, check, and lint: passed",
-    "Rust library tests: 390 passed, 2 ignored",
-    "USB signer crate tests: 26 passed",
+    "Manager Rust library tests: 436 passed, 3 ignored",
+    "USB signer crate tests: 48 passed, GUI tests: 4 passed with compile-time embedded administrator credential",
     "Capability-pack audit: 50 Skills, 7 Agents, 253 files, hashes and model policy passed",
     "Adapter contract tests: 41 passed",
-    "USB bundle verification: latest MSIX, payload identity, manager binding, prerequisites and no static usb-license.json passed"
+    "USB bundle verification: latest MSIX, payload identity, manager binding, prerequisites and no static usb-license.json passed",
+    "G39.4 formal pair preflight: bundle, signer manifest, portable vault, profile, releaseId, keyId and public-key digest matched",
+    "G39.4 package verification: verify-usb.ps1 -InternalSigned -SkipNetwork passed; signer startup window smoke passed",
+    "G39.5/r7 archives created: complete rebuilt USB package and embedded-key signer package",
+    "G39.5/r8: model catalog 7/7, install transaction 13/13, command layer 27/27, engine full suite 179 passed + 1 ignored after lexical USB path fix, manager 445 passed + 3 ignored, frontend 361 passed, TypeScript/lint/format/target checks passed",
+    "Final signer: 48 core tests, clippy -D warnings, direct same-process compile-time credential verification, startup smoke, no text credential hits, no sub2api-config.json",
+    "Final package: 289-file USB directory, 8-file signer directory, package/payload/one-click/pair/CCSwitch/PE gates passed; both ZIP central directories contain all required entries",
+    "G39.5/r9: provider catalog unified-api-internal label, runtime model source, no fixed model list, CCSwitch static/network verification, manager rebuild, final2 USB package verification, and ZIP archive listing passed",
+    "G39.5/r10: single-bar progress UI, bounded/visible model refresh with post-install auto-refresh, USB startup status re-read/path normalization, password-card removal, 32 OfflineHome tests, 364 root frontend tests, model catalog 7/7, package/one-click/CCSwitch/network/PE/signing-pair gates and ZIP listing passed",
+    "G39.5/r11: fresh manager/launcher build, new r11 profile, fresh signer with embedded admin credential and portable vault, 289-file USB package, USB ZIP SHA-256 CF754FDB4953E7AB7CC8D72087C71D06DCA0BF65EEFF582F852C1286957ED818, separate signer ZIP SHA-256 16BFB98F22592237874F51D8E7A8789EB70FBB7B36A5DD38A3F9AF844EC6B359, package/payload/one-click/CCSwitch/network/PE/signing-pair/archive gates passed",
+    "G39.5/r12: portable fallback phase moved to interruptible Applying before first rename; uninstall handoff/encoded finalizer/bookkeeping reconciliation repaired; 447 manager Rust tests passed + 3 ignored, Windows x64/custom-protocol, TypeScript, ESLint and diff checks passed; fresh 289-file USB package manager SHA-256 B3DBAC10DFC27BD2A2858A28882E8E969716E77AF394BD53D247041B35C18A8D, USB ZIP SHA-256 08AE0767D39524C532F76ACA3FF04A62FB5D93F44968464BFC25AB35731EEE91, signer ZIP SHA-256 888F555EEA3282593CC149ED2BE07E66844D2312589AD4E11131FBF0B89F656C, package/payload/one-click/PE/signing-pair/archive gates passed",
+    "G39.5/r13: root cause confirmed as duplicate full-write extraction on removable media; manifest-directed one-pass app-tree streaming extraction plus per-file length checks and periodic progress logs added; engine 180 passed + 1 ignored plus real r13 MSIX transaction hook passed in 49.29s locally, manager 447 passed + 3 ignored, frontend 364 passed, TypeScript/ESLint/target/format/diff checks passed; 289-file USB package manager SHA-256 C1464191A9EB3A84283CF77B311173DC7E6FCDEDE373BFEAF37001C2AD3DF677, USB ZIP SHA-256 799393F47F0207CD21458617546C3767B64CF103BF366A0EFDBBF2B2261B0A83, signer ZIP SHA-256 7BF8ACCE06E29ABA890FF7FE20883303C307D853AD76345B774AE9541217CFAD, package/payload/one-click/PE/signing-pair/archive gates passed",
+    "G39.5/r14: extraction progress callback uses application-tree byte totals, reusable 1 MiB copy buffer and throttled UI events; manager exposes compact 404token recharge-code card with on-demand login and safe 400/409 errors; engine 180 + 1 ignored, manager 447 + 3 ignored, frontend 365, TypeScript/ESLint/Windows target/format/diff checks passed; r14 package and signer pair gates passed, manager SHA-256 DC75E35C0C1A050235E5211E3879E3573C29CAD81D1FE6399ED11F885DF85262",
+    "G39.5/r15: CCSwitch source rebuilt with USB provider bootstrap/retry and hidden tray startup; native model refresh uses bounded upstream retries and explicit 404token diagnostics; OfflineHome/managerApi 60/60, model catalog 7/7, CCSwitch manager 9/9, window engine 5 + helper, release tests 56/56, TypeScript/offline bundle/package/CCSwitch/PE/payload/signing-pair gates passed; complete directory manager SHA-256 2E6E02CE3DBD43412EFC7DBCE16C8C68A5B11890F6742272C0B0ACCCCD829C38 and CCSwitch SHA-256 927AF2AA40E2F5E1B08ECEF90C9BA8063DFB9667007E4F7AF12395463E867378",
+    "G39.5/r16: signer create-user stable idempotency/recovery fixture passed; signer 49 library + 4 GUI tests, manager account 10/10, full manager 451/3 ignored, root targeted UI 60/60, release 56/56, offline bundle, manager release build and r16 package/USB/one-click/payload/CCSwitch/PE/signing-pair gates passed; manager SHA-256 95711EE5FEA0BB375789075BF3FFDFF40C2C92E58F4F700C62A72ADA3888BDC0; signer production EXE intentionally retained until secure admin-Key build",
+    "G39.5/r16 final: native model-refresh renderer watchdog increased from 60s to 75s after timing audit; check/lint and targeted UI 60/60 passed; final 289-file package release/usb-oneclick-g39.5-20260922-r16-account-retry-manager-final rebuilt and package/one-click/payload/CCSwitch/PE/signing-pair verification passed; final manager SHA-256 9C216EAC5AF7EB2761699B4908003CE7DE8D4E592A82D4DD5CE7D10759A52BD8"
   ],
   "known_bugs": [],
-  "blockers": [],
+  "blockers": [
+    "Physical NTFS U-disk sign/install/uninstall acceptance remains device-bound and was not executed on this development workspace",
+    "Isolated CCSwitch runtime smoke was not repeated because an unrelated external D:/AI/cc-switch/app/cc-switch.exe already owned the single-instance listener; production bundle verification and package hash binding passed",
+    "The r16 signer source compiles and tests, but the distributed signer EXE was not replaced because this environment has no original compile-time administrator Key; replacing it with a no-key build would break the previously real-tested create-user path"
+  ],
   "done_criteria": [
     "Requested implementation work is complete",
     "Relevant tests or checks pass",
     "Progress and verification are recorded"
   ],
-  "last_verified_at": "2026-09-13T04:55:10+08:00",
+  "last_verified_at": "2026-09-22T22:15:00+08:00",
   "created_at": "2026-09-13T03:02:00+08:00",
-  "updated_at": "2026-09-13T04:55:10+08:00"
+  "updated_at": "2026-09-22T22:15:00+08:00"
 }

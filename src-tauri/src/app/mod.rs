@@ -1,3 +1,4 @@
+pub mod account;
 pub mod appx_volume;
 pub mod atomic_file;
 pub mod capability_pack;
@@ -11,6 +12,7 @@ pub mod disk;
 pub mod install_tx;
 pub mod logging;
 pub mod mac_update;
+pub mod model_catalog;
 pub mod msix_policy_tx;
 pub mod offline_payload;
 pub mod op_phase;

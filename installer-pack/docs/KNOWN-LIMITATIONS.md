@@ -1,7 +1,7 @@
 # 已知限制与未完成的外部条件
 
 更新日期：2026-09-08  
-适用版本：`codex-starter-kit 1.2.1`  
+适用版本：`codex-starter-kit 1.3.0`  
 验证环境：Windows x64、CPython 3.12、Codex CLI 0.147.0
 
 本文只列出完成 Codex 适配后仍然存在的限制。这里的“受限”不等于代码失败：有些能力需要私有运行时或凭据，
@@ -12,9 +12,9 @@
 | 状态 | 数量 | 当前含义 |
 |---|---:|---|
 | `core-ready` | 25 | 只依赖 Codex 原生能力或说明性工作流，默认安装 |
-| `auto-installable-runtime` | 14 | 包内已携带 Windows x64 / CPython 3.12 运行时和完整 wheelhouse，安装时仍需通过本机健康检查 |
+| `auto-installable-runtime` | 15 | 包内已携带 Windows x64 / CPython 3.12 运行时和完整 wheelhouse，安装时仍需通过本机健康检查 |
 | `guided-config` | 7 | 需要用户提供外部服务、凭据、模型或本地 MCP 包，默认不启用 |
-| `unsupported` | 4 | 缺少可验证运行时、后端协议或再分发依据，保持禁用 |
+| `unsupported` | 3 | 外部后端或权限不在包内；配置中可启用，但缺失时安全失败 |
 
 复制 Skill 或 Agent 文件只代表文件安装完成，不代表运行时、网络、凭据、权限和数据源均已健康。
 
@@ -72,17 +72,16 @@ App ID/Secret、飞书侧应用权限和可访问租户。
 全部连接字段及启用条件见 [`manifest/connection-fields.json`](../manifest/connection-fields.json) 和
 [`manifest/api-services.json`](../manifest/api-services.json)。
 
-## 4. 明确保持禁用的 4 个 Skill
+## 4. 配置启用但受外部后端约束的 3 个 Skill
 
-| Skill | 保持禁用的原因 | 解除条件 |
+| Skill | 当前边界 | 缺失时行为 |
 |---|---|---|
-| `canvas` | 能力包没有可验证的远程 Canvas 节点或画布运行时 | 提供可审计的运行时、协议、认证和健康检查 |
-| `healthcheck` | 主机加固涉及管理员权限、系统策略和外部设备状态，静态 Skill 不能冒充真实审计 | 建立受控权限模型、逐项探测和可回滚实现 |
-| `node-connect` | 设备配对协议和节点后端不在能力包中 | 提供协议、后端、认证、权限边界和端到端测试 |
-| `pdf-processing-toolkit` | 上游声明专有许可证但缺少被引用的 `LICENSE.txt`；公开仓库只保留隔离占位，不含上游指南正文 | 获得可核验的再分发授权，或替换为许可证清晰且由仓库自行维护的实现 |
+| `canvas` | 依赖外部 Canvas 节点、画布网关和设备桥接 | 明确报告后端未连接，改用本地 HTML 原型 |
+| `healthcheck` | 依赖 Windows 安全工具、管理员权限、系统策略和设备状态 | 明确报告权限/后端不可用，不伪造审计结果 |
+| `node-connect` | 依赖设备配对协议、节点后端和远程网关 | 明确报告未配对/后端不可用，不把二维码或网页可达当成配对 |
 
-安装器默认排除这些 Skill。只有同时使用 `-IncludeNonDefault -IncludeUnsupported` 才会复制其隔离占位/审计源码；复制不
-表示支持、授权或启用。PDF 占位也不会恢复任何上游正文或执行能力。
+安装器的一键路径会复制并在配置层面启用这些 Skill；启用只表示允许调用安全降级说明，不表示外部后端已存在。
+`pdf-processing-toolkit` 已替换为本项目自维护实现，许可证见其 `LICENSE.txt`，并通过离线 PDF smoke test。
 
 ## 5. 数据源与高风险领域限制
 
@@ -95,8 +94,8 @@ App ID/Secret、飞书侧应用权限和可访问租户。
 
 ## 6. 安装与配置限制
 
-- 安装器默认只安装 25 个 `core-ready` Skill 和 7 个 Agent；包根目录的 `Install-Codex-Starter.cmd` 会全量安装 50 个 Skill；
-- `-IncludeNonDefault` 会把可补运行时或可配置的 Skill 扩展到 46 个，并自动准备包内运行时；外部连接仍需凭据；
+- 安装器默认安装并在配置中启用 43 个 Skill（25 core-ready、15 auto-installable-runtime、3 unsupported），另复制 7 个 guided-config 但保持关闭；
+- `-IncludeNonDefault` 会把 7 个 guided-config 也复制到 Skill 根目录并自动准备包内运行时；外部连接仍需凭据；
 - 安装器会备份并合并自己的托管配置区块；遇到用户已有未托管的同名 Feishu MCP 时报告冲突，不覆盖用户配置；
 - 遇到同名 Skill、用户修改或用户新增文件时，安装器默认保留并跳过；用户需自行决定是否迁移内容；
 - readiness 报告是本机探测结果，不是跨机器保证；复制安装包到另一台电脑后必须重新执行健康检查；

@@ -432,12 +432,111 @@ fn remove_transaction_file(path: &Path) -> Result<(), AppError> {
 /// It never replays a rename/rollback or deletes a path stored in a journal.
 /// Call after the app uninstall and environment-policy cleanup have completed.
 pub fn clear_completed_for_uninstall() -> Result<usize, AppError> {
-    let dir =
-        transactions_dir().ok_or_else(|| AppError::Internal("无法定位安装事务目录".into()))?;
-    clear_completed_in_dir(&dir)
+    clear_completed_for_uninstall_scoped(None)
 }
 
+/// Clear terminal install journals that belong to one install root.
+///
+/// A machine can have more than one manager installation (for example a
+/// normal C: installation and a removable-drive installation).  Uninstalling
+/// one of them must not fail merely because another root has a pending update
+/// journal.  `None` retains the historical whole-directory behavior for
+/// startup/diagnostic callers; product uninstall paths should pass the active
+/// install root.
+pub fn clear_completed_for_uninstall_scoped(scope: Option<&Path>) -> Result<usize, AppError> {
+    let dir =
+        transactions_dir().ok_or_else(|| AppError::Internal("无法定位安装事务目录".into()))?;
+    clear_completed_in_dir_scoped(&dir, scope)
+}
+
+/// Convert a crash-left `new-installed` Windows portable journal into a
+/// terminal journal when the on-disk state is already unambiguous.  This is
+/// deliberately a bookkeeping-only operation: it never renames or deletes an
+/// install, staged payload, or rollback tree.  It must run before uninstall
+/// removes the live install, otherwise the evidence needed for this decision
+/// is gone. If an explicit uninstall has already removed the install root and
+/// no staged/rollback path remains, the journal is also safe to close as
+/// bookkeeping-only evidence.
+pub fn reconcile_for_uninstall() -> Result<usize, AppError> {
+    reconcile_for_uninstall_scoped(None)
+}
+
+/// Reconcile only landed transactions whose install root matches `scope`.
+/// See [`clear_completed_for_uninstall_scoped`] for why the scope matters.
+pub fn reconcile_for_uninstall_scoped(scope: Option<&Path>) -> Result<usize, AppError> {
+    let dir =
+        transactions_dir().ok_or_else(|| AppError::Internal("无法定位安装事务目录".into()))?;
+    reconcile_new_installed_in_dir_scoped(&dir, scope)
+}
+
+fn transaction_matches_scope(tx: &InstallTransaction, scope: Option<&Path>) -> bool {
+    scope
+        .is_none_or(|scope| codex_win_engine::same_windows_path(Path::new(&tx.install_path), scope))
+}
+
+fn can_reconcile_new_installed_for_uninstall(tx: &InstallTransaction) -> bool {
+    tx.kind == InstallTxKind::WindowsPortable
+        && tx.step == InstallTxStep::NewInstalled
+        && !path_exists(&tx.new_path)
+        && !path_exists(&tx.backup_path)
+    // The usual landed-update shape has the install root present.  After
+    // a later explicit uninstall the root may already be gone; with no
+    // staged payload or rollback tree left, retaining this journal cannot
+    // recover anything and would block the detached second-stage cleanup
+    // forever.  Both shapes are therefore safe bookkeeping-only
+    // reconciliations; no filesystem path is renamed or removed here.
+}
+
+fn reconcile_new_installed_in_dir_scoped(
+    dir: &Path,
+    scope: Option<&Path>,
+) -> Result<usize, AppError> {
+    codex_win_engine::validate_cleanup_path(dir).map_err(|e| AppError::Engine(e.to_string()))?;
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(AppError::Engine(format!("无法扫描安装事务目录：{error}"))),
+    };
+    let mut reconciled = 0;
+    for entry in entries {
+        let path = entry.map_err(|e| AppError::Engine(e.to_string()))?.path();
+        codex_win_engine::validate_cleanup_path(&path)
+            .map_err(|e| AppError::Engine(e.to_string()))?;
+        if path.extension().and_then(|v| v.to_str()) != Some("json") {
+            continue;
+        }
+        let mut tx = InstallTransaction::load_from_path(&path)?;
+        if !transaction_matches_scope(&tx, scope) {
+            continue;
+        }
+        if uuid::Uuid::parse_str(&tx.id).is_err()
+            || tx.schema_version != SCHEMA_VERSION
+            || tx_path_for(&tx.id).as_deref() != Some(path.as_path())
+        {
+            return Err(AppError::Engine(format!(
+                "安装事务身份/版本不符，已保留：{}",
+                path.display()
+            )));
+        }
+        if can_reconcile_new_installed_for_uninstall(&tx) {
+            log::warn!(
+                "reconciling landed Windows portable install transaction before uninstall id={} install={}",
+                tx.id,
+                tx.install_path
+            );
+            tx.advance(InstallTxStep::Completed)?;
+            reconciled += 1;
+        }
+    }
+    Ok(reconciled)
+}
+
+#[cfg(test)]
 fn clear_completed_in_dir(dir: &Path) -> Result<usize, AppError> {
+    clear_completed_in_dir_scoped(dir, None)
+}
+
+fn clear_completed_in_dir_scoped(dir: &Path, scope: Option<&Path>) -> Result<usize, AppError> {
     codex_win_engine::validate_cleanup_path(dir).map_err(|e| AppError::Engine(e.to_string()))?;
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -462,6 +561,9 @@ fn clear_completed_in_dir(dir: &Path) -> Result<usize, AppError> {
         let tx = InstallTransaction::load_from_path(&path)?;
         if tx.schema_version != SCHEMA_VERSION || tx.id != id {
             return Err(AppError::Engine("安装事务身份/版本不符，已保留".into()));
+        }
+        if !transaction_matches_scope(&tx, scope) {
+            continue;
         }
         groups.entry(id.into()).or_default().push(path);
     }
@@ -571,6 +673,82 @@ mod uninstall_cleanup_tests {
         assert!(clear_completed_in_dir(&dir).is_err());
         assert!(path.is_file());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn landed_windows_transaction_can_be_reconciled_without_paths_being_touched() {
+        let root = fixture_root();
+        fs::create_dir_all(root.join("install")).unwrap();
+        let tx = fixture(
+            &root,
+            &uuid::Uuid::new_v4().to_string(),
+            InstallTxStep::NewInstalled,
+        );
+        assert!(can_reconcile_new_installed_for_uninstall(&tx));
+        assert!(root.join("install").is_dir());
+        assert!(!root.join("new").exists());
+        assert!(!root.join("backup").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn uninstalled_windows_transaction_without_recovery_paths_is_reconciled() {
+        let root = fixture_root();
+        fs::create_dir_all(&root).unwrap();
+        let tx = fixture(
+            &root,
+            &uuid::Uuid::new_v4().to_string(),
+            InstallTxStep::NewInstalled,
+        );
+        assert!(!root.join("install").exists());
+        assert!(can_reconcile_new_installed_for_uninstall(&tx));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn incomplete_windows_transaction_is_not_reconciled() {
+        let root = fixture_root();
+        fs::create_dir_all(root.join("install")).unwrap();
+        fs::create_dir_all(root.join("backup")).unwrap();
+        let tx = fixture(
+            &root,
+            &uuid::Uuid::new_v4().to_string(),
+            InstallTxStep::NewInstalled,
+        );
+        assert!(!can_reconcile_new_installed_for_uninstall(&tx));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scoped_terminal_cleanup_ignores_other_install_roots() {
+        let root = fixture_root();
+        let other = fixture_root();
+        let dir = root.join("journals");
+        fs::create_dir_all(&dir).unwrap();
+        let current_id = uuid::Uuid::new_v4().to_string();
+        let other_id = uuid::Uuid::new_v4().to_string();
+        let current_path = dir.join(format!("{current_id}.json"));
+        let other_path = dir.join(format!("{other_id}.json"));
+        fs::write(
+            &current_path,
+            serde_json::to_vec(&fixture(&root, &current_id, InstallTxStep::Completed)).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            &other_path,
+            serde_json::to_vec(&fixture(&other, &other_id, InstallTxStep::NewInstalled)).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            clear_completed_in_dir_scoped(&dir, Some(&root.join("install"))).unwrap(),
+            1
+        );
+        assert!(!current_path.exists());
+        assert!(other_path.exists());
+
+        fs::remove_dir_all(root).unwrap();
+        let _ = fs::remove_dir_all(other);
     }
 }
 

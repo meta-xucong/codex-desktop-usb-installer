@@ -25,6 +25,8 @@ use std::fs::{self, File};
 #[cfg(target_os = "windows")]
 use std::io::Write;
 use std::io::{self, Read};
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "windows")]
 use std::process::Command;
@@ -42,8 +44,8 @@ use crate::errors::AppError;
 
 use codex_usb_license as license_core;
 pub use license_core::{
-    UsbFingerprint, UsbLicense, ANCHOR_SCHEMA_V1, ANCHOR_SCHEMA_V2, LICENSE_SCHEMA_VERSION,
-    PRODUCT_ID,
+    UsbFingerprint, UsbLicense, ANCHOR_SCHEMA_V1, ANCHOR_SCHEMA_V2, ANCHOR_SCHEMA_V3,
+    LICENSE_SCHEMA_VERSION, PRODUCT_ID,
 };
 
 pub const GUARD_ARG: &str = "--codex-usb-guard";
@@ -61,6 +63,11 @@ pub const DISCONNECT_GRACE_MS: u64 = 5_000;
 const LEASE_SCHEMA_VERSION: u32 = 1;
 const STATUS_SCHEMA_VERSION: u32 = 1;
 const USB_MANIFEST_POLICY_MAX_BYTES: u64 = 256 * 1024;
+const GUARD_READY_TIMEOUT_MS: u64 = 5_000;
+const AUTHORIZATION_RETRY_TIMEOUT_MS: u64 = 3_000;
+const AUTHORIZATION_RETRY_INTERVAL_MS: u64 = 100;
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 #[used]
 static COMPILED_USB_POLICY_MARKER: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/codex-usb-policy-marker.txt"));
@@ -732,6 +739,19 @@ pub fn canonical_anchor_sha256(bundle_root: &Path) -> Result<String, AppError> {
     license_core::canonical_anchor_sha256(bundle_root).map_err(map_license_error)
 }
 
+pub fn stable_anchor_sha256_from_bytes(
+    manifest_bytes: &[u8],
+    usb_manifest_bytes: &[u8],
+    checksum_bytes: &[u8],
+) -> Result<String, AppError> {
+    license_core::stable_anchor_sha256_from_bytes(
+        manifest_bytes,
+        usb_manifest_bytes,
+        checksum_bytes,
+    )
+    .map_err(map_license_error)
+}
+
 pub fn bundle_anchor_schema(bundle_root: &Path) -> Result<u32, AppError> {
     license_core::bundle_anchor_schema(bundle_root).map_err(map_license_error)
 }
@@ -908,7 +928,7 @@ pub fn current_status() -> UsbGuardStatus {
         status.message = "正在校验 U 盘能力包，完成后才会开放 Codex 操作".to_string();
         return status;
     }
-    status_path()
+    let mut status = status_path()
         .ok()
         .and_then(|path| read_json::<UsbGuardStatus>(&path))
         .unwrap_or_else(|| {
@@ -917,7 +937,19 @@ pub fn current_status() -> UsbGuardStatus {
             } else {
                 disabled_status()
             }
-        })
+        });
+    // `status.json` is a persisted renderer snapshot. A process crash or a
+    // slow helper launch can leave an old `authorized/running` value behind;
+    // never expose that stale value as an actionable authorization state when
+    // the live lease or helper lock is absent. Keep the status readable and
+    // retryable so the UI can poll until startup settles.
+    #[cfg(target_os = "windows")]
+    if guard_required() {
+        let lease_live = read_lease().is_some();
+        let helper_live = guard_helper_is_live();
+        status = mask_stale_authorized_status(status, lease_live, helper_live);
+    }
+    status
 }
 
 /// Only the fixed USB layout is mandatory-bound.  A normal installed manager
@@ -1056,6 +1088,15 @@ pub fn require_signed_codex_bundle(
     if !guard_required() {
         return Ok(None);
     }
+    // Give startup a short bounded opportunity to publish the helper lease,
+    // and keep this failure distinct from an invalid package signature. The
+    // renderer also performs a preflight, but this backend gate remains the
+    // final authority for every protected operation.
+    require_authorized().map_err(|error| {
+        engine(format!(
+            "usb_watchdog_not_ready phase={phase} failed: {error}"
+        ))
+    })?;
     let (bundle, fingerprint) = authorized_bundle_identity()
         .map_err(|error| engine(format!("usb_license_gate phase={phase} failed: {error}")))?;
     let license = read_license(&bundle)?.ok_or_else(|| {
@@ -1189,6 +1230,37 @@ pub fn authorized_signed_bundle_identity() -> Result<(PathBuf, UsbFingerprint), 
     Ok((authorization.bundle_root, authorization.fingerprint))
 }
 
+/// Return the account binding from the currently authorized signed bundle.
+/// The binding is consumed only by the backend launch hand-off and is never
+/// returned to the renderer or written to local settings.
+pub fn authorized_account_binding() -> Result<Option<license_core::UsbAccountBinding>, AppError> {
+    if !guard_required() {
+        return Ok(None);
+    }
+    let (bundle, fingerprint) = authorized_bundle_identity()?;
+    let license =
+        read_license(&bundle)?.ok_or_else(|| engine("usb_license_missing：当前 U 盘缺少许可证"))?;
+    // Development/legacy USB bundles may still launch CCSwitch manually. Do
+    // not reject those bundles merely because they cannot provide automatic
+    // account injection; only a signed binding is eligible for the hand-off.
+    if license.signature.is_none() {
+        return Ok(None);
+    }
+    let signed = validate_license(&license, &fingerprint)
+        .map_err(|error| engine(format!("usb_license_invalid：{error}")))?;
+    if !signed {
+        return Err(engine(
+            "usb_license_unsigned：自动 CCSwitch 账号注入需要签名许可证",
+        ));
+    }
+    let binding = license.account_binding;
+    if let Some(binding) = binding.as_ref() {
+        license_core::validate_account_binding(binding)
+            .map_err(|error| engine(format!("usb_account_binding_invalid：{error}")))?;
+    }
+    Ok(binding)
+}
+
 /// Resolve and authorize the only install destination permitted to the fixed
 /// USB product. Existing `apps`/`Codex` reparse points are rejected so a copied
 /// or tampered bundle cannot redirect the payload onto C: or another volume.
@@ -1315,19 +1387,58 @@ pub fn require_authorized() -> Result<(), AppError> {
     if !guard_required() {
         return Ok(());
     }
-    let status = current_status();
-    let lease_live = read_lease().is_some();
-    #[cfg(target_os = "windows")]
-    let helper_live = guard_helper_is_live();
-    #[cfg(not(target_os = "windows"))]
-    let helper_live = true;
-    if status.status == "authorized" && status.watchdog == "running" && lease_live && helper_live {
-        return Ok(());
+    let deadline =
+        std::time::Instant::now() + Duration::from_millis(AUTHORIZATION_RETRY_TIMEOUT_MS);
+    loop {
+        let status = current_status();
+        let lease_live = read_lease().is_some();
+        #[cfg(target_os = "windows")]
+        let helper_live = guard_helper_is_live();
+        #[cfg(not(target_os = "windows"))]
+        let helper_live = true;
+        if status.status == "authorized"
+            && status.watchdog == "running"
+            && lease_live
+            && helper_live
+        {
+            return Ok(());
+        }
+        // Startup publishes the status and helper lock asynchronously. Only
+        // wait for states that can legitimately settle; a mismatch/invalid
+        // license must fail immediately and remain fail-closed.
+        if !authorization_may_still_settle(&status) || std::time::Instant::now() >= deadline {
+            return Err(engine(format!(
+                "未检测到有效 U 盘租约或看门狗（status={} watchdog={} lease={} helper={}），拒绝执行受保护操作",
+                status.status, status.watchdog, lease_live, helper_live
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(AUTHORIZATION_RETRY_INTERVAL_MS));
     }
-    Err(engine(format!(
-        "未检测到有效 U 盘租约或看门狗（status={} watchdog={} lease={} helper={}），拒绝执行受保护操作",
-        status.status, status.watchdog, lease_live, helper_live
-    )))
+}
+
+fn authorization_may_still_settle(status: &UsbGuardStatus) -> bool {
+    status.status == "starting" || (status.status == "authorized" && status.watchdog == "running")
+}
+
+fn mask_stale_authorized_status(
+    mut status: UsbGuardStatus,
+    lease_live: bool,
+    helper_live: bool,
+) -> UsbGuardStatus {
+    if status.status == "authorized"
+        && status.watchdog == "running"
+        && (!lease_live || !helper_live)
+    {
+        status.status = "starting".to_string();
+        status.watchdog = "not-running".to_string();
+        status.codex_allowed = false;
+        status.codex_block_reason = Some(format!(
+            "usb_watchdog_not_ready：活动 U 盘租约或看门狗尚未就绪（lease={} helper={}）",
+            lease_live, helper_live
+        ));
+        status.message = "U 盘授权正在准备中，请保持连接并稍后重试".to_string();
+    }
+    status
 }
 
 #[cfg(target_os = "windows")]
@@ -1340,6 +1451,20 @@ fn guard_helper_is_live() -> bool {
         return false;
     };
     process_matches(pid, Some(GUARD_EXE_NAME))
+}
+
+#[cfg(target_os = "windows")]
+fn wait_for_guard_helper_ready() -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_millis(GUARD_READY_TIMEOUT_MS);
+    loop {
+        if guard_helper_is_live() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(AUTHORIZATION_RETRY_INTERVAL_MS));
+    }
 }
 
 /// Perform the small, read-only portion of startup validation. The expensive
@@ -1499,6 +1624,7 @@ fn tasklist_pids(image_name: &str) -> Vec<u32> {
             "CSV",
             "/NH",
         ])
+        .creation_flags(CREATE_NO_WINDOW)
         .output();
     let Ok(output) = output else {
         return Vec::new();
@@ -1576,6 +1702,7 @@ pub fn terminate_managed_processes_for_role(role: &str) -> usize {
 fn process_matches(pid: u32, expected_image: Option<&str>) -> bool {
     let output = Command::new("tasklist")
         .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .creation_flags(CREATE_NO_WINDOW)
         .output();
     let Ok(output) = output else { return false };
     let text = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
@@ -1614,6 +1741,7 @@ fn terminate_managed_processes(lease: &UsbLease) -> usize {
         let pid_text = managed.pid.to_string();
         let graceful = Command::new("taskkill")
             .args(["/PID", &pid_text, "/T"])
+            .creation_flags(CREATE_NO_WINDOW)
             .output();
         if graceful.as_ref().is_err() || !graceful.as_ref().is_ok_and(|out| out.status.success()) {
             log::debug!(
@@ -1629,6 +1757,7 @@ fn terminate_managed_processes(lease: &UsbLease) -> usize {
         }
         match Command::new("taskkill")
             .args(["/PID", &pid_text, "/T", "/F"])
+            .creation_flags(CREATE_NO_WINDOW)
             .output()
         {
             Ok(output) if output.status.success() => terminated += 1,
@@ -1922,8 +2051,6 @@ fn ensure_local_guard_binary(current_exe: &Path) -> Result<PathBuf, AppError> {
 
 #[cfg(target_os = "windows")]
 fn spawn_guard(executable: &Path, lease_path: &Path) -> Result<(), AppError> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     Command::new(executable)
         .args([GUARD_ARG, "--lease-file", &lease_path.to_string_lossy()])
         .creation_flags(CREATE_NO_WINDOW)
@@ -2092,13 +2219,22 @@ fn start_for_manager_inner() -> Result<UsbGuardStatus, AppError> {
     // Refresh the local helper before creating the new lease. A stale helper
     // must never see and retain a newly-issued lease while we are trying to
     // replace its executable.
+    // This stop is also required when the helper binary bytes are unchanged:
+    // a previous manager instance may still own the lock and otherwise cause
+    // the new manager to publish a false `running` status.
+    stop_previous_guard_for_refresh()?;
     let local_binary = ensure_local_guard_binary(&executable)?;
     write_lease(&lease)?;
     let lease_file = lease_path()?;
     let spawn_result = spawn_guard(&local_binary, &lease_file);
+    // `spawn()` only means Windows accepted process creation. Do not publish
+    // an actionable status until the detached helper has acquired the lock;
+    // otherwise the first click can race the helper and fail at the backend
+    // lease gate even though the USB signature is valid.
+    let helper_ready = spawn_result.is_ok() && wait_for_guard_helper_ready();
     let mut status = base_status(
         "authorized",
-        if spawn_result.is_ok() {
+        if helper_ready {
             "running"
         } else {
             "not-running"
@@ -2114,19 +2250,25 @@ fn start_for_manager_inner() -> Result<UsbGuardStatus, AppError> {
     } else {
         "unsigned-development".to_string()
     };
-    status.codex_allowed = spawn_result.is_ok() && signed;
+    status.codex_allowed = helper_ready && signed;
     status.codex_block_reason = (!status.codex_allowed).then(|| {
         if !signed {
             "未签名开发许可证不能执行 Codex 操作".to_string()
-        } else {
+        } else if spawn_result.is_err() {
             "USB 看门狗未能启动".to_string()
+        } else {
+            "usb_watchdog_not_ready：看门狗进程未在启动窗口内登记活动锁，请稍后重试".to_string()
         }
     });
     status.managed_processes = lease.managed_processes;
-    status.message = if signed {
+    status.message = if signed && helper_ready {
         "U 盘已验证，签名许可证有效".to_string()
-    } else {
+    } else if signed {
+        "U 盘已验证，但看门狗尚未就绪，请稍后重试".to_string()
+    } else if helper_ready {
         "U 盘已验证（开发许可证未签名），看门狗运行中".to_string()
+    } else {
+        "U 盘已验证（开发许可证未签名），但看门狗尚未就绪，请稍后重试".to_string()
     };
     if let Err(error) = spawn_result {
         status.message = format!("{}；{error}", status.message);
@@ -2389,6 +2531,38 @@ mod tests {
         assert!(!StartupPreflight::Ready.is_authorization_blocked());
         assert!(!StartupPreflight::Ready.is_integrity_pending());
         assert_eq!(StartupPreflight::Ready.reason(), None);
+    }
+
+    #[test]
+    fn authorization_retry_only_covers_transient_startup_states() {
+        let starting = base_status("starting", "not-running");
+        assert!(authorization_may_still_settle(&starting));
+
+        let published = base_status("authorized", "running");
+        assert!(authorization_may_still_settle(&published));
+
+        let mismatch = base_status("mismatch", "not-running");
+        assert!(!authorization_may_still_settle(&mismatch));
+
+        let stopped = base_status("authorized", "not-running");
+        assert!(!authorization_may_still_settle(&stopped));
+    }
+
+    #[test]
+    fn stale_authorized_status_is_masked_when_live_guard_evidence_is_missing() {
+        let published = base_status("authorized", "running");
+        let masked = mask_stale_authorized_status(published, true, false);
+        assert_eq!(masked.status, "starting");
+        assert_eq!(masked.watchdog, "not-running");
+        assert!(!masked.codex_allowed);
+        assert!(masked
+            .codex_block_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("helper=false")));
+
+        let live = base_status("authorized", "running");
+        let unchanged = mask_stale_authorized_status(live.clone(), true, true);
+        assert_eq!(unchanged, live);
     }
 
     #[test]

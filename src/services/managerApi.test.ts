@@ -5,6 +5,7 @@ import { DEFAULT_SETTINGS, type AppSettings } from "../shared/types";
 import {
   isNetworkError,
   managerApi,
+  skillRepoAttempts,
   SETTINGS_CHANGED_EVENT,
   type UpdateInfo,
 } from "./managerApi";
@@ -33,7 +34,6 @@ beforeEach(() => {
   vi.stubGlobal("window", { open: vi.fn(), __TAURI_INTERNALS__: undefined });
   localStorage.clear();
 });
-
 describe("isNetworkError", () => {
   it("classifies transport and TLS failures as connectivity errors", () => {
     expect(
@@ -96,6 +96,20 @@ describe("settings API", () => {
       "https://codexapp.agentsmirror.com/",
     );
     expect(settings.codexPayloadRepo).toBe("");
+  });
+
+  it("normalizes a persisted legacy Codex mirror source to auto", async () => {
+    localStorage.setItem(
+      "cam.settings",
+      JSON.stringify({
+        ...DEFAULT_SETTINGS,
+        codexPayloadSourceKind: "mirror",
+      }),
+    );
+
+    const settings = await managerApi.getSettings();
+
+    expect(settings.codexPayloadSourceKind).toBe("auto");
   });
 
   it("normalizes and broadcasts browser settings writes", async () => {
@@ -196,6 +210,28 @@ describe("settings API", () => {
     expect(fallback.codexPayloadBaseUrl).toBe(
       DEFAULT_SETTINGS.codexPayloadBaseUrl,
     );
+  });
+});
+
+describe("Windows launch locale", () => {
+  it("passes the selected Chinese locale to the native launcher", async () => {
+    window.__TAURI_INTERNALS__ = {};
+    invokeMock.mockResolvedValue(undefined);
+
+    await managerApi.winLaunch("zh-CN");
+
+    expect(invokeMock).toHaveBeenCalledWith("win_launch_codex", {
+      locale: "zh-CN",
+    });
+  });
+
+  it("keeps the legacy no-argument launch payload for the default language", async () => {
+    window.__TAURI_INTERNALS__ = {};
+    invokeMock.mockResolvedValue(undefined);
+
+    await managerApi.winLaunch();
+
+    expect(invokeMock).toHaveBeenCalledWith("win_launch_codex");
   });
 });
 
@@ -323,6 +359,17 @@ describe("Windows perform API", () => {
     });
   });
 
+  it("uses the dedicated command to acknowledge a pending uninstall handoff", async () => {
+    window.__TAURI_INTERNALS__ = {};
+    invokeMock.mockResolvedValue(undefined);
+
+    await managerApi.completeUninstallHandoff("handoff-test-id");
+
+    expect(invokeMock).toHaveBeenCalledWith("complete_uninstall_handoff", {
+      handoffId: "handoff-test-id",
+    });
+  });
+
   it("sends the renderer resume mode and one-shot install root to the backend", async () => {
     window.__TAURI_INTERNALS__ = {};
     invokeMock.mockResolvedValue({ success: true });
@@ -413,6 +460,81 @@ describe("Codex payload API", () => {
   });
 });
 
+describe("Skill Hub API", () => {
+  it("keeps only the safe source-attempt fields at the IPC boundary", async () => {
+    window.__TAURI_INTERNALS__ = {};
+    invokeMock.mockResolvedValue({
+      attempts: [
+        {
+          sourceId: "cn-mirror-1",
+          sourceKind: "domestic",
+          phase: "metadata",
+          result: "timeout",
+          httpStatus: null,
+          elapsedMs: 8_001.4,
+          url: "https://secret.example/source",
+        },
+        {
+          sourceId: "https://account.example/source",
+          sourceKind: "domestic",
+          phase: "metadata",
+          result: "ok",
+          httpStatus: 200,
+          elapsedMs: 1,
+        },
+      ],
+    });
+
+    const info = await managerApi.skillRepoCheckUpdate();
+
+    expect(info.attempts).toEqual([
+      {
+        sourceId: "cn-mirror-1",
+        sourceKind: "domestic",
+        phase: "metadata",
+        result: "timeout",
+        httpStatus: null,
+        elapsedMs: 8_001,
+      },
+    ]);
+    expect(invokeMock).toHaveBeenCalledWith("skill_repo_check_update");
+  });
+
+  it("reads structured error attempts without exposing untrusted source values", () => {
+    const attempts = [
+      {
+        sourceId: "cn-mirror-2",
+        sourceKind: "domestic",
+        phase: "archive",
+        result: "http",
+        httpStatus: 503,
+        elapsedMs: 2_000,
+      },
+      {
+        sourceId: "https://secret.example/source",
+        sourceKind: "domestic",
+        phase: "archive",
+        result: "ok",
+        httpStatus: 200,
+        elapsedMs: 1,
+      },
+    ];
+    const expected = [
+      {
+        sourceId: "cn-mirror-2",
+        sourceKind: "domestic",
+        phase: "archive",
+        result: "http",
+        httpStatus: 503,
+        elapsedMs: 2_000,
+      },
+    ];
+
+    expect(skillRepoAttempts({ attempts })).toEqual(expected);
+    expect(skillRepoAttempts({ detail: JSON.stringify({ attempts }) })).toEqual(expected);
+  });
+});
+
 describe("macOS resumable target API", () => {
   it("sends exact update and fresh-install targets to the backend", async () => {
     window.__TAURI_INTERNALS__ = {};
@@ -448,5 +570,96 @@ describe("macOS resumable target API", () => {
       expectedTargetBuild: 150,
       expectedTargetVersion: "1.5.0",
     });
+  });
+});
+
+describe("404token account API", () => {
+  it("returns unbound status fallback when not in Tauri runtime", async () => {
+    const status = await managerApi.accountStatus?.();
+    expect(status?.bound).toBe(false);
+    expect(status?.message).toContain("account unavailable");
+  });
+
+  it("invokes account status command in Tauri", async () => {
+    window.__TAURI_INTERNALS__ = {};
+    invokeMock.mockResolvedValue({
+      bound: true,
+      accountName: "USB-0001",
+      loggedIn: false,
+      balance: null,
+      usage: null,
+      message: "已绑定,请输入密码登录",
+    });
+
+    const status = await managerApi.accountStatus?.();
+
+    expect(invokeMock).toHaveBeenCalledWith("account_status");
+    expect(status?.bound).toBe(true);
+    expect(status?.accountName).toBe("USB-0001");
+    expect(status?.loggedIn).toBe(false);
+  });
+
+  it("invokes account login with password", async () => {
+    window.__TAURI_INTERNALS__ = {};
+    invokeMock.mockResolvedValue({
+      bound: true,
+      accountName: "USB-0001",
+      loggedIn: true,
+      balance: 12500,
+      usage: { today: 320, thisMonth: 8460 },
+      message: "登录成功",
+    });
+
+    const status = await managerApi.accountLogin("test-password");
+
+    expect(invokeMock).toHaveBeenCalledWith("account_login", {
+      password: "test-password",
+    });
+    expect(status.loggedIn).toBe(true);
+    expect(status.balance).toBe(12500);
+  });
+
+  it("invokes account refresh", async () => {
+    window.__TAURI_INTERNALS__ = {};
+    invokeMock.mockResolvedValue({
+      bound: true,
+      accountName: "USB-0001",
+      loggedIn: true,
+      balance: 15000,
+      usage: { today: 450 },
+      message: "账户信息已刷新",
+    });
+
+    const status = await managerApi.accountRefresh();
+
+    expect(invokeMock).toHaveBeenCalledWith("account_refresh");
+    expect(status.balance).toBe(15000);
+  });
+
+  it("invokes account redeem with code", async () => {
+    window.__TAURI_INTERNALS__ = {};
+    invokeMock.mockResolvedValue({
+      bound: true,
+      accountName: "USB-0001",
+      loggedIn: true,
+      balance: 25000,
+      usage: null,
+      message: "充值成功,余额已更新",
+    });
+
+    const status = await managerApi.accountRedeem("RECHARGE-ABC123");
+
+    expect(invokeMock).toHaveBeenCalledWith("account_redeem", {
+      code: "RECHARGE-ABC123",
+    });
+    expect(status.balance).toBe(25000);
+    expect(status.message).toContain("充值成功");
+  });
+
+  it("handles account errors gracefully", async () => {
+    window.__TAURI_INTERNALS__ = {};
+    invokeMock.mockRejectedValue(new Error("登录失败：密码错误或会话已过期,请重新登录"));
+
+    await expect(managerApi.accountLogin("wrong-password")).rejects.toThrow("密码错误");
   });
 });

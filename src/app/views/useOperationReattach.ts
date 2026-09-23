@@ -4,6 +4,7 @@ import { managerApi } from "../../services/managerApi";
 import type {
   DownloadProgress,
   OperationKind,
+  OperationPhase,
   OperationSnapshot,
 } from "../../shared/types";
 import type { PausedDownload } from "./ProgressScreen";
@@ -32,6 +33,7 @@ export function useOperationReattach(opts: {
   startDlListen: (options?: StartDlListenOptions) => Promise<() => void>;
   applySnapshotProgress: (
     progress: DownloadProgress | null | undefined,
+    phase?: OperationPhase,
   ) => void;
   resetStop: () => void;
   setBusy: (busy: ReattachBusy | null) => void;
@@ -104,7 +106,14 @@ export function useOperationReattach(opts: {
       const busy = snap.resume?.kind ?? busyFromKind(snap.kind);
       if (!busy) return false;
       setBusyRef.current(busy);
-      applySnapshotProgressRef.current(snap.progress ?? null);
+      // Keep the historical call shape for ordinary byte-download snapshots;
+      // the phase is only embedded when it carries an install-stage transition
+      // that cannot be inferred from bytes alone.
+      const progress =
+        snap.progress && snap.phase !== "downloading"
+          ? { ...snap.progress, phase: snap.phase }
+          : snap.progress;
+      applySnapshotProgressRef.current(progress ?? null);
       if (snap.paused) {
         const kind = snap.resume?.kind ?? pausedKind(snap.kind);
         if (kind) {

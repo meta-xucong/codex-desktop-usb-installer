@@ -14,8 +14,8 @@
     "unsupported"
   ],
   "policy": {
-    "defaultInstall": "installByDefault=true only",
-    "implicitInvocation": "non-core-ready skills are disabled until enableWhen passes",
+    "defaultInstall": "core-ready, auto-installable-runtime, and unsupported entries are installed and enabled by default; guided-config entries wait for user credentials or MCP setup",
+    "implicitInvocation": "the rendered config enables core-ready, auto-installable-runtime, and unsupported Skills; guided-config Skills remain disabled until enableWhen passes",
     "dependencyModel": "Each dependency is an object; status never hides runtime, connection, credential, or capability closure.",
     "pythonRuntime": {"platform": "win_amd64", "implementation": "cpython", "abi": "cp312", "version": "3.12.10", "materializationStatus": "ready", "installReady": true, "mediaManifest": "runtime/bundled/media-manifest.json", "wheelhouseManifest": "runtime/wheelhouse-manifest.json"}
   },
@@ -55,7 +55,7 @@
     {
       "id": "canvas",
       "status": "unsupported/disabled",
-      "defaultEnabled": false,
+      "defaultEnabled": true,
       "dependencies": [
         {
           "id": "external.host-specific-canvas-runtime",
@@ -69,22 +69,23 @@
       "capabilities": [
         "HTML 原型说明"
       ],
-      "notes": "保持禁用：当前能力包没有可验证的远程 Canvas 节点/画布运行时；仅提供替代建议。",
-      "installByDefault": false,
+      "notes": "配置层面默认启用；当前能力包没有可验证的远程 Canvas 节点/画布运行时，运行时必须明确返回后端未连接，不得伪造画布操作成功。",
+      "installByDefault": true,
       "afterRemediationStatus": "unsupported",
     "enableWhen": [
-      "disabled"
+      "skill-installed",
+      "external.host-specific-canvas-runtime"
       ],
       "verification": {
         "skillFile": "skills/canvas/SKILL.md",
         "windowsEntry": "Codex workflow / frontmatter",
-        "smoke": "negative test: no compatible automatic entry point; must remain disabled"
+        "smoke": "safe-failure contract: missing Canvas backend is reported explicitly; no external action is claimed"
       }
     },
     {
       "id": "china-stock-analysis",
       "status": "requires-runtime",
-      "defaultEnabled": false,
+      "defaultEnabled": true,
       "dependencies": [
         {
           "id": "runtime.python312",
@@ -137,7 +138,7 @@
         "财务分析",
         "估值与筛选"
       ],
-      "installByDefault": false,
+      "installByDefault": true,
       "afterRemediationStatus": "auto-installable-runtime",
       "enableWhen": [
         "skill-installed",
@@ -244,7 +245,7 @@
     {
       "id": "data-assistant",
       "status": "requires-runtime",
-      "defaultEnabled": false,
+      "defaultEnabled": true,
       "dependencies": [
         {
           "id": "runtime.python312",
@@ -308,7 +309,7 @@
         "数据清洗",
         "图表与 PDF 提取"
       ],
-      "installByDefault": false,
+      "installByDefault": true,
       "afterRemediationStatus": "auto-installable-runtime",
       "enableWhen": [
         "skill-installed",
@@ -324,7 +325,7 @@
     {
       "id": "docx-butler",
       "status": "requires-runtime",
-      "defaultEnabled": false,
+      "defaultEnabled": true,
       "dependencies": [
         {
           "id": "runtime.python312",
@@ -377,7 +378,7 @@
         "格式转换",
         "演示稿结构"
       ],
-      "installByDefault": false,
+      "installByDefault": true,
       "afterRemediationStatus": "auto-installable-runtime",
       "enableWhen": [
         "skill-installed",
@@ -439,7 +440,7 @@
     {
       "id": "excel-xlsx",
       "status": "requires-runtime",
-      "defaultEnabled": false,
+      "defaultEnabled": true,
       "dependencies": [
         {
           "id": "runtime.python312",
@@ -470,7 +471,7 @@
         "公式与日期",
         "工作簿生成"
       ],
-      "installByDefault": false,
+      "installByDefault": true,
       "afterRemediationStatus": "auto-installable-runtime",
       "enableWhen": [
         "skill-installed",
@@ -606,7 +607,7 @@
     {
       "id": "fitness-coach",
       "status": "requires-runtime",
-      "defaultEnabled": false,
+      "defaultEnabled": true,
       "dependencies": [
         {
           "id": "runtime.python312",
@@ -626,7 +627,7 @@
         "动作与周期",
         "进度记录"
       ],
-      "installByDefault": false,
+      "installByDefault": true,
       "afterRemediationStatus": "auto-installable-runtime",
       "enableWhen": [
         "skill-installed",
@@ -642,7 +643,7 @@
     {
       "id": "fund-portfolio",
       "status": "requires-runtime",
-      "defaultEnabled": false,
+      "defaultEnabled": true,
       "dependencies": [
         {
           "id": "runtime.python312",
@@ -706,7 +707,7 @@
         "组合配置",
         "定投与风险"
       ],
-      "installByDefault": false,
+      "installByDefault": true,
       "afterRemediationStatus": "auto-installable-runtime",
       "enableWhen": [
         "skill-installed",
@@ -745,7 +746,7 @@
     {
       "id": "healthcheck",
       "status": "unsupported/disabled",
-      "defaultEnabled": false,
+      "defaultEnabled": true,
       "dependencies": [
         {
           "id": "external.windows-security-admin-tools",
@@ -759,16 +760,17 @@
       "capabilities": [
         "主机安全检查说明"
       ],
-      "notes": "保持禁用：主机加固涉及管理员权限、策略和外部设备状态，不能用静态 Skill 冒充审计结果。",
-      "installByDefault": false,
+      "notes": "配置层面默认启用；真实审计仍受 Windows 安全工具、管理员权限、系统策略和设备状态约束。后端或权限不足时必须返回明确的不可用状态，不得伪造检查结果。",
+      "installByDefault": true,
       "afterRemediationStatus": "unsupported",
       "enableWhen": [
-        "disabled"
+        "skill-installed",
+        "external.windows-security-admin-tools"
       ],
       "verification": {
         "skillFile": "skills/healthcheck/SKILL.md",
         "windowsEntry": "Codex workflow / frontmatter",
-        "smoke": "negative test: no compatible automatic entry point; must remain disabled"
+        "smoke": "safe-failure contract: missing Windows security backend or permission is reported explicitly"
       }
     },
     {
@@ -883,7 +885,7 @@
     {
       "id": "macro-research",
       "status": "requires-runtime",
-      "defaultEnabled": false,
+      "defaultEnabled": true,
       "dependencies": [
         {
           "id": "runtime.python312",
@@ -936,7 +938,7 @@
         "政策解读",
         "资产配置框架"
       ],
-      "installByDefault": false,
+      "installByDefault": true,
       "afterRemediationStatus": "auto-installable-runtime",
       "enableWhen": [
         "skill-installed",
@@ -984,7 +986,7 @@
     {
       "id": "meal-planner",
       "status": "requires-runtime",
-      "defaultEnabled": false,
+      "defaultEnabled": true,
       "dependencies": [
         {
           "id": "runtime.python312",
@@ -1004,7 +1006,7 @@
         "营养分析",
         "购物清单"
       ],
-      "installByDefault": false,
+      "installByDefault": true,
       "afterRemediationStatus": "auto-installable-runtime",
       "enableWhen": [
         "skill-installed",
@@ -1075,7 +1077,7 @@
     {
       "id": "node-connect",
       "status": "unsupported/disabled",
-      "defaultEnabled": false,
+      "defaultEnabled": true,
       "dependencies": [
         {
           "id": "external.device-pairing-runtime",
@@ -1089,16 +1091,17 @@
       "capabilities": [
         "连接问题排查说明"
       ],
-      "notes": "保持禁用：设备配对协议与节点后端不在本能力包可验证边界内。",
-      "installByDefault": false,
+      "notes": "配置层面默认启用；设备配对协议、节点后端和网关仍需外部提供。后端未连接时必须明确返回不可用，不得把网页可达或二维码存在误报为已配对。",
+      "installByDefault": true,
       "afterRemediationStatus": "unsupported",
       "enableWhen": [
-        "disabled"
+        "skill-installed",
+        "external.device-pairing-runtime"
       ],
       "verification": {
         "skillFile": "skills/node-connect/SKILL.md",
         "windowsEntry": "Codex workflow / frontmatter",
-        "smoke": "negative test: no compatible automatic entry point; must remain disabled"
+        "smoke": "safe-failure contract: missing device pairing backend is reported explicitly"
       }
     },
     {
@@ -1149,8 +1152,8 @@
     },
     {
       "id": "pdf-processing-toolkit",
-      "status": "unsupported/disabled",
-      "defaultEnabled": false,
+      "status": "requires-runtime",
+      "defaultEnabled": true,
       "dependencies": [
         {
           "id": "runtime.python312",
@@ -1203,31 +1206,30 @@
         "合并拆分",
         "表单与生成"
       ],
-      "installByDefault": false,
-      "afterRemediationStatus": "unsupported",
+    "installByDefault": true,
+      "afterRemediationStatus": "auto-installable-runtime",
       "redistribution": {
-        "status": "quarantined-stub-only",
-        "sourceBodyIncluded": false,
-        "evidenceRequired": true,
-        "publicStubMarker": "CODEX_PUBLIC_QUARANTINE_STUB_V1",
-        "maxPublicStubBytes": 4096
+        "status": "maintained-original",
+        "sourceBodyIncluded": true,
+        "evidenceRequired": false,
+        "licenseFile": "skills/pdf-processing-toolkit/LICENSE.txt",
+        "thirdPartyDependencies": "pypdf, pdfplumber, and reportlab retain their own upstream licenses"
       },
       "enableWhen": [
-        "license-evidence-approved",
         "skill-installed",
         "runtime-healthy"
       ],
       "verification": {
         "skillFile": "skills/pdf-processing-toolkit/SKILL.md",
         "windowsEntry": "Codex workflow / frontmatter",
-        "smoke": "frontmatter and provenance warning; must remain disabled without license evidence"
+        "smoke": "PDF read, text extraction, write/merge, and generation smoke test using the bundled Python runtime"
       },
-      "notes": "原始 frontmatter 声称 Proprietary 且引用缺失的 LICENSE.txt；在再分发条款可核验前保持 unsupported。"
+      "notes": "已替换为本项目自行维护的最小 PDF 工具实现，补充 LICENSE.txt；pypdf、pdfplumber、reportlab 通过离线 wheelhouse 安装并在运行时健康检查。"
     },
     {
       "id": "powerpoint-pptx",
       "status": "requires-runtime",
-      "defaultEnabled": false,
+      "defaultEnabled": true,
       "dependencies": [
         {
           "id": "runtime.python312",
@@ -1258,7 +1260,7 @@
         "版式与图表",
         "批量处理"
       ],
-      "installByDefault": false,
+      "installByDefault": true,
       "afterRemediationStatus": "auto-installable-runtime",
       "enableWhen": [
         "skill-installed",
@@ -1463,7 +1465,7 @@
     {
       "id": "travel-planner",
       "status": "requires-runtime",
-      "defaultEnabled": false,
+      "defaultEnabled": true,
       "dependencies": [
         {
           "id": "runtime.python312",
@@ -1491,7 +1493,7 @@
         "预算",
         "打包与交通检索"
       ],
-      "installByDefault": false,
+      "installByDefault": true,
       "afterRemediationStatus": "auto-installable-runtime",
       "enableWhen": [
         "skill-installed",
@@ -1539,7 +1541,7 @@
     {
       "id": "venture-analysis",
       "status": "requires-runtime",
-      "defaultEnabled": false,
+      "defaultEnabled": true,
       "dependencies": [
         {
           "id": "runtime.python312",
@@ -1592,7 +1594,7 @@
         "财务模型",
         "估值与尽调"
       ],
-      "installByDefault": false,
+      "installByDefault": true,
       "afterRemediationStatus": "auto-installable-runtime",
       "enableWhen": [
         "skill-installed",
@@ -1631,7 +1633,7 @@
     {
       "id": "wealth-allocation",
       "status": "requires-runtime",
-      "defaultEnabled": false,
+      "defaultEnabled": true,
       "dependencies": [
         {
           "id": "runtime.python312",
@@ -1684,7 +1686,7 @@
         "再平衡",
         "收益追踪"
       ],
-      "installByDefault": false,
+      "installByDefault": true,
       "afterRemediationStatus": "auto-installable-runtime",
       "enableWhen": [
         "skill-installed",
@@ -1888,7 +1890,7 @@
     {
       "id": "wechat-article-creator",
       "status": "requires-runtime",
-      "defaultEnabled": false,
+      "defaultEnabled": true,
       "dependencies": [
         {
           "id": "runtime.python312",
@@ -1927,7 +1929,7 @@
         "文章结构",
         "标题与封面"
       ],
-      "installByDefault": false,
+      "installByDefault": true,
       "afterRemediationStatus": "auto-installable-runtime",
       "enableWhen": [
         "skill-installed",
@@ -1943,7 +1945,7 @@
     {
       "id": "word-docx",
       "status": "requires-runtime",
-      "defaultEnabled": false,
+      "defaultEnabled": true,
       "dependencies": [
         {
           "id": "runtime.python312",
@@ -1973,7 +1975,7 @@
         "Word 读写",
         "样式与页眉页脚"
       ],
-      "installByDefault": false,
+      "installByDefault": true,
       "afterRemediationStatus": "auto-installable-runtime",
       "enableWhen": [
         "skill-installed",
