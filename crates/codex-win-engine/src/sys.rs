@@ -48,21 +48,21 @@ pub enum PortableLaunchPolicy {
     /// Preserve the ordinary desktop-manager behaviour.
     #[default]
     Standard,
-    /// USB edition: start with sandboxed software rendering, require a stable
-    /// sizeable window, and retry once with the empirically proven no-sandbox
-    /// fallback only when the safer attempt cannot present a usable UI.
+    /// USB edition: start with the same hardware-rendered launch as a direct
+    /// ChatGPT.exe open, require a stable user-operable window, and retry with
+    /// the software-rendering/no-sandbox compatibility path only on failure.
     UsbCompatible,
     /// A prior launch on this machine already proved that Chromium's sandbox
-    /// prevents the GPU/software renderer from starting. Skip the doomed first
-    /// attempt while keeping the exception scoped to this USB product launch.
+    /// must be disabled. Keep the normal GPU path but apply that exception to
+    /// the first USB attempt without showing a renderer auxiliary window.
     UsbCompatibleNoSandbox,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexLaunchReport {
-    /// `msix`, `standard`, `software-rendering`, or
-    /// `software-rendering-no-sandbox`.
+    /// `msix`, `standard`, `portable`, `portable-no-sandbox`,
+    /// `software-rendering`, or `software-rendering-no-sandbox`.
     pub launch_mode: String,
     pub usable_window_confirmed: bool,
     pub no_sandbox: bool,
@@ -4938,6 +4938,16 @@ fn portable_compatibility_arguments(
 }
 
 #[cfg(windows)]
+fn portable_launch_mode(software_rendering: bool, no_sandbox: bool) -> &'static str {
+    match (software_rendering, no_sandbox) {
+        (false, false) => "portable",
+        (false, true) => "portable-no-sandbox",
+        (true, false) => "software-rendering",
+        (true, true) => "software-rendering-no-sandbox",
+    }
+}
+
+#[cfg(windows)]
 fn configure_portable_launch_command(
     exe: &Path,
     options: &LaunchOptions,
@@ -4966,16 +4976,57 @@ fn configure_portable_launch_command(
 
 #[cfg(windows)]
 fn schedule_console_window_suppression(root: &Path) {
-    // The renderer can create a console-backed helper just after the main
-    // window becomes stable.  Sweep briefly after launch and hide only
-    // `ConsoleWindowClass` windows under this managed root; the Codex GUI is
-    // never targeted by this helper.
+    // Fallback for systems where the WinEvent hook cannot be installed. Start
+    // before CreateProcess and keep watching through startup and process exit.
     let root = root.to_path_buf();
     std::thread::spawn(move || {
-        for _ in 0..16 {
-            let _ = crate::windows_process::hide_console_windows_for_root(&root);
+        let started = std::time::Instant::now();
+        let lifetime = std::time::Duration::from_secs(60);
+        let mut root_seen = false;
+        let mut absent_since = None;
+        loop {
+            // This is a bounded startup guard.  The portable PE/ASAR edits
+            // handle future child creation, so do not retain a polling thread
+            // for the full lifetime of a healthy Codex process.
+            if started.elapsed() >= lifetime {
+                break;
+            }
+            match crate::windows_process::hide_console_windows_for_root(&root) {
+                Ok(hidden) if hidden > 0 => {
+                    log::debug!("managed Codex console fallback hidden_candidates={hidden}")
+                }
+                Err(error) => log::warn!("managed Codex console fallback failed: {error}"),
+                _ => {}
+            }
+            match crate::windows_process::hide_codex_auxiliary_windows_for_root(&root) {
+                Ok(hidden) if hidden > 0 => {
+                    log::debug!(
+                        "managed Codex auxiliary window fallback hidden_candidates={hidden}"
+                    )
+                }
+                Err(error) => log::warn!("managed Codex auxiliary window fallback failed: {error}"),
+                _ => {}
+            }
+            match crate::windows_process::processes_running_for_root(&root) {
+                Ok(true) => {
+                    root_seen = true;
+                    absent_since = None;
+                }
+                Ok(false) if root_seen => {
+                    let absent = absent_since.get_or_insert_with(std::time::Instant::now);
+                    if absent.elapsed() >= std::time::Duration::from_secs(3) {
+                        break;
+                    }
+                }
+                Ok(false) if started.elapsed() >= std::time::Duration::from_secs(45) => break,
+                Err(error) => {
+                    log::debug!("managed Codex console fallback process scan unavailable: {error}")
+                }
+                _ => {}
+            }
             std::thread::sleep(std::time::Duration::from_millis(250));
         }
+        log::info!("managed Codex console fallback stopped root_seen={root_seen}");
     });
 }
 
@@ -5005,6 +5056,7 @@ fn launch_portable_with_usable_window(
     root: &Path,
     exe: &Path,
     options: &LaunchOptions,
+    software_rendering: bool,
     no_sandbox: bool,
 ) -> Result<CodexLaunchReport, EngineError> {
     const WINDOW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
@@ -5016,8 +5068,15 @@ fn launch_portable_with_usable_window(
     // effective for both first install and in-place payload updates.
     let _ = crate::portable::ensure_portable_codex_startup_compatibility(root)?;
 
-    let mut command = configure_portable_launch_command(exe, options, true, no_sandbox);
+    let mut command =
+        configure_portable_launch_command(exe, options, software_rendering, no_sandbox);
     command.stdout(Stdio::null()).stderr(Stdio::null());
+    if let Err(error) = crate::windows_process::start_console_window_watcher(root) {
+        log::warn!(
+            "prelaunch Codex console event hook unavailable; using process-tree polling: {error}"
+        );
+        schedule_console_window_suppression(root);
+    }
     let mut child = command
         .spawn()
         .map_err(|error| EngineError::Io(format!("launch Codex: {error}")))?;
@@ -5042,11 +5101,7 @@ fn launch_portable_with_usable_window(
             if child.try_wait().ok().flatten().is_none() {
                 std::mem::forget(child);
             }
-            let launch_mode = if no_sandbox {
-                "software-rendering-no-sandbox"
-            } else {
-                "software-rendering"
-            };
+            let launch_mode = portable_launch_mode(software_rendering, no_sandbox);
             log::info!(
                 "portable Codex usable window confirmed mode={launch_mode} pid={} size={}x{} initially_visible={} foreground_accepted={}",
                 stable.pid,
@@ -5055,15 +5110,19 @@ fn launch_portable_with_usable_window(
                 window.was_visible,
                 stable.foreground_accepted
             );
-            schedule_console_window_suppression(root);
             return Ok(CodexLaunchReport {
                 launch_mode: launch_mode.to_string(),
                 usable_window_confirmed: true,
                 no_sandbox,
-                message: if no_sandbox {
-                    "Codex 已用软件渲染兼容模式启动；此设备需要关闭 Chromium 沙箱。".to_string()
-                } else {
-                    "Codex 已用软件渲染兼容模式启动。".to_string()
+                message: match (software_rendering, no_sandbox) {
+                    (false, false) => "Codex 已按常规渲染模式启动。".to_string(),
+                    (false, true) => {
+                        "Codex 已按常规渲染模式启动；此设备需要关闭 Chromium 沙箱。".to_string()
+                    }
+                    (true, false) => "Codex 已用软件渲染兼容模式启动。".to_string(),
+                    (true, true) => {
+                        "Codex 已用软件渲染兼容模式启动；此设备需要关闭 Chromium 沙箱。".to_string()
+                    }
                 },
             });
         }
@@ -5083,11 +5142,7 @@ fn launch_portable_with_usable_window(
     }
     Err(EngineError::Io(format!(
         "Codex 未能显示稳定窗口（模式={}，状态={exit}）",
-        if no_sandbox {
-            "software-rendering-no-sandbox"
-        } else {
-            "software-rendering"
-        }
+        portable_launch_mode(software_rendering, no_sandbox)
     )))
 }
 
@@ -5118,21 +5173,30 @@ pub fn launch_codex_with_options(
         if options.portable_launch_policy != PortableLaunchPolicy::Standard {
             let first_no_sandbox =
                 options.portable_launch_policy == PortableLaunchPolicy::UsbCompatibleNoSandbox;
-            match launch_portable_with_usable_window(root, &exe, &options, first_no_sandbox) {
+            // Match a direct ChatGPT.exe launch first.  The old USB path
+            // forced --disable-gpu here, which could surface Electron's
+            // title-less Chrome_WidgetWin_0 renderer as a full-size black
+            // window.  Keep software rendering as a bounded fallback.
+            match launch_portable_with_usable_window(root, &exe, &options, false, first_no_sandbox)
+            {
                 Ok(report) => return Ok(report),
-                Err(first_error) if !first_no_sandbox => {
+                Err(first_error) => {
                     log::warn!(
-                        "sandboxed software-rendering launch failed; retrying exact USB compatibility fallback: {first_error}"
+                        "normal GPU launch failed; retrying USB software-rendering compatibility fallback: {first_error}"
                     );
-                    return launch_portable_with_usable_window(root, &exe, &options, true).map_err(
-                        |fallback_error| {
-                            EngineError::Io(format!(
-                                "Codex 启动失败；软件渲染尝试：{first_error}；关闭沙箱重试：{fallback_error}"
-                            ))
-                        },
-                    );
+                    return launch_portable_with_usable_window(
+                        root,
+                        &exe,
+                        &options,
+                        true,
+                        true,
+                    )
+                    .map_err(|fallback_error| {
+                        EngineError::Io(format!(
+                            "Codex 启动失败；常规渲染尝试：{first_error}；软件渲染兼容重试：{fallback_error}"
+                        ))
+                    });
                 }
-                Err(error) => return Err(error),
             }
         }
 
@@ -5634,7 +5698,12 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn usb_launch_starts_safe_and_adds_no_sandbox_only_for_fallback() {
+    fn usb_launch_prefers_normal_gpu_and_keeps_compatibility_fallback_args() {
+        assert!(portable_compatibility_arguments(false, false).is_empty());
+        assert_eq!(
+            portable_compatibility_arguments(false, true),
+            vec!["--no-sandbox"]
+        );
         assert_eq!(
             portable_compatibility_arguments(true, false),
             vec!["--disable-gpu"]
@@ -5643,7 +5712,13 @@ mod tests {
             portable_compatibility_arguments(true, true),
             vec!["--disable-gpu", "--no-sandbox"]
         );
-        assert!(portable_compatibility_arguments(false, false).is_empty());
+        assert_eq!(portable_launch_mode(false, false), "portable");
+        assert_eq!(portable_launch_mode(false, true), "portable-no-sandbox");
+        assert_eq!(portable_launch_mode(true, false), "software-rendering");
+        assert_eq!(
+            portable_launch_mode(true, true),
+            "software-rendering-no-sandbox"
+        );
     }
 
     #[test]

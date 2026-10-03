@@ -819,6 +819,12 @@ pub fn install(
         ));
     };
     let (pack_version, install_script) = validate_pack(&source)?;
+    log::info!(
+        "capability pack install requested source={} version={} profile={}",
+        source.display(),
+        pack_version,
+        user_profile()?.display()
+    );
     let profile = user_profile()?;
     let mut command = Command::new("powershell.exe");
     command
@@ -907,12 +913,27 @@ pub fn install(
         &options.seedance_refund_rule,
     );
 
-    let output = command
-        .output()
-        .map_err(|error| AppError::Engine(format!("启动能力包安装器失败: {error}")))?;
+    let output = command.output().map_err(|error| {
+        log::error!(
+            "capability pack installer process could not start source={} error={error}",
+            source.display()
+        );
+        AppError::Engine(format!("启动能力包安装器失败: {error}"))
+    })?;
     if !output.status.success() {
         let code = output.status.code().unwrap_or(-1);
         let detail = sanitized_child_output(&output, &options);
+        log::error!(
+            "capability pack install failed source={} version={} exit_code={} detail={}",
+            source.display(),
+            pack_version,
+            code,
+            if detail.is_empty() {
+                "<no-output>"
+            } else {
+                &detail
+            }
+        );
         return Err(AppError::Engine(format!(
             "能力包安装失败（PowerShell 退出码 {code}）{}；请打开组件修复入口重试",
             if detail.is_empty() {
@@ -922,6 +943,11 @@ pub fn install(
             }
         )));
     }
+    log::info!(
+        "capability pack installer exited successfully source={} version={}",
+        source.display(),
+        pack_version
+    );
     persist_configured_environment(&options, &profile)?;
     let readiness = readiness_summary(&profile);
     let installed = readiness.pack_identity_valid
@@ -929,6 +955,16 @@ pub fn install(
         && readiness.pack_version.as_deref() == Some(pack_version.as_str());
     if !installed {
         let readiness_file = readiness_path(&profile);
+        log::error!(
+            "capability pack readiness failed source={} version={} skills={} agents={} runtime={} config={} readiness={}",
+            source.display(),
+            pack_version,
+            readiness.skills,
+            readiness.agents,
+            readiness.runtime_status,
+            readiness.config_status,
+            readiness_file.display()
+        );
         return Err(AppError::Engine(
             format!(
                 "能力包核心文件已返回，但 readiness 校验未通过（Skills：{}，Agents：{}，路径：{}，运行时：{}，配置：{}）；请打开组件修复入口重试",

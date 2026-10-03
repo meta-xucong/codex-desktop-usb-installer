@@ -232,6 +232,20 @@ function Assert-CompiledUsbManagerPolicy([string]$Path, [string]$ExpectedPolicy)
     Assert-Condition ($ascii.IndexOf($marker, [System.StringComparison]::Ordinal) -ge 0) "USB 管理器编译期策略与联合清单不一致：期望 $ExpectedPolicy；未找到标记 $marker"
 }
 
+function Assert-CompiledCcswitchHandoff([string]$Path, [string]$Label) {
+    Assert-Condition (Test-Path -LiteralPath $Path -PathType Leaf) "$Label CCSwitch 不存在，无法验证 API Key 注入协议：$Path"
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    $ascii = [System.Text.Encoding]::ASCII.GetString($bytes)
+    foreach ($marker in @(
+        "CODEX_USB_404TOKEN_HANDOFF_V1",
+        "CCSWITCH_404TOKEN_HANDOFF_PATH",
+        "CCSWITCH_404TOKEN_HANDOFF_NONCE",
+        "CCSWITCH_404TOKEN_DEVICE_KEY"
+    )) {
+        Assert-Condition ($ascii.IndexOf($marker, [System.StringComparison]::Ordinal) -ge 0) "$Label CCSwitch 缺少确认式 404token API Key 注入协议标记：$marker"
+    }
+}
+
 $manifestPath = Join-Path $root "manifest.json"
 $usbManifestPath = Join-Path $root "usb-manifest.json"
 $sumsPath = Join-Path $root "SHA256SUMS.txt"
@@ -336,6 +350,11 @@ Assert-Condition ($usbManifest.codexLaunch.initialMode -eq "software-rendering")
 Assert-Condition (($usbManifest.codexLaunch.initialArguments -join " ") -eq "--disable-gpu") "USB Codex 初始兼容参数不正确"
 Assert-Condition (($usbManifest.codexLaunch.fallbackArguments -join " ") -eq "--disable-gpu --no-sandbox") "USB Codex 末级兼容参数不正确"
 Assert-Condition ($usbManifest.codexLaunch.fallbackOnlyAfterNoUsableWindow -eq $true) "no-sandbox 只能在可操作窗口验收失败后使用"
+Assert-Condition ($usbManifest.codexLaunch.runtimeInitialMode -eq "portable") "USB Codex 实际首次启动必须使用常规渲染"
+Assert-Condition (($usbManifest.codexLaunch.runtimeInitialArguments -join " ") -eq "") "USB Codex 实际首次启动不得强制 --disable-gpu"
+Assert-Condition ($usbManifest.codexLaunch.runtimeFallbackMode -eq "software-rendering-no-sandbox") "USB Codex 实际兼容回退模式不正确"
+Assert-Condition (($usbManifest.codexLaunch.runtimeFallbackArguments -join " ") -eq "--disable-gpu --no-sandbox") "USB Codex 实际兼容回退参数不正确"
+Assert-Condition ($usbManifest.codexLaunch.runtimeFallbackOnlyAfterNoUsableWindow -eq $true) "USB Codex 实际兼容回退必须只在可操作窗口验收失败后使用"
 Assert-Condition ($usbManifest.codexLaunch.successPostcondition -eq "stable-sizeable-window") "USB Codex 不得只以进程存活作为启动成功"
 Assert-Condition ($usbManifest.codexLaunch.compatibilityMemory -eq "local-exact-codex-version") "USB Codex 兼容状态必须按精确版本保存在本机"
 Assert-Condition ($usbManifest.codexLaunch.selfUpdate -eq "disabled-for-usb-child") "USB Codex 必须对子进程关闭原地自更新"
@@ -408,6 +427,8 @@ Assert-Condition (Test-Path -LiteralPath $manager -PathType Leaf) "缺少 CodexA
 Assert-Condition (Test-Path -LiteralPath $launcherVerifierPath -PathType Leaf) "缺少 verify-usb-launcher.ps1"
 Assert-Condition (Test-Path -LiteralPath $ccswitch -PathType Leaf) "缺少根目录 ccswitch\CodexSwitch.exe"
 Assert-Condition (Test-Path -LiteralPath $embeddedCcswitch -PathType Leaf) "安装器资源中缺少 resources\ccswitch\CodexSwitch.exe"
+Assert-CompiledCcswitchHandoff $ccswitch "USB 根目录"
+Assert-CompiledCcswitchHandoff $embeddedCcswitch "安装器资源"
 Assert-Condition (Test-Path -LiteralPath $vcRedist -PathType Leaf) "缺少 resources\prerequisites\vc_redist.x64.exe"
 Assert-Condition (Test-Path -LiteralPath $webView2 -PathType Leaf) "缺少 WebView2 x64 完整离线安装包；空白机将无法显示安装界面"
 Assert-SkillHubSourceResource $root

@@ -80,31 +80,17 @@ $cargoProjectDir = if (Test-Path -LiteralPath (Join-Path $SourceDir "Cargo.toml"
 Write-Host "[步骤 2/6] 检查产品化改造..." -ForegroundColor Green
 
 $resourceSourceDir = Join-Path $repoRoot "src-tauri\resources\ccswitch"
-$providersJsonPath = Join-Path $SourceDir "providers.json"
-if (-not (Test-Path -LiteralPath $providersJsonPath -PathType Leaf)) {
-    $providersJsonPath = Join-Path $resourceSourceDir "providers.json"
-}
-if (-not (Test-Path -LiteralPath $providersJsonPath)) {
-    Write-Warning "未找到 providers.json,可能需要手动添加"
-} else {
-    $providersContent = Get-Content -LiteralPath $providersJsonPath -Raw
-    if ($providersContent -notmatch "404token") {
-        Write-Host "需要添加 404token provider 配置" -ForegroundColor Yellow
-        Write-Host "当前 providers.json 内容:" -ForegroundColor Gray
-        Write-Host $providersContent -ForegroundColor Gray
-        Write-Host ""
-        Write-Warning "请手动编辑 $providersJsonPath 添加 404token-sub2api provider"
-        $response = Read-Host "编辑完成后按 Enter 继续..."
-    } else {
-        Write-Host "✓ 404token provider 已存在" -ForegroundColor Green
-    }
-}
+# The repository resource is authoritative. A stale source-tree catalog must
+# never override the resource used by the manager's capability gate.
+$providersJsonPath = Join-Path $resourceSourceDir "providers.json"
+& (Join-Path $PSScriptRoot "verify-model-provider-resource.ps1") -SourcePath $providersJsonPath
+
 Write-Host ""
 
 # 步骤 3: 应用环境变量补丁
 Write-Host "[步骤 3/6] 应用环境变量补丁..." -ForegroundColor Green
 
-$codexAdapterPath = Join-Path $SourceDir "src-tauri\src\proxy\providers\codex.rs"
+$codexAdapterPath = Join-Path $cargoProjectDir "src\proxy\providers\codex.rs"
 if (-not (Test-Path -LiteralPath $codexAdapterPath)) {
     Write-Warning "未找到 codex.rs,路径可能不同"
     Write-Host "请手动定位 CodexAdapter::extract_key 函数并添加补丁" -ForegroundColor Yellow
@@ -152,6 +138,19 @@ if provider.id == "404token-sub2api" {
     }
 }
 Write-Host ""
+
+# The environment adapter alone only makes the key available to CCSwitch. It
+# does not prove the key reached its database or the active Codex provider.
+# Require the product-side persistence/switch/readback acknowledgement before
+# building anything that the manager may advertise as auto-configured.
+$providerServicePath = Join-Path $cargoProjectDir "src\services\provider\mod.rs"
+if (-not (Test-Path -LiteralPath $providerServicePath -PathType Leaf)) {
+    throw "CCSwitch 源码缺少 provider service：$providerServicePath"
+}
+$providerServiceText = [System.IO.File]::ReadAllText($providerServicePath)
+if (-not $providerServiceText.Contains("CODEX_USB_404TOKEN_HANDOFF_V1")) {
+    throw "CCSwitch 源码缺少确认式 API Key 持久化与回读协议；拒绝构建旧版自动注入实现"
+}
 
 # A release CCSwitch must contain the production renderer.  Running only
 # `cargo build --release` can reuse a stale `dist` directory (or, in a copied
@@ -223,14 +222,19 @@ Write-Host ""
 Write-Host "[步骤 6/6] 准备产物..." -ForegroundColor Green
 
 $builtExeCandidates = @(
-    (Join-Path $cargoProjectDir "target\release\CodexSwitch.exe"),
-    (Join-Path $cargoProjectDir "target\release\cc-switch.exe")
+    (Join-Path $cargoProjectDir "target\release\cc-switch.exe"),
+    (Join-Path $cargoProjectDir "target\release\CodexSwitch.exe")
 )
 $builtExePath = $builtExeCandidates |
     Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
     Select-Object -First 1
 if ([string]::IsNullOrWhiteSpace([string]$builtExePath)) {
     throw "未找到构建产物，已检查：$($builtExeCandidates -join ', ')"
+}
+$binaryText = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($builtExePath))
+if (-not $binaryText.Contains("CODEX_USB_404TOKEN_HANDOFF_V1") -or
+    -not $binaryText.Contains("CCSWITCH_404TOKEN_DEVICE_KEY")) {
+    throw "构建产物缺少 404token 确认式注入协议标记；可能选中了旧缓存 EXE：$builtExePath"
 }
 
 # 计算 SHA256
@@ -268,13 +272,31 @@ if (Test-Path -LiteralPath $currentManifestPath) {
     $manifest.notes = @(
         "404TOKEN is a third-party Sub2API relay, not an OpenAI official endpoint.",
         "A verified USB license injects one device API key for the unified-api-internal group at runtime.",
-        "On startup, CCSwitch idempotently persists and activates the USB provider in its normal user profile; no second Save or Apply click is required.",
+        "CCSwitch saves the USB key to its normal private provider database, switches the provider, and returns a nonce-bound acknowledgement only after local readback succeeds.",
+        "The USB manager reports injection success only after validating that acknowledgement; on failure it keeps the CCSwitch window visible and shows an error on its home page.",
+        "Model discovery does not gate normal provider activation or Codex launch.",
         "The device key is never included in this static resource bundle or providers.json.",
         "The Windows MSI/NSIS wrapper is not included in this P0 artifact."
     )
-    $manifest | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $newManifestPath -Encoding UTF8
+    $manifestJson = $manifest | ConvertTo-Json -Depth 10
+    $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+    [System.IO.File]::WriteAllText($newManifestPath, $manifestJson, $utf8NoBom)
+    $manifestBytes = [System.IO.File]::ReadAllBytes($newManifestPath)
+    if ($manifestBytes.Length -ge 3 -and
+        $manifestBytes[0] -eq 0xEF -and
+        $manifestBytes[1] -eq 0xBB -and
+        $manifestBytes[2] -eq 0xBF) {
+        throw "manifest.json 写入后仍包含 UTF-8 BOM：$newManifestPath"
+    }
     Write-Host "✓ manifest.json 已更新 (SHA256 已更新)" -ForegroundColor Green
 }
+
+$productVerifier = Join-Path $OutputDir "verify-product.ps1"
+if (-not (Test-Path -LiteralPath $productVerifier -PathType Leaf)) {
+    throw "CCSwitch 产物缺少 verify-product.ps1：$productVerifier"
+}
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $productVerifier -ArtifactDir $OutputDir -SkipNetwork
+if ($LASTEXITCODE -ne 0) { throw "CCSwitch 输出产物未通过确认式 API Key 注入门禁" }
 
 Write-Host ""
 Write-Host "================================================" -ForegroundColor Cyan

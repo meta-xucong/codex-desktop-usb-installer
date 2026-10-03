@@ -469,6 +469,93 @@ pub fn reconcile_for_uninstall_scoped(scope: Option<&Path>) -> Result<usize, App
     reconcile_new_installed_in_dir_scoped(&dir, scope)
 }
 
+/// Refuse to uninstall one volume while a transaction owned by another install
+/// still points anywhere on that volume. Foreign journals are inspected only;
+/// they are never reconciled, deleted or replayed by this operation.
+pub fn validate_foreign_recovery_volume(scope: &Path) -> Result<(), AppError> {
+    let dir =
+        transactions_dir().ok_or_else(|| AppError::Internal("无法定位安装事务目录".into()))?;
+    validate_foreign_recovery_volume_in_dir(&dir, scope)
+}
+
+fn windows_volume_key(raw: &str) -> Option<String> {
+    let mut value = raw.trim().replace('/', "\\");
+    if let Some(rest) = value.strip_prefix(r"\\?\") {
+        value = rest.to_string();
+    }
+    let lower = value.to_ascii_lowercase();
+    if lower.starts_with(r"\\") {
+        let mut parts = lower[2..].split('\\').filter(|part| !part.is_empty());
+        let server = parts.next()?;
+        let share = parts.next()?;
+        return Some(format!(r"\\{server}\{share}"));
+    }
+    (lower.as_bytes().get(1) == Some(&b':')).then(|| lower[..2].to_string())
+}
+
+fn validate_foreign_recovery_volume_in_dir(dir: &Path, scope: &Path) -> Result<(), AppError> {
+    codex_win_engine::validate_cleanup_path(dir)
+        .map_err(|error| AppError::Engine(error.to_string()))?;
+    let scope_volume = windows_volume_key(&scope.to_string_lossy()).ok_or_else(|| {
+        AppError::Engine("无法确认 U 盘卸载目标的卷身份；保留安装及所有恢复记录".into())
+    })?;
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(AppError::Engine(format!("无法读取安装恢复目录：{error}"))),
+    };
+    for entry in entries {
+        let path = entry
+            .map_err(|error| AppError::Engine(error.to_string()))?
+            .path();
+        codex_win_engine::validate_cleanup_path(&path)
+            .map_err(|error| AppError::Engine(error.to_string()))?;
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("");
+        let Some(id) = name
+            .strip_suffix(".json")
+            .or_else(|| name.strip_suffix(".json.bak"))
+        else {
+            return Err(AppError::Engine(format!(
+                "安装恢复目录包含未知材料，未开始卸载：{}",
+                path.display()
+            )));
+        };
+        if uuid::Uuid::parse_str(id).is_err() {
+            return Err(AppError::Engine("安装事务文件名无效，保留恢复材料".into()));
+        }
+        let tx = InstallTransaction::load_from_path(&path)?;
+        if tx.schema_version != SCHEMA_VERSION || tx.id != id {
+            return Err(AppError::Engine(format!(
+                "安装事务身份/版本不符，未开始卸载：{}",
+                path.display()
+            )));
+        }
+        if transaction_matches_scope(&tx, Some(scope)) {
+            continue;
+        }
+        for raw in [&tx.install_path, &tx.new_path, &tx.backup_path] {
+            codex_win_engine::validate_cleanup_path(Path::new(raw))
+                .map_err(|error| AppError::Engine(error.to_string()))?;
+            let volume = windows_volume_key(raw).ok_or_else(|| {
+                AppError::Engine(format!(
+                    "其他安装的事务包含无法识别的卷路径，未开始卸载：{}",
+                    path.display()
+                ))
+            })?;
+            if volume == scope_volume {
+                return Err(AppError::Engine(format!(
+                    "其他安装的恢复事务引用了 U 盘目标卷 {scope_volume}，未开始卸载并保留恢复材料：{}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn transaction_matches_scope(tx: &InstallTransaction, scope: Option<&Path>) -> bool {
     scope
         .is_none_or(|scope| codex_win_engine::same_windows_path(Path::new(&tx.install_path), scope))
@@ -477,14 +564,26 @@ fn transaction_matches_scope(tx: &InstallTransaction, scope: Option<&Path>) -> b
 fn can_reconcile_new_installed_for_uninstall(tx: &InstallTransaction) -> bool {
     tx.kind == InstallTxKind::WindowsPortable
         && tx.step == InstallTxStep::NewInstalled
-        && !path_exists(&tx.new_path)
-        && !path_exists(&tx.backup_path)
+        && path_is_definitively_absent(&tx.new_path)
+        && path_is_definitively_absent(&tx.backup_path)
     // The usual landed-update shape has the install root present.  After
     // a later explicit uninstall the root may already be gone; with no
     // staged payload or rollback tree left, retaining this journal cannot
     // recover anything and would block the detached second-stage cleanup
     // forever.  Both shapes are therefore safe bookkeeping-only
     // reconciliations; no filesystem path is renamed or removed here.
+}
+
+/// `Path::exists()` collapses permission failures and other metadata errors
+/// into `false`.  That is too permissive at this boundary: a transaction may
+/// only be closed when both recovery paths are positively known to be absent.
+/// Reparse points (including dangling links) also count as present evidence.
+fn path_is_definitively_absent(raw: &str) -> bool {
+    match fs::symlink_metadata(raw) {
+        Ok(_) => false,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => false,
+    }
 }
 
 fn reconcile_new_installed_in_dir_scoped(
@@ -749,6 +848,107 @@ mod uninstall_cleanup_tests {
 
         fs::remove_dir_all(root).unwrap();
         let _ = fs::remove_dir_all(other);
+    }
+
+    #[test]
+    fn foreign_recovery_reference_on_usb_volume_blocks_uninstall() {
+        let root = fixture_root();
+        let dir = root.join("journals");
+        fs::create_dir_all(&dir).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut tx = fixture(&root, &id, InstallTxStep::NewInstalled);
+        tx.install_path = r"C:\Users\fixture\Programs\Codex".into();
+        tx.new_path = r"E:\CodexBundle\apps\Codex.stage".into();
+        tx.backup_path = r"C:\Users\fixture\Programs\Codex.backup".into();
+        fs::write(
+            dir.join(format!("{id}.json")),
+            serde_json::to_vec(&tx).unwrap(),
+        )
+        .unwrap();
+
+        let error =
+            validate_foreign_recovery_volume_in_dir(&dir, Path::new(r"E:\CodexBundle\apps\Codex"))
+                .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("引用了 u 盘目标卷 e:"),
+            "{error}"
+        );
+        assert!(dir.join(format!("{id}.json")).is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn foreign_recovery_on_another_volume_is_inspected_but_preserved() {
+        let root = fixture_root();
+        let dir = root.join("journals");
+        fs::create_dir_all(&dir).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut tx = fixture(&root, &id, InstallTxStep::NewInstalled);
+        tx.install_path = r"C:\Users\fixture\Programs\Codex".into();
+        tx.new_path = r"C:\Users\fixture\Programs\Codex.new".into();
+        tx.backup_path = r"C:\Users\fixture\Programs\Codex.backup".into();
+        fs::write(
+            dir.join(format!("{id}.json")),
+            serde_json::to_vec(&tx).unwrap(),
+        )
+        .unwrap();
+
+        assert!(validate_foreign_recovery_volume_in_dir(
+            &dir,
+            Path::new(r"E:\CodexBundle\apps\Codex"),
+        )
+        .is_ok());
+        assert!(dir.join(format!("{id}.json")).is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn global_reconciliation_allows_safe_journal_from_another_install_root() {
+        let root = fixture_root();
+        let other = fixture_root();
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(other.join("install")).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let tx = fixture(&other, &id, InstallTxStep::NewInstalled);
+
+        // The active USB root is deliberately different.  The scoped pass
+        // must leave the record alone, while the explicit global pass used by
+        // the finalizer gate may consider it because no staged or backup path
+        // exists and no filesystem rename is performed.  The actual directory
+        // scanner also validates the journal filename against the production
+        // data root, so this test stays at the pure decision boundary.
+        assert_eq!(
+            transaction_matches_scope(&tx, Some(&root.join("install"))),
+            false
+        );
+        assert!(transaction_matches_scope(&tx, None));
+        assert!(can_reconcile_new_installed_for_uninstall(&tx));
+        assert!(other.join("install").is_dir());
+
+        fs::remove_dir_all(root).unwrap();
+        let _ = fs::remove_dir_all(other);
+    }
+
+    #[test]
+    fn global_terminal_cleanup_removes_terminal_journal_after_reconciliation() {
+        let root = fixture_root();
+        let dir = root.join("journals");
+        fs::create_dir_all(&dir).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let path = dir.join(format!("{id}.json"));
+        fs::write(
+            &path,
+            serde_json::to_vec(&fixture(&root, &id, InstallTxStep::Completed)).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(clear_completed_in_dir_scoped(&dir, None).unwrap(), 1);
+        assert!(!path.exists());
+
+        fs::remove_dir_all(root).unwrap();
     }
 }
 

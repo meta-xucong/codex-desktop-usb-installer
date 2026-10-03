@@ -64,6 +64,8 @@ async function confirmDefaultBundle(user: ReturnType<typeof userEvent.setup>) {
   await openBundle(user);
   await user.click(screen.getByRole("button", { name: "Uninstall Codex + CCSwitch" }));
   await user.click(screen.getByRole("button", { name: "Continue" }));
+  const purge = screen.queryByRole("button", { name: "Erase data & uninstall" });
+  if (purge) await user.click(purge);
 }
 
 describe("Uninstall", () => {
@@ -150,7 +152,7 @@ describe("Uninstall", () => {
     writeText.mockRestore();
   });
 
-  it("runs the combined Windows cleanup and keeps data by default", async () => {
+  it("runs the combined Windows cleanup and purges managed data by default", async () => {
     const user = userEvent.setup();
     setPlatform("Win32");
     render(<I18nProvider><Uninstall onBack={vi.fn()} bundleMode /></I18nProvider>);
@@ -158,16 +160,18 @@ describe("Uninstall", () => {
     expect(await screen.findByText("CCSwitch program to remove")).toBeInTheDocument();
     expect(screen.queryByRole("switch", { name: "Keep my data" })).not.toBeInTheDocument();
     await user.click(screen.getByText(CATALOG.en["uninstall.bundle.advanced"]));
-    expect(screen.getByRole("switch", { name: CATALOG.en["uninstall.bundle.purgeCodex"] })).not.toBeChecked();
-    expect(screen.getByRole("switch", { name: CATALOG.en["uninstall.bundle.purgeCcswitch"] })).not.toBeChecked();
+    expect(screen.getByRole("switch", { name: CATALOG.en["uninstall.bundle.purgeCodex"] })).toBeChecked();
+    expect(screen.getByRole("switch", { name: CATALOG.en["uninstall.bundle.purgeCcswitch"] })).toBeChecked();
+    expect(screen.getByRole("switch", { name: CATALOG.en["uninstall.bundle.purgeManager"] })).toBeChecked();
     await user.click(screen.getByRole("button", { name: "Uninstall Codex + CCSwitch" }));
     const first = screen.getByRole("dialog", { name: "Uninstall Codex + CCSwitch?" });
-    expect(within(first).getByText(CATALOG.en["uninstall.bundle.codexKeep"])).toBeInTheDocument();
-    expect(within(first).getByText(CATALOG.en["uninstall.bundle.ccswitchKeep"])).toBeInTheDocument();
-    expect(within(first).queryByText(/^Permanently erase:/)).not.toBeInTheDocument();
+    expect(within(first).getByText(CATALOG.en["uninstall.bundle.codexErase"])).toBeInTheDocument();
+    expect(within(first).getByText(CATALOG.en["uninstall.bundle.ccswitchErase"])).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Continue" }));
+    expect(screen.getByRole("dialog", { name: CATALOG.en["uninstall.bundle.confirm2.title"] })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Erase data & uninstall" }));
 
-    await waitFor(() => expect(winUninstallBundle).toHaveBeenCalledWith(true, false, false));
+    await waitFor(() => expect(winUninstallBundle).toHaveBeenCalledWith(true, true, true, true));
     expect(winUninstall).not.toHaveBeenCalled();
   });
 
@@ -191,8 +195,9 @@ describe("Uninstall", () => {
     expect(await screen.findByText(/No managed Codex record was found/i)).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Uninstall Codex + CCSwitch" }));
     await user.click(screen.getByRole("button", { name: "Continue" }));
+    await user.click(screen.getByRole("button", { name: "Erase data & uninstall" }));
 
-    await waitFor(() => expect(winUninstallBundle).toHaveBeenCalledWith(true, false, false));
+    await waitFor(() => expect(winUninstallBundle).toHaveBeenCalledWith(true, true, true, true));
   });
 
   it.each([[true, false], [false, true], [true, true]])("independently confirms shared data: Codex=%s CCSwitch=%s", async (purgeCodex, purgeCcswitch) => {
@@ -202,8 +207,11 @@ describe("Uninstall", () => {
 
     await screen.findByText("CCSwitch program to remove");
     await user.click(screen.getByText(CATALOG.en["uninstall.bundle.advanced"]));
-    if (purgeCodex) await user.click(screen.getByRole("switch", { name: CATALOG.en["uninstall.bundle.purgeCodex"] }));
-    if (purgeCcswitch) await user.click(screen.getByRole("switch", { name: CATALOG.en["uninstall.bundle.purgeCcswitch"] }));
+    // The USB bundle defaults to a complete cleanup. Toggle a switch only when
+    // this case asks to retain that data, so the parameters describe the final
+    // state sent to the backend.
+    if (!purgeCodex) await user.click(screen.getByRole("switch", { name: CATALOG.en["uninstall.bundle.purgeCodex"] }));
+    if (!purgeCcswitch) await user.click(screen.getByRole("switch", { name: CATALOG.en["uninstall.bundle.purgeCcswitch"] }));
     await user.click(screen.getByRole("button", { name: "Uninstall Codex + CCSwitch" }));
     const first = screen.getByRole("dialog", { name: "Uninstall Codex + CCSwitch?" });
     expect(within(first).getByText(CATALOG.en[purgeCodex ? "uninstall.bundle.codexErase" : "uninstall.bundle.codexKeep"])).toBeInTheDocument();
@@ -219,7 +227,7 @@ describe("Uninstall", () => {
     expect(within(second).queryByText(CATALOG.en[purgeCcswitch ? "uninstall.bundle.ccswitchKeep" : "uninstall.bundle.ccswitchErase"])).not.toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "Erase data & uninstall" }));
-    await waitFor(() => expect(winUninstallBundle).toHaveBeenCalledWith(true, purgeCodex, purgeCcswitch));
+    await waitFor(() => expect(winUninstallBundle).toHaveBeenCalledWith(true, purgeCodex, purgeCcswitch, true));
   });
 
   it("keeps the USB installation kit available for future reinstalls", async () => {
@@ -230,7 +238,8 @@ describe("Uninstall", () => {
     const first = screen.getByRole("dialog", { name: "Uninstall Codex + CCSwitch?" });
     expect(first).toHaveTextContent(CATALOG.en["uninstall.bundle.mediaKeep"]);
     await user.click(within(first).getByRole("button", { name: "Continue" }));
-    await waitFor(() => expect(winUninstallBundle).toHaveBeenCalledWith(true, false, false));
+    await user.click(screen.getByRole("button", { name: "Erase data & uninstall" }));
+    await waitFor(() => expect(winUninstallBundle).toHaveBeenCalledWith(true, true, true, true));
   });
 
   it.each([1, 2])("cancelling confirmation %s never starts program or data removal", async (step) => {
@@ -249,9 +258,10 @@ describe("Uninstall", () => {
   it("keeps missing-auth and small-directory heuristics out of data deletion authorization", async () => {
     const user = userEvent.setup();
     await openBundle(user);
-    expect(screen.getByText(CATALOG.en["uninstall.bundle.sharedRisk"])).toHaveTextContent(/Missing sign-in files or API keys, or a small size, does not authorize deletion/);
-    expect(screen.getByRole("switch", { name: CATALOG.en["uninstall.bundle.purgeCodex"] })).not.toBeChecked();
-    expect(screen.getByRole("switch", { name: CATALOG.en["uninstall.bundle.purgeCcswitch"] })).not.toBeChecked();
+    expect(screen.getByText(CATALOG.en["uninstall.bundle.sharedRisk"])).toHaveTextContent(/permanently delete the current user's Codex, CCSwitch, and manager data/i);
+    expect(screen.getByRole("switch", { name: CATALOG.en["uninstall.bundle.purgeCodex"] })).toBeChecked();
+    expect(screen.getByRole("switch", { name: CATALOG.en["uninstall.bundle.purgeCcswitch"] })).toBeChecked();
+    expect(screen.getByRole("switch", { name: CATALOG.en["uninstall.bundle.purgeManager"] })).toBeChecked();
   });
 
   it("preserves raw thrown backend errors in a details disclosure", async () => {
@@ -295,6 +305,29 @@ describe("Uninstall", () => {
     expect(document.querySelector(".ring.success")).not.toBeInTheDocument();
   });
 
+  it("reports primary USB uninstall success when shared recovery cleanup is safely deferred", async () => {
+    const user = userEvent.setup();
+    setPlatform("Win32");
+    const original = await winUninstallBundle.getMockImplementation()!(true, false, false);
+    winUninstallBundle.mockResolvedValue({
+      ...original,
+      cleanupDeferred: true,
+      message: "USB apps removed; another install's recovery record was retained",
+      outcome: emptyOperationOutcome({ primaryOk: true, appState: "absent",
+        cleanup: { state: "skipped", detail: "shared cleanup retained" } }),
+    });
+    await confirmDefaultBundle(user);
+    expect(await screen.findByText(CATALOG.en["uninstall.bundle.sharedCleanupDeferred"]))
+      .toBeInTheDocument();
+    expect(screen.getByText(CATALOG.en["uninstall.bundle.sharedCleanupDeferredNote"]))
+      .toBeInTheDocument();
+    await user.click(screen.getByText(CATALOG.en["home.error.details"]));
+    expect(screen.getByText("USB apps removed; another install's recovery record was retained", {
+      selector: "pre.errdetails",
+    })).toBeVisible();
+    expect(document.querySelector(".ring.success")).not.toBeInTheDocument();
+  });
+
   it("does not show success for an unfinished backend cleanup state", async () => {
     const user = userEvent.setup();
     const original = await winUninstallBundle.getMockImplementation()!(true, false, false);
@@ -335,6 +368,7 @@ describe("Uninstall", () => {
     await screen.findByText("CCSwitch program to remove");
     await user.click(screen.getByRole("button", { name: "Uninstall Codex + CCSwitch" }));
     await user.click(screen.getByRole("button", { name: "Continue" }));
+    await user.click(screen.getByRole("button", { name: "Erase data & uninstall" }));
     expect(await screen.findByText(CATALOG.en["uninstall.bundle.exiting"])).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Finish and exit" })).toBeEnabled();
     expect(completeUninstallHandoff).not.toHaveBeenCalled();
@@ -381,12 +415,14 @@ describe("Uninstall", () => {
     await screen.findByText("CCSwitch program to remove");
     await user.click(screen.getByRole("button", { name: "Uninstall Codex + CCSwitch" }));
     await user.click(screen.getByRole("button", { name: "Continue" }));
+    await user.click(screen.getByRole("button", { name: "Erase data & uninstall" }));
     await user.click(await screen.findByRole("button", { name: /Retry cleanup only/i }));
     expect(await screen.findByText(/Manager caches still need final cleanup/)).toBeInTheDocument();
     expect(winUninstallBundle).toHaveBeenCalledTimes(1);
     await user.click(screen.getByRole("button", { name: "Continue final cleanup" }));
     expect(winUninstallBundle).toHaveBeenCalledTimes(1);
     await user.click(screen.getByRole("button", { name: "Continue" }));
+    await user.click(screen.getByRole("button", { name: "Erase data & uninstall" }));
     expect(await screen.findByText(CATALOG.en["uninstall.bundle.exiting"])).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Finish and exit" })).toBeInTheDocument();
     expect(winUninstallBundle).toHaveBeenCalledTimes(2);
@@ -530,7 +566,7 @@ describe("Uninstall", () => {
         cleanup: { state: "failed", detail: "purge failed: file locked" }, recoveryActions: ["purge_user_data"] }),
     });
     await openBundle(user);
-    await user.click(screen.getByRole("switch", { name: CATALOG.en["uninstall.bundle.purgeCodex"] }));
+    await user.click(screen.getByRole("switch", { name: CATALOG.en["uninstall.bundle.purgeCcswitch"] }));
     await user.click(screen.getByRole("button", { name: "Uninstall Codex + CCSwitch" }));
     await user.click(screen.getByRole("button", { name: "Continue" }));
     await user.click(screen.getByRole("button", { name: "Erase data & uninstall" }));
@@ -547,7 +583,7 @@ describe("Uninstall", () => {
     await user.click(within(screen.getByRole("dialog", { name: CATALOG.en["uninstall.bundle.retryPurgeTitle"] })).getByRole("button", { name: /Retry purging user data only/i }));
     await waitFor(() => expect(retryAncillary).toHaveBeenCalledWith({ actions: ["purge_user_data"], purgeUserData: true, path: "D:\\WindowsApps\\OpenAI.Codex" }));
     expect(winUninstallBundle).toHaveBeenCalledTimes(1);
-    expect(winUninstallBundle).toHaveBeenCalledWith(true, true, false);
+    expect(winUninstallBundle).toHaveBeenCalledWith(true, true, false, true);
   });
 
   it("preserves raw retry failure without claiming ancillary completion", async () => {

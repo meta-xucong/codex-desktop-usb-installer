@@ -102,9 +102,14 @@ export function Uninstall({
   // Default to keeping the user's data (~/.codex on mac, %USERPROFILE%\.codex on
   // Windows). Opting out is deliberate.
   const [keepData, setKeepData] = useState(true);
-  const [purgeCodexData, setPurgeCodexData] = useState(false);
-  const [purgeCcswitchData, setPurgeCcswitchData] = useState(false);
+  const [purgeCodexData, setPurgeCodexData] = useState(true);
+  const [purgeCcswitchData, setPurgeCcswitchData] = useState(true);
+  // USB bundle removal is intentionally a complete local product cleanup by
+  // default. The user can turn either data class off in Advanced, but the
+  // final confirmation remains mandatory before any shared profile is erased.
+  const [forceManagerCleanup, setForceManagerCleanup] = useState(true);
   const [cleanupPending, setCleanupPending] = useState(false);
+  const [sharedCleanupDeferred, setSharedCleanupDeferred] = useState(false);
   const [cleanupHandoffId, setCleanupHandoffId] = useState<string | null>(null);
   const [handoffBusy, setHandoffBusy] = useState(false);
   const [needsFinalCleanup, setNeedsFinalCleanup] = useState(false);
@@ -132,6 +137,7 @@ export function Uninstall({
   const keepDataTitleId = useId();
   const purgeCodexTitleId = useId();
   const purgeCcswitchTitleId = useId();
+  const purgeManagerTitleId = useId();
 
   const refreshProbe = useCallback(async () => {
     setProbe("loading");
@@ -180,6 +186,7 @@ export function Uninstall({
     setNeedsFinalCleanup(false);
     setDoneDetail(null);
     setCleanupPending(false);
+    setSharedCleanupDeferred(false);
     setCleanupHandoffId(null);
     setHandoffBusy(false);
     try {
@@ -187,7 +194,12 @@ export function Uninstall({
       // inverse) — both surface the backend message as the source of truth.
       if (win) {
         const r = bundledWindows
-          ? await managerApi.winUninstallBundle(true, purgeCodexData, purgeCcswitchData)
+          ? await managerApi.winUninstallBundle(
+            true,
+            purgeCodexData,
+            purgeCcswitchData,
+            forceManagerCleanup,
+          )
           : await managerApi.winUninstall(true, !keepData);
         if (!r.success || !r.outcome.primaryOk) {
           setError(t("uninstall.failed"));
@@ -217,6 +229,12 @@ export function Uninstall({
           setNeedsFinalCleanup(bundledWindows);
           setPartialOutcome(r.outcome);
           setDone(t("uninstall.partial.summary"));
+          setDoneDetail(r.message);
+          return;
+        }
+        if ("cleanupDeferred" in r && r.cleanupDeferred) {
+          setSharedCleanupDeferred(true);
+          setDone(t("uninstall.bundle.sharedCleanupDeferred"));
           setDoneDetail(r.message);
           return;
         }
@@ -302,7 +320,9 @@ export function Uninstall({
   // First confirm → run when keeping data; otherwise escalate to a second,
   // explicit data-erasure confirm before doing anything destructive.
   const onFirstConfirm = () => {
-    if (bundledWindows ? !purgeCodexData && !purgeCcswitchData : keepData) {
+    if (bundledWindows
+      ? !purgeCodexData && !purgeCcswitchData && !forceManagerCleanup
+      : keepData) {
       void run();
     } else {
       setConfirmStep(2);
@@ -310,16 +330,17 @@ export function Uninstall({
   };
 
   const dataPaths = codexHome;
-  const selectedSharedData = purgeCodexData || purgeCcswitchData;
+  const selectedSharedData = purgeCodexData || purgeCcswitchData || forceManagerCleanup;
   const bundleSelection = (
     <div className="uninstall-selection">
       <p><strong>{t(purgeCodexData ? "uninstall.bundle.codexErase" : "uninstall.bundle.codexKeep")}</strong>
         <span className="rsub mono path" style={DATA_PATH_STYLE}>{CODEX_WINDOWS_DATA_PATHS}</span>
         {!purgeCodexData ? <span className="rsub">{t("uninstall.bundle.codexKeepNote")}</span> : null}
       </p>
-      <p><strong>{t(purgeCcswitchData ? "uninstall.bundle.ccswitchErase" : "uninstall.bundle.ccswitchKeep")}</strong>
+    <p><strong>{t(purgeCcswitchData ? "uninstall.bundle.ccswitchErase" : "uninstall.bundle.ccswitchKeep")}</strong>
         <span className="rsub mono path" style={DATA_PATH_STYLE}>{CCSWITCH_DATA_PATHS}</span>
       </p>
+      <p><strong>{t(forceManagerCleanup ? "uninstall.bundle.purgeManager" : "uninstall.bundle.managerKeep")}</strong></p>
       <p>{t("uninstall.bundle.mediaKeep")}</p>
     </div>
   );
@@ -362,8 +383,8 @@ export function Uninstall({
           <>
             <section className="hero" style={{ marginTop: 16 }}>
               <Ring
-                icon={cleanupPending ? "loader" : partialOutcome || needsFinalCleanup ? "alert" : "check"}
-                variant={cleanupPending || partialOutcome || needsFinalCleanup ? "amber" : "success"}
+                icon={cleanupPending ? "loader" : sharedCleanupDeferred || partialOutcome || needsFinalCleanup ? "alert" : "check"}
+                variant={cleanupPending || sharedCleanupDeferred || partialOutcome || needsFinalCleanup ? "amber" : "success"}
                 className="pop"
               />
               <div className="headline">
@@ -391,6 +412,9 @@ export function Uninstall({
                     : t("uninstall.bundle.finishExit")}
                 </button>
               </>
+            ) : null}
+            {sharedCleanupDeferred ? (
+              <StatusBanner tone="warn">{t("uninstall.bundle.sharedCleanupDeferredNote")}</StatusBanner>
             ) : null}
             {partialOutcome ? (
               <>
@@ -568,6 +592,22 @@ export function Uninstall({
                     </Tooltip>
                     <Toggle ariaLabelledBy={purgeCcswitchTitleId} checked={purgeCcswitchData}
                       onChange={setPurgeCcswitchData} disabled={busy || !canUninstall} />
+                  </div>
+                  <div className={`row data-path-row${forceManagerCleanup ? " danger" : ""}`}>
+                    <span className="rtext">
+                      <span className="rtitle" id={purgeManagerTitleId}>{t("uninstall.bundle.purgeManager")}</span>
+                    </span>
+                    <Tooltip content={t("uninstall.bundle.managerRisk")}>
+                      <span className="tooltip-icon" aria-label={t("themes.details")}>
+                        <Icon name="info" />
+                      </span>
+                    </Tooltip>
+                    <Toggle
+                      ariaLabelledBy={purgeManagerTitleId}
+                      checked={forceManagerCleanup}
+                      onChange={setForceManagerCleanup}
+                      disabled={busy || !canUninstall}
+                    />
                   </div>
                 </div>
               </details>

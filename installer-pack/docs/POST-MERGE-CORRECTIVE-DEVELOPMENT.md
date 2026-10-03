@@ -10,7 +10,7 @@
 ### 目标
 
 1. 修复合并后生成的 `installer-pack/` 与当前源码树之间的 provenance 漂移。
-2. 让 `--SkipRebuild` 验收也能发现生成包来自旧源码，而不是只检查包内自洽的文件哈希。
+2. 让只读验收也能发现生成包来自旧源码，而不是只检查包内自洽的文件哈希。
 3. 从公开仓库移除疑似专有的 PDF 指南正文，保留一个不含上游正文的隔离占位，维持 50 Skill 的状态和目录契约。
 4. 将运行时、飞书真实租户和外部付费 API 的未验证条件保留为明确阻断，不把静态 dry-run 描述成真实可用。
 5. 将 Windows x64 / CPython 3.12、Node 20、Feishu npm closure 和 Python wheelhouse 纳入可复现的一键安装包。
@@ -52,7 +52,7 @@
 - 包内 `sourceTreeSha256` 等于当前可编辑源码输入的计算值；
 - 不重建、不修改任何文件。
 
-`verify-package.ps1` 无论是否使用 `-SkipRebuild` 都执行该检查。这样旧生成包会在安装前失败，而不是只因包内自洽而通过。
+`verify-package.ps1` 无论是否使用 `-SkipAudit` 都执行该检查；`-SkipAudit` 只跳过重复的兼容性审计，不跳过 provenance/closure 校验。这样旧生成包会在安装前失败，而不是只因包内自洽而通过。
 
 ### 4.2 PDF 隔离
 
@@ -67,7 +67,7 @@
 
 | ID | 成功条件 | 方法 |
 | --- | --- | --- |
-| `R1` | 旧生成包 provenance 漂移可被发现；重新构建后只读验证通过 | `python scripts/build-pack.py --verify`；`verify-package.ps1 -SkipRebuild` |
+| `R1` | 旧生成包 provenance 漂移可被发现；重新构建后只读验证通过 | `python scripts/build-pack.py --verify`；`verify-package.ps1 -SkipAudit` |
 | `R2` | 源树和生成包均只有 PDF 隔离占位，且默认/非默认安装仍排除该 Skill | Codex compatibility audit、安装 smoke、文件大小/marker 检查 |
 | `R3` | 50 Skill、7 Agent、25 默认 Skill、哈希、路径安全和 adapter 回归不退化 | `verify-package.ps1`、`test-adapter-contracts.py` |
 | `R4` | 包内运行时介质可离线安装，Feishu 租户授权仍 fail-closed | 检查 ready manifest、逐文件哈希、隔离安装、无密钥渲染、wrapper dry-run |

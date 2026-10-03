@@ -48,8 +48,8 @@
     },
     {
       "path": "audit-codex-compatibility.py",
-      "sha256": "eeeda204d93af16cff1360fb42490f39cf9608e4897b525b7daa2ca6f785edc8",
-      "bytes": 61359,
+      "sha256": "81fdbf9f139af2290dd6ba0b0f6eb8965d8ea3c9d3ba0ae24bd8fff74f846170",
+      "bytes": 61794,
       "owned": true
     },
     {
@@ -114,8 +114,8 @@
     },
     {
       "path": "docs/POST-MERGE-CORRECTIVE-DEVELOPMENT.md",
-      "sha256": "a2cee22c0ac1add1438cea0e816c74e4fb4a333e64bcdc58f532319b09f2e4ad",
-      "bytes": 6679,
+      "sha256": "bea619e6362cb1930f8b590c4cfb8a3937f442ac5dfa9f53decec6190d7f5523",
+      "bytes": 6751,
       "owned": true
     },
     {
@@ -138,8 +138,8 @@
     },
     {
       "path": "install-to-codex.ps1",
-      "sha256": "8b4c6ad7bcabb710aa96ab1b0aba59b34feff94a565f977ed2bbb1f3a8365a00",
-      "bytes": 40983,
+      "sha256": "bedc90bc8565ca6bbc5380931e18efc7f4d2ca37345b8a830769e08d465d511e",
+      "bytes": 41043,
       "owned": true
     },
     {
@@ -276,14 +276,14 @@
     },
     {
       "path": "pack.json",
-      "sha256": "e9769c5e6d2c2f0faa28eabf456f31f2309bcbc0faa550d5d78973331582b575",
+      "sha256": "584461cb12f890d5a351ab570448a68e195ae45e38e7e83940b97eb9f5a78111",
       "bytes": 4155,
       "owned": true
     },
     {
       "path": "README.md",
-      "sha256": "cda6fc64e00f49495cf5b8b07e816d16c6946fdcefe9fe1f1371bcadde8271fd",
-      "bytes": 14525,
+      "sha256": "ed982cc841ed41028ac87b5ef932c2dd97c651e2ecb41750262e74d0ff7cdbd9",
+      "bytes": 14781,
       "owned": true
     },
     {
@@ -1524,14 +1524,14 @@
     },
     {
       "path": "sync-model-catalog.ps1",
-      "sha256": "84e571960dfaabec6223546ffd428f24a34e835933e75904cf4fe6b611786ab9",
-      "bytes": 13030,
+      "sha256": "c5244354c530bd57ec42bc2a055229a2605bf213a3272df075ed0a45a3363705",
+      "bytes": 9431,
       "owned": true
     },
     {
       "path": "test-adapter-contracts.py",
-      "sha256": "400c4a31490a94aa16e320c1d7656d9bf153f5cf3e54f8526e6bdaf78410df77",
-      "bytes": 58585,
+      "sha256": "846e54582d39a220f654d7d3b6d0922bf1ca40725122ea5a5a0d9f72a225376b",
+      "bytes": 59053,
       "owned": true
     }
   ]

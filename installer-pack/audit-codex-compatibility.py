@@ -1135,13 +1135,18 @@ def check_model_catalog(audit: Audit) -> None:
     sync_text = sync_path.read_text(encoding="utf-8-sig")
     if "SupportsShouldProcess" not in sync_text or ".ShouldProcess(" not in sync_text or "'planned'" not in sync_text:
         audit.error("Model synchronizer must support ShouldProcess/WhatIf and emit planned status.")
+    for marker in ("preferredModel = $null", "configChanged = $false", "modelSelectionStatus = 'deferred-until-verified'"):
+        if marker not in sync_text:
+            audit.error(f"Model synchronizer is missing metadata-only selection boundary: {marker}")
+    if re.search(r"Write-Utf8NoBom\s+\$configPath", sync_text):
+        audit.error("Model metadata synchronization must not write a default model into user config.")
     installer_text = installer_path.read_text(encoding="utf-8")
     if "sync-model-catalog.ps1" not in installer_text or "model-catalog.json" not in installer_text:
         audit.error("Capability installer does not invoke/install the model synchronization contract.")
     if any(path.name.casefold() == "models_cache.json" for path in audit.root.rglob("*")):
         audit.error("Raw models_cache.json must never be shipped in the public capability pack.")
     if len(audit.errors) == errors_before:
-        audit.passed("Sanitized upstream model catalog and default-model migration contract")
+        audit.passed("Sanitized model metadata synchronization; default selection remains deferred")
 
 
 def check_codex(audit: Audit, required: bool) -> None:

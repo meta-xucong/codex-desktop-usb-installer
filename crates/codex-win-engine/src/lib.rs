@@ -85,7 +85,8 @@ pub use sys::{
 /// termination is exposed to callers.
 pub use windows_process::{
     close_processes_for_root, hide_console_windows_for_root, hide_windows_for_root,
-    processes_running_for_root, wait_for_usable_window_for_root, UsableWindowReport,
+    processes_running_for_root, show_windows_for_root, wait_for_usable_window_for_root,
+    UsableWindowReport,
 };
 // Failure-kind constants for structured MSIX health outcomes.
 pub use sys::msix_failure;

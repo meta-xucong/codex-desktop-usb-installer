@@ -2,10 +2,10 @@
   "schemaVersion": 2,
   "id": "codex-starter",
   "version": "1.3.0",
-  "sourceCommit": "6e38cfbd157b47e0281eba25f72b141cba9e30ca",
+  "sourceCommit": "e9514d08c343f594b0e452617bdf4a45bc0216b0",
   "sourceCommitRole": "build-input",
-  "sourceTreeSha256": "931a51bdd0366b6f5340aae328967f81b9c473cbb7c8942a88fabbf8a1ab9cb6",
-  "sourceDate": "2026-09-23",
+  "sourceTreeSha256": "6f727a930f00ff466787fdd86fb0bed25f8e4a32da04df12ee5663ba039ed2b2",
+  "sourceDate": "2026-09-28",
   "compatibleCodex": {
     "minCodexVersion": "0.144.0",
     "testedCodexVersion": "0.147.0",

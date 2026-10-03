@@ -3003,6 +3003,11 @@ pub fn launch_codex(settings: &AppSettings, codex_locale: Option<&str>) -> Resul
     let installed = detect_managed_codex(settings, &store)
         .ok_or_else(|| AppError::Engine("没有可打开的 Codex".to_string()))?;
     let usb_mode = usb_guard::guard_required();
+    if usb_mode {
+        if let Err(error) = crate::app::codex_agents_hint::ensure_portable_usb_hint() {
+            log::warn!("could not add the USB Codex mojibake hint to AGENTS.md before launch: {error}");
+        }
+    }
     if settings.disable_codex_self_updates {
         crate::app::codex_self_update::sync_setting(true)?;
     }

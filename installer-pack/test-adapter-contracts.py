@@ -369,24 +369,31 @@ class ModelCatalogSyncContractTests(unittest.TestCase):
             self.assertFalse(config_path.exists())
             self.assertFalse(kit_home.exists())
 
-    def test_hidden_and_api_unsupported_official_models_migrate_but_third_party_is_preserved(self):
-        for model_id in ("gpt-reserve", "gpt-5.3-codex-spark"):
+    def test_metadata_sync_preserves_all_existing_model_selections(self):
+        for model_id in ("gpt-reserve", "gpt-5.3-codex-spark", "gpt-5.2", "vendor-private-model"):
             with self.subTest(model_id=model_id), tempfile.TemporaryDirectory() as directory:
                 config = f'model = "{model_id}"\n\n[other]\nvalue = 1\n'
                 completed, result, config_path, _ = self.invoke(Path(directory), self.catalog(), config=config)
                 self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
                 self.assertEqual(result["status"], "ready")
-                self.assertEqual(result["migration"], "unavailable-official-model-migrated")
-                migrated = config_path.read_text(encoding="utf-8")
-                self.assertIn('model = "gpt-6-astra"', migrated)
-                self.assertIn("[other]", migrated)
+                self.assertEqual(result["migration"], "preserved-existing-model")
+                self.assertEqual(result["modelSelectionStatus"], "deferred-until-verified")
+                self.assertIsNone(result["preferredModel"])
+                self.assertFalse(result["configChanged"])
+                self.assertEqual(result["currentModel"], model_id)
+                self.assertEqual(config_path.read_text(encoding="utf-8"), config)
 
+    def test_metadata_sync_does_not_invent_missing_model_configuration(self):
         with tempfile.TemporaryDirectory() as directory:
-            config = 'model = "vendor-private-model"\n\n[other]\nvalue = 1\n'
-            completed, result, config_path, _ = self.invoke(Path(directory), self.catalog(), config=config)
+            completed, result, config_path, kit_home = self.invoke(Path(directory), self.catalog())
             self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
-            self.assertEqual(result["migration"], "preserved-active-model")
-            self.assertEqual(config_path.read_text(encoding="utf-8"), config)
+            self.assertEqual(result["migration"], "default-selection-deferred")
+            self.assertEqual(result["modelSelectionStatus"], "deferred-until-verified")
+            self.assertIsNone(result["preferredModel"])
+            self.assertIsNone(result["currentModel"])
+            self.assertFalse(result["configChanged"])
+            self.assertFalse(config_path.exists())
+            self.assertTrue((kit_home / "model-catalog.json").is_file())
 
     def test_strict_catalog_field_validation_and_idempotence(self):
         invalid = self.catalog()

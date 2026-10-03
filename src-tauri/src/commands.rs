@@ -3280,14 +3280,30 @@ pub fn usb_guard_status() -> UsbGuardStatus {
     crate::app::usb_guard::current_status()
 }
 
-/// Refresh the official Codex native model catalog from the signed USB
-/// account's unified gateway. The operation is best-effort at the UI layer;
-/// an unavailable gateway does not prevent Codex from launching.
+/// Read the signed 404token binding and perform an explicitly requested,
+/// read-only model-directory check or gateway capability probe.
+#[tauri::command]
+pub async fn gateway_model_probe(
+    request: crate::app::gateway_model_probe::GatewayModelProbeRequest,
+) -> Result<crate::app::gateway_model_probe::GatewayModelProbeReport, CommandError> {
+    crate::app::gateway_model_probe::run(request)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub fn cancel_gateway_model_probe(request_id: String) -> bool {
+    crate::app::gateway_model_probe::cancel(&request_id)
+}
+
+/// Refresh only the signed provider's model metadata for the Codex menu.
+/// This path never sends a generation request and never gates CCSwitch or
+/// Codex installation; full capability/native verification remains advanced.
 #[tauri::command]
 pub async fn refresh_native_model_catalog(
     force: bool,
 ) -> Result<NativeModelCatalogReport, CommandError> {
-    crate::app::model_catalog::refresh(force)
+    crate::app::model_catalog::refresh_native_model_catalog(force)
         .await
         .map_err(Into::into)
 }
@@ -3309,6 +3325,21 @@ pub async fn install_and_launch_ccswitch(
     reject_uninstall_handoff(&state)?;
     crate::app::usb_guard::require_usb_content_access("ccswitch-launch")?;
     tauri::async_runtime::spawn_blocking(move || install_and_launch_ccswitch_impl(&app))
+        .await
+        .map_err(|e| AppError::Internal(format!("join: {e}")))?
+        .map_err(Into::into)
+}
+
+/// Restore or open the managed CCSwitch window after the one-time bootstrap
+/// hand-off. This command never applies the automatic background hide policy.
+#[tauri::command]
+pub async fn open_ccswitch(
+    app: AppHandle,
+    state: State<'_, ManagerState>,
+) -> Result<CcswitchLaunchReport, CommandError> {
+    reject_uninstall_handoff(&state)?;
+    crate::app::usb_guard::require_usb_content_access("ccswitch-open")?;
+    tauri::async_runtime::spawn_blocking(move || crate::app::ccswitch::open(&app))
         .await
         .map_err(|e| AppError::Internal(format!("join: {e}")))?
         .map_err(Into::into)
@@ -3543,6 +3574,9 @@ pub async fn win_perform_update(
         }
     }
     if report.success {
+        if let Err(error) = crate::app::codex_agents_hint::ensure_portable_usb_hint() {
+            log::warn!("could not add the USB Codex mojibake hint to AGENTS.md: {error}");
+        }
         // The staged MSIX was consumed by the install — drop the cache. A failed
         // or cancelled perform leaves it so the next run (or a resume) reuses the
         // partial/full artifact instead of re-downloading. `stage`/`auto_stage`
@@ -3815,6 +3849,11 @@ pub async fn win_install_historical_release(
             saved.save()?;
         }
     }
+    if report.success && install_to_usb {
+        if let Err(error) = crate::app::codex_agents_hint::ensure_portable_usb_hint() {
+            log::warn!("could not add the USB Codex mojibake hint to AGENTS.md: {error}");
+        }
+    }
     if report.success && !was_local {
         let _ = crate::app::staging::clear_download_cache();
     }
@@ -3849,6 +3888,15 @@ pub async fn win_uninstall(
         {
             log::warn!("pre-uninstall install transaction reconciliation skipped: {error}");
         }
+        // A user can have a stale journal from an older C: install while the
+        // active install is on a removable drive.  The scoped pass above is
+        // correct for ordinary cleanup, but the detached cleanup gate later
+        // checks the shared manager journal directory as a whole.  Reconcile
+        // only the bookkeeping-only, no-recovery-path shape across all roots
+        // as well; this never renames or deletes an install tree.
+        if let Err(error) = crate::app::install_tx::reconcile_for_uninstall() {
+            log::warn!("pre-uninstall global install transaction reconciliation skipped: {error}");
+        }
         uninstall_windows_codex(&settings, confirm, purge_user_data)
     })
     .await
@@ -3878,6 +3926,10 @@ pub struct WinBundleUninstallReport {
     /// Primary uninstall is complete; the detached helper still has to remove
     /// the manager's open files after process exit. Never label this "all clean".
     pub cleanup_pending: bool,
+    /// The USB applications were removed, but shared Manager/recovery data
+    /// remains because another installation still owns or needs it.
+    #[serde(default)]
+    pub cleanup_deferred: bool,
     pub cleanup_report_path: Option<String>,
     /// Opaque helper nonce required by the explicit exit acknowledgement.
     #[serde(default)]
@@ -4007,6 +4059,7 @@ fn combine_bundle_uninstall(
         purged_user_data: purged_codex_data,
         purged_ccswitch_data,
         cleanup_pending: false,
+        cleanup_deferred: false,
         cleanup_report_path: None,
         cleanup_handoff_id: None,
         outcome,
@@ -4055,10 +4108,22 @@ fn merge_usb_machine_cleanup(
 
 fn bundle_can_start_final_cleanup(report: &WinBundleUninstallReport) -> bool {
     report.success
+        && !report.cleanup_deferred
         && report.outcome.primary_ok
         && !report.outcome.is_partial()
         && report.outcome.steps_are_terminal()
         && report.outcome.recovery_actions.is_empty()
+}
+
+fn defer_shared_bundle_cleanup(report: &mut WinBundleUninstallReport, detail: &str) {
+    report.cleanup_deferred = true;
+    let note = format!(
+        "U 盘版 Codex 与 CCSwitch 已完成卸载；检测到其他安装或共享恢复记录，未删除共享管理器数据。请保留该恢复材料并在对应安装中处理。详情：{detail}"
+    );
+    report.notes.push(note.clone());
+    report.message = format!("{}；{}", report.message, note);
+    report.outcome.cleanup =
+        StepOutcome::skipped("共享管理器数据和其他安装的恢复记录已保留，最终清理延后");
 }
 
 /// Keep the original primary errors even when later policy/helper steps add
@@ -4144,6 +4209,7 @@ pub async fn win_uninstall_bundle(
     token: OperationToken,
     purge_user_data: bool,
     purge_ccswitch_data: bool,
+    force_cleanup: Option<bool>,
     remove_usb_media: Option<bool>,
 ) -> Result<WinBundleUninstallReport, CommandError> {
     if !matches!(state.target.os, OperatingSystem::Windows) {
@@ -4157,6 +4223,7 @@ pub async fn win_uninstall_bundle(
     let _op = DetachedGuard::validate_with_phase(&state, token, OperationPhase::Committing)?;
     let settings = windows_domain_settings_for_persisted(&state);
     let transaction_scope = PathBuf::from(settings.install_root.clone());
+    let force_cleanup = force_cleanup.unwrap_or(false);
     let remove_usb_media = remove_usb_media.unwrap_or(false);
     if remove_usb_media {
         // Older renderers exposed a destructive "erase USB kit" toggle. Keep
@@ -4172,10 +4239,36 @@ pub async fn win_uninstall_bundle(
     // reinstall path and must remain intact for the lifetime of the drive.
     let source_license: Option<crate::app::usb_guard::UsbFingerprint> = None;
     let report = tauri::async_runtime::spawn_blocking(move || {
-        if let Err(error) = crate::app::install_tx::reconcile_for_uninstall_scoped(Some(
+        // Validate and close only this USB install's terminal bookkeeping
+        // before touching either product. A foreign or malformed recovery
+        // record must never be reconciled or deleted on behalf of this one.
+        let preflight = crate::app::install_tx::reconcile_for_uninstall_scoped(Some(
             &transaction_scope,
-        )) {
-            log::warn!("pre-uninstall USB install transaction reconciliation skipped: {error}");
+        ))
+        .and_then(|_| {
+            crate::app::install_tx::clear_completed_for_uninstall_scoped(Some(
+                &transaction_scope,
+            ))
+            .map(|_| ())
+        })
+        .and_then(|_| {
+            if force_cleanup {
+                Ok(())
+            } else {
+                crate::app::install_tx::validate_foreign_recovery_volume(&transaction_scope)
+            }
+        });
+        if let Err(error) = preflight {
+            let mut report = combine_bundle_uninstall(
+                Err(AppError::Engine(format!(
+                    "U 盘安装事务无法安全核对，未开始卸载：{error}"
+                ))),
+                Err(AppError::Engine("由于安装恢复记录未通过安全核验，未卸载 CCSwitch".into())),
+                purge_user_data,
+                purge_ccswitch_data,
+            );
+            finish_bundle_uninstall_report(&mut report);
+            return report;
         }
         let mut codex =
             uninstall_windows_codex_for_usb_bundle(&settings, confirm, purge_user_data);
@@ -4401,8 +4494,13 @@ pub async fn win_uninstall_bundle(
                         Some(&transaction_scope),
                     ) {
                         report.success = false;
-                        report.notes.push(format!("安装文件事务仍待处理：{error}"));
+                        report.notes.push(format!("U 盘安装文件事务仍待处理：{error}"));
                         report.outcome.cleanup = StepOutcome::failed(error.to_string());
+                    }
+                }
+                if report.success {
+                    if let Err(error) = crate::app::uninstall_cleanup::deferred_cleanup_preflight(force_cleanup) {
+                        defer_shared_bundle_cleanup(&mut report, &error);
                     }
                 }
             }
@@ -4411,6 +4509,7 @@ pub async fn win_uninstall_bundle(
             match crate::app::uninstall_cleanup::launch_deferred_cleanup(
                 purge_user_data,
                 purge_ccswitch_data,
+                force_cleanup,
                 remove_usb_media,
                 source_license,
                 report.notes.clone(),
@@ -4571,6 +4670,24 @@ mod tests {
         assert!(!report.success);
         assert!(report.message.contains("尚未完成"));
         assert!(report.message.contains("helper has not committed"));
+    }
+
+    #[test]
+    fn foreign_shared_recovery_record_defers_only_shared_cleanup() {
+        let mut report = super::combine_bundle_uninstall(
+            Ok(uninstall_fixture(true)),
+            Ok(switch_uninstall_fixture(true)),
+            false,
+            false,
+        );
+        super::defer_shared_bundle_cleanup(&mut report, "foreign transaction fixture");
+        assert!(report.success);
+        assert!(report.outcome.primary_ok);
+        assert!(report.cleanup_deferred);
+        assert_eq!(report.outcome.cleanup.state, "skipped");
+        assert!(!super::bundle_can_start_final_cleanup(&report));
+        super::finish_bundle_uninstall_report(&mut report);
+        assert!(report.message.contains("共享管理器数据"));
     }
 
     #[test]

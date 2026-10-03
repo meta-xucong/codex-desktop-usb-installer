@@ -355,6 +355,7 @@ describe("Windows perform API", () => {
       token: "bundle-uninstall-token",
       purgeUserData: false,
       purgeCcswitchData: false,
+      forceCleanup: false,
       removeUsbMedia: false,
     });
   });
@@ -661,5 +662,40 @@ describe("404token account API", () => {
     invokeMock.mockRejectedValue(new Error("登录失败：密码错误或会话已过期,请重新登录"));
 
     await expect(managerApi.accountLogin("wrong-password")).rejects.toThrow("密码错误");
+  });
+});
+
+
+describe("advanced gateway diagnostic API", () => {
+  it("passes the selected model IDs and one-run cost consent through IPC", async () => {
+    vi.stubGlobal("window", { __TAURI_INTERNALS__: {} });
+    invokeMock.mockResolvedValue({});
+    await managerApi.gatewayModelProbe({
+      requestId: "gateway-probe-fixture",
+      selectedModelIds: ["glm-5.2"],
+      costConsent: true,
+    });
+    expect(invokeMock).toHaveBeenCalledWith("gateway_model_probe", {
+      request: {
+        requestId: "gateway-probe-fixture",
+        selectedModelIds: ["glm-5.2"],
+        costConsent: true,
+      },
+    });
+  });
+  it("uses the request ID to cancel the active diagnostic", async () => {
+    vi.stubGlobal("window", { __TAURI_INTERNALS__: {} });
+    invokeMock.mockResolvedValue(true);
+    await managerApi.cancelGatewayModelProbe("fixture-run");
+    expect(invokeMock).toHaveBeenCalledWith("cancel_gateway_model_probe", { requestId: "fixture-run" });
+  });
+  it("browser preview cannot probe or issue model requests", async () => {
+    const report = await managerApi.gatewayModelProbe({
+      requestId: "fixture-browser", selectedModelIds: [], costConsent: false,
+    });
+    expect(report.status).toBe("skipped");
+    expect(report).toMatchObject({ endpoint: "", models: [], results: [], generatedRequests: 0 });
+    expect(await managerApi.cancelGatewayModelProbe("fixture-browser")).toBe(false);
+    expect(invokeMock).not.toHaveBeenCalled();
   });
 });

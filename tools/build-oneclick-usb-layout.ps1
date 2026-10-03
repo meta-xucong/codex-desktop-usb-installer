@@ -266,6 +266,32 @@ function Assert-NoSuccessfulStateResidue([string]$RootPath) {
 # retain the exit code of a previous native command in the parent session.
 
 $output = (Resolve-Path -LiteralPath $OutputPath).Path
+# Keep the two packaged CCSwitch manifest copies aligned with the canonical
+# repository resource. The launcher-side resource directory can be an older
+# staging snapshot even when the executable and provider catalog are current.
+$canonicalCcswitchManifest = Join-Path $repo "src-tauri\resources\ccswitch\manifest.json"
+if (-not (Test-Path -LiteralPath $canonicalCcswitchManifest -PathType Leaf)) {
+    throw "缺少当前 CCSwitch 资源清单：$canonicalCcswitchManifest"
+}
+foreach ($relativeCcswitchManifest in @("resources\ccswitch\manifest.json", "ccswitch\manifest.json")) {
+    $destinationManifest = Join-Path $output $relativeCcswitchManifest
+    if (-not (Test-Path -LiteralPath (Split-Path -Parent $destinationManifest) -PathType Container)) {
+        throw "U 盘输出缺少 CCSwitch 清单目录：$destinationManifest"
+    }
+    Copy-Item -LiteralPath $canonicalCcswitchManifest -Destination $destinationManifest -Force
+    $manifestBytes = [System.IO.File]::ReadAllBytes($destinationManifest)
+    if ($manifestBytes.Length -ge 3 -and
+        $manifestBytes[0] -eq 0xEF -and
+        $manifestBytes[1] -eq 0xBB -and
+        $manifestBytes[2] -eq 0xBF) {
+        throw "CCSwitch manifest.json 必须使用无 BOM 的 UTF-8 编码：$destinationManifest"
+    }
+    $sourceHash = (Get-FileHash -LiteralPath $canonicalCcswitchManifest -Algorithm SHA256).Hash
+    $destinationHash = (Get-FileHash -LiteralPath $destinationManifest -Algorithm SHA256).Hash
+    if ($sourceHash -ine $destinationHash) {
+        throw "U 盘包中的 CCSwitch 清单与当前资源不一致：$relativeCcswitchManifest"
+    }
+}
 $manifestPath = Join-Path $output "manifest.json"
 $manifest = Read-JsonFile $manifestPath
 if ((Get-JsonInteger $manifest "schemaVersion") -ne 2) {
@@ -364,6 +390,11 @@ if ($UsbPolicy -eq "SignedRequired") {
 }
 if ($UsbPolicy -eq "DevelopmentAutoEnroll") {
     Assert-CompiledUsbManagerPolicy $managerItem.FullName $UsbPolicy
+}
+# Compare both catalog copies against the canonical source before hashing
+# the release. Binary/package hashes alone do not prove config consistency.
+foreach ($relativeCatalog in @("ccswitch\providers.json", "resources\ccswitch\providers.json")) {
+    & (Join-Path $repo "tools\verify-model-provider-resource.ps1") -ArtifactPath (Join-Path $output $relativeCatalog)
 }
 $ccswitchItem = Get-Item -LiteralPath (Join-Path $output "ccswitch\CodexSwitch.exe")
 $embeddedCcswitchItem = Get-Item -LiteralPath (Join-Path $output "resources\ccswitch\CodexSwitch.exe")
@@ -534,6 +565,15 @@ $usbManifest = [ordered]@{
         fallbackMode = "software-rendering-no-sandbox"
         fallbackArguments = @("--disable-gpu", "--no-sandbox")
         fallbackOnlyAfterNoUsableWindow = $true
+        # Keep the legacy fields above because the existing signed-license
+        # contract validates them.  They are descriptive compatibility
+        # history, not the command line used by the current manager.  The
+        # effective USB runtime policy is recorded explicitly below.
+        runtimeInitialMode = "portable"
+        runtimeInitialArguments = @()
+        runtimeFallbackMode = "software-rendering-no-sandbox"
+        runtimeFallbackArguments = @("--disable-gpu", "--no-sandbox")
+        runtimeFallbackOnlyAfterNoUsableWindow = $true
         successPostcondition = "stable-sizeable-window"
         compatibilityMemory = "local-exact-codex-version"
         selfUpdate = "disabled-for-usb-child"
@@ -563,10 +603,10 @@ $usbManifest = [ordered]@{
         "This route never calls StagePackageAsync, RegisterPackageAsync, Add-AppxPackage, Add-AppxVolume or Move-AppxPackage and never creates <USB>/WindowsApps or <USB>/WpSystem.",
         "A legacy exact OpenAI.Codex MSIX left by an earlier product version may be removed through supported Windows APIs after the USB portable tree is ready; no WindowsApps ACL or private package database is edited.",
         "Before CCSwitch launch, it checks VCRUNTIME140.dll/VCRUNTIME140_1.dll/MSVCP140.dll; if missing, it verifies and runs the bundled Microsoft VC++ x64 installer offline, then launches CodexSwitch.exe directly from the USB with child-scoped WebView2 software rendering and requires a stable sizeable window.",
-        "On first launch the manager passes the signed USB account binding to CCSwitch; CCSwitch automatically saves and enables the 404TOKEN unified-api-internal provider, so the user does not enter or save an API Key manually. A missing binding is reported as a re-sign requirement.",
+        "On first launch the manager passes the signed USB account binding to CCSwitch through the legacy startup environment. CCSwitch stores the 404TOKEN API key in its normal local provider database and activates the provider through its standard switch path; the manager does not wait for an acknowledgement file. After a usable window appears, CCSwitch is minimized once into the tray. Later use of the explicit Open CCSwitch button restores the window and does not minimize it again. A missing signed binding or launch failure is shown on the manager home page. The user can later switch providers and models in CCSwitch. Installation, Codex launch, and provider switching do not require a Manager model test. The Manager's Advanced gateway probe is optional and read-only: it does not apply a model or change configuration. A full matrix sends up to 12 generation requests per selected model (up to three models), may consume upstream quota, and requires separate user cost confirmation.",
         "If an older CCSwitch process already owns its single-instance localhost port, close that old process and use the manager retry entry; the manager reports the conflict instead of treating a refused localhost connection as a successful launch.",
         "In the CCSwitch Codex provider editor, Refresh models calls the current provider's /v1/models endpoint. It keeps every vendor, collapses only stable/latest/valid-date release aliases, and preserves the selected raw upstream model ID.",
-        "Codex is launched only by the authorized USB manager with CODEX_HOME fixed to %USERPROFILE%/.codex. It first uses software rendering and automatically retries the proven no-sandbox fallback only if no stable usable window appears. Removing the USB triggers the existing five-second guarded shutdown.",
+        "Codex is launched only by the authorized USB manager with CODEX_HOME fixed to %USERPROFILE%/.codex. The effective USB runtime policy starts with normal hardware rendering (no --disable-gpu) and automatically retries the proven software-rendering/no-sandbox fallback only if no stable usable window appears. Removing the USB triggers the existing five-second guarded shutdown.",
         "Ordinary uninstall removes <bundle>/apps/Codex and preserves local user data. Advanced purge remains a separate explicit confirmation. Source-media deletion is allowed only after the runtime tree has been removed, immutable release files still match SHA256SUMS.txt, and usb-license.json plus its atomic backup match the active lease fingerprint and handoff snapshot."
     )
     secretsIncluded = $false
@@ -576,6 +616,7 @@ $usbManifest = [ordered]@{
         "The CCSwitch launch is best-effort; a missing payload does not roll back a successful Codex installation.",
         "Executable bytes are installed only under apps/Codex on the removable drive. Mutable Codex state uses the normal Windows profile (normally C:); a declared or canonicalized profile path resolving to the product USB blocks installation.",
         "CodexDesktopSetup.exe is a tiny USB-only launcher with an embedded requireAdministrator manifest; after the user's standard UAC approval it starts the USB-specific CodexAppManager.exe, which also embeds requireAdministrator as a defence-in-depth boundary. The normal installed manager build remains asInvoker. Declining UAC, lacking administrator credentials, or an enterprise policy that blocks elevation cannot be bypassed.",
+        "The legacy codexLaunch.initialMode/initialArguments fields remain for compatibility with the existing signed-license contract. The manager ignores those descriptive fields and follows codexLaunch.runtimeInitialMode/runtimeInitialArguments: normal GPU first, then the bounded software-rendering/no-sandbox fallback.",
         "The manager entry point is statically linked to the MSVC CRT so it can start before the prerequisite is present. The bundled vc_redist.x64.exe is the unmodified Microsoft installer and is hash-pinned; no DLL is copied directly to System32.",
         "No AppX external-volume registry policy, developer mode or sideload policy is required for the portable route. Enterprise execution-control restrictions are diagnosed, not bypassed.",
         "The content/codex-starter-kit folder contains the complete offline capability pack. The manager automatically installs or repairs its Skills, Agents, runtimes and local MCP resources after Codex is verified; external connections remain opt-in and their secrets stay in the local Windows user environment.",

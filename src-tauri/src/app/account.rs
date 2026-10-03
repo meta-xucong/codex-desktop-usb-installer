@@ -51,7 +51,7 @@ struct Session {
     account_ref: String,
     usb_asset_id: String,
     token: String,
-    expires_at: SystemTime,
+    expires_at: Option<SystemTime>,
 }
 
 fn session() -> &'static Mutex<Option<Session>> {
@@ -85,6 +85,25 @@ fn find_string_recursive(value: &Value, keys: &[&str]) -> Option<String> {
         Value::Array(items) => items
             .iter()
             .find_map(|child| find_string_recursive(child, keys)),
+        _ => None,
+    }
+}
+
+fn find_u64_recursive(value: &Value, keys: &[&str]) -> Option<u64> {
+    match value {
+        Value::Object(object) => {
+            for key in keys {
+                if let Some(number) = object.get(*key).and_then(Value::as_u64) {
+                    return Some(number);
+                }
+            }
+            object
+                .values()
+                .find_map(|child| find_u64_recursive(child, keys))
+        }
+        Value::Array(items) => items
+            .iter()
+            .find_map(|child| find_u64_recursive(child, keys)),
         _ => None,
     }
 }
@@ -269,8 +288,15 @@ fn session_token(binding: &codex_usb_license::UsbAccountBinding) -> Result<Strin
         return Err(AppError::Engine("U 盘已更换,请重新登录".to_string()));
     }
 
-    // Check token expiration
-    if SystemTime::now() >= sess.expires_at {
+    // Honor an expiry explicitly returned by 404token. If the response has no
+    // expiry metadata, let the API remain the source of truth instead of
+    // guessing a one-hour lifetime and clearing a still-valid session.
+    if sess
+        .expires_at
+        .as_ref()
+        .map(|expires_at| SystemTime::now() >= *expires_at)
+        .unwrap_or(false)
+    {
         drop(guard);
         clear_session();
         return Err(AppError::Engine("会话已过期,请重新登录".to_string()));
@@ -291,23 +317,9 @@ pub fn status_unbound() -> AccountStatus {
 }
 
 pub fn status() -> Result<AccountStatus, AppError> {
-    let binding = match account_binding() {
-        Ok(b) => b,
-        Err(e) => {
-            // Distinguish authorization failure from not-bound
-            if e.to_string().contains("尚未绑定") {
-                return Ok(status_unbound());
-            }
-            // Authorization invalid (signature error, etc)
-            return Ok(AccountStatus {
-                bound: false,
-                account_name: None,
-                logged_in: false,
-                balance: None,
-                usage: None,
-                message: "U 盘授权失效,请重新签名".to_string(),
-            });
-        }
+    let binding = match usb_guard::authorized_account_binding()? {
+        Some(binding) => binding,
+        None => return Ok(status_unbound()),
     };
 
     let logged_in = session_token(&binding).is_ok();
@@ -362,14 +374,12 @@ pub async fn login(password: String) -> Result<AccountStatus, AppError> {
     let token = find_string_recursive(&body, &["access_token", "accessToken", "token"])
         .ok_or_else(|| AppError::Engine("登录失败：响应缺少会话令牌".to_string()))?;
 
-    // Extract expires_in (default 1 hour if not present)
-    let expires_in_secs = body
-        .get("expires_in")
-        .or_else(|| body.get("expiresIn"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(3600);
-
-    let expires_at = SystemTime::now() + Duration::from_secs(expires_in_secs);
+    // Some compatible login responses nest token metadata under data.
+    // Honor a supplied TTL wherever it appears; do not invent a local TTL when
+    // the server omitted it. In that case the authenticated API response is
+    // authoritative and a 401 below will invalidate the session.
+    let expires_at = find_u64_recursive(&body, &["expires_in", "expiresIn"])
+        .and_then(|seconds| SystemTime::now().checked_add(Duration::from_secs(seconds)));
 
     // Save session with USB binding
     session()

@@ -10,6 +10,7 @@ import {
 import type {
   CapabilityPackInstallOptions,
   CapabilityPackReport,
+  CcswitchLaunchReport,
   DownloadProgress,
   HistoricalInstallSelection,
   OfflinePayloadReport,
@@ -28,8 +29,9 @@ import { FailureBanner, Ring, StatusBanner, Tooltip, TopBar } from "../component
 import { mib } from "../format";
 import { Sheet } from "../Sheet";
 import { OfflineComponentsSheet } from "./OfflineComponentsSheet";
-import { AccountCard } from "./AccountCard";
+import { AccountCard, type AccountAuthorizationState } from "./AccountCard";
 import { SkillRepoUpdateCard } from "./SkillRepoUpdateCard";
+import { GatewayModelProbePanel } from "./GatewayModelProbePanel";
 import { ProgressScreen } from "./ProgressScreen";
 import { useDownloadProgress } from "./useDownloadProgress";
 
@@ -41,21 +43,9 @@ type PayloadUpdateProgress = {
   bytesTotal?: number;
 };
 
-type NativeModelNotice = {
-  message: string;
-  tone: "err" | "info" | "ok" | "warn";
-};
-
 const USB_GUARD_STARTUP_FAST_POLL_LIMIT = 60;
 const USB_GUARD_STARTUP_FAST_POLL_MS = 250;
 const USB_GUARD_NORMAL_POLL_MS = 1_000;
-// The native command performs a bounded three-attempt upstream refresh. Keep
-// the renderer watchdog longer than that budget so a slow 404token response
-// is reported with the backend's upstream diagnosis instead of being turned
-// into a misleading local timeout.
-// Three 20-second upstream attempts plus the 500ms/1s backoff need 61.5s in
-// the worst case. Keep a margin so the renderer does not turn the backend's
-// explicit 404token-upstream diagnosis into a generic local timeout.
 const NATIVE_MODEL_REFRESH_TIMEOUT_MS = 75_000;
 const NATIVE_MODEL_REFRESH_START_DELAY_MS = 250;
 
@@ -155,6 +145,73 @@ function ccswitchUserMessage(message: string | null | undefined, fallback: strin
   return value;
 }
 
+type CcswitchInjectionIssue =
+  | "unsupported-binary"
+  | "missing-binding"
+  | "failed"
+  | "launch-failed"
+  | "unconfirmed";
+
+const CCSWITCH_INJECTION_ISSUE_STORAGE_KEY = "codex-usb-ccswitch-injection-issue-v1";
+
+function readStoredCcswitchInjectionIssue(): CcswitchInjectionIssue | null {
+  try {
+    if (typeof window === "undefined") return null;
+    const value = window.localStorage.getItem(CCSWITCH_INJECTION_ISSUE_STORAGE_KEY);
+    return value === "unsupported-binary" || value === "missing-binding" ||
+      value === "failed" || value === "launch-failed" || value === "unconfirmed"
+      ? value
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function ccswitchInjectionIssueFor(
+  report: CcswitchLaunchReport | null,
+): CcswitchInjectionIssue | null {
+  if (
+    report?.accountInjectionStatus === "verified" &&
+    report.accountInjected === true
+  ) {
+    return null;
+  }
+  switch (report?.accountInjectionStatus) {
+    case "unsupported-binary":
+      return "unsupported-binary";
+    case "missing-binding":
+      return "missing-binding";
+    case "failed":
+      return "failed";
+    case "injected":
+    case "pending":
+    case "unconfirmed":
+      return "unconfirmed";
+    case "unavailable":
+      return "launch-failed";
+    case "verified":
+      return report?.accountInjected === true ? null : "unconfirmed";
+    case "not-attempted":
+    default:
+      return report?.launched ? "unconfirmed" : "launch-failed";
+  }
+}
+
+function ccswitchInjectionMessageKey(issue: CcswitchInjectionIssue): Parameters<TFn>[0] {
+  switch (issue) {
+    case "unsupported-binary":
+      return "offline.ccswitchInjection.unsupported";
+    case "missing-binding":
+      return "offline.ccswitchInjection.missingBinding";
+    case "launch-failed":
+      return "offline.ccswitchInjection.launchFailed";
+    case "unconfirmed":
+      return "offline.ccswitchInjection.unconfirmed";
+    default:
+      return "offline.ccswitchInjection.failed";
+  }
+}
+
 function codexReadyOnAuthorizedUsb(guard: UsbGuardStatus | null): boolean {
   return Boolean(
     guard?.status === "authorized" &&
@@ -187,6 +244,30 @@ function programIsOnCurrentUsb(
     .replace(/[\\]+$/, "")
     .toLowerCase();
   return normalize(installPath) === `${normalize(bundlePath)}\\apps\\codex`;
+}
+
+/**
+ * A portable install whose path is proven to belong to the currently
+ * authorized USB bundle is usable even when the first winStatus snapshot
+ * was classified as `external` while the USB guard was still starting.
+ * The path/source/bundle proof remains the ownership boundary; the status
+ * label itself is only a cached classification and must not strand a valid
+ * USB install after the manager is restarted.
+ */
+function currentUsbInstallMatchesPayload(
+  status: WinInstallStatus | null,
+  guard: UsbGuardStatus | null,
+  payload: OfflinePayloadReport | null,
+): boolean {
+  const installed = status?.installed;
+  return Boolean(
+    payload &&
+      codexReadyOnAuthorizedUsb(guard) &&
+      installed &&
+      !status?.recoveryPending &&
+      compareVersions(installed.version, payload.codexDesktopVersion) === 0 &&
+      programIsOnCurrentUsb(status, guard),
+  );
 }
 
 function usbInstallBlockedByExistingCodex(
@@ -250,7 +331,12 @@ export function OfflineHome({
   const [usbGuardQueryFailed, setUsbGuardQueryFailed] = useState(false);
   const [failure, setFailure] = useState<FailureSurface | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const [nativeModelNotice, setNativeModelNotice] = useState<NativeModelNotice | null>(null);
+  const [ccswitchInjectionIssue, setCcswitchInjectionIssue] =
+    useState<CcswitchInjectionIssue | null>(readStoredCcswitchInjectionIssue);
+  const [nativeModelNotice, setNativeModelNotice] = useState<{
+    message: string;
+    tone: "info" | "ok" | "warn" | "err";
+  } | null>(null);
   const [installationDetail, setInstallationDetail] = useState<string | null>(null);
   const [componentsOpen, setComponentsOpen] = useState(false);
   const [pendingCodexUpdate, setPendingCodexUpdate] = useState<UpdateInfo | null>(null);
@@ -268,6 +354,20 @@ export function OfflineHome({
   const progressScopeRef = useRef<HTMLDivElement | null>(null);
   const nativeModelRefreshStarted = useRef(false);
   const usbGuardWasReady = useRef(false);
+
+  const updateCcswitchInjectionIssue = useCallback((issue: CcswitchInjectionIssue | null) => {
+    setCcswitchInjectionIssue(issue);
+    try {
+      if (typeof window === "undefined") return;
+      if (issue) {
+        window.localStorage.setItem(CCSWITCH_INJECTION_ISSUE_STORAGE_KEY, issue);
+      } else {
+        window.localStorage.removeItem(CCSWITCH_INJECTION_ISSUE_STORAGE_KEY);
+      }
+    } catch {
+      // The banner still works for this session when storage is unavailable.
+    }
+  }, []);
 
   const {
     dl,
@@ -323,7 +423,6 @@ export function OfflineHome({
     setPayloadLoading(true);
     setFailure(null);
     setNotice(null);
-    setNativeModelNotice(null);
     setInstallationDetail(null);
     setUsbGuardQueryFailed(false);
     try {
@@ -396,19 +495,11 @@ export function OfflineHome({
       ) {
         setNotice(t("offline.newerVersion"));
       }
-      const installed = settledStatus.installed;
-      const sameVersion = Boolean(
-        installed &&
-          compareVersions(installed.version, nextPayload.codexDesktopVersion) === 0,
-      );
-      if (
-        codexReadyOnAuthorizedUsb(settledUsbGuard) &&
-        installed &&
-        settledStatus.status === "managed" &&
-        !settledStatus.recoveryPending &&
-        sameVersion &&
-        programIsOnCurrentUsb(settledStatus, settledUsbGuard)
-      ) {
+      if (currentUsbInstallMatchesPayload(settledStatus, settledUsbGuard, nextPayload)) {
+        // A startup snapshot can leave an "installed elsewhere" notice
+        // behind while USB authorization is still settling. The proven USB
+        // install must win once the path and version have been confirmed.
+        setNotice(null);
         setPhase("installed");
       } else {
         setPhase("ready");
@@ -438,10 +529,10 @@ export function OfflineHome({
     // The modal owns a long, scrollable form. The watchdog countdown is not
     // useful while it is open, and updating it would needlessly re-render the
     // whole page behind the modal once per second.
-    if (componentsOpen || !usbGuardStatus) return;
+    if (componentsOpen || (!usbGuardStatus && !usbGuardQueryFailed)) return;
     let active = true;
     let timer: number | null = null;
-    if (usbGuardStatus !== "starting") {
+    if (usbGuardStatus && usbGuardStatus !== "starting") {
       usbGuardStartupPolls.current = 0;
     }
     const poll = () => {
@@ -451,12 +542,23 @@ export function OfflineHome({
           if (!active) return;
           setUsbGuard(next);
           setUsbGuardQueryFailed(false);
-          const ready = codexReadyOnAuthorizedUsb(next);
-          const becameReady = ready && !usbGuardWasReady.current;
-          usbGuardWasReady.current = ready;
-          if (becameReady) {
-            void managerApi.winStatus().then(setStatus).catch(() => undefined);
-          }
+           const ready = codexReadyOnAuthorizedUsb(next);
+           const becameReady = ready && !usbGuardWasReady.current;
+           usbGuardWasReady.current = ready;
+           if (becameReady) {
+             void managerApi.winStatus()
+               .then((nextStatus) => {
+                 if (!active) return;
+                 setStatus(nextStatus);
+                 if (currentUsbInstallMatchesPayload(nextStatus, next, payload)) {
+                   // Clear a stale startup classification once the USB
+                   // install has been proven after authorization.
+                   setNotice(null);
+                   setPhase("installed");
+                 }
+               })
+               .catch(() => undefined);
+           }
           if (usbGuardStartupPending(next)) {
             usbGuardStartupPolls.current += 1;
           } else {
@@ -485,7 +587,7 @@ export function OfflineHome({
       active = false;
       if (timer !== null) window.clearTimeout(timer);
     };
-  }, [componentsOpen, usbGuardStatus]);
+  }, [componentsOpen, payload, usbGuardQueryFailed, usbGuardStatus]);
 
   const newerInstalled = useMemo(() => {
     if (!payload || !status?.installed) return false;
@@ -495,10 +597,7 @@ export function OfflineHome({
   const refreshNativeModels = useCallback(async (automatic = false) => {
     if (nativeModelBusy) return;
     setNativeModelBusy(true);
-    setNativeModelNotice({
-      message: t("offline.nativeModelsRefreshing"),
-      tone: "info",
-    });
+    setNativeModelNotice({ message: t("offline.nativeModelsRefreshing"), tone: "info" });
     try {
       const result = await new Promise<Awaited<ReturnType<typeof managerApi.refreshNativeModelCatalog>>>((resolve, reject) => {
         const timer = window.setTimeout(
@@ -516,39 +615,28 @@ export function OfflineHome({
           },
         );
       });
-      const message =
-        result.status === "ready" || result.status === "fresh"
-          ? t("offline.nativeModelsReady", { count: result.modelCount })
-          : result.message || t("offline.nativeModelsUnavailable");
+      const ready = result.status === "ready" || result.status === "fresh";
       setNativeModelNotice({
-        message,
-        tone: result.status === "ready" || result.status === "fresh" ? "ok" : "warn",
+        message: ready
+          ? t("offline.nativeModelsReady", { count: result.modelCount })
+          : result.message || t("offline.nativeModelsUnavailable"),
+        tone: ready ? "ok" : "warn",
       });
+      if (!ready && !automatic) setFailure(resolveFailure(new Error(result.message), t));
     } catch (cause) {
       const detail = cause instanceof Error ? cause.message : String(cause ?? "");
-      const likelyUpstream = /404token|gateway|network|timeout|unavailable|连接|上游/i.test(detail);
       setNativeModelNotice({
-        message: likelyUpstream
+        message: automatic
           ? t("offline.nativeModelsUpstreamUnavailable")
-          : t("offline.nativeModelsUnavailable"),
-        // Automatic refresh is best-effort after installation. Keep the
-        // completed install visible and distinguish a retryable upstream
-        // problem from a local installation failure. Manual refresh remains
-        // a hard-error surface so the user can investigate it explicitly.
+          : `${t("offline.nativeModelsUnavailable")} ${detail}`,
         tone: automatic ? "warn" : "err",
       });
-      if (!automatic) {
-        setFailure(resolveFailure(cause, t));
-      }
+      if (!automatic) setFailure(resolveFailure(cause, t));
     } finally {
       setNativeModelBusy(false);
     }
   }, [nativeModelBusy, t]);
 
-  // Keep the delayed startup refresh scheduled even when a user clicks the
-  // manual button in the meantime.  `refreshNativeModels` changes identity
-  // while its busy flag flips; storing the latest callback in a ref prevents
-  // that normal state transition from cancelling the one-shot startup timer.
   const refreshNativeModelsRef = useRef(refreshNativeModels);
   useEffect(() => {
     refreshNativeModelsRef.current = refreshNativeModels;
@@ -559,10 +647,10 @@ export function OfflineHome({
     setPhase("staging");
     setFailure(null);
     setNotice(null);
-    setNativeModelNotice(null);
     setInstallationDetail(null);
     let stage: OfflineStageReport | null = null;
     let pendingRecovery = false;
+    let verifiedInstalled: WinInstallStatus | null = null;
     try {
       // The initial button state is only a snapshot. Re-read the live guard
       // before staging the MSIX so a stale `authorized/running` status can
@@ -655,6 +743,7 @@ export function OfflineHome({
       }
       setUsbGuard(verifiedUsbGuard);
       setPayload(stage.payload);
+      verifiedInstalled = installed;
       // Keep diagnostic staging until all installed-state/placement checks
       // pass. A verification failure must not claim a deleted file was kept.
       await managerApi.offlinePayloadCleanup(stage.stagedPath).catch(() => undefined);
@@ -663,11 +752,16 @@ export function OfflineHome({
       // best-effort: a failure never rolls back a verified Codex installation
       // and remains retryable from the quiet Components entry below.
       let capabilityPackReport: CapabilityPackReport | null = null;
+      let capabilityPackErrorDetail: string | null = null;
       try {
         capabilityPackReport = await managerApi.installCapabilityPack({
           ...DEFAULT_CAPABILITY_PACK_OPTIONS,
         });
       } catch (capabilityError) {
+        capabilityPackErrorDetail =
+          capabilityError instanceof Error
+            ? capabilityError.message
+            : String(capabilityError ?? "");
         console.warn("[capability-pack] automatic install failed", capabilityError);
       }
       let ccswitchReport = null;
@@ -680,6 +774,13 @@ export function OfflineHome({
             ? ccswitchError.message
             : String(ccswitchError ?? "");
         console.warn("[ccswitch] automatic launch failed", ccswitchError);
+      }
+      const injectionIssue = ccswitchInjectionIssueFor(ccswitchReport);
+      updateCcswitchInjectionIssue(injectionIssue);
+      if (capabilityPackErrorDetail) {
+        setInstallationDetail(
+          `${result.message}\n能力包自动安装失败：${capabilityPackErrorDetail}\n可在“高级功能 > 组件修复”中重试。`,
+        );
       }
       setStatus(installed);
       setPhase("installed");
@@ -708,28 +809,35 @@ export function OfflineHome({
       } else {
         notices.push(t("offline.capabilityFailed"));
       }
-      if (ccswitchReport?.launched) {
+      if (!injectionIssue && ccswitchReport?.launched) {
         notices.push(ccswitchUserMessage(ccswitchReport.message, t("offline.ccswitchLaunched")));
-      } else if (ccswitchReport && !ccswitchReport.available) {
+      } else if (!injectionIssue && ccswitchReport && !ccswitchReport.available) {
         notices.push(t("offline.ccswitchUnavailable"));
-      } else if (ccswitchErrorDetail) {
+      } else if (!injectionIssue && ccswitchErrorDetail) {
         notices.push(`${t("offline.ccswitchFailed")} ${ccswitchErrorDetail}`);
-      } else {
+      } else if (!injectionIssue) {
         notices.push(t("offline.ccswitchFailed"));
       }
       setNotice(notices.join(" "));
+      // Model-menu discovery is metadata-only and must not gate the normal
+      // install/CCSwitch path. Run it after the successful hand-off so a
+      // transient upstream outage remains retryable from Advanced.
+      if (ccswitchReport?.launched) {
+        void refreshNativeModels(true);
+      }
       return true;
     } catch (cause) {
-      setPhase("ready");
+      if (verifiedInstalled) setStatus(verifiedInstalled);
+      setPhase(verifiedInstalled ? "installed" : "ready");
       setFailure(resolveFailure(cause, t));
       if (pendingRecovery) {
         setNotice(t("offline.recoveryPending"));
-      } else if (stage) {
+      } else if (stage && !verifiedInstalled) {
         setNotice("暂存文件已保留，便于查看日志和重试。");
       }
       return false;
     }
-  }, [resetStop, t]);
+  }, [refreshNativeModels, resetStop, t, updateCcswitchInjectionIssue]);
 
   const install = useCallback(async () => {
     if (!payload || busyAction) return;
@@ -831,12 +939,39 @@ export function OfflineHome({
     }
   }, [busyAction, checkCodexPayload, pendingCodexUpdate, performInstall, t]);
 
-  const launchCcswitch = useCallback(async () => {
+  const retryCcswitchInjection = useCallback(async () => {
     if (busyAction) return;
     setBusyAction("ccswitch");
     setFailure(null);
     try {
       const report = await managerApi.installAndLaunchCcswitch();
+      const issue = ccswitchInjectionIssueFor(report);
+      updateCcswitchInjectionIssue(issue);
+      if (issue) {
+        setNotice(null);
+      } else {
+        setNotice(ccswitchUserMessage(report.message, t("offline.ccswitchLaunched")));
+      }
+    } catch {
+      updateCcswitchInjectionIssue("failed");
+      setNotice(null);
+    } finally {
+      setBusyAction(null);
+    }
+  }, [busyAction, t, updateCcswitchInjectionIssue]);
+
+  const launchCcswitch = useCallback(async () => {
+    if (busyAction) return;
+    setBusyAction("ccswitch");
+    setFailure(null);
+    try {
+      // Keep compatibility with older manager previews that do not expose the
+      // split restore command yet; production builds always use openCcswitch.
+      const openCcswitch =
+        typeof managerApi.openCcswitch === "function"
+          ? managerApi.openCcswitch
+          : managerApi.installAndLaunchCcswitch;
+      const report = await openCcswitch();
       if (report.launched) {
         setNotice(ccswitchUserMessage(report.message, t("offline.ccswitchLaunched")));
       } else if (!report.available) {
@@ -885,22 +1020,18 @@ export function OfflineHome({
   const installed = status?.installed;
   const codexReady = !usbGuardQueryFailed && codexReadyOnAuthorizedUsb(usbGuard);
   const codexActionsAllowed = codexActionsAllowedOnCurrentRuntime(usbGuard, usbGuardQueryFailed);
+  const accountAuthorizationState: AccountAuthorizationState = usbGuardQueryFailed
+    ? "unavailable"
+    : !usbGuard
+      ? phase === "loading" ? "checking" : "unavailable"
+      : usbGuard.status === "starting"
+        ? "checking"
+        : usbGuard.status === "authorized" && usbGuard.watchdog === "running" && usbGuard.signed
+          ? "authorized"
+          : "unavailable";
   const usbGuardIsStarting = usbGuardStartupPending(usbGuard);
-  const showInstalled = phase === "installed" && codexReady;
-  const displayInstalled = codexReady ? installed : null;
-  const startupReadinessPending =
-    payloadLoading || phase === "loading" || usbGuardIsStarting;
-  const disabled =
-    busyAction !== null ||
-    startupReadinessPending ||
-    phase === "staging" ||
-    phase === "installing";
-  const payloadBytesDone = payloadUpdateProgress?.bytesDone ?? 0;
-  const payloadBytesTotal = payloadUpdateProgress?.bytesTotal ?? 0;
-
-  // Native Codex accepts the catalog through its official model_catalog_json
-  // setting. Refresh once in the background after the USB install is known to
-  // be usable; the explicit button below remains available for retry.
+  const currentUsbInstalled = currentUsbInstallMatchesPayload(status, usbGuard, payload);
+  const showInstalled = codexReady && (phase === "installed" || currentUsbInstalled);
   useEffect(() => {
     if (!showInstalled) {
       nativeModelRefreshStarted.current = false;
@@ -913,6 +1044,16 @@ export function OfflineHome({
     }, NATIVE_MODEL_REFRESH_START_DELAY_MS);
     return () => window.clearTimeout(timer);
   }, [codexActionsAllowed, showInstalled]);
+  const displayInstalled = codexReady ? installed : null;
+  const startupReadinessPending =
+    payloadLoading || phase === "loading" || usbGuardIsStarting;
+  const disabled =
+    busyAction !== null ||
+    startupReadinessPending ||
+    phase === "staging" ||
+    phase === "installing";
+  const payloadBytesDone = payloadUpdateProgress?.bytesDone ?? 0;
+  const payloadBytesTotal = payloadUpdateProgress?.bytesTotal ?? 0;
 
   const payloadProgressDownload: DownloadProgress | null = payloadUpdateProgress
     ? {
@@ -936,6 +1077,29 @@ export function OfflineHome({
     payloadProgressTotal > 0
       ? Math.min(100, (payloadProgressDone / payloadProgressTotal) * 100)
       : 0;
+
+  // Keep the compact installer surface to one notification rail.  Detailed
+  // recovery text and maintenance controls live in the collapsed advanced
+  // section below, so an ordinary install has one predictable status location.
+  const guardNeedsAttention = Boolean(
+    usbGuard && usbGuard.status !== "authorized" && usbGuard.status !== "disabled",
+  );
+  const unifiedNotice = failure
+    ? null
+    : currentUsbInstalled && phase !== "installed"
+      ? null
+      : notice ??
+      (usbGuardIsStarting
+        ? t("offline.usbGuard.startingHint")
+        : guardNeedsAttention
+          ? usbGuard?.message || usbGuardLabel(usbGuard?.status ?? "", t)
+          : null);
+  const unifiedNoticeTone = guardNeedsAttention && !notice ? "warn" : "info";
+  const visibleCcswitchInjectionIssue = showInstalled ? ccswitchInjectionIssue : null;
+  const ccswitchIssueRetryable =
+    visibleCcswitchInjectionIssue === "failed" ||
+    visibleCcswitchInjectionIssue === "launch-failed" ||
+    visibleCcswitchInjectionIssue === "unconfirmed";
 
   // Keep the main-screen phase union intact below; the progress screen is a
   // temporary view and the page still renders the normal phase copy after it
@@ -996,21 +1160,61 @@ export function OfflineHome({
         </button>
       </TopBar>
       <div className="scroll">
-        {failure ? <FailureBanner failure={failure} /> : null}
-        {notice ? <StatusBanner tone="info">{notice}</StatusBanner> : null}
-        {nativeModelNotice ? (
-          <StatusBanner tone={nativeModelNotice.tone}>{nativeModelNotice.message}</StatusBanner>
-        ) : null}
-        {usbGuardIsStarting ? (
-          <StatusBanner tone="info">{t("offline.usbGuard.startingHint")}</StatusBanner>
-        ) : null}
-        {installationDetail ? (
-          <StatusBanner tone="info">
-            <details>
-              <summary>{t("offline.installDetails")}</summary>
-              <div style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{installationDetail}</div>
-            </details>
+        {failure ? <FailureBanner failure={failure} context={notice} /> : null}
+        {visibleCcswitchInjectionIssue && !failure ? (
+          <StatusBanner
+            tone="err"
+            action={(
+              <button
+                className="linkbtn"
+                onClick={() =>
+                  void (ccswitchIssueRetryable ? retryCcswitchInjection() : launchCcswitch())
+                }
+                disabled={disabled}
+                data-testid="ccswitch-injection-action"
+              >
+                <Icon
+                  name={
+                    ccswitchIssueRetryable
+                      ? busyAction === "ccswitch" ? "loader" : "refresh"
+                      : busyAction === "ccswitch" ? "loader" : "gear"
+                  }
+                  className={busyAction === "ccswitch" ? "spinicon" : undefined}
+                />
+                {ccswitchIssueRetryable
+                  ? busyAction === "ccswitch"
+                    ? t("offline.ccswitchInjectionRetrying")
+                    : t("offline.ccswitchInjectionRetry")
+                  : busyAction === "ccswitch"
+                    ? t("offline.ccswitchLaunching")
+                    : t("offline.ccswitchInjectionOpen")}
+              </button>
+            )}
+          >
+            <span>
+              {t(ccswitchInjectionMessageKey(visibleCcswitchInjectionIssue))}
+            </span>
+            {notice ? <span className="installer-notice-meta">{notice}</span> : null}
           </StatusBanner>
+        ) : unifiedNotice ? (
+          <StatusBanner tone={unifiedNoticeTone}>
+            <span>{unifiedNotice}</span>
+            {usbGuard ? (
+              <span className="installer-notice-meta" data-testid="usb-guard-status">
+                {usbGuardLabel(usbGuard.status, t)}
+                {usbGuard.countdownSeconds !== null ? ` · ${usbGuard.countdownSeconds}s` : ""}
+              </span>
+            ) : null}
+          </StatusBanner>
+        ) : usbGuard ? (
+          <div
+            className={`usb-guard-inline usb-guard-${usbGuard.status}`}
+            data-testid="usb-guard-status"
+          >
+            <span className="usb-guard-status-icon"><Icon name={usbGuard.status === "authorized" ? "shield" : "alert"} /></span>
+            <span>{usbGuardLabel(usbGuard.status, t)}</span>
+            {usbGuard.countdownSeconds !== null ? <span className="usb-guard-countdown">{usbGuard.countdownSeconds}s</span> : null}
+          </div>
         ) : null}
         {payloadUpdateProgress ? (
           <section className="payload-update-progress" data-testid="payload-update-progress">
@@ -1052,38 +1256,6 @@ export function OfflineHome({
                 {mib(payloadBytesDone)} / {mib(payloadBytesTotal)}
               </div>
             ) : null}
-          </section>
-        ) : null}
-        {usbGuard ? (
-          <section
-            className={`usb-guard-status usb-guard-${usbGuard.status}`}
-            data-testid="usb-guard-status"
-          >
-            <div className="usb-guard-status-head">
-              <span className="usb-guard-status-icon"><Icon name={usbGuard.status === "authorized" ? "shield" : "alert"} /></span>
-              <span className="usb-guard-status-title">{usbGuardLabel(usbGuard.status, t)}</span>
-              {usbGuard.countdownSeconds !== null ? (
-                <span className="usb-guard-countdown">{usbGuard.countdownSeconds}s</span>
-              ) : null}
-              <Tooltip
-                content={[
-                  usbGuard.message,
-                  usbGuard.codexBlockReason,
-                  usbGuard.driveRoot
-                    ? `${usbGuard.driveRoot}${usbGuard.bundleRelativePath ? ` · ${usbGuard.bundleRelativePath}` : ""}`
-                    : null,
-                  !usbGuard.signed && usbGuard.status === "authorized"
-                    ? t("offline.usbGuard.unsigned")
-                    : null,
-                ]
-                  .filter(Boolean)
-                  .join("\n")}
-              >
-                <span className="tooltip-icon" aria-label={t("themes.details")}>
-                  <Icon name="info" />
-                </span>
-              </Tooltip>
-            </div>
           </section>
         ) : null}
         <section className="hero" data-testid="offline-hero">
@@ -1165,11 +1337,7 @@ export function OfflineHome({
         ) : null}
 
         <div className="actions">
-          {phase === "error" ? (
-            <button className="btn primary big" onClick={() => void load()} disabled={disabled}>
-              <Icon name="refresh" />{t("offline.recheck")}
-            </button>
-          ) : showInstalled ? (
+          {phase === "error" ? null : showInstalled ? (
             <>
               <button className="btn primary big" onClick={() => void launch()} disabled={disabled}>
                 {busyAction === "launch" ? <Icon name="loader" className="spinicon" /> : <CodexGlyph />}
@@ -1179,24 +1347,6 @@ export function OfflineHome({
                 {busyAction === "ccswitch" ? <Icon name="loader" className="spinicon" /> : <Icon name="gear" />}
                 {busyAction === "ccswitch" ? t("offline.ccswitchLaunching") : t("offline.ccswitchLaunch")}
               </button>
-              <button
-                className="btn ghost"
-                onClick={() => void refreshNativeModels()}
-                disabled={disabled || nativeModelBusy}
-                data-testid="refresh-native-models"
-              >
-                {nativeModelBusy ? <Icon name="loader" className="spinicon" /> : <Icon name="refresh" />}
-                {nativeModelBusy ? t("offline.nativeModelsRefreshing") : t("offline.nativeModelsRefresh")}
-              </button>
-              <button className="btn ghost" onClick={() => void load()} disabled={disabled}><Icon name="refresh" />{t("offline.recheck")}</button>
-              <button className="btn ghost" onClick={() => void install()} disabled={disabled}>
-                <Icon name="refresh" />{t("offline.repair")}
-              </button>
-              <Tooltip content={t("offline.repairHint")}>
-                <span className="tooltip-icon action-info" aria-label={t("themes.details")}>
-                  <Icon name="info" />
-                </span>
-              </Tooltip>
               {onOpenUninstall ? (
                 <button className="btn ghost danger" onClick={onOpenUninstall} disabled={disabled}>
                   <Icon name="trash" />{t("offline.uninstallBundle")}
@@ -1210,7 +1360,6 @@ export function OfflineHome({
                   ? t("offline.external")
                   : t("offline.existingOutsideUsb")}
               </div>
-              <button className="btn ghost" onClick={() => void load()} disabled={disabled}><Icon name="refresh" />{t("offline.recheck")}</button>
             </>
           ) : (
             <>
@@ -1218,7 +1367,6 @@ export function OfflineHome({
                 {busyAction === "install" ? <Icon name="loader" className="spinicon" /> : <Icon name="download" />}
                 {busyAction === "install" ? t("offline.installing") : status?.recoveryPending ? t("offline.resumeInstall") : t("offline.install")}
               </button>
-              <button className="btn ghost" onClick={() => void load()} disabled={disabled}><Icon name="refresh" />{t("offline.recheck")}</button>
             </>
           )}
           {phase !== "error" ? (
@@ -1253,21 +1401,62 @@ export function OfflineHome({
               <Icon name="trash" />{t("offline.uninstallBundle")}
             </button>
           ) : null}
-              <button className="btn ghost" onClick={() => void openLogs()} disabled={disabled}>
-            {busyAction === "logs" ? <Icon name="loader" className="spinicon" /> : <Icon name="folder" />}
-            {t("offline.openLogs")}
-          </button>
-          <button
-            className="linkbtn component-entry"
-            onClick={() => setComponentsOpen(true)}
-            disabled={disabled}
-          >
-            <Icon name="sliders" />{t("offline.components.entry")}
-          </button>
         </div>
 
+        <details className="advanced-tools" data-testid="advanced-tools">
+          <summary>{t("offline.advancedTools")}</summary>
+          <div className="advanced-maintenance">
+            <div className="advanced-maintenance-row">
+              <button className="btn ghost" onClick={() => void load()} disabled={disabled}>
+                <Icon name="refresh" />{t("offline.recheck")}
+              </button>
+              {showInstalled ? (
+                <Tooltip content={t("offline.repairHint")}>
+                  <button className="btn ghost" onClick={() => void install()} disabled={disabled}>
+                    <Icon name="refresh" />{t("offline.repair")}
+                  </button>
+                </Tooltip>
+              ) : null}
+              <button className="btn ghost" onClick={() => void openLogs()} disabled={disabled}>
+                {busyAction === "logs" ? <Icon name="loader" className="spinicon" /> : <Icon name="folder" />}
+                {t("offline.openLogs")}
+              </button>
+              <button
+                className="btn ghost"
+                onClick={() => setComponentsOpen(true)}
+                disabled={disabled}
+              >
+                <Icon name="sliders" />{t("offline.components.entry")}
+              </button>
+            </div>
+            {installationDetail ? (
+              <details className="advanced-detail">
+                <summary>{t("offline.installDetails")}</summary>
+                <div>{installationDetail}</div>
+              </details>
+            ) : null}
+            {nativeModelNotice ? (
+              <StatusBanner tone={nativeModelNotice.tone}>
+                {nativeModelNotice.message}
+              </StatusBanner>
+            ) : null}
+            {showInstalled ? (
+              <button
+                className="btn ghost"
+                onClick={() => void refreshNativeModels(false)}
+                disabled={disabled || nativeModelBusy}
+                data-testid="refresh-native-models"
+              >
+                {nativeModelBusy ? <Icon name="loader" className="spinicon" /> : <Icon name="refresh" />}
+                {nativeModelBusy ? t("offline.nativeModelsRefreshing") : t("offline.nativeModelsRefresh")}
+              </button>
+            ) : null}
+          </div>
+          {showInstalled ? <GatewayModelProbePanel /> : null}
+        </details>
+
         <SkillRepoUpdateCard />
-        <AccountCard />
+        <AccountCard authorizationState={accountAuthorizationState} />
         {displayInstalled ? (
           <Tooltip
             content={[

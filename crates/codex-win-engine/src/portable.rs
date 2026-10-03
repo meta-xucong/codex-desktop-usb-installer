@@ -149,6 +149,21 @@ const CODEX_ASAR_PACKAGE_FAMILY_PATCH_PREFIX: &[u8] = b"void 0/*USB*/";
 // replacement, which lets us patch the minified ASAR in place without moving
 // offsets or invalidating the signed MSIX archive before extraction.
 const CODEX_ASAR_CONSOLE_SPAWN_CALLS: &[(&[u8], &[u8])] = &[
+    // Codex 26.917 adds an explicit cwd after the inherited environment.
+    // Keep the replacement fixed-width so the extracted ASAR remains a
+    // byte-for-byte layout-preserving patch on the removable install.
+    (
+        b"stdio:[`pipe`,`pipe`,`pipe`],env:this.options.env,cwd:this.options.cwd",
+        b"stdio:\"pipe\",windowsHide:!0,env:this.options.env,cwd:this.options.cwd",
+    ),
+    (
+        b"stdio:[\"pipe\",\"pipe\",\"pipe\"],env:this.options.env,cwd:this.options.cwd",
+        b"stdio:\"pipe\",windowsHide:!0,env:this.options.env,cwd:this.options.cwd",
+    ),
+    (
+        b"stdio:['pipe','pipe','pipe'],env:this.options.env,cwd:this.options.cwd",
+        b"stdio:\"pipe\",windowsHide:!0,env:this.options.env,cwd:this.options.cwd",
+    ),
     (
         b"stdio:[`pipe`,`pipe`,`pipe`],env:this.options.env",
         b"stdio:\"pipe\",windowsHide:!0,env:this.options.env",
@@ -164,6 +179,73 @@ const CODEX_ASAR_CONSOLE_SPAWN_CALLS: &[(&[u8], &[u8])] = &[
 ];
 const CODEX_ASAR_CONSOLE_SPAWN_SENTINEL: &[u8] =
     b"stdio:\"pipe\",windowsHide:!0,env:this.options.env";
+const CODEX_ASAR_CONSOLE_SPAWN_CWD_SENTINEL: &[u8] =
+    b"stdio:\"pipe\",windowsHide:!0,env:this.options.env,cwd:this.options.cwd";
+
+// Codex's open-in-targets helper wraps .cmd/.bat launches in cmd.exe.  The
+// helper used to pass only `stdio` and `env`, so Windows could allocate a
+// console for cmd.exe before the process-tree watcher had a chance to hide it.
+// Keep the edit fixed-width while retaining Codex's Windows command resolver.
+// That resolver applies PATH/PATHEXT and is required for custom targets whose
+// configured command is a bare `.cmd`/`.bat` name. `windowsHide:1` is
+// intentional; Node treats any truthy value as enabled and the one-character
+// form fits the in-place extracted-ASAR patch.
+const CODEX_ASAR_GENERIC_SPAWN_CALLS: &[(&[u8], &[u8])] = &[
+    // This is the complete minified bridge around the generic Zi() helper.
+    // Keep the replacement no wider than the source bytes so the extracted
+    // ASAR can be repaired without rebuilding its header and file offsets.
+    // `Ane` still receives the resolved command, the normalized environment's
+    // ComSpec (with its existing `cmd.exe` fallback), and the original stdio
+    // expression.  Calling the imported spawn function directly is equivalent
+    // here: Node's child_process.spawn does not depend on a receiver object.
+    (
+        b"o=n.Bi(r?.env??process.env),s=Ane(process.platform,n.qn.resolve(e,{env:o})??e,t,process.env.ComSpec),c=(0,P.spawn)(s.command,s.args,{stdio:r?.stdin==null?`ignore`:[`pipe`,`ignore`,`ignore`],env:o})",
+        b"o=n.Bi(r?.env??process.env),s=Ane(process.platform,n.qn.resolve(e,{env:o})??e,t,o.ComSpec),c=P.spawn(s.command,s.args,{windowsHide:1,stdio:r?.stdin==null?`ignore`:[`pipe`,`ignore`,`ignore`],env:o})",
+    ),
+];
+const CODEX_ASAR_GENERIC_SPAWN_SENTINEL: &[u8] =
+    b"o=n.Bi(r?.env??process.env),s=Ane(process.platform,n.qn.resolve(e,{env:o})??e,t,o.ComSpec),c=P.spawn(s.command,s.args,{windowsHide:1,stdio:r?.stdin==null?`ignore`:[`pipe`,`ignore`,`ignore`],env:o})";
+
+// A few Codex sidecars are shipped as Windows console-subsystem PE files.
+// Node's `windowsHide` option covers children created through the patched
+// app-server bridge, but it cannot change a sidecar that creates its own
+// console before that bridge is reached.  The USB payload is an extracted,
+// manager-owned copy (the source MSIX remains Authenticode-verified), so the
+// following known sidecars can be made GUI-subsystem at install/launch
+// time.  The edit changes only the two-byte PE OptionalHeader.Subsystem field,
+// preserves file length and is idempotent.
+const CODEX_CONSOLE_SUBSYSTEM_EXECUTABLES: &[&str] = &[
+    "codex.exe",
+    "codex-code-mode-host.exe",
+    "codex-windows-sandbox-service.exe",
+    "codex-windows-sandbox-setup.exe",
+    "rg.exe",
+    "app.asar.unpacked/node_modules/node-pty/build/Release/winpty-agent.exe",
+    "cua_node/bin/node.exe",
+    "cua_node/bin/node_repl.exe",
+    "cua_node/bin/node_modules/%40oai/cua/bin/windows/codex-computer-use.exe",
+    "cua_node/bin/node_modules/%40oai/sky/bin/windows/codex-computer-use.exe",
+    "cua_node/bin/node_modules/%40oai/sky/bin/windows/swift/x64/codex-computer-use-swift.exe",
+    "plugins/openai-bundled/plugins/chrome/extension-host/windows/x64/extension-host.exe",
+    "plugins/openai-bundled/plugins/latex/bin/tectonic.exe",
+];
+
+// The bundled codex_app MCP server ships as a .cmd launcher. Starting that
+// launcher through cmd.exe creates a visible conhost before Codex's native
+// process hiding logic can run, including when the server restarts on a new
+// conversation. Invoke the already-bundled, GUI-subsystem CUA Node directly.
+const CODEX_APP_TOOLS_MCP_CONFIG: &str = "plugins/openai-bundled/plugins/codex-app-tools/.mcp.json";
+const CODEX_APP_TOOLS_MCP_NODE_COMMAND: &str = r"..\..\..\..\cua_node\bin\node.exe";
+const CODEX_APP_TOOLS_MCP_OLD_COMMAND: &str = "cmd.exe";
+const CODEX_APP_TOOLS_MCP_OLD_ARGS: &[&str] = &[
+    "/d",
+    "/s",
+    "/c",
+    "call",
+    "./scripts/launch_codex_app_tools_mcp.cmd",
+    "./server.mjs",
+];
+const CODEX_APP_TOOLS_MCP_DIRECT_ARGS: &[&str] = &["./server.mjs"];
 
 // Codex ships the translated webview bundles, but several desktop releases
 // gate loading them behind a remote `enable_i18n` flag whose local fallback is
@@ -292,32 +374,403 @@ fn patch_first_fixed_width_call(
 }
 
 fn patch_codex_console_spawn(app_asar: &Path) -> Result<bool, EngineError> {
-    if find_bytes_in_file(app_asar, CODEX_ASAR_CONSOLE_SPAWN_SENTINEL)
-        .map_err(|error| io_err("scan Codex app.asar for console-silence patch", error))?
-        .is_some()
-    {
-        return Ok(false);
-    }
-
-    for (call, replacement) in CODEX_ASAR_CONSOLE_SPAWN_CALLS {
-        if find_bytes_in_file(app_asar, call)
-            .map_err(|error| io_err("scan Codex app.asar for app-server spawn", error))?
-            .is_some()
-        {
-            return patch_first_fixed_width_call(
-                app_asar,
-                call,
-                replacement,
-                "app-server-console-window",
-            );
+    // Scan the archive once.  Reopening and rescanning a 300+ MB ASAR for
+    // every known shape made a slow removable-drive launch needlessly costly;
+    // collect fixed-width edits from the original bytes, then apply only the
+    // small offsets that matched.
+    let bytes = fs::read(app_asar)
+        .map_err(|error| io_err("read Codex app.asar for console-silence patch", error))?;
+    let mut edits = Vec::<(usize, Vec<u8>, &'static str)>::new();
+    for (label, calls) in [
+        ("app-server-console-window", CODEX_ASAR_CONSOLE_SPAWN_CALLS),
+        (
+            "generic-command-console-window",
+            CODEX_ASAR_GENERIC_SPAWN_CALLS,
+        ),
+    ] {
+        for (call, replacement) in calls {
+            if replacement.len() > call.len() {
+                return Err(EngineError::Msix(
+                    "portable Codex console patch is wider than the original call".to_string(),
+                ));
+            }
+            let mut search_from = 0_usize;
+            while search_from.saturating_add(call.len()) <= bytes.len() {
+                let Some(relative) = bytes[search_from..]
+                    .windows(call.len())
+                    .position(|window| window == *call)
+                else {
+                    break;
+                };
+                let offset = search_from + relative;
+                // Some of the shorter `env` forms are byte prefixes of the
+                // newer `env,cwd` forms.  Keep the longest shape when their
+                // ranges overlap; otherwise the second edit would overwrite
+                // the beginning of the more specific replacement and leave
+                // the cwd call unpatched.
+                let overlaps_existing = edits.iter().any(|(existing_offset, existing, _)| {
+                    let existing_end = existing_offset.saturating_add(existing.len());
+                    let new_end = offset.saturating_add(call.len());
+                    offset < existing_end && *existing_offset < new_end
+                });
+                if !overlaps_existing {
+                    let mut fixed = vec![b' '; call.len()];
+                    fixed[..replacement.len()].copy_from_slice(replacement);
+                    edits.push((offset, fixed, label));
+                }
+                search_from = offset.saturating_add(call.len());
+            }
         }
     }
 
-    log::warn!(
-        "portable Codex app-server spawn did not match a known console-silence patch shape path={}",
-        app_asar.display()
-    );
+    if !edits.is_empty() {
+        for (offset, replacement, label) in edits {
+            patch_asar_bytes_in_place(app_asar, offset as u64, &replacement)?;
+            log::info!(
+                "portable Codex startup compatibility patch applied path={} offset={} reason={label}",
+                app_asar.display(),
+                offset
+            );
+        }
+        return Ok(true);
+    }
+
+    let has_known_patch = [
+        CODEX_ASAR_CONSOLE_SPAWN_SENTINEL,
+        CODEX_ASAR_CONSOLE_SPAWN_CWD_SENTINEL,
+        CODEX_ASAR_GENERIC_SPAWN_SENTINEL,
+    ]
+    .iter()
+    .any(|needle| bytes.windows(needle.len()).any(|window| window == *needle));
+    if !has_known_patch {
+        log::warn!(
+            "portable Codex console spawn did not match a known console-silence patch shape path={}",
+            app_asar.display()
+        );
+    }
     Ok(false)
+}
+
+fn read_u16_le(bytes: &[u8], offset: usize) -> Option<u16> {
+    bytes
+        .get(offset..offset.saturating_add(2))
+        .map(|value| u16::from_le_bytes([value[0], value[1]]))
+}
+
+fn read_u32_le(bytes: &[u8], offset: usize) -> Option<u32> {
+    bytes
+        .get(offset..offset.saturating_add(4))
+        .map(|value| u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
+}
+
+fn is_regular_non_reparse_file(path: &Path) -> Result<bool, EngineError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(io_err("inspect Codex console sidecar", error)),
+    };
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Ok(false);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        // FILE_ATTRIBUTE_REPARSE_POINT.  symlink_metadata() does not follow a
+        // junction, but Windows still reports a reparse-point file as a
+        // regular file in some filesystem configurations.
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Change one known extracted Codex sidecar from Windows CUI (3) to GUI (2).
+///
+/// Invalid or non-PE files are left untouched because an upstream build may
+/// replace a sidecar with a script/shim.  A real I/O or write failure remains
+/// fatal: continuing would reintroduce the startup black-console regression
+/// while reporting a successful portable preparation.
+fn patch_console_subsystem_executable(path: &Path) -> Result<(bool, Option<u16>), EngineError> {
+    if !is_regular_non_reparse_file(path)? {
+        return Ok((false, None));
+    }
+    let bytes = fs::read(path).map_err(|error| io_err("read Codex console sidecar", error))?;
+    if bytes.len() < 0x40 || &bytes[..2] != b"MZ" {
+        log::warn!(
+            "portable Codex sidecar is not a PE image; leaving unchanged path={}",
+            path.display()
+        );
+        return Ok((false, None));
+    }
+    let nt_offset = read_u32_le(&bytes, 0x3c).map(|value| value as usize);
+    let Some(nt_offset) = nt_offset else {
+        return Ok((false, None));
+    };
+    let Some(signature) = bytes.get(nt_offset..nt_offset.saturating_add(4)) else {
+        return Ok((false, None));
+    };
+    if signature != b"PE\0\0" {
+        return Ok((false, None));
+    }
+    let optional_size = read_u16_le(&bytes, nt_offset.saturating_add(20))
+        .map(usize::from)
+        .unwrap_or(0);
+    let optional_offset = nt_offset.saturating_add(24);
+    let subsystem_offset = optional_offset.saturating_add(68);
+    if optional_size < 70
+        || read_u16_le(&bytes, optional_offset).is_none()
+        || subsystem_offset.saturating_add(2) > bytes.len()
+        || subsystem_offset.saturating_add(2) > optional_offset.saturating_add(optional_size)
+    {
+        return Ok((false, None));
+    }
+
+    let subsystem = read_u16_le(&bytes, subsystem_offset).unwrap_or_default();
+    match subsystem {
+        2 => Ok((false, Some(2))),
+        3 => {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .map_err(|error| io_err("open Codex console sidecar for patch", error))?;
+            file.seek(SeekFrom::Start(subsystem_offset as u64))
+                .map_err(|error| io_err("seek Codex console sidecar subsystem", error))?;
+            file.write_all(&2_u16.to_le_bytes())
+                .map_err(|error| io_err("write Codex console sidecar subsystem", error))?;
+            file.flush()
+                .map_err(|error| io_err("flush Codex console sidecar subsystem", error))?;
+            log::info!(
+                "portable Codex console sidecar subsystem patched path={} old=3 new=2 reason=console-subsystem-suppression",
+                path.display()
+            );
+            Ok((true, Some(2)))
+        }
+        other => {
+            log::debug!(
+                "portable Codex sidecar has unsupported PE subsystem; leaving unchanged path={} subsystem={other}",
+                path.display()
+            );
+            Ok((false, Some(other)))
+        }
+    }
+}
+
+fn patch_console_subsystem_executables(
+    install_root: &Path,
+) -> Result<(bool, Option<u16>), EngineError> {
+    let resources = install_root.join("resources");
+    let mut patched = false;
+    let mut cua_node_subsystem = None;
+    for name in CODEX_CONSOLE_SUBSYSTEM_EXECUTABLES {
+        let path = resources.join(name);
+        if is_regular_non_reparse_file(&path)? {
+            let (sidecar_patched, subsystem) = patch_console_subsystem_executable(&path)?;
+            patched |= sidecar_patched;
+            if *name == "cua_node/bin/node.exe" {
+                cua_node_subsystem = subsystem;
+            }
+        }
+    }
+    Ok((patched, cua_node_subsystem))
+}
+
+fn mcp_server_mut<'a>(
+    value: &'a mut serde_json::Value,
+) -> Option<&'a mut serde_json::Map<String, serde_json::Value>> {
+    value.get_mut("mcpServers")?.as_object_mut()
+}
+
+fn ensure_plain_directory_tree(root: &Path, target_parent: &Path) -> Result<(), EngineError> {
+    let relative = target_parent
+        .strip_prefix(root)
+        .map_err(|_| EngineError::Install("Codex MCP 配置路径超出便携安装目录".to_string()))?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        let metadata = fs::symlink_metadata(&current)
+            .map_err(|error| io_err("inspect Codex MCP configuration directory", error))?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(EngineError::Install(
+                "Codex MCP 配置目录包含非普通目录，拒绝修改".to_string(),
+            ));
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if metadata.file_attributes() & 0x400 != 0 {
+                return Err(EngineError::Install(
+                    "Codex MCP 配置目录包含 Windows 重解析点，拒绝修改".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn replace_file_atomically(path: &Path, contents: &[u8]) -> Result<(), EngineError> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("mcp.json");
+    let temporary = path.with_file_name(format!(
+        ".{file_name}.codex-usb-{}.tmp",
+        uuid::Uuid::new_v4()
+    ));
+    let write_result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|error| io_err("create temporary Codex MCP configuration", error))?;
+        file.write_all(contents)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| io_err("write temporary Codex MCP configuration", error))?;
+        drop(file);
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            use windows_sys::Win32::Storage::FileSystem::{
+                MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+            };
+            let source: Vec<u16> = temporary.as_os_str().encode_wide().chain(Some(0)).collect();
+            let destination: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            let result = unsafe {
+                MoveFileExW(
+                    source.as_ptr(),
+                    destination.as_ptr(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            };
+            if result == 0 {
+                return Err(io_err(
+                    "atomically replace Codex MCP configuration",
+                    io::Error::last_os_error(),
+                ));
+            }
+        }
+        #[cfg(not(windows))]
+        fs::rename(&temporary, path)
+            .map_err(|error| io_err("atomically replace Codex MCP configuration", error))?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    write_result
+}
+
+fn patch_codex_app_tools_mcp_config(
+    install_root: &Path,
+    cua_node_subsystem: Option<u16>,
+) -> Result<bool, EngineError> {
+    let path = install_root
+        .join("resources")
+        .join(CODEX_APP_TOOLS_MCP_CONFIG);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(io_err("inspect Codex App Tools MCP configuration", error)),
+    };
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(EngineError::Install(
+            "Codex App Tools MCP 配置不是普通文件，拒绝修改".to_string(),
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Err(EngineError::Install(
+                "Codex App Tools MCP 配置是 Windows 重解析点，拒绝修改".to_string(),
+            ));
+        }
+    }
+    if metadata.len() > 1024 * 1024 {
+        return Err(EngineError::Install(
+            "Codex App Tools MCP 配置超出安全大小上限".to_string(),
+        ));
+    }
+    ensure_plain_directory_tree(install_root, path.parent().expect("MCP config has parent"))?;
+    let original =
+        fs::read(&path).map_err(|error| io_err("read Codex App Tools MCP configuration", error))?;
+    let has_utf8_bom = original.starts_with(&[0xEF, 0xBB, 0xBF]);
+    let json_bytes = if has_utf8_bom {
+        &original[3..]
+    } else {
+        &original[..]
+    };
+    let mut config: serde_json::Value = serde_json::from_slice(json_bytes).map_err(|error| {
+        EngineError::Install(format!("解析 Codex App Tools MCP 配置失败：{error}"))
+    })?;
+    let Some(server) = mcp_server_mut(&mut config).and_then(|servers| servers.get_mut("codex_app"))
+    else {
+        log::debug!("Codex App Tools MCP configuration has no codex_app server; leaving unchanged");
+        return Ok(false);
+    };
+    let Some(server_object) = server.as_object_mut() else {
+        return Err(EngineError::Install(
+            "Codex App Tools MCP 服务配置格式错误".to_string(),
+        ));
+    };
+    let command = server_object
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let args = server_object
+        .get("args")
+        .and_then(serde_json::Value::as_array);
+    let direct_args = CODEX_APP_TOOLS_MCP_DIRECT_ARGS
+        .iter()
+        .map(|value| serde_json::Value::String((*value).to_string()))
+        .collect::<Vec<_>>();
+    let is_direct = command.eq_ignore_ascii_case(CODEX_APP_TOOLS_MCP_NODE_COMMAND)
+        && args.is_some_and(|args| args == &direct_args);
+    let is_legacy = command.eq_ignore_ascii_case(CODEX_APP_TOOLS_MCP_OLD_COMMAND)
+        && args.is_some_and(|args| {
+            args.len() == CODEX_APP_TOOLS_MCP_OLD_ARGS.len()
+                && args
+                    .iter()
+                    .zip(CODEX_APP_TOOLS_MCP_OLD_ARGS)
+                    .all(|(actual, expected)| actual.as_str() == Some(expected))
+        });
+    if !is_direct && !is_legacy {
+        log::warn!("Codex App Tools MCP launcher has an unknown shape; leaving it unchanged");
+        return Ok(false);
+    }
+
+    let node_path = install_root
+        .join("resources")
+        .join("cua_node")
+        .join("bin")
+        .join("node.exe");
+    if !is_regular_non_reparse_file(&node_path)? || cua_node_subsystem != Some(2) {
+        return Err(EngineError::Install(
+            "Codex App Tools MCP 隐藏控制台启动器未通过 PE 校验，拒绝保留会弹出控制台的启动方式"
+                .to_string(),
+        ));
+    }
+    if is_direct {
+        return Ok(false);
+    }
+
+    server_object.insert(
+        "command".to_string(),
+        serde_json::Value::String(CODEX_APP_TOOLS_MCP_NODE_COMMAND.to_string()),
+    );
+    server_object.insert("args".to_string(), serde_json::Value::Array(direct_args));
+    let mut serialized = serde_json::to_vec_pretty(&config).map_err(|error| {
+        EngineError::Install(format!("序列化 Codex App Tools MCP 配置失败：{error}"))
+    })?;
+    if has_utf8_bom {
+        serialized.splice(0..0, [0xEF, 0xBB, 0xBF]);
+    }
+    serialized.push(b'\n');
+    replace_file_atomically(&path, &serialized)?;
+    log::info!("portable Codex App Tools MCP launcher switched from cmd.exe to bundled GUI Node");
+    Ok(true)
 }
 
 /// Make an extracted Codex tree safe to launch without an MSIX package
@@ -328,15 +781,20 @@ fn patch_codex_console_spawn(app_asar: &Path) -> Result<bool, EngineError> {
 pub fn ensure_portable_codex_startup_compatibility(
     install_root: &Path,
 ) -> Result<bool, EngineError> {
+    // The executable edit complements the ASAR `windowsHide` patch.  Both
+    // run before the first portable launch and remain safe to repeat after an
+    // in-place update or a manager restart.
+    let (mut patched, cua_node_subsystem) = patch_console_subsystem_executables(install_root)?;
+    patched |= patch_codex_app_tools_mcp_config(install_root, cua_node_subsystem)?;
     let app_asar = install_root.join("resources").join("app.asar");
     if !app_asar.is_file() {
-        return Ok(false);
+        return Ok(patched);
     }
 
     // This patch is independent from the unpackaged-MSIX updater patch below:
     // newer Codex builds can change or remove the updater bootstrap while the
     // app-server spawn remains the source of a visible console window.
-    let mut patched = patch_codex_console_spawn(&app_asar)?;
+    patched |= patch_codex_console_spawn(&app_asar)?;
 
     // Only touch a Codex archive that actually contains the package-identity
     // updater.  This keeps the patch scoped to the known failure mechanism.
@@ -2517,6 +2975,18 @@ mod tests {
         dir
     }
 
+    fn fake_pe_image(subsystem: u16) -> Vec<u8> {
+        let mut bytes = vec![0_u8; 0x300];
+        bytes[..2].copy_from_slice(b"MZ");
+        bytes[0x3c..0x40].copy_from_slice(&0x80_u32.to_le_bytes());
+        bytes[0x80..0x84].copy_from_slice(b"PE\0\0");
+        bytes[0x80 + 20..0x80 + 22].copy_from_slice(&0xE0_u16.to_le_bytes());
+        let optional = 0x80 + 24;
+        bytes[optional..optional + 2].copy_from_slice(&0x20B_u16.to_le_bytes());
+        bytes[optional + 68..optional + 70].copy_from_slice(&subsystem.to_le_bytes());
+        bytes
+    }
+
     fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
         TEST_ENV_LOCK
             .get_or_init(|| Mutex::new(()))
@@ -2589,6 +3059,87 @@ mod tests {
     }
 
     #[test]
+    fn codex_app_tools_mcp_uses_bundled_gui_node_and_preserves_other_settings() {
+        let root = temp_test_dir("codex-app-tools-mcp");
+        let resources = root.join("resources");
+        let plugin_dir = resources.join("plugins/openai-bundled/plugins/codex-app-tools");
+        let node_path = resources.join("cua_node/bin/node.exe");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        fs::create_dir_all(node_path.parent().unwrap()).unwrap();
+        fs::write(&node_path, fake_pe_image(3)).unwrap();
+        let original = serde_json::json!({
+            "mcpServers": {
+                "codex_app": {
+                    "command": "cmd.exe",
+                    "args": ["/d", "/s", "/c", "call", "./scripts/launch_codex_app_tools_mcp.cmd", "./server.mjs"],
+                    "cwd": ".",
+                    "enabled": false,
+                    "env_vars": { "EXAMPLE": "preserved" },
+                    "approval_policy": "user"
+                }
+            },
+            "pluginMetadata": { "keep": true }
+        });
+        fs::write(
+            plugin_dir.join(".mcp.json"),
+            serde_json::to_vec_pretty(&original).unwrap(),
+        )
+        .unwrap();
+
+        let (sidecars_patched, node_subsystem) =
+            patch_console_subsystem_executables(&root).unwrap();
+        assert!(sidecars_patched);
+        assert_eq!(node_subsystem, Some(2));
+        assert!(patch_codex_app_tools_mcp_config(&root, node_subsystem).unwrap());
+
+        let patched: serde_json::Value =
+            serde_json::from_slice(&fs::read(plugin_dir.join(".mcp.json")).unwrap()).unwrap();
+        let server = &patched["mcpServers"]["codex_app"];
+        assert_eq!(
+            server["command"],
+            serde_json::Value::String(CODEX_APP_TOOLS_MCP_NODE_COMMAND.to_string())
+        );
+        assert_eq!(server["args"], serde_json::json!(["./server.mjs"]));
+        assert_eq!(server["cwd"], ".");
+        assert_eq!(server["enabled"], false);
+        assert_eq!(server["env_vars"]["EXAMPLE"], "preserved");
+        assert_eq!(server["approval_policy"], "user");
+        assert_eq!(patched["pluginMetadata"]["keep"], true);
+
+        let resolved_node = plugin_dir.join(CODEX_APP_TOOLS_MCP_NODE_COMMAND);
+        assert_eq!(
+            fs::canonicalize(resolved_node).unwrap(),
+            fs::canonicalize(node_path).unwrap()
+        );
+        assert!(!patch_codex_app_tools_mcp_config(&root, Some(2)).unwrap());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_app_tools_mcp_leaves_unknown_launcher_shape_untouched() {
+        let root = temp_test_dir("codex-app-tools-mcp-unknown");
+        let resources = root.join("resources");
+        let plugin_dir = resources.join("plugins/openai-bundled/plugins/codex-app-tools");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        let config = serde_json::json!({
+            "mcpServers": {
+                "codex_app": {
+                    "command": "custom-host.exe",
+                    "args": ["./server.mjs"],
+                    "cwd": "."
+                }
+            }
+        });
+        let bytes = serde_json::to_vec(&config).unwrap();
+        let path = plugin_dir.join(".mcp.json");
+        fs::write(&path, &bytes).unwrap();
+
+        assert!(!patch_codex_app_tools_mcp_config(&root, None).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn portable_console_spawn_patch_is_fixed_width_and_idempotent() {
         let root = temp_test_dir("console-spawn-patch");
         let resources = root.join("resources");
@@ -2606,6 +3157,114 @@ mod tests {
         assert!(patched
             .windows(CODEX_ASAR_CONSOLE_SPAWN_SENTINEL.len())
             .any(|window| window == CODEX_ASAR_CONSOLE_SPAWN_SENTINEL));
+        assert!(!ensure_portable_codex_startup_compatibility(&root).unwrap());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn portable_console_spawn_patch_covers_codex_cwd_shape() {
+        let root = temp_test_dir("console-spawn-patch-cwd");
+        let resources = root.join("resources");
+        fs::create_dir_all(&resources).unwrap();
+        let app_asar = resources.join("app.asar");
+        let call = CODEX_ASAR_CONSOLE_SPAWN_CALLS
+            .iter()
+            .find(|(needle, _)| needle.ends_with(b",cwd:this.options.cwd"))
+            .expect("cwd patch shape");
+        fs::write(
+            &app_asar,
+            [b"header ".as_slice(), call.0, b" trailer"].concat(),
+        )
+        .unwrap();
+
+        assert!(ensure_portable_codex_startup_compatibility(&root).unwrap());
+        let patched = fs::read(&app_asar).unwrap();
+        assert!(!patched.windows(call.0.len()).any(|window| window == call.0));
+        assert!(patched
+            .windows(CODEX_ASAR_CONSOLE_SPAWN_CWD_SENTINEL.len())
+            .any(|window| window == CODEX_ASAR_CONSOLE_SPAWN_CWD_SENTINEL));
+        assert!(!ensure_portable_codex_startup_compatibility(&root).unwrap());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn portable_generic_console_spawn_patch_is_fixed_width_and_idempotent() {
+        let root = temp_test_dir("generic-console-spawn-patch");
+        let resources = root.join("resources");
+        fs::create_dir_all(&resources).unwrap();
+        let app_asar = resources.join("app.asar");
+        let (call, replacement) = CODEX_ASAR_GENERIC_SPAWN_CALLS[0];
+        fs::write(
+            &app_asar,
+            [b"header ".as_slice(), call, b" trailer"].concat(),
+        )
+        .unwrap();
+
+        assert!(ensure_portable_codex_startup_compatibility(&root).unwrap());
+        let patched = fs::read(&app_asar).unwrap();
+        assert_eq!(
+            patched.len(),
+            b"header ".len() + call.len() + b" trailer".len()
+        );
+        assert!(!patched.windows(call.len()).any(|window| window == call));
+        assert!(patched
+            .windows(replacement.len())
+            .any(|window| window == replacement));
+        assert!(patched
+            .windows(CODEX_ASAR_GENERIC_SPAWN_SENTINEL.len())
+            .any(|window| window == CODEX_ASAR_GENERIC_SPAWN_SENTINEL));
+        assert!(!ensure_portable_codex_startup_compatibility(&root).unwrap());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn portable_generic_console_spawn_patch_keeps_windows_command_resolution() {
+        let (original, replacement) = CODEX_ASAR_GENERIC_SPAWN_CALLS[0];
+        assert!(replacement.len() <= original.len());
+        assert!(replacement
+            .windows(b"n.qn.resolve(e,{env:o})??e".len())
+            .any(|window| window == b"n.qn.resolve(e,{env:o})??e"));
+        assert!(replacement
+            .windows(b"windowsHide:1".len())
+            .any(|window| window == b"windowsHide:1"));
+        assert!(replacement
+            .windows(b"o.ComSpec".len())
+            .any(|window| window == b"o.ComSpec"));
+        assert!(replacement
+            .windows(b"r?.stdin==null?".len())
+            .any(|window| window == b"r?.stdin==null?"));
+    }
+
+    #[test]
+    fn portable_console_subsystem_patch_is_fixed_width_and_idempotent() {
+        let root = temp_test_dir("console-subsystem-patch");
+        let resources = root.join("resources");
+        fs::create_dir_all(&resources).unwrap();
+        let nt_offset = 0x80_usize;
+        let optional_offset = nt_offset + 24;
+        let subsystem_offset = optional_offset + 68;
+        let mut original = vec![0_u8; optional_offset + 0xf0];
+        original[..2].copy_from_slice(b"MZ");
+        original[0x3c..0x40].copy_from_slice(&(nt_offset as u32).to_le_bytes());
+        original[nt_offset..nt_offset + 4].copy_from_slice(b"PE\0\0");
+        original[nt_offset + 20..nt_offset + 22].copy_from_slice(&0xf0_u16.to_le_bytes());
+        original[optional_offset..optional_offset + 2].copy_from_slice(&0x20b_u16.to_le_bytes());
+        original[subsystem_offset..subsystem_offset + 2].copy_from_slice(&3_u16.to_le_bytes());
+        for name in CODEX_CONSOLE_SUBSYSTEM_EXECUTABLES {
+            let path = resources.join(name);
+            fs::create_dir_all(path.parent().expect("sidecar parent")).unwrap();
+            fs::write(path, &original).unwrap();
+        }
+
+        assert!(ensure_portable_codex_startup_compatibility(&root).unwrap());
+        for name in CODEX_CONSOLE_SUBSYSTEM_EXECUTABLES {
+            let patched = fs::read(resources.join(name)).unwrap();
+            assert_eq!(patched.len(), original.len());
+            assert_eq!(read_u16_le(&patched, subsystem_offset), Some(2));
+        }
         assert!(!ensure_portable_codex_startup_compatibility(&root).unwrap());
 
         let _ = fs::remove_dir_all(root);

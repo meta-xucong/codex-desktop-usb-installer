@@ -28,6 +28,15 @@ export default tseslint.config(
       // policy and generated dist tree; it is not part of this manager bundle.
       "CCSwitch/",
       "release/",
+      // Historical source snapshots and audit transcripts are evidence, not
+      // live app sources. Lint the checked-out product tree, not those copies.
+      ".codex-audit/",
+      // Local release/capability simulations contain bundled third-party
+      // runtimes and extracted vendor JavaScript. They are test evidence, not
+      // renderer sources, and must not make the product lint gate depend on a
+      // particular audit run being present in the workspace.
+      "_audit-artifacts/",
+      "_codex-oneclick-test-artifacts/",
       "scripts/",
       "docs/",
       // Local reverse-engineering/probe fixtures are diagnostic artifacts, not

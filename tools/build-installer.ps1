@@ -94,16 +94,25 @@ try {
     if (-not (Test-Path -LiteralPath $ccswitchSource -PathType Leaf)) {
         throw "未找到 CodexSwitch.exe：$ccswitchSource。请先构建 CCSwitch 产品版，或通过 -CcswitchArtifactDir 指定产物目录。"
     }
-    $ccswitchVerifier = Join-Path $CcswitchArtifactDir "verify-product.ps1"
-    if (Test-Path -LiteralPath $ccswitchVerifier -PathType Leaf) {
-        # The verifier checks the external provider catalog and the embedded
-        # runtime environment-patch marker before the offline installer can
-        # consume the CCSwitch artifact.
-        & pwsh.exe -NoProfile -File $ccswitchVerifier -ArtifactDir $CcswitchArtifactDir -SkipNetwork
-        if ($LASTEXITCODE -ne 0) { throw "CCSwitch 产品版验证失败，拒绝打包未验证的版本" }
-    } else {
-        Write-Warning "CCSwitch 产物缺少 verify-product.ps1，跳过嵌入 renderer 检查"
+    $ccswitchBinaryText = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($ccswitchSource))
+    foreach ($handoffMarker in @(
+        "CODEX_USB_404TOKEN_HANDOFF_V1",
+        "CCSWITCH_404TOKEN_HANDOFF_PATH",
+        "CCSWITCH_404TOKEN_HANDOFF_NONCE",
+        "CCSWITCH_404TOKEN_DEVICE_KEY"
+    )) {
+        if (-not $ccswitchBinaryText.Contains($handoffMarker)) {
+            throw "CCSwitch EXE 缺少确认式 404token API Key 注入协议标记 $handoffMarker；拒绝继续打包：$ccswitchSource"
+        }
     }
+    $ccswitchVerifier = Join-Path $CcswitchArtifactDir "verify-product.ps1"
+    if (-not (Test-Path -LiteralPath $ccswitchVerifier -PathType Leaf)) {
+        throw "CCSwitch 产物缺少必需的 verify-product.ps1；拒绝打包未经确认式 API Key 注入校验的版本"
+    }
+    # This verifier checks the catalog, renderer, and the compiled persistence
+    # acknowledgement marker before the offline installer consumes the EXE.
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $ccswitchVerifier -ArtifactDir $CcswitchArtifactDir -SkipNetwork
+    if ($LASTEXITCODE -ne 0) { throw "CCSwitch 产品版验证失败，拒绝打包未验证的版本" }
     New-Item -ItemType Directory -Force -Path $ccswitchResourceDir | Out-Null
     foreach ($fileName in @("CodexSwitch.exe", "providers.json", "manifest.json", "LICENSE", "SOURCE-NOTICE.txt", "verify-product.ps1")) {
         $sourceFile = Join-Path $CcswitchArtifactDir $fileName

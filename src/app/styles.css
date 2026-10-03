@@ -1930,8 +1930,11 @@ button.themecard-art:focus-visible {
 .account-panel-head svg { width: 16px; height: 16px; vertical-align: -3px; }
 .account-balance { color: var(--accent-deep, var(--accent)); font-weight: 600; }
 .account-input { flex: 1; min-width: 0; }
-.account-panel-message { color: var(--text-soft); font-size: var(--fs-sm); margin-top: 8px; }
-.account-panel-error { color: var(--danger); font-size: var(--fs-sm); margin-top: 8px; white-space: pre-wrap; }
+.account-panel-row + .account-panel-row { margin-top: 10px; }
+.account-panel-message,
+.account-panel-error { min-height: 18px; line-height: 1.45; margin-top: 8px; font-size: var(--fs-sm); }
+.account-panel-message { color: var(--text-soft); }
+.account-panel-error { color: var(--danger); white-space: pre-wrap; }
 .account-login-row { margin-top: 8px; }
 .account-login-link {
   margin-top: 8px;
@@ -2555,6 +2558,62 @@ button.row.danger:hover {
 }
 .usb-guard-status-note {
   color: var(--warning, var(--text-faint));
+}
+
+/* The offline installer uses one compact notification rail.  Keep the live
+   USB lease label readable without allocating a second card above the hero. */
+.installer-notice-meta {
+  display: inline-flex;
+  margin-inline-start: 8px;
+  color: var(--text-soft);
+  font-size: var(--fs-label);
+  white-space: nowrap;
+}
+.usb-guard-inline {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0 18px 8px;
+  padding: 5px 3px;
+  color: var(--text-faint);
+  font-size: var(--fs-label);
+}
+.usb-guard-inline .usb-guard-status-icon {
+  width: 15px;
+  height: 15px;
+}
+.usb-guard-inline .usb-guard-countdown {
+  margin-inline-start: auto;
+}
+.advanced-maintenance {
+  display: grid;
+  gap: 8px;
+  padding-top: 8px;
+}
+.advanced-maintenance-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px;
+}
+.advanced-maintenance-row .tooltip-anchor {
+  display: block;
+}
+.advanced-maintenance-row .btn {
+  width: 100%;
+  min-height: 38px;
+  padding: 8px 10px;
+  font-size: var(--fs-label);
+}
+.advanced-detail {
+  border-top: 1px solid var(--line);
+  padding-top: 7px;
+  color: var(--text-soft);
+  font-size: var(--fs-label);
+}
+.advanced-detail > div {
+  margin-top: 5px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .install-root-row {
@@ -4332,6 +4391,10 @@ button.row.danger:hover {
   gap: 4px;
   min-width: 0;
   flex: 1;
+}
+.failure-banner-context {
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
 }
 .failure-banner-toggle {
   margin-top: 2px;

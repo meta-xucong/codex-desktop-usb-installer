@@ -42,9 +42,9 @@ foreach ($requiredFile in @($packFile, $dependencyFile, $fileManifest, $checksum
     if (-not (Test-Path -LiteralPath $requiredFile -PathType Leaf)) { throw "Invalid capability pack: missing $requiredFile" }
 }
 
-$pack = Get-Content -LiteralPath $packFile -Raw | ConvertFrom-Json
+$pack = Get-Content -LiteralPath $packFile -Raw -Encoding UTF8 | ConvertFrom-Json
 if ([int]$pack.schemaVersion -ne 2) { throw "Unsupported capability pack schema: $($pack.schemaVersion)" }
-$manifest = Get-Content -LiteralPath $fileManifest -Raw | ConvertFrom-Json
+$manifest = Get-Content -LiteralPath $fileManifest -Raw -Encoding UTF8 | ConvertFrom-Json
 $packReparsePoints = @(Get-ChildItem -LiteralPath $PackRoot -Recurse -Force | Where-Object { ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 })
 if ($packReparsePoints.Count -gt 0) { throw "Capability pack contains a symbolic link or junction: $($packReparsePoints[0].FullName)" }
 function Resolve-PackOwnedFile([string]$RelativePath) {
@@ -98,7 +98,7 @@ foreach ($entry in $manifest.files) {
     if ($hash -ne ([string]$entry.sha256).ToLowerInvariant()) { throw "Pack hash mismatch: $($entry.path)" }
 }
 $checksumPaths = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-foreach ($line in Get-Content -LiteralPath $checksumFile) {
+foreach ($line in Get-Content -LiteralPath $checksumFile -Encoding UTF8) {
     if ([string]::IsNullOrWhiteSpace($line)) { continue }
     $match = [regex]::Match($line, '^(?<hash>[0-9a-fA-F]{64}) \*(?<path>.+)$')
     if (-not $match.Success) { throw "Invalid pack checksum line: $line" }
@@ -151,7 +151,7 @@ foreach ($targetRoot in @($agentTarget, $skillTarget, $ownershipRoot)) {
 $previousFiles = @()
 if (Test-Path -LiteralPath $ownershipFile -PathType Leaf) {
     try {
-        $previousRecord = Get-Content -LiteralPath $ownershipFile -Raw | ConvertFrom-Json
+        $previousRecord = Get-Content -LiteralPath $ownershipFile -Raw -Encoding UTF8 | ConvertFrom-Json
         if ([int]$previousRecord.schemaVersion -notin @(3,4) -or [string]$previousRecord.packId -ne [string]$pack.id) { throw 'Ownership record identity is invalid.' }
         if (-not ([IO.Path]::GetFullPath([string]$previousRecord.agentRoot)).Equals([IO.Path]::GetFullPath($agentTarget), [StringComparison]::OrdinalIgnoreCase) -or
             -not ([IO.Path]::GetFullPath([string]$previousRecord.skillRoot)).Equals([IO.Path]::GetFullPath($skillTarget), [StringComparison]::OrdinalIgnoreCase)) {

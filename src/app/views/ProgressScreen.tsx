@@ -82,6 +82,7 @@ export function ProgressScreen({
 
   // Paused reads from its captured snapshot; live runs from the eased `dl`.
   const snap = paused ? paused.dl : dl;
+  const source = (snap?.source ?? "").trim();
   const known = Boolean(snap && snap.total > 0);
   const snapPct =
     snap && snap.total > 0
@@ -121,7 +122,9 @@ export function ProgressScreen({
   const phase = paused
     ? t("progress.paused.title")
     : phaseCode === "downloading" && snap
-      ? t("progress.downloadingFrom", { source: snap.source })
+      ? source
+        ? t("progress.downloadingFrom", { source })
+        : t("progress.downloading")
       : phaseCode === "preparing" || phaseCode === "idle"
         ? t("progress.preparing")
         : phaseCode === "verifying"

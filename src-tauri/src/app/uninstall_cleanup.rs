@@ -45,6 +45,8 @@ const FINALIZER_REPORT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
 const FINALIZER_REPORT_CONFIRM_INTERVAL: Duration = Duration::from_millis(100);
 #[cfg(windows)]
 const FINALIZER_START_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(windows)]
+const FINALIZER_STDIN_BOOTSTRAP: &str = r#"$reader = [System.IO.StreamReader]::new([Console]::OpenStandardInput(), [System.Text.UTF8Encoding]::new($false)); $source = $reader.ReadToEnd(); $reader.Dispose(); & ([ScriptBlock]::Create($source))"#;
 const CONNECTION_OWNERSHIP_MAX_BYTES: u64 = 64 * 1024;
 const CONNECTION_OWNERSHIP_RELATIVE: &str = ".codex/codex-agent-kit/connection-ownership.json";
 const OWNED_CONNECTION_ENV_NAMES: &[&str] = &[
@@ -121,6 +123,12 @@ struct CleanupPlan {
     purge_user_data: bool,
     #[serde(default)]
     purge_ccswitch_data: bool,
+    /// Explicit USB-bundle "彻底清理" authorization.  When set, the
+    /// detached helper is allowed to remove this product's shared recovery
+    /// journals after the manager has exited; ordinary uninstall preserves
+    /// those journals for another installation to recover.
+    #[serde(default)]
+    force_shared_cleanup: bool,
     remove_usb_media: bool,
     source_volume: Option<VolumeIdentity>,
     source_media: Option<MediaSnapshot>,
@@ -747,6 +755,19 @@ fn ensure_journals_recovered(roots: &CleanupRoots) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Read-only gate used by the bundle uninstaller before it starts the detached
+/// finalizer. A different manager installation may own a live transaction in
+/// these shared per-user directories; in that case the USB app uninstall can
+/// be complete while shared-manager cleanup is explicitly deferred.
+pub fn deferred_cleanup_preflight(force_shared_cleanup: bool) -> Result<(), String> {
+    let roots = CleanupRoots::discover()?;
+    if force_shared_cleanup {
+        Ok(())
+    } else {
+        ensure_journals_recovered(&roots)
+    }
 }
 
 #[cfg(windows)]
@@ -1442,14 +1463,159 @@ fn finalizer_report_completed(report: &Path) -> Result<bool, String> {
 }
 
 #[cfg(windows)]
-fn confirm_finalizer_report(report: &Path) -> Result<(), String> {
+/// Repair only the narrow state that can be produced after a successful
+/// finalizer process has already removed its helper directory but the durable
+/// JSON report was left at its pre-finalization state.  The helper directory
+/// absence is the safety gate: without it, a report must never be upgraded to
+/// `removed` merely because the child exited with code 0.
+fn repair_successful_finalizer_report(
+    helper_dir: &Path,
+    report: &Path,
+    roots: &CleanupRoots,
+    nonce: &str,
+) -> Result<bool, String> {
+    let parsed_nonce = uuid::Uuid::parse_str(nonce)
+        .map_err(|_| "最终收尾批次 UUID 无效，拒绝修复卸载报告".to_string())?;
+    if parsed_nonce.to_string() != nonce
+        || helper_dir.parent() != Some(roots.temp.as_path())
+        || helper_dir.file_name().and_then(|name| name.to_str())
+            != Some(&format!("{HELPER_PREFIX}{nonce}"))
+        || report != report_path(roots, nonce)
+    {
+        return Err("最终收尾 helper/report 身份不匹配，拒绝修复卸载报告".into());
+    }
+    check_ancestors(helper_dir)?;
+    if metadata_optional(helper_dir)?.is_some() {
+        return Ok(false);
+    }
+    check_ancestors(report)?;
+    let Some(metadata) = metadata_optional(report)? else {
+        return Ok(false);
+    };
+    if !metadata.is_file() || is_reparse(&metadata) {
+        return Err("卸载报告不是普通文件".into());
+    }
+    if metadata.len() > 1024 * 1024 {
+        return Err("卸载报告超过大小限制".into());
+    }
+    let bytes = fs::read(report).map_err(|error| error.to_string())?;
+    let value = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes);
+    let mut current: CleanupReport =
+        serde_json::from_slice(value).map_err(|error| format!("卸载报告 JSON 无效：{error}"))?;
+
+    // A terminal report may have become visible just after the confirmer's
+    // last poll.  Accept that durable proof before inspecting the pre-state
+    // fields used only for repair eligibility.
+    if finalizer_report_completed(report)? {
+        return Ok(true);
+    }
+
+    // Do not repair an explicit finalizer failure, a failed phase, or an
+    // unrelated/stale report.  Only the handoff states that the real finalizer
+    // writes before its terminal report are eligible for this recovery.
+    if current.schema_version != 1
+        || current.exit_code.is_some()
+        || current.helper_finalization != "pending"
+        || !matches!(
+            current.status.as_str(),
+            "finalizing" | "completed" | "partialFailure"
+        )
+        || !matches!(current.phase.as_str(), "" | "finalizing" | "completed")
+    {
+        return Ok(false);
+    }
+    if current.status != "partialFailure"
+        && current
+            .items
+            .iter()
+            .any(|item| matches!(item.status.as_str(), "failed" | "deferred"))
+    {
+        return Ok(false);
+    }
+    current.helper_finalization = "removed".into();
+    current.phase = "completed".into();
+    current.exit_code = Some(0);
+    current.retry_suggestion.clear();
+    if current.status == "finalizing" {
+        current.status = "completed".into();
+    }
+    write_report_atomically(report, &current)?;
+    finalizer_report_completed(report)
+}
+
+#[cfg(windows)]
+fn write_report_atomically(path: &Path, report: &CleanupReport) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    check_ancestors(path)?;
+    let bytes = serde_json::to_vec_pretty(report).map_err(|error| error.to_string())?;
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or("卸载报告文件名无效")?;
+    let pending = path.with_file_name(format!(".{name}.repair.pending"));
+    check_ancestors(&pending)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&pending)
+        .map_err(|error| format!("创建卸载报告修复暂存失败：{error}"))?;
+    if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
+        let _ = fs::remove_file(&pending);
+        return Err(format!("写入卸载报告修复暂存失败：{error}"));
+    }
+    drop(file);
+    let from = pending
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let to = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let result = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        let error = io::Error::last_os_error();
+        let _ = fs::remove_file(&pending);
+        return Err(format!("原子替换卸载报告失败：{error}"));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn finalizer_completion_ready(report: &Path, helper_dir: Option<&Path>) -> Result<bool, String> {
+    if !finalizer_report_completed(report)? {
+        return Ok(false);
+    }
+    if let Some(helper_dir) = helper_dir {
+        check_ancestors(helper_dir)?;
+        // A terminal JSON report is not enough while the exact helper tree is
+        // still present.  The finalizer's deletion of that tree is the
+        // independent proof that the second stage actually finished.
+        return Ok(metadata_optional(helper_dir)?.is_none());
+    }
+    Ok(true)
+}
+
+#[cfg(windows)]
+fn confirm_finalizer_report(report: &Path, helper_dir: Option<&Path>) -> Result<(), String> {
     let deadline = Instant::now() + FINALIZER_REPORT_CONFIRM_TIMEOUT;
     loop {
-        let detail = match finalizer_report_completed(report) {
+        let detail = match finalizer_completion_ready(report, helper_dir) {
             Ok(true) => return Ok(()),
             Ok(false) => {
-                "卸载报告尚未确认收尾完成（helperFinalization 不是 removed，或 status 仍未完成）"
-                    .to_string()
+                "卸载报告尚未确认收尾完成（helperFinalization/status 未完成，或临时 helper 尚未删除）".to_string()
             }
             Err(error) => format!("读取最终卸载报告失败：{error}"),
         };
@@ -1549,12 +1715,14 @@ fn schedule_helper_cleanup_on_reboot(
         Ok(())
     };
 
-    let scheduled = targets.len().saturating_sub(1);
-    for path in &targets {
+    let files = targets.iter().filter(|path| path != &helper_dir);
+    let mut scheduled = 0usize;
+    for path in files {
         schedule(path)?;
+        scheduled += 1;
     }
     Ok(format!(
-        "即时收尾失败后已登记 {scheduled} 个已核验文件及其空目录在下次 Windows 启动时删除"
+        "即时收尾失败后已登记 {scheduled} 个已核验文件在下次 Windows 启动时删除；临时目录将在后续启动的空目录清理中移除"
     ))
 }
 
@@ -1604,7 +1772,11 @@ fn validate_plan(
     {
         return Err("安装介质校验清单已更改，拒绝清理".into());
     }
-    ensure_journals_recovered(roots)
+    if plan.force_shared_cleanup {
+        Ok(())
+    } else {
+        ensure_journals_recovered(roots)
+    }
 }
 
 /// Call only after AppX, process, configuration, volume and policy cleanup
@@ -1613,6 +1785,7 @@ fn validate_plan(
 pub fn launch_deferred_cleanup(
     purge_user_data: bool,
     purge_ccswitch_data: bool,
+    force_shared_cleanup: bool,
     remove_usb_media: bool,
     source_license: Option<crate::app::usb_guard::UsbFingerprint>,
     prior_notes: Vec<String>,
@@ -1625,6 +1798,7 @@ pub fn launch_deferred_cleanup(
         let _ = (
             purge_user_data,
             purge_ccswitch_data,
+            force_shared_cleanup,
             remove_usb_media,
             source_license,
             prior_notes,
@@ -1647,7 +1821,9 @@ pub fn launch_deferred_cleanup(
         if remove_usb_media != source_license.is_some() {
             return Err("删除安装介质需要当前进程持有的 U 盘许可身份".into());
         }
-        ensure_journals_recovered(&roots)?;
+        if !force_shared_cleanup {
+            ensure_journals_recovered(&roots)?;
+        }
         // Resolve all planned names before detachment so unreadable roots do
         // not masquerade as a successful empty cleanup.
         let _ = roots.targets(purge_user_data, purge_ccswitch_data)?;
@@ -1687,6 +1863,7 @@ pub fn launch_deferred_cleanup(
             roots: roots.clone(),
             purge_user_data,
             purge_ccswitch_data,
+            force_shared_cleanup,
             remove_usb_media,
             source_volume,
             source_media,
@@ -1914,6 +2091,42 @@ function Get-ReportIssueSummary([object]$value) {{
   if($lines.Count -eq 0) {{ return $null }}
   return ('具体原因/保留项：' + "`r`n" + ($lines -join "`r`n"))
 }}
+function Register-RebootDelete([string]$path) {{
+  Assert-SafeAncestors $path
+  $entry=Get-Item -LiteralPath $path -Force -ErrorAction Stop
+  if(($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {{ throw ('Refusing reboot cleanup reparse point: '+$path) }}
+  if($path -eq $helper) {{
+    if(-not $entry.PSIsContainer) {{ throw ('Refusing reboot cleanup type change: '+$path) }}
+  }} elseif($entry.PSIsContainer) {{
+    throw ('Refusing reboot cleanup type change: '+$path)
+  }}
+  if(-not ('CodexUsbUninstallRebootDelete' -as [type])) {{
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+public static class CodexUsbUninstallRebootDelete {{
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+  private static extern bool MoveFileEx(string existingFileName, string newFileName, int flags);
+  public static void Delete(string path) {{
+    if(!MoveFileEx(path, null, 0x00000004)) throw new Win32Exception(Marshal.GetLastWin32Error());
+  }}
+}}
+'@
+  }}
+  [CodexUsbUninstallRebootDelete]::Delete($path)
+}}
+function Register-HelperRebootCleanup {{
+  # Only the exact helper allow-list can be deferred.  An unknown entry keeps
+  # the directory out of the reboot queue so user data cannot be swept.
+  Assert-KnownHelperEntries
+  $scheduled=@()
+  foreach($name in @('CodexUninstallCleanup.exe','plan.json','ready.json','ready.pending','finalizer.ready','finalizer.ready.pending','finalizer.error.txt','finalizer.error.pending','commit.json','commit.pending','lifetime.lock')) {{
+    $f=Join-Path $helper $name
+    if(Test-Path -LiteralPath $f) {{ Register-RebootDelete $f; $scheduled += $f }}
+  }}
+  return ('已登记 '+$scheduled.Count+' 个已核验收尾文件在下次 Windows 启动时删除；临时目录将在后续启动的空目录清理中移除')
+}}
 try {{
   Assert-SafeAncestors $helper
   Assert-SafeAncestors $report
@@ -1962,8 +2175,15 @@ try {{
 }} catch {{
   $finalizationRecorded=$false
   $problem=$_.Exception.Message
+  # Publish the error before registering the reboot queue so the newly-created
+  # finalizer.error.txt is included in the exact allow-list. Otherwise the
+  # helper directory would remain non-empty after reboot.
   $finalizationError=$problem
   Publish-FinalizerError $problem
+  $rebootDetail=$null
+  try {{ $rebootDetail=Register-HelperRebootCleanup }} catch {{ $rebootDetail='重启兜底登记失败：'+$_.Exception.Message }}
+  if($rebootDetail) {{ $problem=$problem+'；'+$rebootDetail }}
+  $finalizationError=$problem
   try {{
     Assert-SafeAncestors $report
     $pendingReport=$report+'.{token}.pending'
@@ -1973,7 +2193,9 @@ try {{
     $r.helperFinalization='failed: '+$problem
     $r.phase='failed'
     $r.exitCode=2
-    $r.retrySuggestion='请根据报告中的具体失败文件处理占用或权限后重试卸载'
+    $r.retrySuggestion=if($rebootDetail -and $rebootDetail -notlike '重启兜底登记失败：*') {{ $rebootDetail }} else {{ '请根据报告中的具体失败文件处理占用或权限后重试卸载' }}
+    $rebootStatus=if($rebootDetail -and $rebootDetail -notlike '重启兜底登记失败：*') {{ 'deferred' }} else {{ 'failed' }}
+    $r.items=@($r.items)+[pscustomobject]@{{ path=$helper; status=$rebootStatus; detail=$rebootDetail }}
     $r.status='partialFailure'
     $null=Publish-FinalizerReport $r $true
   }} catch {{ }}
@@ -2021,6 +2243,7 @@ fn powershell_encoded_command(script: &str) -> String {
 fn schedule_self_cleanup(
     helper_dir: &Path,
     report: &Path,
+    roots: &CleanupRoots,
     lifetime_token: &str,
 ) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
@@ -2029,10 +2252,13 @@ fn schedule_self_cleanup(
     check_ancestors(helper_dir)?;
     check_ancestors(report)?;
     let script = finalizer_script(helper_dir, report, lifetime_token, true);
-    let encoded = powershell_encoded_command(&script);
     let system_root = std::env::var_os("SystemRoot").ok_or("无法确定 Windows 目录")?;
     let shell = PathBuf::from(system_root).join("System32/WindowsPowerShell/v1.0/powershell.exe");
     check_ancestors(&shell)?;
+    // Keep this bootstrap ASCII-only on the command line.  The actual
+    // generated script is UTF-8 and can contain a non-ASCII Windows user or
+    // USB path, so the detached PowerShell process reads it explicitly with
+    // UTF-8 instead of relying on the active console code page.
     let mut child = Command::new(shell)
         .current_dir(
             PathBuf::from(std::env::var_os("SystemRoot").ok_or("无法确定 Windows 工作目录")?)
@@ -2043,15 +2269,34 @@ fn schedule_self_cleanup(
             "-NonInteractive",
             "-ExecutionPolicy",
             "Bypass",
-            "-EncodedCommand",
-            &encoded,
+            // Read the generated script from stdin.  The previous encoded
+            // command put the entire finalizer on the Windows command line;
+            // long paths and the PowerShell UTF-16/base64 expansion could
+            // make the detached process exit before publishing
+            // `finalizer.ready`, which surfaced as a false second-stage
+            // uninstall failure.
+            "-Command",
+            FINALIZER_STDIN_BOOTSTRAP,
         ])
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
         .spawn()
         .map_err(|error| format!("自清理启动失败：{error}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        if let Err(error) = stdin.write_all(script.as_bytes()) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("向自清理进程写入脚本失败：{error}"));
+        }
+        // Dropping stdin sends EOF, allowing `powershell -Command -` to
+        // parse and execute the complete script in the detached child.
+    } else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("自清理进程未提供脚本输入管道".into());
+    }
     let ready = helper_dir.join("finalizer.ready");
     let expected = lifetime_token;
     let start = Instant::now();
@@ -2077,9 +2322,22 @@ fn schedule_self_cleanup(
                 // bounded window instead of treating one transient read or
                 // parse failure as a cleanup failure. The PowerShell script
                 // also performs a read-back check before it can return 0.
-                match confirm_finalizer_report(report) {
+                match confirm_finalizer_report(report, Some(helper_dir)) {
                     Ok(()) => return Ok(()),
                     Err(report_error) => {
+                        // A Windows delete-pending handle can make the
+                        // helper directory disappear just after PowerShell
+                        // exits.  If that happened and the only missed step
+                        // was durable report publication, repair the report
+                        // from the independently verified directory absence.
+                        if repair_successful_finalizer_report(
+                            helper_dir,
+                            report,
+                            roots,
+                            lifetime_token,
+                        )? {
+                            return Ok(());
+                        }
                         let detail = read_finalizer_error(helper_dir)?
                             .map(|error| format!("{report_error}；收尾错误：{error}"))
                             .unwrap_or(report_error);
@@ -2187,7 +2445,9 @@ fn run_helper(nonce_arg: &str) -> Result<(), String> {
         {
             return Err("二阶段确认身份不匹配；未执行删除".into());
         }
-        ensure_journals_recovered(&roots)?;
+        if !plan.force_shared_cleanup {
+            ensure_journals_recovered(&roots)?;
+        }
         // The parent has exited, so the log sink is closed. Preserve the
         // bounded newest tail inside the durable report before deleting the
         // manager-owned log/cache tree.
@@ -2323,7 +2583,7 @@ fn run_helper(nonce_arg: &str) -> Result<(), String> {
         "等待收尾组件完成自清理".into()
     };
     write_report(&report_file, &report)?;
-    let finalizer_error = schedule_self_cleanup(helper_dir, &report_file, &nonce).err();
+    let finalizer_error = schedule_self_cleanup(helper_dir, &report_file, &roots, &nonce).err();
     // `finalizer.ready` means that the detached PowerShell process has taken
     // ownership of the handoff and is waiting for this exact lifetime lock.
     // Once it is ready, this helper must release the lock and exit immediately:
@@ -2893,6 +3153,7 @@ mod tests {
             roots: roots.clone(),
             purge_user_data: false,
             purge_ccswitch_data: false,
+            force_shared_cleanup: false,
             remove_usb_media: false,
             source_volume: None,
             source_media: None,
@@ -3070,6 +3331,49 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn finalizer_stdin_bootstrap_executes_utf8_paths() {
+        use std::os::windows::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        let root = TempRoot::new();
+        let marker = root.0.join("中文-finalizer-路径 & ampersand.txt");
+        let script = format!(
+            "Set-Content -LiteralPath '{}' -Value 'stdin-utf8' -Encoding UTF8",
+            marker.display().to_string().replace('\'', "''")
+        );
+        let shell = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        let mut child = Command::new(shell)
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                FINALIZER_STDIN_BOOTSTRAP,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .creation_flags(0x08000000)
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(script.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value = fs::read_to_string(marker).unwrap();
+        assert_eq!(value.trim_start_matches('\u{feff}').trim(), "stdin-utf8");
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn encoded_finalizer_command_round_trips_utf16le() {
         use base64::Engine as _;
 
@@ -3083,6 +3387,137 @@ mod tests {
             .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]));
         let decoded = String::from_utf16(units.collect::<Vec<_>>().as_slice()).unwrap();
         assert_eq!(decoded, script);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn finalizer_failure_has_exact_reboot_fallback_without_recursive_delete() {
+        let root = TempRoot::new();
+        let helper = root.0.join("helper");
+        fs::create_dir(&helper).unwrap();
+        let report = root.0.join("report.json");
+        let script = finalizer_script(&helper, &report, &uuid::Uuid::new_v4().to_string(), false);
+        assert!(script.contains("Register-HelperRebootCleanup"));
+        assert!(script.contains("MoveFileEx"));
+        assert!(script.contains("Assert-KnownHelperEntries"));
+        assert!(script.contains("$rebootStatus"));
+        assert!(script.contains("'deferred'"));
+        assert!(!script.contains("Remove-Item -Recurse"));
+        assert!(!script.contains("Get-ChildItem -Recurse"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn finalizer_catch_publishes_error_before_registering_reboot_fallback() {
+        use std::os::windows::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        let root = TempRoot::new();
+        let helper = root.0.join("codex-uninstall-helper");
+        fs::create_dir(&helper).unwrap();
+        for name in [HELPER_EXE, "plan.json", "ready.json"] {
+            fs::write(helper.join(name), b"fixture").unwrap();
+        }
+        let report_path = root.0.join("report.json");
+        fs::write(
+            &report_path,
+            serde_json::to_vec(&CleanupReport {
+                schema_version: 1,
+                status: "finalizing".into(),
+                phase: "finalizing".into(),
+                exit_code: None,
+                retry_suggestion: "retry fixture".into(),
+                items: Vec::new(),
+                helper_finalization: "pending".into(),
+                note: "temp test".into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let token = uuid::Uuid::new_v4().to_string();
+        let lifetime_lock = create_lifetime_lock(&helper, &token).unwrap();
+        let reboot_calls = root.0.join("reboot-calls.txt");
+        let reboot_calls_literal = reboot_calls.display().to_string().replace('\'', "''");
+        let shell = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        let generated = finalizer_script(&helper, &report_path, &token, false)
+            .replace("$attempt -lt 40", "$attempt -lt 1");
+        let script = format!(
+            r#"
+Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+public static class CodexUsbUninstallRebootDelete {{
+  public static string LogPath;
+  public static void Delete(string path) {{ File.AppendAllText(LogPath, path + Environment.NewLine); }}
+}}
+'@
+[CodexUsbUninstallRebootDelete]::LogPath='{reboot_calls_literal}'
+function Remove-Item {{
+  param([string]$LiteralPath,[switch]$Force,[string]$ErrorAction)
+  if($LiteralPath -like '*CodexUninstallCleanup.exe') {{ throw 'injected finalizer delete failure' }}
+  Microsoft.PowerShell.Management\Remove-Item -LiteralPath $LiteralPath -Force -ErrorAction $ErrorAction
+}}
+{generated}
+"#,
+            reboot_calls_literal = reboot_calls_literal,
+        );
+        let mut finalizer = Command::new(shell)
+            .current_dir(PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32"))
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                &script,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .creation_flags(0x08000000)
+            .spawn()
+            .unwrap();
+        let ready = helper.join("finalizer.ready");
+        let start = Instant::now();
+        while !ready.exists() {
+            if let Some(status) = finalizer.try_wait().unwrap() {
+                panic!("finalizer exited before ready: {status}");
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "finalizer ready timeout"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        drop(lifetime_lock);
+        let output = finalizer.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{}", output.status);
+        let bytes = fs::read(&report_path).unwrap();
+        let report: CleanupReport =
+            serde_json::from_slice(bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes))
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "report parse failed: {error}; bytes={:?}; stderr={}",
+                        bytes,
+                        String::from_utf8_lossy(&output.stderr)
+                    )
+                });
+        assert_eq!(report.status, "partialFailure");
+        assert!(report
+            .helper_finalization
+            .contains("injected finalizer delete failure"));
+        assert!(
+            report
+                .items
+                .iter()
+                .any(|item| item.path.ends_with("codex-uninstall-helper")
+                    && matches!(item.status.as_str(), "deferred" | "failed")),
+            "{report:?}"
+        );
+        assert!(helper.join("finalizer.error.txt").exists());
+        let reboot_log = fs::read_to_string(&reboot_calls).unwrap();
+        assert!(reboot_log.contains("finalizer.error.txt"), "{reboot_log}");
     }
 
     #[test]
@@ -3183,6 +3618,138 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn successful_child_exit_repairs_only_after_helper_directory_is_gone() {
+        let root = TempRoot::new();
+        let roots = fake_roots(&root.0);
+        let nonce = uuid::Uuid::new_v4().to_string();
+        let helper = roots.temp.join(format!("{HELPER_PREFIX}{nonce}"));
+        let report = report_path(&roots, &nonce);
+        fs::write(
+            &report,
+            serde_json::to_vec(&CleanupReport {
+                schema_version: 1,
+                status: "finalizing".into(),
+                phase: "finalizing".into(),
+                exit_code: None,
+                retry_suggestion: "wait fixture".into(),
+                items: Vec::new(),
+                helper_finalization: "pending".into(),
+                note: "fixture".into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        // This is the only state in which the recovery is allowed: the
+        // successful finalizer process has already removed its exact helper
+        // directory, but the report still contains the pre-finalization
+        // state.  The report becomes a durable terminal proof after repair.
+        assert!(repair_successful_finalizer_report(&helper, &report, &roots, &nonce).unwrap());
+        assert!(finalizer_report_completed(&report).unwrap());
+        let bytes = fs::read(&report).unwrap();
+        let repaired: CleanupReport = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(repaired.helper_finalization, "removed");
+        assert_eq!(repaired.status, "completed");
+        assert_eq!(repaired.phase, "completed");
+        assert_eq!(repaired.exit_code, Some(0));
+        assert!(repair_successful_finalizer_report(&helper, &report, &roots, &nonce).unwrap());
+
+        // A still-present helper directory is not safe to upgrade.  This
+        // prevents an exit-code-only signal from masking a real residual.
+        let present_nonce = uuid::Uuid::new_v4().to_string();
+        let helper_present = roots.temp.join(format!("{HELPER_PREFIX}{present_nonce}"));
+        fs::create_dir(&helper_present).unwrap();
+        let present_report = report_path(&roots, &present_nonce);
+        fs::write(
+            &present_report,
+            serde_json::to_vec(&CleanupReport {
+                schema_version: 1,
+                status: "finalizing".into(),
+                phase: "finalizing".into(),
+                exit_code: None,
+                retry_suggestion: "wait fixture".into(),
+                items: Vec::new(),
+                helper_finalization: "pending".into(),
+                note: "fixture".into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(!repair_successful_finalizer_report(
+            &helper_present,
+            &present_report,
+            &roots,
+            &present_nonce
+        )
+        .unwrap());
+        let bytes = fs::read(&present_report).unwrap();
+        let untouched: CleanupReport = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(untouched.helper_finalization, "pending");
+
+        // A non-terminal report with an existing non-zero exit code is never
+        // rewritten as success, even when the helper directory is absent.
+        let failed_nonce = uuid::Uuid::new_v4().to_string();
+        let failed_helper = roots.temp.join(format!("{HELPER_PREFIX}{failed_nonce}"));
+        let failed_report = report_path(&roots, &failed_nonce);
+        fs::write(
+            &failed_report,
+            serde_json::to_vec(&CleanupReport {
+                schema_version: 1,
+                status: "finalizing".into(),
+                phase: "finalizing".into(),
+                exit_code: Some(2),
+                retry_suggestion: "retry fixture".into(),
+                items: Vec::new(),
+                helper_finalization: "pending".into(),
+                note: "fixture".into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(!repair_successful_finalizer_report(
+            &failed_helper,
+            &failed_report,
+            &roots,
+            &failed_nonce
+        )
+        .unwrap());
+        let bytes = fs::read(&failed_report).unwrap();
+        let failed: CleanupReport = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(failed.exit_code, Some(2));
+
+        let malformed_nonce = uuid::Uuid::new_v4().to_string();
+        let malformed_helper = roots.temp.join(format!("{HELPER_PREFIX}{malformed_nonce}"));
+        let malformed_report = report_path(&roots, &malformed_nonce);
+        fs::write(
+            &malformed_report,
+            serde_json::to_vec(&CleanupReport {
+                schema_version: 1,
+                status: "completed".into(),
+                phase: "completed".into(),
+                exit_code: None,
+                retry_suggestion: "inconsistent fixture".into(),
+                items: vec![CleanupItem {
+                    path: "locked-item".into(),
+                    status: "failed".into(),
+                    detail: "fixture failure".into(),
+                }],
+                helper_finalization: "pending".into(),
+                note: "fixture".into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(!repair_successful_finalizer_report(
+            &malformed_helper,
+            &malformed_report,
+            &roots,
+            &malformed_nonce
+        )
+        .unwrap());
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn finalizer_report_confirmation_retries_transient_incomplete_state() {
         let root = TempRoot::new();
         let report = root.0.join("report.json");
@@ -3220,8 +3787,35 @@ mod tests {
             )
             .unwrap();
         });
-        assert!(confirm_finalizer_report(&report).is_ok());
+        assert!(confirm_finalizer_report(&report, None).is_ok());
         writer.join().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn terminal_report_is_not_ready_while_helper_directory_remains() {
+        let root = TempRoot::new();
+        let report = root.0.join("report.json");
+        let helper = root.0.join("helper");
+        fs::create_dir(&helper).unwrap();
+        fs::write(
+            &report,
+            serde_json::to_vec(&CleanupReport {
+                schema_version: 1,
+                status: "completed".into(),
+                phase: "completed".into(),
+                exit_code: Some(0),
+                retry_suggestion: String::new(),
+                items: Vec::new(),
+                helper_finalization: "removed".into(),
+                note: "fixture".into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(!finalizer_completion_ready(&report, Some(&helper)).unwrap());
+        fs::remove_dir(&helper).unwrap();
+        assert!(finalizer_completion_ready(&report, Some(&helper)).unwrap());
     }
 
     #[cfg(windows)]

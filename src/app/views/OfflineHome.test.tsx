@@ -24,7 +24,8 @@ vi.mock("../../services/managerApi", async (importOriginal) => {
       checkCodexPayloadUpdate: vi.fn(),
       applyCodexPayloadUpdate: vi.fn(),
       installAndLaunchCcswitch: vi.fn(),
-      refreshNativeModelCatalog: vi.fn(),
+      gatewayModelProbe: vi.fn(),
+      cancelGatewayModelProbe: vi.fn(),
       accountStatus: vi.fn(),
       accountLogin: vi.fn(),
       accountRefresh: vi.fn(),
@@ -115,6 +116,7 @@ function renderView(onOpenUninstall = vi.fn()) {
 describe("OfflineHome", () => {
   beforeEach(() => {
     vi.resetAllMocks();
+    localStorage.removeItem("codex-usb-ccswitch-injection-issue-v1");
     localStorage.setItem("cam.lang", "zh-CN");
     api.offlinePayloadProbe.mockResolvedValue(PAYLOAD);
     api.offlinePayloadStage.mockResolvedValue(STAGE);
@@ -137,12 +139,10 @@ describe("OfflineHome", () => {
       copiedFiles: 5,
       message: "launched",
     });
-    api.refreshNativeModelCatalog.mockResolvedValue({
-      status: "ready",
-      modelCount: 3,
-      catalogPath: "C:\\Users\\test\\.codex\\codex-usb-native-model-catalog.json",
-      fetchedAt: "unix:1",
-      message: "ready",
+    api.cancelGatewayModelProbe.mockResolvedValue(true);
+    api.gatewayModelProbe.mockResolvedValue({
+      status: "connected", endpoint: "https://404token.xyz/v1", credentialFingerprint: "sha256:fixture",
+      checkedAt: 1, models: [], results: [], generatedRequests: 0, errorCode: null,
     });
     api.accountStatus.mockResolvedValue({
       bound: false,
@@ -299,6 +299,15 @@ describe("OfflineHome", () => {
     await waitFor(() => expect(screen.getByText("安装包已准备好")).toBeInTheDocument());
     expect(screen.queryByText("此版本已经安装")).not.toBeInTheDocument();
     expect(screen.queryByText("安装位置")).not.toBeInTheDocument();
+  });
+
+  it("keeps install and launch available without an upstream model proof", async () => {
+    api.winStatus.mockResolvedValue({ status: "managed", installed: USB_PORTABLE_CODEX });
+    renderView();
+
+    expect(await screen.findByRole("button", { name: "启动 Codex" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "打开 Codex Switch" })).toBeEnabled();
+    expect(api.gatewayModelProbe).not.toHaveBeenCalled();
   });
 
   it("disables the initial install action for an unsigned USB", async () => {
@@ -482,15 +491,28 @@ describe("OfflineHome", () => {
     expect(screen.getByText(/需要已配置签名许可证/)).toBeInTheDocument();
   });
 
-  it("stages the payload and calls the guarded USB portable install", async () => {
+  it("stages the payload and launches CCSwitch without running model probes", async () => {
     const user = userEvent.setup();
+    const setupOrder: string[] = [];
+    localStorage.setItem("codex-usb-ccswitch-injection-issue-v1", "launch-failed");
+    api.installAndLaunchCcswitch.mockImplementationOnce(async () => {
+      setupOrder.push("ccswitch-launch");
+      return {
+        available: true,
+        installed: true,
+        launched: true,
+        sourcePath: "F:\\ccswitch\\CodexSwitch.exe",
+        installedPath: "C:\\Users\\test\\AppData\\Local\\Programs\\CodexSwitch\\CodexSwitch.exe",
+        copiedFiles: 5,
+        accountInjected: true,
+        accountInjectionStatus: "verified",
+        message: "launched",
+      };
+    });
     api.winStatus
       .mockResolvedValueOnce({ installed: null, status: "none" })
       .mockResolvedValueOnce({ installed: null, status: "none" })
-      .mockResolvedValue({
-        status: "managed",
-        installed: USB_PORTABLE_CODEX,
-      });
+      .mockResolvedValue({ status: "managed", installed: USB_PORTABLE_CODEX });
     renderView();
     api.offlinePayloadStage.mockResolvedValue({
       ...STAGE,
@@ -504,7 +526,7 @@ describe("OfflineHome", () => {
       localPath: STAGE.stagedPath,
       version: PAYLOAD.codexDesktopVersion,
       format: "msix",
-      releaseTag: `local-signed-${PAYLOAD.codexDesktopVersion}`,
+      releaseTag: "local-signed-" + PAYLOAD.codexDesktopVersion,
     });
     expect(api.winInstallHistoricalRelease.mock.calls[0]?.[1]).toBe(true);
     expect(api.winInstallHistoricalRelease.mock.calls[0]?.[5]).toBe(true);
@@ -515,37 +537,92 @@ describe("OfflineHome", () => {
       enableFeishu: false,
       enabledApiServices: [],
     });
-    expect(api.installAndLaunchCcswitch).toHaveBeenCalledTimes(1);
-    await waitFor(() => expect(screen.getByText(/Codex Switch 已从 U 盘启动/)).toBeInTheDocument());
-    await waitFor(() => expect(api.refreshNativeModelCatalog).toHaveBeenCalledWith(true));
-    expect(await screen.findByText(/已刷新 Codex 原生模型列表/)).toBeInTheDocument();
+    await waitFor(() => expect(api.installAndLaunchCcswitch).toHaveBeenCalledTimes(1));
+    expect(setupOrder).toEqual(["ccswitch-launch"]);
+    expect(api.gatewayModelProbe).not.toHaveBeenCalled();
+    expect(screen.queryByText(/404token API Key 自动/)).not.toBeInTheDocument();
+    expect(localStorage.getItem("codex-usb-ccswitch-injection-issue-v1")).toBeNull();
+    expect(await screen.findByRole("button", { name: "启动 Codex" })).toBeEnabled();
   });
 
-  it("shows a visible failure when the native model refresh rejects", async () => {
+  it("keeps a warning when CCSwitch receives a key but does not confirm activation", async () => {
+    const user = userEvent.setup();
+    api.winStatus
+      .mockResolvedValueOnce({ installed: null, status: "none" })
+      .mockResolvedValueOnce({ installed: null, status: "none" })
+      .mockResolvedValue({ status: "managed", installed: USB_PORTABLE_CODEX });
+    api.installAndLaunchCcswitch.mockResolvedValueOnce({
+      available: true,
+      installed: true,
+      launched: true,
+      sourcePath: "F:\\ccswitch\\CodexSwitch.exe",
+      installedPath: "F:\\ccswitch\\CodexSwitch.exe",
+      copiedFiles: 0,
+      accountInjected: true,
+      accountInjectionStatus: "injected",
+      message: "launched without activation acknowledgement",
+    });
+    renderView();
+    api.offlinePayloadStage.mockResolvedValue({
+      ...STAGE,
+      payload: { ...STAGE.payload, releaseTag: "upstream-26.602.40724" },
+    });
+    await waitFor(() => expect(screen.getByRole("button", { name: "一键安装" })).toBeEnabled());
+    await user.click(screen.getByRole("button", { name: "一键安装" }));
+
+    await waitFor(() => expect(api.installAndLaunchCcswitch).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText(/404token 自动配置状态无法确认/)).toBeInTheDocument();
+    expect(localStorage.getItem("codex-usb-ccswitch-injection-issue-v1")).toBe("unconfirmed");
+  });
+
+  it("runs only the directory request when an advanced user asks for it", async () => {
     const user = userEvent.setup();
     api.winStatus.mockResolvedValue({ status: "managed", installed: USB_PORTABLE_CODEX });
-    api.refreshNativeModelCatalog
-      .mockResolvedValueOnce({
-        status: "ready",
-        modelCount: 3,
-        catalogPath: "C:\\Users\\test\\.codex\\catalog.json",
-        fetchedAt: "unix:1",
-        message: "ready",
-      })
-      .mockRejectedValue(new Error("gateway unavailable"));
-
     renderView();
-    await waitFor(() => expect(screen.getByRole("button", { name: "刷新模型列表" })).toBeEnabled());
-    await user.click(screen.getByRole("button", { name: "刷新模型列表" }));
-
-    expect(
-      await screen.findByText(
-        "404token 上游服务器暂时无法访问（不是本地程序故障），已重试后继续使用上次目录。",
-      ),
-    ).toBeInTheDocument();
-    expect(screen.getByText(/刷新模型列表/)).toBeInTheDocument();
+    await screen.findByRole("button", { name: "启动 Codex" });
+    await user.click(screen.getByText("高级功能"));
+    await user.click(screen.getByRole("button", { name: "只检查模型目录（不生成）" }));
+    await waitFor(() => expect(api.gatewayModelProbe).toHaveBeenCalledWith({
+      requestId: expect.any(String),
+      selectedModelIds: [],
+      costConsent: false,
+    }));
+    expect(api.gatewayModelProbe.mock.calls[0]?.[0].selectedModelIds).toEqual([]);
   });
 
+  it("requires separate cost consent before a selected gateway matrix", async () => {
+    const user = userEvent.setup();
+    api.winStatus.mockResolvedValue({ status: "managed", installed: USB_PORTABLE_CODEX });
+    const directoryReport = {
+      status: "connected" as const, endpoint: "https://404token.xyz/v1",
+      credentialFingerprint: "sha256:fixture", checkedAt: 1,
+      models: [{ id: "glm-5.2", ownedBy: "fixture", selectable: true }],
+      results: [], generatedRequests: 0, errorCode: null,
+    };
+    api.gatewayModelProbe.mockResolvedValueOnce(directoryReport).mockResolvedValueOnce({
+      ...directoryReport,
+      status: "passed",
+      results: [{ modelId: "glm-5.2", passed: true, generatedRequests: 12,
+        checks: [{ name: "text", passed: true }], errorCode: null }],
+      generatedRequests: 12,
+    });
+    renderView();
+    await screen.findByRole("button", { name: "启动 Codex" });
+    await user.click(screen.getByText("高级功能"));
+    await user.click(screen.getByRole("button", { name: "只检查模型目录（不生成）" }));
+    await user.click(await screen.findByRole("checkbox", { name: /glm-5.2/ }));
+    const run = screen.getByRole("button", { name: "探测所选模型（1 个）" });
+    expect(run).toBeDisabled();
+    await user.click(screen.getByRole("checkbox", { name: /我已了解费用无法预估/ }));
+    expect(run).toBeEnabled();
+    await user.click(run);
+    await waitFor(() => expect(api.gatewayModelProbe).toHaveBeenCalledTimes(2));
+    expect(api.gatewayModelProbe.mock.calls[1]?.[0]).toMatchObject({
+      selectedModelIds: ["glm-5.2"],
+      costConsent: true,
+    });
+    expect(await screen.findByText("本次所选模型通过了网关协议矩阵。")).toBeInTheDocument();
+  });
   it("does not render an unplanned account password field in the USB home", async () => {
     renderView();
     await screen.findByText("26.602.40724");
@@ -573,6 +650,7 @@ describe("OfflineHome", () => {
 
     renderView();
     const input = await screen.findByPlaceholderText("输入充值码");
+    await waitFor(() => expect(input).toBeEnabled());
     await user.type(input, "RECHARGE-ABCD1234");
     await user.click(screen.getByRole("button", { name: "一键充值" }));
 
@@ -815,6 +893,7 @@ describe("OfflineHome", () => {
       currentSource: "portable",
     });
     await waitFor(() => expect(api.installAndLaunchCcswitch).toHaveBeenCalledTimes(1));
+    await user.click(screen.getByText("高级功能"));
     await user.click(screen.getByText("安装／修复详情与备份位置"));
     expect(screen.getByText(/新注册数据备份保留在 C:/)).toBeVisible();
   });
@@ -906,4 +985,5 @@ describe("OfflineHome", () => {
     expect(screen.queryByRole("button", { name: "开始管理" })).not.toBeInTheDocument();
     expect(api.winAdopt).not.toHaveBeenCalled();
   });
+
 });

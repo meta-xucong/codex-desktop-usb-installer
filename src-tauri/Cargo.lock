@@ -563,6 +563,7 @@ dependencies = [
  "tauri-plugin-updater",
  "thiserror 2.0.20",
  "tokio",
+ "toml 0.8.2",
  "url",
  "uuid",
  "webview2-com",

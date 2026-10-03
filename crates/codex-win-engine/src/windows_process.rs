@@ -60,6 +60,35 @@ fn is_codex_startup_failure_dialog(class_name: &str, title: &str) -> bool {
     .any(|marker| normalized.contains(marker))
 }
 
+#[cfg(any(windows, test))]
+fn is_codex_auxiliary_window(class_name: &str, title: &str) -> bool {
+    // Electron creates a title-less Chrome_WidgetWin_0 companion surface on
+    // some portable launches.  It can be a full-size black renderer while
+    // Chrome_WidgetWin_1 is the actual user-operable Codex window.  Keep this
+    // predicate narrow: only the title-less auxiliary class is hidden by the
+    // startup watcher, so a user-created browser window is untouched.
+    class_name.eq_ignore_ascii_case("Chrome_WidgetWin_0") && title.trim().is_empty()
+}
+
+#[cfg(any(windows, test))]
+fn is_user_operable_window(class_name: &str, title: &str) -> bool {
+    // Never restore the auxiliary Chromium surface as the launch result. A
+    // real Codex shell normally uses Chrome_WidgetWin_1; keep its title check
+    // permissive because Chromium can publish the title asynchronously. Other
+    // app classes (including CCSwitch's Tauri window) retain generic sizing.
+    let _ = title;
+    !class_name.eq_ignore_ascii_case("Chrome_WidgetWin_0")
+}
+
+#[cfg(any(windows, test))]
+fn is_lifecycle_window_class(class_name: &str) -> bool {
+    // The WinEvent hook is process-global.  Filter the overwhelmingly common
+    // unrelated window classes before taking a managed-process snapshot; the
+    // two classes below are the only surfaces this watcher can suppress.
+    class_name.eq_ignore_ascii_case("ConsoleWindowClass")
+        || class_name.eq_ignore_ascii_case("Chrome_WidgetWin_0")
+}
+
 fn normalize_windows_path_text(value: &str) -> String {
     let mut normalized = value.replace('/', "\\").to_lowercase();
     if let Some(rest) = normalized.strip_prefix(r"\\?\unc\") {
@@ -103,6 +132,7 @@ mod imp {
     use std::mem::size_of;
     use std::os::windows::ffi::OsStringExt;
     use std::path::{Path, PathBuf};
+    use std::sync::{mpsc, Mutex, OnceLock};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -118,25 +148,199 @@ mod imp {
         TH32CS_SNAPPROCESS,
     };
     use windows_sys::Win32::System::Threading::{
-        OpenProcess, QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
-        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+        GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW, TerminateProcess,
+        WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
     };
+    use windows_sys::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetClassNameW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-        GetWindowThreadProcessId, IsIconic, IsWindowVisible, PostMessageW, SetForegroundWindow,
-        SetWindowPos, ShowWindow, HWND_TOP, SWP_NOSIZE, SWP_SHOWWINDOW, SW_HIDE, SW_RESTORE,
-        WM_CLOSE,
+        DispatchMessageW, EnumWindows, GetClassNameW, GetWindowRect, GetWindowTextLengthW,
+        GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
+        MsgWaitForMultipleObjectsEx, PeekMessageW, PostMessageW, SetForegroundWindow, SetWindowPos,
+        ShowWindow, TranslateMessage, EVENT_OBJECT_CREATE, EVENT_OBJECT_SHOW, HWND_TOP,
+        MWMO_INPUTAVAILABLE, OBJID_WINDOW, PM_REMOVE, QS_ALLINPUT, SWP_NOSIZE, SWP_SHOWWINDOW,
+        SW_HIDE, SW_RESTORE, WM_CLOSE,
     };
 
     use super::{
-        is_codex_startup_failure_dialog, path_is_within_root, window_dimensions_are_usable,
-        EngineError, UsableWindowReport,
+        is_codex_auxiliary_window, is_codex_startup_failure_dialog, is_lifecycle_window_class,
+        is_user_operable_window, path_is_within_root, window_dimensions_are_usable, EngineError,
+        UsableWindowReport,
     };
 
     const PROCESS_SYNCHRONIZE: u32 = 0x0010_0000;
     const FORCE_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
     const POLL_INTERVAL: Duration = Duration::from_millis(250);
     const MAX_PROCESS_PATH_UTF16: usize = 32_768;
+    const CONSOLE_WATCH_POLL: Duration = Duration::from_millis(250);
+    const CONSOLE_WATCH_STARTUP_LIMIT: Duration = Duration::from_secs(45);
+    const CONSOLE_WATCH_LIFETIME: Duration = Duration::from_secs(60);
+    const CONSOLE_WATCH_EXIT_GRACE: Duration = Duration::from_secs(3);
+    const WINEVENT_SKIPOWNPROCESS: u32 = 0x0002;
+    static CONSOLE_WATCH_ROOTS: OnceLock<Mutex<HashMap<u32, PathBuf>>> = OnceLock::new();
+
+    unsafe extern "system" fn on_window_lifecycle_event(
+        _hook: HWINEVENTHOOK,
+        event: u32,
+        hwnd: HWND,
+        object_id: i32,
+        child_id: i32,
+        _event_thread: u32,
+        _event_time: u32,
+    ) {
+        if !matches!(event, EVENT_OBJECT_CREATE | EVENT_OBJECT_SHOW)
+            || hwnd.is_null()
+            || object_id != OBJID_WINDOW
+            || child_id != 0
+        {
+            return;
+        }
+        let mut class_name = [0_u16; 128];
+        let class_length =
+            unsafe { GetClassNameW(hwnd, class_name.as_mut_ptr(), class_name.len() as i32) };
+        if class_length <= 0 {
+            return;
+        }
+        let class_name = String::from_utf16_lossy(&class_name[..class_length as usize]);
+        if !is_lifecycle_window_class(&class_name) {
+            return;
+        }
+        let thread_id = unsafe { GetCurrentThreadId() };
+        let Some(registry) = CONSOLE_WATCH_ROOTS.get() else {
+            return;
+        };
+        let root = registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&thread_id)
+            .cloned();
+        if let Some(root) = root {
+            if let Ok(hidden) = hide_console_windows_for_root(&root) {
+                if hidden > 0 {
+                    log::debug!("managed Codex console window suppression event={event} hidden_candidates={hidden}");
+                }
+            }
+            if let Ok(hidden) = hide_codex_auxiliary_windows_for_root(&root) {
+                if hidden > 0 {
+                    log::debug!(
+                        "managed Codex auxiliary window suppression event={event} hidden_candidates={hidden}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Arm an out-of-context create/show hook before launching Codex. The
+    /// callback applies the managed process-tree filter to both console hosts
+    /// and the title-less Chromium auxiliary surface; it never hides an
+    /// unrelated console or normal application window. A bounded polling pass
+    /// is retained inside the watcher for missed WinEvents.
+    pub fn start_console_window_watcher(root: &Path) -> Result<(), EngineError> {
+        let root = root.to_path_buf();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        thread::Builder::new()
+            .name("codex-console-window-watch".into())
+            .spawn(move || {
+                let thread_id = unsafe { GetCurrentThreadId() };
+                let roots = CONSOLE_WATCH_ROOTS.get_or_init(|| Mutex::new(HashMap::new()));
+                roots.lock().unwrap_or_else(|e| e.into_inner()).insert(thread_id, root.clone());
+                // Create this thread's message queue before installing the hook.
+                let mut message = unsafe { std::mem::zeroed() };
+                unsafe { PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) };
+                let hook = unsafe {
+                    SetWinEventHook(
+                        EVENT_OBJECT_CREATE,
+                        EVENT_OBJECT_SHOW,
+                        std::ptr::null_mut(),
+                        Some(on_window_lifecycle_event),
+                        0,
+                        0,
+                        WINEVENT_SKIPOWNPROCESS,
+                    )
+                };
+                if hook.is_null() {
+                    roots.lock().unwrap_or_else(|e| e.into_inner()).remove(&thread_id);
+                    let error = std::io::Error::last_os_error();
+                    let _ = ready_tx.send(Err(format!("SetWinEventHook failed: {error}")));
+                    return;
+                }
+                let _ = ready_tx.send(Ok(()));
+                log::info!("managed Codex console event hook armed before launch root={}", root.display());
+                let started = Instant::now();
+                let mut root_seen = false;
+                let mut absent_since = None;
+                let mut last_fallback = Instant::now();
+                loop {
+                    // The hook is a startup guard, not a permanent global
+                    // window monitor.  PE/ASAR fixes cover later launches;
+                    // always release this thread and its WinEvent hook after
+                    // a bounded post-launch lifetime even if Codex remains
+                    // open for hours.
+                    if started.elapsed() >= CONSOLE_WATCH_LIFETIME {
+                        break;
+                    }
+                    unsafe {
+                        MsgWaitForMultipleObjectsEx(
+                            0,
+                            std::ptr::null(),
+                            CONSOLE_WATCH_POLL.as_millis() as u32,
+                            QS_ALLINPUT,
+                            MWMO_INPUTAVAILABLE,
+                        );
+                    }
+                    while unsafe {
+                        PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE)
+                    } != 0
+                    {
+                        unsafe {
+                            TranslateMessage(&message);
+                            DispatchMessageW(&message);
+                        }
+                    }
+                    if last_fallback.elapsed() >= CONSOLE_WATCH_POLL {
+                        match hide_console_windows_for_root(&root) {
+                            Ok(hidden) if hidden > 0 => log::debug!(
+                                "managed Codex console fallback hidden_candidates={hidden}"
+                            ),
+                            Err(error) => log::warn!("managed Codex console fallback failed: {error}"),
+                            _ => {}
+                        }
+                        match hide_codex_auxiliary_windows_for_root(&root) {
+                            Ok(hidden) if hidden > 0 => log::debug!(
+                                "managed Codex auxiliary window fallback hidden_candidates={hidden}"
+                            ),
+                            Err(error) => log::warn!(
+                                "managed Codex auxiliary window fallback failed: {error}"
+                            ),
+                            _ => {}
+                        }
+                        last_fallback = Instant::now();
+                    }
+                    match processes_running_for_root(&root) {
+                        Ok(true) => {
+                            root_seen = true;
+                            absent_since = None;
+                        }
+                        Ok(false) if root_seen => {
+                            let absent = absent_since.get_or_insert_with(Instant::now);
+                            if absent.elapsed() >= CONSOLE_WATCH_EXIT_GRACE {
+                                break;
+                            }
+                        }
+                        Ok(false) if started.elapsed() >= CONSOLE_WATCH_STARTUP_LIMIT => break,
+                        Err(error) => log::debug!("managed Codex console process scan unavailable: {error}"),
+                        _ => {}
+                    }
+                }
+                let unhooked = unsafe { UnhookWinEvent(hook) } != 0;
+                roots.lock().unwrap_or_else(|e| e.into_inner()).remove(&thread_id);
+                log::info!("managed Codex console event hook stopped root_seen={root_seen} unhooked={unhooked}");
+            })
+            .map_err(|error| EngineError::Io(format!("start Codex console window watcher: {error}")))?;
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|error| EngineError::Io(format!("wait for console watcher: {error}")))?
+            .map_err(|error| EngineError::Io(error))
+    }
 
     struct OwnedHandle(HANDLE);
 
@@ -215,7 +419,10 @@ mod imp {
             return None;
         }
 
-        log::info!(
+        // Process snapshots can visit the same managed process many times while
+        // an install/uninstall is in flight. Keep this diagnostic available for
+        // troubleshooting without flooding the user-facing log at INFO level.
+        log::debug!(
             "managed install process discovered pid={pid} image={}",
             image_path.display()
         );
@@ -283,6 +490,82 @@ mod imp {
         Ok(targets)
     }
 
+    /// Return the PIDs that may own a window for a managed install.
+    ///
+    /// The executable-path check above deliberately remains the ownership
+    /// boundary: only a process whose image is below the exact USB root can
+    /// establish the managed tree.  Chromium/WebView2 and `conhost.exe` are
+    /// then allowed to create child windows outside that directory, so window
+    /// operations must follow the point-in-time parent-PID chain from those
+    /// exact roots.  This keeps an unrelated CCSwitch/Codex installation out
+    /// of the hide/show scope while covering the current multi-process shell.
+    fn managed_window_pids(root: &Path) -> Result<Vec<u32>, EngineError> {
+        // Use one point-in-time process snapshot for both the exact image
+        // ownership check and the parent map.  This function is called every
+        // 100 ms during a cold start; taking a second system-wide snapshot on
+        // each poll needlessly amplified removable-drive startup cost.
+        // SAFETY: TH32CS_SNAPPROCESS ignores the process-id argument.
+        let snapshot = OwnedHandle::new(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) })
+            .ok_or_else(|| last_error("create process snapshot for managed window scope"))?;
+        let mut entry = PROCESSENTRY32W {
+            dwSize: size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut entries = Vec::<(u32, u32)>::new();
+        // A process can disappear while the snapshot is being enumerated. In
+        // that case the roots already collected remain valid and the missing
+        // descendant simply cannot own a later window.
+        if unsafe { Process32FirstW(snapshot.raw(), &mut entry) } != 0 {
+            loop {
+                entries.push((entry.th32ProcessID, entry.th32ParentProcessID));
+                if unsafe { Process32NextW(snapshot.raw(), &mut entry) } == 0 {
+                    break;
+                }
+            }
+        }
+
+        let manager_pid = std::process::id();
+        let mut roots = HashSet::<u32>::new();
+        for (pid, _) in &entries {
+            if *pid == manager_pid {
+                continue;
+            }
+            if let Some(target) = open_process_under_root(*pid, root) {
+                if target.is_running() {
+                    roots.insert(target.pid);
+                }
+            }
+        }
+        if roots.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let parents = entries.into_iter().collect::<HashMap<_, _>>();
+        let mut managed = roots.clone();
+        for pid in parents.keys().copied() {
+            let mut current = pid;
+            // A broken/cyclic process tree must never make a launch probe
+            // spin. Windows process ancestry is normally much shorter than
+            // this bound; the cap is a defensive upper limit.
+            for _ in 0..64 {
+                if roots.contains(&current) {
+                    managed.insert(pid);
+                    break;
+                }
+                let Some(parent) = parents.get(&current).copied() else {
+                    break;
+                };
+                if parent == 0 || parent == current {
+                    break;
+                }
+                current = parent;
+            }
+        }
+        let mut pids = managed.into_iter().collect::<Vec<_>>();
+        pids.sort_unstable();
+        Ok(pids)
+    }
+
     #[derive(Clone, Copy)]
     struct WindowCandidate {
         hwnd: HWND,
@@ -312,6 +595,18 @@ mod imp {
         pids: *const u32,
         pid_count: usize,
         hidden: usize,
+    }
+
+    struct AuxiliaryHideContext {
+        pids: *const u32,
+        pid_count: usize,
+        hidden: usize,
+    }
+
+    struct WindowShowContext {
+        pids: *const u32,
+        pid_count: usize,
+        shown: usize,
     }
 
     fn window_text(hwnd: HWND) -> String {
@@ -353,7 +648,9 @@ mod imp {
             return 1;
         }
         let class_name = String::from_utf16_lossy(&class_name[..length as usize]);
-        if class_name.eq_ignore_ascii_case("ConsoleWindowClass") {
+        if class_name.eq_ignore_ascii_case("ConsoleWindowClass")
+            && unsafe { IsWindowVisible(hwnd) } != 0
+        {
             unsafe {
                 ShowWindow(hwnd, SW_HIDE);
             }
@@ -381,6 +678,57 @@ mod imp {
         context.hidden
     }
 
+    unsafe extern "system" fn hide_codex_auxiliary_window(hwnd: HWND, raw_context: LPARAM) -> i32 {
+        if raw_context == 0 {
+            return 1;
+        }
+        // SAFETY: the caller passes a live stack context to synchronous
+        // EnumWindows; the PID slice remains valid for the callback duration.
+        let context = unsafe { &mut *(raw_context as *mut AuxiliaryHideContext) };
+        let pids = unsafe { std::slice::from_raw_parts(context.pids, context.pid_count) };
+        let mut pid = 0_u32;
+        unsafe {
+            GetWindowThreadProcessId(hwnd, &mut pid);
+        }
+        if !pids.contains(&pid) || unsafe { IsWindowVisible(hwnd) } == 0 {
+            return 1;
+        }
+        let mut class_name = [0u16; 128];
+        let class_length =
+            unsafe { GetClassNameW(hwnd, class_name.as_mut_ptr(), class_name.len() as i32) };
+        if class_length <= 0 {
+            return 1;
+        }
+        let class_name = String::from_utf16_lossy(&class_name[..class_length as usize]);
+        let title = window_text(hwnd);
+        if is_codex_auxiliary_window(&class_name, &title) {
+            unsafe {
+                ShowWindow(hwnd, SW_HIDE);
+            }
+            context.hidden += 1;
+        }
+        1
+    }
+
+    fn hide_codex_auxiliary_windows_for_pids(pids: &[u32]) -> usize {
+        if pids.is_empty() {
+            return 0;
+        }
+        let mut context = AuxiliaryHideContext {
+            pids: pids.as_ptr(),
+            pid_count: pids.len(),
+            hidden: 0,
+        };
+        // SAFETY: callback and context are synchronous and no pointer escapes.
+        unsafe {
+            EnumWindows(
+                Some(hide_codex_auxiliary_window),
+                (&mut context as *mut AuxiliaryHideContext) as LPARAM,
+            );
+        }
+        context.hidden
+    }
+
     /// Hide only Win32 console windows belonging to the managed process tree.
     ///
     /// Chromium can start a console-backed helper after the main window has
@@ -390,54 +738,16 @@ mod imp {
     /// descendants of the managed processes by parent-PID ancestry instead of
     /// matching only the executable path.
     pub fn hide_console_windows_for_root(root: &Path) -> Result<usize, EngineError> {
-        let root_pids = target_processes_under_root(root)?
-            .into_iter()
-            .filter(TargetProcess::is_running)
-            .map(|target| target.pid)
-            .collect::<Vec<_>>();
-        if root_pids.is_empty() {
-            return Ok(0);
-        }
+        let pids = managed_window_pids(root)?;
+        Ok(hide_console_windows_for_pids(&pids))
+    }
 
-        // Build a point-in-time PID -> parent map. A conhost process may not
-        // live under the USB directory, but its parent chain still leads back
-        // to ChatGPT.exe or resources/codex.exe.
-        let snapshot = OwnedHandle::new(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) })
-            .ok_or_else(|| last_error("create process snapshot for console suppression"))?;
-        let mut entry = PROCESSENTRY32W {
-            dwSize: size_of::<PROCESSENTRY32W>() as u32,
-            ..Default::default()
-        };
-        let mut parents = HashMap::<u32, u32>::new();
-        if unsafe { Process32FirstW(snapshot.raw(), &mut entry) } != 0 {
-            loop {
-                parents.insert(entry.th32ProcessID, entry.th32ParentProcessID);
-                if unsafe { Process32NextW(snapshot.raw(), &mut entry) } == 0 {
-                    break;
-                }
-            }
-        }
-
-        let roots = root_pids.iter().copied().collect::<HashSet<_>>();
-        let mut console_pids = roots.clone();
-        for pid in parents.keys().copied() {
-            let mut current = pid;
-            for _ in 0..64 {
-                if roots.contains(&current) {
-                    console_pids.insert(pid);
-                    break;
-                }
-                let Some(parent) = parents.get(&current).copied() else {
-                    break;
-                };
-                if parent == 0 || parent == current {
-                    break;
-                }
-                current = parent;
-            }
-        }
-        let console_pids = console_pids.into_iter().collect::<Vec<_>>();
-        Ok(hide_console_windows_for_pids(&console_pids))
+    /// Hide the title-less Chromium companion surface observed on portable
+    /// Codex launches.  This is scoped to the managed process tree and never
+    /// touches a normal Chrome_WidgetWin_1 application window.
+    pub fn hide_codex_auxiliary_windows_for_root(root: &Path) -> Result<usize, EngineError> {
+        let pids = managed_window_pids(root)?;
+        Ok(hide_codex_auxiliary_windows_for_pids(&pids))
     }
 
     unsafe extern "system" fn hide_application_window(hwnd: HWND, raw_context: LPARAM) -> i32 {
@@ -467,11 +777,7 @@ mod imp {
     /// process remains alive while the configuration window stays out of the
     /// user's way.
     pub fn hide_windows_for_root(root: &Path) -> Result<usize, EngineError> {
-        let pids = target_processes_under_root(root)?
-            .into_iter()
-            .filter(TargetProcess::is_running)
-            .map(|target| target.pid)
-            .collect::<Vec<_>>();
+        let pids = managed_window_pids(root)?;
         if pids.is_empty() {
             return Ok(0);
         }
@@ -488,6 +794,73 @@ mod imp {
             );
         }
         Ok(context.hidden)
+    }
+
+    unsafe extern "system" fn show_application_window(hwnd: HWND, raw_context: LPARAM) -> i32 {
+        if raw_context == 0 {
+            return 1;
+        }
+        let context = unsafe { &mut *(raw_context as *mut WindowShowContext) };
+        let pids = unsafe { std::slice::from_raw_parts(context.pids, context.pid_count) };
+        let mut pid = 0_u32;
+        unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+        if !pids.contains(&pid) {
+            return 1;
+        }
+        let mut class_name = [0u16; 128];
+        let class_length =
+            unsafe { GetClassNameW(hwnd, class_name.as_mut_ptr(), class_name.len() as i32) };
+        if class_length > 0 {
+            let class_name = String::from_utf16_lossy(&class_name[..class_length as usize]);
+            let title = window_text(hwnd);
+            if class_name.eq_ignore_ascii_case("ConsoleWindowClass")
+                || !is_user_operable_window(&class_name, &title)
+            {
+                return 1;
+            }
+        }
+        let mut rect = RECT::default();
+        if unsafe { GetWindowRect(hwnd, &mut rect) } == 0 {
+            return 1;
+        }
+        let width = rect.right.saturating_sub(rect.left);
+        let height = rect.bottom.saturating_sub(rect.top);
+        if !window_dimensions_are_usable(width, height) {
+            return 1;
+        }
+        let (x, y) =
+            visible_origin_on_nearest_monitor(hwnd, width, height).unwrap_or((rect.left, rect.top));
+        unsafe {
+            ShowWindow(hwnd, SW_RESTORE);
+            SetWindowPos(hwnd, HWND_TOP, x, y, 0, 0, SWP_NOSIZE | SWP_SHOWWINDOW);
+            SetForegroundWindow(hwnd);
+        }
+        if unsafe { IsWindowVisible(hwnd) } != 0 {
+            context.shown += 1;
+        }
+        1
+    }
+
+    /// Restore visible top-level windows belonging to the managed root. This
+    /// is intentionally the inverse of `hide_windows_for_root` and is used by
+    /// the explicit CCSwitch button after the one-time bootstrap hide.
+    pub fn show_windows_for_root(root: &Path) -> Result<usize, EngineError> {
+        let pids = managed_window_pids(root)?;
+        if pids.is_empty() {
+            return Ok(0);
+        }
+        let mut context = WindowShowContext {
+            pids: pids.as_ptr(),
+            pid_count: pids.len(),
+            shown: 0,
+        };
+        unsafe {
+            EnumWindows(
+                Some(show_application_window),
+                (&mut context as *mut WindowShowContext) as LPARAM,
+            );
+        }
+        Ok(context.shown)
     }
 
     unsafe extern "system" fn find_usable_window(hwnd: HWND, raw_context: LPARAM) -> i32 {
@@ -513,9 +886,17 @@ mod imp {
         } else {
             String::new()
         };
-        if is_codex_startup_failure_dialog(&class_name, &window_text(hwnd)) {
+        let title = window_text(hwnd);
+        // A sizeable console host can be mistaken for the GUI while Electron
+        // is still starting. Never treat it as a usable Codex window.
+        if class_name.eq_ignore_ascii_case("ConsoleWindowClass")
+            || !is_user_operable_window(&class_name, &title)
+        {
+            return 1;
+        }
+        if is_codex_startup_failure_dialog(&class_name, &title) {
             if context.startup_failure_dialog.is_none() {
-                context.startup_failure_dialog = Some(window_text(hwnd));
+                context.startup_failure_dialog = Some(title);
             }
             return 1;
         }
@@ -603,16 +984,18 @@ mod imp {
     ) -> Result<Option<UsableWindowReport>, EngineError> {
         let deadline = Instant::now() + timeout;
         loop {
-            let pids = target_processes_under_root(root)?
-                .into_iter()
-                .filter(TargetProcess::is_running)
-                .map(|target| target.pid)
-                .collect::<Vec<_>>();
+            let pids = managed_window_pids(root)?;
             if !pids.is_empty() {
                 let hidden = hide_console_windows_for_pids(&pids);
                 if hidden > 0 {
                     log::info!(
                         "hidden console window(s) created by managed Codex process tree count={hidden}"
+                    );
+                }
+                let hidden_auxiliary = hide_codex_auxiliary_windows_for_pids(&pids);
+                if hidden_auxiliary > 0 {
+                    log::info!(
+                        "hidden auxiliary Chromium window(s) created by managed Codex process tree count={hidden_auxiliary}"
                     );
                 }
                 let mut context = WindowSearchContext {
@@ -655,6 +1038,13 @@ mod imp {
                             0,
                             SWP_NOSIZE | SWP_SHOWWINDOW,
                         );
+                    }
+                    if unsafe { IsWindowVisible(candidate.hwnd) } == 0 {
+                        // The HWND existed but did not become user-visible;
+                        // keep polling instead of reporting a false success
+                        // that leaves the caller staring at a black/hidden
+                        // startup surface.
+                        continue;
                     }
                     let foreground_accepted = unsafe { SetForegroundWindow(candidate.hwnd) } != 0;
                     return Ok(Some(UsableWindowReport {
@@ -807,6 +1197,9 @@ mod imp {
             // Chromium/Electron helpers can hold payload files open too.
             let helper = root.join("Codex.Helper.exe");
             std::fs::copy(std::env::current_exe().unwrap(), &helper).unwrap();
+            // Arm the out-of-context listener before child creation, matching
+            // the production launch ordering and exercising hook setup/teardown.
+            start_console_window_watcher(&root).unwrap();
             let mut child = Command::new(&helper)
                 .args([
                     "--exact",
@@ -841,8 +1234,9 @@ mod imp {
 
 #[cfg(windows)]
 pub use imp::{
-    close_processes_for_root, hide_console_windows_for_root, hide_windows_for_root,
-    processes_running_for_root, wait_for_usable_window_for_root,
+    close_processes_for_root, hide_codex_auxiliary_windows_for_root, hide_console_windows_for_root,
+    hide_windows_for_root, processes_running_for_root, show_windows_for_root,
+    start_console_window_watcher, wait_for_usable_window_for_root,
 };
 
 #[cfg(windows)]
@@ -867,8 +1261,23 @@ pub fn hide_windows_for_root(_root: &Path) -> Result<usize, EngineError> {
 }
 
 #[cfg(not(windows))]
+pub fn show_windows_for_root(_root: &Path) -> Result<usize, EngineError> {
+    Ok(0)
+}
+
+#[cfg(not(windows))]
 pub fn hide_console_windows_for_root(_root: &Path) -> Result<usize, EngineError> {
     Ok(0)
+}
+
+#[cfg(not(windows))]
+pub fn hide_codex_auxiliary_windows_for_root(_root: &Path) -> Result<usize, EngineError> {
+    Ok(0)
+}
+
+#[cfg(not(windows))]
+pub fn start_console_window_watcher(_root: &Path) -> Result<(), EngineError> {
+    Ok(())
 }
 
 #[cfg(not(windows))]
@@ -947,5 +1356,26 @@ mod tests {
             "ChatGPT"
         ));
         assert!(!is_codex_startup_failure_dialog("#32770", "另一个应用"));
+    }
+
+    #[test]
+    fn rejects_titleless_chromium_auxiliary_window_from_launch_restore() {
+        assert!(is_codex_auxiliary_window("Chrome_WidgetWin_0", ""));
+        assert!(!is_codex_auxiliary_window("Chrome_WidgetWin_0", "ChatGPT"));
+        assert!(!is_codex_auxiliary_window("Chrome_WidgetWin_1", "ChatGPT"));
+
+        assert!(!is_user_operable_window("Chrome_WidgetWin_0", ""));
+        assert!(!is_user_operable_window("Chrome_WidgetWin_0", "ChatGPT"));
+        assert!(is_user_operable_window("Chrome_WidgetWin_1", ""));
+        assert!(is_user_operable_window("Chrome_WidgetWin_1", "ChatGPT"));
+        assert!(is_user_operable_window("Tauri Window", ""));
+    }
+
+    #[test]
+    fn lifecycle_hook_only_considers_managed_window_classes() {
+        assert!(is_lifecycle_window_class("ConsoleWindowClass"));
+        assert!(is_lifecycle_window_class("Chrome_WidgetWin_0"));
+        assert!(!is_lifecycle_window_class("Chrome_WidgetWin_1"));
+        assert!(!is_lifecycle_window_class("Tauri Window"));
     }
 }

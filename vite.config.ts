@@ -10,7 +10,15 @@ export default defineConfig({
   },
   clearScreen: false,
   test: {
-    exclude: [...configDefaults.exclude, ".claude/**"],
+    // CCSwitch is an independent nested Vite project with its own alias,
+    // setup and test command. Keep root Vitest from loading its tests under
+    // the manager's configuration; CCSwitch runs its own full suite.
+    exclude: [
+      ...configDefaults.exclude,
+      ".claude/**",
+      ".codex-audit/**",
+      "CCSwitch/CCSwitch/**",
+    ],
     environment: "jsdom",
     environmentOptions: {
       jsdom: {

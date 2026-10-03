@@ -47,6 +47,7 @@ rustls = { version = "0.23.42", default-features = false, features = ["ring", "s
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.11"
+toml = "0.8.2"
 tauri = { version = "2.11.2", features = ["tray-icon", "image-png", "macos-private-api"] }
 tauri-plugin-autostart = "2"
 tauri-plugin-dialog = "2.7.1"
@@ -58,7 +59,7 @@ thiserror = "2.0"
 tokio = { version = "1", features = ["sync", "time"] }
 url = "2.5"
 uuid = { version = "1", features = ["v4"] }
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_Diagnostics_ToolHelp", "Win32_System_WindowsProgramming", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 zip = { version = "8", default-features = false, features = ["deflate"] }
 
 [target.'cfg(unix)'.dependencies]

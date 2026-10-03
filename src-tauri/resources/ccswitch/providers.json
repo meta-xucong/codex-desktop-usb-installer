@@ -12,9 +12,9 @@
       "modelsUrl": "https://404token.xyz/v1/models",
       "protocol": "responses",
       "needsLocalRouting": false,
-      "defaultModel": "gpt-5.4",
+      "defaultModel": null,
       "modelSource": "runtime",
-      "fallbackModels": ["gpt-5.4", "gpt-5.5"],
+      "fallbackModels": [],
       "requiresApiKey": true,
       "enabledByDefault": true
     }

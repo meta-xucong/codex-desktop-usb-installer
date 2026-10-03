@@ -645,7 +645,14 @@ export function StatusBanner({
 
 /** Action-path failure banner: localized primary message + optional raw detail
  *  disclosure. Used by Home/WinHome install/update/launch paths. */
-export function FailureBanner({ failure }: { failure: FailureSurface }) {
+export function FailureBanner({
+  failure,
+  context,
+}: {
+  failure: FailureSurface;
+  /** Optional action-specific context that belongs in the same compact rail. */
+  context?: ReactNode;
+}) {
   const { t } = useI18n();
   const [showDetails, setShowDetails] = useState(false);
   return (
@@ -655,6 +662,7 @@ export function FailureBanner({ failure }: { failure: FailureSurface }) {
         <span role="alert" aria-live="assertive">
           {failure.message}
         </span>
+        {context ? <span className="failure-banner-context">{context}</span> : null}
         {failure.detail ? (
           <>
             <button

@@ -224,9 +224,32 @@ export interface CcswitchLaunchReport {
   usableWindowConfirmed?: boolean;
   /** USB Windows builds use child-scoped WebView2 software rendering. */
   graphicsMode?: "software-rendering" | "unknown" | string;
-  /** Signed USB binding was handed to CCSwitch without exposing the key. */
+  /** True when the signed USB key was passed to CCSwitch's startup bootstrap. */
   accountInjected?: boolean;
+    /** `verified` means CCSwitch read back the saved key and active provider. */
+    /** Other states include `pending`, `unconfirmed`, `missing-binding`, `failed`, or `unavailable`. */
+    accountInjectionStatus?: string;
   message: string;
+}
+
+export interface NativeModelCatalogReport {
+  status: string;
+  modelCount: number;
+  catalogPath: string | null;
+  fetchedAt: string | null;
+  message: string;
+  attempts: number;
+  errorKind: string | null;
+  runId: string;
+  gatewayStatus: string;
+  readyCount: number;
+  quarantinedCount: number;
+  defaultModel: string | null;
+  sidecarPath: string | null;
+  nativeStatus: string;
+  activationStatus: string;
+  serviceRevision: string | null;
+  models: Array<unknown>;
 }
 
 export interface AccountStatus {
@@ -238,19 +261,37 @@ export interface AccountStatus {
   message: string;
 }
 
-/** Result of refreshing Codex's official model_catalog_json bridge. */
-export interface NativeModelCatalogReport {
-  status: "ready" | "fresh" | "stale" | "failed" | "skipped" | string;
-  modelCount: number;
-  catalogPath: string | null;
-  fetchedAt: string | null;
-  message: string;
-  /** Number of bounded requests made to the 404token upstream. */
-  attempts?: number;
-  /** `upstream-*` when the remote gateway, rather than local files, failed. */
-  errorKind?: string | null;
+export interface GatewayModelProbeRequest {
+  requestId: string;
+  selectedModelIds: string[];
+  costConsent: boolean;
 }
-
+export interface GatewayProbeModel {
+  id: string;
+  ownedBy: string | null;
+  selectable: boolean;
+}
+export interface GatewayProbeCheck {
+  name: string;
+  passed: boolean;
+}
+export interface GatewayProbeModelResult {
+  modelId: string;
+  passed: boolean;
+  generatedRequests: number;
+  checks: GatewayProbeCheck[];
+  errorCode: string | null;
+}
+export interface GatewayModelProbeReport {
+  status: "connected" | "passed" | "failed" | "cancelled" | "skipped" | string;
+  endpoint: string;
+  credentialFingerprint: string;
+  checkedAt: number;
+  models: GatewayProbeModel[];
+  results: GatewayProbeModelResult[];
+  generatedRequests: number;
+  errorCode: string | null;
+}
 /** Options for the offline capability-pack installer. Secrets are never
  * serialized to the USB bundle; the native command uses them only for the
  * current install and writes configured values to the current user's private
@@ -919,6 +960,8 @@ export interface WinBundleUninstallReport {
   purgedCcswitchData: boolean;
   /** Phase 1 finished; no final filesystem success is claimed before exit. */
   cleanupPending?: boolean;
+  /** USB applications were removed, but shared recovery data was retained. */
+  cleanupDeferred?: boolean;
   cleanupReportPath?: string | null;
   cleanupHandoffId?: string | null;
   outcome: OperationOutcome;

@@ -269,6 +269,13 @@ if ($isUsbLauncher) {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot "verify-usb-launcher.ps1") -Destination (Join-Path $output "verify-usb-launcher.ps1") -Force
 }
 $resourceSource = Join-Path $installerItem.DirectoryName "resources"
+# Reject resource drift before copying a stale provider default into either
+# the embedded resources/ccswitch or the root ccswitch copy.
+$providerSource = Join-Path $resourceSource "ccswitch\providers.json"
+if (Test-Path -LiteralPath (Join-Path $resourceSource "ccswitch") -PathType Container) {
+    & (Join-Path $PSScriptRoot "verify-model-provider-resource.ps1") -ArtifactPath $providerSource
+}
+
 if (Test-Path -LiteralPath $resourceSource -PathType Container) {
     Copy-Item -LiteralPath $resourceSource -Destination $output -Recurse -Force
     # Keep a user-visible root-level copy for the validation/USB layout.  The

@@ -13,7 +13,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -43,6 +43,12 @@ const CCSWITCH_404TOKEN_DEVICE_KEY_ENV: &str = "CCSWITCH_404TOKEN_DEVICE_KEY";
 const CCSWITCH_404TOKEN_ACCOUNT_ENV: &str = "CCSWITCH_404TOKEN_ACCOUNT";
 const CCSWITCH_404TOKEN_GROUP_ENV: &str = "CCSWITCH_404TOKEN_GROUP_ID";
 const CCSWITCH_404TOKEN_PROVIDER_ENV: &str = "CCSWITCH_404TOKEN_PROVIDER";
+const CCSWITCH_404TOKEN_HANDOFF_PATH_ENV: &str = "CCSWITCH_404TOKEN_HANDOFF_PATH";
+const CCSWITCH_404TOKEN_HANDOFF_NONCE_ENV: &str = "CCSWITCH_404TOKEN_HANDOFF_NONCE";
+const CCSWITCH_404TOKEN_HANDOFF_PROTOCOL: &str = "CODEX_USB_404TOKEN_HANDOFF_V1";
+const CCSWITCH_404TOKEN_PROVIDER_ID: &str = "404token-sub2api";
+const CCSWITCH_HANDOFF_ACK_MAX_BYTES: u64 = 4096;
+const CCSWITCH_HANDOFF_ACK_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Files copied when they exist beside the product executable.  Only the EXE
 /// is required at runtime; the catalog and notices make the local install
@@ -63,6 +69,118 @@ struct CcswitchManifest {
 #[derive(Debug, Deserialize)]
 struct CcswitchArtifact {
     sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CcswitchHandoffAck {
+    protocol: String,
+    nonce: String,
+    status: String,
+    provider_id: String,
+    credential_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CcswitchHandoffOutcome {
+    Verified,
+    Failed,
+    Unconfirmed,
+}
+
+/// A single-use challenge passed only to the signed USB CCSwitch child.
+/// The acknowledgement contains a one-way key fingerprint, never the key.
+struct CcswitchHandoffRequest {
+    path: PathBuf,
+    nonce: String,
+    credential_sha256: String,
+}
+
+impl CcswitchHandoffRequest {
+    fn new(device_key: &str) -> Result<Self, AppError> {
+        let temp_dir = fs::canonicalize(std::env::temp_dir())
+            .map_err(|error| AppError::Internal(format!("无法确认 CCSwitch 交接目录: {error}")))?;
+        let nonce = uuid::Uuid::new_v4().to_string();
+        let path = temp_dir.join(format!("codex-usb-ccswitch-handoff-{nonce}.json"));
+        if fs::symlink_metadata(&path).is_ok() {
+            return Err(AppError::Internal(
+                "CCSwitch 交接确认文件名冲突".to_string(),
+            ));
+        }
+        let digest = sha2::Sha256::digest(device_key.as_bytes());
+        let credential_sha256 = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        Ok(Self {
+            path,
+            nonce,
+            credential_sha256,
+        })
+    }
+
+    fn outcome_from_file(&self) -> Option<CcswitchHandoffOutcome> {
+        let metadata = match fs::symlink_metadata(&self.path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(_) => return Some(CcswitchHandoffOutcome::Unconfirmed),
+        };
+        if !metadata.file_type().is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.len() == 0
+            || metadata.len() > CCSWITCH_HANDOFF_ACK_MAX_BYTES
+        {
+            return Some(CcswitchHandoffOutcome::Unconfirmed);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if metadata.file_attributes() & 0x400 != 0 {
+                return Some(CcswitchHandoffOutcome::Unconfirmed);
+            }
+        }
+        let bytes = match fs::read(&self.path) {
+            Ok(bytes) if bytes.len() as u64 <= CCSWITCH_HANDOFF_ACK_MAX_BYTES => bytes,
+            _ => return Some(CcswitchHandoffOutcome::Unconfirmed),
+        };
+        let ack: CcswitchHandoffAck = match serde_json::from_slice(&bytes) {
+            Ok(ack) => ack,
+            Err(_) => return Some(CcswitchHandoffOutcome::Unconfirmed),
+        };
+        if ack.protocol != CCSWITCH_404TOKEN_HANDOFF_PROTOCOL
+            || ack.nonce != self.nonce
+            || ack.provider_id != CCSWITCH_404TOKEN_PROVIDER_ID
+        {
+            return Some(CcswitchHandoffOutcome::Unconfirmed);
+        }
+        match ack.status.as_str() {
+            "verified" if ack.credential_sha256.as_deref() == Some(&self.credential_sha256) => {
+                Some(CcswitchHandoffOutcome::Verified)
+            }
+            "failed" | "missing-credential" | "invalid-provider" => {
+                Some(CcswitchHandoffOutcome::Failed)
+            }
+            _ => Some(CcswitchHandoffOutcome::Unconfirmed),
+        }
+    }
+
+    fn wait_for_outcome(&self, timeout: Duration) -> CcswitchHandoffOutcome {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(outcome) = self.outcome_from_file() {
+                return outcome;
+            }
+            if Instant::now() >= deadline {
+                return CcswitchHandoffOutcome::Unconfirmed;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+impl Drop for CcswitchHandoffRequest {
+    fn drop(&mut self) {
+        // This path is generated under the system temporary directory with a
+        // fresh UUID and is the only manager-owned hand-off file removed here.
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -93,11 +211,26 @@ pub struct CcswitchLaunchReport {
     pub usable_window_confirmed: bool,
     #[serde(default)]
     pub graphics_mode: String,
-    /// Whether the signed USB binding was handed to the child process.
-    /// The key itself is never returned to the renderer or written to logs.
+    /// Whether the signed USB binding was passed to the CCSwitch child.
+    /// This only means it was handed to the process; it does not imply that
+    /// CCSwitch saved the key or selected the provider.
     #[serde(default)]
     pub account_injected: bool,
+    /// `pending`, `verified`, `unconfirmed`, `not-attempted`, `missing-binding`,
+    /// `failed`, or `unavailable`.
+    #[serde(default)]
+    pub account_injection_status: String,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CcswitchLaunchIntent {
+    /// First install/bootstrap: apply the one-time tray hand-off after the
+    /// account has been injected.
+    Bootstrap,
+    /// Explicit user action: reuse the managed process when possible and
+    /// restore its window; never hide it after launch.
+    UserOpen,
 }
 
 /// Result of removing the per-user CCSwitch copy installed by this manager.
@@ -131,6 +264,7 @@ fn report_missing(message: impl Into<String>) -> CcswitchLaunchReport {
         usable_window_confirmed: false,
         graphics_mode: "unknown".to_string(),
         account_injected: false,
+        account_injection_status: "unavailable".to_string(),
         message: message.into(),
     }
 }
@@ -164,7 +298,7 @@ fn ccswitch_account_environment(
     vec![
         (
             CCSWITCH_404TOKEN_DEVICE_KEY_ENV,
-            binding.ccswitch.device_api_key.clone(),
+            binding.ccswitch.device_api_key.trim().to_string(),
         ),
         (CCSWITCH_404TOKEN_ACCOUNT_ENV, binding.account_ref.clone()),
         (
@@ -223,7 +357,28 @@ fn usb_marker_path() -> Result<PathBuf, AppError> {
         .ok_or_else(|| AppError::Engine("无法确定 CCSwitch USB 所有权记录目录".to_string()))
 }
 
-fn write_usb_managed_marker(source: &Path) -> Result<(), AppError> {
+fn usb_marker_background_hidden_for(source: &Path) -> bool {
+    let path = match usb_marker_path() {
+        Ok(path) => path,
+        Err(_) => return false,
+    };
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    let Some(previous) = value.get("sourcePath").and_then(|value| value.as_str()) else {
+        return false;
+    };
+    value
+        .get("backgroundHidden")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+        && same_windows_path(Path::new(previous), source)
+}
+
+fn write_usb_managed_marker(source: &Path, background_hidden: bool) -> Result<(), AppError> {
     let path = usb_marker_path()?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| io_error(parent, error))?;
@@ -233,6 +388,7 @@ fn write_usb_managed_marker(source: &Path) -> Result<(), AppError> {
         "component": "ccswitch",
         "launchMode": "usb",
         "sourcePath": source.to_string_lossy(),
+        "backgroundHidden": background_hidden,
         "createdAtMs": crate::app::usb_guard::now_ms(),
     });
     let bytes = serde_json::to_vec_pretty(&marker).map_err(|error| {
@@ -308,8 +464,15 @@ fn verify_source_executable(source: &Path) -> Result<(), AppError> {
     let manifest_path = source_dir.join("manifest.json");
     let manifest_bytes =
         fs::read(&manifest_path).map_err(|error| io_error(&manifest_path, error))?;
+    // Windows PowerShell 5.1's `Set-Content -Encoding UTF8` writes a UTF-8
+    // BOM. Older USB bundles therefore contain valid JSON that serde_json
+    // rejects at byte zero. Accept that legacy encoding while keeping the
+    // executable hash gate unchanged.
+    let manifest_json = manifest_bytes
+        .strip_prefix(&[0xEF, 0xBB, 0xBF][..])
+        .unwrap_or(&manifest_bytes);
     let manifest: CcswitchManifest =
-        serde_json::from_slice(&manifest_bytes).map_err(|error| io_error(&manifest_path, error))?;
+        serde_json::from_slice(manifest_json).map_err(|error| io_error(&manifest_path, error))?;
     let expected = manifest.artifact.sha256.trim();
     if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(AppError::Engine(
@@ -356,10 +519,35 @@ fn source_candidates(executable: &Path, resource_dir: Option<&Path>) -> Vec<Path
     candidates
 }
 
-fn find_source(executable: &Path, resource_dir: Option<&Path>) -> Option<PathBuf> {
-    source_candidates(executable, resource_dir)
-        .into_iter()
-        .find(|candidate| is_regular_file(candidate))
+fn find_verified_source(
+    executable: &Path,
+    resource_dir: Option<&Path>,
+) -> Result<Option<PathBuf>, AppError> {
+    let mut rejected = Vec::new();
+    for candidate in source_candidates(executable, resource_dir) {
+        if !is_regular_file(&candidate) {
+            continue;
+        }
+        match verify_source_executable(&candidate) {
+            Ok(()) => return Ok(Some(candidate)),
+            Err(error) => {
+                log::warn!(
+                    "CCSwitch candidate rejected by adjacent manifest path={} error={}",
+                    candidate.display(),
+                    error
+                );
+                rejected.push(format!("{}: {}", candidate.display(), error));
+            }
+        }
+    }
+    if rejected.is_empty() {
+        Ok(None)
+    } else {
+        Err(AppError::Engine(format!(
+            "找到 CCSwitch 程序，但所有候选都未通过相邻清单校验：{}",
+            rejected.join("；")
+        )))
+    }
 }
 
 fn same_windows_path(left: &Path, right: &Path) -> bool {
@@ -885,7 +1073,10 @@ fn copy_payload(source_executable: &Path, target_dir: &Path) -> Result<usize, Ap
 /// deliberately *not* copied to C:; only the app's normal user-profile data
 /// remains local. A missing source is represented as a non-fatal report so the
 /// caller can still mark Codex installation complete.
-pub fn install_and_launch(app: &AppHandle) -> Result<CcswitchLaunchReport, AppError> {
+fn launch_with_intent(
+    app: &AppHandle,
+    intent: CcswitchLaunchIntent,
+) -> Result<CcswitchLaunchReport, AppError> {
     if !cfg!(target_os = "windows") {
         return Ok(report_missing("当前平台不支持自动启动 Windows CCSwitch"));
     }
@@ -909,13 +1100,12 @@ pub fn install_and_launch(app: &AppHandle) -> Result<CcswitchLaunchReport, AppEr
             ))
             .collect::<Vec<_>>()
     );
-    let Some(source) = find_source(&executable, resource_dir.as_deref()) else {
+    let Some(source) = find_verified_source(&executable, resource_dir.as_deref())? else {
         return Ok(report_missing(
             "未找到 ccswitch\\CodexSwitch.exe；Codex 已安装，但 CCSwitch 未自动启动",
         ));
     };
     log::info!("CCSwitch source selected path={}", source.display());
-    verify_source_executable(&source)?;
     log::info!("CCSwitch source hash verified path={}", source.display());
     let runtime =
         crate::app::runtime::ensure_bundled_vc_runtime(&executable, resource_dir.as_deref())?;
@@ -947,44 +1137,125 @@ pub fn install_and_launch(app: &AppHandle) -> Result<CcswitchLaunchReport, AppEr
             "local",
         )
     };
+    // Read the previous ownership record before writing the current source.
+    // Otherwise a drive-letter/path change would overwrite the only pointer
+    // to the old USB process and leave that stale single-instance process
+    // running indefinitely.
+    let previous_managed_source = if usb_mode {
+        read_usb_managed_source()
+    } else {
+        None
+    };
+    let background_was_hidden = usb_mode && usb_marker_background_hidden_for(&source);
     if usb_mode {
         // USB mode has no local executable directory in which to place the
         // normal ownership marker.  Persist a small, non-secret marker beside
         // the manager settings so the combined uninstaller can identify and
         // clean this product's CCSwitch profile on a later run.
-        if let Err(error) = write_usb_managed_marker(&source) {
+        if let Err(error) = write_usb_managed_marker(&source, background_was_hidden) {
             log::warn!("CCSwitch launched from USB but ownership marker was not written: {error}");
         }
     }
     let inherited_webview2_arguments = std::env::var(WEBVIEW2_ARGUMENTS_ENV).ok();
     let webview2_arguments =
         webview2_software_rendering_arguments(inherited_webview2_arguments.as_deref());
-    // A valid USB lease is enough to launch CCSwitch.  Account binding is an
-    // optional hand-off: if an older/unsigned license or a transient license
-    // read prevents it, keep the launch usable and surface the exact reason in
-    // the backend log/report instead of aborting before spawning the app.
-    let account_binding = match crate::app::usb_guard::authorized_account_binding() {
-        Ok(binding) => binding,
-        Err(error) => {
-            log::error!(
-                "CCSwitch account binding unavailable; launching without injection: {error}"
-            );
-            None
+    // Pass the signed binding to the USB CCSwitch child. A nonce-bound
+    // acknowledgement is also required before automatic minimization, so a
+    // launched process is never mistaken for a saved-and-selected provider.
+    let account_binding = if usb_mode && intent == CcswitchLaunchIntent::Bootstrap {
+        match crate::app::usb_guard::authorized_account_binding() {
+            Ok(binding) => binding,
+            Err(error) => {
+                log::error!(
+                    "CCSwitch account binding unavailable; launching without injection: {error}"
+                );
+                None
+            }
         }
+    } else {
+        None
     };
-    let account_environment = ccswitch_account_environment(account_binding.as_ref());
+    let account_environment = if usb_mode && intent == CcswitchLaunchIntent::Bootstrap {
+        ccswitch_account_environment(account_binding.as_ref())
+    } else {
+        Vec::new()
+    };
     let account_injected = !account_environment.is_empty();
+    let handoff_request = if account_injected {
+        account_environment
+            .iter()
+            .find(|(name, _)| *name == CCSWITCH_404TOKEN_DEVICE_KEY_ENV)
+            .and_then(|(_, key)| match CcswitchHandoffRequest::new(key) {
+                Ok(request) => Some(request),
+                Err(error) => {
+                    log::warn!(
+                        "CCSwitch provider hand-off confirmation could not be prepared: {error}"
+                    );
+                    None
+                }
+            })
+    } else {
+        None
+    };
+    let mut injection_status = if !usb_mode || intent == CcswitchLaunchIntent::UserOpen {
+        "not-attempted"
+    } else if account_injected {
+        if handoff_request.is_some() {
+            "pending"
+        } else {
+            "unconfirmed"
+        }
+    } else {
+        "missing-binding"
+    };
     log::info!(
-        "CCSwitch launch mode={} target={} account_injected={}",
+        "CCSwitch launch mode={} target={} account_injection_status={}",
         launch_mode,
         target.display(),
-        account_injected
+        injection_status
     );
+
+    // An explicit user open should restore the existing managed process rather
+    // than close/relaunch it. Relaunching here used to reapply the background
+    // environment and hide the window every time the button was clicked.
+    if intent == CcswitchLaunchIntent::UserOpen
+        && codex_win_engine::processes_running_for_root(&working_dir).unwrap_or(false)
+    {
+        let shown_windows = codex_win_engine::show_windows_for_root(&working_dir)
+            .map_err(|error| AppError::Engine(format!("无法恢复 CCSwitch 窗口：{error}")))?;
+        let window = codex_win_engine::wait_for_usable_window_for_root(
+            &working_dir,
+            Duration::from_secs(10),
+        )
+        .map_err(|error| AppError::Engine(format!("检查 CCSwitch 窗口失败：{error}")))?
+        .ok_or_else(|| AppError::Engine("CCSwitch 进程仍在运行，但没有可操作窗口".into()))?;
+        log::info!(
+            "CCSwitch existing process restored root={} shown_windows={} pid={}",
+            working_dir.display(),
+            shown_windows,
+            window.pid
+        );
+        return Ok(CcswitchLaunchReport {
+            available: true,
+            installed,
+            launched: true,
+            source_path: Some(source.to_string_lossy().into_owned()),
+            installed_path: Some(target.to_string_lossy().into_owned()),
+            copied_files: 0,
+            launch_mode: launch_mode.to_string(),
+            data_scope: "user-profile".to_string(),
+            usable_window_confirmed: true,
+            graphics_mode: "software-rendering".to_string(),
+            account_injected: false,
+            account_injection_status: "not-attempted".to_string(),
+            message: "Codex Switch 已恢复显示；后台进程保持运行".to_string(),
+        });
+    }
 
     // An earlier USB bundle may still own CCSwitch's single-instance window.
     // The ownership marker is exact and lets us close only that prior managed
     // root; unrelated standalone CCSwitch installations remain untouched.
-    if let Some(previous_source) = read_usb_managed_source() {
+    if let Some(previous_source) = previous_managed_source {
         if let Some(previous_root) = previous_source.parent() {
             if !same_windows_path(previous_root, &working_dir)
                 && codex_win_engine::processes_running_for_root(previous_root).unwrap_or(false)
@@ -1005,7 +1276,9 @@ pub fn install_and_launch(app: &AppHandle) -> Result<CcswitchLaunchReport, AppEr
     // the old/missing API key). Close only processes physically loaded from
     // this managed root before starting a fresh child. Unrelated CCSwitch
     // installations are never touched.
-    if codex_win_engine::processes_running_for_root(&working_dir).unwrap_or(false) {
+    if intent == CcswitchLaunchIntent::Bootstrap
+        && codex_win_engine::processes_running_for_root(&working_dir).unwrap_or(false)
+    {
         codex_win_engine::close_processes_for_root(10, &working_dir).map_err(|error| {
             AppError::Engine(format!("无法关闭同一套件中的旧 CCSwitch 进程：{error}"))
         })?;
@@ -1024,15 +1297,37 @@ pub fn install_and_launch(app: &AppHandle) -> Result<CcswitchLaunchReport, AppEr
         // manager hides the main window while leaving the tray process alive.
         .env(
             CCSWITCH_USB_BACKGROUND_ENV,
-            if account_injected { "1" } else { "0" },
+            if intent == CcswitchLaunchIntent::Bootstrap && account_injected {
+                "1"
+            } else {
+                "0"
+            },
         )
         // The target-machine report proved that this WebView2 renderer stalls
         // with hardware acceleration on Windows 10/Intel graphics. Keep the
         // workaround scoped to this child instead of changing a machine/user
         // environment variable used by unrelated WebView2 applications.
         .env(WEBVIEW2_ARGUMENTS_ENV, &webview2_arguments);
+    for name in [
+        CCSWITCH_404TOKEN_DEVICE_KEY_ENV,
+        CCSWITCH_404TOKEN_ACCOUNT_ENV,
+        CCSWITCH_404TOKEN_GROUP_ENV,
+        CCSWITCH_404TOKEN_PROVIDER_ENV,
+        CCSWITCH_404TOKEN_HANDOFF_PATH_ENV,
+        CCSWITCH_404TOKEN_HANDOFF_NONCE_ENV,
+    ] {
+        // These values are supplied only for a verified USB bootstrap. Never
+        // inherit a developer-shell or machine-level credential into an
+        // explicit user-open or normal local CCSwitch launch.
+        command.env_remove(name);
+    }
     for (name, value) in &account_environment {
         command.env(name, value);
+    }
+    if let Some(request) = &handoff_request {
+        command
+            .env(CCSWITCH_404TOKEN_HANDOFF_PATH_ENV, &request.path)
+            .env(CCSWITCH_404TOKEN_HANDOFF_NONCE_ENV, &request.nonce);
     }
     let child = command.spawn().map_err(|error| {
         log::error!(
@@ -1081,16 +1376,52 @@ pub fn install_and_launch(app: &AppHandle) -> Result<CcswitchLaunchReport, AppEr
         ));
     };
 
-    // Explicit configuration hand-off: keep the manager visible so the user
-    // can see the completed installation and its final status. When a signed
-    // USB binding is present, hide CCSwitch into its tray after its sizeable
-    // window has been observed and kept stable. This makes the automatic
-    // provider hand-off invisible while retaining a tray entry for deliberate
-    // user access.
-    let hidden_windows = if account_injected {
-        codex_win_engine::hide_windows_for_root(&working_dir).map_err(|error| {
-            AppError::Engine(format!("CCSwitch 已注入授权，但无法收至托盘：{error}"))
-        })?
+    if account_injected && intent == CcswitchLaunchIntent::Bootstrap {
+        let outcome = handoff_request
+            .as_ref()
+            .map_or(CcswitchHandoffOutcome::Unconfirmed, |request| {
+                request.wait_for_outcome(CCSWITCH_HANDOFF_ACK_TIMEOUT)
+            });
+        injection_status = match outcome {
+            CcswitchHandoffOutcome::Verified => "verified",
+            CcswitchHandoffOutcome::Failed => "failed",
+            CcswitchHandoffOutcome::Unconfirmed => "unconfirmed",
+        };
+        log::info!(
+            "CCSwitch provider hand-off result status={}",
+            injection_status
+        );
+    }
+
+    // Hide only after CCSwitch confirms that the matching credential is saved
+    // and 404token is the active Codex provider. Explicit user opens remain
+    // visible and are never subject to the bootstrap hand-off.
+    let should_hide = intent == CcswitchLaunchIntent::Bootstrap
+        && account_injected
+        && injection_status == "verified";
+    let hidden_windows = if should_hide {
+        // WebView2 can hand the first top-level HWND to a renderer child a
+        // fraction after the stable-window probe.  Retry the exact managed
+        // process tree for a short bounded interval so the one-time bootstrap
+        // hide is reliable without turning an explicit user open into a
+        // background launch.
+        let hide_deadline = Instant::now() + Duration::from_secs(3);
+        let mut hidden_total = 0_usize;
+        loop {
+            let hidden =
+                codex_win_engine::hide_windows_for_root(&working_dir).map_err(|error| {
+                    AppError::Engine(format!("CCSwitch 已注入授权，但无法收至托盘：{error}"))
+                })?;
+            hidden_total = hidden_total.saturating_add(hidden);
+            // Keep polling through the bounded window even after the first
+            // HWND was hidden. WebView2 can create a renderer-owned top-level
+            // HWND shortly after that first hide; stopping early would report
+            // success while leaving the late window visible.
+            if Instant::now() >= hide_deadline {
+                break hidden_total;
+            }
+            std::thread::sleep(Duration::from_millis(150));
+        }
     } else {
         0
     };
@@ -1107,6 +1438,12 @@ pub fn install_and_launch(app: &AppHandle) -> Result<CcswitchLaunchReport, AppEr
         webview2_arguments
     );
 
+    if should_hide && hidden_windows > 0 && usb_mode {
+        if let Err(error) = write_usb_managed_marker(&source, true) {
+            log::warn!("CCSwitch background hand-off completed but marker update failed: {error}");
+        }
+    }
+
     Ok(CcswitchLaunchReport {
         available: true,
         installed,
@@ -1119,12 +1456,24 @@ pub fn install_and_launch(app: &AppHandle) -> Result<CcswitchLaunchReport, AppEr
         usable_window_confirmed: true,
         graphics_mode: "software-rendering".to_string(),
         account_injected,
+        account_injection_status: injection_status.to_string(),
         message: if usb_mode {
-            if !account_injected {
-                "Codex Switch 已从 U 盘启动并显示配置窗口；当前 U 盘没有可用的 404token 绑定，请重新签名".to_string()
-            } else {
-                "Codex Switch 已从 U 盘启动并自动注入 404token 授权，已收至系统托盘后台运行"
+            if injection_status == "verified" && should_hide {
+                "Codex Switch 已从 U 盘启动，404token 授权已提交，已收至系统托盘后台运行"
                     .to_string()
+            } else if injection_status == "verified" {
+                "Codex Switch 已从 U 盘启动，404token 已保存并设为当前 Provider，配置窗口已显示"
+                    .to_string()
+            } else if injection_status == "failed" {
+                "Codex Switch 已启动，但未能保存并启用 404token Provider；配置窗口保持打开，请检查配置后重试".to_string()
+            } else if account_injected {
+                "404token API Key 已传给 CCSwitch，但未确认其已保存并设为当前 Provider；配置窗口保持打开，请检查 CCSwitch".to_string()
+            } else if intent == CcswitchLaunchIntent::UserOpen {
+                "Codex Switch 已从 U 盘启动或恢复显示，配置窗口已打开".to_string()
+            } else if injection_status == "missing-binding" {
+                "Codex Switch 已启动，但未读取到可用的签名 404token 账户绑定；尚未确认 Codex 登录配置，配置窗口保持打开，请检查账户绑定并重新签名".to_string()
+            } else {
+                "Codex Switch 已启动，但未确认 404token API Key 已保存并启用；尚未确认 Codex 登录配置，配置窗口保持打开，请重试或手动配置".to_string()
             }
         } else {
             "Codex Switch 已复制到本机、启动并显示配置窗口，请输入 API Key 完成配置".to_string()
@@ -1132,12 +1481,26 @@ pub fn install_and_launch(app: &AppHandle) -> Result<CcswitchLaunchReport, AppEr
     })
 }
 
+/// Automatic first-install path. It keeps the historical bootstrap behavior
+/// but records that the one-time tray hand-off already happened.
+pub fn install_and_launch(app: &AppHandle) -> Result<CcswitchLaunchReport, AppError> {
+    launch_with_intent(app, CcswitchLaunchIntent::Bootstrap)
+}
+
+/// Explicit user-facing open path. It restores an existing managed process and
+/// only starts a new visible process when none is running.
+pub fn open(app: &AppHandle) -> Result<CcswitchLaunchReport, AppError> {
+    launch_with_intent(app, CcswitchLaunchIntent::UserOpen)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        autostart_targets, ccswitch_account_environment, local_install_is_managed,
-        source_candidates, verify_source_executable, webview2_software_rendering_arguments,
-        CCSWITCH_EXECUTABLE, CCSWITCH_MANAGED_MARKER, CCSWITCH_SOURCE_DIR,
+        autostart_targets, ccswitch_account_environment, find_verified_source,
+        local_install_is_managed, source_candidates, verify_source_executable,
+        webview2_software_rendering_arguments, CcswitchHandoffOutcome, CcswitchHandoffRequest,
+        CCSWITCH_404TOKEN_HANDOFF_PROTOCOL, CCSWITCH_404TOKEN_PROVIDER_ID, CCSWITCH_EXECUTABLE,
+        CCSWITCH_MANAGED_MARKER, CCSWITCH_SOURCE_DIR,
     };
     use codex_usb_license::{UsbAccountBinding, UsbCcswitchBinding};
     use std::fs;
@@ -1193,6 +1556,51 @@ mod tests {
     }
 
     #[test]
+    fn ccswitch_handoff_ack_requires_matching_nonce_provider_and_key_fingerprint() {
+        let request = CcswitchHandoffRequest::new("fixture-device-key").unwrap();
+        let verified_ack = serde_json::json!({
+            "protocol": CCSWITCH_404TOKEN_HANDOFF_PROTOCOL,
+            "nonce": request.nonce,
+            "status": "verified",
+            "providerId": CCSWITCH_404TOKEN_PROVIDER_ID,
+            "credentialSha256": request.credential_sha256,
+        });
+        fs::write(&request.path, serde_json::to_vec(&verified_ack).unwrap()).unwrap();
+        assert_eq!(
+            request.outcome_from_file(),
+            Some(CcswitchHandoffOutcome::Verified)
+        );
+
+        let mut mismatched_key = verified_ack.clone();
+        mismatched_key["credentialSha256"] = serde_json::Value::String("0".repeat(64));
+        fs::write(&request.path, serde_json::to_vec(&mismatched_key).unwrap()).unwrap();
+        assert_eq!(
+            request.outcome_from_file(),
+            Some(CcswitchHandoffOutcome::Unconfirmed)
+        );
+
+        let mut failed_ack = verified_ack;
+        failed_ack["status"] = serde_json::Value::String("failed".to_string());
+        failed_ack["credentialSha256"] = serde_json::Value::Null;
+        fs::write(&request.path, serde_json::to_vec(&failed_ack).unwrap()).unwrap();
+        assert_eq!(
+            request.outcome_from_file(),
+            Some(CcswitchHandoffOutcome::Failed)
+        );
+    }
+
+    #[test]
+    fn ccswitch_handoff_ack_missing_or_malformed_is_not_verified() {
+        let request = CcswitchHandoffRequest::new("fixture-device-key").unwrap();
+        assert_eq!(request.outcome_from_file(), None);
+        fs::write(&request.path, b"not-json").unwrap();
+        assert_eq!(
+            request.outcome_from_file(),
+            Some(CcswitchHandoffOutcome::Unconfirmed)
+        );
+    }
+
+    #[test]
     fn invalid_or_missing_binding_does_not_inject_environment() {
         assert!(ccswitch_account_environment(None).is_empty());
         let binding = UsbAccountBinding {
@@ -1233,14 +1641,61 @@ mod tests {
         let executable = dir.join(CCSWITCH_EXECUTABLE);
         fs::write(&executable, b"known payload").unwrap();
         let hash = super::sha256_file(&executable).unwrap();
-        fs::write(
-            dir.join("manifest.json"),
-            serde_json::json!({ "artifact": { "sha256": hash } }).to_string(),
-        )
-        .unwrap();
+        let manifest = serde_json::json!({ "artifact": { "sha256": hash } }).to_string();
+        let mut manifest_with_utf8_bom = vec![0xEF, 0xBB, 0xBF];
+        manifest_with_utf8_bom.extend_from_slice(manifest.as_bytes());
+        fs::write(dir.join("manifest.json"), manifest_with_utf8_bom).unwrap();
         assert!(verify_source_executable(&executable).is_ok());
         fs::write(&executable, b"tampered payload").unwrap();
         assert!(verify_source_executable(&executable).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verified_source_falls_back_to_a_valid_resource_copy() {
+        let dir = fixture_temp_dir(&format!(
+            "codex-ccswitch-source-fallback-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let usb_root = dir.join("usb");
+        let primary_dir = usb_root.join(CCSWITCH_SOURCE_DIR);
+        let resources_dir = usb_root.join("resources");
+        let fallback_dir = resources_dir.join(CCSWITCH_SOURCE_DIR);
+        fs::create_dir_all(&primary_dir).unwrap();
+        fs::create_dir_all(&fallback_dir).unwrap();
+
+        let primary_executable = primary_dir.join(CCSWITCH_EXECUTABLE);
+        fs::write(&primary_executable, b"stale USB CCSwitch").unwrap();
+        fs::write(
+            primary_dir.join("manifest.json"),
+            serde_json::json!({
+                "artifact": { "sha256": super::sha256_file(&primary_executable).unwrap() }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        // Simulate the exact reported failure: the preferred USB copy exists,
+        // but its adjacent manifest was generated for different executable
+        // bytes. A valid packaged resource copy must still be selected.
+        fs::write(&primary_executable, b"USB CCSwitch replaced after manifest").unwrap();
+
+        let fallback_executable = fallback_dir.join(CCSWITCH_EXECUTABLE);
+        fs::write(&fallback_executable, b"known-good packaged CCSwitch").unwrap();
+        fs::write(
+            fallback_dir.join("manifest.json"),
+            serde_json::json!({
+                "artifact": { "sha256": super::sha256_file(&fallback_executable).unwrap() }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let anchor = usb_root.join("CodexAppManager.exe");
+        let selected = find_verified_source(&anchor, Some(&resources_dir))
+            .unwrap()
+            .expect("the valid packaged resource copy should be selected");
+        assert_eq!(selected, fallback_executable);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1312,4 +1767,29 @@ mod tests {
         assert!(super::local_install_cleanup_settled(false, true));
         assert!(!super::local_install_cleanup_settled(true, true));
     }
+}
+
+/// Resolve only the signed USB product binary for a finite configuration RPC.
+/// This does not start/stop the normal GUI or touch another CCSwitch install.
+pub(crate) fn verified_usb_selection_executable() -> Result<PathBuf, AppError> {
+    crate::app::usb_guard::require_usb_content_access("ccswitch-model-selection")?;
+    let status = crate::app::usb_guard::current_status();
+    if !status.signed || !status.codex_allowed {
+        return Err(AppError::Engine(
+            "USB model selection is not authorized".into(),
+        ));
+    }
+    let bundle = status
+        .bundle_path
+        .ok_or_else(|| AppError::Engine("USB bundle is unavailable".into()))?;
+    let anchor = Path::new(&bundle).join("CodexAppManager.exe");
+    let executable = find_verified_source(&anchor, None)?
+        .ok_or_else(|| AppError::Engine("Bundled CCSwitch is unavailable".into()))?;
+    Ok(executable)
+}
+
+pub(crate) fn selection_environment(
+    binding: &codex_usb_license::UsbAccountBinding,
+) -> Vec<(&'static str, String)> {
+    ccswitch_account_environment(Some(binding))
 }

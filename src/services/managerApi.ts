@@ -35,6 +35,8 @@ import type {
   MacPerformReport,
   MacUninstallReport,
   MacUpdateReport,
+  GatewayModelProbeReport,
+  GatewayModelProbeRequest,
   NativeModelCatalogReport,
   OfflinePayloadReport,
   OfflineStageReport,
@@ -1821,6 +1823,7 @@ export const managerApi = {
     confirm: boolean,
     purgeUserData: boolean,
     purgeCcswitchData: boolean,
+    forceCleanup = false,
   ): Promise<WinBundleUninstallReport> {
     if (!hasTauriRuntime()) {
       if (!confirm) {
@@ -1845,6 +1848,7 @@ export const managerApi = {
       token,
       purgeUserData,
       purgeCcswitchData,
+      forceCleanup,
       // Keep the offline kit available for reinstall. The optional backend
       // field remains for compatibility with older managers, but current
       // callers must never authorize source-media deletion.
@@ -1924,7 +1928,22 @@ export const managerApi = {
     }
     return invoke<CcswitchLaunchReport>("install_and_launch_ccswitch");
   },
-  /** Refresh Codex's official native model catalog from the signed gateway. */
+  /** Restore/open CCSwitch without reapplying the one-time background hide. */
+  openCcswitch(): Promise<CcswitchLaunchReport> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({
+        available: false,
+        installed: false,
+        launched: false,
+        sourcePath: null,
+        installedPath: null,
+        copiedFiles: 0,
+        message: "browser preview: CCSwitch open is unavailable",
+      });
+    }
+    return invoke<CcswitchLaunchReport>("open_ccswitch");
+  },
+  /** Refresh Codex's native menu metadata without probing model generation. */
   refreshNativeModelCatalog(force = false): Promise<NativeModelCatalogReport> {
     if (!hasTauriRuntime()) {
       return Promise.resolve({
@@ -1933,11 +1952,35 @@ export const managerApi = {
         catalogPath: null,
         fetchedAt: null,
         message: "browser preview: native model catalog is unavailable",
+        attempts: 0,
+        errorKind: "tauri-runtime-unavailable",
+        runId: "browser-preview",
+        gatewayStatus: "unavailable",
+        readyCount: 0,
+        quarantinedCount: 0,
+        defaultModel: null,
+        sidecarPath: null,
+        nativeStatus: "metadata_only",
+        activationStatus: "not_requested",
+        serviceRevision: null,
+        models: [],
       });
     }
-    return invoke<NativeModelCatalogReport>("refresh_native_model_catalog", {
-      force,
-    });
+    return invoke<NativeModelCatalogReport>("refresh_native_model_catalog", { force });
+  },
+  /** Explicit, read-only 404token directory and gateway diagnostics. */
+  gatewayModelProbe(request: GatewayModelProbeRequest): Promise<GatewayModelProbeReport> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({
+        status: "skipped", endpoint: "", credentialFingerprint: "", checkedAt: 0,
+        models: [], results: [], generatedRequests: 0, errorCode: "tauri-runtime-unavailable",
+      });
+    }
+    return invoke<GatewayModelProbeReport>("gateway_model_probe", { request });
+  },
+  cancelGatewayModelProbe(requestId: string): Promise<boolean> {
+    if (!hasTauriRuntime()) return Promise.resolve(false);
+    return invoke<boolean>("cancel_gateway_model_probe", { requestId });
   },
   accountStatus(): Promise<AccountStatus> {
     if (!hasTauriRuntime()) {

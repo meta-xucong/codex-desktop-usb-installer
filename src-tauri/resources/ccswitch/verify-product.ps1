@@ -42,6 +42,7 @@ Assert-Condition ($sha256 -eq ([string]$manifest.artifact.sha256).ToUpperInvaria
 
 $binaryText = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($exePath))
 Assert-Condition ($binaryText.Contains("404token.xyz/v1")) "EXE 未包含 404TOKEN 端点"
+Assert-Condition ($binaryText.Contains("CODEX_USB_404TOKEN_HANDOFF_V1")) "EXE 不支持管理器确认式 API Key 注入；请使用包含持久化回读确认协议的 CCSwitch 源码重新构建"
 Assert-Condition (-not $binaryText.Contains("127.0.0.1:8080")) "EXE 不应包含旧本地代理地址"
 # A release binary built without Tauri's custom-protocol feature falls back to
 # devUrl (localhost:3000) on a blank machine.  The compiled renderer asset

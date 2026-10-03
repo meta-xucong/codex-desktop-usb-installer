@@ -1,22 +1,25 @@
 {
-  "schemaVersion": 1,
-  "product": "codex-usb",
-  "displayName": "Codex Switch",
-  "sourceRepository": "https://github.com/farion1231/cc-switch",
-  "sourceCommit": "1d44b1ba41987cddeb8096fadba8190fab465cbb",
-  "sourceVersion": "3.14.1",
-  "artifact": {
-    "file": "CodexSwitch.exe",
-    "sha256": "75B847CA54D207CBE92866154DA8F504C6874F6D253423899C7CDDFA5FEE0045",
-    "kind": "portable-executable",
-    "installerBundle": false
-  },
-  "providerCatalog": "providers.json",
-  "secretsIncluded": false,
-  "notes": [
-    "404TOKEN is a third-party Sub2API relay, not an OpenAI official endpoint.",
-    "The API key is intentionally not included and must be entered on the target machine.",
-    "The first launch opens a 404TOKEN API Key dialog and activates the provider after saving.",
-    "The Windows MSI/NSIS wrapper is not included in this P0 artifact."
-  ]
+    "schemaVersion":  1,
+    "product":  "codex-usb",
+    "displayName":  "Codex Switch",
+    "sourceRepository":  "https://github.com/farion1231/cc-switch",
+    "sourceCommit":  "1d44b1ba41987cddeb8096fadba8190fab465cbb",
+    "sourceVersion":  "3.14.1",
+    "artifact":  {
+                     "file":  "CodexSwitch.exe",
+                     "sha256":  "CD6CF836CA0EF95EE087E897A9966F590F80B9B6FDCF6D43BB8E87AA3628604B",
+                     "kind":  "portable-executable",
+                     "installerBundle":  false
+                 },
+    "providerCatalog":  "providers.json",
+    "secretsIncluded":  false,
+    "notes":  [
+                  "404TOKEN is a third-party Sub2API relay, not an OpenAI official endpoint.",
+                  "A verified USB license injects one device API key for the unified-api-internal group at runtime.",
+                  "CCSwitch saves the USB key to its normal private provider database, switches the provider, and returns a nonce-bound acknowledgement only after local readback succeeds.",
+      "The standard USB manager passes the signed device key through the legacy startup environment contract; this build also supports an optional nonce-bound acknowledgement for integrations that request it.",
+                  "Model discovery does not gate normal provider activation or Codex launch.",
+                  "The device key is never included in this static resource bundle or providers.json.",
+                  "The Windows MSI/NSIS wrapper is not included in this P0 artifact."
+              ]
 }
