@@ -15,7 +15,7 @@
 2. 同步器失败只写 journald，不保存 last-attempt、last-success、last-error、下一次重试等持久状态；API、资产未齐、下载、校验、权限和空间错误无法自动收敛。
 3. 发布先把 staging 改名为固定 `releases/<releaseId>`，再切换 `current`；切换失败留下已存在目录，后续永远拒绝同一 release。
 4. `current_release_id()` 只比较 `releaseId`，无法识别同一 Release 的资产补齐、资产修订或 manifest/checksum 变化。
-5. 当前空间预检把“保留 current + 下载新版本 + 安全余量”作为硬门槛是正确的；本次远端约 1.511 GB 可用、旧发布约 1.566 GB、新下载约 775 MB，故必须扩容/增加挂载空间或由运维提供清理后的可用空间，不能删除 current 绕过门禁。
+5. 2026-09-16 的初始实现把“保留 current + 下载新版本 + 安全余量”都计入空闲空间门槛；该判断后来在 2026-10-11 的生产诊断中被纠正：current 已经占用磁盘，因此它的字节数已反映在文件系统的 `free` 结果中，再加一次会重复计算。修正后的设计见第 9 节。
 
 ## 3. 实现契约
 
@@ -101,3 +101,33 @@
 - `max_published_releases` 已从 2 调整为 1：每次新版本完成校验并切换 current 后，只保留 current，其余数字命名的 Codex 发布目录自动清理。
 - “已经是最新版本”不再直接绕过清理；正常非 dry-run 执行也会清理残留旧版本。dry-run 不执行删除。
 - 2026-09-16 17:37 CST 已在 VPS 实际验证：`export/releases` 仅剩 `388674726`，current 指向该目录，service `Result=success`，journalPhase=`none`，Skill Hub current 未变化。
+
+## 9. 2026-10-11 空间门槛修正与 VPS 清理
+
+### 9.1 更新空间计算修正
+
+生产诊断确认 Relay 定时器正常触发、GitHub API 可达，但更新持续因空间预检失败。检查时 GitHub 最新 Release 为 `405522635` / `codex-app-26.1002.52244`，发布于 2026-10-07；当前 Relay 仍提供 `395156145` / `codex-app-26.917.71314`。最新三项资产共 `941271953` bytes，保留的当前发布占 `830544024` bytes，配置安全余量为 `536870912` bytes；文件系统可用 `1725071360` bytes。旧逻辑要求 `2308686889` bytes，短缺 `583615529` bytes。
+
+旧发布已实际占用磁盘，其大小已经从文件系统空闲容量中扣除。空间预检再加一次 `retained_bytes` 属于重复计数，并非安全所需。更新策略修正为：
+
+1. 下载和验证期间保留当前可用发布；空间门槛只计算新资产总大小加安全余量，即 `expected_download_bytes + min_free_bytes`。
+2. 下载或校验失败时删除临时 staging，`current` 保持旧版本。
+3. 校验成功后按既有 journal 事务切换 `current`；切换完成后立即清理所有非 current 发布，`max_published_releases=1`。
+4. 若可用空间不足以容纳新资产和安全余量，仍安全失败，不预先删除当前版本。
+
+因此“新包更新完再删旧包”已经由发布事务和 `max_published_releases=1` 实现；本次代码修正的是让空间检查准确反映增量下载需求。该修正已部署到 VPS，具体记录见第 9.3 节。
+
+### 9.2 清理审计
+
+2026-10-11 对 `.152` 做只读盘点后，仅删除 `/tmp` 下 55 个超过 24 小时、无进程打开、root 所有且符合 `codex-<32位随机编号>.key/.sh` 命名的临时文件，共 `294337` bytes（30 个 key、25 个脚本）。删除后确认该范围内没有超过 24 小时的匹配文件残留。其他用途不明临时文件、最近文件、当前 Relay 包、系统日志和 Docker 数据均保留。
+
+盘点时根分区为 7.9 GB，已用 5.9 GB、可用约 1.7 GB；`/var/log` 约 954 MB，其中 systemd journal 约 824 MB，日志覆盖 2026-09-16 至 2026-10-11，故保留；`/var/lib/docker` 约 1.6 GB，Docker 报告 3 个镜像和 4 个容器全部 active、可回收空间为 0，也保留。APT 缓存约 6.5 MB，`/srv/codex-update-relay/export` 当前仅有一个发布目录约 793 MB，没有遗留旧 Release 可清理。
+
+### 9.3 修正部署与同步验收（2026-10-11 20:18 CST）
+
+- 部署脚本退出码为 0，备份目录为 `/srv/codex-update-relay/state/backups/20261011T121806Z`。远端 `/usr/local/libexec/codex-update-relay-sync.py` 与工作区 SHA-256 相同：`2e94c4bf5b7e55d52bc368eb7afc9542b6e33175b87ac25427ca58fc12bb396b`。
+- dry-run 通过，报告可用空间 `1724227584` bytes、新 MSIX `941254056` bytes；实际同步退出码 0，`lastSuccessAt=2026-10-11T12:18:28Z`、`lastError=null`、`journalPhase=finalized`。
+- current 指向 `releases/405522635`，tag=`codex-app-26.1002.52244`。目录中仅保留该 Release；旧 `395156145` / `codex-app-26.917.71314` 已删除。
+- 新 MSIX asset id=`618568585`、size=`941254056`、GitHub/下载 SHA-256=`f2913fdf027a0924ef42198222e325ac8f6331580cbffc51c7a8d18d8ce73c78`；manifest 和 checksums 的 id、size、digest 也与 GitHub 一致。同步器下载校验和 manifest 绑定校验均通过。
+- 公网验收输出 `PUBLIC_ACCEPTANCE_OK releaseId=405522635 tag=codex-app-26.1002.52244`；公网 latest 与 GitHub Release 的资产身份一致，MSIX Range 请求通过。公网 metadata 返回的新包 SHA 与同步器校验的 SHA 相同。
+- 部署后根分区可用 `1613471744` bytes，旧包删除后仅保留新包。timer 为 `active/waiting`，下一次触发 `2026-10-12 00:06 CST`。本轮未运行单元测试套件；dry-run、真实同步资产校验、服务退出状态及公网验收均通过。

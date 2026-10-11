@@ -305,19 +305,6 @@ def identity_equal(left: Dict[str, Any] | None, right: Dict[str, Any]) -> bool:
     return left.get("releaseId") == right.get("releaseId") and left.get("tag") == right.get("tag") and left.get("publishedAt") == right.get("publishedAt") and left.get("assets") == right.get("assets")
 
 
-def published_release_bytes(releases_root: Path) -> int:
-    if not releases_root.exists():
-        return 0
-    total = 0
-    for release in releases_root.iterdir():
-        if release.is_symlink() or not release.is_dir():
-            continue
-        for item in release.rglob("*"):
-            if not item.is_symlink() and item.is_file():
-                total += item.stat().st_size
-    return total
-
-
 def switch_current(export_root: Path, target: str) -> None:
     if os.path.isabs(target):
         fail("current target must be relative")
@@ -492,10 +479,12 @@ def sync(config: Dict[str, Any], dry_run: bool) -> None:
             return
         expected_bytes = sum(int(asset["size"]) for asset in assets)
         free_bytes = shutil.disk_usage(root).free
-        retained_bytes = published_release_bytes(export_root / "releases")
-        required_bytes = expected_bytes + retained_bytes + config["min_free_bytes"]
+        # Existing release files already reduce filesystem free space. Counting
+        # their size again here double-counts the rollback copy: keep current
+        # intact while staging, then prune it only after the verified publish.
+        required_bytes = expected_bytes + config["min_free_bytes"]
         if free_bytes < required_bytes:
-            fail(f"insufficient free space: need {required_bytes} (download={expected_bytes}, retained={retained_bytes}, safety={config['min_free_bytes']}), have {free_bytes}")
+            fail(f"insufficient free space: need {required_bytes} (download={expected_bytes}, safety={config['min_free_bytes']}), have {free_bytes}")
         if dry_run:
             log(f"dry-run: release={release.get('tag_name')} id={release.get('id')} msix={assets[0].get('name')} size={assets[0].get('size')} free={free_bytes}")
             return
