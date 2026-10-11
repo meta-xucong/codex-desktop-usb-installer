@@ -72,7 +72,7 @@ v0.5.20+ 从结构上消除这类不确定性：生产安装路线不调用
 5. 核验 `%USERPROFILE%`、`%APPDATA%`、`%LOCALAPPDATA%` 的声明位置与真实解析位置均不在产品 U 盘。
 6. 在 `apps` 下建立同卷暂存目录，逐项安全解包；拒绝绝对路径、`..`、链接类条目和越界写入，并复核写入字节数。
 7. 事务性把旧程序树改名为 rollback，再将新树原子改名为 `apps\Codex`；入口和 manifest 后置条件失败时恢复旧树。
-8. USB 模式不创建 Codex 直接开始菜单入口，也不在 API 配置完成前启动 Codex，避免绕过看门狗。
+8. USB 模式不创建 Codex 开始菜单或桌面快捷方式；API 配置完成后由管理器启动 Codex，并在实际启动前复核远程授权状态。
 9. 检查 WebView2 与 VC++ x64 运行库；只运行 U 盘内哈希固定、微软签名的完整离线安装器，不手工复制 DLL。
 10. 以仅作用于子进程的软件渲染参数从 U 盘启动 Codex Switch；只有检测到尺寸正常的
     可操作窗口并将其恢复到屏幕内、前置显示后才报告成功，再引导用户填写 API Key。
@@ -95,20 +95,20 @@ Codex 后会重新从安全模式探测。`--no-sandbox` 会降低 Chromium 子�
 每次启动管理器还会核对本机看门狗副本与 U 盘当前版本；不一致时先让旧 helper 正常
 退出，再做哈希校验后的原子刷新，避免升级后继续运行旧版路径/租约逻辑。
 
-不创建直接 Codex 快捷方式是有意设计：快捷方式指向 `Codex.exe` 会绕过 U 盘租约。
-发行包复制到另一位置后，卷序列号、锚点哈希和 bundle 相对路径不匹配时不能获得租约。
+不创建直接 Codex 快捷方式是有意设计。用户仍可直接运行 `apps\Codex` 中 MSIX manifest 声明的官方程序入口；这种方式会绕过管理器的远程状态检查和 U 盘租约，属于已接受的边界。远程作废清理只由之后通过管理器进行的授权检查触发。发行包复制到另一位置后，卷序列号、锚点哈希和 bundle 相对路径不匹配时不能获得租约。
 
 ## Skill、Agent 与 MCP 边界
 
 一键流程在 Codex 安装并完成位置校验后，会调用 U 盘内的
 `content\codex-starter-kit\install-all.ps1`。它会离线校验能力包清单，将完整随包
 Skills、Agents、Python/Node 运行时、MCP wrapper 和配置模板安装到当前用户目录。
-该步骤不依赖 GitHub、npm 或 PyPI 网络下载。
+大多数运行时和 Python/Feishu 依赖随包离线安装。HyperFrames CLI 首次物化需要联网访问 npm；若本机没有可用 Chrome，浏览器初始化还会联网下载浏览器。该部分失败会标记为 `requires-network`，不会阻断其余能力安装；联网后可从“高级功能 → 组件修复”重试。
 
-安装器前端还提供一个低调的“组件修复”入口：可以单独重跑能力包，或单独重试
-CCSwitch。外部连接全部是可选项，默认不启用；没有填写凭据就不会启用飞书、DashScope、
-Image-2 或 Seedance。API Key、OAuth token、登录状态和用户会话不得写进 U 盘，
-仅在用户主动配置时保存到本机用户环境变量或 Codex 用户目录。
+安装器主界面提供“连接与扩展”入口，集中设置飞书、DashScope、统一媒体生成 MCP（Image-2、Grok、Seedance，及未来由同一上游开放的 MiniMax 模型），
+以及 Cloudflare、Figma、Linear、Notion 远程 MCP。外部连接全部可选，默认不启用。媒体 provider 共用一个 Base URL 和 API Key；MiniMax 模型当前留空，不接官方 MiniMax API，
+每次生成仍需单独确认；远程 MCP 需要用户在 Codex 中完成 OAuth。“高级功能”中的“组件修复”用于
+单独重跑能力包或重试 CCSwitch，运行时检查、程序修复和日志也留在高级菜单。API Key、OAuth token、登录状态和用户会话
+不得写进 U 盘，仅在用户主动配置时保存到本机用户环境变量或 Codex 用户目录。
 
 ## 卸载
 

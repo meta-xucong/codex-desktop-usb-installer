@@ -23,6 +23,18 @@
       ]
     },
     {
+      "package": "av",
+      "normalizedPackage": "av",
+      "version": "19.0.1",
+      "filename": "av-19.0.1-cp312-abi3-win_amd64.whl",
+      "relativePath": "runtime/bundled/python-wheels/av-19.0.1-cp312-abi3-win_amd64.whl",
+      "bytes": 28149519,
+      "sha256": "906fc3db09288319a75ea23ffefb59961c7dbe0d1c074601507a89de7d8593d8",
+      "tags": [
+        "cp312-abi3-win_amd64"
+      ]
+    },
+    {
       "package": "beautifulsoup4",
       "normalizedPackage": "beautifulsoup4",
       "version": "4.15.0",
@@ -68,6 +80,30 @@
       "sha256": "3617ac3cfd8b9888f145ad89dd6e692285834b0201c6074a5eeaad3fd4d668c2",
       "tags": [
         "cp312-cp312-win_amd64"
+      ]
+    },
+    {
+      "package": "click",
+      "normalizedPackage": "click",
+      "version": "8.5.0",
+      "filename": "click-8.5.0-py3-none-any.whl",
+      "relativePath": "runtime/bundled/python-wheels/click-8.5.0-py3-none-any.whl",
+      "bytes": 125251,
+      "sha256": "255bc9599cf7748b4b1a446ccc735421bd08a2ae529a8b88597d3de5664ee360",
+      "tags": [
+        "py3-none-any"
+      ]
+    },
+    {
+      "package": "cloup",
+      "normalizedPackage": "cloup",
+      "version": "4.0.0",
+      "filename": "cloup-4.0.0-py3-none-any.whl",
+      "relativePath": "runtime/bundled/python-wheels/cloup-4.0.0-py3-none-any.whl",
+      "bytes": 55776,
+      "sha256": "0678744a3a2753e1d78dd3ea5c6e4cbbc3b41561fd7a7a7d075dbc8dad74f74f",
+      "tags": [
+        "py3-none-any"
       ]
     },
     {
@@ -180,6 +216,18 @@
       ]
     },
     {
+      "package": "glcontext",
+      "normalizedPackage": "glcontext",
+      "version": "3.0.0",
+      "filename": "glcontext-3.0.0-cp312-cp312-win_amd64.whl",
+      "relativePath": "runtime/bundled/python-wheels/glcontext-3.0.0-cp312-cp312-win_amd64.whl",
+      "bytes": 12971,
+      "sha256": "e80bb37ba727bd20c192f2754aea40c437a7665005c1001c10752f91913964e9",
+      "tags": [
+        "cp312-cp312-win_amd64"
+      ]
+    },
+    {
       "package": "html2text",
       "normalizedPackage": "html2text",
       "version": "2025.4.15",
@@ -212,6 +260,18 @@
       "relativePath": "runtime/bundled/python-wheels/idna-3.19-py3-none-any.whl",
       "bytes": 68550,
       "sha256": "815e7be7a7806d54abb586dc943addc79e8b2ee16915059658cbeff4b1b43bf4",
+      "tags": [
+        "py3-none-any"
+      ]
+    },
+    {
+      "package": "isosurfaces",
+      "normalizedPackage": "isosurfaces",
+      "version": "0.1.2",
+      "filename": "isosurfaces-0.1.2-py3-none-any.whl",
+      "relativePath": "runtime/bundled/python-wheels/isosurfaces-0.1.2-py3-none-any.whl",
+      "bytes": 11649,
+      "sha256": "525a49ba93f4dbc35303cd2faf30976af0f99d9274cfa2787aec016b8ef96c64",
       "tags": [
         "py3-none-any"
       ]
@@ -253,6 +313,54 @@
       ]
     },
     {
+      "package": "manim",
+      "normalizedPackage": "manim",
+      "version": "0.21.0",
+      "filename": "manim-0.21.0-py3-none-any.whl",
+      "relativePath": "runtime/bundled/python-wheels/manim-0.21.0-py3-none-any.whl",
+      "bytes": 679365,
+      "sha256": "021001097bb568372fa8f5d1dcf46ba085c8502c10efb2312ff45f19f7facb60",
+      "tags": [
+        "py3-none-any"
+      ]
+    },
+    {
+      "package": "ManimPango",
+      "normalizedPackage": "manimpango",
+      "version": "0.7.0",
+      "filename": "manimpango-0.7.0-cp312-cp312-win_amd64.whl",
+      "relativePath": "runtime/bundled/python-wheels/manimpango-0.7.0-cp312-cp312-win_amd64.whl",
+      "bytes": 6384848,
+      "sha256": "7bf6b1c468f1910ae8f2d68c62674b14c40e059c337b167147cd3fa38e2b1e17",
+      "tags": [
+        "cp312-cp312-win_amd64"
+      ]
+    },
+    {
+      "package": "mapbox_earcut",
+      "normalizedPackage": "mapbox-earcut",
+      "version": "2.1.0",
+      "filename": "mapbox_earcut-2.1.0-cp312-cp312-win_amd64.whl",
+      "relativePath": "runtime/bundled/python-wheels/mapbox_earcut-2.1.0-cp312-cp312-win_amd64.whl",
+      "bytes": 279405,
+      "sha256": "eeea00eeb70873d840290e98471671d02e4ac0536b847b785177a14001e33a95",
+      "tags": [
+        "cp312-cp312-win_amd64"
+      ]
+    },
+    {
+      "package": "markdown-it-py",
+      "normalizedPackage": "markdown-it-py",
+      "version": "4.2.0",
+      "filename": "markdown_it_py-4.2.0-py3-none-any.whl",
+      "relativePath": "runtime/bundled/python-wheels/markdown_it_py-4.2.0-py3-none-any.whl",
+      "bytes": 91687,
+      "sha256": "9f7ebbcd14fe59494226453aed97c1070d83f8d24b6fc3a3bcf9a38092641c4a",
+      "tags": [
+        "py3-none-any"
+      ]
+    },
+    {
       "package": "matplotlib",
       "normalizedPackage": "matplotlib",
       "version": "3.11.1",
@@ -265,6 +373,18 @@
       ]
     },
     {
+      "package": "mdurl",
+      "normalizedPackage": "mdurl",
+      "version": "0.1.2",
+      "filename": "mdurl-0.1.2-py3-none-any.whl",
+      "relativePath": "runtime/bundled/python-wheels/mdurl-0.1.2-py3-none-any.whl",
+      "bytes": 9979,
+      "sha256": "84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8",
+      "tags": [
+        "py3-none-any"
+      ]
+    },
+    {
       "package": "mini-racer",
       "normalizedPackage": "mini-racer",
       "version": "0.14.1",
@@ -274,6 +394,42 @@
       "sha256": "4abd58c62c9955988dbc0cbf5a798914334fe570d2b192f8890bec20135ab6d1",
       "tags": [
         "py3-none-win_amd64"
+      ]
+    },
+    {
+      "package": "moderngl",
+      "normalizedPackage": "moderngl",
+      "version": "5.12.0",
+      "filename": "moderngl-5.12.0-cp312-cp312-win_amd64.whl",
+      "relativePath": "runtime/bundled/python-wheels/moderngl-5.12.0-cp312-cp312-win_amd64.whl",
+      "bytes": 108525,
+      "sha256": "8698a59ad03539a2982125b7998efc1c107ba31d5d03437b6fcd72cb2c226922",
+      "tags": [
+        "cp312-cp312-win_amd64"
+      ]
+    },
+    {
+      "package": "moderngl-window",
+      "normalizedPackage": "moderngl-window",
+      "version": "3.1.1",
+      "filename": "moderngl_window-3.1.1-py3-none-any.whl",
+      "relativePath": "runtime/bundled/python-wheels/moderngl_window-3.1.1-py3-none-any.whl",
+      "bytes": 382381,
+      "sha256": "e3b3ac2b4e23afcbfdac1971318a4db893bed3ba6a8fbde3367b1226af39b2e5",
+      "tags": [
+        "py3-none-any"
+      ]
+    },
+    {
+      "package": "networkx",
+      "normalizedPackage": "networkx",
+      "version": "3.7",
+      "filename": "networkx-3.7-py3-none-any.whl",
+      "relativePath": "runtime/bundled/python-wheels/networkx-3.7-py3-none-any.whl",
+      "bytes": 2142205,
+      "sha256": "e3fd2c13a7814cee3746340d8d7f8598a67f16a58bf47fb7f8793fab6efca1b0",
+      "tags": [
+        "py3-none-any"
       ]
     },
     {
@@ -374,6 +530,18 @@
       ]
     },
     {
+      "package": "pycairo",
+      "normalizedPackage": "pycairo",
+      "version": "1.29.2",
+      "filename": "pycairo-1.29.2-cp312-cp312-win_amd64.whl",
+      "relativePath": "runtime/bundled/python-wheels/pycairo-1.29.2-cp312-cp312-win_amd64.whl",
+      "bytes": 846938,
+      "sha256": "b97fd674dea445eae40387353f32665dbe19080a2ef63df97fd81273afc6e9d1",
+      "tags": [
+        "cp312-cp312-win_amd64"
+      ]
+    },
+    {
       "package": "pycparser",
       "normalizedPackage": "pycparser",
       "version": "3.0",
@@ -381,6 +549,55 @@
       "relativePath": "runtime/bundled/python-wheels/pycparser-3.0-py3-none-any.whl",
       "bytes": 48172,
       "sha256": "b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992",
+      "tags": [
+        "py3-none-any"
+      ]
+    },
+    {
+      "package": "pydub",
+      "normalizedPackage": "pydub",
+      "version": "0.25.1",
+      "filename": "pydub-0.25.1-py2.py3-none-any.whl",
+      "relativePath": "runtime/bundled/python-wheels/pydub-0.25.1-py2.py3-none-any.whl",
+      "bytes": 32327,
+      "sha256": "65617e33033874b59d87db603aa1ed450633288aefead953b30bded59cb599a6",
+      "tags": [
+        "py2-none-any",
+        "py3-none-any"
+      ]
+    },
+    {
+      "package": "pyglet",
+      "normalizedPackage": "pyglet",
+      "version": "2.1.16",
+      "filename": "pyglet-2.1.16-py3-none-any.whl",
+      "relativePath": "runtime/bundled/python-wheels/pyglet-2.1.16-py3-none-any.whl",
+      "bytes": 1037857,
+      "sha256": "27f9cabf97a64b15d335cf70d9e8979bbab5f84a9900a058206bcd3a2de341ae",
+      "tags": [
+        "py3-none-any"
+      ]
+    },
+    {
+      "package": "pyglm",
+      "normalizedPackage": "pyglm",
+      "version": "2.8.3",
+      "filename": "pyglm-2.8.3-cp312-cp312-win_amd64.whl",
+      "relativePath": "runtime/bundled/python-wheels/pyglm-2.8.3-cp312-cp312-win_amd64.whl",
+      "bytes": 1663004,
+      "sha256": "5f7ff6f4ac14b092d897931b9ef76bb8108b5faa6f5118963c9de86c6fa18efc",
+      "tags": [
+        "cp312-cp312-win_amd64"
+      ]
+    },
+    {
+      "package": "Pygments",
+      "normalizedPackage": "pygments",
+      "version": "2.21.0",
+      "filename": "pygments-2.21.0-py3-none-any.whl",
+      "relativePath": "runtime/bundled/python-wheels/pygments-2.21.0-py3-none-any.whl",
+      "bytes": 1250147,
+      "sha256": "2363c69b61c4a97c838da3b130dcd6468f4848992b21a82f2a63ec34377137d9",
       "tags": [
         "py3-none-any"
       ]
@@ -483,6 +700,30 @@
       ]
     },
     {
+      "package": "rich",
+      "normalizedPackage": "rich",
+      "version": "15.0.0",
+      "filename": "rich-15.0.0-py3-none-any.whl",
+      "relativePath": "runtime/bundled/python-wheels/rich-15.0.0-py3-none-any.whl",
+      "bytes": 310654,
+      "sha256": "33bd4ef74232fb73fe9279a257718407f169c09b78a87ad3d296f548e27de0bb",
+      "tags": [
+        "py3-none-any"
+      ]
+    },
+    {
+      "package": "scipy",
+      "normalizedPackage": "scipy",
+      "version": "1.18.1",
+      "filename": "scipy-1.18.1-cp312-cp312-win_amd64.whl",
+      "relativePath": "runtime/bundled/python-wheels/scipy-1.18.1-cp312-cp312-win_amd64.whl",
+      "bytes": 36658278,
+      "sha256": "5e4d44984abc0020154ea81b247adeddcc3ac5527b975ff798bd1ba0adc513c2",
+      "tags": [
+        "cp312-cp312-win_amd64"
+      ]
+    },
+    {
       "package": "scrapling",
       "normalizedPackage": "scrapling",
       "version": "0.4.15",
@@ -490,6 +731,18 @@
       "relativePath": "runtime/bundled/python-wheels/scrapling-0.4.15-py3-none-any.whl",
       "bytes": 180463,
       "sha256": "ae66bde9f63afb793ad6f93bd76b451e29f1631347465a553c4e7765c0ecc1f2",
+      "tags": [
+        "py3-none-any"
+      ]
+    },
+    {
+      "package": "screeninfo",
+      "normalizedPackage": "screeninfo",
+      "version": "0.8.1",
+      "filename": "screeninfo-0.8.1-py3-none-any.whl",
+      "relativePath": "runtime/bundled/python-wheels/screeninfo-0.8.1-py3-none-any.whl",
+      "bytes": 12907,
+      "sha256": "e97d6b173856edcfa3bd282f81deb528188aff14b11ec3e195584e7641be733c",
       "tags": [
         "py3-none-any"
       ]
@@ -508,6 +761,18 @@
       ]
     },
     {
+      "package": "skia-pathops",
+      "normalizedPackage": "skia-pathops",
+      "version": "0.9.2",
+      "filename": "skia_pathops-0.9.2-cp310-abi3-win_amd64.whl",
+      "relativePath": "runtime/bundled/python-wheels/skia_pathops-0.9.2-cp310-abi3-win_amd64.whl",
+      "bytes": 1782901,
+      "sha256": "9ae72d801b5f4c5dbb937fb25476a12fa2da70860f28dd637da2b529dbd8271c",
+      "tags": [
+        "cp310-abi3-win_amd64"
+      ]
+    },
+    {
       "package": "soupsieve",
       "normalizedPackage": "soupsieve",
       "version": "2.9.2",
@@ -516,6 +781,31 @@
       "bytes": 37370,
       "sha256": "8089a26fd974ca7a1f30276d3d8492ab266ab15af581642dfe8aa162e0c1c823",
       "tags": [
+        "py3-none-any"
+      ]
+    },
+    {
+      "package": "srt",
+      "normalizedPackage": "srt",
+      "version": "3.5.3",
+      "filename": "srt-3.5.3-py3-none-any.whl",
+      "relativePath": "runtime/bundled/python-wheels/srt-3.5.3-py3-none-any.whl",
+      "bytes": 22639,
+      "sha256": "470ec0a07a67ebdd9cfc016daa13d47c12e472fdb6f05ae9672bd0374c53c221",
+      "tags": [
+        "py3-none-any"
+      ]
+    },
+    {
+      "package": "svgelements",
+      "normalizedPackage": "svgelements",
+      "version": "1.9.6",
+      "filename": "svgelements-1.9.6-py2.py3-none-any.whl",
+      "relativePath": "runtime/bundled/python-wheels/svgelements-1.9.6-py2.py3-none-any.whl",
+      "bytes": 137856,
+      "sha256": "8a5cf2cc066d98e713d5b875b1d6e5eeb9b92e855e835ebd7caab2713ae1dcad",
+      "tags": [
+        "py2-none-any",
         "py3-none-any"
       ]
     },
@@ -606,6 +896,18 @@
       ]
     },
     {
+      "package": "watchdog",
+      "normalizedPackage": "watchdog",
+      "version": "6.0.0",
+      "filename": "watchdog-6.0.0-py3-none-win_amd64.whl",
+      "relativePath": "runtime/bundled/python-wheels/watchdog-6.0.0-py3-none-win_amd64.whl",
+      "bytes": 79070,
+      "sha256": "cbafb470cf848d93b5d013e2ecb245d4aa1c8fd0504e863ccefa32445359d680",
+      "tags": [
+        "py3-none-win_amd64"
+      ]
+    },
+    {
       "package": "webencodings",
       "normalizedPackage": "webencodings",
       "version": "0.6.1",
@@ -646,11 +948,14 @@
   "transitiveClosure": {
     "required": true,
     "complete": true,
-    "wheelCount": 52,
-    "verification": "All generated wheels are hashed and represented in the generated lock."
+    "wheelCount": 77,
+    "verification": "Every package referenced by the main Python lock and Manim lock resolves to a SHA-256-pinned wheel in the bundled wheelhouse."
   },
   "materializeScript": "runtime/materialize-python-wheelhouse.ps1",
   "materializeCommand": "powershell -ExecutionPolicy Bypass -File runtime/materialize-python-wheelhouse.ps1 -OutputRoot runtime/bundled/python-build -FindLinks runtime/bundled/python-wheels",
-  "policy": "Bundled release media for Windows x64 / CPython 3.12. Every wheel is present under runtime/bundled/python-wheels and represented in the hashed lock.",
-  "bundledMedia": true
+  "policy": "Bundled release media for Windows x64 / CPython 3.12. Main Python packages and the isolated Manim environment are pinned by separate hashed lock files; all required wheels are present in runtime/bundled/python-wheels.",
+  "bundledMedia": true,
+  "additionalLocks": [
+    "runtime/bundled/manim-requirements.lock"
+  ]
 }

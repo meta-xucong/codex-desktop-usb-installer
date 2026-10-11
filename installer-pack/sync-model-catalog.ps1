@@ -12,6 +12,9 @@ $profileFull = [IO.Path]::GetFullPath($TargetUserProfile).TrimEnd('\')
 $catalogSource = Join-Path $PackRoot 'model-catalog.json'
 $catalogTarget = Join-Path $KitHome 'model-catalog.json'
 $configPath = Join-Path $profileFull '.codex\config.toml'
+$backupRoot = Join-Path $KitHome 'backups'
+$beginMarker = '# BEGIN CODEX-STARTER-KIT MODEL POLICY v1'
+$endMarker = '# END CODEX-STARTER-KIT MODEL POLICY v1'
 
 if (-not (Test-Path -LiteralPath $catalogSource -PathType Leaf)) { throw "Model catalog is missing: $catalogSource" }
 
@@ -89,6 +92,8 @@ $activeIds = @($catalog.models | Where-Object {
         [string]$_.visibility -eq 'list' -and
         -not $retiredSeen.Contains([string]$_.id)
     } | ForEach-Object { [string]$_.id })
+$catalogById = @{}
+foreach ($model in @($catalog.models)) { $catalogById[[string]$model.id] = $model }
 $catalogText = ($catalog | ConvertTo-Json -Depth 8) + [Environment]::NewLine
 if ($catalogText -match '(?i)(model_messages|persistent_instructions|instructions_template|api[_-]?key|app[_-]?secret|access[_-]?token|password|bearer)') {
     throw 'Model catalog contains runtime instructions or credential-like fields.'
@@ -113,22 +118,27 @@ if (Test-Path -LiteralPath $catalogTarget -PathType Leaf) {
     $catalogChanged = $existingCatalog -ne $catalogText
 }
 if ($catalogChanged) {
-    # This is installer-owned discovery metadata, not capability evidence or
-    # permission to select a model. User configuration is never changed here.
+    # The catalog is installer-owned policy, not user state. Replace it on
+    # every install/repair so a capability-pack upgrade cannot leave an older
+    # model list behind. The atomic writer prevents a half-written JSON file
+    # from being observed by a concurrent Codex launch.
     $plannedActions += [ordered]@{ action = 'write'; kind = 'model-catalog'; path = $catalogTarget }
     if ($PSCmdlet.ShouldProcess($catalogTarget, 'Write the synchronized model catalog')) {
         Write-Utf8NoBom $catalogTarget $catalogText
     }
 }
 
-# The bundled snapshot is not proof that a model is usable by this account.
-# Keep every existing user setting, including old managed blocks, unchanged.
+$changed = $false
+$configWouldChange = $false
+$migration = 'preserved-active-model'
 if (Test-Path -LiteralPath $configPath -PathType Leaf) {
     $existing = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8
 } else {
     $existing = ''
 }
-$lines = @($existing -split '\r?\n')
+$managedPattern = '(?ms)^' + [regex]::Escape($beginMarker) + '\r?\n.*?^' + [regex]::Escape($endMarker) + '\r?\n?'
+$withoutManaged = [regex]::Replace($existing, $managedPattern, '')
+$lines = @($withoutManaged -split '\r?\n')
 $firstTable = -1
 for ($index = 0; $index -lt $lines.Count; $index++) {
     if ([string]$lines[$index] -match '^\s*\[') { $firstTable = $index; break }
@@ -143,20 +153,67 @@ for ($index = 0; $index -lt $rootEnd; $index++) {
     }
     if ($match.Success) { $modelLineIndex = $index; $currentModel = $match.Groups['id'].Value; break }
 }
-# No fallback, retirement migration, or default-model write is authorized by
-# this metadata sync. Only the native verified-ready path may choose defaults.
-$migration = if ($null -eq $currentModel) { 'default-selection-deferred' } else { 'preserved-existing-model' }
+$currentKnownModel = $null
+if ($null -ne $currentModel -and $catalogById.ContainsKey($currentModel)) { $currentKnownModel = $catalogById[$currentModel] }
+$isRetired = $null -ne $currentModel -and $retiredSeen.Contains($currentModel)
+$isUnavailableOfficialModel = $null -ne $currentKnownModel -and (([string]$currentKnownModel.visibility -eq 'hide') -or $currentKnownModel.supportedInApi -eq $false)
+$shouldSetPreferred = $modelLineIndex -lt 0 -or $isRetired -or $isUnavailableOfficialModel
+if ($shouldSetPreferred) {
+    $modelLine = 'model = "' + [string]$catalog.preferredModel + '"'
+    $policyLines = @($beginMarker, $modelLine, $endMarker)
+    if ($modelLineIndex -ge 0) {
+        $prefix = if ($modelLineIndex -gt 0) { @($lines[0..($modelLineIndex - 1)]) } else { @() }
+        $suffix = if (($modelLineIndex + 1) -lt $lines.Count) { @($lines[($modelLineIndex + 1)..($lines.Count - 1)]) } else { @() }
+        $lines = $prefix + $policyLines + $suffix
+    } elseif ($firstTable -ge 0) {
+        $prefix = if ($firstTable -gt 0) { @($lines[0..($firstTable - 1)]) } else { @() }
+        $suffix = @($lines[$firstTable..($lines.Count - 1)])
+        $lines = $prefix + $policyLines + @('') + $suffix
+    } else {
+        $lines = $policyLines + @('') + $lines
+    }
+    $newContent = ($lines -join [Environment]::NewLine).TrimEnd() + [Environment]::NewLine
+    if ($newContent -ne $existing) {
+        $configWouldChange = $true
+        $migration = if ($isRetired) { 'retired-model-migrated' } elseif ($isUnavailableOfficialModel) { 'unavailable-official-model-migrated' } else { 'preferred-model-added' }
+        if (Test-Path -LiteralPath $configPath -PathType Leaf) {
+            $plannedActions += [ordered]@{ action = 'backup'; kind = 'config'; path = $backupRoot }
+        }
+        $plannedActions += [ordered]@{ action = 'write'; kind = 'config'; path = $configPath }
+        if ($PSCmdlet.ShouldProcess($configPath, 'Write the managed Codex model policy')) {
+            New-Item -ItemType Directory -Force -Path $backupRoot | Out-Null
+            if (Test-Path -LiteralPath $configPath -PathType Leaf) {
+                $backup = Join-Path $backupRoot ('config.toml.model-sync.' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ') + '.bak')
+                Copy-Item -LiteralPath $configPath -Destination $backup -Force
+            }
+            $python = $PythonExe
+            if (-not [string]::IsNullOrWhiteSpace($python) -and (Test-Path -LiteralPath $python -PathType Leaf)) {
+                $tempConfig = Join-Path ([IO.Path]::GetTempPath()) ('codex-model-config-' + [guid]::NewGuid().ToString('N') + '.toml')
+                try {
+                    [IO.File]::WriteAllText($tempConfig, $newContent, $utf8NoBom)
+                    & $python -c "import pathlib,sys,tomllib; tomllib.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8-sig'))" $tempConfig
+                    if ($LASTEXITCODE -ne 0) { throw 'Model policy produced invalid TOML.' }
+                } finally {
+                    if (Test-Path -LiteralPath $tempConfig -PathType Leaf) { Remove-Item -LiteralPath $tempConfig -Force }
+                }
+            }
+            Write-Utf8NoBom $configPath $newContent
+            $changed = $true
+        }
+    }
+} elseif ($null -eq $currentModel) {
+    $migration = 'preferred-model-added'
+}
 
 [ordered]@{
     schemaVersion = 1
     status = if ($whatIfMode) { 'planned' } else { 'ready' }
-    preferredModel = $null
-    modelSelectionStatus = 'deferred-until-verified'
+    preferredModel = [string]$catalog.preferredModel
     currentModel = $currentModel
     activeModelCount = @($activeIds).Count
     retiredModelIds = $retiredIds
     migration = $migration
-    configChanged = $false
+    configChanged = if ($whatIfMode) { $configWouldChange } else { $changed }
     catalogChanged = $catalogChanged
     catalogPath = $catalogTarget
     configPath = $configPath

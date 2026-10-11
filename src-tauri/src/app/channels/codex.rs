@@ -5,8 +5,9 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -34,11 +35,14 @@ pub const DEFAULT_CODEX_PAYLOAD_REPO: &str = "Wangnov/codex-app-mirror";
 
 const STAGING_DIR: &str = ".staging";
 const TRANSACTION_PREFIX: &str = "codex-update-";
+const OWNER_SIDECAR_PREFIX: &str = ".codex-update-";
+const OWNER_SIDECAR_SUFFIX: &str = ".owner.json";
 const SHA256SUMS_NAME: &str = "SHA256SUMS.txt";
 const ROOT_MANIFEST_NAME: &str = "manifest.json";
 const USB_MANIFEST_NAME: &str = "usb-manifest.json";
 const USB_LICENSE_NAME: &str = "usb-license.json";
 const TRANSACTION_VERSION: u32 = 1;
+const MAX_TRANSACTION_STATE_BYTES: u64 = 64 * 1024;
 const SOURCE_METADATA_ATTEMPTS: usize = 2;
 const SOURCE_METADATA_RETRY_DELAY_MS: u64 = 450;
 // Auto only probes the Wangnov-compatible Codex payload chain.  Keep the
@@ -196,6 +200,37 @@ struct CodexUpdatePayload {
 struct TransactionState {
     version: u32,
     phase: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recovery: Option<RecoveryTransactionState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner: Option<TransactionOwner>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TransactionOwner {
+    transaction_id: String,
+    installation_id: String,
+    license_signature_sha256: String,
+    fingerprint_sha256: String,
+    #[serde(default, skip_serializing)]
+    legacy_bundle_root: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RecoveryTransactionState {
+    prior_payload_missing: bool,
+    transaction_id: String,
+    installation_id: String,
+    license_signature_sha256: String,
+    fingerprint_sha256: String,
+    fingerprint: crate::app::usb_guard::UsbFingerprint,
+    target_relative_path: String,
+    #[serde(default)]
+    staged_payload_sha256: Option<String>,
+    #[serde(default, skip_serializing)]
+    legacy_bundle_root: Option<String>,
 }
 
 struct StagedCommit<'a> {
@@ -208,6 +243,8 @@ struct StagedCommit<'a> {
     actual_sha: &'a str,
     total: u64,
     progress: &'a dyn Fn(u64, u64),
+    reactivation_reinstall: bool,
+    deferred_cleanup: &'a mut Option<crate::app::usb_guard::DeferredRevocationCleanup>,
 }
 
 type DownloadFn = dyn Fn(&str, &Path, u64, &dyn Fn(u64)) -> Result<(), String>;
@@ -1362,7 +1399,7 @@ fn require_sha256(value: Option<&serde_json::Value>, label: &str) -> Result<Stri
 }
 
 fn require_capability(bundle_root: &Path) -> Result<LocalBundle, AppError> {
-    require_capability_impl(bundle_root, true)
+    require_capability_impl(bundle_root, true, false)
 }
 
 /// Read and validate the immutable capability metadata without doing the
@@ -1371,12 +1408,20 @@ fn require_capability(bundle_root: &Path) -> Result<LocalBundle, AppError> {
 /// removable-drive full-file read.  The caller must perform the full
 /// SHA256SUMS verification before treating the bundle as trusted.
 fn require_capability_metadata(bundle_root: &Path) -> Result<LocalBundle, AppError> {
-    require_capability_impl(bundle_root, false)
+    require_capability_impl(bundle_root, false, false)
+}
+
+/// Read capability metadata for the single authenticated reactivation path.
+/// The only relaxed condition is that the manifest-declared MSIX file may be
+/// absent; all manifest fields and the exact path remain validated.
+fn require_capability_metadata_for_reinstall(bundle_root: &Path) -> Result<LocalBundle, AppError> {
+    require_capability_impl(bundle_root, false, true)
 }
 
 fn require_capability_impl(
     bundle_root: &Path,
     verify_payload_hash: bool,
+    allow_missing_payload: bool,
 ) -> Result<LocalBundle, AppError> {
     reject_reparse(bundle_root)?;
     for name in [ROOT_MANIFEST_NAME, USB_MANIFEST_NAME, SHA256SUMS_NAME] {
@@ -1384,16 +1429,7 @@ fn require_capability_impl(
     }
     let manifest = read_json(&bundle_root.join(ROOT_MANIFEST_NAME), ROOT_MANIFEST_NAME)?;
     let usb_manifest = read_json(&bundle_root.join(USB_MANIFEST_NAME), USB_MANIFEST_NAME)?;
-    if exact_u64(manifest.get("schemaVersion"), "root manifest.schemaVersion")? != 2
-        || exact_u64(
-            usb_manifest.get("schemaVersion"),
-            "usb-manifest.schemaVersion",
-        )? != 2
-    {
-        return Err(AppError::Engine(
-            "此 U 盘包不是支持 Codex 更新的清单格式，请重建并重新授权".to_string(),
-        ));
-    }
+    let _manifest_schema = require_supported_manifest_schemas(&manifest, &usb_manifest)?;
     let root_capability = manifest
         .get("updateCapability")
         .and_then(serde_json::Value::as_object)
@@ -1491,26 +1527,30 @@ fn require_capability_impl(
     let payload_path =
         bundle_root.join(payload_relative.replace('/', std::path::MAIN_SEPARATOR_STR));
     reject_reparse_chain(&payload_path)?;
-    if !regular_file_exists(&payload_path)? {
+    let payload_exists = regular_file_exists(&payload_path)?;
+    if !payload_exists && !(allow_missing_payload && !payload_path.exists()) {
         return Err(AppError::Engine(
             "Codex payload 不存在或不是普通文件".to_string(),
         ));
     }
-    let actual_payload_size = fs::metadata(&payload_path)
-        .map_err(|error| AppError::Engine(format!("读取 payload 大小失败: {error}")))?
-        .len();
-    if actual_payload_size != manifest_payload_size {
-        return Err(AppError::Engine(
-            "当前 payload 大小与 manifest 不一致".to_string(),
-        ));
-    }
-    if verify_payload_hash {
-        let actual_payload_sha = sha256_file(&payload_path)
-            .map_err(|error| AppError::Engine(format!("计算当前 payload SHA256 失败: {error}")))?;
-        if !actual_payload_sha.eq_ignore_ascii_case(&manifest_payload_sha) {
+    if payload_exists {
+        let actual_payload_size = fs::metadata(&payload_path)
+            .map_err(|error| AppError::Engine(format!("读取 payload 大小失败: {error}")))?
+            .len();
+        if actual_payload_size != manifest_payload_size {
             return Err(AppError::Engine(
-                "当前 payload SHA256 与 manifest 不一致".to_string(),
+                "当前 payload 大小与 manifest 不一致".to_string(),
             ));
+        }
+        if verify_payload_hash {
+            let actual_payload_sha = sha256_file(&payload_path).map_err(|error| {
+                AppError::Engine(format!("计算当前 payload SHA256 失败: {error}"))
+            })?;
+            if !actual_payload_sha.eq_ignore_ascii_case(&manifest_payload_sha) {
+                return Err(AppError::Engine(
+                    "当前 payload SHA256 与 manifest 不一致".to_string(),
+                ));
+            }
         }
     }
     let installer = usb_manifest
@@ -1539,6 +1579,30 @@ fn require_capability_impl(
         architecture,
         current_version,
     })
+}
+
+fn require_supported_manifest_schemas(
+    root: &serde_json::Value,
+    usb: &serde_json::Value,
+) -> Result<u64, AppError> {
+    let root_schema = exact_u64(root.get("schemaVersion"), "root manifest.schemaVersion")?;
+    let usb_schema = exact_u64(usb.get("schemaVersion"), "usb-manifest.schemaVersion")?;
+    if !matches!(root_schema, 2 | 3) || root_schema != usb_schema {
+        return Err(AppError::Engine(
+            "root and USB manifest schema versions do not match or are unsupported".to_string(),
+        ));
+    }
+    if root_schema == 3
+        && root
+            .pointer("/revocationPolicy/registrationRequired")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+    {
+        return Err(AppError::Engine(
+            "schema 3 root manifest must require registration".to_string(),
+        ));
+    }
+    Ok(root_schema)
 }
 
 #[cfg(test)]
@@ -1701,7 +1765,7 @@ fn require_local_snapshot_from_digests(
     Ok(())
 }
 
-fn pending_transaction_dirs(bundle_root: &Path) -> Result<Vec<PathBuf>, AppError> {
+pub(crate) fn pending_transaction_dirs(bundle_root: &Path) -> Result<Vec<PathBuf>, AppError> {
     let staging = bundle_root.join(STAGING_DIR);
     if !staging.exists() {
         return Ok(Vec::new());
@@ -1726,6 +1790,24 @@ fn pending_transaction_dirs(bundle_root: &Path) -> Result<Vec<PathBuf>, AppError
                 return Err(AppError::Engine("发现未知事务目录，拒绝继续".to_string()));
             }
             result.push(entry.path());
+        } else if entry
+            .file_type()
+            .map_err(|error| AppError::Engine(error.to_string()))?
+            .is_file()
+            && parse_owner_sidecar_name(&entry.file_name().to_string_lossy()).is_some()
+        {
+            reject_reparse_chain(&entry.path())?;
+            let bytes = read_bounded_transaction_state_file(&entry.path())?
+                .ok_or_else(|| AppError::Engine("owner sidecar 在读取期间消失".to_string()))?;
+            let owner: TransactionOwner = serde_json::from_slice(&bytes)
+                .map_err(|error| AppError::Engine(format!("事务 owner sidecar 无效：{error}")))?;
+            let sidecar_id = parse_owner_sidecar_name(&entry.file_name().to_string_lossy())
+                .expect("checked exact owner sidecar name");
+            if owner.transaction_id != sidecar_id {
+                return Err(AppError::Engine(
+                    "事务 owner sidecar 与其文件名 ID 不一致".to_string(),
+                ));
+            }
         } else {
             return Err(AppError::Engine(
                 "事务目录包含未知文件，拒绝继续".to_string(),
@@ -1735,35 +1817,673 @@ fn pending_transaction_dirs(bundle_root: &Path) -> Result<Vec<PathBuf>, AppError
     Ok(result)
 }
 
-fn write_transaction_state(tx: &Path, phase: &str) -> Result<(), AppError> {
-    let bytes = serde_json::to_vec(&TransactionState {
-        version: TRANSACTION_VERSION,
-        phase: phase.to_string(),
-    })
-    .map_err(|error| AppError::Engine(format!("序列化事务状态失败: {error}")))?;
-    reject_reparse_chain(tx)?;
-    crate::app::atomic_file::write_atomic(&tx.join("state.json"), &bytes)
-        .map_err(|error| AppError::Engine(format!("原子写入事务状态失败: {error}")))
+fn owner_sidecar_name(transaction_id: &str) -> String {
+    format!("{OWNER_SIDECAR_PREFIX}{transaction_id}{OWNER_SIDECAR_SUFFIX}")
 }
 
-fn read_transaction_state(tx: &Path) -> Result<TransactionState, AppError> {
-    let state_path = tx.join("state.json");
-    reject_reparse_chain(&state_path)?;
-    let backup_path = crate::app::atomic_file::backup_path(&state_path);
-    if backup_path.exists() {
-        reject_reparse_chain(&backup_path)?;
+fn owner_sidecar_path(staging: &Path, transaction_id: &str) -> PathBuf {
+    staging.join(owner_sidecar_name(transaction_id))
+}
+
+fn parse_owner_sidecar_name(name: &str) -> Option<String> {
+    let transaction_id = name
+        .strip_prefix(OWNER_SIDECAR_PREFIX)?
+        .strip_suffix(OWNER_SIDECAR_SUFFIX)?;
+    let parsed = uuid::Uuid::parse_str(transaction_id).ok()?;
+    (parsed.to_string() == transaction_id).then(|| transaction_id.to_string())
+}
+
+fn write_owner_sidecar(staging: &Path, owner: &TransactionOwner) -> Result<(), AppError> {
+    let path = owner_sidecar_path(staging, &owner.transaction_id);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {
+            return Err(AppError::Engine(
+                "事务 owner sidecar 已存在，拒绝覆盖".to_string(),
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(AppError::Engine(error.to_string())),
     }
-    let (state, outcome) =
-        crate::app::atomic_file::read_with_recovery::<TransactionState>(&state_path);
-    let state = state.ok_or_else(|| {
+    let bytes = serde_json::to_vec(owner)
+        .map_err(|error| AppError::Engine(format!("序列化事务 owner sidecar 失败：{error}")))?;
+    if bytes.len() as u64 > MAX_TRANSACTION_STATE_BYTES {
+        return Err(AppError::Engine(
+            "事务 owner sidecar 超过安全大小上限".to_string(),
+        ));
+    }
+    crate::app::atomic_file::write_atomic(&path, &bytes)
+        .map_err(|error| AppError::Engine(format!("写入事务 owner sidecar 失败：{error}")))?;
+    let readback = read_bounded_transaction_state_file(&path)?
+        .ok_or_else(|| AppError::Engine("事务 owner sidecar 写入后缺失".to_string()))?;
+    let verified: TransactionOwner = serde_json::from_slice(&readback)
+        .map_err(|error| AppError::Engine(format!("事务 owner sidecar 回读失败：{error}")))?;
+    if verified != *owner {
+        return Err(AppError::Engine(
+            "事务 owner sidecar 回读身份不匹配".to_string(),
+        ));
+    }
+    let backup = crate::app::atomic_file::backup_path(&path);
+    if backup.exists() {
+        reject_reparse_chain(&backup)?;
+        fs::remove_file(backup).map_err(|error| {
+            AppError::Engine(format!("清理事务 owner sidecar 备份失败：{error}"))
+        })?;
+    }
+    Ok(())
+}
+
+fn remove_owner_sidecar_after_transaction(
+    bundle_root: &Path,
+    transaction_id: &str,
+    expected_owner: Option<&TransactionOwner>,
+) -> Result<(), AppError> {
+    let staging = bundle_root.join(STAGING_DIR);
+    let transaction = staging.join(format!("{TRANSACTION_PREFIX}{transaction_id}"));
+    if transaction.exists() {
+        return Err(AppError::Engine(
+            "Codex 更新事务目录仍存在；保留 owner sidecar 供重试".to_string(),
+        ));
+    }
+    let sidecar = owner_sidecar_path(&staging, transaction_id);
+    let Some(bytes) = read_bounded_transaction_state_file(&sidecar)? else {
+        return Ok(());
+    };
+    let actual: TransactionOwner = serde_json::from_slice(&bytes)
+        .map_err(|error| AppError::Engine(format!("事务 owner sidecar 无效：{error}")))?;
+    if actual.transaction_id != transaction_id
+        || expected_owner.is_some_and(|expected| expected != &actual)
+    {
+        return Err(AppError::Engine(
+            "事务 owner sidecar 与已完成事务身份不匹配；保留供重试".to_string(),
+        ));
+    }
+    reject_reparse_chain(&sidecar)?;
+    fs::remove_file(&sidecar)
+        .map_err(|error| AppError::Engine(format!("清理事务 owner sidecar 失败：{error}")))?;
+    Ok(())
+}
+
+/// Return only update transactions whose bounded owner marker is bound to the
+/// currently validated USB license and fingerprint. Revocation cleanup uses
+/// this stricter inventory; ordinary updater recovery keeps the legacy v1
+/// behavior above.
+pub(crate) fn revocation_transaction_dirs(
+    bundle_root: &Path,
+    license: &crate::app::usb_guard::UsbLicense,
+    fingerprint: &crate::app::usb_guard::UsbFingerprint,
+    pinned_root: &crate::app::uninstall_cleanup::RevocationCleanupRoot,
+) -> Result<Vec<crate::app::uninstall_cleanup::PinnedRevocationTransaction>, AppError> {
+    pinned_root
+        .validate_identity(bundle_root, fingerprint)
+        .map_err(AppError::Engine)?;
+    if !codex_usb_license::fingerprints_match(fingerprint, &license.fingerprint) {
+        return Err(AppError::Engine(
+            "Codex 更新事务的 USB 指纹与许可证不一致".to_string(),
+        ));
+    }
+    let expected_license_sha = codex_usb_license::license_signature_sha256(license)
+        .map_err(|error| AppError::Engine(format!("计算许可证签名摘要失败：{error}")))?;
+    let expected_fingerprint_sha = codex_usb_license::fingerprint_digest(fingerprint)
+        .map_err(|error| AppError::Engine(format!("计算 USB 指纹摘要失败：{error}")))?;
+    let Some(staging) = pinned_root
+        .open_pinned_entry(STAGING_DIR)
+        .map_err(AppError::Engine)?
+    else {
+        return Ok(Vec::new());
+    };
+    if !staging.is_directory().map_err(AppError::Engine)? {
+        return Err(AppError::Engine("U 盘事务路径不是目录".to_string()));
+    }
+    let names = staging.list_names().map_err(AppError::Engine)?;
+    if names.len() > 512 {
+        return Err(AppError::Engine("U 盘事务项目超过数量上限".to_string()));
+    }
+    let (transaction_ids, sidecar_ids) = inventory_revocation_staging_names(&names)?;
+
+    let mut result = Vec::new();
+    for transaction_id in transaction_ids.iter() {
+        let dir_name = format!("{TRANSACTION_PREFIX}{transaction_id}");
+        let sidecar_name = owner_sidecar_name(transaction_id);
+        let sidecar = staging
+            .open_child(&sidecar_name)
+            .map_err(AppError::Engine)?
+            .ok_or_else(|| AppError::Engine("事务 owner sidecar 在核验期间消失".to_string()))?;
+        if sidecar.is_directory().map_err(AppError::Engine)? {
+            return Err(AppError::Engine(
+                "事务 owner sidecar 不能是目录".to_string(),
+            ));
+        }
+        let owner_bytes = sidecar
+            .read_bounded(MAX_TRANSACTION_STATE_BYTES as usize)
+            .map_err(AppError::Engine)?;
+        let owner: TransactionOwner = serde_json::from_slice(&owner_bytes)
+            .map_err(|error| AppError::Engine(format!("事务 owner sidecar 无效：{error}")))?;
+        if !transaction_owner_matches(
+            &owner,
+            transaction_id,
+            &license.installation_id,
+            &expected_license_sha,
+            &expected_fingerprint_sha,
+        ) {
+            return Err(AppError::Engine(format!(
+                "事务 owner sidecar 与当前 USB 身份不匹配：{dir_name}"
+            )));
+        }
+        let tx_entry = staging
+            .open_child(&dir_name)
+            .map_err(AppError::Engine)?
+            .ok_or_else(|| AppError::Engine("Codex 更新事务在核验期间消失".to_string()))?;
+        if !tx_entry.is_directory().map_err(AppError::Engine)? {
+            return Err(AppError::Engine("Codex 更新事务不是目录".to_string()));
+        }
+        let tree = tx_entry.prepare_delete_tree().map_err(AppError::Engine)?;
+        validate_pinned_transaction_state(&tree, &owner)?;
+        let relative = format!("{STAGING_DIR}/{dir_name}");
+        let staging_ancestor = staging.duplicate().map_err(AppError::Engine)?;
+        result.push(
+            crate::app::uninstall_cleanup::RevocationCleanupRoot::prepare_pinned_transaction(
+                relative,
+                Some(tree),
+                sidecar,
+                staging_ancestor,
+            ),
+        );
+    }
+
+    for transaction_id in sidecar_ids.difference(&transaction_ids) {
+        let sidecar_name = owner_sidecar_name(transaction_id);
+        let sidecar = staging
+            .open_child(&sidecar_name)
+            .map_err(AppError::Engine)?
+            .ok_or_else(|| AppError::Engine("孤儿事务 sidecar 在核验期间消失".to_string()))?;
+        if sidecar.is_directory().map_err(AppError::Engine)? {
+            return Err(AppError::Engine(
+                "事务 owner sidecar 不能是目录".to_string(),
+            ));
+        }
+        let owner_bytes = sidecar
+            .read_bounded(MAX_TRANSACTION_STATE_BYTES as usize)
+            .map_err(AppError::Engine)?;
+        let owner: TransactionOwner = serde_json::from_slice(&owner_bytes)
+            .map_err(|error| AppError::Engine(format!("孤儿事务 owner sidecar 无效：{error}")))?;
+        if !transaction_owner_matches(
+            &owner,
+            transaction_id,
+            &license.installation_id,
+            &expected_license_sha,
+            &expected_fingerprint_sha,
+        ) {
+            return Err(AppError::Engine(format!(
+                "孤儿事务 owner sidecar 与当前 USB 身份不匹配：{sidecar_name}"
+            )));
+        }
+        let relative = format!("{STAGING_DIR}/{TRANSACTION_PREFIX}{transaction_id}");
+        if pinned_root
+            .exists_relative(&relative)
+            .map_err(AppError::Engine)?
+        {
+            return Err(AppError::Engine(
+                "事务目录与 sidecar inventory 不一致，拒绝远程清理".to_string(),
+            ));
+        }
+        let staging_ancestor = staging.duplicate().map_err(AppError::Engine)?;
+        result.push(
+            crate::app::uninstall_cleanup::RevocationCleanupRoot::prepare_pinned_transaction(
+                relative,
+                None,
+                sidecar,
+                staging_ancestor,
+            ),
+        );
+    }
+    Ok(result)
+}
+
+fn parse_transaction_dir_name(name: &str) -> Option<String> {
+    let transaction_id = name.strip_prefix(TRANSACTION_PREFIX)?;
+    let parsed = uuid::Uuid::parse_str(transaction_id).ok()?;
+    (parsed.to_string() == transaction_id).then(|| transaction_id.to_string())
+}
+
+fn partition_revocation_staging_names(
+    names: &[String],
+) -> Result<(HashSet<String>, HashSet<String>), AppError> {
+    let mut transaction_ids = HashSet::new();
+    let mut sidecar_ids = HashSet::new();
+    for name in names {
+        if let Some(id) = parse_transaction_dir_name(name) {
+            transaction_ids.insert(id);
+        } else if let Some(id) = parse_owner_sidecar_name(name) {
+            sidecar_ids.insert(id);
+        } else {
+            return Err(AppError::Engine(format!(
+                "U 盘事务目录包含未知项，拒绝作废清理：{name}"
+            )));
+        }
+    }
+    Ok((transaction_ids, sidecar_ids))
+}
+
+fn inventory_revocation_staging_names(
+    names: &[String],
+) -> Result<(HashSet<String>, HashSet<String>), AppError> {
+    let (transaction_ids, sidecar_ids) = partition_revocation_staging_names(names)?;
+    validate_revocation_staging_owner_pairs(&transaction_ids, &sidecar_ids)?;
+    Ok((transaction_ids, sidecar_ids))
+}
+
+fn validate_revocation_staging_owner_pairs(
+    transaction_ids: &HashSet<String>,
+    sidecar_ids: &HashSet<String>,
+) -> Result<(), AppError> {
+    for transaction_id in transaction_ids {
+        if !sidecar_ids.contains(transaction_id) {
+            return Err(AppError::Engine(format!(
+                "Codex 更新事务缺少 owner sidecar，拒绝远程清理：{TRANSACTION_PREFIX}{transaction_id}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_pinned_transaction_state(
+    tree: &crate::app::uninstall_cleanup::PreparedRevocationTree,
+    owner: &TransactionOwner,
+) -> Result<(), AppError> {
+    let main = tree
+        .read_relative_bounded("state.json", MAX_TRANSACTION_STATE_BYTES as usize)
+        .map_err(AppError::Engine)?;
+    let backup = tree
+        .read_relative_bounded("state.json.bak", MAX_TRANSACTION_STATE_BYTES as usize)
+        .map_err(AppError::Engine)?;
+    validate_transaction_state_owner_markers(main.as_deref(), backup.as_deref(), owner)
+}
+
+fn validate_transaction_state_owner_markers(
+    main: Option<&[u8]>,
+    backup: Option<&[u8]>,
+    owner: &TransactionOwner,
+) -> Result<(), AppError> {
+    for bytes in [main, backup].into_iter().flatten() {
+        let state: TransactionState = serde_json::from_slice(bytes).map_err(|error| {
+            AppError::Engine(format!(
+                "事务 state marker JSON 无效，拒绝作废清理：{error}"
+            ))
+        })?;
+        if state.version != TRANSACTION_VERSION || state.owner.as_ref() != Some(owner) {
+            return Err(AppError::Engine(
+                "事务 state marker 与 owner sidecar 不一致".to_string(),
+            ));
+        }
+    }
+    // Both absent is a valid partially-created transaction: the sidecar was
+    // atomically written before the transaction directory contents.
+    Ok(())
+}
+
+fn validate_transaction_owner_inventory(
+    canonical_root: &Path,
+    license: &crate::app::usb_guard::UsbLicense,
+    expected_license_sha: &str,
+    expected_fingerprint_sha: &str,
+    transactions: &[PathBuf],
+    mut read_state: impl FnMut(&Path, &str) -> Result<TransactionState, AppError>,
+) -> Result<(), AppError> {
+    for tx in transactions {
+        let name = tx
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| AppError::Engine("Codex 更新事务目录名无效".to_string()))?;
+        let transaction_id = name
+            .strip_prefix(TRANSACTION_PREFIX)
+            .ok_or_else(|| AppError::Engine("Codex 更新事务目录前缀无效".to_string()))?;
+        let parsed = uuid::Uuid::parse_str(transaction_id)
+            .map_err(|_| AppError::Engine("Codex 更新事务目录 ID 无效".to_string()))?;
+        if parsed.to_string() != transaction_id {
+            return Err(AppError::Engine(
+                "Codex 更新事务目录 ID 不是规范 UUID".to_string(),
+            ));
+        }
+        let relative = tx
+            .strip_prefix(canonical_root)
+            .map_err(|_| AppError::Engine("Codex 更新事务目录逃逸 Bundle 根目录".to_string()))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let state = read_state(tx, &relative)?;
+        let owner = state.owner.ok_or_else(|| {
+            AppError::Engine(format!(
+                "Codex 更新事务缺少 owner marker，拒绝远程清理：{}",
+                tx.display()
+            ))
+        })?;
+        if !transaction_owner_matches(
+            &owner,
+            transaction_id,
+            &license.installation_id,
+            expected_license_sha,
+            expected_fingerprint_sha,
+        ) {
+            return Err(AppError::Engine(format!(
+                "Codex 更新事务 owner marker 与当前 USB 身份不匹配，拒绝远程清理：{}",
+                tx.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn transaction_owner_matches(
+    owner: &TransactionOwner,
+    transaction_id: &str,
+    installation_id: &str,
+    license_signature_sha256: &str,
+    fingerprint_sha256: &str,
+) -> bool {
+    owner.transaction_id == transaction_id
+        && owner.installation_id == installation_id
+        && owner
+            .license_signature_sha256
+            .eq_ignore_ascii_case(license_signature_sha256)
+        && owner
+            .fingerprint_sha256
+            .eq_ignore_ascii_case(fingerprint_sha256)
+}
+
+fn recovery_owner_matches(recovery: &RecoveryTransactionState, owner: &TransactionOwner) -> bool {
+    let Ok(fingerprint_sha256) = codex_usb_license::fingerprint_digest(&recovery.fingerprint)
+    else {
+        return false;
+    };
+    recovery.transaction_id == owner.transaction_id
+        && recovery.installation_id == owner.installation_id
+        && recovery
+            .license_signature_sha256
+            .eq_ignore_ascii_case(&owner.license_signature_sha256)
+        && recovery
+            .fingerprint_sha256
+            .eq_ignore_ascii_case(&fingerprint_sha256)
+        && recovery.fingerprint_sha256 == owner.fingerprint_sha256
+        && transaction_owner_matches(
+            owner,
+            &recovery.transaction_id,
+            &recovery.installation_id,
+            &recovery.license_signature_sha256,
+            &recovery.fingerprint_sha256,
+        )
+}
+
+fn read_transaction_state_pinned(
+    pinned_root: &crate::app::uninstall_cleanup::RevocationCleanupRoot,
+    _tx: &Path,
+    relative_tx: &str,
+) -> Result<TransactionState, AppError> {
+    let main_path = format!("{relative_tx}/state.json");
+    let backup_path = format!("{relative_tx}/state.json.bak");
+    let main = pinned_root
+        .read_relative_bounded(&main_path, MAX_TRANSACTION_STATE_BYTES as usize)
+        .map_err(AppError::Engine)?
+        .and_then(|bytes| serde_json::from_slice::<TransactionState>(&bytes).ok());
+    let state = match main {
+        Some(state) => Some(state),
+        None => pinned_root
+            .read_relative_bounded(&backup_path, MAX_TRANSACTION_STATE_BYTES as usize)
+            .map_err(AppError::Engine)?
+            .and_then(|bytes| serde_json::from_slice::<TransactionState>(&bytes).ok()),
+    }
+    .ok_or_else(|| {
         AppError::Engine(format!(
-            "事务状态缺失或损坏，保留事务供人工恢复（状态={outcome:?}）"
+            "固定 Bundle 根句柄下事务状态缺失、损坏或超过 {} 字节上限",
+            MAX_TRANSACTION_STATE_BYTES
         ))
     })?;
     if state.version != TRANSACTION_VERSION {
         return Err(AppError::Engine("事务状态版本不受支持".to_string()));
     }
     Ok(state)
+}
+
+fn transaction_owner_for_authorization(
+    bundle_root: &Path,
+    tx: &Path,
+    authorization: &crate::app::usb_guard::SignedUsbAuthorization,
+) -> Result<TransactionOwner, AppError> {
+    let canonical_root = fs::canonicalize(bundle_root)
+        .map_err(|error| AppError::Engine(format!("解析事务 Bundle 根目录失败：{error}")))?;
+    let tx_name = tx
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| AppError::Engine("Codex 更新事务目录名无效".to_string()))?;
+    let transaction_id = tx_name
+        .strip_prefix(TRANSACTION_PREFIX)
+        .ok_or_else(|| AppError::Engine("Codex 更新事务目录前缀无效".to_string()))?;
+    let parsed = uuid::Uuid::parse_str(transaction_id)
+        .map_err(|_| AppError::Engine("Codex 更新事务目录 ID 无效".to_string()))?;
+    if parsed.to_string() != transaction_id {
+        return Err(AppError::Engine(
+            "Codex 更新事务目录 ID 不是规范 UUID".to_string(),
+        ));
+    }
+    let authorized_root = fs::canonicalize(&authorization.bundle_root)
+        .map_err(|error| AppError::Engine(format!("解析授权 Bundle 根目录失败：{error}")))?;
+    if canonical_root != authorized_root {
+        return Err(AppError::Engine(
+            "Codex 更新事务身份在创建前发生变化".to_string(),
+        ));
+    }
+    let license_path = canonical_root.join(USB_LICENSE_NAME);
+    let license_bytes = read_bounded_transaction_state_file(&license_path)?
+        .ok_or_else(|| AppError::Engine("签名许可证缺失，不能登记更新事务 owner".to_string()))?;
+    let license: crate::app::usb_guard::UsbLicense = serde_json::from_slice(&license_bytes)
+        .map_err(|error| AppError::Engine(format!("签名许可证 JSON 无效：{error}")))?;
+    if license.installation_id != authorization.installation_id
+        || !codex_usb_license::fingerprints_match(&license.fingerprint, &authorization.fingerprint)
+        || !crate::app::usb_guard::validate_license(&license, &authorization.fingerprint)?
+    {
+        return Err(AppError::Engine(
+            "签名许可证与更新事务授权身份不匹配".to_string(),
+        ));
+    }
+    Ok(TransactionOwner {
+        transaction_id: transaction_id.to_string(),
+        installation_id: authorization.installation_id.clone(),
+        license_signature_sha256: codex_usb_license::license_signature_sha256(&license)
+            .map_err(|error| AppError::Engine(format!("计算许可证签名摘要失败：{error}")))?,
+        fingerprint_sha256: codex_usb_license::fingerprint_digest(&authorization.fingerprint)
+            .map_err(|error| AppError::Engine(format!("计算 USB 指纹摘要失败：{error}")))?,
+        legacy_bundle_root: None,
+    })
+}
+
+fn current_license_signature_sha256(
+    bundle_root: &Path,
+    authorization: &crate::app::usb_guard::SignedUsbAuthorization,
+) -> Result<String, AppError> {
+    let license_path = bundle_root.join(USB_LICENSE_NAME);
+    let license_bytes = read_bounded_transaction_state_file(&license_path)?
+        .ok_or_else(|| AppError::Engine("签名许可证缺失，不能登记恢复事务身份".to_string()))?;
+    let license: crate::app::usb_guard::UsbLicense = serde_json::from_slice(&license_bytes)
+        .map_err(|error| AppError::Engine(format!("签名许可证 JSON 无效：{error}")))?;
+    if license.installation_id != authorization.installation_id
+        || !codex_usb_license::fingerprints_match(&license.fingerprint, &authorization.fingerprint)
+        || !crate::app::usb_guard::validate_license(&license, &authorization.fingerprint)?
+    {
+        return Err(AppError::Engine(
+            "签名许可证与恢复事务授权身份不匹配".to_string(),
+        ));
+    }
+    codex_usb_license::license_signature_sha256(&license)
+        .map_err(|error| AppError::Engine(format!("计算许可证签名摘要失败：{error}")))
+}
+
+fn write_transaction_state(tx: &Path, phase: &str) -> Result<(), AppError> {
+    write_transaction_state_with_recovery(tx, phase, None)
+}
+
+fn write_transaction_state_with_recovery(
+    tx: &Path,
+    phase: &str,
+    recovery: Option<RecoveryTransactionState>,
+) -> Result<(), AppError> {
+    let state_path = tx.join("state.json");
+    let owner = if state_path.exists() {
+        read_transaction_state(tx)?.owner
+    } else {
+        None
+    };
+    write_transaction_state_with_owner(tx, phase, recovery, owner)
+}
+
+fn write_transaction_state_with_owner(
+    tx: &Path,
+    phase: &str,
+    recovery: Option<RecoveryTransactionState>,
+    owner: Option<TransactionOwner>,
+) -> Result<(), AppError> {
+    let bytes = serde_json::to_vec(&TransactionState {
+        version: TRANSACTION_VERSION,
+        phase: phase.to_string(),
+        recovery,
+        owner: owner.clone(),
+    })
+    .map_err(|error| AppError::Engine(format!("序列化事务状态失败: {error}")))?;
+    reject_reparse_chain(tx)?;
+    crate::app::atomic_file::write_atomic(&tx.join("state.json"), &bytes)
+        .map_err(|error| AppError::Engine(format!("原子写入事务状态失败: {error}")))?;
+    if owner.is_some() {
+        let written = read_transaction_state(tx)?;
+        if written.owner != owner || written.phase != phase {
+            return Err(AppError::Engine(
+                "USB 安装事务 owner marker 回读不匹配".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn write_commit_transaction_state(
+    tx: &Path,
+    phase: &str,
+    reactivation_reinstall: bool,
+    staged_payload_sha256: &str,
+) -> Result<(), AppError> {
+    if reactivation_reinstall {
+        let mut recovery = read_transaction_state(tx)?
+            .recovery
+            .filter(|state| state.prior_payload_missing)
+            .ok_or_else(|| AppError::Engine("恢复事务缺少原始授权身份记录".to_string()))?;
+        recovery.staged_payload_sha256 = Some(staged_payload_sha256.to_ascii_lowercase());
+        write_transaction_state_with_recovery(tx, phase, Some(recovery))
+    } else {
+        write_transaction_state(tx, phase)
+    }
+}
+
+fn read_transaction_state(tx: &Path) -> Result<TransactionState, AppError> {
+    let state_path = tx.join("state.json");
+    reject_reparse_chain(&state_path)?;
+    let backup_path = crate::app::atomic_file::backup_path(&state_path);
+    let main = match read_bounded_transaction_state_file(&state_path)? {
+        Some(bytes) => serde_json::from_slice::<TransactionState>(&bytes).ok(),
+        None => None,
+    };
+    let state = match main {
+        Some(state) => Some(state),
+        None => read_bounded_transaction_state_file(&backup_path)?
+            .and_then(|bytes| serde_json::from_slice::<TransactionState>(&bytes).ok()),
+    }
+    .ok_or_else(|| {
+        AppError::Engine("事务状态缺失、损坏或超过安全读取上限，保留事务供恢复".to_string())
+    })?;
+    if state.version != TRANSACTION_VERSION {
+        return Err(AppError::Engine("事务状态版本不受支持".to_string()));
+    }
+    Ok(state)
+}
+
+fn read_bounded_transaction_state_file(path: &Path) -> Result<Option<Vec<u8>>, AppError> {
+    let preflight = match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            reject_reparse(path)?;
+            if !metadata.file_type().is_file() {
+                return Err(AppError::Engine(format!(
+                    "事务状态必须是普通文件：{}",
+                    path.display()
+                )));
+            }
+            Some(metadata)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(AppError::Engine(format!(
+                "读取事务状态属性失败 ({}): {error}",
+                path.display()
+            )))
+        }
+    };
+    if preflight.is_none() {
+        return Ok(None);
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Open the reparse point itself so the opened handle metadata can be
+        // checked before reading, instead of following a swapped junction.
+        options.custom_flags(0x0020_0000);
+    }
+    let mut file = options.open(path).map_err(|error| {
+        AppError::Engine(format!("打开事务状态失败 ({}): {error}", path.display()))
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        AppError::Engine(format!(
+            "读取事务状态句柄属性失败 ({}): {error}",
+            path.display()
+        ))
+    })?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_TRANSACTION_STATE_BYTES {
+        return Err(AppError::Engine(format!(
+            "事务状态不是普通文件或超过 {} 字节上限：{}",
+            MAX_TRANSACTION_STATE_BYTES,
+            path.display()
+        )));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Err(AppError::Engine(format!(
+                "事务状态不能是重解析点或硬链接：{}",
+                path.display()
+            )));
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err(AppError::Engine(format!(
+                "事务状态不能是硬链接：{}",
+                path.display()
+            )));
+        }
+    }
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(MAX_TRANSACTION_STATE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            AppError::Engine(format!("读取事务状态失败 ({}): {error}", path.display()))
+        })?;
+    if bytes.len() as u64 > MAX_TRANSACTION_STATE_BYTES {
+        return Err(AppError::Engine(format!(
+            "事务状态超过 {} 字节读取上限：{}",
+            MAX_TRANSACTION_STATE_BYTES,
+            path.display()
+        )));
+    }
+    Ok(Some(bytes))
 }
 
 fn replace_file(staged: &Path, destination: &Path) -> Result<(), AppError> {
@@ -1803,7 +2523,96 @@ fn restore_file(snapshot: &Path, destination: &Path) -> Result<(), AppError> {
     Ok(())
 }
 
+fn verify_reactivation_transaction_authorization(
+    bundle_root: &Path,
+    recovery: &RecoveryTransactionState,
+    owner: &TransactionOwner,
+    manifest_payload_relative: &str,
+) -> Result<(), AppError> {
+    let target_relative = normalize_relative_path(&recovery.target_relative_path)?;
+    let manifest_payload_relative = normalize_relative_path(manifest_payload_relative)?;
+    if target_relative != manifest_payload_relative {
+        return Err(AppError::Engine(
+            "恢复事务目标与原始 root manifest 不一致".to_string(),
+        ));
+    }
+    #[cfg(test)]
+    if !crate::app::usb_guard::guard_required() {
+        // Synthetic unit fixtures have no removable volume, signed license,
+        // or status service. Production never takes this branch.
+        return Ok(());
+    }
+    let authorization = crate::app::usb_guard::verify_signed_codex_reinstall_transaction(
+        "codex-payload-reinstall-rollback",
+        bundle_root,
+        &recovery.installation_id,
+        &recovery.fingerprint,
+    )?;
+    let license_bytes =
+        read_bounded_transaction_state_file(&bundle_root.join(USB_LICENSE_NAME))?
+            .ok_or_else(|| AppError::Engine("恢复事务当前签名许可证缺失".to_string()))?;
+    let license: crate::app::usb_guard::UsbLicense = serde_json::from_slice(&license_bytes)
+        .map_err(|error| AppError::Engine(format!("恢复事务当前许可证 JSON 无效：{error}")))?;
+    let current_license_sha = codex_usb_license::license_signature_sha256(&license)
+        .map_err(|error| AppError::Engine(format!("计算当前许可证签名摘要失败：{error}")))?;
+    let current_fingerprint_sha = codex_usb_license::fingerprint_digest(&authorization.fingerprint)
+        .map_err(|error| AppError::Engine(format!("计算当前 USB 指纹摘要失败：{error}")))?;
+    if authorization.installation_id != recovery.installation_id
+        || license.installation_id != recovery.installation_id
+        || !codex_usb_license::fingerprints_match(&authorization.fingerprint, &recovery.fingerprint)
+        || !recovery
+            .fingerprint_sha256
+            .eq_ignore_ascii_case(&current_fingerprint_sha)
+        || !recovery
+            .license_signature_sha256
+            .eq_ignore_ascii_case(&current_license_sha)
+        || !recovery_owner_matches(recovery, owner)
+    {
+        return Err(AppError::Engine(
+            "恢复事务的 installation_id、许可证摘要、事务 ID 或完整 USB 指纹已变化".to_string(),
+        ));
+    }
+    let current_manifest = read_json(&bundle_root.join(ROOT_MANIFEST_NAME), ROOT_MANIFEST_NAME)?;
+    let current_target = normalize_relative_path(
+        current_manifest
+            .pointer("/payload/path")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| AppError::Engine("当前 root manifest 缺少 payload.path".to_string()))?,
+    )?;
+    if current_target != target_relative {
+        return Err(AppError::Engine(
+            "当前 root manifest 改变了恢复事务的受管目标路径".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn verify_reactivation_transaction_boundary(root: &Path, tx: &Path) -> Result<(), AppError> {
+    let state = read_transaction_state(tx)?;
+    let recovery = state
+        .recovery
+        .as_ref()
+        .filter(|recovery| recovery.prior_payload_missing)
+        .ok_or_else(|| AppError::Engine("恢复事务缺少身份记录".to_string()))?;
+    let owner = state
+        .owner
+        .as_ref()
+        .ok_or_else(|| AppError::Engine("恢复事务缺少 owner 身份记录".to_string()))?;
+    let old_manifest = read_json(&tx.join("old").join(ROOT_MANIFEST_NAME), ROOT_MANIFEST_NAME)?;
+    let old_target = old_manifest
+        .pointer("/payload/path")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| AppError::Engine("恢复事务快照缺少 payload.path".to_string()))?;
+    verify_reactivation_transaction_authorization(root, recovery, owner, old_target)
+}
+
 fn rollback_transaction(bundle_root: &Path, tx: &Path) -> Result<(), AppError> {
+    let transaction_state = read_transaction_state(tx)?;
+    let recovery_install = transaction_state
+        .recovery
+        .as_ref()
+        .filter(|state| state.prior_payload_missing);
+    let transaction_owner = transaction_state.owner.as_ref();
     let old = tx.join("old");
     reject_reparse_chain(&old)?;
     let old_manifest = read_json(&old.join(ROOT_MANIFEST_NAME), ROOT_MANIFEST_NAME)?;
@@ -1814,6 +2623,16 @@ fn rollback_transaction(bundle_root: &Path, tx: &Path) -> Result<(), AppError> {
             .ok_or_else(|| AppError::Engine("旧 manifest 缺少 payload.path".to_string()))?,
     )?;
     let local = bundle_root.join(local_relative.replace('/', std::path::MAIN_SEPARATOR_STR));
+    if let Some(recovery) = recovery_install {
+        let owner = transaction_owner
+            .ok_or_else(|| AppError::Engine("恢复事务缺少 owner 身份记录".to_string()))?;
+        verify_reactivation_transaction_authorization(
+            bundle_root,
+            recovery,
+            owner,
+            &local_relative,
+        )?;
+    }
     let old_usb_manifest = read_json(&old.join(USB_MANIFEST_NAME), USB_MANIFEST_NAME)?;
     let final_backup_relative = normalize_relative_path(
         old_usb_manifest
@@ -1845,10 +2664,33 @@ fn rollback_transaction(bundle_root: &Path, tx: &Path) -> Result<(), AppError> {
         old_architecture,
         sanitize_version(old_version)
     ));
+    if let Some(recovery) = recovery_install {
+        // A recovery transaction starts with this exact manifest-declared
+        // payload absent. Remove only the file this transaction installed,
+        // and only after its hash matches the SHA verified before the rename.
+        // Any unexpected replacement is left untouched and stops rollback.
+        reject_reparse_chain(&local)?;
+        if local.exists() {
+            let expected_sha = recovery.staged_payload_sha256.as_deref().ok_or_else(|| {
+                AppError::Engine(
+                    "恢复事务目标意外出现，但事务未记录 staged SHA；拒绝删除".to_string(),
+                )
+            })?;
+            crate::app::uninstall_cleanup::remove_revocation_staged_payload_if_sha256(
+                bundle_root,
+                &recovery.fingerprint,
+                &local_relative,
+                expected_sha,
+            )
+            .map_err(|error| {
+                AppError::Engine(format!("移除未提交恢复载荷失败；目标已保留：{error}"))
+            })?;
+        }
+    }
     // Restore only the exact backup name generated by this transaction. A
     // pre-existing backup must never be mistaken for the payload being
     // rolled back.
-    if regular_file_exists(&expected_backup)? {
+    if recovery_install.is_none() && regular_file_exists(&expected_backup)? {
         let old_payload_sha = require_sha256(
             old_manifest.pointer("/payload/sha256"),
             "旧 manifest.payload.sha256",
@@ -1917,6 +2759,16 @@ fn rollback_transaction(bundle_root: &Path, tx: &Path) -> Result<(), AppError> {
         fs::remove_dir_all(tx)
             .map_err(|error| AppError::Engine(format!("清理已回滚事务失败: {error}")))?;
     }
+    let transaction_id = transaction_state
+        .owner
+        .as_ref()
+        .map(|owner| owner.transaction_id.as_str())
+        .unwrap_or_else(|| transaction_id_from_path(tx));
+    remove_owner_sidecar_after_transaction(
+        bundle_root,
+        transaction_id,
+        transaction_state.owner.as_ref(),
+    )?;
     Ok(())
 }
 
@@ -1990,9 +2842,31 @@ fn recover_pending_transactions(bundle_root: &Path) -> Result<(), AppError> {
     reject_reparse(bundle_root)?;
     for tx in pending_transaction_dirs(bundle_root)? {
         let state = read_transaction_state(&tx)?;
+        if state.phase == "owner-registered" {
+            discard_unprepared_owner_transaction(&tx, &state)?;
+            remove_owner_sidecar_after_transaction(
+                bundle_root,
+                &state
+                    .owner
+                    .as_ref()
+                    .ok_or_else(|| AppError::Engine("未准备事务缺少 owner".to_string()))?
+                    .transaction_id,
+                state.owner.as_ref(),
+            )?;
+            continue;
+        }
         if state.phase == "committed" {
             if verify_committed_transaction(bundle_root, &tx).is_ok() {
                 fs::remove_dir_all(&tx).map_err(|error| AppError::Engine(error.to_string()))?;
+                remove_owner_sidecar_after_transaction(
+                    bundle_root,
+                    &state
+                        .owner
+                        .as_ref()
+                        .map(|owner| owner.transaction_id.as_str())
+                        .unwrap_or_else(|| transaction_id_from_path(&tx)),
+                    state.owner.as_ref(),
+                )?;
             } else {
                 rollback_transaction(bundle_root, &tx)?;
             }
@@ -2000,6 +2874,7 @@ fn recover_pending_transactions(bundle_root: &Path) -> Result<(), AppError> {
             rollback_transaction(bundle_root, &tx)?;
         }
     }
+    cleanup_orphan_owner_sidecars(bundle_root)?;
     let staging = bundle_root.join(STAGING_DIR);
     if staging.exists()
         && fs::read_dir(&staging)
@@ -2012,6 +2887,170 @@ fn recover_pending_transactions(bundle_root: &Path) -> Result<(), AppError> {
             .map_err(|error| AppError::Engine(format!("清理空事务目录失败: {error}")))?;
     }
     Ok(())
+}
+
+fn transaction_id_from_path(tx: &Path) -> &str {
+    tx.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix(TRANSACTION_PREFIX))
+        .unwrap_or_default()
+}
+
+fn cleanup_orphan_owner_sidecars(bundle_root: &Path) -> Result<(), AppError> {
+    let staging = bundle_root.join(STAGING_DIR);
+    if !staging.exists() {
+        return Ok(());
+    }
+    let has_owner_sidecar = fs::read_dir(&staging)
+        .map_err(|error| AppError::Engine(format!("读取事务 sidecar 失败：{error}")))?
+        .try_fold(false, |found, entry| {
+            let entry = entry.map_err(|error| AppError::Engine(error.to_string()))?;
+            Ok::<_, AppError>(
+                found || parse_owner_sidecar_name(&entry.file_name().to_string_lossy()).is_some(),
+            )
+        })?;
+    // Legacy v1/v2 transactions never had owner sidecars. Their recovery
+    // semantics must not require a signed v3 license just to finish an update.
+    if !has_owner_sidecar {
+        return Ok(());
+    }
+    let license_bytes =
+        read_bounded_transaction_state_file(&bundle_root.join(USB_LICENSE_NAME))?
+            .ok_or_else(|| AppError::Engine("事务 sidecar 清理缺少签名许可证".to_string()))?;
+    let license: crate::app::usb_guard::UsbLicense = serde_json::from_slice(&license_bytes)
+        .map_err(|error| AppError::Engine(format!("事务 sidecar 清理许可证无效：{error}")))?;
+    if !crate::app::usb_guard::validate_license(&license, &license.fingerprint)? {
+        return Err(AppError::Engine(
+            "事务 sidecar 清理需要有效签名许可证".to_string(),
+        ));
+    }
+    let license_sha = codex_usb_license::license_signature_sha256(&license)
+        .map_err(|error| AppError::Engine(error.to_string()))?;
+    let fingerprint_sha = codex_usb_license::fingerprint_digest(&license.fingerprint)
+        .map_err(|error| AppError::Engine(error.to_string()))?;
+    let transactions = pending_transaction_dirs(bundle_root)?;
+    let transaction_ids = transactions
+        .iter()
+        .filter_map(|tx| parse_transaction_dir_name(tx.file_name()?.to_str()?))
+        .collect::<HashSet<_>>();
+    for entry in fs::read_dir(&staging)
+        .map_err(|error| AppError::Engine(format!("读取事务 sidecar 失败：{error}")))?
+    {
+        let entry = entry.map_err(|error| AppError::Engine(error.to_string()))?;
+        let name = entry.file_name();
+        let Some(transaction_id) = parse_owner_sidecar_name(&name.to_string_lossy()) else {
+            continue;
+        };
+        if transaction_ids.contains(&transaction_id) {
+            continue;
+        }
+        let sidecar_path = entry.path();
+        reject_reparse_chain(&sidecar_path)?;
+        let bytes = read_bounded_transaction_state_file(&sidecar_path)?
+            .ok_or_else(|| AppError::Engine("孤儿 owner sidecar 在读取期间消失".to_string()))?;
+        let owner: TransactionOwner = serde_json::from_slice(&bytes)
+            .map_err(|error| AppError::Engine(format!("孤儿 owner sidecar 无效：{error}")))?;
+        if !transaction_owner_matches(
+            &owner,
+            &transaction_id,
+            &license.installation_id,
+            &license_sha,
+            &fingerprint_sha,
+        ) {
+            return Err(AppError::Engine(
+                "孤儿 owner sidecar 与当前签名许可证身份不匹配，保留文件".to_string(),
+            ));
+        }
+        remove_owner_sidecar_after_transaction(bundle_root, &transaction_id, Some(&owner))?;
+    }
+    Ok(())
+}
+
+/// An owner-registered transaction is written before any snapshot or payload
+/// data. If the process stops during preparation, discard it only when its
+/// tree contains the exact state/metadata shape that can exist before commit.
+fn discard_unprepared_owner_transaction(
+    tx: &Path,
+    state: &TransactionState,
+) -> Result<(), AppError> {
+    if state.owner.is_none() {
+        return Err(AppError::Engine(
+            "未准备事务缺少 owner marker，保留目录供人工检查".to_string(),
+        ));
+    }
+    reject_reparse_chain(tx)?;
+    for entry in fs::read_dir(tx)
+        .map_err(|error| AppError::Engine(format!("读取未准备事务失败：{error}")))?
+    {
+        let entry = entry.map_err(|error| AppError::Engine(error.to_string()))?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let path = entry.path();
+        reject_reparse_chain(&path)?;
+        match name.as_ref() {
+            "state.json" | "state.json.bak" => {
+                if !entry
+                    .file_type()
+                    .map_err(|error| AppError::Engine(error.to_string()))?
+                    .is_file()
+                {
+                    return Err(AppError::Engine(
+                        "未准备事务状态不是普通文件，保留目录".to_string(),
+                    ));
+                }
+            }
+            "old" => {
+                let metadata = entry
+                    .metadata()
+                    .map_err(|error| AppError::Engine(error.to_string()))?;
+                if !metadata.is_dir() {
+                    return Err(AppError::Engine(
+                        "未准备事务 old 路径不是目录，保留目录".to_string(),
+                    ));
+                }
+                for snapshot in
+                    fs::read_dir(&path).map_err(|error| AppError::Engine(error.to_string()))?
+                {
+                    let snapshot = snapshot.map_err(|error| AppError::Engine(error.to_string()))?;
+                    if !matches!(
+                        snapshot.file_name().to_str(),
+                        Some(ROOT_MANIFEST_NAME | USB_MANIFEST_NAME | SHA256SUMS_NAME)
+                    ) || !snapshot
+                        .file_type()
+                        .map_err(|error| AppError::Engine(error.to_string()))?
+                        .is_file()
+                    {
+                        return Err(AppError::Engine(
+                            "未准备事务 old 目录包含未知项，保留目录".to_string(),
+                        ));
+                    }
+                    reject_reparse_chain(&snapshot.path())?;
+                }
+            }
+            "next" => {
+                let metadata = entry
+                    .metadata()
+                    .map_err(|error| AppError::Engine(error.to_string()))?;
+                if !metadata.is_dir()
+                    || fs::read_dir(&path)
+                        .map_err(|error| AppError::Engine(error.to_string()))?
+                        .next()
+                        .is_some()
+                {
+                    return Err(AppError::Engine(
+                        "未准备事务 next 目录非空或类型无效，保留目录".to_string(),
+                    ));
+                }
+            }
+            _ => {
+                return Err(AppError::Engine(format!(
+                    "未准备事务包含未知项，保留目录：{}",
+                    path.display()
+                )))
+            }
+        }
+    }
+    fs::remove_dir_all(tx).map_err(|error| AppError::Engine(format!("清理未准备事务失败：{error}")))
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
@@ -2042,6 +3081,37 @@ fn collect_files(
         let path = entry.path();
         reject_reparse(&path)?;
         let relative_lower = relative.to_ascii_lowercase();
+        let file_type = entry
+            .file_type()
+            .map_err(|error| AppError::Engine(error.to_string()))?;
+        // Revocation state is mutable after bundle signing. Use the bundle
+        // validator's exact shared predicate so new update checksum sets and
+        // startup validation agree on the same runtime files.
+        if crate::app::usb_bundle::is_mutable_revocation_file(&relative) {
+            if !file_type.is_file() {
+                return Err(AppError::Engine(format!(
+                    "USB 撤销运行状态必须是普通文件：{relative}"
+                )));
+            }
+            if crate::app::usb_revocation::is_atomic_state_tmp_relative(&relative) {
+                crate::app::usb_bundle::validate_atomic_state_temp(&path)?;
+            } else {
+                crate::app::usb_bundle::validate_mutable_revocation_sidecar(&path)?;
+            }
+            continue;
+        }
+        if relative_lower == "codexusbstate" {
+            if !file_type.is_dir() {
+                return Err(AppError::Engine("CodexUsbState 必须是目录".to_string()));
+            }
+            collect_files(root, &relative, out)?;
+            continue;
+        }
+        if relative_lower.starts_with("codexusbstate/") {
+            return Err(AppError::Engine(format!(
+                "CodexUsbState 包含未支持项：{relative}"
+            )));
+        }
         // `apps/Codex` is created and updated after the USB bundle is built;
         // it is deliberately outside SHA256SUMS just like the transaction
         // directory. Keep checking its reparse boundary above, but never
@@ -2053,9 +3123,6 @@ fn collect_files(
         {
             continue;
         }
-        let file_type = entry
-            .file_type()
-            .map_err(|error| AppError::Engine(error.to_string()))?;
         if file_type.is_dir() {
             collect_files(root, &relative, out)?;
         } else if file_type.is_file()
@@ -2124,7 +3191,10 @@ fn verify_sha256_sums_with_digests(
             return Err(AppError::Engine("SHA256SUMS 哈希格式错误".to_string()));
         }
         let relative = normalize_relative_path(raw_path.trim())?;
-        if relative == SHA256SUMS_NAME || listed.contains_key(&relative) {
+        if relative == SHA256SUMS_NAME
+            || crate::app::usb_bundle::is_mutable_revocation_file(&relative)
+            || listed.contains_key(&relative)
+        {
             return Err(AppError::Engine(
                 "SHA256SUMS 包含重复或非法条目".to_string(),
             ));
@@ -2312,6 +3382,20 @@ fn require_newer_version(current: &str, latest: &str) -> Result<(), AppError> {
     }
 }
 
+fn require_not_older_version(current: &str, latest: &str) -> Result<(), AppError> {
+    if !is_numeric_version(current) || !is_numeric_version(latest) {
+        return Err(AppError::StaleExpectation(
+            "远端或本地版本格式无效，拒绝恢复。".to_string(),
+        ));
+    }
+    if compare_versions(current, latest) == std::cmp::Ordering::Greater {
+        return Err(AppError::StaleExpectation(
+            "远端版本早于当前版本，拒绝降级恢复。".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn clear_writer_artifacts(bundle_root: &Path) -> Result<(), AppError> {
     for name in [
         ROOT_MANIFEST_NAME,
@@ -2331,15 +3415,104 @@ fn clear_writer_artifacts(bundle_root: &Path) -> Result<(), AppError> {
 }
 
 pub fn check(ctx: &UpdateContext) -> Result<Option<UpdateInfo>, AppError> {
+    check_inner(ctx, false)
+}
+
+/// Read-only update check for the single missing-payload reactivation state.
+/// It is not exposed as a renderer flag: both this function and its command
+/// caller independently require the signed USB recovery gate.
+pub fn check_reinstall(ctx: &UpdateContext) -> Result<Option<UpdateInfo>, AppError> {
+    check_inner(ctx, true)
+}
+
+fn check_inner(
+    ctx: &UpdateContext,
+    reactivation_reinstall: bool,
+) -> Result<Option<UpdateInfo>, AppError> {
+    let initial_reinstall_authorization = if reactivation_reinstall {
+        Some(
+            crate::app::usb_guard::require_signed_codex_reinstall_bundle(
+                "codex-payload-reinstall-check-inner",
+            )?,
+        )
+    } else {
+        None
+    };
     require_windows()?;
-    // A previous apply may have been interrupted after a rename. Recover the
-    // durable transaction before observing the version; refusing to check
-    // would strand the user in a state that the next check cannot repair.
-    recover_pending_transactions(&ctx.bundle_root)?;
+    let mut deferred_cleanup = None;
+    {
+        let _operation = CODEX_UPDATE_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let initial_authorization = if reactivation_reinstall {
+            Some(
+                initial_reinstall_authorization
+                    .expect("reactivation check produced an authorization"),
+            )
+        } else {
+            crate::app::usb_guard::require_signed_codex_bundle(
+                "codex-payload-check-transaction-lock",
+            )?
+        };
+        let _transaction_guard = if let Some(initial) = initial_authorization.as_ref() {
+            let guard = crate::app::usb_revocation::acquire_codex_update_transaction_lock(
+                &initial.installation_id,
+            )
+            .map_err(|error| AppError::Engine(format!("无法锁定 USB 安装事务：{error}")))?;
+            let current = if reactivation_reinstall {
+                match crate::app::usb_guard::require_signed_codex_reinstall_bundle_deferred(
+                    "codex-payload-reinstall-check-lock-recheck",
+                )? {
+                    crate::app::usb_guard::ReinstallGateOutcome::Authorized(current) => {
+                        Some(current)
+                    }
+                    crate::app::usb_guard::ReinstallGateOutcome::DeferredCleanup(request) => {
+                        deferred_cleanup = Some(request);
+                        None
+                    }
+                }
+            } else {
+                Some(
+                    crate::app::usb_guard::require_signed_codex_bundle(
+                        "codex-payload-check-lock-recheck",
+                    )?
+                    .ok_or_else(|| AppError::Engine("当前进程不是受管 USB bundle".to_string()))?,
+                )
+            };
+            if let Some(current) = current {
+                if current.installation_id != initial.installation_id
+                    || current.bundle_root != initial.bundle_root
+                    || current.fingerprint != initial.fingerprint
+                    || current.license_digest != initial.license_digest
+                {
+                    return Err(AppError::StaleExpectation(
+                        "授权 U 盘或许可证在等待更新事务锁时发生变化，请重新检查。".to_string(),
+                    ));
+                }
+            }
+            Some(guard)
+        } else {
+            None
+        };
+        if deferred_cleanup.is_none() {
+            // A previous apply may have been interrupted after a rename. Recovery
+            // is serialized with revoked cleanup before it reads or mutates the
+            // staging tree. The update and cleanup paths revalidate after this lock.
+            recover_pending_transactions(&ctx.bundle_root)?;
+        }
+    }
+    if let Some(request) = deferred_cleanup {
+        return request.cleanup_and_reject().map(|_| None);
+    }
     // Read only the capability metadata first. The full removable-drive
     // integrity pass is intentionally delayed until after remote resolution,
     // so an unavailable source is not hidden behind a long local hash.
-    let local = require_capability_metadata(&ctx.bundle_root).map_err(|error| {
+    let local_metadata = if reactivation_reinstall {
+        require_capability_metadata_for_reinstall(&ctx.bundle_root)
+    } else {
+        require_capability_metadata(&ctx.bundle_root)
+    };
+    let local = local_metadata.map_err(|error| {
         log::error!(
             "codex payload update check failed stage=capability code={} error={}",
             error.code(),
@@ -2355,11 +3528,16 @@ pub fn check(ctx: &UpdateContext) -> Result<Option<UpdateInfo>, AppError> {
         ctx.settings.proxy_mode.as_str()
     );
     let network = network_from_settings(&ctx.settings);
+    let source_version = if reactivation_reinstall {
+        "0.0.0"
+    } else {
+        &local.current_version
+    };
     let fresh = match resolve_preferred_source(
         &ctx.settings,
         &local.architecture,
         &network,
-        &local.current_version,
+        source_version,
     ) {
         Ok(fresh) => fresh,
         Err(error) => {
@@ -2378,27 +3556,32 @@ pub fn check(ctx: &UpdateContext) -> Result<Option<UpdateInfo>, AppError> {
         local.architecture,
         local.current_version
     );
-    let verified_digests = match verify_bundle_integrity_with_digests(&ctx.bundle_root) {
-        Ok(digests) => digests,
-        Err(error) => {
-            log::error!(
-                "codex payload update check failed stage=integrity current={} code={} error={}",
-                local.current_version,
-                error.code(),
-                error
-            );
-            return Err(error);
-        }
+    let verified_digests = if reactivation_reinstall {
+        None
+    } else {
+        let verified_digests = match verify_bundle_integrity_with_digests(&ctx.bundle_root) {
+            Ok(digests) => digests,
+            Err(error) => {
+                log::error!(
+                    "codex payload update check failed stage=integrity current={} code={} error={}",
+                    local.current_version,
+                    error.code(),
+                    error
+                );
+                return Err(error);
+            }
+        };
+        let payload_sha = verified_digest(&verified_digests, &local.payload_relative, "payload")?;
+        let payload_size = fs::metadata(&local.payload_path)
+            .map_err(|error| AppError::Engine(format!("读取 payload 大小失败: {error}")))?
+            .len();
+        verify_metadata_values(&ctx.bundle_root, &payload_sha, payload_size)?;
+        log::info!(
+            "codex payload update check stage=integrity completed files={}",
+            verified_digests.len()
+        );
+        Some(verified_digests)
     };
-    let payload_sha = verified_digest(&verified_digests, &local.payload_relative, "payload")?;
-    let payload_size = fs::metadata(&local.payload_path)
-        .map_err(|error| AppError::Engine(format!("读取 payload 大小失败: {error}")))?
-        .len();
-    verify_metadata_values(&ctx.bundle_root, &payload_sha, payload_size)?;
-    log::info!(
-        "codex payload update check stage=integrity completed files={}",
-        verified_digests.len()
-    );
     let Some(fresh) = fresh else {
         log::info!(
             "codex payload update check completed stage=compare result=no-update reason=source_no_newer current={}",
@@ -2406,7 +3589,12 @@ pub fn check(ctx: &UpdateContext) -> Result<Option<UpdateInfo>, AppError> {
         );
         return Ok(None);
     };
-    if compare_versions(&local.current_version, &fresh.app_version) != std::cmp::Ordering::Less {
+    let version_order = compare_versions(&local.current_version, &fresh.app_version);
+    if if reactivation_reinstall {
+        version_order == std::cmp::Ordering::Greater
+    } else {
+        version_order != std::cmp::Ordering::Less
+    } {
         log::info!(
             "codex payload update check completed stage=compare result=up-to-date current={} latest={} source={}",
             local.current_version,
@@ -2422,12 +3610,16 @@ pub fn check(ctx: &UpdateContext) -> Result<Option<UpdateInfo>, AppError> {
         fresh.identity.source_kind.as_str(),
         fresh.msix.size
     );
-    let payload = codex_update_payload_with_digests(
-        &ctx.bundle_root,
-        &local,
-        &fresh.identity,
-        &verified_digests,
-    )?;
+    let payload = match verified_digests.as_ref() {
+        Some(digests) => {
+            codex_update_payload_with_digests(&ctx.bundle_root, &local, &fresh.identity, digests)?
+        }
+        None => serde_json::to_value(CodexUpdatePayload {
+            identity: fresh.identity.clone(),
+            local_snapshot: None,
+        })
+        .map_err(|error| AppError::Engine(format!("序列化重装更新对象失败: {error}")))?,
+    };
     Ok(Some(UpdateInfo {
         channel: ChannelKind::Codex,
         current_version: local.current_version,
@@ -2444,8 +3636,62 @@ pub fn apply(
     expected: &UpdateInfo,
     progress: &dyn Fn(u64, u64),
 ) -> Result<(), AppError> {
+    apply_inner(ctx, expected, progress, false)
+}
+
+/// Apply a Codex payload repair only while the internal USB revocation gate
+/// confirms an active receipt newer than the retained revoked history. This
+/// is not a renderer-selectable mode and does not establish a launch lease.
+pub fn apply_reinstall(
+    ctx: &UpdateContext,
+    expected: &UpdateInfo,
+    progress: &dyn Fn(u64, u64),
+) -> Result<(), AppError> {
+    apply_inner(ctx, expected, progress, true)
+}
+
+fn require_reinstall_authorization_while_locked(
+    phase: &str,
+    deferred_cleanup: &mut Option<crate::app::usb_guard::DeferredRevocationCleanup>,
+) -> Result<crate::app::usb_guard::SignedUsbAuthorization, AppError> {
+    match crate::app::usb_guard::require_signed_codex_reinstall_bundle_deferred(phase)? {
+        crate::app::usb_guard::ReinstallGateOutcome::Authorized(authorization) => Ok(authorization),
+        crate::app::usb_guard::ReinstallGateOutcome::DeferredCleanup(request) => {
+            *deferred_cleanup = Some(request);
+            Err(AppError::Engine(
+                "usb_revocation_cleanup_deferred".to_string(),
+            ))
+        }
+    }
+}
+
+fn after_update_locks_release<T>(
+    transaction_guard: crate::app::usb_revocation::InstallationTransactionGuard,
+    operation_guard: std::sync::MutexGuard<'static, ()>,
+    action: impl FnOnce() -> T,
+) -> T {
+    drop(transaction_guard);
+    drop(operation_guard);
+    action()
+}
+
+fn apply_inner(
+    ctx: &UpdateContext,
+    expected: &UpdateInfo,
+    progress: &dyn Fn(u64, u64),
+    reactivation_reinstall: bool,
+) -> Result<(), AppError> {
     // Security boundary: this must remain the first executable statement.
-    crate::app::usb_guard::require_signed_codex_bundle("codex-payload-apply")?;
+    let initial_reinstall_authorization = if reactivation_reinstall {
+        Some(
+            crate::app::usb_guard::require_signed_codex_reinstall_bundle(
+                "codex-payload-reinstall-apply",
+            )?,
+        )
+    } else {
+        crate::app::usb_guard::require_signed_codex_bundle("codex-payload-apply")?;
+        None
+    };
     require_windows()?;
     log::info!(
         "codex payload update apply start current={} expected_latest={} expected_source={}",
@@ -2458,7 +3704,59 @@ pub fn apply(
     let _operation = CODEX_UPDATE_LOCK
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    let (observed_root, _) = crate::app::usb_guard::authorized_signed_bundle_identity()?;
+    let initial_authorization = if reactivation_reinstall {
+        initial_reinstall_authorization
+            .as_ref()
+            .cloned()
+            .expect("reactivation gate produced an authorization")
+    } else {
+        crate::app::usb_guard::require_signed_codex_bundle("codex-payload-transaction-lock")?
+            .ok_or_else(|| AppError::Engine("当前进程不是受管 USB bundle".to_string()))?
+    };
+    let transaction_guard = crate::app::usb_revocation::acquire_codex_update_transaction_lock(
+        &initial_authorization.installation_id,
+    )
+    .map_err(|error| AppError::Engine(format!("无法锁定 USB 安装事务：{error}")))?;
+    if transaction_guard.installation_id() != initial_authorization.installation_id {
+        return Err(AppError::Engine("USB 安装事务锁身份不匹配".to_string()));
+    }
+    let mut deferred_cleanup = None;
+    macro_rules! reinstall_gate_or_cleanup {
+        ($phase:expr) => {{
+            match require_reinstall_authorization_while_locked($phase, &mut deferred_cleanup) {
+                Ok(authorization) => authorization,
+                Err(error) => {
+                    if let Some(request) = deferred_cleanup.take() {
+                        return after_update_locks_release(transaction_guard, _operation, || {
+                            request.cleanup_and_reject().map(|_| ())
+                        });
+                    }
+                    return Err(error);
+                }
+            }
+        }};
+    }
+    // Authorization may have changed while waiting for another update or
+    // cleanup process. Re-read it only after holding the installation lock;
+    // this fresh gate is the authority for recovery and all later writes.
+    let mut current_authorization = if reactivation_reinstall {
+        reinstall_gate_or_cleanup!("codex-payload-reinstall-transaction-lock")
+    } else {
+        crate::app::usb_guard::require_signed_codex_bundle(
+            "codex-payload-transaction-lock-recheck",
+        )?
+        .ok_or_else(|| AppError::Engine("当前进程不是受管 USB bundle".to_string()))?
+    };
+    if current_authorization.installation_id != initial_authorization.installation_id
+        || current_authorization.bundle_root != initial_authorization.bundle_root
+        || current_authorization.fingerprint != initial_authorization.fingerprint
+        || current_authorization.license_digest != initial_authorization.license_digest
+    {
+        return Err(AppError::StaleExpectation(
+            "授权 U 盘或许可证在等待安装事务锁时发生变化，请重新检查。".to_string(),
+        ));
+    }
+    let observed_root = current_authorization.bundle_root.clone();
     let expected_root =
         fs::canonicalize(&ctx.bundle_root).map_err(|error| AppError::Engine(error.to_string()))?;
     let observed_root =
@@ -2472,7 +3770,27 @@ pub fn apply(
     // Re-observe after recovery as well. Recovery is the first mutating
     // operation and a drive removal/reuse during it must not be followed by
     // capability reads or a network-backed swap.
-    let (post_recovery_root, _) = crate::app::usb_guard::authorized_signed_bundle_identity()?;
+    let post_recovery_authorization = if reactivation_reinstall {
+        reinstall_gate_or_cleanup!("codex-payload-reinstall-post-recovery")
+    } else {
+        crate::app::usb_guard::require_signed_codex_bundle("codex-payload-post-recovery")?
+            .ok_or_else(|| {
+                AppError::Engine(
+                    "anchor_postrecovery_failed：恢复事务后未能重新取得 USB 授权".to_string(),
+                )
+            })?
+    };
+    if post_recovery_authorization.installation_id != current_authorization.installation_id
+        || post_recovery_authorization.bundle_root != current_authorization.bundle_root
+        || post_recovery_authorization.fingerprint != current_authorization.fingerprint
+        || post_recovery_authorization.license_digest != current_authorization.license_digest
+    {
+        return Err(AppError::StaleExpectation(
+            "授权 U 盘在恢复事务期间发生变化，请重新检查后再确认。".to_string(),
+        ));
+    }
+    current_authorization = post_recovery_authorization;
+    let post_recovery_root = current_authorization.bundle_root.clone();
     let post_recovery_root = fs::canonicalize(post_recovery_root)
         .map_err(|error| AppError::Engine(error.to_string()))?;
     if expected_root != post_recovery_root {
@@ -2488,7 +3806,12 @@ pub fn apply(
     // Capability metadata is cheap enough to establish the local channel
     // identity, but the full payload read is deliberately postponed until
     // after the fresh remote identity has been resolved.
-    let local = require_capability_metadata(&ctx.bundle_root).map_err(|error| {
+    let local = (if reactivation_reinstall {
+        require_capability_metadata_for_reinstall(&ctx.bundle_root)
+    } else {
+        require_capability_metadata(&ctx.bundle_root)
+    })
+    .map_err(|error| {
         log::error!(
             "codex payload update apply failed stage=capability code={} error={}",
             error.code(),
@@ -2498,9 +3821,20 @@ pub fn apply(
     })?;
     let expected_payload = parse_codex_update_payload(&expected.payload)?;
     let expected_identity = expected_payload.identity;
-    let expected_snapshot = expected_payload.local_snapshot.ok_or_else(|| {
-        AppError::StaleExpectation("更新确认缺少本地 USB 快照，请重新检查后再确认。".to_string())
-    })?;
+    let expected_snapshot = if reactivation_reinstall {
+        if expected_payload.local_snapshot.is_some() {
+            return Err(AppError::StaleExpectation(
+                "受限重装确认对象不得携带普通更新快照，请重新检查。".to_string(),
+            ));
+        }
+        None
+    } else {
+        Some(expected_payload.local_snapshot.ok_or_else(|| {
+            AppError::StaleExpectation(
+                "更新确认缺少本地 USB 快照，请重新检查后再确认。".to_string(),
+            )
+        })?)
+    };
     let source_matches = source_matches_settings(&ctx.settings, &expected_identity)?;
     if !source_matches || expected.current_version != local.current_version {
         log::warn!(
@@ -2559,54 +3893,64 @@ pub fn apply(
             "远端 Codex 显示版本已变化，请重新检查后再确认。".to_string(),
         ));
     }
-    require_newer_version(&local.current_version, &fresh.app_version)?;
+    if reactivation_reinstall {
+        require_not_older_version(&local.current_version, &fresh.app_version)?;
+    } else {
+        require_newer_version(&local.current_version, &fresh.app_version)?;
+    }
     require_https_url(&fresh.msix.url, "MSIX 下载地址")?;
     require_https_url(&fresh.checksums.url, "SHA256SUMS 下载地址")?;
     log::info!(
         "codex payload update apply stage=integrity start payload={}",
         local.payload_relative
     );
-    let verified_digests =
-        verify_bundle_integrity_with_digests(&ctx.bundle_root).map_err(|error| {
+    let verified_digests = if reactivation_reinstall {
+        reinstall_gate_or_cleanup!("codex-payload-reinstall-integrity");
+        None
+    } else {
+        let verified_digests =
+            verify_bundle_integrity_with_digests(&ctx.bundle_root).map_err(|error| {
+                log::error!(
+                    "codex payload update apply failed stage=integrity current={} code={} error={}",
+                    local.current_version,
+                    error.code(),
+                    error
+                );
+                error
+            })?;
+        let payload_sha = verified_digest(&verified_digests, &local.payload_relative, "payload")?;
+        let payload_size = fs::metadata(&local.payload_path)
+            .map_err(|error| AppError::Engine(format!("读取 payload 大小失败: {error}")))?
+            .len();
+        verify_metadata_values(&ctx.bundle_root, &payload_sha, payload_size).map_err(|error| {
             log::error!(
-                "codex payload update apply failed stage=integrity current={} code={} error={}",
+                "codex payload update apply failed stage=integrity-metadata current={} code={} error={}",
                 local.current_version,
                 error.code(),
                 error
             );
             error
         })?;
-    let payload_sha = verified_digest(&verified_digests, &local.payload_relative, "payload")?;
-    let payload_size = fs::metadata(&local.payload_path)
-        .map_err(|error| AppError::Engine(format!("读取 payload 大小失败: {error}")))?
-        .len();
-    verify_metadata_values(&ctx.bundle_root, &payload_sha, payload_size).map_err(|error| {
-        log::error!(
-            "codex payload update apply failed stage=integrity-metadata current={} code={} error={}",
-            local.current_version,
-            error.code(),
+        require_local_snapshot_from_digests(
+            &ctx.bundle_root,
+            &local,
+            expected_snapshot.as_ref().expect("normal update snapshot"),
+            &verified_digests,
+        )
+        .map_err(|error| {
+            log::error!(
+                "codex payload update apply failed stage=snapshot current={} code={} error={}",
+                local.current_version,
+                error.code(),
+                error
+            );
             error
-        );
-        error
-    })?;
-    require_local_snapshot_from_digests(
-        &ctx.bundle_root,
-        &local,
-        &expected_snapshot,
-        &verified_digests,
-    )
-    .map_err(|error| {
-        log::error!(
-            "codex payload update apply failed stage=snapshot current={} code={} error={}",
-            local.current_version,
-            error.code(),
-            error
-        );
-        error
-    })?;
+        })?;
+        Some(verified_digests)
+    };
     log::info!(
         "codex payload update apply stage=integrity completed files={}",
-        verified_digests.len()
+        verified_digests.as_ref().map_or(0, BTreeMap::len)
     );
     reject_reparse_chain(&ctx.bundle_root)?;
     let staging = ctx.bundle_root.join(STAGING_DIR);
@@ -2620,15 +3964,67 @@ pub fn apply(
             .map_err(|error| AppError::Engine(format!("创建事务目录失败: {error}")))?;
         reject_reparse(&staging)?;
     }
-    let tx = staging.join(format!("{TRANSACTION_PREFIX}{}", uuid::Uuid::new_v4()));
+    let transaction_id = uuid::Uuid::new_v4().to_string();
+    let tx = staging.join(format!("{TRANSACTION_PREFIX}{transaction_id}"));
+    let owner = transaction_owner_for_authorization(&ctx.bundle_root, &tx, &current_authorization)?;
+    write_owner_sidecar(&staging, &owner)?;
     fs::create_dir(&tx).map_err(|error| AppError::Engine(error.to_string()))?;
     reject_reparse_chain(&tx)?;
-    fs::create_dir(tx.join("old")).map_err(|error| AppError::Engine(error.to_string()))?;
-    fs::create_dir(tx.join("next")).map_err(|error| AppError::Engine(error.to_string()))?;
-    if let Err(error) = snapshot_metadata(&ctx.bundle_root, &tx)
-        .and_then(|()| write_transaction_state(&tx, "prepared"))
-    {
-        fs::remove_dir_all(&tx).ok();
+    let recovery = if reactivation_reinstall {
+        Some(RecoveryTransactionState {
+            prior_payload_missing: true,
+            transaction_id: transaction_id.clone(),
+            installation_id: current_authorization.installation_id.clone(),
+            license_signature_sha256: current_license_signature_sha256(
+                &ctx.bundle_root,
+                &current_authorization,
+            )?,
+            fingerprint_sha256: codex_usb_license::fingerprint_digest(
+                &current_authorization.fingerprint,
+            )
+            .map_err(|error| AppError::Engine(format!("计算 USB 指纹摘要失败：{error}")))?,
+            fingerprint: current_authorization.fingerprint.clone(),
+            target_relative_path: local.payload_relative.clone(),
+            staged_payload_sha256: None,
+            legacy_bundle_root: None,
+        })
+    } else {
+        None
+    };
+    let marker_result = write_transaction_state_with_owner(
+        &tx,
+        "owner-registered",
+        recovery.clone(),
+        Some(owner.clone()),
+    );
+    if let Err(error) = marker_result {
+        if fs::remove_dir_all(&tx).is_ok() {
+            let _ = remove_owner_sidecar_after_transaction(
+                &ctx.bundle_root,
+                &transaction_id,
+                Some(&owner),
+            );
+        }
+        return Err(error);
+    }
+    // The verified owner marker is durable and has been read back before any
+    // snapshot or downloaded/update content is created in this directory.
+    let transaction_state_result = (|| {
+        fs::create_dir(tx.join("old"))
+            .map_err(|error| AppError::Engine(format!("创建事务旧快照目录失败: {error}")))?;
+        fs::create_dir(tx.join("next"))
+            .map_err(|error| AppError::Engine(format!("创建事务新快照目录失败: {error}")))?;
+        snapshot_metadata(&ctx.bundle_root, &tx)?;
+        write_transaction_state_with_recovery(&tx, "prepared", recovery)
+    })();
+    if let Err(error) = transaction_state_result {
+        if fs::remove_dir_all(&tx).is_ok() {
+            let _ = remove_owner_sidecar_after_transaction(
+                &ctx.bundle_root,
+                &transaction_id,
+                Some(&owner),
+            );
+        }
         return Err(error);
     }
     let result = apply_transaction(
@@ -2639,6 +4035,8 @@ pub fn apply(
         expected,
         progress,
         &network,
+        reactivation_reinstall,
+        &mut deferred_cleanup,
     );
     if let Err(error) = result {
         log::error!(
@@ -2652,6 +4050,14 @@ pub fn apply(
             return Err(error);
         }
         let rollback = rollback_transaction(&ctx.bundle_root, &tx);
+        if let Some(request) = deferred_cleanup.take() {
+            if let Err(rollback_error) = rollback {
+                log::error!("更新被作废状态阻止，事务回滚仍需重试：{rollback_error}");
+            }
+            return after_update_locks_release(transaction_guard, _operation, || {
+                request.cleanup_and_reject().map(|_| ())
+            });
+        }
         return match rollback {
             Ok(()) => Err(error),
             Err(rollback_error) => Err(AppError::Engine(format!(
@@ -2675,12 +4081,24 @@ fn apply_transaction(
     expected: &UpdateInfo,
     progress: &dyn Fn(u64, u64),
     network: &NetworkConfig,
+    reactivation_reinstall: bool,
+    deferred_cleanup: &mut Option<crate::app::usb_guard::DeferredRevocationCleanup>,
 ) -> Result<(), AppError> {
     let allow_redirects = fresh.identity.source_kind == CodexPayloadSourceKind::Github
         || (fresh.identity.source_kind == CodexPayloadSourceKind::Mirror
             && is_builtin_codex_mirror_base(&fresh.identity.source_locator));
     let transport = production_apply_transport(network, allow_redirects);
-    apply_transaction_with_transport(root, tx, local, fresh, expected, progress, &transport)
+    apply_transaction_with_transport_mode_and_deferred(
+        root,
+        tx,
+        local,
+        fresh,
+        expected,
+        progress,
+        &transport,
+        reactivation_reinstall,
+        deferred_cleanup,
+    )
 }
 
 fn production_apply_transport(network: &NetworkConfig, allow_redirects: bool) -> ApplyTransport {
@@ -2747,6 +4165,46 @@ fn apply_transaction_with_transport(
     expected: &UpdateInfo,
     progress: &dyn Fn(u64, u64),
     transport: &ApplyTransport,
+) -> Result<(), AppError> {
+    apply_transaction_with_transport_mode(
+        root, tx, local, fresh, expected, progress, transport, false,
+    )
+}
+
+fn apply_transaction_with_transport_mode(
+    root: &Path,
+    tx: &Path,
+    local: &LocalBundle,
+    fresh: &ResolvedRelease,
+    expected: &UpdateInfo,
+    progress: &dyn Fn(u64, u64),
+    transport: &ApplyTransport,
+    reactivation_reinstall: bool,
+) -> Result<(), AppError> {
+    let mut deferred_cleanup = None;
+    apply_transaction_with_transport_mode_and_deferred(
+        root,
+        tx,
+        local,
+        fresh,
+        expected,
+        progress,
+        transport,
+        reactivation_reinstall,
+        &mut deferred_cleanup,
+    )
+}
+
+fn apply_transaction_with_transport_mode_and_deferred(
+    root: &Path,
+    tx: &Path,
+    local: &LocalBundle,
+    fresh: &ResolvedRelease,
+    expected: &UpdateInfo,
+    progress: &dyn Fn(u64, u64),
+    transport: &ApplyTransport,
+    reactivation_reinstall: bool,
+    deferred_cleanup: &mut Option<crate::app::usb_guard::DeferredRevocationCleanup>,
 ) -> Result<(), AppError> {
     let staged = tx.join(format!("codex-{}.Msix", fresh.identity.msix_version));
     reject_reparse_chain(tx)?;
@@ -2868,6 +4326,8 @@ fn apply_transaction_with_transport(
         actual_sha: &actual_sha,
         total,
         progress,
+        reactivation_reinstall,
+        deferred_cleanup,
     })
 }
 
@@ -2900,6 +4360,8 @@ fn commit_staged_payload(input: StagedCommit<'_>) -> Result<(), AppError> {
         actual_sha,
         total,
         progress,
+        reactivation_reinstall,
+        deferred_cleanup,
     } = input;
     reject_reparse_chain(staged)?;
     let root_manifest_path = root.join(ROOT_MANIFEST_NAME);
@@ -2908,30 +4370,51 @@ fn commit_staged_payload(input: StagedCommit<'_>) -> Result<(), AppError> {
     // The full SHA256SUMS pass below is the authoritative pre-commit payload
     // read. Keep the final standalone payload hash immediately before the
     // rename as the independent TOCTOU boundary check.
-    let latest_local = require_capability_metadata(root)?;
+    let latest_local = if reactivation_reinstall {
+        require_capability_metadata_for_reinstall(root)?
+    } else {
+        require_capability_metadata(root)?
+    };
     log::info!(
         "codex payload update stage=commit-preflight start payload={}",
         latest_local.payload_relative
     );
-    let verified_digests = verify_bundle_integrity_with_digests(root)?;
-    let verified_payload_sha =
-        verified_digest(&verified_digests, &latest_local.payload_relative, "payload")?;
-    let verified_payload_size = fs::metadata(&latest_local.payload_path)
-        .map_err(|error| AppError::Engine(format!("读取 payload 大小失败: {error}")))?
-        .len();
-    verify_metadata_values(root, &verified_payload_sha, verified_payload_size)?;
-    if let Some(expected_snapshot) = parse_codex_update_payload(&expected.payload)?.local_snapshot {
-        require_local_snapshot_from_digests(
-            root,
-            &latest_local,
-            &expected_snapshot,
-            &verified_digests,
+    let verified_digests = if reactivation_reinstall {
+        require_reinstall_authorization_while_locked(
+            "codex-payload-reinstall-commit-preflight",
+            deferred_cleanup,
         )?;
-    }
+        if regular_file_exists(&latest_local.payload_path)? {
+            return Err(AppError::StaleExpectation(
+                "恢复期间受管 payload 已由其他操作填入，请重新检查后再试。".to_string(),
+            ));
+        }
+        None
+    } else {
+        let verified_digests = verify_bundle_integrity_with_digests(root)?;
+        let verified_payload_sha =
+            verified_digest(&verified_digests, &latest_local.payload_relative, "payload")?;
+        let verified_payload_size = fs::metadata(&latest_local.payload_path)
+            .map_err(|error| AppError::Engine(format!("读取 payload 大小失败: {error}")))?
+            .len();
+        verify_metadata_values(root, &verified_payload_sha, verified_payload_size)?;
+        if let Some(expected_snapshot) =
+            parse_codex_update_payload(&expected.payload)?.local_snapshot
+        {
+            require_local_snapshot_from_digests(
+                root,
+                &latest_local,
+                &expected_snapshot,
+                &verified_digests,
+            )?;
+        }
+        Some(verified_digests)
+    };
     if latest_local.current_version != expected.current_version
         || latest_local.payload_relative != local.payload_relative
         || latest_local.architecture != local.architecture
-        || !latest_local.payload_path.exists()
+        || (reactivation_reinstall && regular_file_exists(&latest_local.payload_path)?)
+        || (!reactivation_reinstall && !latest_local.payload_path.exists())
     {
         return Err(AppError::StaleExpectation(
             "本地 USB payload 在更新期间发生变化，请重新检查后再确认。".to_string(),
@@ -2939,19 +4422,26 @@ fn commit_staged_payload(input: StagedCommit<'_>) -> Result<(), AppError> {
     }
     log::info!(
         "codex payload update stage=commit-preflight integrity-completed files={}",
-        verified_digests.len()
+        verified_digests.as_ref().map_or(0, BTreeMap::len)
     );
-    let old_payload_sha = sha256_file(&latest_local.payload_path)
-        .map_err(|error| AppError::Engine(error.to_string()))?;
-    let manifest_sha = latest_local
-        .manifest
-        .pointer("/payload/sha256")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    if !manifest_sha.is_empty() && !manifest_sha.eq_ignore_ascii_case(&old_payload_sha) {
-        return Err(AppError::StaleExpectation(
-            "当前 USB payload 与 manifest 不一致，请先修复或重建安装包。".to_string(),
-        ));
+    if let Some(digests) = &verified_digests {
+        let old_payload_sha = sha256_file(&latest_local.payload_path)
+            .map_err(|error| AppError::Engine(error.to_string()))?;
+        let manifest_sha = latest_local
+            .manifest
+            .pointer("/payload/sha256")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if !manifest_sha.is_empty() && !manifest_sha.eq_ignore_ascii_case(&old_payload_sha) {
+            return Err(AppError::StaleExpectation(
+                "当前 USB payload 与 manifest 不一致，请先修复或重建安装包。".to_string(),
+            ));
+        }
+        if !digests.contains_key(&latest_local.payload_relative) {
+            return Err(AppError::StaleExpectation(
+                "完整性校验未包含当前 payload，拒绝提交。".to_string(),
+            ));
+        }
     }
     let backup_relative = latest_local
         .usb_manifest
@@ -2993,8 +4483,14 @@ fn commit_staged_payload(input: StagedCommit<'_>) -> Result<(), AppError> {
     )?;
     let current_sums = fs::read(&sums_path)
         .map_err(|error| AppError::Engine(format!("读取当前 {SHA256SUMS_NAME} 失败: {error}")))?;
-    let precommit_authorization =
-        crate::app::usb_guard::require_signed_codex_bundle("codex-payload-precommit")?;
+    let precommit_authorization = if reactivation_reinstall {
+        Some(require_reinstall_authorization_while_locked(
+            "codex-payload-reinstall-precommit",
+            deferred_cleanup,
+        )?)
+    } else {
+        crate::app::usb_guard::require_signed_codex_bundle("codex-payload-precommit")?
+    };
     if let Some(authorization) = &precommit_authorization {
         if authorization.fingerprint.anchor_schema != crate::app::usb_guard::ANCHOR_SCHEMA_V3 {
             return Err(AppError::StaleExpectation(
@@ -3035,34 +4531,36 @@ fn commit_staged_payload(input: StagedCommit<'_>) -> Result<(), AppError> {
             ));
         }
     }
-    fs::create_dir_all(tx.join("backup-dir").join("payload-backup"))
-        .map_err(|error| AppError::Engine(error.to_string()))?;
-    reject_reparse_chain(&tx.join("backup-dir"))?;
-    reject_reparse_chain(&tx.join("backup-dir").join("payload-backup"))?;
-    if backup_dir.exists() {
-        for entry in
-            fs::read_dir(&backup_dir).map_err(|error| AppError::Engine(error.to_string()))?
-        {
-            let entry = entry.map_err(|error| AppError::Engine(error.to_string()))?;
-            reject_reparse(&entry.path())?;
-            if !entry
-                .file_type()
-                .map_err(|error| AppError::Engine(error.to_string()))?
-                .is_file()
+    if !reactivation_reinstall {
+        fs::create_dir_all(tx.join("backup-dir").join("payload-backup"))
+            .map_err(|error| AppError::Engine(error.to_string()))?;
+        reject_reparse_chain(&tx.join("backup-dir"))?;
+        reject_reparse_chain(&tx.join("backup-dir").join("payload-backup"))?;
+        if backup_dir.exists() {
+            for entry in
+                fs::read_dir(&backup_dir).map_err(|error| AppError::Engine(error.to_string()))?
             {
-                return Err(AppError::Engine("backup 目录包含非文件项".to_string()));
+                let entry = entry.map_err(|error| AppError::Engine(error.to_string()))?;
+                reject_reparse(&entry.path())?;
+                if !entry
+                    .file_type()
+                    .map_err(|error| AppError::Engine(error.to_string()))?
+                    .is_file()
+                {
+                    return Err(AppError::Engine("backup 目录包含非文件项".to_string()));
+                }
+                fs::rename(
+                    entry.path(),
+                    tx.join("backup-dir")
+                        .join("payload-backup")
+                        .join(entry.file_name()),
+                )
+                .map_err(|error| AppError::Engine(format!("暂存旧 backup 失败: {error}")))?;
             }
-            fs::rename(
-                entry.path(),
-                tx.join("backup-dir")
-                    .join("payload-backup")
-                    .join(entry.file_name()),
-            )
-            .map_err(|error| AppError::Engine(format!("暂存旧 backup 失败: {error}")))?;
+        } else {
+            fs::create_dir_all(&backup_dir).map_err(|error| AppError::Engine(error.to_string()))?;
+            reject_reparse_chain(&backup_dir)?;
         }
-    } else {
-        fs::create_dir_all(&backup_dir).map_err(|error| AppError::Engine(error.to_string()))?;
-        reject_reparse_chain(&backup_dir)?;
     }
     let old_version = latest_local
         .manifest
@@ -3090,12 +4588,23 @@ fn commit_staged_payload(input: StagedCommit<'_>) -> Result<(), AppError> {
             ));
         }
     }
-    fs::rename(&latest_local.payload_path, &backup_path)
-        .map_err(|error| AppError::Engine(format!("备份旧 MSIX 失败: {error}")))?;
-    write_transaction_state(tx, "payload-backup")?;
+    if reactivation_reinstall {
+        reject_reparse_chain(&latest_local.payload_path)?;
+        if latest_local.payload_path.exists() {
+            return Err(AppError::StaleExpectation(
+                "恢复目标在提交前已出现，拒绝覆盖。".to_string(),
+            ));
+        }
+        write_commit_transaction_state(tx, "payload-swap-pending", true, actual_sha)?;
+        verify_reactivation_transaction_boundary(root, tx)?;
+    } else {
+        fs::rename(&latest_local.payload_path, &backup_path)
+            .map_err(|error| AppError::Engine(format!("备份旧 MSIX 失败: {error}")))?;
+        write_transaction_state(tx, "payload-backup")?;
+    }
     fs::rename(staged, &latest_local.payload_path)
         .map_err(|error| AppError::Engine(format!("替换 MSIX 失败: {error}")))?;
-    write_transaction_state(tx, "payload-swapped")?;
+    write_commit_transaction_state(tx, "payload-swapped", reactivation_reinstall, actual_sha)?;
 
     let payload_size = fs::metadata(&latest_local.payload_path)
         .map_err(|error| AppError::Engine(error.to_string()))?
@@ -3120,25 +4629,45 @@ fn commit_staged_payload(input: StagedCommit<'_>) -> Result<(), AppError> {
         .map_err(|error| AppError::Engine(error.to_string()))?;
     fs::write(tx.join("next").join(SHA256SUMS_NAME), &next_sums)
         .map_err(|error| AppError::Engine(error.to_string()))?;
-    write_transaction_state(tx, "metadata-ready")?;
+    write_commit_transaction_state(tx, "metadata-ready", reactivation_reinstall, actual_sha)?;
+    if reactivation_reinstall {
+        verify_reactivation_transaction_boundary(root, tx)?;
+    }
     replace_file(
         &tx.join("next").join(ROOT_MANIFEST_NAME),
         &root_manifest_path,
     )?;
-    write_transaction_state(tx, "manifest-committed")?;
+    write_commit_transaction_state(tx, "manifest-committed", reactivation_reinstall, actual_sha)?;
+    if reactivation_reinstall {
+        verify_reactivation_transaction_boundary(root, tx)?;
+    }
     replace_file(&tx.join("next").join(USB_MANIFEST_NAME), &usb_manifest_path)?;
-    write_transaction_state(tx, "usb-manifest-committed")?;
+    write_commit_transaction_state(
+        tx,
+        "usb-manifest-committed",
+        reactivation_reinstall,
+        actual_sha,
+    )?;
+    if reactivation_reinstall {
+        verify_reactivation_transaction_boundary(root, tx)?;
+    }
     replace_file(&tx.join("next").join(SHA256SUMS_NAME), &sums_path)?;
     verify_sha256_sums(root, &next_sums, &BTreeMap::new())?;
     verify_metadata_values(root, actual_sha, payload_size)?;
     if let Some(precommit) = &precommit_authorization {
-        let postcommit =
+        let postcommit = if reactivation_reinstall {
+            require_reinstall_authorization_while_locked(
+                "codex-payload-reinstall-postcommit",
+                deferred_cleanup,
+            )?
+        } else {
             crate::app::usb_guard::require_signed_codex_bundle("codex-payload-postcommit")?
                 .ok_or_else(|| {
                     AppError::Engine(
                         "anchor_postcommit_failed：正式更新完成后未能重新取得 USB 授权".to_string(),
                     )
-                })?;
+                })?
+        };
         if postcommit.fingerprint.anchor_schema != precommit.fingerprint.anchor_schema
             || !postcommit
                 .fingerprint
@@ -3158,10 +4687,19 @@ fn commit_staged_payload(input: StagedCommit<'_>) -> Result<(), AppError> {
             postcommit.fingerprint.anchor_sha256
         );
     }
-    write_transaction_state(tx, "committed")?;
+    write_commit_transaction_state(tx, "committed", reactivation_reinstall, actual_sha)?;
+    let committed_state = read_transaction_state(tx)?;
+    let transaction_id = committed_state
+        .owner
+        .as_ref()
+        .map(|owner| owner.transaction_id.as_str())
+        .unwrap_or_else(|| transaction_id_from_path(tx))
+        .to_string();
     fs::remove_dir_all(tx).map_err(|error| {
         AppError::Committed(format!("无法清理已提交事务目录 {}：{error}", tx.display()))
     })?;
+    remove_owner_sidecar_after_transaction(root, &transaction_id, committed_state.owner.as_ref())
+        .map_err(|error| AppError::Committed(error.to_string()))?;
     let staging = root.join(STAGING_DIR);
     if staging.exists()
         && fs::read_dir(&staging)
@@ -3203,6 +4741,7 @@ fn sanitize_version(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::app::settings_store::DEFAULT_CODEX_PAYLOAD_BASE_URL;
+    use base64::Engine as _;
 
     fn v2_fixture() -> PathBuf {
         let root =
@@ -3246,6 +4785,682 @@ mod tests {
         let sums = build_sha256_sums(&root, &BTreeMap::new()).unwrap();
         fs::write(root.join(SHA256SUMS_NAME), sums).unwrap();
         root
+    }
+
+    #[test]
+    fn checksum_update_excludes_only_exact_revocation_runtime_state() {
+        let root = v2_fixture();
+        let original_sums = fs::read(root.join(SHA256SUMS_NAME)).unwrap();
+        let state_dir = root.join("CodexUsbState");
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::write(state_dir.join("revocation.json"), b"{\"state\":\"active\"}").unwrap();
+        fs::write(state_dir.join("revocation.json.tmp-321-7"), b"pending").unwrap();
+        let registration_name = codex_usb_license::REVOCATION_REGISTRATION_FILE_NAME;
+        fs::write(root.join(registration_name), b"registration").unwrap();
+
+        verify_sha256_sums(&root, &original_sums, &BTreeMap::new()).unwrap();
+        let updated_sums = build_sha256_sums(&root, &BTreeMap::new()).unwrap();
+        let updated_text = String::from_utf8(updated_sums.clone()).unwrap();
+        assert!(!updated_text.contains("CodexUsbState/"));
+        assert!(!updated_text.contains(registration_name));
+        verify_sha256_sums(&root, &updated_sums, &BTreeMap::new()).unwrap();
+
+        for mutable_path in [
+            registration_name,
+            "CodexUsbState/revocation.json",
+            "CodexUsbState/revocation.json.tmp-321-7",
+        ] {
+            let file = root.join(mutable_path.replace('/', std::path::MAIN_SEPARATOR_STR));
+            let hash = sha256_file(&file).unwrap();
+            let listed_runtime_state = format!("{updated_text}{hash}  {mutable_path}\n");
+            assert!(
+                verify_sha256_sums(&root, listed_runtime_state.as_bytes(), &BTreeMap::new())
+                    .is_err()
+            );
+        }
+
+        let linked_temp = state_dir.join("revocation.json.tmp-321-8");
+        fs::hard_link(root.join(ROOT_MANIFEST_NAME), &linked_temp).unwrap();
+        assert!(verify_sha256_sums(&root, &updated_sums, &BTreeMap::new()).is_err());
+        assert!(build_sha256_sums(&root, &BTreeMap::new()).is_err());
+        fs::remove_file(&linked_temp).unwrap();
+
+        for mutable_path in [registration_name, "CodexUsbState/revocation.json"] {
+            let sidecar = root.join(mutable_path.replace('/', std::path::MAIN_SEPARATOR_STR));
+            fs::remove_file(&sidecar).unwrap();
+            fs::hard_link(root.join(ROOT_MANIFEST_NAME), &sidecar).unwrap();
+            assert!(verify_sha256_sums(&root, &updated_sums, &BTreeMap::new()).is_err());
+            assert!(build_sha256_sums(&root, &BTreeMap::new()).is_err());
+            fs::remove_file(sidecar).unwrap();
+        }
+
+        let near_match = state_dir.join("revocation.json.tmp-0321-7");
+        fs::write(&near_match, b"not a recognized atomic temp").unwrap();
+        assert!(verify_sha256_sums(&root, &updated_sums, &BTreeMap::new()).is_err());
+        assert!(build_sha256_sums(&root, &BTreeMap::new()).is_err());
+        fs::remove_file(&near_match).unwrap();
+
+        let unknown = state_dir.join("operator-note.json");
+        fs::write(&unknown, b"unlisted state").unwrap();
+        assert!(verify_sha256_sums(&root, &updated_sums, &BTreeMap::new()).is_err());
+        assert!(build_sha256_sums(&root, &BTreeMap::new()).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn revocation_fixture_identity() -> (
+        crate::app::usb_guard::UsbFingerprint,
+        crate::app::usb_guard::UsbLicense,
+    ) {
+        let fingerprint = crate::app::usb_guard::UsbFingerprint {
+            volume_serial: 77,
+            anchor_sha256: "a".repeat(64),
+            bundle_relative_path: "CodexUSB".to_string(),
+            anchor_schema: 3,
+        };
+        let license = crate::app::usb_guard::UsbLicense {
+            schema_version: codex_usb_license::LICENSE_SCHEMA_VERSION,
+            product: codex_usb_license::PRODUCT_ID.to_string(),
+            installation_id: "fixture-installation".to_string(),
+            fingerprint: fingerprint.clone(),
+            issued_at: "1".to_string(),
+            key_id: Some("fixture-key".to_string()),
+            account_binding: None,
+            signature: Some(base64::engine::general_purpose::STANDARD.encode([0u8; 64])),
+        };
+        (fingerprint, license)
+    }
+
+    #[test]
+    fn deferred_cleanup_runs_only_after_update_locks_are_released() {
+        let installation_id = format!("deferred-cleanup-test-{}", uuid::Uuid::new_v4());
+        let operation_guard = CODEX_UPDATE_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let transaction_guard =
+            crate::app::usb_revocation::acquire_codex_update_transaction_lock(&installation_id)
+                .unwrap();
+        let acquired = after_update_locks_release(transaction_guard, operation_guard, || {
+            let id = installation_id.clone();
+            std::thread::spawn(move || {
+                crate::app::usb_revocation::acquire_revocation_cleanup_transaction_lock(&id).is_ok()
+            })
+            .join()
+            .unwrap()
+        });
+        assert!(
+            acquired,
+            "cleanup must reacquire the production lock after deferred release"
+        );
+    }
+
+    #[test]
+    fn transaction_and_recovery_markers_bind_portable_usb_identity_not_drive_letter() {
+        let (fingerprint, license) = revocation_fixture_identity();
+        let transaction_id = uuid::Uuid::new_v4().to_string();
+        let license_sha = codex_usb_license::license_signature_sha256(&license).unwrap();
+        let fingerprint_sha = codex_usb_license::fingerprint_digest(&fingerprint).unwrap();
+        let owner = TransactionOwner {
+            transaction_id: transaction_id.clone(),
+            installation_id: license.installation_id.clone(),
+            license_signature_sha256: license_sha.clone(),
+            fingerprint_sha256: fingerprint_sha.clone(),
+            legacy_bundle_root: None,
+        };
+        let recovery = RecoveryTransactionState {
+            prior_payload_missing: true,
+            transaction_id: transaction_id.clone(),
+            installation_id: license.installation_id.clone(),
+            license_signature_sha256: license_sha.clone(),
+            fingerprint_sha256: fingerprint_sha.clone(),
+            fingerprint: fingerprint.clone(),
+            target_relative_path: "payload/OpenAI.Codex_Test.msix".to_string(),
+            staged_payload_sha256: None,
+            legacy_bundle_root: None,
+        };
+
+        // `D:\\One` and `F:\\One` are only current-session locators. Neither
+        // marker persists those strings; the volume/path binding comes from
+        // the stable fingerprint digest and remains identical after relabel.
+        let serialized_owner = serde_json::to_string(&owner).unwrap();
+        let serialized_recovery = serde_json::to_string(&recovery).unwrap();
+        let current_path_d = PathBuf::from(r"D:\One");
+        let current_path_f = PathBuf::from(r"F:\One");
+        assert_ne!(current_path_d, current_path_f);
+        assert_eq!(
+            codex_usb_license::fingerprint_digest(&fingerprint).unwrap(),
+            codex_usb_license::fingerprint_digest(&fingerprint).unwrap(),
+            "the stable USB identity is derived from fingerprint fields, not the current drive letter"
+        );
+        assert!(!serialized_owner.contains("bundleRoot"));
+        assert!(!serialized_recovery.contains("bundleRoot"));
+        assert!(!serialized_owner.contains("D:\\\\One"));
+        assert!(!serialized_owner.contains("F:\\\\One"));
+        assert!(!serialized_recovery.contains("D:\\\\One"));
+        assert!(!serialized_recovery.contains("F:\\\\One"));
+        assert!(transaction_owner_matches(
+            &owner,
+            &transaction_id,
+            &license.installation_id,
+            &license_sha,
+            &fingerprint_sha,
+        ));
+        assert!(recovery_owner_matches(&recovery, &owner));
+
+        for mismatch in [
+            (
+                "other-tx".to_string(),
+                license.installation_id.clone(),
+                license_sha.clone(),
+                fingerprint_sha.clone(),
+            ),
+            (
+                transaction_id.clone(),
+                "other-installation".to_string(),
+                license_sha.clone(),
+                fingerprint_sha.clone(),
+            ),
+            (
+                transaction_id.clone(),
+                license.installation_id.clone(),
+                "f".repeat(64),
+                fingerprint_sha.clone(),
+            ),
+            (
+                transaction_id.clone(),
+                license.installation_id.clone(),
+                license_sha.clone(),
+                "e".repeat(64),
+            ),
+        ] {
+            assert!(!transaction_owner_matches(
+                &owner,
+                &mismatch.0,
+                &mismatch.1,
+                &mismatch.2,
+                &mismatch.3,
+            ));
+        }
+
+        for changed_fingerprint in [
+            crate::app::usb_guard::UsbFingerprint {
+                volume_serial: fingerprint.volume_serial + 1,
+                ..fingerprint.clone()
+            },
+            crate::app::usb_guard::UsbFingerprint {
+                anchor_sha256: "b".repeat(64),
+                ..fingerprint.clone()
+            },
+            crate::app::usb_guard::UsbFingerprint {
+                bundle_relative_path: "OtherBundle".to_string(),
+                ..fingerprint.clone()
+            },
+            crate::app::usb_guard::UsbFingerprint {
+                anchor_schema: fingerprint.anchor_schema - 1,
+                ..fingerprint.clone()
+            },
+        ] {
+            let changed_digest =
+                codex_usb_license::fingerprint_digest(&changed_fingerprint).unwrap();
+            assert!(!transaction_owner_matches(
+                &owner,
+                &transaction_id,
+                &license.installation_id,
+                &license_sha,
+                &changed_digest,
+            ));
+            let mut changed_recovery = recovery.clone();
+            changed_recovery.fingerprint = changed_fingerprint;
+            assert!(!recovery_owner_matches(&changed_recovery, &owner));
+        }
+        let mut changed_recovery = recovery.clone();
+        changed_recovery.license_signature_sha256 = "c".repeat(64);
+        assert!(!recovery_owner_matches(&changed_recovery, &owner));
+        let mut changed_recovery = recovery.clone();
+        changed_recovery.transaction_id = uuid::Uuid::new_v4().to_string();
+        assert!(!recovery_owner_matches(&changed_recovery, &owner));
+        let mut changed_recovery = recovery;
+        changed_recovery.installation_id.push_str("-other");
+        assert!(!recovery_owner_matches(&changed_recovery, &owner));
+    }
+
+    #[test]
+    fn revocation_inventory_accepts_sidecar_only_partial_transaction() {
+        let (fingerprint, license) = revocation_fixture_identity();
+        let transaction_id = uuid::Uuid::new_v4().to_string();
+        let owner = TransactionOwner {
+            transaction_id: transaction_id.clone(),
+            installation_id: license.installation_id.clone(),
+            license_signature_sha256: codex_usb_license::license_signature_sha256(&license)
+                .unwrap(),
+            fingerprint_sha256: codex_usb_license::fingerprint_digest(&fingerprint).unwrap(),
+            legacy_bundle_root: None,
+        };
+        inventory_revocation_staging_names(&[
+            format!("{TRANSACTION_PREFIX}{transaction_id}"),
+            owner_sidecar_name(&transaction_id),
+        ])
+        .unwrap();
+        // The sidecar is created and verified before transaction contents, so
+        // an empty transaction may have neither state file after interruption.
+        validate_transaction_state_owner_markers(None, None, &owner).unwrap();
+    }
+
+    #[test]
+    fn revocation_inventory_rejects_unknown_or_mismatched_staging_before_first_delete() {
+        let (fingerprint, license) = revocation_fixture_identity();
+        let transaction_id = uuid::Uuid::new_v4().to_string();
+        let owner = TransactionOwner {
+            transaction_id: transaction_id.clone(),
+            installation_id: license.installation_id.clone(),
+            license_signature_sha256: codex_usb_license::license_signature_sha256(&license)
+                .unwrap(),
+            fingerprint_sha256: codex_usb_license::fingerprint_digest(&fingerprint).unwrap(),
+            legacy_bundle_root: None,
+        };
+        let mut mismatched_owner = owner.clone();
+        mismatched_owner.fingerprint_sha256 = "f".repeat(64);
+        let matching_state = serde_json::to_vec(&TransactionState {
+            version: TRANSACTION_VERSION,
+            phase: "prepared".to_string(),
+            recovery: None,
+            owner: Some(owner.clone()),
+        })
+        .unwrap();
+        let mismatched_state = serde_json::to_vec(&TransactionState {
+            version: TRANSACTION_VERSION,
+            phase: "prepared".to_string(),
+            recovery: None,
+            owner: Some(mismatched_owner),
+        })
+        .unwrap();
+        let sentinel_root = std::env::temp_dir().join(format!(
+            "codex-revocation-inventory-preflight-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&sentinel_root).unwrap();
+        let sentinel = sentinel_root.join("first-target-must-remain");
+        fs::write(&sentinel, b"untouched").unwrap();
+
+        let mut first_delete_started = false;
+        let inventory_result = (|| {
+            let names = vec![
+                format!("{TRANSACTION_PREFIX}{transaction_id}"),
+                owner_sidecar_name(&transaction_id),
+            ];
+            inventory_revocation_staging_names(&names)?;
+            validate_transaction_state_owner_markers(Some(&mismatched_state), None, &owner)?;
+            Ok::<_, AppError>(())
+        })();
+        if inventory_result.is_ok() {
+            first_delete_started = true;
+            fs::remove_file(&sentinel).unwrap();
+        }
+        assert!(inventory_result.is_err());
+        assert!(!first_delete_started);
+        assert_eq!(fs::read(&sentinel).unwrap(), b"untouched");
+
+        let unknown_names = vec!["codex-update-notes".to_string()];
+        assert!(inventory_revocation_staging_names(&unknown_names).is_err());
+        assert!(!first_delete_started);
+        assert_eq!(fs::read(&sentinel).unwrap(), b"untouched");
+
+        let missing_sidecar = HashSet::new();
+        let tx_ids = HashSet::from([uuid::Uuid::new_v4().to_string()]);
+        assert!(validate_revocation_staging_owner_pairs(&tx_ids, &missing_sidecar).is_err());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"untouched");
+
+        // A matching state remains accepted; the rejection above is specific
+        // to marker mismatch, not a blanket prohibition on prepared states.
+        validate_transaction_state_owner_markers(Some(&matching_state), None, &owner).unwrap();
+        fs::remove_dir_all(sentinel_root).unwrap();
+    }
+
+    #[test]
+    fn owner_sidecar_is_exact_idempotent_and_retained_until_transaction_disappears() {
+        let root =
+            std::env::temp_dir().join(format!("codex-owner-sidecar-{}", uuid::Uuid::new_v4()));
+        let staging = root.join(STAGING_DIR);
+        fs::create_dir_all(&staging).unwrap();
+        let (fingerprint, license) = revocation_fixture_identity();
+        let transaction_id = uuid::Uuid::new_v4().to_string();
+        let owner = TransactionOwner {
+            transaction_id: transaction_id.clone(),
+            installation_id: license.installation_id.clone(),
+            license_signature_sha256: codex_usb_license::license_signature_sha256(&license)
+                .unwrap(),
+            fingerprint_sha256: codex_usb_license::fingerprint_digest(&fingerprint).unwrap(),
+            legacy_bundle_root: None,
+        };
+
+        assert_eq!(
+            parse_owner_sidecar_name(&owner_sidecar_name(&transaction_id)),
+            Some(transaction_id.clone())
+        );
+        assert!(parse_owner_sidecar_name(&format!(
+            "{OWNER_SIDECAR_PREFIX}{transaction_id}-extra{OWNER_SIDECAR_SUFFIX}"
+        ))
+        .is_none());
+        assert!(parse_owner_sidecar_name(&format!(
+            "{OWNER_SIDECAR_PREFIX}{}{}",
+            transaction_id.to_uppercase(),
+            OWNER_SIDECAR_SUFFIX
+        ))
+        .is_none());
+
+        write_owner_sidecar(&staging, &owner).unwrap();
+        assert!(write_owner_sidecar(&staging, &owner).is_err());
+        let sidecar = owner_sidecar_path(&staging, &transaction_id);
+        let bytes = read_bounded_transaction_state_file(&sidecar)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<TransactionOwner>(&bytes).unwrap(),
+            owner
+        );
+
+        let tx = staging.join(format!("{TRANSACTION_PREFIX}{transaction_id}"));
+        fs::create_dir(&tx).unwrap();
+        assert!(
+            remove_owner_sidecar_after_transaction(&root, &transaction_id, Some(&owner),).is_err()
+        );
+        assert!(
+            sidecar.exists(),
+            "a partial transaction keeps its owner proof"
+        );
+        fs::remove_dir(&tx).unwrap();
+        remove_owner_sidecar_after_transaction(&root, &transaction_id, Some(&owner)).unwrap();
+        assert!(!sidecar.exists());
+        remove_owner_sidecar_after_transaction(&root, &transaction_id, Some(&owner)).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn write_test_transaction_state(
+        root: &Path,
+        transaction_id: &str,
+        license: &crate::app::usb_guard::UsbLicense,
+        fingerprint: &crate::app::usb_guard::UsbFingerprint,
+        owner_override: Option<TransactionOwner>,
+    ) -> PathBuf {
+        let tx = root
+            .join(STAGING_DIR)
+            .join(format!("{TRANSACTION_PREFIX}{transaction_id}"));
+        fs::create_dir_all(&tx).unwrap();
+        let canonical_root = fs::canonicalize(root).unwrap();
+        let owner = owner_override.or_else(|| {
+            Some(TransactionOwner {
+                transaction_id: transaction_id.to_string(),
+                installation_id: license.installation_id.clone(),
+                license_signature_sha256: codex_usb_license::license_signature_sha256(license)
+                    .unwrap(),
+                fingerprint_sha256: codex_usb_license::fingerprint_digest(fingerprint).unwrap(),
+                legacy_bundle_root: None,
+            })
+        });
+        write_transaction_state_with_owner(&tx, "prepared", None, owner).unwrap();
+        tx
+    }
+
+    fn validate_test_transaction_inventory(
+        root: &Path,
+        license: &crate::app::usb_guard::UsbLicense,
+        fingerprint: &crate::app::usb_guard::UsbFingerprint,
+    ) -> Result<Vec<PathBuf>, AppError> {
+        let root = fs::canonicalize(root).unwrap();
+        let license_sha = codex_usb_license::license_signature_sha256(license).unwrap();
+        let fingerprint_sha = codex_usb_license::fingerprint_digest(fingerprint).unwrap();
+        let transactions = pending_transaction_dirs(&root)?;
+        validate_transaction_owner_inventory(
+            &root,
+            license,
+            &license_sha,
+            &fingerprint_sha,
+            &transactions,
+            |tx, _relative| read_transaction_state(tx),
+        )?;
+        Ok(transactions)
+    }
+
+    #[test]
+    fn revocation_inventory_requires_exact_bounded_owner_marker_before_deletion() {
+        let root = v2_fixture();
+        let sentinel = root.join("apps/Codex/keep.txt");
+        fs::create_dir_all(sentinel.parent().unwrap()).unwrap();
+        fs::write(&sentinel, b"preserve").unwrap();
+        let (fingerprint, license) = revocation_fixture_identity();
+
+        let transaction_id = uuid::Uuid::new_v4().to_string();
+        let tx = write_test_transaction_state(&root, &transaction_id, &license, &fingerprint, None);
+        assert_eq!(
+            validate_test_transaction_inventory(&root, &license, &fingerprint).unwrap(),
+            vec![fs::canonicalize(&tx).unwrap()]
+        );
+        let phase_update = write_transaction_state(&tx, "download-complete");
+        assert!(phase_update.is_ok());
+        assert!(read_transaction_state(&tx).unwrap().owner.is_some());
+
+        let mut replaced_owner = read_transaction_state(&tx).unwrap().owner.unwrap();
+        replaced_owner.fingerprint_sha256 = "f".repeat(64);
+        let replaced = serde_json::to_vec(&TransactionState {
+            version: TRANSACTION_VERSION,
+            phase: "prepared".to_string(),
+            recovery: None,
+            owner: Some(replaced_owner),
+        })
+        .unwrap();
+        crate::app::atomic_file::write_atomic(&tx.join("state.json"), &replaced).unwrap();
+        assert!(validate_test_transaction_inventory(&root, &license, &fingerprint).is_err());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"preserve");
+        let _ = fs::remove_dir_all(&root);
+
+        // Legacy v1 transaction state and forged prefix-only entries are not
+        // authorization for remote cleanup, and no runtime target is touched.
+        for kind in ["legacy", "notes"] {
+            let root = v2_fixture();
+            let sentinel = root.join("apps/Codex/keep.txt");
+            fs::create_dir_all(sentinel.parent().unwrap()).unwrap();
+            fs::write(&sentinel, b"preserve").unwrap();
+            let (fingerprint, license) = revocation_fixture_identity();
+            if kind == "legacy" {
+                let transaction_id = uuid::Uuid::new_v4().to_string();
+                let tx = root
+                    .join(STAGING_DIR)
+                    .join(format!("{TRANSACTION_PREFIX}{transaction_id}"));
+                fs::create_dir_all(&tx).unwrap();
+                write_transaction_state(&tx, "prepared").unwrap();
+            } else {
+                fs::create_dir_all(root.join(STAGING_DIR).join("codex-update-notes")).unwrap();
+            }
+            assert!(validate_test_transaction_inventory(&root, &license, &fingerprint).is_err());
+            assert_eq!(fs::read(&sentinel).unwrap(), b"preserve");
+            let _ = fs::remove_dir_all(root);
+        }
+
+        // A validly shaped marker tied to a different identity is preserved
+        // and cannot let cleanup inventory advance.
+        let root = v2_fixture();
+        let sentinel = root.join("apps/Codex/keep.txt");
+        fs::create_dir_all(sentinel.parent().unwrap()).unwrap();
+        fs::write(&sentinel, b"preserve").unwrap();
+        let (fingerprint, license) = revocation_fixture_identity();
+        let transaction_id = uuid::Uuid::new_v4().to_string();
+        let mut mismatched = TransactionOwner {
+            transaction_id: transaction_id.clone(),
+            installation_id: "other-installation".to_string(),
+            license_signature_sha256: codex_usb_license::license_signature_sha256(&license)
+                .unwrap(),
+            fingerprint_sha256: codex_usb_license::fingerprint_digest(&fingerprint).unwrap(),
+            legacy_bundle_root: None,
+        };
+        let _tx = write_test_transaction_state(
+            &root,
+            &transaction_id,
+            &license,
+            &fingerprint,
+            Some(mismatched),
+        );
+        assert!(validate_test_transaction_inventory(&root, &license, &fingerprint).is_err());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"preserve");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn owner_registered_prepare_interrupt_is_discarded_only_for_known_shape() {
+        let root = v2_fixture();
+        let (fingerprint, license) = revocation_fixture_identity();
+        let transaction_id = uuid::Uuid::new_v4().to_string();
+        let tx = write_test_transaction_state(&root, &transaction_id, &license, &fingerprint, None);
+        write_transaction_state(&tx, "owner-registered").unwrap();
+        fs::create_dir(tx.join("old")).unwrap();
+        fs::write(tx.join("old").join(ROOT_MANIFEST_NAME), b"snapshot").unwrap();
+        fs::create_dir(tx.join("next")).unwrap();
+        let state = read_transaction_state(&tx).unwrap();
+        discard_unprepared_owner_transaction(&tx, &state).unwrap();
+        assert!(!tx.exists());
+
+        let forged_tx = root
+            .join(STAGING_DIR)
+            .join(format!("{TRANSACTION_PREFIX}{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&forged_tx).unwrap();
+        let owner = TransactionOwner {
+            transaction_id: forged_tx
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .strip_prefix(TRANSACTION_PREFIX)
+                .unwrap()
+                .to_string(),
+            installation_id: license.installation_id.clone(),
+            license_signature_sha256: codex_usb_license::license_signature_sha256(&license)
+                .unwrap(),
+            fingerprint_sha256: codex_usb_license::fingerprint_digest(&fingerprint).unwrap(),
+            legacy_bundle_root: None,
+        };
+        write_transaction_state_with_owner(&forged_tx, "owner-registered", None, Some(owner))
+            .unwrap();
+        fs::write(forged_tx.join("unexpected.bin"), b"keep").unwrap();
+        let state = read_transaction_state(&forged_tx).unwrap();
+        assert!(discard_unprepared_owner_transaction(&forged_tx, &state).is_err());
+        assert!(forged_tx.join("unexpected.bin").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn transaction_state_and_backup_are_bounded_and_regular_files() {
+        let root = v2_fixture();
+        let tx = root.join(STAGING_DIR).join("codex-update-state-bound");
+        fs::create_dir_all(&tx).unwrap();
+        let state_path = tx.join("state.json");
+        fs::write(
+            &state_path,
+            vec![b' '; MAX_TRANSACTION_STATE_BYTES as usize + 1],
+        )
+        .unwrap();
+        assert!(read_transaction_state(&tx).is_err());
+
+        let backup = crate::app::atomic_file::backup_path(&state_path);
+        fs::write(&state_path, b"invalid json").unwrap();
+        fs::write(
+            &backup,
+            vec![b' '; MAX_TRANSACTION_STATE_BYTES as usize + 1],
+        )
+        .unwrap();
+        assert!(read_transaction_state(&tx).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transaction_state_rejects_reparse_marker() {
+        use std::os::unix::fs::symlink;
+
+        let root = v2_fixture();
+        let tx = root.join(STAGING_DIR).join("codex-update-reparse-state");
+        fs::create_dir_all(&tx).unwrap();
+        let outside = root.join("outside-state.json");
+        fs::write(
+            &outside,
+            serde_json::to_vec(&TransactionState {
+                version: TRANSACTION_VERSION,
+                phase: "download-complete".to_string(),
+                recovery: None,
+                owner: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        symlink(&outside, tx.join("state.json")).unwrap();
+        assert!(read_transaction_state(&tx).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn reactivation_recovery_state(
+        root: &Path,
+        local: &LocalBundle,
+        staged_payload_sha256: Option<String>,
+    ) -> RecoveryTransactionState {
+        let (fingerprint, license) = revocation_fixture_identity();
+        RecoveryTransactionState {
+            prior_payload_missing: true,
+            transaction_id: uuid::Uuid::new_v4().to_string(),
+            installation_id: license.installation_id.clone(),
+            license_signature_sha256: codex_usb_license::license_signature_sha256(&license)
+                .unwrap(),
+            fingerprint_sha256: codex_usb_license::fingerprint_digest(&fingerprint).unwrap(),
+            fingerprint,
+            target_relative_path: local.payload_relative.clone(),
+            staged_payload_sha256,
+            legacy_bundle_root: None,
+        }
+    }
+
+    fn owner_for_recovery(recovery: &RecoveryTransactionState) -> TransactionOwner {
+        TransactionOwner {
+            transaction_id: recovery.transaction_id.clone(),
+            installation_id: recovery.installation_id.clone(),
+            license_signature_sha256: recovery.license_signature_sha256.clone(),
+            fingerprint_sha256: recovery.fingerprint_sha256.clone(),
+            legacy_bundle_root: None,
+        }
+    }
+
+    #[test]
+    fn manifest_schema_consumer_preserves_v2_and_requires_matching_v3_policy() {
+        let usb_v2 = serde_json::json!({"schemaVersion": 2});
+        assert_eq!(
+            require_supported_manifest_schemas(&serde_json::json!({"schemaVersion": 2}), &usb_v2)
+                .unwrap(),
+            2
+        );
+        let usb_v3 = serde_json::json!({"schemaVersion": 3});
+        assert_eq!(
+            require_supported_manifest_schemas(
+                &serde_json::json!({
+                    "schemaVersion": 3,
+                    "revocationPolicy": {"registrationRequired": true}
+                }),
+                &usb_v3
+            )
+            .unwrap(),
+            3
+        );
+        assert!(require_supported_manifest_schemas(
+            &serde_json::json!({"schemaVersion": 3}),
+            &usb_v3
+        )
+        .is_err());
+        assert!(require_supported_manifest_schemas(
+            &serde_json::json!({
+                "schemaVersion": 3,
+                "revocationPolicy": {"registrationRequired": false}
+            }),
+            &usb_v3
+        )
+        .is_err());
+        assert!(require_supported_manifest_schemas(
+            &serde_json::json!({"schemaVersion": 3}),
+            &usb_v2
+        )
+        .is_err());
     }
 
     #[test]
@@ -3499,6 +5714,7 @@ mod tests {
         let tx = root.join(STAGING_DIR).join("codex-update-test");
         fs::create_dir_all(tx.join("old")).unwrap();
         snapshot_metadata(&root, &tx).unwrap();
+        write_transaction_state(&tx, "download-complete").unwrap();
         rollback_transaction(&root, &tx).unwrap();
 
         assert_eq!(
@@ -3507,6 +5723,93 @@ mod tests {
         );
         assert!(unrelated.is_file());
         assert!(!tx.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reactivation_rollback_removes_only_the_recorded_staged_payload_and_restores_metadata() {
+        let root = v2_fixture();
+        let local = require_capability(&root).unwrap();
+        let original_root = fs::read(root.join(ROOT_MANIFEST_NAME)).unwrap();
+        let original_usb = fs::read(root.join(USB_MANIFEST_NAME)).unwrap();
+        let original_sums = fs::read(root.join(SHA256SUMS_NAME)).unwrap();
+        fs::remove_file(&local.payload_path).unwrap();
+
+        let staged_payload = b"verified replacement payload";
+        let staged_sha = sha256_bytes(staged_payload);
+        let recovery = reactivation_recovery_state(&root, &local, Some(staged_sha.clone()));
+        let tx = root
+            .join(STAGING_DIR)
+            .join(format!("{TRANSACTION_PREFIX}{}", recovery.transaction_id));
+        fs::create_dir_all(tx.join("old")).unwrap();
+        fs::create_dir_all(tx.join("next")).unwrap();
+        snapshot_metadata(&root, &tx).unwrap();
+        let owner = owner_for_recovery(&recovery);
+        write_transaction_state_with_owner(
+            &tx,
+            "payload-swap-pending",
+            Some(recovery),
+            Some(owner),
+        )
+        .unwrap();
+        fs::write(tx.join("codex-new.Msix"), staged_payload).unwrap();
+        fs::rename(tx.join("codex-new.Msix"), &local.payload_path).unwrap();
+
+        // Model a crash after the first manifest replacement but before the
+        // checksum commit. The target path remains the same and is bound to
+        // the transaction's original signed identity snapshot.
+        let release = fake_resolved_release();
+        let (next_root, next_usb) = update_metadata(
+            &local,
+            &release.identity,
+            &release.app_version,
+            &staged_sha,
+            staged_payload.len() as u64,
+        )
+        .unwrap();
+        fs::write(root.join(ROOT_MANIFEST_NAME), next_root).unwrap();
+
+        rollback_transaction(&root, &tx).unwrap();
+
+        assert!(!local.payload_path.exists());
+        assert_eq!(
+            fs::read(root.join(ROOT_MANIFEST_NAME)).unwrap(),
+            original_root
+        );
+        assert_eq!(
+            fs::read(root.join(USB_MANIFEST_NAME)).unwrap(),
+            original_usb
+        );
+        assert_eq!(fs::read(root.join(SHA256SUMS_NAME)).unwrap(), original_sums);
+        assert!(!tx.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reactivation_rollback_fails_closed_for_unowned_target_bytes_or_path() {
+        let root = v2_fixture();
+        let local = require_capability(&root).unwrap();
+        fs::remove_file(&local.payload_path).unwrap();
+        let expected_sha = sha256_bytes(b"our staged payload");
+        let recovery = reactivation_recovery_state(&root, &local, Some(expected_sha.clone()));
+        let tx = root
+            .join(STAGING_DIR)
+            .join(format!("{TRANSACTION_PREFIX}{}", recovery.transaction_id));
+        fs::create_dir_all(tx.join("old")).unwrap();
+        snapshot_metadata(&root, &tx).unwrap();
+        let mut state = recovery;
+        state.target_relative_path = "payload/other.msix".to_string();
+        let owner = owner_for_recovery(&state);
+        write_transaction_state_with_owner(&tx, "payload-swapped", Some(state), Some(owner))
+            .unwrap();
+        fs::write(&local.payload_path, b"unowned replacement bytes").unwrap();
+
+        assert!(rollback_transaction(&root, &tx).is_err());
+        assert_eq!(
+            fs::read(&local.payload_path).unwrap(),
+            b"unowned replacement bytes"
+        );
+        assert!(tx.exists());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -4715,6 +7018,7 @@ mod tests {
         let expected = fake_update_info(&root, &local);
         let payload_sha = sha256_bytes(payload);
         let progress_events = std::cell::RefCell::new(Vec::new());
+        let mut deferred_cleanup = None;
 
         commit_staged_payload(StagedCommit {
             root: &root,
@@ -4726,6 +7030,8 @@ mod tests {
             actual_sha: &payload_sha,
             total: payload.len() as u64,
             progress: &|done, total| progress_events.borrow_mut().push((done, total)),
+            reactivation_reinstall: false,
+            deferred_cleanup: &mut deferred_cleanup,
         })
         .unwrap();
 
@@ -4759,6 +7065,7 @@ mod tests {
         let release = fake_resolved_release();
         let expected = fake_update_info(&root, &local);
         let payload_sha = sha256_file(&staged).unwrap();
+        let mut deferred_cleanup = None;
 
         let result = commit_staged_payload(StagedCommit {
             root: &root,
@@ -4770,6 +7077,8 @@ mod tests {
             actual_sha: &payload_sha,
             total: 1,
             progress: &|_, _| {},
+            reactivation_reinstall: false,
+            deferred_cleanup: &mut deferred_cleanup,
         });
         assert!(result.is_err());
         rollback_transaction(&root, &tx).unwrap();

@@ -7,8 +7,8 @@ Codex U 盘版 v0.5.24 — 使用说明
 请双击 U 盘根目录的：CodexDesktopSetup.exe
 
 看到 Windows 用户账户控制（UAC）时点击“是”。
-不要直接运行 CodexAppManager.exe，也不要直接打开 apps\Codex 里的 Codex.exe；
-这些入口可能绕过正常的一键流程或 U 盘授权检查。
+日常请从 CodexDesktopSetup.exe 启动。直接运行 apps\Codex 中 MSIX manifest 声明的官方程序入口，
+可能绕过管理器的联网授权检查和 U 盘看门狗；产品接受这一限制，不会声称直接入口也受门禁保护。
 
 
 二、这一版把什么放在哪里
@@ -97,13 +97,18 @@ Codex 和 Codex Switch。重新插回同一只授权 U 盘后可以再次打开�
 运行时和安装清单会写入 `%USERPROFILE%\.codex\codex-agent-kit`；用户配置仍由
 Codex 使用本机目录，U 盘不保存密钥。
 
-如果自动步骤失败，或以后需要修复/补装，可在安装完成页底部不显眼的“组件修复”入口
-单独重跑能力包安装。入口里每个外部连接默认关闭；不勾选或不填写就跳过，不会发起
-外部 API 请求。可选项包含飞书 MCP、DashScope 搜索、Image-2 和 Seedance 的
-API/路由配置，密钥只通过当前用户环境变量传给本次安装，不写入 U 盘或日志。
+Python、Feishu MCP、FFmpeg 和 Manim 依赖随包离线安装。HyperFrames CLI 首次安装需要
+联网访问 npm；如果本机没有可用 Chrome，浏览器初始化也需要联网。网络不可用时这部分会
+显示 `requires-network`，不会阻断其他组件。恢复网络后，可在“高级功能 → 组件修复”重试；
+若 CLI 已安装，也可以运行 `hyperframes.cmd browser ensure` 重试浏览器准备。
 
-同一入口还提供 CCSwitch 单独重试按钮，适合 Codex 已安装但 CCSwitch 因运行库、
-WebView2 或窗口启动问题没有自动打开的情况。
+主界面的“连接与扩展”集中设置飞书 MCP、DashScope 搜索、统一媒体 MCP（Image-2、Grok、Seedance；MiniMax 模型待共享上游开放），
+以及 Cloudflare、Figma、Linear、Notion 远程 MCP。外部连接默认关闭；不勾选或不填写就
+跳过，不会发起外部 API 请求。API Key 只通过当前用户环境变量传给本次安装，不写入 U 盘或日志。
+
+如果自动安装步骤失败，或以后需要修复/补装，可展开“高级功能”，打开“组件修复”并单独
+重跑能力包安装。CCSwitch 单独重试也在这里，适合 Codex 已安装但 CCSwitch 因运行库、
+WebView2 或窗口启动问题没有自动打开的情况。运行时检查、程序修复和日志也留在高级功能中。
 
 如果 CCSwitch 显示 `localhost` 连接被拒绝，先关闭任务栏/任务管理器中残留的旧版
 CCSwitch，再点击管理器中的 CCSwitch 重试；CCSwitch 采用单实例端口，旧版本占用时
@@ -160,8 +165,8 @@ usb-license.json 是管理器为当前物理 U 盘生成的可变身份文件，
   Windows 用户目录后再装；安装器不会在这种状态下继续。
 
 “安装成功但找不到开始菜单 Codex”
-  这是当前设计。直接 Codex 快捷方式会绕过 U 盘授权，请从
-  CodexDesktopSetup.exe 启动。
+  这是当前设计，不会自动创建 Codex 快捷方式。请从 CodexDesktopSetup.exe 启动，
+  让管理器在启动 Codex 前重新检查授权。直接运行 apps\Codex 中的官方入口可能绕过此检查。
 
 “点启动后短暂等待”
   管理器正在确认 Codex 是否出现稳定、可操作的窗口；只有进程但没有窗口不会被误报

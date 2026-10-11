@@ -1,9 +1,11 @@
 //! Offline Codex capability-pack installation for the USB manager.
 //!
 //! The pack is a separate, signed-by-build-input directory shipped beside the
-//! USB manager.  This module deliberately invokes only the pack's local
-//! PowerShell installer: it never downloads a skill, MCP package, Python
-//! runtime, Node runtime, or credential from the network.
+//! USB manager. This module invokes the pack's local PowerShell installer.
+//! Skills, Python/Node base runtimes, Feishu MCP, FFmpeg, and Manim are bundled;
+//! the HyperFrames CLI and its browser may need network access during setup.
+//! A missing network-dependent component is reported as requires-network and
+//! does not prevent the remaining capability pack from being installed.
 
 use std::fs;
 #[cfg(target_os = "windows")]
@@ -31,6 +33,17 @@ const OWNED_CONNECTION_ENV_NAMES: &[&str] = &[
     "DASHSCOPE_API_KEY",
     "DASHSCOPE_BASE_URL",
     "DASHSCOPE_MODEL",
+    "MEDIA_GENERATION_API_BASE_URL",
+    "MEDIA_GENERATION_API_PROFILE",
+    "MEDIA_GENERATION_API_KEY",
+    "MEDIA_GENERATION_AGENT_ID",
+    "MEDIA_IMAGE2_MODEL",
+    "MEDIA_GROK_IMAGE_MODEL",
+    "MEDIA_GROK_VIDEO_MODEL",
+    "MEDIA_SEEDANCE_MODEL",
+    "MEDIA_MINIMAX_VIDEO_MODEL",
+    // Retained only so a prior package-owned connection record can be safely
+    // cleaned up. The new installer never writes or consumes these variables.
     "IMAGE_2_API_KEY",
     "IMAGE_2_API_BASE_URL",
     "IMAGE_2_MODEL",
@@ -42,6 +55,8 @@ const OWNED_CONNECTION_ENV_NAMES: &[&str] = &[
     "SEEDANCE_PRECHARGE_POINTS",
     "SEEDANCE_OFFICIAL_LINK_TTL_HOURS",
     "SEEDANCE_REFUND_RULE",
+    "MINIMAX_API_KEY",
+    "MINIMAX_API_BASE_URL",
 ];
 
 fn strip_utf8_bom(bytes: &[u8]) -> &[u8] {
@@ -60,6 +75,7 @@ struct ConnectionOwnershipRecord {
 
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(default)]
 pub struct CapabilityPackInstallOptions {
     pub enable_feishu: bool,
     pub persist_connections: bool,
@@ -69,20 +85,49 @@ pub struct CapabilityPackInstallOptions {
     pub feishu_domain: String,
     pub feishu_auth_mode: String,
     pub enabled_api_services: Vec<String>,
+    pub enabled_remote_mcps: Vec<String>,
+    pub enable_media_generation: bool,
     pub dashscope_api_key: String,
     pub dashscope_base_url: String,
     pub dashscope_model: String,
-    pub image2_api_key: String,
-    pub image2_base_url: String,
+    pub media_generation_api_base_url: String,
+    pub media_generation_api_profile: String,
+    pub media_generation_api_key: String,
+    pub media_generation_agent_id: String,
     pub image2_model: String,
-    pub image2_agent_id: String,
-    pub seedance_api_key: String,
-    pub seedance_base_url: String,
+    pub grok_image_model: String,
+    pub grok_video_model: String,
     pub seedance_model: String,
-    pub seedance_agent_id: String,
-    pub seedance_precharge_points: String,
-    pub seedance_official_link_ttl_hours: String,
-    pub seedance_refund_rule: String,
+    pub minimax_video_model: String,
+}
+
+impl Default for CapabilityPackInstallOptions {
+    fn default() -> Self {
+        Self {
+            enable_feishu: false,
+            persist_connections: true,
+            feishu_app_id: String::new(),
+            feishu_app_secret: String::new(),
+            feishu_user_access_token: String::new(),
+            feishu_domain: "https://open.feishu.cn".to_string(),
+            feishu_auth_mode: "tenant".to_string(),
+            enabled_api_services: Vec::new(),
+            enabled_remote_mcps: Vec::new(),
+            enable_media_generation: false,
+            dashscope_api_key: String::new(),
+            dashscope_base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1".to_string(),
+            dashscope_model: String::new(),
+            media_generation_api_base_url: String::new(),
+            media_generation_api_profile: "auto".to_string(),
+            media_generation_api_key: String::new(),
+            media_generation_agent_id: String::new(),
+            image2_model: String::new(),
+            grok_image_model: String::new(),
+            grok_video_model: String::new(),
+            seedance_model: String::new(),
+            minimax_video_model: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -330,7 +375,8 @@ fn readiness_summary(profile: &Path) -> ReadinessSummary {
 mod tests {
     use super::{
         core_ready_from_readiness, persist_connection_ownership, readiness_summary, strip_utf8_bom,
-        ConnectionOwnershipRecord, CONNECTION_OWNERSHIP_RELATIVE, PACK_ID,
+        validate_options, CapabilityPackInstallOptions, ConnectionOwnershipRecord,
+        CONNECTION_OWNERSHIP_RELATIVE, PACK_ID,
     };
     use serde_json::json;
     use std::fs;
@@ -417,6 +463,25 @@ mod tests {
         assert!(!text.contains("secret-value"));
         let _ = fs::remove_dir_all(profile);
     }
+
+    #[test]
+    fn minimax_video_uses_the_shared_media_connection_only() {
+        let options = CapabilityPackInstallOptions {
+            enable_media_generation: true,
+            media_generation_api_base_url: "https://api.wokey.ai".to_string(),
+            media_generation_api_profile: "auto".to_string(),
+            media_generation_api_key: "shared-test-key".to_string(),
+            minimax_video_model: "upstream-minimax-video-model".to_string(),
+            ..CapabilityPackInstallOptions::default()
+        };
+        assert!(validate_options(&options).is_ok());
+
+        let mut legacy_direct = options;
+        legacy_direct
+            .enabled_api_services
+            .push("minimax-h3".to_string());
+        assert!(validate_options(&legacy_direct).is_err());
+    }
 }
 
 fn overall_status(core_ready: bool, runtime_status: &str, config_status: &str) -> &'static str {
@@ -440,8 +505,7 @@ fn sanitized_child_output(output: &Output, options: &CapabilityPackInstallOption
         &options.feishu_app_secret,
         &options.feishu_user_access_token,
         &options.dashscope_api_key,
-        &options.image2_api_key,
-        &options.seedance_api_key,
+        &options.media_generation_api_key,
     ] {
         if !secret.trim().is_empty() {
             text = text.replace(secret, "<redacted>");
@@ -536,13 +600,15 @@ fn selected_service(options: &CapabilityPackInstallOptions, id: &str) -> bool {
 
 fn validate_options(options: &CapabilityPackInstallOptions) -> Result<(), AppError> {
     for service in &options.enabled_api_services {
-        if !matches!(
-            service.trim(),
-            "dashscope-web-search" | "image-2" | "seedance"
-        ) {
+        if !matches!(service.trim(), "dashscope-web-search") {
             return Err(AppError::Engine(format!(
                 "不支持的能力包外部服务: {service}"
             )));
+        }
+    }
+    for server in &options.enabled_remote_mcps {
+        if !matches!(server.trim(), "cloudflare" | "figma" | "linear" | "notion") {
+            return Err(AppError::Engine(format!("不支持的远程 MCP 服务: {server}")));
         }
     }
     if options.enable_feishu {
@@ -570,32 +636,53 @@ fn validate_options(options: &CapabilityPackInstallOptions) -> Result<(), AppErr
             "启用 DashScope 搜索时必须填写 API Key、Base URL 和模型".to_string(),
         ));
     }
-    if selected_service(options, "image-2")
-        && (non_empty(&options.image2_api_key).is_none()
-            || non_empty(&options.image2_base_url).is_none()
-            || non_empty(&options.image2_model).is_none()
-            || non_empty(&options.image2_agent_id).is_none())
-    {
-        return Err(AppError::Engine(
-            "启用图像服务时必须填写 API Key、Base URL、模型和路由 ID".to_string(),
-        ));
-    }
-    if selected_service(options, "seedance")
-        && [
-            &options.seedance_api_key,
-            &options.seedance_base_url,
-            &options.seedance_model,
-            &options.seedance_agent_id,
-            &options.seedance_precharge_points,
-            &options.seedance_official_link_ttl_hours,
-            &options.seedance_refund_rule,
-        ]
-        .iter()
-        .any(|value| non_empty(value).is_none())
-    {
-        return Err(AppError::Engine(
-            "启用视频服务时必须补全 API Key、端点、模型、路由和费用策略".to_string(),
-        ));
+    if options.enable_media_generation {
+        if non_empty(&options.media_generation_api_base_url).is_none()
+            || non_empty(&options.media_generation_api_key).is_none()
+        {
+            return Err(AppError::Engine(
+                "启用统一媒体 MCP 时必须填写媒体 Base URL 和共享 API Key".to_string(),
+            ));
+        }
+        if !matches!(
+            options.media_generation_api_profile.trim(),
+            "auto" | "legacy" | "wokey"
+        ) {
+            return Err(AppError::Engine(
+                "媒体 API 兼容模式只允许 auto、legacy 或 wokey".to_string(),
+            ));
+        }
+        let has_image2 = non_empty(&options.image2_model).is_some();
+        let has_grok_image = non_empty(&options.grok_image_model).is_some();
+        let has_grok_video = non_empty(&options.grok_video_model).is_some();
+        let has_seedance = non_empty(&options.seedance_model).is_some();
+        let has_minimax = non_empty(&options.minimax_video_model).is_some();
+        if !(has_image2 || has_grok_image || has_grok_video || has_seedance || has_minimax) {
+            return Err(AppError::Engine(
+                "统一媒体 MCP 至少需要填写一个上游实际支持的模型名".to_string(),
+            ));
+        }
+        let base_is_wokey = non_empty(&options.media_generation_api_base_url)
+            .map(|value| {
+                value
+                    .trim_end_matches('/')
+                    .eq_ignore_ascii_case("https://api.wokey.ai")
+            })
+            .unwrap_or(false);
+        let uses_wokey = options.media_generation_api_profile == "wokey"
+            || (options.media_generation_api_profile == "auto" && base_is_wokey);
+        if has_minimax && !uses_wokey {
+            return Err(AppError::Engine("MiniMax 视频模型槽位仅可用于统一上游的 Wokey 兼容模式；当前不得配置官方 MiniMax API".to_string()));
+        }
+        if !uses_wokey
+            && (has_image2 || has_seedance)
+            && non_empty(&options.media_generation_agent_id).is_none()
+        {
+            return Err(AppError::Engine(
+                "当前媒体兼容模式下使用 Image-2 或 Seedance 时必须填写服务方提供的路由 ID"
+                    .to_string(),
+            ));
+        }
     }
     Ok(())
 }
@@ -759,31 +846,31 @@ fn persist_configured_environment(
             ("DASHSCOPE_MODEL", options.dashscope_model.as_str()),
         ]);
     }
-    if selected_service(options, "image-2") {
+    if options.enable_media_generation {
         values.extend([
-            ("IMAGE_2_API_KEY", options.image2_api_key.as_str()),
-            ("IMAGE_2_API_BASE_URL", options.image2_base_url.as_str()),
-            ("IMAGE_2_MODEL", options.image2_model.as_str()),
-            ("IMAGE_2_AGENT_ID", options.image2_agent_id.as_str()),
-        ]);
-    }
-    if selected_service(options, "seedance") {
-        values.extend([
-            ("SEEDANCE_API_KEY", options.seedance_api_key.as_str()),
-            ("SEEDANCE_API_BASE_URL", options.seedance_base_url.as_str()),
-            ("SEEDANCE_MODEL", options.seedance_model.as_str()),
-            ("SEEDANCE_AGENT_ID", options.seedance_agent_id.as_str()),
             (
-                "SEEDANCE_PRECHARGE_POINTS",
-                options.seedance_precharge_points.as_str(),
+                "MEDIA_GENERATION_API_BASE_URL",
+                options.media_generation_api_base_url.as_str(),
             ),
             (
-                "SEEDANCE_OFFICIAL_LINK_TTL_HOURS",
-                options.seedance_official_link_ttl_hours.as_str(),
+                "MEDIA_GENERATION_API_PROFILE",
+                options.media_generation_api_profile.as_str(),
             ),
             (
-                "SEEDANCE_REFUND_RULE",
-                options.seedance_refund_rule.as_str(),
+                "MEDIA_GENERATION_API_KEY",
+                options.media_generation_api_key.as_str(),
+            ),
+            (
+                "MEDIA_GENERATION_AGENT_ID",
+                options.media_generation_agent_id.as_str(),
+            ),
+            ("MEDIA_IMAGE2_MODEL", options.image2_model.as_str()),
+            ("MEDIA_GROK_IMAGE_MODEL", options.grok_image_model.as_str()),
+            ("MEDIA_GROK_VIDEO_MODEL", options.grok_video_model.as_str()),
+            ("MEDIA_SEEDANCE_MODEL", options.seedance_model.as_str()),
+            (
+                "MEDIA_MINIMAX_VIDEO_MODEL",
+                options.minimax_video_model.as_str(),
             ),
         ]);
     }
@@ -853,6 +940,15 @@ pub fn install(
             command.arg(service);
         }
     }
+    if !options.enabled_remote_mcps.is_empty() {
+        command.arg("-EnabledRemoteMcps");
+        for server in &options.enabled_remote_mcps {
+            command.arg(server);
+        }
+    }
+    if options.enable_media_generation {
+        command.arg("-EnableMediaGeneration");
+    }
     add_env(&mut command, "FEISHU_APP_ID", &options.feishu_app_id);
     add_env(
         &mut command,
@@ -877,40 +973,46 @@ pub fn install(
         &options.dashscope_base_url,
     );
     add_env(&mut command, "DASHSCOPE_MODEL", &options.dashscope_model);
-    add_env(&mut command, "IMAGE_2_API_KEY", &options.image2_api_key);
     add_env(
         &mut command,
-        "IMAGE_2_API_BASE_URL",
-        &options.image2_base_url,
-    );
-    add_env(&mut command, "IMAGE_2_MODEL", &options.image2_model);
-    add_env(&mut command, "IMAGE_2_AGENT_ID", &options.image2_agent_id);
-    add_env(&mut command, "SEEDANCE_API_KEY", &options.seedance_api_key);
-    add_env(
-        &mut command,
-        "SEEDANCE_API_BASE_URL",
-        &options.seedance_base_url,
-    );
-    add_env(&mut command, "SEEDANCE_MODEL", &options.seedance_model);
-    add_env(
-        &mut command,
-        "SEEDANCE_AGENT_ID",
-        &options.seedance_agent_id,
+        "MEDIA_GENERATION_API_BASE_URL",
+        &options.media_generation_api_base_url,
     );
     add_env(
         &mut command,
-        "SEEDANCE_PRECHARGE_POINTS",
-        &options.seedance_precharge_points,
+        "MEDIA_GENERATION_API_PROFILE",
+        &options.media_generation_api_profile,
     );
     add_env(
         &mut command,
-        "SEEDANCE_OFFICIAL_LINK_TTL_HOURS",
-        &options.seedance_official_link_ttl_hours,
+        "MEDIA_GENERATION_API_KEY",
+        &options.media_generation_api_key,
     );
     add_env(
         &mut command,
-        "SEEDANCE_REFUND_RULE",
-        &options.seedance_refund_rule,
+        "MEDIA_GENERATION_AGENT_ID",
+        &options.media_generation_agent_id,
+    );
+    add_env(&mut command, "MEDIA_IMAGE2_MODEL", &options.image2_model);
+    add_env(
+        &mut command,
+        "MEDIA_GROK_IMAGE_MODEL",
+        &options.grok_image_model,
+    );
+    add_env(
+        &mut command,
+        "MEDIA_GROK_VIDEO_MODEL",
+        &options.grok_video_model,
+    );
+    add_env(
+        &mut command,
+        "MEDIA_SEEDANCE_MODEL",
+        &options.seedance_model,
+    );
+    add_env(
+        &mut command,
+        "MEDIA_MINIMAX_VIDEO_MODEL",
+        &options.minimax_video_model,
     );
 
     let output = command.output().map_err(|error| {

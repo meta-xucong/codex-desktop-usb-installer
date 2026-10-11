@@ -14,7 +14,7 @@
         "repository": "https://github.com/larksuite/lark-openapi-mcp",
         "package": "@larksuiteoapi/lark-mcp@0.5.1",
         "license": "MIT",
-        "runtime": "Node.js >=20",
+        "runtime": "Node.js >=22",
         "publishedArtifact": "npm package",
         "release": "v0.5.1",
         "beta": true,
@@ -48,11 +48,11 @@
       "healthCheck": {
         "offlineCommand": "scripts/start-feishu-mcp.ps1 -PackageCache <private-feishu-cache> -DryRun",
         "codexCommand": "codex mcp get feishu --json",
-        "expected": "Node >=20, locked package name/version/entrypoint and the wrapper validate without exposing credentials; then Codex parses the 25-tool allowlist and a read-only document/tool probe succeeds",
+        "expected": "Node >=22, locked package name/version/entrypoint and the wrapper validate without exposing credentials; then Codex parses the 25-tool allowlist and a read-only document/tool probe succeeds",
         "failure": "连接未健康时只显示配置步骤，不声称已经读写飞书"
       },
       "enableWhen": [
-        "runtime.node20-feishu-optional.ready",
+        "runtime.node22-common.ready",
         "runtime.feishu-mcp-package.ready",
         "feishu.app-id",
         "feishu.app-secret",
@@ -71,6 +71,146 @@
         "feishu-perm",
         "feishu-wiki"
       ]
+    },
+    {
+      "id": "media-generation",
+      "name": "统一媒体生成 MCP",
+      "status": "guided-config",
+      "available": true,
+      "recommended": false,
+      "transport": "stdio",
+      "purpose": "同一 MCP 使用一组共享端点与 API Key 提供 Image-2、Grok、Seedance，以及未来由统一上游开放后的 MiniMax 图片/视频任务准备、用户确认、提交、查询和结果保存。MiniMax 模型槽位默认留空，不会回退到其他模型。",
+      "implementation": {
+        "publisher": "Codex Starter Kit",
+        "runtime": "bundled Python 3.12 standard library",
+        "source": "mcp/media-generation-mcp.py",
+        "noAdditionalPackages": true
+      },
+      "toolContract": {
+        "manifest": "manifest/media-generation-tools.json",
+        "tools": [
+          "media_capabilities",
+          "media_prepare",
+          "media_submit",
+          "media_check",
+          "media_save"
+        ],
+        "confirmation": "expiring HMAC-validated single-use local record",
+        "unknownSubmit": "never retry"
+      },
+      "configFragment": "config-fragments/media-generation-stdio.template.toml",
+      "connectionFields": [
+        "media-generation.api-base-url",
+        "media-generation.api-profile",
+        "media-generation.api-key",
+        "media-generation.agent-id",
+        "media-generation.image2-model",
+        "media-generation.grok-image-model",
+        "media-generation.grok-video-model",
+        "media-generation.seedance-model",
+        "media-generation.minimax-video-model"
+      ],
+      "enableWhen": [
+        "user-selected-in-setup-wizard",
+        "MEDIA_GENERATION_API_BASE_URL",
+        "MEDIA_GENERATION_API_PROFILE",
+        "MEDIA_GENERATION_API_KEY",
+        "runtime.python312.healthy"
+      ],
+      "healthCheck": {
+        "offlineCommand": "scripts/start-media-generation-mcp.ps1 -DryRun",
+        "codexCommand": "codex mcp get media_generation --json",
+        "expected": "Bundled Python and MCP server exist; tools/list exposes the five declared tools without making provider API calls. MiniMax remains unavailable until its shared-upstream model ID is configured.",
+        "failure": "缺少端点、凭据或模型时，对应 provider 显示未配置；不声称生成成功。"
+      },
+      "pricing": "The MCP does not assume prices or refund policy; user must check the selected provider and approve each paid submit.",
+      "disableRule": "Set [mcp_servers.media_generation].enabled=false; keep unrelated MCP blocks.",
+      "relatedSkills": [
+        "image-2",
+        "seedance2-0-video-gen",
+        "grok-video-prompt-compiler",
+        "minimax-video-gen"
+      ]
+    },
+    {
+      "id": "cloudflare",
+      "name": "Cloudflare MCP",
+      "status": "guided-config",
+      "available": true,
+      "recommended": false,
+      "transport": "streamable-http",
+      "url": "https://mcp.cloudflare.com/mcp",
+      "auth": "oauth",
+      "purpose": "Cloudflare API 管理与开发者文档搜索工具",
+      "accountRequirement": "需要 Cloudflare 账号并经 OAuth 授予所需账户权限；可用工具包含 API 写入操作，部分操作可能影响生产配置或产生费用。",
+      "officialDocs": "https://github.com/cloudflare/mcp",
+      "enableWhen": [
+        "user-selected-in-setup-wizard",
+        "codex.oauth.authorized"
+      ],
+      "healthCheck": "Codex MCP server status is ready after the user completes OAuth in Codex.",
+      "disableRule": "Set [mcp_servers.cloudflare].enabled=false or remove only this server block.",
+      "relatedSkills": []
+    },
+    {
+      "id": "figma",
+      "name": "Figma MCP",
+      "status": "guided-config",
+      "available": true,
+      "recommended": false,
+      "transport": "streamable-http",
+      "url": "https://mcp.figma.com/mcp",
+      "auth": "oauth",
+      "purpose": "Figma 文件与设计上下文",
+      "accountRequirement": "需 Figma 账号、受支持的 MCP 客户端及文件权限；通过 Codex OAuth 授权。",
+      "officialDocs": "https://developers.figma.com/docs/figma-mcp-server/",
+      "enableWhen": [
+        "user-selected-in-setup-wizard",
+        "codex.oauth.authorized"
+      ],
+      "healthCheck": "Codex MCP server status is ready after the user completes OAuth in Codex.",
+      "disableRule": "Set [mcp_servers.figma].enabled=false or remove only this server block.",
+      "relatedSkills": []
+    },
+    {
+      "id": "linear",
+      "name": "Linear MCP",
+      "status": "guided-config",
+      "available": true,
+      "recommended": false,
+      "transport": "streamable-http",
+      "url": "https://mcp.linear.app/mcp",
+      "auth": "oauth",
+      "purpose": "Linear 工作区与 issue 管理",
+      "accountRequirement": "需 Linear 账号与工作区；Codex OAuth，默认授权具有读写工具，完成授权前先检查工作区与 OAuth scope。",
+      "officialDocs": "https://linear.app/docs/mcp",
+      "enableWhen": [
+        "user-selected-in-setup-wizard",
+        "codex.oauth.authorized"
+      ],
+      "healthCheck": "Codex MCP server status is ready after the user completes OAuth in Codex.",
+      "disableRule": "Set [mcp_servers.linear].enabled=false or remove only this server block.",
+      "relatedSkills": []
+    },
+    {
+      "id": "notion",
+      "name": "Notion MCP",
+      "status": "guided-config",
+      "available": true,
+      "recommended": false,
+      "transport": "streamable-http",
+      "url": "https://mcp.notion.com/mcp",
+      "auth": "oauth",
+      "purpose": "Notion 页面与工作区搜索/编辑",
+      "accountRequirement": "需 Notion 账号与工作区批准该 AI 应用；通过 OAuth 连接，页面读写受工作区授权约束。",
+      "officialDocs": "https://developers.notion.com/docs/mcp",
+      "enableWhen": [
+        "user-selected-in-setup-wizard",
+        "codex.oauth.authorized"
+      ],
+      "healthCheck": "Codex MCP server status is ready after the user completes OAuth in Codex.",
+      "disableRule": "Set [mcp_servers.notion].enabled=false or remove only this server block.",
+      "relatedSkills": []
     }
   ]
 }

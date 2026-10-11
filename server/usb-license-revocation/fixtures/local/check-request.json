@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "requestId": "00112233445566778899aabbccddeeff",
+  "product": "codex-usb-oneclick",
+  "installationId": "usb-install-001",
+  "licenseSignatureSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "registration": {
+    "payloadB64": "eyJzY2hlbWFWZXJzaW9uIjoxLCJkb21haW4iOiJjb2RleC11c2ItcmV2b2NhdGlvbi1yZWdpc3RyYXRpb24tdjEiLCJwcm9kdWN0IjoiY29kZXgtdXNiLW9uZWNsaWNrIiwiaW5zdGFsbGF0aW9uSWQiOiJ1c2ItaW5zdGFsbC0wMDEiLCJsaWNlbnNlS2V5SWQiOiJsaWNlbnNlLXRlc3QtMjAyNiIsImxpY2Vuc2VTaWduYXR1cmVTaGEyNTYiOiJhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhIiwiZmluZ2VycHJpbnRTaGEyNTYiOiI2NDU4YTkwMzVmNjkwY2RmYzlhNjQyM2Y0NGY0ZmVmMTg2MGY2YWFmOWI5MGM1YzEzNGNhNWMwZmI3ZWNhNTFmIiwiaXNzdWVkQXQiOiIxNzcwMDAwMDAwMDAwIn0=",
+    "signatureB64": "F4TgInoYksaZ57gZfQ9G/FzZXB0XXsikSeqcw2k6mw65F0Wt1OTJRWVU0g3Uv6LsAQiv1SkYN/kpx33etEf9Aw=="
+  },
+  "observedFingerprint": {
+    "volumeSerial": 305419896,
+    "anchorSha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "bundleRelativePath": "CodexUsb\\Bundle",
+    "anchorSchema": 3
+  }
+}

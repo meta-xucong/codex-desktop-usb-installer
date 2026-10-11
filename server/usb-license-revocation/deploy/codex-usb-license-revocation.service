@@ -1,0 +1,35 @@
+[Unit]
+Description=Codex USB license revocation state service
+After=network.target
+
+[Service]
+Type=simple
+User=codex-license-revocation
+Group=codex-license-revocation
+UMask=0027
+EnvironmentFile=/etc/codex-usb-license-revocation/service.env
+ExecStart=/opt/codex-usb-license-revocation/revocationd
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadOnlyPaths=/opt/codex-usb-license-revocation /etc/codex-usb-license-revocation
+ReadWritePaths=/var/lib/codex-usb-license-revocation /var/backups/codex-usb-license-revocation
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateDevices=true
+ProtectClock=true
+ProtectHostname=true
+SystemCallArchitectures=native
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

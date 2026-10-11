@@ -2,6 +2,7 @@
 param(
     [string]$Target = "x86_64-pc-windows-msvc",
     [string]$CcswitchArtifactDir = "",
+    [string]$OutputDir = "",
     [ValidateSet("SignedRequired", "DevelopmentAutoEnroll")]
     [string]$UsbPolicy = "SignedRequired",
     [string]$UsbSigningProfilePath = "",
@@ -12,6 +13,20 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$defaultSetupDir = [string]::IsNullOrWhiteSpace($OutputDir)
+if ($defaultSetupDir) {
+    $setupDirPath = Join-Path $repo "release\setup"
+} else {
+    $outputCandidate = if ([System.IO.Path]::IsPathRooted($OutputDir)) { $OutputDir } else { Join-Path $repo $OutputDir }
+    $setupDirPath = [System.IO.Path]::GetFullPath($outputCandidate)
+    $releaseRoot = [System.IO.Path]::GetFullPath((Join-Path $repo "release")).TrimEnd('\') + '\'
+    if (-not $setupDirPath.StartsWith($releaseRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "OutputDir 必须位于仓库 release 目录内：$setupDirPath"
+    }
+    if (Test-Path -LiteralPath $setupDirPath) {
+        throw "版本化输出目录已存在，为避免覆盖产物而停止：$setupDirPath"
+    }
+}
 $previousUsbPolicy = $env:CODEX_USB_GUARD_POLICY
 Push-Location $repo
 try {
@@ -48,8 +63,18 @@ try {
     }
     $ccswitchArtifactExplicit = -not [string]::IsNullOrWhiteSpace($CcswitchArtifactDir)
     if ([string]::IsNullOrWhiteSpace($CcswitchArtifactDir)) {
-        $workspace = (Split-Path -Parent $repo)
-        $CcswitchArtifactDir = Join-Path $workspace "release\ccswitch-product"
+        # Prefer the resource set already staged and verified with this checkout.
+        # A stale workspace-level release directory may still contain a valid EXE
+        # that predates the USB handoff protocol required by this manager.
+        $embeddedCcswitchDir = Join-Path $repo "src-tauri\resources\ccswitch"
+        $embeddedCcswitchSource = Join-Path $embeddedCcswitchDir "CodexSwitch.exe"
+        if ((Test-Path -LiteralPath $embeddedCcswitchSource -PathType Leaf) -and
+            (Test-Path -LiteralPath (Join-Path $embeddedCcswitchDir "verify-product.ps1") -PathType Leaf)) {
+            $CcswitchArtifactDir = $embeddedCcswitchDir
+        } else {
+            $workspace = (Split-Path -Parent $repo)
+            $CcswitchArtifactDir = Join-Path $workspace "release\ccswitch-product"
+        }
     }
     $ccswitchSource = Join-Path $CcswitchArtifactDir "CodexSwitch.exe"
     $ccswitchResourceDir = Join-Path $repo "src-tauri\resources\ccswitch"
@@ -179,7 +204,58 @@ try {
     if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
         throw "未找到 Tauri 应用二进制：$binary"
     }
-    $setupDir = (New-Item -ItemType Directory -Force -Path (Join-Path $repo "release\setup")).FullName
+    $setupDir = (New-Item -ItemType Directory -Force -Path $setupDirPath).FullName
+    $entryShimProject = Join-Path $repo "tools\codex-entry-shim\Cargo.toml"
+    $entryShimBinary = Join-Path $repo "tools\codex-entry-shim\target\$Target\release\codex-entry-shim.exe"
+    & cargo.exe build --release --manifest-path $entryShimProject --target $Target
+    if ($LASTEXITCODE -ne 0) { throw "USB Codex direct-entry shim 构建失败" }
+    if (-not (Test-Path -LiteralPath $entryShimBinary -PathType Leaf)) {
+        throw "未找到 USB Codex direct-entry shim：$entryShimBinary"
+    }
+    $entryShim = Join-Path $setupDir "CodexEntryShim.exe"
+    Copy-Item -LiteralPath $entryShimBinary -Destination $entryShim -Force
+    # Rust's MSVC linker does not consistently emit the shim's requested
+    # execution level as an RT_MANIFEST resource.  Embed the checked-in
+    # asInvoker manifest explicitly into the copied release artifact before
+    # verifying it.  The shim itself must remain unelevated; it delegates
+    # privileged USB work to CodexAppManager through the named pipe.
+    $shimManifest = Join-Path $repo "tools\codex-entry-shim\as-invoker.manifest"
+    if (-not (Test-Path -LiteralPath $shimManifest -PathType Leaf)) {
+        throw "缺少 USB Codex direct-entry shim 的 asInvoker 清单：$shimManifest"
+    }
+    $programFilesX86 = [Environment]::GetEnvironmentVariable("ProgramFiles(x86)")
+    $programFiles = [Environment]::GetEnvironmentVariable("ProgramFiles")
+    $windowsKitRoots = @(
+        $(if (-not [string]::IsNullOrWhiteSpace($programFilesX86)) { Join-Path $programFilesX86 "Windows Kits\10\bin" }),
+        $(if (-not [string]::IsNullOrWhiteSpace($programFiles)) { Join-Path $programFiles "Windows Kits\10\bin" })
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and (Test-Path -LiteralPath $_) }
+    $mtCandidates = foreach ($kitRoot in $windowsKitRoots) {
+        Get-ChildItem -LiteralPath $kitRoot -Recurse -Filter "mt.exe" -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match "\\x64\\mt\.exe$" }
+    }
+    $mt = $mtCandidates | Sort-Object FullName -Descending | Select-Object -First 1
+    if ($null -eq $mt) {
+        throw "未找到 Windows SDK mt.exe，无法嵌入 USB Codex direct-entry shim 清单"
+    }
+    $shimManifestWritten = $false
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        & $mt.FullName -manifest $shimManifest ("-outputresource:{0};#1" -f $entryShim)
+        if ($LASTEXITCODE -eq 0) {
+            $shimManifestWritten = $true
+            break
+        }
+        if ($attempt -lt 5) {
+            Write-Warning "mt.exe 暂时无法写入 USB Codex direct-entry shim（尝试 $attempt/5），稍后重试"
+            Start-Sleep -Milliseconds (500 * $attempt)
+        }
+    }
+    if (-not $shimManifestWritten) {
+        throw "无法把 asInvoker 清单写入 USB Codex direct-entry shim：$entryShim"
+    }
+    $launcherVerifier = Join-Path $repo "tools\verify-usb-launcher.ps1"
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $launcherVerifier -Path $entryShim -ExpectedLevel asInvoker
+    if ($LASTEXITCODE -ne 0) { throw "USB Codex direct-entry shim 未通过 asInvoker 清单验证" }
+    Write-Output "USB Codex direct-entry shim：$entryShim（asInvoker）"
     # The copied manager is the USB-specific requireAdministrator build.  The
     # tiny launcher remains the friendly entry point, but a direct/legacy launch
     # cannot accidentally run AppX operations with a filtered token.

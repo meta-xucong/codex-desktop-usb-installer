@@ -15,17 +15,6 @@
       "install": "per-user Python 3.12.10 installer; no system PATH modification"
     },
     {
-      "id": "runtime.node20-feishu-optional",
-      "path": "runtime/bundled/node-v20.20.0-win-x64.zip",
-      "kind": "runtime-zip",
-      "source": "https://nodejs.org/dist/v20.20.0/node-v20.20.0-win-x64.zip",
-      "checksumSource": "https://nodejs.org/dist/v20.20.0/SHASUMS256.txt",
-      "sha256": "32f24e1405b113d4e01ad2585c92024df673b6156ef6f43a5469a75bf52c0a5a",
-      "bytes": 29902899,
-      "signature": "Official Node.js SHASUMS256.txt; ZIP has no Authenticode signature",
-      "install": "extract per-user and expose the runtime through the Codex Agent Kit PATH shim"
-    },
-    {
       "id": "runtime.feishu-mcp-package",
       "path": "runtime/bundled/feishu-node-modules.zip",
       "kind": "npm-offline-closure",
@@ -35,16 +24,70 @@
       "package": "@larksuiteoapi/lark-mcp@0.5.1",
       "packageCount": 195,
       "install": "extract node_modules and package-lock.json to the per-user Feishu runtime cache"
+    },
+    {
+      "id": "runtime.node22-common",
+      "path": "runtime/bundled/node-v22.22.0-win-x64.zip",
+      "kind": "runtime-zip",
+      "source": "https://nodejs.org/dist/v22.22.0/node-v22.22.0-win-x64.zip",
+      "checksumSource": "https://nodejs.org/dist/v22.22.0/SHASUMS256.txt",
+      "sha256": "c97fa376d2becdc8863fcd3ca2dd9a83a9f3468ee7ccf7a6d076ec66a645c77a",
+      "bytes": 35556852,
+      "signature": "Official Node.js SHASUMS256.txt; ZIP has no Authenticode signature",
+      "install": "Extract per-user as the shared Node 22 runtime for HyperFrames and Feishu."
+    },
+    {
+      "id": "runtime.ffmpeg-windows-x64",
+      "path": "runtime/bundled/ffmpeg-n9.0-latest-win64-lgpl-shared-9.0.zip",
+      "kind": "runtime-zip",
+      "source": "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n9.0-latest-win64-lgpl-shared-9.0.zip",
+      "sourceProject": "https://github.com/BtbN/FFmpeg-Builds",
+      "sha256": "3f67595fb8c7be0c48d8f54b2a5a89175426a6d7b194065d0c08cca9bd95eb19",
+      "bytes": 77221060,
+      "license": "FFmpeg LGPL build (shared); see runtime/THIRD-PARTY-NOTICES.md",
+      "install": "Extract ffmpeg.exe, ffprobe.exe, ffplay.exe and companion DLLs into the per-user Codex Agent Kit runtime."
+    },
+    {
+      "id": "runtime.hyperframes-package-json",
+      "path": "runtime/bundled/hyperframes-package.json",
+      "kind": "npm-lock-contract",
+      "source": "https://registry.npmjs.org/hyperframes/0.8.134",
+      "sha256": "907747a9d9adfb41244fe8dfc3786d929c6b2261813ca509c58cf4429b88ee11",
+      "bytes": 147,
+      "install": "Copied into the per-user HyperFrames runtime and installed with npm ci from the locked dependency graph."
+    },
+    {
+      "id": "runtime.hyperframes-package-lock",
+      "path": "runtime/bundled/hyperframes-package-lock.json",
+      "kind": "npm-lock-contract",
+      "source": "https://registry.npmjs.org/",
+      "sha256": "e6d58048a953a40e40df4cce287f45f2027ca38b750e0e6a45d68f48a80255d9",
+      "bytes": 62115,
+      "install": "Copied into the per-user HyperFrames runtime and installed with npm ci from the locked dependency graph."
     }
   ],
   "pythonWheelhouse": {
     "manifest": "runtime/bundled/python-wheelhouse-manifest.json",
     "lock": "runtime/bundled/python-requirements.lock",
     "directory": "runtime/bundled/python-wheels",
-    "wheelCount": 52,
-    "bytes": 85236661,
+    "wheelCount": 77,
+    "bytes": 167504800,
     "hashPolicy": "Every wheel has a SHA-256 and exact byte count in the wheelhouse manifest; pip installs with --require-hashes.",
-    "healthCheck": "import akshare, pandas, numpy, matplotlib, openpyxl, docx, pptx, pypdf, pdfplumber, reportlab, PIL, scrapling, html2text, jsonpath"
+    "healthCheck": "Base Python imports pass; isolated manim-env installs manim==0.21.0 from hashed local wheels.",
+    "additionalLock": "runtime/bundled/manim-requirements.lock"
   },
-  "secretsPolicy": "No credentials are bundled. Feishu and direct HTTP APIs require first-run user configuration and remain disabled until health checks pass."
+  "secretsPolicy": "No credentials are bundled. Feishu and direct HTTP APIs require first-run user configuration and remain disabled until health checks pass.",
+  "manim": {
+    "version": "0.21.0",
+    "lock": "runtime/bundled/manim-requirements.lock",
+    "wheelhouse": "runtime/bundled/python-wheels",
+    "environment": "per-user isolated CPython 3.12 venv",
+    "healthCheck": "CODEX_MANIM_PYTHON -c \"import manim\""
+  },
+  "optionalLatex": {
+    "name": "MiKTeX",
+    "requiredFor": "Manim Tex/MathTex formula rendering only",
+    "required": false,
+    "note": "Manim basic scenes render without a system TeX distribution; install/configure MiKTeX only when formula rendering is requested."
+  }
 }

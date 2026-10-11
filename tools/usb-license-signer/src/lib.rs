@@ -2,6 +2,7 @@
 
 #![allow(dead_code)]
 
+pub mod activation;
 pub mod bundle;
 pub mod error;
 pub mod key_blob;

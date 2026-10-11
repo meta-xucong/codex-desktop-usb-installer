@@ -48,9 +48,10 @@ pub enum PortableLaunchPolicy {
     /// Preserve the ordinary desktop-manager behaviour.
     #[default]
     Standard,
-    /// USB edition: start with the same hardware-rendered launch as a direct
-    /// ChatGPT.exe open, require a stable user-operable window, and retry with
-    /// the software-rendering/no-sandbox compatibility path only on failure.
+    /// USB edition: start with the normal hardware-rendered launch and require
+    /// a stable user-operable window. Retry with software-rendering/no-sandbox
+    /// compatibility flags only when diagnostics succeeded but no usable
+    /// window appeared.
     UsbCompatible,
     /// A prior launch on this machine already proved that Chromium's sandbox
     /// must be disabled. Keep the normal GPU path but apply that exception to
@@ -72,6 +73,10 @@ pub struct CodexLaunchReport {
 #[derive(Debug, Clone, Default)]
 pub struct LaunchOptions {
     pub disable_codex_self_updates: bool,
+    /// Signed schema 3 USB bundles require the direct-entry shim overlay.
+    /// Legacy schema 2 and standard portable installs retain their manifest
+    /// entry behavior.
+    pub require_usb_entry_overlay: bool,
     /// Start Electron's loopback DevTools endpoint for renderer theme injection.
     /// `None` preserves the ordinary launch path.
     pub remote_debugging_port: Option<u16>,
@@ -105,6 +110,46 @@ fn remote_debugging_arguments(port: u16) -> [String; 2] {
         "--remote-debugging-address=127.0.0.1".to_string(),
         format!("--remote-debugging-port={port}"),
     ]
+}
+
+#[cfg(windows)]
+fn portable_launch_arguments(
+    options: &LaunchOptions,
+    software_rendering: bool,
+    no_sandbox: bool,
+) -> Vec<std::ffi::OsString> {
+    let mut arguments = portable_compatibility_arguments(software_rendering, no_sandbox)
+        .into_iter()
+        .map(std::ffi::OsString::from)
+        .collect::<Vec<_>>();
+    if let Some(port) = options.remote_debugging_port {
+        arguments.extend(
+            remote_debugging_arguments(port)
+                .into_iter()
+                .map(std::ffi::OsString::from),
+        );
+    }
+    arguments
+}
+
+#[cfg(windows)]
+fn portable_launch_environment_overrides(
+    options: &LaunchOptions,
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    let mut overrides = Vec::new();
+    if options.disable_codex_self_updates {
+        overrides.push((
+            CODEX_SELF_UPDATE_ENV_KEY.into(),
+            CODEX_SELF_UPDATE_ENV_DISABLED.into(),
+        ));
+    }
+    if let Some(codex_home) = options.codex_home.as_ref() {
+        overrides.push(("CODEX_HOME".into(), codex_home.as_os_str().to_os_string()));
+    }
+    if let Some(locale) = normalized_locale_override(options.locale_override.as_deref()) {
+        overrides.push((CODEX_LOCALE_OVERRIDE_ENV_KEY.into(), locale.into()));
+    }
+    overrides
 }
 
 #[derive(Debug, Deserialize)]
@@ -4955,22 +5000,14 @@ fn configure_portable_launch_command(
     no_sandbox: bool,
 ) -> std::process::Command {
     let mut command = hidden_command(exe);
-    if options.disable_codex_self_updates {
-        command.env(CODEX_SELF_UPDATE_ENV_KEY, CODEX_SELF_UPDATE_ENV_DISABLED);
+    for (name, value) in portable_launch_environment_overrides(options) {
+        command.env(name, value);
     }
-    if let Some(codex_home) = options.codex_home.as_ref() {
-        command.env("CODEX_HOME", codex_home);
-    }
-    if let Some(locale) = normalized_locale_override(options.locale_override.as_deref()) {
-        command.env(CODEX_LOCALE_OVERRIDE_ENV_KEY, locale);
-    }
-    command.args(portable_compatibility_arguments(
+    command.args(portable_launch_arguments(
+        options,
         software_rendering,
         no_sandbox,
     ));
-    if let Some(port) = options.remote_debugging_port {
-        command.args(remote_debugging_arguments(port));
-    }
     command
 }
 
@@ -5051,6 +5088,42 @@ fn cleanup_failed_portable_launch(root: &Path, launch_error: EngineError) -> Eng
     }
 }
 
+#[cfg(any(windows, test))]
+#[derive(Debug)]
+enum PortableLaunchFailure {
+    /// The process started and diagnostics succeeded, but no stable usable
+    /// Codex window appeared. This is the only condition eligible for a
+    /// software-rendering compatibility retry.
+    NoUsableWindow(String),
+    /// Setup, process creation, or diagnostics failed. Retrying with renderer
+    /// flags cannot repair these failures and may obscure the original cause.
+    Fatal(EngineError),
+}
+
+#[cfg(any(windows, test))]
+impl PortableLaunchFailure {
+    fn should_retry_compatibility(&self) -> bool {
+        matches!(self, Self::NoUsableWindow(_))
+    }
+
+    fn into_engine_error(self) -> EngineError {
+        match self {
+            Self::NoUsableWindow(message) => EngineError::Io(message),
+            Self::Fatal(error) => error,
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+impl std::fmt::Display for PortableLaunchFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoUsableWindow(message) => formatter.write_str(message),
+            Self::Fatal(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
 #[cfg(windows)]
 fn launch_portable_with_usable_window(
     root: &Path,
@@ -5058,44 +5131,46 @@ fn launch_portable_with_usable_window(
     options: &LaunchOptions,
     software_rendering: bool,
     no_sandbox: bool,
-) -> Result<CodexLaunchReport, EngineError> {
+) -> Result<CodexLaunchReport, PortableLaunchFailure> {
     const WINDOW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
     const STABILITY_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
 
-    // Existing USB installs may have been created by a manager version that
-    // did not yet neutralize the packaged Windows updater.  Repair that one
-    // file before spawning Electron; this is idempotent and keeps the fix
-    // effective for both first install and in-place payload updates.
-    let _ = crate::portable::ensure_portable_codex_startup_compatibility(root)?;
-
-    let mut command =
-        configure_portable_launch_command(exe, options, software_rendering, no_sandbox);
-    command.stdout(Stdio::null()).stderr(Stdio::null());
     if let Err(error) = crate::windows_process::start_console_window_watcher(root) {
         log::warn!(
             "prelaunch Codex console event hook unavailable; using process-tree polling: {error}"
         );
         schedule_console_window_suppression(root);
     }
-    let mut child = command
-        .spawn()
-        .map_err(|error| EngineError::Io(format!("launch Codex: {error}")))?;
+    let mut command =
+        configure_portable_launch_command(exe, options, software_rendering, no_sandbox);
+    command.stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = command.spawn().map_err(|error| {
+        PortableLaunchFailure::Fatal(EngineError::Io(format!("launch Codex: {error}")))
+    })?;
 
     let first = match crate::windows_process::wait_for_usable_window_for_root(root, WINDOW_TIMEOUT)
     {
         Ok(report) => report,
-        Err(error) => return Err(cleanup_failed_portable_launch(root, error)),
+        Err(error) => {
+            return Err(PortableLaunchFailure::Fatal(
+                cleanup_failed_portable_launch(root, error),
+            ))
+        }
     };
     if let Some(window) = first {
-        // A transient HWND followed by Chromium's fatal GPU shutdown is not a
-        // successful launch. Re-check after a short stability window.
+        // A transient HWND is not a successful launch. Re-check after a short
+        // stability window before reporting that Codex is ready.
         std::thread::sleep(STABILITY_WINDOW);
         let stable = match crate::windows_process::wait_for_usable_window_for_root(
             root,
             std::time::Duration::ZERO,
         ) {
             Ok(report) => report,
-            Err(error) => return Err(cleanup_failed_portable_launch(root, error)),
+            Err(error) => {
+                return Err(PortableLaunchFailure::Fatal(
+                    cleanup_failed_portable_launch(root, error),
+                ))
+            }
         };
         if let Some(stable) = stable {
             if child.try_wait().ok().flatten().is_none() {
@@ -5137,11 +5212,14 @@ fn launch_portable_with_usable_window(
         .unwrap_or_else(|| "仍有后台进程但没有可用窗口".to_string());
     // The retry must not attach to a broken first attempt or leave its GPU
     // cache locks alive. Scope shutdown to this exact portable program root.
-    if crate::windows_process::processes_running_for_root(root)? {
-        crate::windows_process::close_processes_for_root(5, root)?;
+    if crate::windows_process::processes_running_for_root(root)
+        .map_err(PortableLaunchFailure::Fatal)?
+    {
+        crate::windows_process::close_processes_for_root(5, root)
+            .map_err(PortableLaunchFailure::Fatal)?;
     }
-    Err(EngineError::Io(format!(
-        "Codex 未能显示稳定窗口（模式={}，状态={exit}）",
+    Err(PortableLaunchFailure::NoUsableWindow(format!(
+        "未显示稳定的 Codex 可操作窗口（模式={}，状态={exit}）",
         portable_launch_mode(software_rendering, no_sandbox)
     )))
 }
@@ -5152,12 +5230,11 @@ pub fn launch_codex_with_options(
 ) -> Result<CodexLaunchReport, EngineError> {
     if installed.source == "portable" {
         let root = Path::new(&installed.path);
-        let exe = crate::portable::installed_app_exe(root).ok_or_else(|| {
-            EngineError::Io(format!(
-                "no app entry executable (ChatGPT.exe / Codex.exe) in {}",
-                root.display()
-            ))
-        })?;
+        let exe = if options.require_usb_entry_overlay {
+            crate::portable::installed_usb_codex_launch_exe(root)?
+        } else {
+            crate::portable::installed_codex_launch_exe(root)?
+        };
         // Keep older non-USB/standard portable roots safe as well.  The patch
         // is no-op for a package whose bootstrap does not use the MSIX
         // updater, and is applied before either launch strategy below.
@@ -5180,9 +5257,10 @@ pub fn launch_codex_with_options(
             match launch_portable_with_usable_window(root, &exe, &options, false, first_no_sandbox)
             {
                 Ok(report) => return Ok(report),
-                Err(first_error) => {
+                Err(first_failure) if first_failure.should_retry_compatibility() => {
+                    let first_error = first_failure.to_string();
                     log::warn!(
-                        "normal GPU launch failed; retrying USB software-rendering compatibility fallback: {first_error}"
+                        "portable Codex did not show a stable usable window; retrying software-rendering compatibility mode: {first_error}"
                     );
                     return launch_portable_with_usable_window(
                         root,
@@ -5193,10 +5271,11 @@ pub fn launch_codex_with_options(
                     )
                     .map_err(|fallback_error| {
                         EngineError::Io(format!(
-                            "Codex 启动失败；常规渲染尝试：{first_error}；软件渲染兼容重试：{fallback_error}"
+                            "Codex 启动失败；常规渲染尝试未显示稳定窗口：{first_error}；软件渲染兼容重试：{fallback_error}"
                         ))
                     });
                 }
+                Err(fatal) => return Err(fatal.into_engine_error()),
             }
         }
 
@@ -5694,6 +5773,31 @@ mod tests {
                 "User-Agent: Codex-App-Manager",
             ]
         );
+    }
+
+    #[test]
+    fn portable_launch_only_retries_after_a_successful_probe_without_a_usable_window() {
+        let spawn_error = super::PortableLaunchFailure::Fatal(super::EngineError::Io(
+            "launch Codex: access denied".to_string(),
+        ));
+        let diagnostic_error = super::PortableLaunchFailure::Fatal(super::EngineError::Io(
+            "window probe returned an error dialog".to_string(),
+        ));
+        let compatibility_error = super::PortableLaunchFailure::Fatal(super::EngineError::Io(
+            "startup compatibility patch failed".to_string(),
+        ));
+        let cleanup_error = super::PortableLaunchFailure::Fatal(super::EngineError::Io(
+            "process-tree cleanup failed".to_string(),
+        ));
+        let no_usable_window = super::PortableLaunchFailure::NoUsableWindow(
+            "未显示稳定的 Codex 可操作窗口".to_string(),
+        );
+
+        assert!(!spawn_error.should_retry_compatibility());
+        assert!(!diagnostic_error.should_retry_compatibility());
+        assert!(!compatibility_error.should_retry_compatibility());
+        assert!(!cleanup_error.should_retry_compatibility());
+        assert!(no_usable_window.should_retry_compatibility());
     }
 
     #[cfg(windows)]

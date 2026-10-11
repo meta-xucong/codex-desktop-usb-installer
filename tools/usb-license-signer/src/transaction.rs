@@ -1,10 +1,11 @@
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use codex_usb_license::{
     fingerprints_match, new_unsigned_license, sign_license, validate_fingerprint, validate_key_id,
-    validate_license, UsbAccountBinding, UsbFingerprint, UsbLicense,
+    validate_license, verify_registration, RevocationRegistrationEnvelope, UsbAccountBinding,
+    UsbFingerprint, UsbLicense, REVOCATION_REGISTRATION_FILE_NAME,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -17,6 +18,7 @@ use crate::path_security::ensure_no_reparse_components;
 use crate::windows::atomic_replace;
 
 const LICENSE_FILE_NAME: &str = "usb-license.json";
+const MAX_REGISTRATION_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -46,6 +48,56 @@ pub struct ExistingLicense {
 
 pub fn license_path(bundle_root: &Path) -> PathBuf {
     bundle_root.join(LICENSE_FILE_NAME)
+}
+
+pub fn registration_path(bundle_root: &Path) -> PathBuf {
+    bundle_root.join(REVOCATION_REGISTRATION_FILE_NAME)
+}
+
+pub fn load_registration(
+    bundle_root: &Path,
+) -> Result<Option<(Vec<u8>, RevocationRegistrationEnvelope)>, SignerError> {
+    let path = registration_path(bundle_root);
+    ensure_no_reparse_components(&path)?;
+    let file = match OpenOptions::new().read(true).open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(SignerError::io(
+                "reading registration declaration",
+                &path,
+                error,
+            ))
+        }
+    };
+    let path_metadata = fs::symlink_metadata(&path)
+        .map_err(|error| SignerError::io("reading registration attributes", &path, error))?;
+    if !path_metadata.is_file() {
+        return Err(SignerError::ExistingLicense(
+            "registration declaration is not a regular file".to_string(),
+        ));
+    }
+    let metadata = file
+        .metadata()
+        .map_err(|error| SignerError::io("reading registration attributes", &path, error))?;
+    if !metadata.is_file() || metadata.len() > MAX_REGISTRATION_BYTES {
+        return Err(SignerError::ExistingLicense(
+            "registration declaration is not a regular file or exceeds the size limit".to_string(),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_REGISTRATION_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| SignerError::io("reading registration declaration", &path, error))?;
+    if bytes.len() as u64 > MAX_REGISTRATION_BYTES {
+        return Err(SignerError::ExistingLicense(
+            "registration declaration exceeds the size limit".to_string(),
+        ));
+    }
+    let envelope = serde_json::from_slice(&bytes).map_err(|error| {
+        SignerError::ExistingLicense(format!("registration declaration JSON is invalid: {error}"))
+    })?;
+    Ok(Some((bytes, envelope)))
 }
 
 pub fn inspect_license(
@@ -206,6 +258,191 @@ pub fn verify_signed_license(
     Ok(())
 }
 
+pub fn verify_signed_pair(
+    license: &UsbLicense,
+    registration: &RevocationRegistrationEnvelope,
+    fingerprint: &UsbFingerprint,
+    public_key_b64: &str,
+) -> Result<(), SignerError> {
+    validate_license(license, fingerprint, Some(public_key_b64))?;
+    verify_registration(registration, license, fingerprint, public_key_b64)?;
+    Ok(())
+}
+
+/// Write the signed registration first and the signed license last. The
+/// license is the bundle's commit marker: a crash before it is replaced can
+/// leave an extra registration declaration, but cannot make an unsigned or
+/// missing license launchable. On ordinary errors, restore both prior byte
+/// sequences exactly before returning.
+pub fn write_signed_pair_atomic(
+    bundle_root: &Path,
+    license: &UsbLicense,
+    registration: &RevocationRegistrationEnvelope,
+    prior_license: &ExistingLicense,
+    prior_registration: Option<&[u8]>,
+    fingerprint: &UsbFingerprint,
+    public_key_b64: &str,
+) -> Result<(), SignerError> {
+    write_signed_pair_atomic_with(
+        bundle_root,
+        license,
+        registration,
+        prior_license,
+        prior_registration,
+        fingerprint,
+        public_key_b64,
+        atomic_replace,
+    )
+}
+
+fn write_signed_pair_atomic_with<F>(
+    bundle_root: &Path,
+    license: &UsbLicense,
+    registration: &RevocationRegistrationEnvelope,
+    prior_license: &ExistingLicense,
+    prior_registration: Option<&[u8]>,
+    fingerprint: &UsbFingerprint,
+    public_key_b64: &str,
+    mut replace: F,
+) -> Result<(), SignerError>
+where
+    F: FnMut(&Path, &Path) -> Result<(), SignerError>,
+{
+    verify_signed_pair(license, registration, fingerprint, public_key_b64)?;
+    let license_bytes = serde_json::to_vec_pretty(license).map_err(|error| {
+        SignerError::Report(format!("serializing signed license failed: {error}"))
+    })?;
+    let registration_bytes = serde_json::to_vec_pretty(registration).map_err(|error| {
+        SignerError::Report(format!("serializing registration failed: {error}"))
+    })?;
+
+    let license_destination = license_path(bundle_root);
+    let registration_destination = registration_path(bundle_root);
+    ensure_no_reparse_components(&license_destination)?;
+    ensure_no_reparse_components(&registration_destination)?;
+    let license_temp = stage_bytes(bundle_root, "usb-license", &license_bytes)?;
+    let registration_temp = match stage_bytes(bundle_root, "usb-registration", &registration_bytes)
+    {
+        Ok(path) => path,
+        Err(error) => {
+            let _ = fs::remove_file(&license_temp);
+            return Err(error);
+        }
+    };
+
+    let write_result = (|| {
+        replace(&registration_temp, &registration_destination)?;
+        replace(&license_temp, &license_destination)?;
+        let readback_license = read_back_license(bundle_root)?;
+        let (_, readback_registration) = load_registration(bundle_root)?.ok_or_else(|| {
+            SignerError::OutcomeUnknown("registration sidecar disappeared after commit".to_string())
+        })?;
+        verify_signed_pair(
+            &readback_license,
+            &readback_registration,
+            fingerprint,
+            public_key_b64,
+        )
+        .map_err(|error| {
+            SignerError::OutcomeUnknown(format!("signed pair readback failed: {error}"))
+        })?;
+        if readback_license != *license || readback_registration != *registration {
+            return Err(SignerError::OutcomeUnknown(
+                "signed pair readback differs from the staged values".to_string(),
+            ));
+        }
+        Ok(())
+    })();
+
+    let _ = fs::remove_file(&license_temp);
+    let _ = fs::remove_file(&registration_temp);
+    if let Err(error) = write_result {
+        let license_rollback = restore_replaced_file(
+            &license_destination,
+            prior_license
+                .license
+                .as_ref()
+                .map(|_| prior_license.bytes.as_slice()),
+            &license_bytes,
+        );
+        let registration_rollback = restore_replaced_file(
+            &registration_destination,
+            prior_registration,
+            &registration_bytes,
+        );
+        if let Err(rollback) = license_rollback.and(registration_rollback) {
+            return Err(SignerError::OutcomeUnknown(format!(
+                "signed pair write failed ({error}); rollback also failed ({rollback})"
+            )));
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn stage_bytes(root: &Path, label: &str, bytes: &[u8]) -> Result<PathBuf, SignerError> {
+    let path = root.join(format!(".{label}.signing-{}.tmp", Uuid::new_v4()));
+    let mut created = false;
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|error| SignerError::io("creating staged signer file", &path, error))?;
+        created = true;
+        file.write_all(bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|error| SignerError::io("writing staged signer file", &path, error))
+    })();
+    if result.is_err() && created {
+        let _ = fs::remove_file(&path);
+    }
+    result.map(|_| path)
+}
+
+fn restore_replaced_file(
+    destination: &Path,
+    prior_bytes: Option<&[u8]>,
+    candidate_bytes: &[u8],
+) -> Result<(), SignerError> {
+    let current = match fs::read(destination) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(SignerError::io(
+                "checking signer rollback target",
+                destination,
+                error,
+            ))
+        }
+    };
+    if current.as_deref() == prior_bytes {
+        return Ok(());
+    }
+    if current.as_deref() != Some(candidate_bytes) {
+        return Err(SignerError::OutcomeUnknown(format!(
+            "rollback refused to overwrite a signer file changed by another actor: {}",
+            destination.display()
+        )));
+    }
+    match prior_bytes {
+        Some(bytes) => {
+            let parent = destination.parent().ok_or_else(|| {
+                SignerError::PathRejected("signer rollback destination has no parent".to_string())
+            })?;
+            let temp = stage_bytes(parent, "rollback", bytes)?;
+            let result = atomic_replace(&temp, destination);
+            if result.is_err() {
+                let _ = fs::remove_file(&temp);
+            }
+            result
+        }
+        None => fs::remove_file(destination).map_err(|error| {
+            SignerError::io("removing newly created signer file", destination, error)
+        }),
+    }
+}
+
 pub fn write_old_license_audit(
     old_bytes: &[u8],
     audit_directory: &Path,
@@ -274,6 +511,85 @@ pub fn write_license_atomic(bundle_root: &Path, license: &UsbLicense) -> Result<
         let _ = fs::remove_file(&temp);
     }
     result
+}
+
+pub fn write_registration_atomic(
+    bundle_root: &Path,
+    registration: &RevocationRegistrationEnvelope,
+) -> Result<(), SignerError> {
+    let destination = registration_path(bundle_root);
+    ensure_no_reparse_components(&destination)?;
+    let bytes = serde_json::to_vec_pretty(registration).map_err(|error| {
+        SignerError::Report(format!("serializing registration failed: {error}"))
+    })?;
+    let temp = stage_bytes(bundle_root, "usb-registration", &bytes)?;
+    let result = move_file_create_new(&temp, &destination);
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
+pub fn replace_registration_atomic(
+    bundle_root: &Path,
+    registration: &RevocationRegistrationEnvelope,
+) -> Result<(), SignerError> {
+    let destination = registration_path(bundle_root);
+    ensure_no_reparse_components(&destination)?;
+    let bytes = serde_json::to_vec_pretty(registration).map_err(|error| {
+        SignerError::Report(format!("serializing registration failed: {error}"))
+    })?;
+    let temp = stage_bytes(bundle_root, "usb-registration-update", &bytes)?;
+    let result = atomic_replace(&temp, &destination);
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
+#[cfg(windows)]
+fn move_file_create_new(source: &Path, destination: &Path) -> Result<(), SignerError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
+
+    let source_wide = source
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let destination_wide = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    if unsafe {
+        MoveFileExW(
+            source_wide.as_ptr(),
+            destination_wide.as_ptr(),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
+        return Err(SignerError::io(
+            "creating missing registration declaration",
+            destination,
+            std::io::Error::last_os_error(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn move_file_create_new(source: &Path, destination: &Path) -> Result<(), SignerError> {
+    fs::hard_link(source, destination).map_err(|error| {
+        SignerError::io(
+            "creating missing registration declaration",
+            destination,
+            error,
+        )
+    })?;
+    fs::remove_file(source)
+        .map_err(|error| SignerError::io("removing staged registration file", source, error))
 }
 
 pub fn read_back_license(bundle_root: &Path) -> Result<UsbLicense, SignerError> {
@@ -382,6 +698,190 @@ mod tests {
         let readback = read_back_license(&root).unwrap();
         verify_signed_license(&readback, &observed, &key.public_key_b64()).unwrap();
         assert!(readback.signature.is_some());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn signed_pair_fixture() -> (UsbLicense, RevocationRegistrationEnvelope, ProtectedKey) {
+        use codex_usb_license::{new_unsigned_license, sign_registration};
+        use ed25519_dalek::SigningKey;
+
+        let observed = observation();
+        let key = ProtectedKey {
+            key_id: "test-key".to_string(),
+            signing_key: SigningKey::from_bytes(&[9u8; 32]),
+        };
+        let mut license = new_unsigned_license(observed.fingerprint.clone(), 2);
+        license.key_id = Some(key.key_id.clone());
+        sign_candidate(&mut license, &key).unwrap();
+        let registration = sign_registration(&license, &key.signing_key).unwrap();
+        (license, registration, key)
+    }
+
+    fn unsigned_prior_license() -> ExistingLicense {
+        use codex_usb_license::new_unsigned_license;
+
+        let license = new_unsigned_license(observation().fingerprint, 1);
+        ExistingLicense {
+            bytes: serde_json::to_vec(&license).unwrap(),
+            license: Some(license),
+        }
+    }
+
+    #[test]
+    fn pair_write_failure_restores_existing_license_and_registration_bytes() {
+        let root =
+            std::env::temp_dir().join(format!("usb-license-pair-rollback-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let prior = unsigned_prior_license();
+        let prior_registration = br#"{"previous":"registration-bytes"}"#;
+        fs::write(license_path(&root), &prior.bytes).unwrap();
+        fs::write(registration_path(&root), prior_registration).unwrap();
+        let (license, registration, key) = signed_pair_fixture();
+        let mut replacements = 0;
+        let result = write_signed_pair_atomic_with(
+            &root,
+            &license,
+            &registration,
+            &prior,
+            Some(prior_registration),
+            &observation().fingerprint,
+            &key.public_key_b64(),
+            |temp, destination| {
+                replacements += 1;
+                if replacements == 2 {
+                    return Err(SignerError::Report(
+                        "injected license replacement failure".to_string(),
+                    ));
+                }
+                atomic_replace(temp, destination)
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(fs::read(license_path(&root)).unwrap(), prior.bytes);
+        assert_eq!(
+            fs::read(registration_path(&root)).unwrap(),
+            prior_registration
+        );
+        let current: UsbLicense =
+            serde_json::from_slice(&fs::read(license_path(&root)).unwrap()).unwrap();
+        assert!(
+            current.signature.is_none(),
+            "failed pair must not leave a signed license commit marker"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pair_write_failure_without_prior_registration_leaves_no_partial_pair() {
+        let root = std::env::temp_dir().join(format!("usb-license-pair-empty-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let prior = unsigned_prior_license();
+        fs::write(license_path(&root), &prior.bytes).unwrap();
+        let (license, registration, key) = signed_pair_fixture();
+        let mut replacements = 0;
+        let result = write_signed_pair_atomic_with(
+            &root,
+            &license,
+            &registration,
+            &prior,
+            None,
+            &observation().fingerprint,
+            &key.public_key_b64(),
+            |temp, destination| {
+                replacements += 1;
+                if replacements == 2 {
+                    return Err(SignerError::Report(
+                        "injected license replacement failure".to_string(),
+                    ));
+                }
+                atomic_replace(temp, destination)
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(fs::read(license_path(&root)).unwrap(), prior.bytes);
+        assert!(!registration_path(&root).exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pair_is_cryptographically_validated_before_any_file_is_written() {
+        let root =
+            std::env::temp_dir().join(format!("usb-license-pair-preflight-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let prior = unsigned_prior_license();
+        fs::write(license_path(&root), &prior.bytes).unwrap();
+        let (license, mut registration, key) = signed_pair_fixture();
+        registration.payload_b64.push('x');
+        let result = write_signed_pair_atomic(
+            &root,
+            &license,
+            &registration,
+            &prior,
+            None,
+            &observation().fingerprint,
+            &key.public_key_b64(),
+        );
+        assert!(result.is_err());
+        assert_eq!(fs::read(license_path(&root)).unwrap(), prior.bytes);
+        assert!(!registration_path(&root).exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn successful_pair_write_reads_back_both_matching_signatures() {
+        let root =
+            std::env::temp_dir().join(format!("usb-license-pair-success-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let prior = unsigned_prior_license();
+        fs::write(license_path(&root), &prior.bytes).unwrap();
+        let (license, registration, key) = signed_pair_fixture();
+        write_signed_pair_atomic(
+            &root,
+            &license,
+            &registration,
+            &prior,
+            None,
+            &observation().fingerprint,
+            &key.public_key_b64(),
+        )
+        .unwrap();
+        let readback_license = read_back_license(&root).unwrap();
+        let (_, readback_registration) = load_registration(&root).unwrap().unwrap();
+        verify_signed_pair(
+            &readback_license,
+            &readback_registration,
+            &observation().fingerprint,
+            &key.public_key_b64(),
+        )
+        .unwrap();
+        assert_eq!(readback_license, license);
+        assert_eq!(readback_registration, registration);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn registration_repair_preserves_license_bytes_and_is_create_only() {
+        let root =
+            std::env::temp_dir().join(format!("usb-license-register-only-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let (license, registration, _) = signed_pair_fixture();
+        let license_bytes = serde_json::to_vec_pretty(&license).unwrap();
+        fs::write(license_path(&root), &license_bytes).unwrap();
+
+        write_registration_atomic(&root, &registration).unwrap();
+        let first_registration = fs::read(registration_path(&root)).unwrap();
+        assert_eq!(fs::read(license_path(&root)).unwrap(), license_bytes);
+
+        let result = write_registration_atomic(&root, &registration);
+        assert!(
+            result.is_err(),
+            "register must never replace an existing sidecar"
+        );
+        assert_eq!(
+            fs::read(registration_path(&root)).unwrap(),
+            first_registration
+        );
+        assert_eq!(fs::read(license_path(&root)).unwrap(), license_bytes);
         fs::remove_dir_all(root).unwrap();
     }
 

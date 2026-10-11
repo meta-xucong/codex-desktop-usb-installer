@@ -1,6 +1,7 @@
 academic-research
 canvas
 china-stock-analysis
+codex-skin-design
 competitor-intelligence
 conversion-optimizer
 daily-reflection
@@ -17,13 +18,17 @@ fitness-coach
 fund-portfolio
 growth-analyst
 healthcheck
+hyperframes-video
 image-2
 image-prompt-generator
 industry-analysis
+local-video-editing
 macro-research
+manim-animation
 market-sizing-analysis
 meal-planner
 meeting-secretary
+minimax-video-gen
 multi-search-engine
 node-connect
 offer-designer

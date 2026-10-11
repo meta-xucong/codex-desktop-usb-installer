@@ -774,6 +774,715 @@ pub fn deferred_cleanup_preflight(force_shared_cleanup: bool) -> Result<(), Stri
 #[path = "uninstall_tree.rs"]
 mod handle_tree;
 
+const REVOCATION_MANIFEST_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+pub(crate) struct RevocationCleanupRoot {
+    bundle_root: std::path::PathBuf,
+    fingerprint: crate::app::usb_guard::UsbFingerprint,
+    payload_relative: String,
+    architecture: String,
+    backup_relative: String,
+    #[cfg(windows)]
+    pinned: handle_tree::PinnedRoot,
+}
+
+pub(crate) struct PinnedRevocationEntry {
+    #[cfg(windows)]
+    inner: handle_tree::PinnedEntry,
+}
+
+pub(crate) struct PreparedRevocationTree {
+    #[cfg(windows)]
+    inner: handle_tree::PreparedDeleteTree,
+}
+
+pub(crate) struct PinnedRevocationTransaction {
+    relative: String,
+    tree: Option<PreparedRevocationTree>,
+    sidecar: PinnedRevocationEntry,
+    // Retain the exact `.staging` directory object that anchored both the
+    // sidecar and transaction entry throughout cleanup, including failures.
+    staging_ancestor: PinnedRevocationEntry,
+}
+
+impl PinnedRevocationEntry {
+    pub(crate) fn duplicate(&self) -> Result<PinnedRevocationEntry, String> {
+        #[cfg(windows)]
+        {
+            self.inner
+                .duplicate()
+                .map(|inner| PinnedRevocationEntry { inner })
+        }
+        #[cfg(not(windows))]
+        {
+            Err("远程作废清理只允许在 Windows 受管环境中执行".into())
+        }
+    }
+
+    pub(crate) fn is_directory(&self) -> Result<bool, String> {
+        #[cfg(windows)]
+        {
+            self.inner.is_directory()
+        }
+        #[cfg(not(windows))]
+        {
+            Err("远程作废清理只允许在 Windows 受管环境中执行".into())
+        }
+    }
+
+    pub(crate) fn read_bounded(&self, max_bytes: usize) -> Result<Vec<u8>, String> {
+        #[cfg(windows)]
+        {
+            self.inner.read_bounded(max_bytes)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = max_bytes;
+            Err("远程作废清理只允许在 Windows 受管环境中执行".into())
+        }
+    }
+
+    pub(crate) fn read_child_bounded(
+        &self,
+        name: &str,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, String> {
+        #[cfg(windows)]
+        {
+            self.inner.read_child_bounded(name, max_bytes)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (name, max_bytes);
+            Err("远程作废清理只允许在 Windows 受管环境中执行".into())
+        }
+    }
+
+    pub(crate) fn open_child(&self, name: &str) -> Result<Option<PinnedRevocationEntry>, String> {
+        #[cfg(windows)]
+        {
+            self.inner
+                .open_child(name)
+                .map(|entry| entry.map(|inner| PinnedRevocationEntry { inner }))
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = name;
+            Err("远程作废清理只允许在 Windows 受管环境中执行".into())
+        }
+    }
+
+    pub(crate) fn list_names(&self) -> Result<Vec<String>, String> {
+        #[cfg(windows)]
+        {
+            self.inner
+                .list_names()?
+                .into_iter()
+                .map(|name| {
+                    name.into_string()
+                        .map_err(|_| "固定事务目录包含非 UTF-8 文件名".to_string())
+                })
+                .collect()
+        }
+        #[cfg(not(windows))]
+        {
+            Err("远程作废清理只允许在 Windows 受管环境中执行".into())
+        }
+    }
+
+    pub(crate) fn prepare_delete_tree(self) -> Result<PreparedRevocationTree, String> {
+        #[cfg(windows)]
+        {
+            Ok(PreparedRevocationTree {
+                inner: self.inner.prepare_delete_tree()?,
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            Err("远程作废清理只允许在 Windows 受管环境中执行".into())
+        }
+    }
+
+    pub(crate) fn remove_regular_file(self) -> Result<(), String> {
+        #[cfg(windows)]
+        {
+            self.inner.remove_regular_file()
+        }
+        #[cfg(not(windows))]
+        {
+            Err("远程作废清理只允许在 Windows 受管环境中执行".into())
+        }
+    }
+}
+
+impl PreparedRevocationTree {
+    pub(crate) fn read_relative_bounded(
+        &self,
+        relative: &str,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, String> {
+        #[cfg(windows)]
+        {
+            self.inner.read_relative_bounded(relative, max_bytes)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (relative, max_bytes);
+            Err("远程作废清理只允许在 Windows 受管环境中执行".into())
+        }
+    }
+
+    pub(crate) fn delete(self) -> Result<(), String> {
+        #[cfg(windows)]
+        {
+            self.inner.delete()
+        }
+        #[cfg(not(windows))]
+        {
+            Err("远程作废清理只允许在 Windows 受管环境中执行".into())
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn delete_with_test_hook(
+        self,
+        before_item: impl FnMut(usize) -> Result<(), String>,
+    ) -> Result<(), String> {
+        #[cfg(windows)]
+        {
+            self.inner.delete_with_test_hook(before_item)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = before_item;
+            Err("远程作废清理只允许在 Windows 受管环境中执行".into())
+        }
+    }
+}
+
+impl PinnedRevocationTransaction {
+    pub(crate) fn relative(&self) -> &str {
+        &self.relative
+    }
+
+    pub(crate) fn remove(self, root: &RevocationCleanupRoot) -> Result<(), String> {
+        if !self.staging_ancestor.is_directory()? {
+            return Err("固定的 .staging ancestor 不再是目录".into());
+        }
+        if let Some(tree) = self.tree {
+            tree.delete()?;
+        }
+        if root.exists_relative(&self.relative)? {
+            return Err("Codex 更新事务目录删除后仍存在；保留 owner sidecar 供重试".into());
+        }
+        self.sidecar.remove_regular_file()
+    }
+
+    #[cfg(test)]
+    fn remove_with_test_hooks(
+        self,
+        root: &RevocationCleanupRoot,
+        before_item: impl FnMut(usize) -> Result<(), String>,
+        before_sidecar: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        if !self.staging_ancestor.is_directory()? {
+            return Err("固定的 .staging ancestor 不再是目录".into());
+        }
+        if let Some(tree) = self.tree {
+            tree.delete_with_test_hook(before_item)?;
+        }
+        if root.exists_relative(&self.relative)? {
+            return Err("Codex 更新事务目录删除后仍存在；保留 owner sidecar 供重试".into());
+        }
+        before_sidecar()?;
+        self.sidecar.remove_regular_file()
+    }
+}
+
+/// Open the Bundle root once for a revocation transaction and bind that handle
+/// to the observed volume serial. All subsequent reads, checks, and deletions
+/// are relative to this pinned handle.
+pub(crate) fn pin_revocation_cleanup_root(
+    root: &Path,
+    expected: &crate::app::usb_guard::UsbFingerprint,
+) -> Result<RevocationCleanupRoot, String> {
+    if !root.is_absolute() || fs::canonicalize(root).map_err(|error| error.to_string())? != root {
+        return Err("作废清理 Bundle 根目录不是已核验的规范绝对路径".into());
+    }
+    if expected.anchor_schema != 3 {
+        return Err("作废清理只允许 anchorSchema=3 的有效指纹".into());
+    }
+    #[cfg(windows)]
+    {
+        let pinned = handle_tree::PinnedRoot::open(root, u64::from(expected.volume_serial))?;
+        if pinned.volume_serial() != u64::from(expected.volume_serial) {
+            return Err("固定的 Bundle 根句柄卷序列号与已观察 USB 指纹不一致".into());
+        }
+        let relative_path = bundle_relative_path(root)?;
+        if !relative_path.eq_ignore_ascii_case(&expected.bundle_relative_path) {
+            return Err("固定的 Bundle 根相对路径与已观察 USB 指纹不一致".into());
+        }
+        let manifest_bytes =
+            pinned.read_relative_bounded("manifest.json", REVOCATION_MANIFEST_MAX_BYTES)?;
+        let usb_manifest_bytes =
+            pinned.read_relative_bounded("usb-manifest.json", REVOCATION_MANIFEST_MAX_BYTES)?;
+        let sums_bytes = pinned.read_relative_bounded("SHA256SUMS.txt", 64 * 1024 * 1024)?;
+        let anchor = codex_usb_license::stable_anchor_sha256_from_bytes(
+            &manifest_bytes,
+            &usb_manifest_bytes,
+            &sums_bytes,
+        )
+        .map_err(|error| format!("固定 Bundle 根句柄锚点校验失败：{error}"))?;
+        if !anchor.eq_ignore_ascii_case(&expected.anchor_sha256) {
+            return Err("固定 Bundle 根句柄锚点与已观察 USB 指纹不一致".into());
+        }
+        let root_manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+            .map_err(|error| format!("固定根清单格式无效：{error}"))?;
+        let usb_manifest: serde_json::Value = serde_json::from_slice(&usb_manifest_bytes)
+            .map_err(|error| format!("固定 USB 清单格式无效：{error}"))?;
+        validate_pinned_revocation_policy(&root_manifest, &usb_manifest)?;
+        let (payload_relative, architecture) = revocation_manifest_contract(&manifest_bytes)?;
+        let payload_parent = payload_relative
+            .rsplit_once('/')
+            .map(|(parent, _)| parent)
+            .ok_or_else(|| "MSIX 载荷必须位于受管 payload 目录".to_string())?;
+        let backup_relative = format!("{payload_parent}/_backup");
+        Ok(RevocationCleanupRoot {
+            bundle_root: root.to_path_buf(),
+            fingerprint: expected.clone(),
+            payload_relative,
+            architecture,
+            backup_relative,
+            pinned,
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = expected;
+        Err("远程作废清理只允许在 Windows 受管环境中执行".into())
+    }
+}
+
+impl RevocationCleanupRoot {
+    pub(crate) fn validate_identity(
+        &self,
+        root: &Path,
+        fingerprint: &crate::app::usb_guard::UsbFingerprint,
+    ) -> Result<(), String> {
+        if fs::canonicalize(root).map_err(|error| error.to_string())? != self.bundle_root
+            || !codex_usb_license::fingerprints_match(&self.fingerprint, fingerprint)
+        {
+            return Err("事务 owner marker 检查与固定 Bundle 根身份不一致".into());
+        }
+        #[cfg(windows)]
+        if self.pinned.volume_serial() != u64::from(fingerprint.volume_serial) {
+            return Err("固定 Bundle 根句柄卷序列号已变化".into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn read_relative_bounded(
+        &self,
+        relative: &str,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, String> {
+        #[cfg(windows)]
+        {
+            match self.pinned.read_relative_bounded(relative, max_bytes) {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(error) if error.starts_with("__REVOCATION_NOT_FOUND__") => Ok(None),
+                Err(error) => Err(error),
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (relative, max_bytes);
+            Err("远程作废清理只允许在 Windows 受管环境中执行".into())
+        }
+    }
+
+    pub(crate) fn list_relative_names(
+        &self,
+        relative: &str,
+    ) -> Result<Option<Vec<String>>, String> {
+        #[cfg(windows)]
+        {
+            self.pinned
+                .list_relative_names(relative)?
+                .map(|names| {
+                    names
+                        .into_iter()
+                        .map(|name| {
+                            name.into_string()
+                                .map_err(|_| "固定暂存目录包含非 UTF-8 文件名".to_string())
+                        })
+                        .collect()
+                })
+                .transpose()
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = relative;
+            Err("远程作废清理只允许在 Windows 受管环境中执行".into())
+        }
+    }
+
+    pub(crate) fn open_pinned_entry(
+        &self,
+        relative: &str,
+    ) -> Result<Option<PinnedRevocationEntry>, String> {
+        #[cfg(windows)]
+        {
+            self.pinned
+                .open_pinned_entry(relative)
+                .map(|entry| entry.map(|inner| PinnedRevocationEntry { inner }))
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = relative;
+            Err("远程作废清理只允许在 Windows 受管环境中执行".into())
+        }
+    }
+
+    pub(crate) fn open_entry_child(
+        &self,
+        parent: &PinnedRevocationEntry,
+        name: &str,
+    ) -> Result<Option<PinnedRevocationEntry>, String> {
+        parent.open_child(name)
+    }
+
+    pub(crate) fn exists_relative(&self, relative: &str) -> Result<bool, String> {
+        #[cfg(windows)]
+        {
+            self.pinned.exists_relative(relative)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = relative;
+            Err("远程作废清理只允许在 Windows 受管环境中执行".into())
+        }
+    }
+
+    pub(crate) fn prepare_pinned_transaction(
+        relative: String,
+        tree: Option<PreparedRevocationTree>,
+        sidecar: PinnedRevocationEntry,
+        staging_ancestor: PinnedRevocationEntry,
+    ) -> PinnedRevocationTransaction {
+        PinnedRevocationTransaction {
+            relative,
+            tree,
+            sidecar,
+            staging_ancestor,
+        }
+    }
+
+    pub(crate) fn payload_relative(&self) -> &str {
+        &self.payload_relative
+    }
+
+    pub(crate) fn backup_relative(&self) -> &str {
+        &self.backup_relative
+    }
+
+    pub(crate) fn validate_backup(&self) -> Result<(), String> {
+        #[cfg(windows)]
+        {
+            self.pinned
+                .validate_backup(&self.backup_relative, &self.architecture)
+        }
+        #[cfg(not(windows))]
+        {
+            Err("远程作废清理只允许在 Windows 受管环境中执行".into())
+        }
+    }
+}
+
+#[cfg(windows)]
+fn bundle_relative_path(root: &Path) -> Result<String, String> {
+    use std::path::Component;
+    let mut components = root.components();
+    if !matches!(components.next(), Some(Component::Prefix(_)))
+        || components.next() != Some(Component::RootDir)
+    {
+        return Err("作废清理 Bundle 根路径不是本地卷绝对路径".into());
+    }
+    let parts = components
+        .map(|component| match component {
+            Component::Normal(value) => value
+                .to_str()
+                .map(str::to_string)
+                .ok_or_else(|| "Bundle 相对路径包含非 UTF-8 名称".to_string()),
+            _ => Err("Bundle 相对路径包含跳转组件".to_string()),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if parts.is_empty() {
+        return Err("作废清理 Bundle 根目录不能是卷根".into());
+    }
+    Ok(parts.join("/"))
+}
+
+/// Strictly preflight one exact target in the signed USB revocation cleanup
+/// allowlist. This is separate from the ordinary uninstall workflow.
+pub(crate) fn check_revocation_target(
+    root: &RevocationCleanupRoot,
+    relative: &str,
+) -> Result<(), String> {
+    authorized_revocation_target(&root.payload_relative, relative)?;
+    #[cfg(windows)]
+    {
+        root.pinned.check_relative(relative)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = relative;
+        Err("远程作废清理只允许在 Windows 受管环境中执行".into())
+    }
+}
+
+/// Remove only an exact target authorized by the revocation cleanup policy.
+/// Windows recursively deletes retained handle-tree entries after full-tree
+/// preflight, so path substitution cannot redirect deletion outside the tree.
+pub(crate) fn remove_revocation_target(
+    root: &RevocationCleanupRoot,
+    relative: &str,
+) -> Result<(), String> {
+    authorized_revocation_target(&root.payload_relative, relative)?;
+    #[cfg(windows)]
+    {
+        root.pinned.remove_relative(relative)
+    }
+    #[cfg(not(windows))]
+    {
+        Err("远程作废清理只允许在 Windows 受管环境中执行".to_string())
+    }
+}
+
+/// Remove only the exact payload named by the currently anchored manifest,
+/// after hashing and deleting it through the same single-link file handle.
+/// This is reserved for recovery rollback of a payload staged by this manager.
+pub(crate) fn remove_revocation_staged_payload_if_sha256(
+    root: &Path,
+    fingerprint: &crate::app::usb_guard::UsbFingerprint,
+    relative: &str,
+    expected_sha256: &str,
+) -> Result<(), String> {
+    let parts = relative.split('/').collect::<Vec<_>>();
+    if parts.len() != 2
+        || !parts[0].eq_ignore_ascii_case("payload")
+        || !parts[1].starts_with("OpenAI.Codex_")
+        || !parts[1].ends_with(".msix")
+        || parts[1].contains(['\\', ':', '\0'])
+    {
+        return Err("恢复载荷路径不符合固定 MSIX 布局".into());
+    }
+    #[cfg(test)]
+    {
+        let _ = fingerprint;
+        return remove_revocation_staged_payload_test(root, relative, expected_sha256);
+    }
+    #[cfg(not(test))]
+    {
+        if !root.is_absolute() || fs::canonicalize(root).map_err(|error| error.to_string())? != root
+        {
+            return Err("恢复载荷根目录不是已核验的规范绝对路径".into());
+        }
+        if fingerprint.anchor_schema != 3 {
+            return Err("恢复载荷删除只允许 anchorSchema=3 的 USB 指纹".into());
+        }
+        #[cfg(windows)]
+        {
+            let relative_root = bundle_relative_path(root)?;
+            if !relative_root.eq_ignore_ascii_case(&fingerprint.bundle_relative_path) {
+                return Err("恢复载荷根目录与事务记录的 USB 相对路径不一致".into());
+            }
+            let pinned = handle_tree::PinnedRoot::open(root, u64::from(fingerprint.volume_serial))?;
+            let manifest_bytes =
+                pinned.read_relative_bounded("manifest.json", REVOCATION_MANIFEST_MAX_BYTES)?;
+            let usb_manifest_bytes =
+                pinned.read_relative_bounded("usb-manifest.json", REVOCATION_MANIFEST_MAX_BYTES)?;
+            let sums_bytes = pinned.read_relative_bounded("SHA256SUMS.txt", 64 * 1024 * 1024)?;
+            let anchor = codex_usb_license::stable_anchor_sha256_from_bytes(
+                &manifest_bytes,
+                &usb_manifest_bytes,
+                &sums_bytes,
+            )
+            .map_err(|error| format!("恢复载荷固定根锚点校验失败：{error}"))?;
+            if !anchor.eq_ignore_ascii_case(&fingerprint.anchor_sha256) {
+                return Err("恢复载荷固定根锚点与事务记录不一致".into());
+            }
+            let usb_manifest: serde_json::Value = serde_json::from_slice(&usb_manifest_bytes)
+                .map_err(|error| format!("恢复载荷 USB 清单格式无效：{error}"))?;
+            let root_manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+                .map_err(|error| format!("恢复载荷根清单格式无效：{error}"))?;
+            validate_pinned_revocation_policy(&root_manifest, &usb_manifest)?;
+            let (declared_payload, _) = revocation_manifest_contract(&manifest_bytes)?;
+            if declared_payload != relative {
+                return Err("恢复载荷路径与固定根清单声明不一致".into());
+            }
+            pinned.remove_regular_file_relative_if_sha256(relative, expected_sha256)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = expected_sha256;
+            Err("远程作废清理只允许在 Windows 受管环境中执行".into())
+        }
+    }
+}
+
+#[cfg(test)]
+fn remove_revocation_staged_payload_test(
+    root: &Path,
+    relative: &str,
+    expected_sha256: &str,
+) -> Result<(), String> {
+    let canonical_root = fs::canonicalize(root).map_err(|error| error.to_string())?;
+    #[cfg(windows)]
+    {
+        let pinned = handle_tree::PinnedRoot::open_for_test(&canonical_root)?;
+        pinned.remove_regular_file_relative_if_sha256(relative, expected_sha256)
+    }
+    #[cfg(not(windows))]
+    {
+        let path = canonical_root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(format!("读取测试恢复载荷失败：{error}")),
+            Ok(metadata)
+                if metadata.file_type().is_symlink() || !metadata.file_type().is_file() =>
+            {
+                return Err("测试恢复载荷不是普通文件".into())
+            }
+            Ok(_) => {}
+        }
+        let actual = sha256(&path)?;
+        if !actual.eq_ignore_ascii_case(expected_sha256) {
+            return Err("测试恢复载荷 SHA-256 不匹配；保留目标".into());
+        }
+        fs::remove_file(path).map_err(|error| format!("删除测试恢复载荷失败：{error}"))
+    }
+}
+
+pub(crate) fn exists_revocation_target(
+    root: &RevocationCleanupRoot,
+    relative: &str,
+) -> Result<bool, String> {
+    authorized_revocation_target(&root.payload_relative, relative)?;
+    #[cfg(windows)]
+    {
+        root.pinned.exists_relative(relative)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = relative;
+        Err("远程作废清理只允许在 Windows 受管环境中执行".into())
+    }
+}
+
+pub(crate) fn validate_revocation_backup(root: &RevocationCleanupRoot) -> Result<(), String> {
+    authorized_revocation_target(&root.payload_relative, &root.backup_relative)?;
+    root.validate_backup()
+}
+
+pub(crate) fn authorized_revocation_target(
+    payload_relative: &str,
+    relative: &str,
+) -> Result<(), String> {
+    let normalized = relative.replace('\\', "/");
+    if normalized.is_empty()
+        || normalized.starts_with('/')
+        || normalized.contains(':')
+        || normalized.contains('\0')
+        || normalized
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err("作废清理目标不是安全相对路径".into());
+    }
+    let lower = normalized.to_ascii_lowercase();
+    let payload_parent = payload_relative
+        .rsplit_once('/')
+        .map(|(parent, _)| parent)
+        .ok_or_else(|| "MSIX 载荷必须位于受管 payload 目录".to_string())?;
+    let backup_relative = format!("{payload_parent}/_backup");
+    let authorized = lower == "apps/codex"
+        || lower == "apps/.codex-app-manager-staging"
+        || lower == payload_relative.to_ascii_lowercase()
+        || lower == backup_relative.to_ascii_lowercase()
+        || lower.starts_with(".staging/codex-update-")
+            && lower
+                .strip_prefix(".staging/codex-update-")
+                .is_some_and(valid_update_transaction_name)
+        || lower
+            .strip_prefix("codexusbstate/")
+            .is_some_and(crate::app::usb_revocation::is_atomic_state_tmp_name);
+    if !authorized {
+        return Err("拒绝清理不在远程作废固定白名单内的目标".into());
+    }
+    Ok(())
+}
+
+fn valid_update_transaction_name(suffix: &str) -> bool {
+    !suffix.is_empty()
+        && suffix.len() <= 128
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn revocation_manifest_contract(bytes: &[u8]) -> Result<(String, String), String> {
+    let value: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|error| format!("root manifest 格式无效：{error}"))?;
+    let raw = value
+        .pointer("/payload/path")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "root manifest 缺少 MSIX 载荷路径".to_string())?;
+    let relative = raw.trim().replace('\\', "/");
+    let parts = relative.split('/').collect::<Vec<_>>();
+    if parts.len() != 2
+        || !parts[0].eq_ignore_ascii_case("payload")
+        || !parts[1].starts_with("OpenAI.Codex_")
+        || !parts[1].ends_with(".msix")
+        || parts[1].contains(':')
+        || parts[1].contains('\0')
+    {
+        return Err("root manifest MSIX 路径不符合固定载荷布局".into());
+    }
+    let architecture = value
+        .get("architecture")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| matches!(*value, "x64" | "arm64"))
+        .ok_or_else(|| "root manifest 架构无效".to_string())?
+        .to_string();
+    Ok((relative, architecture))
+}
+
+fn validate_pinned_revocation_policy(
+    root_manifest: &serde_json::Value,
+    usb_manifest: &serde_json::Value,
+) -> Result<(), String> {
+    let root_schema = root_manifest
+        .get("schemaVersion")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "固定根清单版本无效".to_string())?;
+    let usb_schema = usb_manifest
+        .get("schemaVersion")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "固定 USB 清单版本无效".to_string())?;
+    if root_schema != 3 || usb_schema != root_schema {
+        return Err("作废清理要求锚定且版本一致的 schema 3 Bundle 清单".into());
+    }
+    if root_manifest
+        .pointer("/revocationPolicy/registrationRequired")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        return Err("固定根清单未锚定 registrationRequired=true".into());
+    }
+    Ok(())
+}
+
 #[cfg(all(windows, test))]
 fn pin_directory(path: &Path) -> Result<handle_tree::Entry, String> {
     handle_tree::Entry::open(path, false)
@@ -2676,6 +3385,74 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    fn test_revocation_root(path: &Path) -> RevocationCleanupRoot {
+        let pinned = handle_tree::PinnedRoot::open_for_test(path).unwrap();
+        RevocationCleanupRoot {
+            bundle_root: path.to_path_buf(),
+            fingerprint: crate::app::usb_guard::UsbFingerprint {
+                volume_serial: pinned.volume_serial() as u32,
+                anchor_sha256: "a".repeat(64),
+                bundle_relative_path: "fixture/CodexUSB".to_string(),
+                anchor_schema: 3,
+            },
+            payload_relative: "payload/OpenAI.Codex_x64.msix".to_string(),
+            architecture: "x64".to_string(),
+            backup_relative: "payload/_backup".to_string(),
+            pinned,
+        }
+    }
+
+    #[cfg(windows)]
+    fn open_test_pinned_transaction(
+        root: &RevocationCleanupRoot,
+        transaction_id: &str,
+    ) -> PinnedRevocationTransaction {
+        let staging = root.open_pinned_entry(".staging").unwrap().unwrap();
+        let staging_ancestor = staging.duplicate().unwrap();
+        let sidecar = staging
+            .open_child(&format!(".codex-update-{transaction_id}.owner.json"))
+            .unwrap()
+            .unwrap();
+        let relative = format!(".staging/codex-update-{transaction_id}");
+        let transaction = staging
+            .open_child(&format!("codex-update-{transaction_id}"))
+            .unwrap();
+        let tree = transaction.map(|entry| entry.prepare_delete_tree().unwrap());
+        RevocationCleanupRoot::prepare_pinned_transaction(relative, tree, sidecar, staging_ancestor)
+    }
+
+    #[test]
+    fn pinned_revocation_policy_requires_matching_schema_three_and_registration() {
+        let root = serde_json::json!({
+            "schemaVersion": 3,
+            "revocationPolicy": { "registrationRequired": true }
+        });
+        let usb = serde_json::json!({ "schemaVersion": 3 });
+        assert!(validate_pinned_revocation_policy(&root, &usb).is_ok());
+        assert!(validate_pinned_revocation_policy(
+            &serde_json::json!({
+                "schemaVersion": 2,
+                "revocationPolicy": { "registrationRequired": true }
+            }),
+            &usb
+        )
+        .is_err());
+        assert!(validate_pinned_revocation_policy(
+            &root,
+            &serde_json::json!({ "schemaVersion": 2 })
+        )
+        .is_err());
+        assert!(validate_pinned_revocation_policy(
+            &serde_json::json!({
+                "schemaVersion": 3,
+                "revocationPolicy": { "registrationRequired": false }
+            }),
+            &usb
+        )
+        .is_err());
+    }
+
     #[test]
     fn exact_legacy_names_only() {
         for good in [
@@ -2694,6 +3471,127 @@ mod tests {
         ] {
             assert!(!is_legacy_uac_file(bad));
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pinned_transaction_partial_delete_retains_owner_and_retries() {
+        let temp = TempRoot::new();
+        let staging = temp.0.join(".staging");
+        let transaction_id = uuid::Uuid::new_v4().to_string();
+        let transaction_path = staging.join(format!("codex-update-{transaction_id}"));
+        let sidecar_path = staging.join(format!(".codex-update-{transaction_id}.owner.json"));
+        fs::create_dir_all(&transaction_path).unwrap();
+        let marker = br#"{"transactionId":"owner-bound"}"#;
+        fs::write(transaction_path.join("state.json"), marker).unwrap();
+        fs::write(transaction_path.join("payload.bin"), b"staged bytes").unwrap();
+        fs::write(&sidecar_path, marker).unwrap();
+        let outside = temp.0.join("outside-sentinel.txt");
+        fs::write(&outside, b"outside must survive").unwrap();
+        let root = test_revocation_root(&temp.0);
+
+        let transaction = open_test_pinned_transaction(&root, &transaction_id);
+        let staged_count = fs::read_dir(&transaction_path).unwrap().count();
+        let error = transaction
+            .remove_with_test_hooks(
+                &root,
+                |index| {
+                    if index == 0 {
+                        let moved = staging.join("attacker-moved");
+                        assert!(
+                            fs::rename(&transaction_path, moved).is_err(),
+                            "the pinned marker/tree must prevent replacing the verified directory"
+                        );
+                        assert_eq!(fs::read(&outside).unwrap(), b"outside must survive");
+                        Ok(())
+                    } else {
+                        Err("injected failure after first disposition".to_string())
+                    }
+                },
+                || Ok(()),
+            )
+            .unwrap_err();
+        assert!(error.contains("injected failure"));
+        assert!(transaction_path.is_dir());
+        assert!(
+            sidecar_path.is_file(),
+            "owner proof survives partial deletion"
+        );
+        assert!(fs::read_dir(&transaction_path).unwrap().count() < staged_count);
+
+        let retry = open_test_pinned_transaction(&root, &transaction_id);
+        assert!(retry
+            .remove_with_test_hooks(&root, |_| Ok(()), || Ok(()))
+            .is_ok());
+        assert!(!transaction_path.exists());
+        assert!(!sidecar_path.exists());
+        assert_eq!(fs::read(&outside).unwrap(), b"outside must survive");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pinned_transaction_holds_staging_ancestor_until_remove_returns() {
+        let temp = TempRoot::new();
+        let staging = temp.0.join(".staging");
+        let transaction_id = uuid::Uuid::new_v4().to_string();
+        let transaction_path = staging.join(format!("codex-update-{transaction_id}"));
+        let sidecar_path = staging.join(format!(".codex-update-{transaction_id}.owner.json"));
+        fs::create_dir_all(&transaction_path).unwrap();
+        fs::write(transaction_path.join("payload.bin"), b"staged bytes").unwrap();
+        fs::write(&sidecar_path, b"owner proof").unwrap();
+        let root = test_revocation_root(&temp.0);
+
+        let transaction = open_test_pinned_transaction(&root, &transaction_id);
+        let renamed_staging = temp.0.join(".staging-moved");
+        assert!(
+            fs::rename(&staging, &renamed_staging).is_err(),
+            "the transaction must retain the exact pinned .staging ancestor"
+        );
+
+        transaction.remove(&root).unwrap();
+        assert!(
+            !transaction_path.exists() && !sidecar_path.exists(),
+            "the pinned transaction and owner sidecar should be removed"
+        );
+        fs::rename(&staging, &renamed_staging)
+            .expect("after transaction cleanup releases the ancestor handle, rename should work");
+        assert!(renamed_staging.is_dir());
+        fs::rename(&renamed_staging, &staging).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pinned_transaction_orphan_sidecar_deletion_failure_is_retryable() {
+        let temp = TempRoot::new();
+        let staging = temp.0.join(".staging");
+        let transaction_id = uuid::Uuid::new_v4().to_string();
+        let transaction_path = staging.join(format!("codex-update-{transaction_id}"));
+        let sidecar_path = staging.join(format!(".codex-update-{transaction_id}.owner.json"));
+        fs::create_dir_all(&transaction_path).unwrap();
+        fs::write(transaction_path.join("state.json"), b"owner marker").unwrap();
+        fs::write(&sidecar_path, b"sidecar marker").unwrap();
+        let root = test_revocation_root(&temp.0);
+
+        let transaction = open_test_pinned_transaction(&root, &transaction_id);
+        let error = transaction
+            .remove_with_test_hooks(
+                &root,
+                |_| Ok(()),
+                || Err("injected sidecar disposition failure".to_string()),
+            )
+            .unwrap_err();
+        assert!(error.contains("sidecar disposition"));
+        assert!(
+            !transaction_path.exists(),
+            "the transaction tree was fully removed"
+        );
+        assert!(sidecar_path.is_file(), "sidecar remains as retry proof");
+
+        let orphan = open_test_pinned_transaction(&root, &transaction_id);
+        assert!(orphan
+            .remove_with_test_hooks(&root, |_| Ok(()), || Ok(()))
+            .is_ok());
+        assert!(!sidecar_path.exists());
     }
 
     #[test]

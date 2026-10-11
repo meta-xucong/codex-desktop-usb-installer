@@ -4,21 +4,27 @@
 
 USB 一键流程在 Codex 便携程序完成位置、哈希和运行状态校验后，自动安装随包的
 `content/codex-starter-kit`。该目录包含全部 Skills、Agents、离线 Python/Node
-运行时、MCP wrapper、配置模板和连接清单，不依赖 GitHub、npm 或 PyPI 下载。
+运行时、MCP wrapper、配置模板和连接清单。Python、Feishu MCP、FFmpeg 与 Manim
+依赖随包安装；HyperFrames CLI 首次安装需要联网访问 npm，没有可用 Chrome 时还会联网
+准备浏览器。HyperFrames 的联网步骤失败会标记为 `requires-network`，其他组件继续安装，
+恢复网络后可从“高级功能 → 组件修复”重试。
 
-能力包安装失败不回滚已成功安装的 Codex。用户可以从安装器底部低调的“组件修复”
-入口再次安装能力包，或只重试 CCSwitch。
+能力包安装失败不回滚已成功安装的 Codex。主界面的“连接与扩展”用于设置飞书、API
+和远程 MCP；“高级功能”中的“组件修复”用于重装能力包或单独重试 CCSwitch。
 
 ## 前端行为
 
 - 一键安装成功后自动调用 `install_capability_pack`，随后调用
   `install_and_launch_ccswitch`。
 - 两个辅助步骤都是可重试的非主流程；失败会显示提示，但不会宣称 Codex 安装失败。
-- “组件修复”面板默认不启用任何外部连接。勾选服务并填写完整字段后，才会配置飞书
-  MCP、DashScope 搜索、Image-2 或 Seedance。
+- “连接与扩展”面板默认不启用任何外部连接。勾选服务并填写完整字段后，才会配置飞书
+  MCP、DashScope 搜索、统一媒体 MCP（Image-2、Grok、Seedance；MiniMax 仅在共享上游提供模型后启用）；远程 OAuth MCP 另需 Codex 登录授权。
+- “组件修复”视图只提供能力包安装/修复和 CCSwitch 重试；运行时检查、程序修复和日志
+  仍留在“高级功能”菜单。
 - 未勾选的服务不会触发密钥校验、运行时健康检查或环境变量删除；若核心 Skills/Agents
   已完成而某个运行时失败，界面显示“核心能力已就绪，运行时待修复”，不把能力包误报为未安装。
-- “跳过”不会执行能力包安装；“安装 / 修复能力包”只安装本地包和用户明确勾选的连接。
+- “保存并应用连接”只应用本地能力包和用户明确勾选的连接；“组件修复”视图中的
+  “安装 / 修复能力包”用于手动维护。
 
 ## 后端边界
 

@@ -2565,13 +2565,27 @@ fn install_portable_after_stage(
         Ok(())
     };
     let portable_options = if usb_portable {
-        PortableInstallOptions::usb_offline()
+        let bundle_root = usb_guard::current_bundle_root().ok_or_else(|| {
+            AppError::Engine("无法从当前 U 盘管理器解析 direct-entry shim 来源".to_string())
+        })?;
+        let shim = bundle_root.join("CodexEntryShim.exe");
+        if !shim.is_file() {
+            return Err(AppError::Engine(format!(
+                "U 盘缺少 Codex 直接入口组件：{}",
+                shim.display()
+            )));
+        }
+        PortableInstallOptions {
+            usb_entry_shim: Some(shim),
+            ..PortableInstallOptions::usb_offline()
+        }
     } else {
         PortableInstallOptions {
             close_running: true,
             launch_health_check: true,
             relaunch,
             create_shell_metadata: true,
+            usb_entry_shim: None,
         }
     };
     let portable_result = install_portable_from_msix_with_observer_options_and_progress(
@@ -3005,7 +3019,9 @@ pub fn launch_codex(settings: &AppSettings, codex_locale: Option<&str>) -> Resul
     let usb_mode = usb_guard::guard_required();
     if usb_mode {
         if let Err(error) = crate::app::codex_agents_hint::ensure_portable_usb_hint() {
-            log::warn!("could not add the USB Codex mojibake hint to AGENTS.md before launch: {error}");
+            log::warn!(
+                "could not add the USB Codex mojibake hint to AGENTS.md before launch: {error}"
+            );
         }
     }
     if settings.disable_codex_self_updates {
@@ -3050,6 +3066,13 @@ pub fn launch_codex(settings: &AppSettings, codex_locale: Option<&str>) -> Resul
     } else {
         codex_win_engine::PortableLaunchPolicy::Standard
     };
+    let direct_entry_required = if usb_mode {
+        usb_guard::require_signed_codex_bundle("win-launch-direct-entry-policy")?
+            .map(|authorization| authorization.direct_entry_required)
+            .unwrap_or(false)
+    } else {
+        false
+    };
     let report = codex_win_engine::launch_codex_with_options(
         &installed,
         codex_win_engine::LaunchOptions {
@@ -3057,6 +3080,7 @@ pub fn launch_codex(settings: &AppSettings, codex_locale: Option<&str>) -> Resul
             // place. Scope this to the launched child instead of changing the
             // user's global setting for an unrelated official installation.
             disable_codex_self_updates: settings.disable_codex_self_updates || usb_mode,
+            require_usb_entry_overlay: direct_entry_required,
             remote_debugging_port: None,
             codex_home,
             locale_override: codex_locale.map(str::to_string),

@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
   "id": "codex-starter",
-  "version": "1.3.0",
+  "version": "1.5.2",
   "hashScope": "all pack files except file-manifest.json and checksums.sha256; text files use LF canonicalization",
   "files": [
     {
@@ -48,14 +48,14 @@
     },
     {
       "path": "audit-codex-compatibility.py",
-      "sha256": "81fdbf9f139af2290dd6ba0b0f6eb8965d8ea3c9d3ba0ae24bd8fff74f846170",
-      "bytes": 61794,
+      "sha256": "467675e7442ee8d0ddea0f81fbfcd9c107e975163580d0bfd2762b2e7797c688",
+      "bytes": 61278,
       "owned": true
     },
     {
       "path": "config-fragments/codex-skills-gating.template.toml",
-      "sha256": "cd159920e981cf6c66613cda45875f78d815d49b238e5048921c507dc5125131",
-      "bytes": 574,
+      "sha256": "edce8ebfb63bf8672bf96e16729cfbc6257d37b9e63ea6ed28429dfdfa760e4e",
+      "bytes": 629,
       "owned": true
     },
     {
@@ -71,63 +71,69 @@
       "owned": true
     },
     {
+      "path": "config-fragments/media-generation-stdio.template.toml",
+      "sha256": "f55fe8360ba0d97b4ce7d9a682006b7d59d7fbb62e894088d9e4e617cb134f59",
+      "bytes": 735,
+      "owned": true
+    },
+    {
       "path": "config-fragments/README.md",
-      "sha256": "cc18aab094f98ec180b40f3f8475fdce71768adb3e9b5b6972bad3dd942ccab4",
-      "bytes": 1655,
+      "sha256": "200a96d9f0846d883956bacb0cb810b131ae814c52049f58196e851a9aae250a",
+      "bytes": 1726,
       "owned": true
     },
     {
       "path": "configure-codex.ps1",
       "sha256": "f675461253422de62b98b08d7af9947c94c6ee85ec7adb505cb37313d7174150",
-      "bytes": 6102,
+      "bytes": 6047,
       "owned": true
     },
     {
       "path": "dependencies.json",
-      "sha256": "5cf6e1cccb9980390a68b96c6d8d78eac6fb82a1aa11270be1a74e50e682ed62",
-      "bytes": 113825,
+      "sha256": "d09b7ab995b8092791ede5f95f7023a89e05e4e20ed9ab9de747652e34ca3c2d",
+      "bytes": 119608,
       "owned": true
     },
     {
       "path": "docs/CODEX-ADAPTATION-DEVELOPMENT.md",
-      "sha256": "709b68abc683841f78b930176908d4ea8dd5368da68a1b6da859e7ec53543b0b",
-      "bytes": 20817,
+      "sha256": "5ba78560a2ae52fca40fe8a183f73bb0b6e5d3a73d1b85b7e378e27e12473e6f",
+      "bytes": 21400,
       "owned": true
     },
     {
       "path": "docs/CONNECTION-WIZARD.md",
-      "sha256": "eb44364cfa004f52b7167d57672c451b3953857a44a86989344de11e17fbe0b6",
-      "bytes": 2902,
+      "sha256": "a91b8587c3a0ad801c7b684355b5337f824a5ef3fcb9bdaa345335a1f984d92c",
+      "bytes": 3658,
       "owned": true
     },
     {
       "path": "docs/FULL-BUNDLE-ONE-CLICK-DEVELOPMENT.md",
-      "sha256": "b0f4866a9f57affc365714213c790c0a95a335e6c384263ec8d216544ab8ee1c",
-      "bytes": 6162,
+      "sha256": "d4b9aa54c9ebf90505e6510d887ca0e8389fae340fe9ccf0ec7fb26441f1e3ed",
+      "bytes": 6339,
       "owned": true
     },
     {
       "path": "docs/KNOWN-LIMITATIONS.md",
-      "sha256": "a2882cc8113aab95209c1284432851e8c470985d87b5951829cd9abcb3e4180c",
-      "bytes": 7867,
+      "sha256": "024b25d1fff447362eea5eecd061b1e876f79015316d88d4c9de0c5479f548f8",
+      "bytes": 9748,
       "owned": true
     },
     {
       "path": "docs/POST-MERGE-CORRECTIVE-DEVELOPMENT.md",
-      "sha256": "bea619e6362cb1930f8b590c4cfb8a3937f442ac5dfa9f53decec6190d7f5523",
-      "bytes": 6751,
+      "sha256": "95b864caf40a76d44f5e7390fdd4d36ad52f3da419d6ad568ac91b11305c35b0",
+      "bytes": 6877,
       "owned": true
     },
     {
       "path": "ENVIRONMENT-MCP-INVENTORY.md",
-      "sha256": "f742b06e268c965ab83a523b601afadfd83008482a48cb1fa63559aec84d7c09",
-      "bytes": 6922,
+      "sha256": "cdc316051c1de4d73dd151e09369f8a76b75c8246a2d95f28499302f1cda31df",
+      "bytes": 8044,
       "owned": true
     },
     {
       "path": "install-all.ps1",
-      "sha256": "042a24d488cc5c6227347a307eb9e1bbd43076d0e33ca268ee2dac6e2f5f364b",
-      "bytes": 1432,
+      "sha256": "f806d3c1f56a12912ce978c6511bb6716bf9b12bf01a726e621b11bff78c2408",
+      "bytes": 1701,
       "owned": true
     },
     {
@@ -138,20 +144,20 @@
     },
     {
       "path": "install-to-codex.ps1",
-      "sha256": "bedc90bc8565ca6bbc5380931e18efc7f4d2ca37345b8a830769e08d465d511e",
-      "bytes": 41043,
+      "sha256": "4ad41eb1036f570393da210d204cc29adac85b5202305a824d30b2e0e17e469c",
+      "bytes": 48872,
       "owned": true
     },
     {
       "path": "install-wizard.ps1",
-      "sha256": "c115ec9db197190044fdf9dfe5c975baf5527a0561c6a3e4e377eb0f620b3e8a",
-      "bytes": 24575,
+      "sha256": "4e2dd6251b864cd4de8b1c49e394cf1fb0a971a5128f5f685f3e25e973d29054",
+      "bytes": 27432,
       "owned": true
     },
     {
       "path": "manifest/agent-audit.json",
-      "sha256": "76eb51e6e1c0e7265908ddfa8c65babfee4ea677628756be8ff7925829b94272",
-      "bytes": 7369,
+      "sha256": "dda3b6ce11011f85f7a3e7c15b59de8c0ac51f8632be87597f8bf3abd1f873ff",
+      "bytes": 8770,
       "owned": true
     },
     {
@@ -168,14 +174,14 @@
     },
     {
       "path": "manifest/api-services.json",
-      "sha256": "74ab00c4a56463a1d78e9b8efd770a1bb8b55d1ec0cf0be9d219453a187cdcda",
-      "bytes": 3382,
+      "sha256": "af547da261d41ad3378d8255db13a7a4021e844cdc1fa714b7f2c1e991bfee2d",
+      "bytes": 1263,
       "owned": true
     },
     {
       "path": "manifest/connection-fields.json",
-      "sha256": "ae7865aeaaa95834b14a5eb2afa12693be8d568a65ec2ebdc4b7e863d6c1de1f",
-      "bytes": 6893,
+      "sha256": "f26817da7a3d68e25fc620ff8b86bb7fbd3c613159b2f580d33b22f831ac755e",
+      "bytes": 9112,
       "owned": true
     },
     {
@@ -192,44 +198,50 @@
     },
     {
       "path": "manifest/imported-skills.txt",
-      "sha256": "30de9ca11a1c17048a0d2f0f6a37bf7ca873a2ccba1f9e07f0e9b6f48dd6bc3f",
-      "bytes": 825,
+      "sha256": "88109ec6d7f53d7ee43d04ee11c8573138923188da38f154df99dcd0955ea27e",
+      "bytes": 915,
       "owned": true
     },
     {
       "path": "manifest/mcp-servers.json",
-      "sha256": "ab8b8a450e25460919dd9709117c8d8b8e6a7890b7fffd4e4fbd9c5aa62b41af",
-      "bytes": 2926,
+      "sha256": "6fa6fc0672b919a71b08734f6600fce6bb02c4542caba9d1bec3bb5ffb460db8",
+      "bytes": 9333,
+      "owned": true
+    },
+    {
+      "path": "manifest/media-generation-tools.json",
+      "sha256": "543c3656d4c700e734b02d5e7bd7079a5e46b36c0ebc82ac0ddaaca7fc58cb69",
+      "bytes": 1466,
       "owned": true
     },
     {
       "path": "manifest/runtime-artifacts.json",
-      "sha256": "498500ababc9c55bb6598b9783cc8d001a8603a72781be431de61dea0c4d81fc",
-      "bytes": 9506,
+      "sha256": "01897a4146fe969adffc7245ee3c36a6f5b53930338ed1c12c0a8a3c317b9d55",
+      "bytes": 14919,
       "owned": true
     },
     {
       "path": "manifest/skill-audit.json",
-      "sha256": "949853010ebfe498c829a20936a3bfd1b2d4f15484de7c648f71bbc26e489e0b",
-      "bytes": 73379,
+      "sha256": "9a04d5f9e78af2715caf6d3d09d6e3169b8d497fae283cd70f149e9dae13d98b",
+      "bytes": 81250,
       "owned": true
     },
     {
       "path": "manifest/source-notes.md",
-      "sha256": "b8a310bd05a169e7550afe449c600429b51f126d69946bdbb45793bd9e86108a",
-      "bytes": 2976,
+      "sha256": "a8535e7e76a215ff2ee9fb09b4211ff2076444283fb69bc71fb2c78d0a04196e",
+      "bytes": 3189,
       "owned": true
     },
     {
       "path": "mcp/api-services.json",
-      "sha256": "03ca0f2f11a9817781b6dec01c1564d0676caa893c332227351f8c58fc437c5b",
-      "bytes": 3710,
+      "sha256": "af547da261d41ad3378d8255db13a7a4021e844cdc1fa714b7f2c1e991bfee2d",
+      "bytes": 1263,
       "owned": true
     },
     {
       "path": "mcp/connection-fields.json",
-      "sha256": "f565043e08cc45b731193e8037370fbeb74eb0ff2367c5f9bebe1b8131488035",
-      "bytes": 9435,
+      "sha256": "f26817da7a3d68e25fc620ff8b86bb7fbd3c613159b2f580d33b22f831ac755e",
+      "bytes": 9112,
       "owned": true
     },
     {
@@ -239,33 +251,39 @@
       "owned": true
     },
     {
-      "path": "mcp/image-2.template.env",
-      "sha256": "134d7b923eac074cd5354fd57849ca6807fe43118c73ae9af91a1b7bfd55f8a4",
-      "bytes": 364,
+      "path": "mcp/mcp-servers.json",
+      "sha256": "6fa6fc0672b919a71b08734f6600fce6bb02c4542caba9d1bec3bb5ffb460db8",
+      "bytes": 9333,
       "owned": true
     },
     {
-      "path": "mcp/mcp-servers.json",
-      "sha256": "50af79766dcf859f2ffdad17a60f0d58841b7bb2e2065fd54ab426c5edb2da0b",
-      "bytes": 3214,
+      "path": "mcp/media-generation-mcp.py",
+      "sha256": "0de88f0c0107744c57adf4f7e7b0aa2ebc4b54bb5d2b29e1fb4695baf17d38a6",
+      "bytes": 47503,
+      "owned": true
+    },
+    {
+      "path": "mcp/media-generation.template.env",
+      "sha256": "f6c1781d18a11351b97670612bacd277f49f5295ef131470300a744da6d3b4d2",
+      "bytes": 749,
       "owned": true
     },
     {
       "path": "mcp/README.md",
-      "sha256": "b1cc8cce956cf51106c6895e55c01517443b4ae89ce1568994904d84784065ef",
-      "bytes": 415,
-      "owned": true
-    },
-    {
-      "path": "mcp/seedance.template.env",
-      "sha256": "43a28b7172888ebb1bfc2c09fc146abedd70398155c535e17c324c06b14e3e87",
-      "bytes": 505,
+      "sha256": "89e39ac97ffd18fa51add6f391e880829eb5ef3b48975a5030c9b8bf1465bf7c",
+      "bytes": 601,
       "owned": true
     },
     {
       "path": "mcp/start-feishu-mcp.ps1",
-      "sha256": "9a303d6d4bf055df678cee21c1da2285f6a71d434d5bac7b39644384096de6ad",
+      "sha256": "1d7af0beda1b6d8cc859dca3c478eb900812df6517e4284296edfd6ad54cbfc8",
       "bytes": 6094,
+      "owned": true
+    },
+    {
+      "path": "mcp/start-media-generation-mcp.ps1",
+      "sha256": "966cdfd98d3c815c37401b69fe2eb366724bbf74da0c5842d7f59777ff588710",
+      "bytes": 941,
       "owned": true
     },
     {
@@ -276,20 +294,20 @@
     },
     {
       "path": "pack.json",
-      "sha256": "584461cb12f890d5a351ab570448a68e195ae45e38e7e83940b97eb9f5a78111",
-      "bytes": 4155,
+      "sha256": "442ad9b141118a782a4b6174e076f673071b0e7dc41d42a7a6b237b834532781",
+      "bytes": 4019,
       "owned": true
     },
     {
       "path": "README.md",
-      "sha256": "ed982cc841ed41028ac87b5ef932c2dd97c651e2ecb41750262e74d0ff7cdbd9",
-      "bytes": 14781,
+      "sha256": "c5d09c96dbb05af18a1e0532eb78cced54d1ed3180c5f96f836b33eeea91e4da",
+      "bytes": 15747,
       "owned": true
     },
     {
       "path": "render-codex-config.ps1",
-      "sha256": "9188014ce442d7868f7ee340eaa064bef69f5c59d0c9e1b54fc9b8b80b467bb5",
-      "bytes": 7977,
+      "sha256": "53a27f3b121e0ebc07cbdbef2e88297efa98652f7af2a42af390f879ddb74e1c",
+      "bytes": 12697,
       "owned": true
     },
     {
@@ -299,15 +317,39 @@
       "owned": true
     },
     {
-      "path": "runtime/bundled/media-manifest.json",
-      "sha256": "a84470210bb7f76fcce101a73f21a89478e47e53183acfbadb46ed342b0df883",
-      "bytes": 2429,
+      "path": "runtime/bundled/ffmpeg-n9.0-latest-win64-lgpl-shared-9.0.zip",
+      "sha256": "3f67595fb8c7be0c48d8f54b2a5a89175426a6d7b194065d0c08cca9bd95eb19",
+      "bytes": 77221060,
       "owned": true
     },
     {
-      "path": "runtime/bundled/node-v20.20.0-win-x64.zip",
-      "sha256": "32f24e1405b113d4e01ad2585c92024df673b6156ef6f43a5469a75bf52c0a5a",
-      "bytes": 29902899,
+      "path": "runtime/bundled/hyperframes-package-lock.json",
+      "sha256": "e6d58048a953a40e40df4cce287f45f2027ca38b750e0e6a45d68f48a80255d9",
+      "bytes": 62115,
+      "owned": true
+    },
+    {
+      "path": "runtime/bundled/hyperframes-package.json",
+      "sha256": "907747a9d9adfb41244fe8dfc3786d929c6b2261813ca509c58cf4429b88ee11",
+      "bytes": 147,
+      "owned": true
+    },
+    {
+      "path": "runtime/bundled/manim-requirements.lock",
+      "sha256": "bf2a39287e7b7d34eda8f3d1d18c9b61c08972975ba0c87ce454da22c371c400",
+      "bytes": 3148,
+      "owned": true
+    },
+    {
+      "path": "runtime/bundled/media-manifest.json",
+      "sha256": "5ada6674df0028eabc00bd0320c05babb92da33aab882f812d9bca44c99d52bd",
+      "bytes": 4543,
+      "owned": true
+    },
+    {
+      "path": "runtime/bundled/node-v22.22.0-win-x64.zip",
+      "sha256": "c97fa376d2becdc8863fcd3ca2dd9a83a9f3468ee7ccf7a6d076ec66a645c77a",
+      "bytes": 35556852,
       "owned": true
     },
     {
@@ -324,14 +366,20 @@
     },
     {
       "path": "runtime/bundled/python-wheelhouse-manifest.json",
-      "sha256": "b658edc378bf0bf03f32c77698499867ac9ed7c3a6a63f56273b2151a93e761a",
-      "bytes": 22717,
+      "sha256": "1766d48c1d39e64b3cc497645813613c5a35859b1f14707f24eaf6b5ca1e868d",
+      "bytes": 33256,
       "owned": true
     },
     {
       "path": "runtime/bundled/python-wheels/akshare-1.18.94-py3-none-any.whl",
       "sha256": "a66901c646865781da353d294dbab9ac760955e00e5c761ff5028583431c6771",
       "bytes": 1260826,
+      "owned": true
+    },
+    {
+      "path": "runtime/bundled/python-wheels/av-19.0.1-cp312-abi3-win_amd64.whl",
+      "sha256": "906fc3db09288319a75ea23ffefb59961c7dbe0d1c074601507a89de7d8593d8",
+      "bytes": 28149519,
       "owned": true
     },
     {
@@ -356,6 +404,18 @@
       "path": "runtime/bundled/python-wheels/charset_normalizer-3.5.1-cp312-cp312-win_amd64.whl",
       "sha256": "3617ac3cfd8b9888f145ad89dd6e692285834b0201c6074a5eeaad3fd4d668c2",
       "bytes": 200551,
+      "owned": true
+    },
+    {
+      "path": "runtime/bundled/python-wheels/click-8.5.0-py3-none-any.whl",
+      "sha256": "255bc9599cf7748b4b1a446ccc735421bd08a2ae529a8b88597d3de5664ee360",
+      "bytes": 125251,
+      "owned": true
+    },
+    {
+      "path": "runtime/bundled/python-wheels/cloup-4.0.0-py3-none-any.whl",
+      "sha256": "0678744a3a2753e1d78dd3ea5c6e4cbbc3b41561fd7a7a7d075dbc8dad74f74f",
+      "bytes": 55776,
       "owned": true
     },
     {
@@ -413,6 +473,12 @@
       "owned": true
     },
     {
+      "path": "runtime/bundled/python-wheels/glcontext-3.0.0-cp312-cp312-win_amd64.whl",
+      "sha256": "e80bb37ba727bd20c192f2754aea40c437a7665005c1001c10752f91913964e9",
+      "bytes": 12971,
+      "owned": true
+    },
+    {
       "path": "runtime/bundled/python-wheels/html2text-2025.4.15-py3-none-any.whl",
       "sha256": "00569167ffdab3d7767a4cdf589b7f57e777a5ed28d12907d8c58769ec734acc",
       "bytes": 34656,
@@ -428,6 +494,12 @@
       "path": "runtime/bundled/python-wheels/idna-3.19-py3-none-any.whl",
       "sha256": "815e7be7a7806d54abb586dc943addc79e8b2ee16915059658cbeff4b1b43bf4",
       "bytes": 68550,
+      "owned": true
+    },
+    {
+      "path": "runtime/bundled/python-wheels/isosurfaces-0.1.2-py3-none-any.whl",
+      "sha256": "525a49ba93f4dbc35303cd2faf30976af0f99d9274cfa2787aec016b8ef96c64",
+      "bytes": 11649,
       "owned": true
     },
     {
@@ -449,15 +521,63 @@
       "owned": true
     },
     {
+      "path": "runtime/bundled/python-wheels/manim-0.21.0-py3-none-any.whl",
+      "sha256": "021001097bb568372fa8f5d1dcf46ba085c8502c10efb2312ff45f19f7facb60",
+      "bytes": 679365,
+      "owned": true
+    },
+    {
+      "path": "runtime/bundled/python-wheels/manimpango-0.7.0-cp312-cp312-win_amd64.whl",
+      "sha256": "7bf6b1c468f1910ae8f2d68c62674b14c40e059c337b167147cd3fa38e2b1e17",
+      "bytes": 6384848,
+      "owned": true
+    },
+    {
+      "path": "runtime/bundled/python-wheels/mapbox_earcut-2.1.0-cp312-cp312-win_amd64.whl",
+      "sha256": "eeea00eeb70873d840290e98471671d02e4ac0536b847b785177a14001e33a95",
+      "bytes": 279405,
+      "owned": true
+    },
+    {
+      "path": "runtime/bundled/python-wheels/markdown_it_py-4.2.0-py3-none-any.whl",
+      "sha256": "9f7ebbcd14fe59494226453aed97c1070d83f8d24b6fc3a3bcf9a38092641c4a",
+      "bytes": 91687,
+      "owned": true
+    },
+    {
       "path": "runtime/bundled/python-wheels/matplotlib-3.11.1-cp312-cp312-win_amd64.whl",
       "sha256": "88a2a27dd9691ae448dfae4b26f59036be90c3c28757edd3553a29559d00859f",
       "bytes": 9333886,
       "owned": true
     },
     {
+      "path": "runtime/bundled/python-wheels/mdurl-0.1.2-py3-none-any.whl",
+      "sha256": "84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8",
+      "bytes": 9979,
+      "owned": true
+    },
+    {
       "path": "runtime/bundled/python-wheels/mini_racer-0.14.1-py3-none-win_amd64.whl",
       "sha256": "4abd58c62c9955988dbc0cbf5a798914334fe570d2b192f8890bec20135ab6d1",
       "bytes": 15515732,
+      "owned": true
+    },
+    {
+      "path": "runtime/bundled/python-wheels/moderngl-5.12.0-cp312-cp312-win_amd64.whl",
+      "sha256": "8698a59ad03539a2982125b7998efc1c107ba31d5d03437b6fcd72cb2c226922",
+      "bytes": 108525,
+      "owned": true
+    },
+    {
+      "path": "runtime/bundled/python-wheels/moderngl_window-3.1.1-py3-none-any.whl",
+      "sha256": "e3b3ac2b4e23afcbfdac1971318a4db893bed3ba6a8fbde3367b1226af39b2e5",
+      "bytes": 382381,
+      "owned": true
+    },
+    {
+      "path": "runtime/bundled/python-wheels/networkx-3.7-py3-none-any.whl",
+      "sha256": "e3fd2c13a7814cee3746340d8d7f8598a67f16a58bf47fb7f8793fab6efca1b0",
+      "bytes": 2142205,
       "owned": true
     },
     {
@@ -509,9 +629,39 @@
       "owned": true
     },
     {
+      "path": "runtime/bundled/python-wheels/pycairo-1.29.2-cp312-cp312-win_amd64.whl",
+      "sha256": "b97fd674dea445eae40387353f32665dbe19080a2ef63df97fd81273afc6e9d1",
+      "bytes": 846938,
+      "owned": true
+    },
+    {
       "path": "runtime/bundled/python-wheels/pycparser-3.0-py3-none-any.whl",
       "sha256": "b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992",
       "bytes": 48172,
+      "owned": true
+    },
+    {
+      "path": "runtime/bundled/python-wheels/pydub-0.25.1-py2.py3-none-any.whl",
+      "sha256": "65617e33033874b59d87db603aa1ed450633288aefead953b30bded59cb599a6",
+      "bytes": 32327,
+      "owned": true
+    },
+    {
+      "path": "runtime/bundled/python-wheels/pyglet-2.1.16-py3-none-any.whl",
+      "sha256": "27f9cabf97a64b15d335cf70d9e8979bbab5f84a9900a058206bcd3a2de341ae",
+      "bytes": 1037857,
+      "owned": true
+    },
+    {
+      "path": "runtime/bundled/python-wheels/pyglm-2.8.3-cp312-cp312-win_amd64.whl",
+      "sha256": "5f7ff6f4ac14b092d897931b9ef76bb8108b5faa6f5118963c9de86c6fa18efc",
+      "bytes": 1663004,
+      "owned": true
+    },
+    {
+      "path": "runtime/bundled/python-wheels/pygments-2.21.0-py3-none-any.whl",
+      "sha256": "2363c69b61c4a97c838da3b130dcd6468f4848992b21a82f2a63ec34377137d9",
+      "bytes": 1250147,
       "owned": true
     },
     {
@@ -563,9 +713,27 @@
       "owned": true
     },
     {
+      "path": "runtime/bundled/python-wheels/rich-15.0.0-py3-none-any.whl",
+      "sha256": "33bd4ef74232fb73fe9279a257718407f169c09b78a87ad3d296f548e27de0bb",
+      "bytes": 310654,
+      "owned": true
+    },
+    {
+      "path": "runtime/bundled/python-wheels/scipy-1.18.1-cp312-cp312-win_amd64.whl",
+      "sha256": "5e4d44984abc0020154ea81b247adeddcc3ac5527b975ff798bd1ba0adc513c2",
+      "bytes": 36658278,
+      "owned": true
+    },
+    {
       "path": "runtime/bundled/python-wheels/scrapling-0.4.15-py3-none-any.whl",
       "sha256": "ae66bde9f63afb793ad6f93bd76b451e29f1631347465a553c4e7765c0ecc1f2",
       "bytes": 180463,
+      "owned": true
+    },
+    {
+      "path": "runtime/bundled/python-wheels/screeninfo-0.8.1-py3-none-any.whl",
+      "sha256": "e97d6b173856edcfa3bd282f81deb528188aff14b11ec3e195584e7641be733c",
+      "bytes": 12907,
       "owned": true
     },
     {
@@ -575,9 +743,27 @@
       "owned": true
     },
     {
+      "path": "runtime/bundled/python-wheels/skia_pathops-0.9.2-cp310-abi3-win_amd64.whl",
+      "sha256": "9ae72d801b5f4c5dbb937fb25476a12fa2da70860f28dd637da2b529dbd8271c",
+      "bytes": 1782901,
+      "owned": true
+    },
+    {
       "path": "runtime/bundled/python-wheels/soupsieve-2.9.2-py3-none-any.whl",
       "sha256": "8089a26fd974ca7a1f30276d3d8492ab266ab15af581642dfe8aa162e0c1c823",
       "bytes": 37370,
+      "owned": true
+    },
+    {
+      "path": "runtime/bundled/python-wheels/srt-3.5.3-py3-none-any.whl",
+      "sha256": "470ec0a07a67ebdd9cfc016daa13d47c12e472fdb6f05ae9672bd0374c53c221",
+      "bytes": 22639,
+      "owned": true
+    },
+    {
+      "path": "runtime/bundled/python-wheels/svgelements-1.9.6-py2.py3-none-any.whl",
+      "sha256": "8a5cf2cc066d98e713d5b875b1d6e5eeb9b92e855e835ebd7caab2713ae1dcad",
+      "bytes": 137856,
       "owned": true
     },
     {
@@ -623,6 +809,12 @@
       "owned": true
     },
     {
+      "path": "runtime/bundled/python-wheels/watchdog-6.0.0-py3-none-win_amd64.whl",
+      "sha256": "cbafb470cf848d93b5d013e2ecb245d4aa1c8fd0504e863ccefa32445359d680",
+      "bytes": 79070,
+      "owned": true
+    },
+    {
       "path": "runtime/bundled/python-wheels/webencodings-0.6.1-py3-none-any.whl",
       "sha256": "7fab6269c8bf237c657876b52058ccb182e861518d1c695c1a9aaa8c1c105d5b",
       "bytes": 8745,
@@ -654,14 +846,14 @@
     },
     {
       "path": "runtime/provision-runtime.ps1",
-      "sha256": "b05dcdfbb205e81fb2708cdcb8249f751f733223823efc443b0577d3a10d8b35",
-      "bytes": 13699,
+      "sha256": "4f094916e032708afc8911435b34717eba89ab2c7b6bcfe2dedc4b8b17939a7c",
+      "bytes": 24557,
       "owned": true
     },
     {
       "path": "runtime/README.md",
-      "sha256": "c887771b6f4603991e156c0dc0d2626ac24d03d6eff38de0563a094b4c753e86",
-      "bytes": 1054,
+      "sha256": "e4fc571bda95dcfdfd2f151c1bb1335138e154d6f3a5fdee188fb1b8b9c10d9e",
+      "bytes": 1557,
       "owned": true
     },
     {
@@ -671,21 +863,15 @@
       "owned": true
     },
     {
+      "path": "runtime/THIRD-PARTY-NOTICES.md",
+      "sha256": "7617af654cfaadfe73fd0ef99bb634e7ff808811529c3a0b8456ba7ac4fcd5f1",
+      "bytes": 1005,
+      "owned": true
+    },
+    {
       "path": "runtime/wheelhouse-manifest.json",
-      "sha256": "b658edc378bf0bf03f32c77698499867ac9ed7c3a6a63f56273b2151a93e761a",
-      "bytes": 22717,
-      "owned": true
-    },
-    {
-      "path": "scripts/build-pack.py",
-      "sha256": "64152063a9fbe74ea30383f7bc73f7dd4ece3d37366c272c54fa60727708c7aa",
-      "bytes": 9562,
-      "owned": true
-    },
-    {
-      "path": "scripts/verify-package.ps1",
-      "sha256": "a34eb65a3f068e7e28143748cc2df2b6aae570520da90d114660a5f216c36ecb",
-      "bytes": 6585,
+      "sha256": "1766d48c1d39e64b3cc497645813613c5a35859b1f14707f24eaf6b5ca1e868d",
+      "bytes": 33256,
       "owned": true
     },
     {
@@ -776,6 +962,12 @@
       "path": "skills/china-stock-analysis/templates/analysis_report.md",
       "sha256": "4ca48e30728201389f10929d404b7d9845b7ce70cca5f3b1416953a8bc9e6024",
       "bytes": 3069,
+      "owned": true
+    },
+    {
+      "path": "skills/codex-skin-design/SKILL.md",
+      "sha256": "71d80dfaa479058bac8f34a2ab74ff1eb72c69c176eacb06dc00803620972edc",
+      "bytes": 1160,
       "owned": true
     },
     {
@@ -995,21 +1187,27 @@
       "owned": true
     },
     {
+      "path": "skills/hyperframes-video/agents/openai.yaml",
+      "sha256": "f8f660cfd4a99d6523adff49c63da29ef125286ca907f1ee0f1ae4b5f3bad56e",
+      "bytes": 301,
+      "owned": true
+    },
+    {
+      "path": "skills/hyperframes-video/SKILL.md",
+      "sha256": "21beea0c3c90f78c2119879a9772d1fc684c5d4a29560f8ccd6828f9ff96eada",
+      "bytes": 1493,
+      "owned": true
+    },
+    {
       "path": "skills/image-2/agents/openai.yaml",
       "sha256": "5b0cf8f13cb5e4e59f590297b60db26d997850db808a2120b6db18f0d56c28cf",
       "bytes": 310,
       "owned": true
     },
     {
-      "path": "skills/image-2/scripts/image_2_gen.py",
-      "sha256": "53717ecd190bc348b2b5bbb89aee9ca0c18c3500429828cd2f976a4f3db0fc2d",
-      "bytes": 48692,
-      "owned": true
-    },
-    {
       "path": "skills/image-2/SKILL.md",
-      "sha256": "515c15e4776cc13e7d914a73bfa3eb1729f7b5022b6793690c01607f1a1b90ac",
-      "bytes": 7004,
+      "sha256": "47483475d24b2c7cc6e5b96b53c89207aee1177a8df6aaf5e1e838e4ebe0af4b",
+      "bytes": 2789,
       "owned": true
     },
     {
@@ -1022,6 +1220,18 @@
       "path": "skills/industry-analysis/SKILL.md",
       "sha256": "f198b0599f103090894e8a6fa038f10b27004e4e339924a66f430a716151f62c",
       "bytes": 4652,
+      "owned": true
+    },
+    {
+      "path": "skills/local-video-editing/agents/openai.yaml",
+      "sha256": "1e2e6e6346f0bdbecb19859f45dac0528c67e310eac50282fa846ace8da57f89",
+      "bytes": 283,
+      "owned": true
+    },
+    {
+      "path": "skills/local-video-editing/SKILL.md",
+      "sha256": "ef69e1e12a6a16914ac846baf739cb8354f481aba8897a4fd4c1d13e69abf10b",
+      "bytes": 1021,
       "owned": true
     },
     {
@@ -1052,6 +1262,18 @@
       "path": "skills/macro-research/SKILL.md",
       "sha256": "7d3fdf2cbbb8fb0d0a79baae173d7a7ee0f1a44fd8f410edf53bb89de8df2d09",
       "bytes": 6048,
+      "owned": true
+    },
+    {
+      "path": "skills/manim-animation/agents/openai.yaml",
+      "sha256": "174d286c546c55fd7cbab884728a6680d34d431a42645b60c15f2c12d5c16cec",
+      "bytes": 278,
+      "owned": true
+    },
+    {
+      "path": "skills/manim-animation/SKILL.md",
+      "sha256": "80c22ef1740ac160f7bb652280e665e628597c24276547473b0aba8f0bc686a7",
+      "bytes": 1134,
       "owned": true
     },
     {
@@ -1100,6 +1322,18 @@
       "path": "skills/meeting-secretary/SKILL.md",
       "sha256": "b90358bcf099c8ec7786fda62fc472d4af17a70e29090d94f13701febf13b4fb",
       "bytes": 4715,
+      "owned": true
+    },
+    {
+      "path": "skills/minimax-video-gen/agents/openai.yaml",
+      "sha256": "a543b9e61f52876f8cdb1177f32d4a8997b766accb6296a0bd95df4db8107d97",
+      "bytes": 432,
+      "owned": true
+    },
+    {
+      "path": "skills/minimax-video-gen/SKILL.md",
+      "sha256": "9470031c6ebf73482191eeb4a694bf3a0846d23d5b7cb3b2c38faec17a09990e",
+      "bytes": 2463,
       "owned": true
     },
     {
@@ -1206,8 +1440,8 @@
     },
     {
       "path": "skills/powerpoint-pptx/SKILL.md",
-      "sha256": "68a7b751a919b4d88c003722806d3750b69890a12b8bf87b0f574560ac8323c7",
-      "bytes": 3359,
+      "sha256": "6a9eeae3ac3d364a965528e5264db52d19d77fcaa2d9a7037873a6a58763d14d",
+      "bytes": 3832,
       "owned": true
     },
     {
@@ -1241,15 +1475,9 @@
       "owned": true
     },
     {
-      "path": "skills/seedance2-0-video-gen/scripts/seedance_video_gen.py",
-      "sha256": "cb145f9766eaa401383a4170ada33cd2aea070fcb618df7e779a27c65e3274f1",
-      "bytes": 148240,
-      "owned": true
-    },
-    {
       "path": "skills/seedance2-0-video-gen/SKILL.md",
-      "sha256": "9b461d326053c2cb5afa5167d6e346448b5f0b6ff5f97ae58b7961648f64b1e9",
-      "bytes": 9175,
+      "sha256": "401d8142f4ddcab13e5e1fe66d121026f89473c63cb11ff64cacb01df5f58fd4",
+      "bytes": 2805,
       "owned": true
     },
     {
@@ -1326,8 +1554,8 @@
     },
     {
       "path": "skills/travel-planner/SKILL.md",
-      "sha256": "523e46d01cdd6a214ef8d6183c1ac805c733c26f178954efd988d20e0c0e968d",
-      "bytes": 15712,
+      "sha256": "016b7b1013ca631106fafe85a7f46e27f9b1a398cfb7c0a8a90b8e7bf76e6607",
+      "bytes": 16230,
       "owned": true
     },
     {
@@ -1380,8 +1608,8 @@
     },
     {
       "path": "skills/video-prompt-generator/SKILL.md",
-      "sha256": "528715949c365127658bad40a032d576ac11fe09a7d28e7f4a334d10ebb82142",
-      "bytes": 12627,
+      "sha256": "294fb05860091a93b773a498a99c95651706769c3a6a65e13b88b4edfa4cdece",
+      "bytes": 13596,
       "owned": true
     },
     {
@@ -1415,6 +1643,12 @@
       "owned": true
     },
     {
+      "path": "skills/weather/SKILL.md",
+      "sha256": "0d1a1278318b918dc2540767b70fd4a4a57430fec534cd04fc0b2f3ab89d7d1f",
+      "bytes": 1017,
+      "owned": true
+    },
+    {
       "path": "skills/weather-forecast/scripts/weather_db.ps1",
       "sha256": "c4721ad0b145c3ba96b6ac27b6ee35dda5d0f5eeccb424d02b0228c998748312",
       "bytes": 1741,
@@ -1424,12 +1658,6 @@
       "path": "skills/weather-forecast/SKILL.md",
       "sha256": "5445b29decbbea972ecae152650144a83d6ae7ee46defcdebd15cf9974c66570",
       "bytes": 1655,
-      "owned": true
-    },
-    {
-      "path": "skills/weather/SKILL.md",
-      "sha256": "0d1a1278318b918dc2540767b70fd4a4a57430fec534cd04fc0b2f3ab89d7d1f",
-      "bytes": 1017,
       "owned": true
     },
     {
@@ -1512,8 +1740,8 @@
     },
     {
       "path": "skills/word-docx/SKILL.md",
-      "sha256": "b37ce3496844cee7f11e6adaafd463d836758a9f146a3a251329378517b9eb51",
-      "bytes": 3108,
+      "sha256": "714917f7890271d3991715647a4f1df797c5be810cf24d4ab6c80f5c1205c0c0",
+      "bytes": 3669,
       "owned": true
     },
     {
@@ -1524,14 +1752,14 @@
     },
     {
       "path": "sync-model-catalog.ps1",
-      "sha256": "c5244354c530bd57ec42bc2a055229a2605bf213a3272df075ed0a45a3363705",
-      "bytes": 9431,
+      "sha256": "84e571960dfaabec6223546ffd428f24a34e835933e75904cf4fe6b611786ab9",
+      "bytes": 13030,
       "owned": true
     },
     {
       "path": "test-adapter-contracts.py",
-      "sha256": "846e54582d39a220f654d7d3b6d0922bf1ca40725122ea5a5a0d9f72a225376b",
-      "bytes": 59053,
+      "sha256": "1d9b6b06c88cc92ca68b8e5d1738e178605afb90b397b14d4abc626719339199",
+      "bytes": 60986,
       "owned": true
     }
   ]

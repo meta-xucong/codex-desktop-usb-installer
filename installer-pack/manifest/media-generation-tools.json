@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "serverId": "media-generation",
+  "providerSlots": {
+    "active": ["image-2", "grok-image", "grok-video", "seedance-video"],
+    "reserved": {
+      "minimax-video": {
+        "modelEnvironmentVariable": "MEDIA_MINIMAX_VIDEO_MODEL",
+        "enabledOnlyWhenConfigured": true,
+        "currentModelConfigured": false,
+        "sharedCredential": "MEDIA_GENERATION_API_KEY",
+        "officialMiniMaxApi": false,
+        "automaticFallback": false,
+        "profile": "wokey"
+      }
+    }
+  },
+  "tools": [
+    {
+      "name": "media_capabilities",
+      "network": false,
+      "mayBill": false,
+      "description": "Show configured media providers and missing local settings."
+    },
+    {
+      "name": "media_prepare",
+      "network": false,
+      "mayBill": false,
+      "description": "Validate inputs and write a signed, expiring, immutable confirmation manifest."
+    },
+    {
+      "name": "media_submit",
+      "network": true,
+      "mayBill": true,
+      "requiresPriorExplicitUserApproval": true,
+      "requiresConfirmationIdAndFingerprint": true,
+      "singleUse": true,
+      "unknownOutcomeRetry": "never"
+    },
+    {
+      "name": "media_check",
+      "network": true,
+      "mayBill": false,
+      "operation": "query-existing-task-only"
+    },
+    {
+      "name": "media_save",
+      "network": true,
+      "mayBill": false,
+      "operation": "download-existing-result-only",
+      "maxBytes": 536870912
+    }
+  ]
+}

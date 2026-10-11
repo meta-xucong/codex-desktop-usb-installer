@@ -6,8 +6,8 @@
 
 1. 安装/复用 CPython 3.12；
 2. 创建独立 Python 虚拟环境并从本地 wheelhouse 安装完整传递依赖；
-3. 解压 Node.js 20 和锁定的飞书 MCP npm 依赖；
-4. 安装全部 50 个 Skill 和 7 个 Agent；
+3. 离线部署 Node.js 22、FFmpeg/FFprobe 和 Manim；解压锁定的飞书 MCP npm 依赖；联网时再安装 HyperFrames CLI 并准备 Chrome；
+4. 安装全部 55 个 Skill 和 7 个 Agent；
 5. 生成 Codex 的托管配置片段，并保留用户原有配置；
 6. 记录运行时、配置和连接健康状态；
 7. 在没有凭据时保持 Feishu/API 能力关闭，而不是伪装成可用。
@@ -20,9 +20,9 @@
 
 - Skills、Agents、审计清单、MCP/API 配置表和工具 allowlist；
 - CPython 3.12.10 Windows x64 安装器；
-- Node.js 20.20.0 Windows x64 ZIP；
+- Node.js 22.22.0 Windows x64 ZIP、FFmpeg 9 LGPL shared ZIP；
 - `@larksuiteoapi/lark-mcp@0.5.1` 的 npm closure、lockfile 和 CLI；
-- 52 个 Python wheel、哈希锁文件和 wheelhouse manifest；
+- 77 个 Python wheel、基础与 Manim 哈希锁文件和 wheelhouse manifest；
 - 安装脚本、配置渲染器、健康检查、契约测试和文件哈希清单。
 
 ### 仍需用户首次配置
@@ -60,24 +60,22 @@
         ↓
 创建 runtime/python-env
         ↓
---no-index + --require-hashes 安装 52 个 Python wheel
+--no-index + --require-hashes 安装 77 个 Python wheel
         ↓
 导入健康检查（含 PIL、jsonpath、Office/PDF/数据栈）
         ↓
-解压 Node.js 20
+解压 Node.js 22 与 FFmpeg/FFprobe
         ↓
-解压并验证 Feishu MCP npm closure / CLI
+离线安装 Manim 0.21 独立环境；检查 HyperFrames CLI/Chrome（npm/浏览器下载需要网络）；解压并验证 Feishu MCP npm closure / CLI
         ↓
-复制 50 Skills、7 Agents、manifest、连接模板
+复制 55 Skills、7 Agents、manifest、连接模板
         ↓
 渲染托管 Codex 配置并合并到用户 config.toml
         ↓
 写入 runtime-state.json、connection-status.json、readiness.json
 ```
 
-能力包清单、介质哈希、wheel hash、运行时版本或核心文件数量校验失败都不会写出核心 `ready` 状态。
-可选 Node/飞书 MCP 或配置合并失败时，核心 Skills/Agents 仍可保留，并写出 `partial` readiness 供组件修复入口继续处理；
-外部同名文件被安全跳过时则写出 `core=partial`、`overall=failed`，不会误报全量安装完成。
+Python、Manim、Node 和 FFmpeg 的介质哈希/健康检查失败会终止运行时安装；若 HyperFrames 的 npm 或 Chrome 下载离线失败，只将该能力标记为 `requires-network`，其它本地能力照常安装。
 
 ## 5. 配置合并规则
 
@@ -100,7 +98,7 @@
 
 - `manifest/runtime-artifacts.json`：运行时和 MCP 介质的版本、来源、哈希、签名/校验要求；
 - `runtime/bundled/media-manifest.json`：包内实际介质的相对路径、字节数和 SHA-256；
-- `runtime/wheelhouse-manifest.json`：52 个 wheel 的逐文件哈希；
+- `runtime/wheelhouse-manifest.json`：77 个 wheel 的逐文件哈希；
 - `runtime/bundled/python-requirements.lock`：带哈希的离线 pip 安装锁；
 - `installer-pack/checksums.sha256`：最终安装包文件清单。
 
@@ -110,12 +108,12 @@
 
 完整验收必须同时满足：
 
-- source audit：50 Skills、7 Agents、manifest 引用闭合；
+- source audit：55 Skills、7 Agents、manifest 引用闭合；
 - package audit：安装包没有缺失源文件或 transient 用户目录；
-- media audit：Python、Node、Feishu npm closure、52 wheel 全部存在且哈希相符；
+- media audit：Python、Node、FFmpeg、Manim、Feishu npm closure、77 wheel 全部存在且哈希相符；
 - default smoke：核心安装可完成，runtime ready，Codex config merged；
-- full smoke：50 Skills / 7 Agents 全量安装可完成；
-- dependency health：Python 导入探针、Node 版本、Feishu CLI help 均通过；
+- full smoke：55 Skills / 7 Agents 全量安装可完成；
+- dependency health：Python 导入探针、Node/FFmpeg 版本、Manim 导入和 Feishu CLI help 均通过；HyperFrames 在线初始化状态单独记录；
 - security：公开包不含密钥；高风险工具仍受 allowlist 和写操作确认策略约束；
 - repeatability：同一包在全新隔离 profile 上重复安装，结果一致且不污染主用户配置。
 

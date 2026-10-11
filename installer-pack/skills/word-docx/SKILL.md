@@ -3,6 +3,11 @@ name: word-docx
 description: Read and generate Word documents with correct structure, styles, and cross-platform compatibility.
 ---
 
+## 中文公文与正式文件
+
+用户要求公文、制度、正式函件或严格版式时，先确认文种、收文对象、适用格式依据和是否有现成模板。分清内容校对与版式规范，不凭空声称符合某一机关的最新强制标准。对标题层级、正文、附件、落款、日期、页眉页脚统一样式；优先使用 Word 样式而非逐段手工格式。输出前检查字体替换、分页、孤行、表格跨页和打印效果；需要匹配特定地区/组织规范时请用户提供模板或可核查依据。
+
+
 ## Structure
 
 - DOCX is a ZIP containing XML files—`word/document.xml` has main content, `word/styles.xml` has styles

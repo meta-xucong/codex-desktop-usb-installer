@@ -11,8 +11,11 @@ import { useI18n } from "../i18n";
 import { Sheet } from "../Sheet";
 import { Tooltip } from "../components";
 
-type ServiceId = "feishu" | "dashscope-web-search" | "image-2" | "seedance";
-type FormValues = Omit<CapabilityPackInstallOptions, "enabledApiServices">;
+type ApiServiceId = "dashscope-web-search";
+type RemoteMcpId = "cloudflare" | "figma" | "linear" | "notion";
+type ServiceId = "feishu" | "media-generation" | ApiServiceId | RemoteMcpId;
+export type OfflineComponentsView = "connections" | "maintenance";
+type FormValues = Omit<CapabilityPackInstallOptions, "enabledApiServices" | "enabledRemoteMcps" | "enableMediaGeneration">;
 
 const EMPTY_FORM: FormValues = {
   enableFeishu: false,
@@ -25,25 +28,25 @@ const EMPTY_FORM: FormValues = {
   dashscopeApiKey: "",
   dashscopeBaseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
   dashscopeModel: "",
-  image2ApiKey: "",
-  image2BaseUrl: "",
+  mediaGenerationApiBaseUrl: "",
+  mediaGenerationApiProfile: "auto",
+  mediaGenerationApiKey: "",
+  mediaGenerationAgentId: "",
   image2Model: "",
-  image2AgentId: "",
-  seedanceApiKey: "",
-  seedanceBaseUrl: "",
+  grokImageModel: "",
+  grokVideoModel: "",
   seedanceModel: "",
-  seedanceAgentId: "",
-  seedancePrechargePoints: "",
-  seedanceOfficialLinkTtlHours: "",
-  seedanceRefundRule: "",
+  minimaxVideoModel: "",
 };
 
-const SERVICE_KEYS: ServiceId[] = [
-  "feishu",
-  "dashscope-web-search",
-  "image-2",
-  "seedance",
-];
+const API_SERVICE_KEYS: ApiServiceId[] = ["dashscope-web-search"];
+const REMOTE_MCP_KEYS: RemoteMcpId[] = ["cloudflare", "figma", "linear", "notion"];
+const REMOTE_MCP_LABELS = {
+  cloudflare: "offline.components.remoteMcp.cloudflare",
+  figma: "offline.components.remoteMcp.figma",
+  linear: "offline.components.remoteMcp.linear",
+  notion: "offline.components.remoteMcp.notion",
+} as const;
 
 const CONFIG_ATTENTION_STATUSES = new Set(["partial", "failed", "conflict"]);
 
@@ -56,12 +59,24 @@ function configNeedsAttention(report: CapabilityPackReport): boolean {
   );
 }
 
+function mediaUsesLegacyProfile(profile: string, baseUrl: string): boolean {
+  if (profile === "legacy") return true;
+  if (profile === "wokey") return false;
+  try {
+    return new URL(baseUrl.trim()).hostname.toLowerCase() !== "api.wokey.ai";
+  } catch {
+    return true;
+  }
+}
+
 export function OfflineComponentsSheet({
   open,
   onDismiss,
+  view = "connections",
 }: {
   open: boolean;
   onDismiss: () => void;
+  view?: OfflineComponentsView;
 }) {
   const { t } = useI18n();
   const titleId = useId();
@@ -69,9 +84,12 @@ export function OfflineComponentsSheet({
   const [form, setForm] = useState<FormValues>(EMPTY_FORM);
   const [enabled, setEnabled] = useState<Record<ServiceId, boolean>>({
     feishu: false,
+    "media-generation": false,
     "dashscope-web-search": false,
-    "image-2": false,
-    seedance: false,
+    cloudflare: false,
+    figma: false,
+    linear: false,
+    notion: false,
   });
   const [busy, setBusy] = useState<"pack" | "ccswitch" | null>(null);
   const [statusLoading, setStatusLoading] = useState(false);
@@ -79,6 +97,7 @@ export function OfflineComponentsSheet({
   const [packReport, setPackReport] = useState<CapabilityPackReport | null>(null);
   const [ccswitchReport, setCcswitchReport] = useState<CcswitchLaunchReport | null>(null);
   const statusRequestRef = useRef(0);
+  const mediaAdvancedRef = useRef<HTMLDetailsElement>(null);
 
   useEffect(() => {
     if (!open) {
@@ -116,6 +135,16 @@ export function OfflineComponentsSheet({
     setError(null);
   };
 
+  const mediaNeedsRouteId =
+    mediaUsesLegacyProfile(form.mediaGenerationApiProfile, form.mediaGenerationApiBaseUrl) &&
+    Boolean(form.image2Model.trim() || form.seedanceModel.trim());
+
+  useEffect(() => {
+    if (mediaNeedsRouteId && mediaAdvancedRef.current) {
+      mediaAdvancedRef.current.open = true;
+    }
+  }, [mediaNeedsRouteId]);
+
   const validate = (): string | null => {
     if (enabled.feishu && (!form.feishuAppId.trim() || !form.feishuAppSecret.trim())) {
       return t("offline.components.validationFeishu");
@@ -129,26 +158,14 @@ export function OfflineComponentsSheet({
     ) {
       return t("offline.components.validationDashscope");
     }
-    if (
-      enabled["image-2"] &&
-      (!form.image2ApiKey.trim() ||
-        !form.image2BaseUrl.trim() ||
-        !form.image2Model.trim() ||
-        !form.image2AgentId.trim())
-    ) {
-      return t("offline.components.validationImage");
-    }
-    if (
-      enabled.seedance &&
-      (!form.seedanceApiKey.trim() ||
-        !form.seedanceBaseUrl.trim() ||
-        !form.seedanceModel.trim() ||
-        !form.seedanceAgentId.trim() ||
-        !form.seedancePrechargePoints.trim() ||
-        !form.seedanceOfficialLinkTtlHours.trim() ||
-        !form.seedanceRefundRule.trim())
-    ) {
-      return t("offline.components.validationSeedance");
+    if (enabled["media-generation"]) {
+      const mediaModels = [form.image2Model, form.grokImageModel, form.grokVideoModel, form.seedanceModel, form.minimaxVideoModel];
+      if (!form.mediaGenerationApiBaseUrl.trim() || !form.mediaGenerationApiKey.trim() || mediaModels.every((model) => !model.trim())) {
+        return t("offline.components.validationMedia");
+      }
+      if (mediaNeedsRouteId && !form.mediaGenerationAgentId.trim()) {
+        return t("offline.components.validationMediaRoute");
+      }
     }
     return null;
   };
@@ -170,9 +187,9 @@ export function OfflineComponentsSheet({
       const report = await managerApi.installCapabilityPack({
         ...form,
         enableFeishu: enabled.feishu,
-        enabledApiServices: SERVICE_KEYS.filter(
-          (service) => service !== "feishu" && enabled[service],
-        ),
+        enableMediaGeneration: enabled["media-generation"],
+        enabledApiServices: API_SERVICE_KEYS.filter((service) => enabled[service]),
+        enabledRemoteMcps: REMOTE_MCP_KEYS.filter((server) => enabled[server]),
       });
       setPackReport(report);
       if (!report.coreReady) setError(report.message);
@@ -233,7 +250,11 @@ export function OfflineComponentsSheet({
       <div className="component-sheet">
         <div className="component-sheet-heading">
           <Icon name="sliders" />
-          <h3 id={titleId}>{t("offline.components.title")}</h3>
+          <h3 id={titleId}>
+            {view === "connections"
+              ? t("offline.components.title")
+              : t("offline.components.repairEntry")}
+          </h3>
           <Tooltip
             content={`${t("offline.components.body")}\n\n${t("offline.components.skipNote")}`}
             side="bottom"
@@ -247,7 +268,8 @@ export function OfflineComponentsSheet({
           {t("offline.components.body")} {t("offline.components.skipNote")}
         </span>
 
-        <div className="component-service-list">
+        {view === "connections" ? (
+          <div className="component-service-list">
           <section className="component-service">
             <div className="component-service-toggle">
               <input
@@ -294,6 +316,99 @@ export function OfflineComponentsSheet({
               </div>
             ) : null}
           </section>
+          <section className="component-service">
+            <div className="component-service-toggle">
+              <input
+                id="component-media-generation-enabled"
+                type="checkbox"
+                checked={enabled["media-generation"]}
+                onChange={() => toggleService("media-generation")}
+                disabled={busy !== null}
+              />
+              <label className="component-service-toggle-label" htmlFor="component-media-generation-enabled" aria-label={t("offline.components.mediaGeneration")}>
+                <span><strong>{t("offline.components.mediaGeneration")}</strong></span>
+              </label>
+              <Tooltip content={t("offline.components.mediaGenerationDesc")}>
+                <span className="tooltip-icon" aria-label={t("themes.details")}><Icon name="info" /></span>
+              </Tooltip>
+            </div>
+            {enabled["media-generation"] ? (
+              <>
+                <p className="component-note component-service-description">
+                  {t("offline.components.mediaGenerationIntro")}
+                </p>
+                <div className="component-fields">
+                  {field("mediaGenerationApiBaseUrl", t("offline.components.mediaBaseUrl"))}
+                  {field("mediaGenerationApiKey", t("offline.components.mediaApiKey"), true)}
+
+                  <div className="component-field-group">
+                    <strong>{t("offline.components.mediaModelsTitle")}</strong>
+                    <small>{t("offline.components.mediaModelsHint")}</small>
+                    {field("image2Model", t("offline.components.image2Model"), false, t("offline.components.modelIdPlaceholder"))}
+                    {field("grokImageModel", t("offline.components.grokImageModel"), false, t("offline.components.modelIdPlaceholder"))}
+                    {field("grokVideoModel", t("offline.components.grokVideoModel"), false, t("offline.components.modelIdPlaceholder"))}
+                    {field("seedanceModel", t("offline.components.seedanceModel"), false, t("offline.components.modelIdPlaceholder"))}
+                    <div className="component-provider-status" role="status">
+                      <strong>{t("offline.components.minimaxUnavailableTitle")}</strong>
+                      <span>{t("offline.components.minimaxUnavailableBody")}</span>
+                    </div>
+                  </div>
+
+                  <details className="component-advanced" ref={mediaAdvancedRef}>
+                    <summary>{t("offline.components.mediaAdvanced")}</summary>
+                    <div className="component-advanced-fields">
+                      <label className="component-field">
+                        <span>{t("offline.components.apiProfile")}</span>
+                        <select
+                          className="input"
+                          value={form.mediaGenerationApiProfile}
+                          onChange={(event) => update("mediaGenerationApiProfile", event.target.value)}
+                          disabled={busy !== null}
+                        >
+                          <option value="auto">{t("offline.components.profileAuto")}</option>
+                          <option value="legacy">{t("offline.components.profileLegacy")}</option>
+                          <option value="wokey">{t("offline.components.profileWokey")}</option>
+                        </select>
+                      </label>
+                      {mediaNeedsRouteId ? (
+                        <>
+                          {field("mediaGenerationAgentId", t("offline.components.routeId"))}
+                          <small>{t("offline.components.mediaRouteHint")}</small>
+                        </>
+                      ) : null}
+                    </div>
+                  </details>
+                </div>
+              </>
+            ) : null}
+          </section>
+
+          <section className="component-service">
+            <div className="component-service-toggle">
+              <span className="component-service-toggle-label"><strong>{t("offline.components.remoteMcpTitle")}</strong></span>
+              <Tooltip content={t("offline.components.remoteMcpDesc")}>
+                <span className="tooltip-icon" aria-label={t("themes.details")}><Icon name="info" /></span>
+              </Tooltip>
+            </div>
+            {REMOTE_MCP_KEYS.map((server) => (
+              <div className="component-service-toggle" key={server}>
+                <input
+                  id={`component-mcp-${server}-enabled`}
+                  type="checkbox"
+                  checked={enabled[server]}
+                  onChange={() => toggleService(server)}
+                  disabled={busy !== null}
+                />
+                <label
+                  className="component-service-toggle-label"
+                  htmlFor={`component-mcp-${server}-enabled`}
+                  aria-label={t(REMOTE_MCP_LABELS[server])}
+                >
+                  <span><strong>{t(REMOTE_MCP_LABELS[server])}</strong></span>
+                </label>
+              </div>
+            ))}
+          </section>
 
           <section className="component-service">
             <div className="component-service-toggle">
@@ -328,77 +443,26 @@ export function OfflineComponentsSheet({
             ) : null}
           </section>
 
-          <section className="component-service">
-            <div className="component-service-toggle">
-              <input
-                id="component-image-enabled"
-                type="checkbox"
-                checked={enabled["image-2"]}
-                onChange={() => toggleService("image-2")}
-                disabled={busy !== null}
-              />
-              <label
-                className="component-service-toggle-label"
-                htmlFor="component-image-enabled"
-                aria-label={t("offline.components.image")}
-              >
-                <span>
-                  <strong>{t("offline.components.image")}</strong>
-                </span>
-              </label>
-              <Tooltip content={t("offline.components.imageDesc")}>
-                <span className="tooltip-icon" aria-label={t("themes.details")}>
-                  <Icon name="info" />
-                </span>
-              </Tooltip>
-            </div>
-            {enabled["image-2"] ? (
-              <div className="component-fields">
-                {field("image2ApiKey", t("offline.components.apiKey"), true)}
-                {field("image2BaseUrl", t("offline.components.baseUrl"))}
-                {field("image2Model", t("offline.components.model"))}
-                {field("image2AgentId", t("offline.components.routeId"))}
+          </div>
+        ) : (
+          <div className="component-maintenance-panel">
+            <p className="component-note">{t("offline.components.maintenanceBody")}</p>
+            <div className="component-separate-action">
+              <div>
+                <strong>{t("offline.components.ccswitchTitle")}</strong>
+                <Tooltip content={t("offline.components.ccswitchDesc")}>
+                  <span className="tooltip-icon" aria-label={t("themes.details")}>
+                    <Icon name="info" />
+                  </span>
+                </Tooltip>
               </div>
-            ) : null}
-          </section>
-
-          <section className="component-service">
-            <div className="component-service-toggle">
-              <input
-                id="component-seedance-enabled"
-                type="checkbox"
-                checked={enabled.seedance}
-                onChange={() => toggleService("seedance")}
-                disabled={busy !== null}
-              />
-              <label
-                className="component-service-toggle-label"
-                htmlFor="component-seedance-enabled"
-                aria-label={t("offline.components.seedance")}
-              >
-                <span>
-                  <strong>{t("offline.components.seedance")}</strong>
-                </span>
-              </label>
-              <Tooltip content={t("offline.components.seedanceDesc")}>
-                <span className="tooltip-icon" aria-label={t("themes.details")}>
-                  <Icon name="info" />
-                </span>
-              </Tooltip>
+              <button className="btn ghost" onClick={() => void retryCcswitch()} disabled={busy !== null}>
+                {busy === "ccswitch" ? <Icon name="loader" className="spinicon" /> : <Icon name="gear" />}
+                {busy === "ccswitch" ? t("offline.ccswitchLaunching") : t("offline.components.ccswitchRetry")}
+              </button>
             </div>
-            {enabled.seedance ? (
-              <div className="component-fields">
-                {field("seedanceApiKey", t("offline.components.apiKey"), true)}
-                {field("seedanceBaseUrl", t("offline.components.baseUrl"))}
-                {field("seedanceModel", t("offline.components.model"))}
-                {field("seedanceAgentId", t("offline.components.routeId"))}
-                {field("seedancePrechargePoints", t("offline.components.precharge"))}
-                {field("seedanceOfficialLinkTtlHours", t("offline.components.ttl"))}
-                {field("seedanceRefundRule", t("offline.components.refund"))}
-              </div>
-            ) : null}
-          </section>
-        </div>
+          </div>
+        )}
 
         {packReport ? (
           <div className={`component-result${packReport.coreReady ? " success" : ""}`}>
@@ -434,21 +498,6 @@ export function OfflineComponentsSheet({
         ) : null}
         {error ? <div className="component-error">{error}</div> : null}
 
-        <div className="component-separate-action">
-          <div>
-            <strong>{t("offline.components.ccswitchTitle")}</strong>
-            <Tooltip content={t("offline.components.ccswitchDesc")}>
-              <span className="tooltip-icon" aria-label={t("themes.details")}>
-                <Icon name="info" />
-              </span>
-            </Tooltip>
-          </div>
-          <button className="btn ghost" onClick={() => void retryCcswitch()} disabled={busy !== null}>
-            {busy === "ccswitch" ? <Icon name="loader" className="spinicon" /> : <Icon name="gear" />}
-            {busy === "ccswitch" ? t("offline.ccswitchLaunching") : t("offline.components.ccswitchRetry")}
-          </button>
-        </div>
-
         <div className="row2 sheet-actions">
           <button className="btn ghost" onClick={onDismiss} disabled={busy !== null}>
             {t("offline.components.skip")}
@@ -459,7 +508,11 @@ export function OfflineComponentsSheet({
             disabled={busy !== null || statusLoading}
           >
             {busy === "pack" ? <Icon name="loader" className="spinicon" /> : <Icon name="download" />}
-            {busy === "pack" ? t("offline.components.installing") : t("offline.components.install")}
+            {busy === "pack"
+              ? t("offline.components.installing")
+              : view === "connections"
+                ? t("offline.components.apply")
+                : t("offline.components.install")}
           </button>
         </div>
       </div>

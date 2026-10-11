@@ -3,7 +3,10 @@ use std::fs::{self, File};
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 
-use codex_usb_license::{anchor_sha256, bundle_anchor_schema, validate_key_id, ANCHOR_SCHEMA_V3};
+use codex_usb_license::{
+    anchor_sha256, bundle_anchor_schema, validate_key_id, ANCHOR_SCHEMA_V3,
+    REVOCATION_REGISTRATION_FILE_NAME,
+};
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 use serde::Serialize;
@@ -42,6 +45,7 @@ pub enum AuthenticodeMode {
 #[serde(rename_all = "camelCase")]
 pub struct BundleSummary {
     pub bundle_path: String,
+    pub manifest_schema_version: u32,
     pub anchor_schema: u32,
     pub anchor_sha256: String,
     pub payload_path: String,
@@ -97,6 +101,7 @@ pub fn verify_bundle(
     let usb_manifest = read_json(&usb_manifest_path)?;
     validate_root_manifest(&manifest)?;
     validate_usb_manifest(&usb_manifest)?;
+    let manifest_schema = require_matching_document_schemas(&manifest, &usb_manifest)?;
     let root_anchor = required_u64(&manifest, "/updateCapability/anchorSchema")?;
     let usb_anchor = required_u64(&usb_manifest, "/updateCapability/anchorSchema")?;
     if root_anchor != ANCHOR_SCHEMA_V3 as u64 || usb_anchor != ANCHOR_SCHEMA_V3 as u64 {
@@ -192,6 +197,7 @@ pub fn verify_bundle(
     let anchor = anchor_sha256(&root)?;
     Ok(BundleSummary {
         bundle_path: root.display().to_string(),
+        manifest_schema_version: manifest_schema as u32,
         anchor_schema,
         anchor_sha256: anchor,
         payload_path: payload_relative,
@@ -241,7 +247,8 @@ fn parse_signing_binding(manifest: &Value) -> Result<SigningBinding, SignerError
 }
 
 fn validate_root_manifest(manifest: &Value) -> Result<(), SignerError> {
-    require_u64_equals(manifest, "/schemaVersion", 2)?;
+    let schema = require_supported_manifest_schema(manifest, "root manifest")?;
+    validate_registration_policy(manifest, schema)?;
     require_string_equals(manifest, "/packageName", "OpenAI.Codex")?;
     let architecture = required_string(manifest, "/architecture")?;
     if !matches!(architecture, "x64" | "arm64") {
@@ -268,7 +275,7 @@ fn validate_root_manifest(manifest: &Value) -> Result<(), SignerError> {
 }
 
 fn validate_usb_manifest(manifest: &Value) -> Result<(), SignerError> {
-    require_u64_equals(manifest, "/schemaVersion", 2)?;
+    require_supported_manifest_schema(manifest, "USB manifest")?;
     require_string_equals(manifest, "/product", "codex-usb-oneclick")?;
     require_string_equals(manifest, "/status", "oneclick")?;
     require_bool_equals(manifest, "/secretsIncluded", false)?;
@@ -419,6 +426,40 @@ fn validate_usb_manifest(manifest: &Value) -> Result<(), SignerError> {
     )?;
     require_bool_equals(manifest, "/sourceMediaCleanup/usesRecycleBin", false)?;
     Ok(())
+}
+
+fn require_supported_manifest_schema(manifest: &Value, label: &str) -> Result<u64, SignerError> {
+    let schema = required_u64(manifest, "/schemaVersion")?;
+    if !matches!(schema, 2 | 3) {
+        return Err(SignerError::bundle(format!(
+            "{label} document schema is unsupported: {schema}"
+        )));
+    }
+    Ok(schema)
+}
+
+fn validate_registration_policy(manifest: &Value, schema: u64) -> Result<(), SignerError> {
+    if schema == 3 {
+        require_bool_equals(manifest, "/revocationPolicy/registrationRequired", true).map_err(
+            |_| {
+                SignerError::bundle(
+                    "schemaVersion=3 root manifest must require revocation registration",
+                )
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn require_matching_document_schemas(root: &Value, usb: &Value) -> Result<u64, SignerError> {
+    let root_schema = require_supported_manifest_schema(root, "root manifest")?;
+    let usb_schema = require_supported_manifest_schema(usb, "USB manifest")?;
+    if root_schema != usb_schema {
+        return Err(SignerError::bundle(
+            "root and USB manifest document schemas do not match",
+        ));
+    }
+    Ok(root_schema)
 }
 
 fn validate_update_capability(value: &Value, label: &str) -> Result<(), SignerError> {
@@ -809,6 +850,13 @@ fn verify_sha256_sums(root: &Path, sums_path: &Path) -> Result<HashMap<String, u
                 "root usb-license.json must remain outside SHA256SUMS.txt",
             ));
         }
+        if relative.eq_ignore_ascii_case(REVOCATION_REGISTRATION_FILE_NAME)
+            || is_revocation_state_path(&relative)
+        {
+            return Err(SignerError::bundle(
+                "registration and revocation runtime files must remain outside SHA256SUMS.txt",
+            ));
+        }
         if listed
             .insert(relative.clone(), expected.to_ascii_lowercase())
             .is_some()
@@ -860,6 +908,42 @@ fn reject_unlisted_files(root: &Path, listed: &HashMap<String, u64>) -> Result<(
                 }
                 continue;
             }
+            if name.eq_ignore_ascii_case(REVOCATION_REGISTRATION_FILE_NAME) {
+                if !relative.eq_ignore_ascii_case(REVOCATION_REGISTRATION_FILE_NAME) {
+                    return Err(SignerError::bundle(format!(
+                        "nested registration declaration is forbidden: {relative}"
+                    )));
+                }
+                let metadata = fs::symlink_metadata(&path).map_err(|error| {
+                    SignerError::io("reading registration file attributes", &path, error)
+                })?;
+                if !metadata.is_file() {
+                    return Err(SignerError::bundle(
+                        "root registration declaration must be a regular file",
+                    ));
+                }
+                continue;
+            }
+            if is_revocation_state_path(&relative) {
+                let metadata = fs::symlink_metadata(&path).map_err(|error| {
+                    SignerError::io("reading revocation state attributes", &path, error)
+                })?;
+                if !metadata.is_file() {
+                    return Err(SignerError::bundle(
+                        "revocation runtime metadata must be a regular file",
+                    ));
+                }
+                continue;
+            }
+            if name.eq_ignore_ascii_case("revocation.json")
+                || name
+                    .to_ascii_lowercase()
+                    .starts_with("revocation.json.tmp-")
+            {
+                return Err(SignerError::bundle(format!(
+                    "revocation state file is outside its exact runtime location: {relative}"
+                )));
+            }
             if name.eq_ignore_ascii_case("sha256sums.txt") && relative != "sha256sums.txt" {
                 return Err(SignerError::bundle(format!(
                     "nested SHA256SUMS.txt is forbidden: {relative}"
@@ -910,6 +994,26 @@ fn reject_unlisted_files(root: &Path, listed: &HashMap<String, u64>) -> Result<(
         ));
     }
     Ok(())
+}
+
+fn is_revocation_state_path(relative: &str) -> bool {
+    let lower = relative.to_ascii_lowercase();
+    lower == "codexusbstate/revocation.json" || is_revocation_state_tmp_path(&lower)
+}
+
+fn is_revocation_state_tmp_path(relative_lowercase: &str) -> bool {
+    let Some(name) = relative_lowercase.strip_prefix("codexusbstate/revocation.json.tmp-") else {
+        return false;
+    };
+    let mut parts = name.split('-');
+    let (Some(pid), Some(counter), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    pid.parse::<u32>()
+        .is_ok_and(|value| value > 0 && value.to_string() == pid)
+        && counter
+            .parse::<u64>()
+            .is_ok_and(|value| value > 0 && value.to_string() == counter)
 }
 
 fn has_transaction_residue(relative: &str) -> bool {
@@ -1145,6 +1249,86 @@ mod tests {
         let result = verify_sha256_sums(&root, &root.join("SHA256SUMS.txt"));
         assert!(result.is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn schema_three_registration_policy_is_mandatory_and_schema_two_stays_compatible() {
+        assert!(validate_registration_policy(&json!({}), 2).is_ok());
+        assert!(validate_registration_policy(
+            &json!({"revocationPolicy":{"registrationRequired":true}}),
+            3
+        )
+        .is_ok());
+        assert!(validate_registration_policy(&json!({}), 3).is_err());
+        assert!(validate_registration_policy(
+            &json!({"revocationPolicy":{"registrationRequired":false}}),
+            3
+        )
+        .is_err());
+        assert!(validate_registration_policy(
+            &json!({"revocationPolicy":{"registrationRequired":"true"}}),
+            3
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn manifest_document_schema_mismatch_fails_closed() {
+        assert_eq!(
+            require_matching_document_schemas(
+                &json!({"schemaVersion":3}),
+                &json!({"schemaVersion":3})
+            )
+            .unwrap(),
+            3
+        );
+        assert!(require_matching_document_schemas(
+            &json!({"schemaVersion":3}),
+            &json!({"schemaVersion":2})
+        )
+        .is_err());
+        assert!(require_matching_document_schemas(
+            &json!({"schemaVersion":4}),
+            &json!({"schemaVersion":4})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn only_exact_runtime_registration_and_state_files_are_allowed_unlisted() {
+        let root = test_root("runtime-files");
+        let state = root.join("CodexUsbState");
+        fs::create_dir_all(&state).unwrap();
+        fs::write(root.join(REVOCATION_REGISTRATION_FILE_NAME), b"envelope").unwrap();
+        fs::write(state.join("revocation.json"), b"state").unwrap();
+        fs::write(
+            state.join("revocation.json.tmp-123-4"),
+            b"interrupted write",
+        )
+        .unwrap();
+        assert!(reject_unlisted_files(&root, &HashMap::new()).is_ok());
+        fs::remove_dir_all(&root).unwrap();
+
+        let root = test_root("nested-registration");
+        let nested = root.join("content");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join(REVOCATION_REGISTRATION_FILE_NAME), b"nested").unwrap();
+        assert!(reject_unlisted_files(&root, &HashMap::new()).is_err());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn revocation_state_temp_path_requires_canonical_decimal_pid_and_counter() {
+        assert!(is_revocation_state_path(
+            "codexusbstate/revocation.json.tmp-123-4"
+        ));
+        assert!(!is_revocation_state_path(
+            "codexusbstate/revocation.json.tmp-000123-4"
+        ));
+        assert!(!is_revocation_state_path(
+            "codexusbstate/revocation.json.tmp-123-four"
+        ));
+        assert!(!is_revocation_state_path("other/revocation.json.tmp-123-4"));
     }
 
     #[test]

@@ -5,8 +5,10 @@ param(
     [string]$FeishuDomain = 'https://open.feishu.cn',
     [string[]]$EnableSkills = @(),
     [string[]]$EnabledApiServices = @(),
+    [string[]]$EnabledRemoteMcps = @(),
     [switch]$EnableFeishu,
-    [switch]$DisableFeishu
+    [switch]$DisableFeishu,
+    [switch]$EnableMediaGeneration
 )
 
 $ErrorActionPreference = 'Stop'
@@ -33,6 +35,7 @@ if (-not [string]::IsNullOrWhiteSpace($TargetUserProfile)) {
 }
 if ($EnableFeishu) { $arguments += '-EnableFeishu' }
 if ($DisableFeishu) { $arguments += '-DisableFeishu' }
+if ($EnableMediaGeneration) { $arguments += '-EnableMediaGeneration' }
 $arguments += @('-FeishuAuthMode', $FeishuAuthMode, '-FeishuDomain', $FeishuDomain)
 if (@($EnableSkills).Count -gt 0) {
     $arguments += '-EnableSkills'
@@ -41,6 +44,10 @@ if (@($EnableSkills).Count -gt 0) {
 if (@($EnabledApiServices).Count -gt 0) {
     $arguments += '-EnabledApiServices'
     $arguments += @($EnabledApiServices)
+}
+if (@($EnabledRemoteMcps).Count -gt 0) {
+    $arguments += '-EnabledRemoteMcps'
+    $arguments += @($EnabledRemoteMcps)
 }
 
 $powershell = (Get-Command powershell.exe -ErrorAction Stop).Source

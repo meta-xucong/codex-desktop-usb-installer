@@ -3,6 +3,11 @@ name: powerpoint-pptx
 description: Create, edit, and automate PowerPoint presentations with python-pptx for slides, layouts, charts, and batch processing.
 ---
 
+## 版式和演示完整性
+
+制作演示文稿时采用清晰的叙事顺序、统一的主题字体与颜色、可读的字号和足够留白。对用户提供的母版、品牌规范和示例优先沿用。不要只把长文切成每页相同的项目符号；针对标题页、章节页、图表页、结论页选合适布局。交付前检查文字溢出、元素重叠、图表标签、页码和色彩对比；若无法进行视觉渲染检查，应明确说明。
+
+
 ## When to Use
 
 User needs to create or modify PowerPoint (.pptx) files programmatically. Agent handles slide creation, content population, chart generation, and template automation.

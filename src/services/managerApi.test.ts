@@ -689,6 +689,48 @@ describe("advanced gateway diagnostic API", () => {
     await managerApi.cancelGatewayModelProbe("fixture-run");
     expect(invokeMock).toHaveBeenCalledWith("cancel_gateway_model_probe", { requestId: "fixture-run" });
   });
+  it("passes the quick-test model ID without cost-matrix consent", async () => {
+    vi.stubGlobal("window", { __TAURI_INTERNALS__: {} });
+    invokeMock.mockResolvedValue({
+      status: "passed", connectionFingerprint: "binding-fixture",
+      connectivityModelId: "vendor/model-latest", connectivityProofId: "proof-fixture",
+      connectivityProofExpiresAt: 2_000_000_000,
+    });
+    await managerApi.gatewayModelProbe({
+      requestId: "quick-test-fixture",
+      selectedModelIds: [],
+      costConsent: false,
+      connectivityModelId: "vendor/model-latest",
+    });
+    expect(invokeMock).toHaveBeenCalledWith("gateway_model_probe", {
+      request: {
+        requestId: "quick-test-fixture",
+        selectedModelIds: [],
+        costConsent: false,
+        connectivityModelId: "vendor/model-latest",
+      },
+    });
+  });
+  it("maps catalog actions to the one manager command", async () => {
+    vi.stubGlobal("window", { __TAURI_INTERNALS__: {} });
+    invokeMock.mockResolvedValue({ status: "ok", modelIds: ["vendor/model-latest"], restartRequired: true, message: "done" });
+    const request = {
+      operation: "add" as const,
+      requestId: "add-fixture",
+      modelId: "vendor/model-latest",
+      connectivityProofId: "proof-fixture",
+    };
+    await managerApi.manageNativeModelCatalog(request);
+    expect(invokeMock).toHaveBeenCalledWith("manage_native_model_catalog", { request });
+    await managerApi.manageNativeModelCatalog({ operation: "state" });
+    await managerApi.manageNativeModelCatalog({ operation: "reset" });
+    expect(invokeMock).toHaveBeenNthCalledWith(2, "manage_native_model_catalog", {
+      request: { operation: "state" },
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(3, "manage_native_model_catalog", {
+      request: { operation: "reset" },
+    });
+  });
   it("browser preview cannot probe or issue model requests", async () => {
     const report = await managerApi.gatewayModelProbe({
       requestId: "fixture-browser", selectedModelIds: [], costConsent: false,

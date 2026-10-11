@@ -1,3 +1,7 @@
+# SUPERSEDED — Automatic catalog synchronization is retired
+
+The former behavior that synchronized the full upstream `/v1/models` list into Codex automatically is superseded by [`CODEX-SELECTIVE-UPSTREAM-MODEL-MANAGEMENT-DEVELOPMENT.md`](CODEX-SELECTIVE-UPSTREAM-MODEL-MANAGEMENT-DEVELOPMENT.md). Do not implement or restore automatic catalog activation from this document. Its evidence about Codex's `model_catalog_json` schema, ownership checks, and safe file handling remains useful reference material.
+
 # Codex 原生模型目录接入统一网关开发文档
 
 **文档版本：** 1.2  

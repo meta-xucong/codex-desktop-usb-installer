@@ -102,4 +102,22 @@ export default tseslint.config(
       globals: { ...globals.browser, ...globals.node },
     },
   },
+  {
+    // This small browser script is embedded by Go's //go:embed directive and
+    // served by the VPS license admin console. Keep it in the repository lint
+    // gate with the correct browser globals and deliberate discard convention.
+    files: ["server/usb-license-revocation/internal/revocation/adminweb/**/*.js"],
+    languageOptions: { globals: { ...globals.browser } },
+    rules: {
+      "@typescript-eslint/no-unused-vars": [
+        "error",
+        {
+          argsIgnorePattern: "^_",
+          varsIgnorePattern: "^_",
+          caughtErrors: "all",
+          caughtErrorsIgnorePattern: "^_",
+        },
+      ],
+    },
+  },
 );

@@ -16,6 +16,7 @@ pub use activation::{NativeRuntimeTarget, NativeVerificationOptions};
 use serde_json::{json, Value};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::future::Future;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -27,21 +28,29 @@ use std::{env, fs};
 
 const CATALOG_FILE_NAME: &str = "codex-usb-native-model-catalog.json";
 const SIDECAR_FILE_NAME: &str = "codex-usb-model-capabilities.json";
+const CONFIG_FILE_NAME: &str = "config.toml";
 const RELOAD_MARKER_FILE_NAME: &str = "codex-usb-native-model-catalog.reload";
 const CATALOG_IDENTITY: &str = "404token-unified-api-internal";
 const CATALOG_CLIENT_VERSION: &str = "codex-usb-gateway-2";
-const CATALOG_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const CONFIG_BEGIN: &str = "# BEGIN CODEX-USB-NATIVE-MODEL-CATALOG v1";
 const CONFIG_END: &str = "# END CODEX-USB-NATIVE-MODEL-CATALOG v1";
-const GENERIC_BASE_INSTRUCTIONS: &str = "You are Codex, a coding assistant.";
 static REFRESH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-static FILE_LOCK: Mutex<()> = Mutex::new(());
+static CATALOG_MUTATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub(crate) static FILE_LOCK: Mutex<()> = Mutex::new(());
 const RUN_HISTORY_LIMIT: usize = 256;
 static RUNS: Mutex<RunRegistry> = Mutex::new(RunRegistry {
     active: None,
     cancelled_before_start: BTreeSet::new(),
     finished: VecDeque::new(),
 });
+
+async fn with_catalog_mutation_lock<T>(
+    lock: &tokio::sync::Mutex<()>,
+    operation: impl Future<Output = T>,
+) -> T {
+    let _guard = lock.lock().await;
+    operation.await
+}
 
 struct RegisteredRun {
     id: String,
@@ -746,6 +755,31 @@ pub struct NativeModelCatalogReport {
     pub service_revision: Option<String>,
     pub models: Vec<ModelCapabilityReport>,
 }
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativeModelCatalogActionRequest {
+    pub operation: String,
+    #[serde(default)]
+    pub request_id: Option<String>,
+    #[serde(default)]
+    pub model_id: Option<String>,
+    #[serde(default)]
+    pub connectivity_proof_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeModelCatalogActionReport {
+    pub status: String,
+    pub model_ids: Vec<String>,
+    pub restart_required: bool,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connection_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_fingerprint: Option<String>,
+}
 fn report(run_id: &str, status: &str, message: &str) -> NativeModelCatalogReport {
     NativeModelCatalogReport {
         status: status.into(),
@@ -830,14 +864,16 @@ fn codex_home_dir() -> Option<PathBuf> {
 
 fn config_path() -> Result<PathBuf, AppError> {
     codex_home_dir()
-        .map(|home| home.join("config.toml"))
+        .map(|home| config_path_for(&home))
         .ok_or_else(|| engine("无法确定 Codex 配置目录，模型目录未刷新"))
 }
 
-fn catalog_path() -> Result<PathBuf, AppError> {
-    codex_home_dir()
-        .map(|home| home.join(CATALOG_FILE_NAME))
-        .ok_or_else(|| engine("无法确定 Codex 用户目录，模型目录未刷新"))
+fn config_path_for(home: &Path) -> PathBuf {
+    home.join(CONFIG_FILE_NAME)
+}
+
+fn catalog_path_for(home: &Path) -> PathBuf {
+    home.join(CATALOG_FILE_NAME)
 }
 
 fn reload_marker_path() -> Result<PathBuf, AppError> {
@@ -990,163 +1026,19 @@ fn normalize_models(models: Vec<GatewayModel>) -> Vec<NormalizedModel> {
         .collect()
 }
 
-fn catalog_is_fresh(path: &Path) -> bool {
-    let fetched_at = read_optional(path)
-        .ok()
-        .flatten()
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .and_then(|value| {
-            value
-                .get("fetched_at")
-                .and_then(Value::as_str)
-                .and_then(|value| value.strip_prefix("unix:"))
-                .and_then(|value| value.parse::<u64>().ok())
-        });
-    if let Some(fetched_at) = fetched_at {
-        let now = unix_seconds();
-        return now
-            .checked_sub(fetched_at)
-            .is_some_and(|age| age <= CATALOG_TTL.as_secs());
-    }
-    fs::metadata(path)
-        .and_then(|metadata| metadata.modified())
-        .ok()
-        .and_then(|modified| modified.elapsed().ok())
-        .is_some_and(|age| age <= CATALOG_TTL)
-}
-
-fn existing_catalog_count(path: &Path) -> usize {
-    read_optional(path)
-        .ok()
-        .flatten()
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .and_then(|value| {
-            (value.get("identity").and_then(Value::as_str) == Some(CATALOG_IDENTITY))
-                .then(|| value.get("models").and_then(Value::as_array).cloned())
-                .flatten()
-        })
-        .map_or(0, |models| models.len())
-}
-
-fn existing_catalog_image_metadata_is_current(path: &Path) -> bool {
-    read_optional(path)
-        .ok()
-        .flatten()
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .filter(|value| {
-            value.get("identity").and_then(Value::as_str) == Some(CATALOG_IDENTITY)
-                && value.get("client_version").and_then(Value::as_str)
-                    == Some(CATALOG_CLIENT_VERSION)
-        })
-        .and_then(|value| value.get("models").and_then(Value::as_array).cloned())
-        .is_some_and(|models| {
-            !models.is_empty()
-                && models.iter().all(|model| {
-                    model
-                        .get("input_modalities")
-                        .and_then(Value::as_array)
-                        .is_some_and(|modalities| {
-                            modalities.iter().any(|modality| modality.as_str() == Some("image"))
-                        })
-                })
-        })
-}
-
-/// Upgrade manager-owned catalogs from the text-only capability default.
-/// This is a local metadata migration: it does not contact the gateway or
-/// claim that every upstream model has been independently vision-tested.
-fn migrate_existing_catalog_image_input(path: &Path) -> Result<bool, AppError> {
-    let Some(bytes) = read_optional(path)? else {
-        return Ok(false);
-    };
-    let Ok(mut catalog) = serde_json::from_slice::<Value>(&bytes) else {
-        return Ok(false);
-    };
-    if catalog.get("identity").and_then(Value::as_str) != Some(CATALOG_IDENTITY) {
-        return Ok(false);
-    }
-    let Some(models) = catalog.get_mut("models").and_then(Value::as_array_mut) else {
-        return Ok(false);
-    };
-    if models.is_empty() || models.iter().any(|model| !model.is_object()) {
-        return Ok(false);
-    }
-
-    let mut changed = false;
-    for model in models {
-        let Some(object) = model.as_object_mut() else {
-            return Ok(false);
-        };
-        let mut modalities = object
-            .get("input_modalities")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        if !modalities
-            .iter()
-            .any(|modality| modality.as_str() == Some("text"))
-        {
-            modalities.push(json!("text"));
-        }
-        if !modalities
-            .iter()
-            .any(|modality| modality.as_str() == Some("image"))
-        {
-            modalities.push(json!("image"));
-        }
-        let modalities = Value::Array(modalities);
-        if object.get("input_modalities") != Some(&modalities) {
-            object.insert("input_modalities".into(), modalities);
-            changed = true;
-        }
-    }
-
-    if catalog.get("client_version").and_then(Value::as_str) != Some(CATALOG_CLIENT_VERSION) {
-        let Some(object) = catalog.as_object_mut() else {
-            return Ok(false);
-        };
-        object.insert("client_version".into(), json!(CATALOG_CLIENT_VERSION));
-        changed = true;
-    }
-    if !changed {
-        return Ok(false);
-    }
-
-    let migrated =
-        serde_json::to_vec_pretty(&catalog).map_err(|_| engine("模型目录迁移序列化失败"))?;
-    if migrated.len() > BODY_LIMIT {
-        return Err(engine("模型目录迁移后超过本地大小限制"));
-    }
-    let _files = FILE_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    if read_optional(path)?.as_deref() != Some(bytes.as_slice()) {
-        return Err(engine("模型目录已被其他进程修改，未覆盖旧内容"));
-    }
-    atomic_file::write_atomic(path, &migrated)
-        .map_err(|error| engine(format!("迁移旧模型目录图像输入标记失败：{error}")))?;
-    Ok(true)
-}
-
-fn native_model_entry(model: &NormalizedModel, priority: usize) -> Value {
-    let display_name = match model.owned_by.as_deref() {
-        Some(owner) => format!("{owner} / {}", model.canonical_id),
-        None => model.canonical_id.clone(),
-    };
+fn conservative_tested_model_entry(model_id: &str, owner: Option<&str>, priority: usize) -> Value {
+    let display_name = owner
+        .map(|owner| format!("{owner} / {model_id}"))
+        .unwrap_or_else(|| model_id.to_owned());
     json!({
-        "slug": model.raw_id,
+        "slug": model_id,
         "display_name": display_name,
-        "description": "Model supplied by the configured unified gateway.",
-        "default_reasoning_level": "medium",
-        "supported_reasoning_levels": [
-            { "effort": "low", "description": "Fast responses with lighter reasoning" },
-            { "effort": "medium", "description": "Balanced gateway reasoning" },
-            { "effort": "high", "description": "Greater reasoning depth for complex tasks" },
-            { "effort": "xhigh", "description": "Extra high reasoning depth for difficult tasks" },
-            { "effort": "max", "description": "Maximum reasoning depth" }
-        ],
+        "description": "Text model supplied by the configured gateway; only one text response was verified.",
         "shell_type": "unified_exec",
         "visibility": "list",
         "supported_in_api": true,
         "priority": priority,
+        "support_verbosity": false,
         "additional_speed_tiers": [],
         "service_tiers": [],
         "availability_nux": null,
@@ -1154,52 +1046,530 @@ fn native_model_entry(model: &NormalizedModel, priority: usize) -> Value {
         "include_skills_usage_instructions": false,
         "include_plugin_usage_instructions": false,
         "include_apps_usage_instructions": false,
-        "default_reasoning_summary": "none",
-        "support_verbosity": true,
-        "default_verbosity": "low",
-        "apply_patch_tool_type": "freeform",
-        "web_search_tool_type": "text_and_image",
-        "truncation_policy": { "mode": "tokens", "limit": 10000 },
+        "default_reasoning_summary": null,
+        "default_verbosity": null,
+        "apply_patch_tool_type": null,
+        "web_search_tool_type": null,
+        "truncation_policy": null,
         "supports_image_detail_original": false,
-        "context_window": 128000,
-        "max_context_window": 128000,
-        "comp_hash": "gateway",
-        "effective_context_window_percent": 95,
+        "comp_hash": null,
+        "effective_context_window_percent": null,
         "experimental_supported_tools": [],
-        "input_modalities": ["text", "image"],
+        "input_modalities": ["text"],
         "supports_search_tool": false,
-        "use_responses_lite": true,
         "node_repl_auto_review_required": false,
-        "node_repl_disabled": false,
-        "tool_mode": "code_mode_only",
-        "multi_agent_version": "v1",
-        "base_instructions": GENERIC_BASE_INSTRUCTIONS
+        "node_repl_disabled": true,
+        "default_reasoning_level": null,
+        "supported_reasoning_levels": []
     })
 }
 
-fn native_catalog(models: &[NormalizedModel]) -> Value {
+fn expected_catalog_reference(config: &Path) -> Result<String, AppError> {
+    let catalog = config
+        .parent()
+        .ok_or_else(|| engine("模型配置没有父目录"))?
+        .join(CATALOG_FILE_NAME);
+    Ok(format!(
+        "model_catalog_json = \"{}\"",
+        toml_string(&catalog)
+    ))
+}
+
+fn validate_managed_catalog_reference(text: &str, config: &Path) -> Result<bool, AppError> {
+    let expected = expected_catalog_reference(config)?;
+    let mut managed = false;
+    let mut seen = false;
+    let mut count = 0;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed == CONFIG_BEGIN {
+            if managed || seen {
+                return Err(engine("模型目录托管块重复，保留原配置"));
+            }
+            managed = true;
+            seen = true;
+        } else if trimmed == CONFIG_END {
+            if !managed {
+                return Err(engine("模型目录托管块损坏，保留原配置"));
+            }
+            managed = false;
+        } else if managed && !trimmed.is_empty() && !trimmed.starts_with('#') {
+            if trimmed != expected {
+                return Err(engine("模型目录托管块中的路径已被修改，保留原配置"));
+            }
+            count += 1;
+        }
+    }
+    if managed {
+        return Err(engine("模型目录托管块未闭合，保留原配置"));
+    }
+    if seen && count != 1 {
+        return Err(engine("模型目录托管路径不明确，保留原配置"));
+    }
+    Ok(seen)
+}
+
+fn cleaned_config_without_external_catalog(
+    text: &str,
+    config: &Path,
+) -> Result<(String, bool), AppError> {
+    let managed = validate_managed_catalog_reference(text, config)?;
+    let cleaned = remove_managed_config(text)?;
+    let parsed: toml::Value = toml::from_str(cleaned.trim_start_matches('\u{feff}'))
+        .map_err(|_| engine("Codex 配置无法安全解析，未修改模型目录"))?;
+    if parsed.get("model_catalog_json").is_some() {
+        return Err(engine(
+            "检测到外部模型目录配置；已保留原配置，请先处理该配置后重试",
+        ));
+    }
+    Ok((cleaned, managed))
+}
+
+fn has_unmanaged_catalog_key(text: &str) -> bool {
+    toml::from_str::<toml::Value>(text.trim_start_matches('\u{feff}'))
+        .ok()
+        .is_none_or(|value| value.get("model_catalog_json").is_some())
+}
+
+fn catalog_model_ids(value: &Value) -> Result<Vec<String>, AppError> {
+    if value.get("identity").and_then(Value::as_str) != Some(CATALOG_IDENTITY) {
+        return Err(engine("模型目录文件不归本管理器所有，已保留原文件"));
+    }
+    let rows = value
+        .get("models")
+        .and_then(Value::as_array)
+        .filter(|rows| rows.len() <= 512)
+        .ok_or_else(|| engine("本地模型目录格式无效，已保留原文件"))?;
+    let mut ids = Vec::with_capacity(rows.len());
+    for row in rows {
+        let id = row
+            .get("slug")
+            .and_then(Value::as_str)
+            .filter(|id| safe_identifier(id))
+            .ok_or_else(|| engine("本地模型目录包含无效模型标识，已保留原文件"))?;
+        ids.push(id.to_owned());
+    }
+    Ok(ids)
+}
+
+fn action_report(
+    status: &str,
+    model_ids: Vec<String>,
+    message: &str,
+) -> NativeModelCatalogActionReport {
+    NativeModelCatalogActionReport {
+        status: status.to_owned(),
+        model_ids,
+        restart_required: restart_required(),
+        message: message.to_owned(),
+        connection_fingerprint: None,
+        credential_fingerprint: None,
+    }
+}
+
+fn catalog_state_for_home(home: &Path) -> Result<NativeModelCatalogActionReport, AppError> {
+    let _files = FILE_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let config = config_path_for(home);
+    let catalog = catalog_path_for(home);
+    let config_bytes = read_optional(&config)?;
+    let text = config_bytes
+        .as_deref()
+        .map(std::str::from_utf8)
+        .transpose()
+        .map_err(|_| engine("Codex 配置不是 UTF-8"))?
+        .unwrap_or("");
+    let (_, managed) = cleaned_config_without_external_catalog(text, &config)?;
+    let catalog_bytes = read_optional(&catalog)?;
+    let Some(bytes) = catalog_bytes else {
+        if managed {
+            return Err(engine("模型目录配置存在但文件缺失；请先复位模型目录"));
+        }
+        return Ok(action_report(
+            "ok",
+            Vec::new(),
+            "当前没有启用由管理器添加的上游模型",
+        ));
+    };
+    let value: Value =
+        serde_json::from_slice(&bytes).map_err(|_| engine("本地模型目录格式无效；已保留原文件"))?;
+    let ids = catalog_model_ids(&value)?;
+    if managed {
+        Ok(action_report("ok", ids, "已读取当前启用的上游模型目录"))
+    } else {
+        Ok(action_report(
+            "orphaned",
+            Vec::new(),
+            "检测到未启用的管理器目录文件；请复位后再添加模型",
+        ))
+    }
+}
+
+fn catalog_state() -> Result<NativeModelCatalogActionReport, AppError> {
+    let home = codex_home_dir().ok_or_else(|| engine("无法确定 Codex 用户目录"))?;
+    let mut report = catalog_state_for_home(&home)?;
+    if let Some(binding) = usb_guard::authorized_account_binding().ok().flatten() {
+        if let Ok(base) = provider_base(&binding.ccswitch.provider_id) {
+            report.connection_fingerprint = Some(crate::app::gateway_model_probe::binding_digest(
+                &binding, &base,
+            ));
+            report.credential_fingerprint = Some(format!(
+                "sha256:{}",
+                &digest_hex(binding.ccswitch.device_api_key.trim().as_bytes())[..12]
+            ));
+        }
+    }
+    Ok(report)
+}
+
+fn empty_native_catalog() -> Value {
     json!({
         "schema_version": 1,
         "fetched_at": format!("unix:{}", unix_seconds()),
         "client_version": CATALOG_CLIENT_VERSION,
         "identity": CATALOG_IDENTITY,
-        "models": models
-            .iter()
-            .enumerate()
-            .map(|(index, model)| native_model_entry(model, index + 1))
-            .collect::<Vec<_>>()
+        "models": []
     })
 }
 
-fn has_unmanaged_catalog_key(text: &str) -> bool {
-    text.lines().any(|line| {
-        let trimmed = line.trim_start();
-        !trimmed.starts_with('#')
-            && trimmed.starts_with("model_catalog_json")
-            && trimmed["model_catalog_json".len()..]
-                .trim_start()
-                .starts_with('=')
-    })
+pub(crate) fn add_tested_model_to_catalog(
+    request_id: &str,
+    model_id: &str,
+    owner: Option<&str>,
+    expected_binding: &codex_usb_license::UsbAccountBinding,
+    cancelled: &AtomicBool,
+) -> Result<NativeModelCatalogActionReport, AppError> {
+    let home = codex_home_dir().ok_or_else(|| engine("无法确定 Codex 用户目录"))?;
+    let expected_home = home.clone();
+    add_tested_model_files(
+        &home,
+        model_id,
+        owner,
+        cancelled,
+        || {
+            Ok(
+                usb_guard::authorized_account_binding()?.as_ref() == Some(expected_binding)
+                    && codex_home_dir().as_deref() == Some(expected_home.as_path()),
+            )
+        },
+        || crate::app::gateway_model_probe::mark_catalog_commit_started(request_id),
+        mark_restart_required,
+    )
+}
+
+fn add_tested_model_files<F, C, M>(
+    home: &Path,
+    model_id: &str,
+    owner: Option<&str>,
+    cancelled: &AtomicBool,
+    is_current: F,
+    mark_commit: C,
+    mark_restart: M,
+) -> Result<NativeModelCatalogActionReport, AppError>
+where
+    F: Fn() -> Result<bool, AppError>,
+    C: Fn(),
+    M: Fn() -> Result<(), AppError>,
+{
+    if !safe_identifier(model_id) || owner.is_some_and(|value| !safe_identifier(value)) {
+        return Err(engine("已测试模型的标识无效，未写入目录"));
+    }
+    let _files = FILE_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    if cancelled.load(AtomicOrdering::Acquire) {
+        return Err(engine("模型添加已取消；未修改 Codex 目录"));
+    }
+    if !is_current()? {
+        return Err(engine("USB 账户绑定已变化；请重新发现并测试模型"));
+    }
+    let config = config_path_for(home);
+    let catalog = catalog_path_for(home);
+    regular_or_absent(&catalog)?;
+    regular_or_absent(&config)?;
+    let catalog_backup = atomic_file::backup_path(&catalog);
+    let config_backup = atomic_file::backup_path(&config);
+    regular_or_absent(&catalog_backup)?;
+    regular_or_absent(&config_backup)?;
+    if catalog_backup.exists() && !owned_json(&catalog_backup, CATALOG_IDENTITY) {
+        return Err(engine("模型目录备份不归本管理器所有，未覆盖"));
+    }
+
+    let config_snapshot = read_optional(&config)?;
+    let config_backup_snapshot = read_optional(&config_backup)?;
+    let config_text = config_snapshot
+        .as_deref()
+        .map(std::str::from_utf8)
+        .transpose()
+        .map_err(|_| engine("Codex 配置不是 UTF-8，模型未添加"))?
+        .unwrap_or("");
+    let (cleaned_config, managed) = cleaned_config_without_external_catalog(config_text, &config)?;
+    let catalog_snapshot = read_optional(&catalog)?;
+    let mut catalog_value = match catalog_snapshot.as_deref() {
+        Some(bytes) => {
+            let value: Value = serde_json::from_slice(bytes)
+                .map_err(|_| engine("本地模型目录格式无效；请先复位模型目录"))?;
+            let _ = catalog_model_ids(&value)?;
+            if !managed {
+                return Err(engine("发现未启用的管理器目录文件；请先复位模型目录"));
+            }
+            value
+        }
+        None => empty_native_catalog(),
+    };
+    let existing_ids = catalog_model_ids(&catalog_value)?;
+    if existing_ids.iter().any(|id| id == model_id) {
+        return Ok(action_report(
+            "already_added",
+            existing_ids,
+            "该模型已在 Codex 目录中，无需重复添加",
+        ));
+    }
+    let models = catalog_value
+        .get_mut("models")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| engine("本地模型目录格式无效；请先复位模型目录"))?;
+    models.push(conservative_tested_model_entry(
+        model_id,
+        owner,
+        models.len() + 1,
+    ));
+    let resulting_ids = catalog_model_ids(&catalog_value)?;
+    let catalog_bytes =
+        serde_json::to_vec_pretty(&catalog_value).map_err(|_| engine("模型目录序列化失败"))?;
+    if catalog_bytes.len() > BODY_LIMIT {
+        return Err(engine("模型目录超过本地大小限制"));
+    }
+    let merged = if managed {
+        None
+    } else {
+        Some(merged_config(&cleaned_config, &catalog)?)
+    };
+    if !is_current()?
+        || read_optional(&config)? != config_snapshot
+        || read_optional(&config_backup)? != config_backup_snapshot
+        || read_optional(&catalog)? != catalog_snapshot
+        || cancelled.load(AtomicOrdering::Acquire)
+    {
+        return Err(engine("配置或账户在写入前已变化；未覆盖其他修改"));
+    }
+    if cancelled.load(AtomicOrdering::Acquire) {
+        return Err(engine("模型添加已取消；未修改 Codex 目录"));
+    }
+    mark_commit();
+    atomic_file::write_atomic(&catalog, &catalog_bytes)
+        .map_err(|_| engine("模型目录写入未完成；请重新读取状态后再试"))?;
+    if let Some(merged) = merged {
+        if let Err(_) = atomic_file::write_atomic_preserving_backup(&config, merged.as_bytes()) {
+            let current = read_optional(&catalog).ok().flatten();
+            let safe_to_remove = current.as_deref() == Some(catalog_bytes.as_slice());
+            let removed = safe_to_remove && fs::remove_file(&catalog).is_ok();
+            if removed {
+                return Err(engine(
+                    "Codex 配置写入失败；未启用新模型，已清理临时目录文件",
+                ));
+            }
+            return Ok(action_report(
+                "cleanup_pending",
+                Vec::new(),
+                "Codex 配置写入失败；新目录文件清理待重试，请先复位目录",
+            ));
+        }
+    }
+    let readback_catalog = read_optional(&catalog)?
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|value| catalog_model_ids(&value).ok());
+    let expected_config_active = if managed {
+        true
+    } else {
+        read_optional(&config)?
+            .as_deref()
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .and_then(|text| validate_managed_catalog_reference(text, &config).ok())
+            .unwrap_or(false)
+    };
+    if readback_catalog.as_deref() != Some(resulting_ids.as_slice()) || !expected_config_active {
+        return Ok(action_report(
+            "outcome_unconfirmed",
+            readback_catalog.unwrap_or_default(),
+            "目录写入后的回读与预期不一致；请重新打开管理器确认实际状态",
+        ));
+    }
+    if mark_restart().is_err() {
+        return Ok(action_report(
+            "applied_restart_pending",
+            resulting_ids,
+            "模型已加入；重载标记未写入，请手动重启 Codex 后检查",
+        ));
+    }
+    Ok(action_report(
+        "applied_restart_pending",
+        resulting_ids,
+        "模型已加入 Codex 菜单；重启 Codex 后生效",
+    ))
+}
+
+fn reset_owned_catalog() -> Result<NativeModelCatalogActionReport, AppError> {
+    activation::invalidate_live();
+    let home = codex_home_dir().ok_or_else(|| engine("无法确定 Codex 用户目录"))?;
+    reset_owned_catalog_at(&home, mark_restart_required)
+}
+
+fn reset_owned_catalog_at<M>(
+    home: &Path,
+    mark_restart: M,
+) -> Result<NativeModelCatalogActionReport, AppError>
+where
+    M: Fn() -> Result<(), AppError>,
+{
+    let _files = FILE_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let config = config_path_for(home);
+    let catalog = catalog_path_for(home);
+    let sidecar = home.join(SIDECAR_FILE_NAME);
+    let config_backup = atomic_file::backup_path(&config);
+    let catalog_backup = atomic_file::backup_path(&catalog);
+    let sidecar_backup = atomic_file::backup_path(&sidecar);
+    for path in [
+        &config,
+        &config_backup,
+        &catalog,
+        &sidecar,
+        &catalog_backup,
+        &sidecar_backup,
+    ] {
+        regular_or_absent(path)?;
+    }
+    let config_snapshot = read_optional(&config)?;
+    let config_text = config_snapshot
+        .as_deref()
+        .map(std::str::from_utf8)
+        .transpose()
+        .map_err(|_| engine("Codex 配置无法安全解析；原配置和模型目录均未改动"))?
+        .unwrap_or("");
+    let (cleaned_config, managed) = cleaned_config_without_external_catalog(config_text, &config)
+        .map_err(|_| {
+        engine("检测到外部模型目录配置或配置无法安全解析，已保留原配置；未恢复 Codex 原生目录")
+    })?;
+    let config_backup_snapshot = read_optional(&config_backup)?;
+    let catalog_snapshot = read_optional(&catalog)?;
+    let sidecar_snapshot = read_optional(&sidecar)?;
+    let catalog_backup_snapshot = read_optional(&catalog_backup)?;
+    let sidecar_backup_snapshot = read_optional(&sidecar_backup)?;
+    for (bytes, identity, label) in [
+        (catalog_snapshot.as_deref(), CATALOG_IDENTITY, "模型目录"),
+        (
+            catalog_backup_snapshot.as_deref(),
+            CATALOG_IDENTITY,
+            "模型目录备份",
+        ),
+        (sidecar_snapshot.as_deref(), SIDECAR_IDENTITY, "能力文件"),
+        (
+            sidecar_backup_snapshot.as_deref(),
+            SIDECAR_IDENTITY,
+            "能力文件备份",
+        ),
+    ] {
+        if let Some(bytes) = bytes {
+            let value: Value = serde_json::from_slice(bytes)
+                .map_err(|_| engine(format!("{label}无法确认所有权；原文件均未改动")))?;
+            if value.get("identity").and_then(Value::as_str) != Some(identity) {
+                return Err(engine(format!("{label}不归本管理器所有；原文件均未改动")));
+            }
+        }
+    }
+    if managed && catalog_snapshot.is_some() && !owned_json(&catalog, CATALOG_IDENTITY) {
+        return Err(engine(
+            "模型目录文件所有权无法确认；原配置和模型目录均未改动",
+        ));
+    }
+    if read_optional(&config)? != config_snapshot
+        || read_optional(&config_backup)? != config_backup_snapshot
+        || read_optional(&catalog)? != catalog_snapshot
+        || read_optional(&sidecar)? != sidecar_snapshot
+        || read_optional(&catalog_backup)? != catalog_backup_snapshot
+        || read_optional(&sidecar_backup)? != sidecar_backup_snapshot
+    {
+        return Err(engine("模型目录或配置已被其他进程修改；本次复位未执行"));
+    }
+    if managed {
+        atomic_file::write_atomic_preserving_backup(&config, cleaned_config.as_bytes())
+            .map_err(|_| engine("复位时无法安全移除管理器配置块；模型目录未清理"))?;
+    }
+    let mut cleanup_failed = false;
+    for path in [&catalog, &catalog_backup, &sidecar, &sidecar_backup] {
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => cleanup_failed = true,
+        }
+    }
+    let changed = managed
+        || catalog_snapshot.is_some()
+        || catalog_backup_snapshot.is_some()
+        || sidecar_snapshot.is_some()
+        || sidecar_backup_snapshot.is_some();
+    let marker_ok = !changed || mark_restart().is_ok();
+    if cleanup_failed {
+        return Ok(action_report(
+            "cleanup_pending",
+            Vec::new(),
+            "Codex 已切回原生模型目录；管理器文件清理待重试",
+        ));
+    }
+    if !marker_ok {
+        return Ok(action_report(
+            "applied_restart_pending",
+            Vec::new(),
+            "已恢复 Codex 原生模型目录，但未能写入重载标记；请手动重启 Codex",
+        ));
+    }
+    Ok(action_report(
+        if changed {
+            "applied_restart_pending"
+        } else {
+            "already_native"
+        },
+        Vec::new(),
+        if changed {
+            "已恢复 Codex 原生模型目录；重启 Codex 后生效"
+        } else {
+            "当前已使用 Codex 原生模型目录"
+        },
+    ))
+}
+
+pub async fn manage_native_model_catalog(
+    request: NativeModelCatalogActionRequest,
+) -> Result<NativeModelCatalogActionReport, AppError> {
+    match request.operation.as_str() {
+        "state" => catalog_state(),
+        "add" => {
+            let request_id = request
+                .request_id
+                .as_deref()
+                .ok_or_else(|| engine("模型添加请求缺少 requestId"))?;
+            let model_id = request
+                .model_id
+                .as_deref()
+                .ok_or_else(|| engine("模型添加请求缺少 modelId"))?;
+            let proof_id = request
+                .connectivity_proof_id
+                .as_deref()
+                .ok_or_else(|| engine("模型添加请求缺少测试凭证"))?;
+            with_catalog_mutation_lock(
+                &CATALOG_MUTATION_LOCK,
+                crate::app::gateway_model_probe::add_tested_model(request_id, model_id, proof_id),
+            )
+            .await
+        }
+        "reset" => {
+            with_catalog_mutation_lock(&CATALOG_MUTATION_LOCK, async {
+                crate::app::gateway_model_probe::begin_catalog_reset();
+                let result = reset_owned_catalog();
+                crate::app::gateway_model_probe::finish_catalog_reset();
+                result
+            })
+            .await
+        }
+        _ => Err(engine("未知的模型目录操作")),
+    }
 }
 
 fn merged_config(text: &str, catalog: &Path) -> Result<String, AppError> {
@@ -1218,29 +1588,6 @@ fn merged_config(text: &str, catalog: &Path) -> Result<String, AppError> {
         return Ok(format!("{block}\n"));
     }
     Ok(format!("{block}\n\n{body}\n"))
-}
-
-fn write_catalog_and_config(
-    catalog_json: &Value,
-    catalog: &Path,
-    config: &Path,
-) -> Result<(), AppError> {
-    regular_or_absent(catalog)?;
-    regular_or_absent(config)?;
-    let existing_config = read_optional(config)?.unwrap_or_default();
-    let existing_text = std::str::from_utf8(&existing_config)
-        .map_err(|_| engine("Codex 配置不是 UTF-8，模型目录未刷新"))?;
-    let merged = merged_config(existing_text, catalog)?;
-    let catalog_bytes =
-        serde_json::to_vec_pretty(catalog_json).map_err(|_| engine("模型目录序列化失败"))?;
-    if catalog_bytes.len() > BODY_LIMIT {
-        return Err(engine("模型目录超过本地大小限制"));
-    }
-    atomic_file::write_atomic(catalog, &catalog_bytes)
-        .map_err(|error| engine(format!("写入模型目录失败：{error}")))?;
-    atomic_file::write_atomic(config, merged.as_bytes())
-        .map_err(|error| engine(format!("写入 Codex 模型目录配置失败：{error}")))?;
-    Ok(())
 }
 
 struct ActiveRun {
@@ -1408,7 +1755,7 @@ fn deactivate_owned_catalog(config: &Path) -> Result<bool, AppError> {
     if read_optional(config)?.as_deref() != Some(bytes.as_slice()) {
         return Err(engine("Codex 配置已被其他进程修改，请重试"));
     }
-    atomic_file::write_atomic(config, cleaned.as_bytes())
+    atomic_file::write_atomic_preserving_backup(config, cleaned.as_bytes())
         .map_err(|_| engine("停用旧模型目录失败"))?;
     mark_restart_required()?;
     Ok(true)
@@ -1595,336 +1942,6 @@ fn mark_new_auto_operation_required(report: &mut NativeModelCatalogReport) {
         "上次自动配置无法在原启动周期和截止时间内安全续跑；需重新确认费用并显式开始新操作".into();
 }
 
-/// Refresh the Codex model menu from the configured gateway without probing
-/// any model. This is the normal one-click install path: it performs only the
-/// bounded health/models metadata calls, preserves the user's selected model,
-/// and writes the owned `model_catalog_json` bridge so the next Codex launch
-/// can see every discovered model. Generation matrices and native session
-/// checks remain in `refresh_requested(..., Some(native_verification))` and
-/// the advanced probe UI.
-pub async fn refresh_native_model_catalog(
-    force: bool,
-) -> Result<NativeModelCatalogReport, AppError> {
-    let id = format!("metadata-{}", uuid::Uuid::new_v4().simple());
-    let _run = REFRESH_LOCK.lock().await;
-    let catalog = catalog_path()?;
-    let config = config_path()?;
-    let old_count = existing_catalog_count(&catalog);
-    let config_is_current = read_optional(&config)
-        .ok()
-        .flatten()
-        .and_then(|bytes| std::str::from_utf8(&bytes).ok().map(str::to_owned))
-        .is_some_and(|text| {
-            let expected = format!("model_catalog_json = \"{}\"", toml_string(&catalog));
-            text.lines().any(|line| line.trim() == CONFIG_BEGIN)
-                && text.lines().any(|line| line.trim() == expected)
-        });
-    let catalog_was_fresh = catalog_is_fresh(&catalog);
-    let mut catalog_image_metadata_is_current =
-        existing_catalog_image_metadata_is_current(&catalog);
-    let mut catalog_migrated = false;
-    if old_count > 0 && config_is_current && !catalog_image_metadata_is_current {
-        match migrate_existing_catalog_image_input(&catalog) {
-            Ok(true) => {
-                catalog_image_metadata_is_current = true;
-                catalog_migrated = true;
-                mark_restart_required()?;
-                log::info!(
-                    "legacy native model catalog image input metadata migrated path={}",
-                    catalog.display()
-                );
-            }
-            Ok(false) => {}
-            Err(error) => log::warn!(
-                "legacy native model catalog image input migration failed: {error}"
-            ),
-        }
-    }
-    if !force
-        && old_count > 0
-        && catalog_was_fresh
-        && config_is_current
-        && catalog_migrated
-    {
-        return Ok(NativeModelCatalogReport {
-            status: "ready".into(),
-            model_count: old_count,
-            catalog_path: Some(catalog.to_string_lossy().into_owned()),
-            fetched_at: None,
-            message: "已修复现有模型目录的图像输入标记，重启 Codex 后生效；上游模型能力仍以实际响应为准"
-                .into(),
-            attempts: 0,
-            error_kind: None,
-            run_id: id,
-            gateway_status: "cached".into(),
-            ready_count: 0,
-            quarantined_count: 0,
-            default_model: None,
-            sidecar_path: None,
-            native_status: "metadata_only".into(),
-            activation_status: "applied".into(),
-            service_revision: None,
-            models: Vec::new(),
-        });
-    }
-    if !force
-        && old_count > 0
-        && catalog_was_fresh
-        && config_is_current
-        && catalog_image_metadata_is_current
-    {
-        return Ok(NativeModelCatalogReport {
-            status: "fresh".into(),
-            model_count: old_count,
-            catalog_path: Some(catalog.to_string_lossy().into_owned()),
-            fetched_at: None,
-            message: "Codex 模型目录仍在有效期内".into(),
-            attempts: 0,
-            error_kind: None,
-            run_id: id,
-            gateway_status: "cached".into(),
-            ready_count: 0,
-            quarantined_count: 0,
-            default_model: None,
-            sidecar_path: None,
-            native_status: "metadata_only".into(),
-            activation_status: "applied".into(),
-            service_revision: None,
-            models: Vec::new(),
-        });
-    }
-
-    let Some(binding) = usb_guard::authorized_account_binding()? else {
-        return Ok(NativeModelCatalogReport {
-            status: "skipped".into(),
-            model_count: old_count,
-            catalog_path: Some(catalog.to_string_lossy().into_owned()),
-            fetched_at: None,
-            message: "当前没有可用于刷新统一网关目录的 U 盘绑定".into(),
-            attempts: 0,
-            error_kind: Some("usb-binding-unavailable".into()),
-            run_id: id,
-            gateway_status: "unavailable".into(),
-            ready_count: 0,
-            quarantined_count: 0,
-            default_model: None,
-            sidecar_path: None,
-            native_status: "metadata_only".into(),
-            activation_status: "not_requested".into(),
-            service_revision: None,
-            models: Vec::new(),
-        });
-    };
-    let api_key = binding.ccswitch.device_api_key.trim();
-    if api_key.is_empty() {
-        return Ok(NativeModelCatalogReport {
-            status: "skipped".into(),
-            model_count: old_count,
-            catalog_path: Some(catalog.to_string_lossy().into_owned()),
-            fetched_at: None,
-            message: "当前 U 盘绑定没有可用的统一网关 Key".into(),
-            attempts: 0,
-            error_kind: Some("upstream-auth".into()),
-            run_id: id,
-            gateway_status: "unauthorized".into(),
-            ready_count: 0,
-            quarantined_count: 0,
-            default_model: None,
-            sidecar_path: None,
-            native_status: "metadata_only".into(),
-            activation_status: "not_requested".into(),
-            service_revision: None,
-            models: Vec::new(),
-        });
-    }
-    let base = match provider_base(&binding.ccswitch.provider_id) {
-        Ok(base) => base,
-        Err(error) => {
-            return Ok(NativeModelCatalogReport {
-                status: "skipped".into(),
-                model_count: old_count,
-                catalog_path: Some(catalog.to_string_lossy().into_owned()),
-                fetched_at: None,
-                message: error.to_string(),
-                attempts: 0,
-                error_kind: Some("provider-unavailable".into()),
-                run_id: id,
-                gateway_status: "unavailable".into(),
-                ready_count: 0,
-                quarantined_count: 0,
-                default_model: None,
-                sidecar_path: None,
-                native_status: "metadata_only".into(),
-                activation_status: "not_requested".into(),
-                service_revision: None,
-                models: Vec::new(),
-            });
-        }
-    };
-
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let deadline = Instant::now() + REFRESH_BUDGET;
-    let client = ProbeClient::new(&base, api_key, cancelled, deadline)
-        .map_err(|_| engine("无法初始化模型目录客户端"))?
-        .with_run_id(&id);
-    let mut attempts = 0;
-    let mut payload = None;
-    let mut last_error = ProbeError::Network;
-    for attempt in 1..=3_u32 {
-        attempts = attempt;
-        let fetched = match client.health().await {
-            Ok(()) => client.models().await,
-            Err(error) => Err(error),
-        };
-        match fetched {
-            Ok(value) => {
-                payload = Some(value);
-                break;
-            }
-            Err(error) => {
-                last_error = error;
-                if !last_error.retryable()
-                    || matches!(
-                        last_error,
-                        ProbeError::Unauthorized | ProbeError::BudgetExhausted
-                    )
-                {
-                    break;
-                }
-            }
-        }
-        if attempt < 3 {
-            tokio::time::sleep(Duration::from_millis(500 * u64::from(attempt))).await;
-        }
-    }
-    let Some(payload) = payload else {
-        return Ok(NativeModelCatalogReport {
-            status: if old_count > 0 { "stale" } else { "failed" }.into(),
-            model_count: old_count,
-            catalog_path: Some(catalog.to_string_lossy().into_owned()),
-            fetched_at: None,
-            message: "404token 模型目录未完成同步；旧目录仍保留，安装状态不受影响".into(),
-            attempts,
-            error_kind: Some(last_error.code().into()),
-            run_id: id,
-            gateway_status: if last_error == ProbeError::Unauthorized {
-                "unauthorized"
-            } else {
-                "unavailable"
-            }
-            .into(),
-            ready_count: 0,
-            quarantined_count: 0,
-            default_model: None,
-            sidecar_path: None,
-            native_status: "metadata_only".into(),
-            activation_status: "not_applied".into(),
-            service_revision: None,
-            models: Vec::new(),
-        });
-    };
-    let Some(items) = payload
-        .get("data")
-        .or_else(|| payload.get("models"))
-        .and_then(Value::as_array)
-    else {
-        return Ok(NativeModelCatalogReport {
-            status: if old_count > 0 { "stale" } else { "failed" }.into(),
-            model_count: old_count,
-            catalog_path: Some(catalog.to_string_lossy().into_owned()),
-            fetched_at: None,
-            message: "404token 返回的模型目录格式无效；旧目录仍保留".into(),
-            attempts,
-            error_kind: Some("upstream-response".into()),
-            run_id: id,
-            gateway_status: "invalid-response".into(),
-            ready_count: 0,
-            quarantined_count: 0,
-            default_model: None,
-            sidecar_path: None,
-            native_status: "metadata_only".into(),
-            activation_status: "not_applied".into(),
-            service_revision: None,
-            models: Vec::new(),
-        });
-    };
-    if items.len() > 512 {
-        return Err(engine("404token 模型目录超过安全数量限制"));
-    }
-    let normalized = normalize_models(parse_gateway_models(&payload));
-    if normalized.is_empty() {
-        return Ok(NativeModelCatalogReport {
-            status: if old_count > 0 { "stale" } else { "failed" }.into(),
-            model_count: old_count,
-            catalog_path: Some(catalog.to_string_lossy().into_owned()),
-            fetched_at: None,
-            message: "404token 返回的模型目录为空；旧目录仍保留".into(),
-            attempts,
-            error_kind: Some("upstream-response".into()),
-            run_id: id,
-            gateway_status: "invalid-response".into(),
-            ready_count: 0,
-            quarantined_count: 0,
-            default_model: None,
-            sidecar_path: None,
-            native_status: "metadata_only".into(),
-            activation_status: "not_applied".into(),
-            service_revision: None,
-            models: Vec::new(),
-        });
-    }
-    let count = normalized.len();
-    let catalog_json = native_catalog(&normalized);
-    if let Err(error) = write_catalog_and_config(&catalog_json, &catalog, &config) {
-        log::warn!("native model catalog metadata commit failed: {error}");
-        return Ok(NativeModelCatalogReport {
-            status: if old_count > 0 { "stale" } else { "failed" }.into(),
-            model_count: old_count,
-            catalog_path: Some(catalog.to_string_lossy().into_owned()),
-            fetched_at: None,
-            message: "模型目录已获取，但未能安全写入 Codex 配置".into(),
-            attempts,
-            error_kind: Some("local-write-failed".into()),
-            run_id: id,
-            gateway_status: "connected".into(),
-            ready_count: 0,
-            quarantined_count: 0,
-            default_model: None,
-            sidecar_path: None,
-            native_status: "metadata_only".into(),
-            activation_status: "not_applied".into(),
-            service_revision: None,
-            models: Vec::new(),
-        });
-    }
-    mark_restart_required()?;
-    log::info!(
-        "native model catalog metadata refreshed models={} path={} attempts={}",
-        count,
-        catalog.display(),
-        attempts
-    );
-    Ok(NativeModelCatalogReport {
-        status: "ready".into(),
-        model_count: count,
-        catalog_path: Some(catalog.to_string_lossy().into_owned()),
-        fetched_at: Some(format!("unix:{}", unix_seconds())),
-        message: format!("Codex 原生模型目录已刷新，共发现 {count} 个模型；未进行模型生成验证"),
-        attempts,
-        error_kind: None,
-        run_id: id,
-        gateway_status: "connected".into(),
-        ready_count: 0,
-        quarantined_count: 0,
-        default_model: None,
-        sidecar_path: None,
-        native_status: "metadata_only".into(),
-        activation_status: "applied".into(),
-        service_revision: None,
-        models: Vec::new(),
-    })
-}
-
 /// Legacy internal entrypoint; interactive callers use a cancellable run ID.
 pub async fn refresh(force: bool) -> Result<NativeModelCatalogReport, AppError> {
     refresh_requested(force, None, std::future::ready(None), None).await
@@ -1938,10 +1955,10 @@ pub async fn refresh_requested<F>(
 where
     F: std::future::Future<Output = Option<NativeRuntimeTarget>>,
 {
-    if let Some(options) = native_verification.as_ref() {
-        options.validate()?;
+    if native_verification.is_some() {
+        return Err(engine("legacy-auto-activation-disabled"));
     }
-    let native_requested = native_verification.is_some();
+    let native_requested = false;
     let id = request_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     if !valid_run_id(&id) {
         return Err(engine("无效的模型探测请求 ID"));
@@ -2565,13 +2582,6 @@ where
     }
     let proofs = native.proofs();
     finalize_report(&mut result, &context, &proofs);
-    let preferred_model_id = certified_model_ids.iter().find_map(|candidate| {
-        result
-            .models
-            .iter()
-            .find(|model| &model.model_id == candidate && model.state == ModelState::Ready)
-            .map(|model| model.model_id.clone())
-    });
     if native_requested {
         result.native_status = if result.ready_count > 0 {
             "verified"
@@ -2663,19 +2673,7 @@ where
             expected_sidecar_bytes = Some(bytes);
             result.fetched_at = Some(format!("unix:{observed}"));
             result.status = if result.models.iter().any(|m| m.error_code.is_some()) { "partial" } else { "discovered" }.into();
-            if native_requested && result.ready_count > 0 {
-                let preferred_model_id = preferred_model_id
-                    .as_deref()
-                    .ok_or_else(|| engine("通过模型缺少对应的服务端优先级证明"))?;
-                match activation::publish(native, &mut result, &context, preferred_model_id,
-                    &binding, &base, &home, &cancelled, deadline) {
-                    Ok(()) => result.activation_status = "applied".into(),
-                    Err(code) => {
-                        result.activation_status = activation_failure_status(&result).into();
-                        result.error_kind = Some(code.into()); result.status = "partial".into();
-                    }
-                }
-            } else if native_requested {
+            if native_requested {
                 result.activation_status = "not_eligible".into();
                 result.error_kind = Some(native.error.unwrap_or("native-verification-incomplete").into());
             } else {
@@ -2711,6 +2709,342 @@ where
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn tested_catalog_entry_preserves_exact_id_and_claims_only_text_input() {
+        let entry = conservative_tested_model_entry("vendor/model-latest", Some("vendor"), 3);
+        assert_eq!(entry["slug"], "vendor/model-latest");
+        assert_eq!(entry["input_modalities"], json!(["text"]));
+        assert_eq!(entry["supports_search_tool"], false);
+        assert_eq!(entry["supported_reasoning_levels"], json!([]));
+        assert!(entry.get("context_window").is_none());
+        assert!(entry.get("tool_mode").is_none());
+        assert!(!entry.to_string().contains("image\""));
+    }
+
+    #[test]
+    fn external_model_catalog_override_and_invalid_toml_fail_closed_semantically() {
+        let config = std::env::temp_dir()
+            .join("codex-selective-test")
+            .join("config.toml");
+        let external = "model = \"keep-me\"\n\"model_catalog_json\" = \"user.json\"\n";
+        assert!(cleaned_config_without_external_catalog(external, &config).is_err());
+        assert!(cleaned_config_without_external_catalog("model = [\n", &config).is_err());
+        let unrelated_table = "[other]\nmodel_catalog_json = \"not-the-root-setting\"\n";
+        assert!(cleaned_config_without_external_catalog(unrelated_table, &config).is_ok());
+    }
+
+    #[test]
+    fn owned_catalog_reference_is_removed_without_changing_other_toml() {
+        let config = std::env::temp_dir()
+            .join("codex-selective-test")
+            .join("config.toml");
+        let expected = expected_catalog_reference(&config).unwrap();
+        let original = format!(
+            "model = \"keep-me\"\n\n{CONFIG_BEGIN}\n{expected}\n{CONFIG_END}\n\n[other]\nvalue = 7\n"
+        );
+        let (cleaned, managed) =
+            cleaned_config_without_external_catalog(&original, &config).unwrap();
+        assert!(managed);
+        assert_eq!(cleaned, "model = \"keep-me\"\n\n\n[other]\nvalue = 7\n");
+    }
+
+    struct CatalogTempHome(std::path::PathBuf);
+
+    impl CatalogTempHome {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "codex-selective-catalog-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4().simple()
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for CatalogTempHome {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn explicit_add_and_reset_preserve_user_config_and_its_backup() {
+        let home = CatalogTempHome::new();
+        let config = config_path_for(home.path());
+        let config_backup = atomic_file::backup_path(&config);
+        let original = b"model = \"keep-me\"\n[other]\nvalue = 7\n";
+        let user_backup = b"older user recovery point\n";
+        std::fs::write(&config, original).unwrap();
+        std::fs::write(&config_backup, user_backup).unwrap();
+        let cancelled = AtomicBool::new(false);
+
+        let added = add_tested_model_files(
+            home.path(),
+            "vendor/model-latest",
+            Some("vendor"),
+            &cancelled,
+            || Ok(true),
+            || {},
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(added.status, "applied_restart_pending");
+        assert!(std::fs::read_to_string(&config)
+            .unwrap()
+            .contains("model = \"keep-me\""));
+        assert_eq!(std::fs::read(&config_backup).unwrap(), user_backup);
+        assert_eq!(
+            catalog_state_for_home(home.path()).unwrap().model_ids,
+            ["vendor/model-latest"]
+        );
+
+        let reset = reset_owned_catalog_at(home.path(), || Ok(())).unwrap();
+        assert_eq!(reset.status, "applied_restart_pending");
+        let reset_config = std::fs::read_to_string(&config).unwrap();
+        assert_eq!(
+            toml::from_str::<toml::Value>(&reset_config).unwrap(),
+            toml::from_str::<toml::Value>(std::str::from_utf8(original).unwrap()).unwrap()
+        );
+        assert!(!reset_config.contains("model_catalog_json"));
+        assert_eq!(std::fs::read(&config_backup).unwrap(), user_backup);
+        assert!(!catalog_path_for(home.path()).exists());
+        assert!(catalog_state_for_home(home.path())
+            .unwrap()
+            .model_ids
+            .is_empty());
+    }
+
+    #[test]
+    fn catalog_state_marks_unreferenced_owned_json_as_orphaned() {
+        let home = CatalogTempHome::new();
+        let catalog = json!({
+            "identity": CATALOG_IDENTITY,
+            "models": [conservative_tested_model_entry("vendor/model", None, 1)]
+        });
+        std::fs::write(
+            catalog_path_for(home.path()),
+            serde_json::to_vec(&catalog).unwrap(),
+        )
+        .unwrap();
+
+        let state = catalog_state_for_home(home.path()).unwrap();
+        assert_eq!(state.status, "orphaned");
+        assert!(state.model_ids.is_empty());
+        assert!(state.message.contains("请复位"));
+    }
+
+    #[test]
+    fn add_and_reset_fail_closed_on_external_catalog_override_without_mutation() {
+        let home = CatalogTempHome::new();
+        let config = config_path_for(home.path());
+        let original = b"model = \"keep-me\"\nmodel_catalog_json = \"user-catalog.json\"\n";
+        std::fs::write(&config, original).unwrap();
+        let cancelled = AtomicBool::new(false);
+
+        assert!(add_tested_model_files(
+            home.path(),
+            "vendor/model",
+            None,
+            &cancelled,
+            || Ok(true),
+            || {},
+            || Ok(()),
+        )
+        .is_err());
+        assert_eq!(std::fs::read(&config).unwrap(), original);
+        assert!(!catalog_path_for(home.path()).exists());
+
+        let owned_catalog = json!({
+            "identity": CATALOG_IDENTITY,
+            "models": [conservative_tested_model_entry("vendor/model", None, 1)]
+        });
+        std::fs::write(
+            catalog_path_for(home.path()),
+            serde_json::to_vec(&owned_catalog).unwrap(),
+        )
+        .unwrap();
+        assert!(reset_owned_catalog_at(home.path(), || Ok(())).is_err());
+        assert_eq!(std::fs::read(&config).unwrap(), original);
+        assert!(catalog_path_for(home.path()).exists());
+    }
+
+    #[test]
+    fn cancelled_add_does_not_cross_the_catalog_commit_boundary() {
+        let home = CatalogTempHome::new();
+        let config = config_path_for(home.path());
+        let original = b"model = \"unchanged\"\n";
+        std::fs::write(&config, original).unwrap();
+        let cancelled = AtomicBool::new(true);
+        let committed = AtomicBool::new(false);
+
+        let result = add_tested_model_files(
+            home.path(),
+            "vendor/model",
+            None,
+            &cancelled,
+            || Ok(true),
+            || committed.store(true, AtomicOrdering::Release),
+            || Ok(()),
+        );
+        assert!(result.is_err());
+        assert!(!committed.load(AtomicOrdering::Acquire));
+        assert_eq!(std::fs::read(&config).unwrap(), original);
+        assert!(!catalog_path_for(home.path()).exists());
+    }
+
+    #[test]
+    fn cancellation_after_final_precommit_check_leaves_files_untouched() {
+        use std::cell::Cell;
+
+        let home = CatalogTempHome::new();
+        let config = config_path_for(home.path());
+        let original = b"model = \"unchanged\"\n";
+        std::fs::write(&config, original).unwrap();
+        let cancelled = AtomicBool::new(false);
+        let checks = Cell::new(0);
+        let committed = AtomicBool::new(false);
+
+        let result = add_tested_model_files(
+            home.path(),
+            "vendor/model",
+            None,
+            &cancelled,
+            || {
+                let count = checks.get() + 1;
+                checks.set(count);
+                if count == 2 {
+                    cancelled.store(true, AtomicOrdering::Release);
+                }
+                Ok(true)
+            },
+            || committed.store(true, AtomicOrdering::Release),
+            || Ok(()),
+        );
+
+        assert!(result.is_err());
+        assert!(!committed.load(AtomicOrdering::Acquire));
+        assert_eq!(std::fs::read(&config).unwrap(), original);
+        assert!(!catalog_path_for(home.path()).exists());
+    }
+
+    #[test]
+    fn cancellation_after_commit_boundary_keeps_applied_catalog_state() {
+        let home = CatalogTempHome::new();
+        let config = config_path_for(home.path());
+        std::fs::write(&config, b"model = \"unchanged\"\n").unwrap();
+        let cancelled = AtomicBool::new(false);
+
+        let result = add_tested_model_files(
+            home.path(),
+            "vendor/model",
+            None,
+            &cancelled,
+            || Ok(true),
+            || cancelled.store(true, AtomicOrdering::Release),
+            || Ok(()),
+        )
+        .unwrap();
+
+        assert!(cancelled.load(AtomicOrdering::Acquire));
+        assert_eq!(result.status, "applied_restart_pending");
+        assert_eq!(result.model_ids, ["vendor/model"]);
+        assert_eq!(
+            catalog_state_for_home(home.path()).unwrap().model_ids,
+            ["vendor/model"]
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_mutation_lock_serializes_add_before_queued_reset() {
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let held = lock.lock().await;
+        let order = Arc::new(Mutex::new(Vec::new()));
+
+        let (add_ready_tx, add_ready_rx) = tokio::sync::oneshot::channel();
+        let add_lock = lock.clone();
+        let add_order = order.clone();
+        let add = tokio::spawn(async move {
+            add_ready_tx.send(()).unwrap();
+            with_catalog_mutation_lock(&add_lock, async {
+                add_order.lock().unwrap().push("add");
+                tokio::task::yield_now().await;
+            })
+            .await;
+        });
+        add_ready_rx.await.unwrap();
+
+        let (reset_ready_tx, reset_ready_rx) = tokio::sync::oneshot::channel();
+        let reset_lock = lock.clone();
+        let reset_order = order.clone();
+        let reset = tokio::spawn(async move {
+            reset_ready_tx.send(()).unwrap();
+            with_catalog_mutation_lock(&reset_lock, async {
+                reset_order.lock().unwrap().push("reset");
+            })
+            .await;
+        });
+        reset_ready_rx.await.unwrap();
+        drop(held);
+
+        add.await.unwrap();
+        reset.await.unwrap();
+        assert_eq!(*order.lock().unwrap(), ["add", "reset"]);
+    }
+
+    #[tokio::test]
+    async fn catalog_mutation_lock_reset_first_rejects_queued_add_without_writes() {
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let held = lock.lock().await;
+        let reset_finished = Arc::new(AtomicBool::new(false));
+        let writes = Arc::new(AtomicBool::new(false));
+        let order = Arc::new(Mutex::new(Vec::new()));
+
+        let (reset_ready_tx, reset_ready_rx) = tokio::sync::oneshot::channel();
+        let reset_lock = lock.clone();
+        let reset_done = reset_finished.clone();
+        let reset_order = order.clone();
+        let reset = tokio::spawn(async move {
+            reset_ready_tx.send(()).unwrap();
+            with_catalog_mutation_lock(&reset_lock, async {
+                reset_order.lock().unwrap().push("reset");
+                reset_done.store(true, AtomicOrdering::Release);
+            })
+            .await;
+        });
+        reset_ready_rx.await.unwrap();
+
+        let (add_ready_tx, add_ready_rx) = tokio::sync::oneshot::channel();
+        let add_lock = lock.clone();
+        let add_reset_done = reset_finished.clone();
+        let add_writes = writes.clone();
+        let add_order = order.clone();
+        let add = tokio::spawn(async move {
+            add_ready_tx.send(()).unwrap();
+            with_catalog_mutation_lock(&add_lock, async {
+                if add_reset_done.load(AtomicOrdering::Acquire) {
+                    add_order.lock().unwrap().push("add-rejected");
+                } else {
+                    add_writes.store(true, AtomicOrdering::Release);
+                    add_order.lock().unwrap().push("add-write");
+                }
+            })
+            .await;
+        });
+        add_ready_rx.await.unwrap();
+        drop(held);
+
+        reset.await.unwrap();
+        add.await.unwrap();
+        assert_eq!(*order.lock().unwrap(), ["reset", "add-rejected"]);
+        assert!(!writes.load(AtomicOrdering::Acquire));
+    }
+
     #[test]
     fn generation_probes_are_limited_to_server_certified_models() {
         let certified = vec!["glm-5.2".into(), "deepseek-v4-flash".into()];

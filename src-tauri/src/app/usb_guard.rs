@@ -68,6 +68,12 @@ const AUTHORIZATION_RETRY_TIMEOUT_MS: u64 = 3_000;
 const AUTHORIZATION_RETRY_INTERVAL_MS: u64 = 100;
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+#[cfg(target_os = "windows")]
+const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+#[cfg(target_os = "windows")]
+const PROCESS_TERMINATE: u32 = 0x0001;
+#[cfg(target_os = "windows")]
+const PROCESS_SYNCHRONIZE: u32 = 0x0010_0000;
 #[used]
 static COMPILED_USB_POLICY_MARKER: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/codex-usb-policy-marker.txt"));
@@ -141,6 +147,17 @@ pub struct UsbGuardStatus {
     pub codex_allowed: bool,
     #[serde(default)]
     pub codex_block_reason: Option<String>,
+    /// Last locally verified remote-revocation decision. This is display and
+    /// operation-routing state only; every backend gate revalidates signed
+    /// receipts before performing a protected action.
+    #[serde(default = "default_revocation_state")]
+    pub revocation_state: String,
+    #[serde(default)]
+    pub revocation_state_version: Option<u64>,
+    /// True only for the restricted USB payload reinstall path after a newer
+    /// signed active receipt reactivates a bundle with missing managed files.
+    #[serde(default)]
+    pub reinstall_allowed: bool,
     pub last_checked_at_ms: u64,
     pub missing_since_ms: Option<u64>,
     pub countdown_seconds: Option<u64>,
@@ -168,10 +185,50 @@ pub struct SignedUsbAuthorization {
     pub bundle_root: PathBuf,
     pub codex_root: PathBuf,
     pub fingerprint: UsbFingerprint,
+    pub direct_entry_required: bool,
     pub installation_id: String,
     pub key_id: String,
     pub license_digest: String,
     pub checked_at_ms: u64,
+}
+
+/// A revoked decision discovered while an updater owns the installation
+/// transaction lock must be acted on only after that lock is released.
+#[derive(Debug, Clone)]
+pub(crate) struct DeferredRevocationCleanup {
+    observation: UsbObservation,
+    bundle_root: PathBuf,
+    license: UsbLicense,
+    fingerprint: UsbFingerprint,
+    state_version: u64,
+    conflict: bool,
+    phase: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum ReinstallGateOutcome {
+    Authorized(SignedUsbAuthorization),
+    DeferredCleanup(DeferredRevocationCleanup),
+}
+
+impl DeferredRevocationCleanup {
+    pub(crate) fn cleanup_and_reject(self) -> Result<SignedUsbAuthorization, AppError> {
+        #[cfg(target_os = "windows")]
+        {
+            let _ = revoke_and_cleanup_with_retry(
+                &self.observation,
+                &self.bundle_root,
+                &self.license,
+                &self.fingerprint,
+                self.state_version,
+                self.conflict,
+            );
+        }
+        Err(engine(format!(
+            "usb_reinstall_revoked phase={}: 服务器状态仍为已作废",
+            self.phase
+        )))
+    }
 }
 
 /// Startup may continue into a restricted manager UI when the immutable USB
@@ -183,8 +240,18 @@ pub struct SignedUsbAuthorization {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StartupPreflight {
     Ready,
-    IntegrityPending { reason: String },
-    AuthorizationBlocked { reason: String },
+    IntegrityPending {
+        reason: String,
+    },
+    /// A signed USB revocation/registration condition was checked before
+    /// startup side effects. The manager shell may continue, but no Codex
+    /// lease or operation is enabled until the manager worker resolves it.
+    RevocationPending {
+        reason: String,
+    },
+    AuthorizationBlocked {
+        reason: String,
+    },
 }
 
 impl StartupPreflight {
@@ -193,15 +260,18 @@ impl StartupPreflight {
     }
 
     pub fn is_integrity_pending(&self) -> bool {
-        matches!(self, Self::IntegrityPending { .. })
+        matches!(
+            self,
+            Self::IntegrityPending { .. } | Self::RevocationPending { .. }
+        )
     }
 
     pub fn reason(&self) -> Option<&str> {
         match self {
             Self::Ready => None,
-            Self::IntegrityPending { reason } | Self::AuthorizationBlocked { reason } => {
-                Some(reason)
-            }
+            Self::IntegrityPending { reason }
+            | Self::RevocationPending { reason }
+            | Self::AuthorizationBlocked { reason } => Some(reason),
         }
     }
 }
@@ -255,6 +325,61 @@ fn engine(message: impl Into<String>) -> AppError {
 
 const COMPILETIME_PUBLIC_KEY_B64: Option<&str> = option_env!("CODEX_USB_GUARD_PUBLIC_KEY_B64");
 const COMPILETIME_PUBLIC_KEY_ID: Option<&str> = option_env!("CODEX_USB_GUARD_PUBLIC_KEY_ID");
+
+#[cfg(test)]
+thread_local! {
+    static TEST_LICENSE_PUBLIC_KEYS: std::cell::RefCell<Vec<(String, String)>> =
+        std::cell::RefCell::new(Vec::new());
+}
+
+#[cfg(test)]
+struct TestLicensePublicKeyScope {
+    previous_len: usize,
+}
+
+#[cfg(test)]
+impl Drop for TestLicensePublicKeyScope {
+    fn drop(&mut self) {
+        TEST_LICENSE_PUBLIC_KEYS.with(|keys| keys.borrow_mut().truncate(self.previous_len));
+    }
+}
+
+#[cfg(test)]
+fn test_license_public_key_for(key_id: &str) -> Option<(String, String)> {
+    TEST_LICENSE_PUBLIC_KEYS.with(|keys| {
+        keys.borrow()
+            .iter()
+            .rev()
+            .find(|(candidate, _)| candidate == key_id)
+            .cloned()
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn test_license_public_key_config(key_id: &str) -> Option<(String, String)> {
+    test_license_public_key_for(key_id)
+}
+
+/// Temporarily supplies the public half of a test signing key as if it were
+/// embedded in this test build. Thread-local RAII keeps parallel tests from
+/// sharing or leaking key configuration, including when the action panics.
+#[cfg(test)]
+pub(crate) fn with_test_license_public_key<T>(
+    key_id: &str,
+    public_key_b64: &str,
+    action: impl FnOnce() -> T,
+) -> T {
+    let previous_len = TEST_LICENSE_PUBLIC_KEYS.with(|keys| {
+        let mut keys = keys.borrow_mut();
+        let previous_len = keys.len();
+        keys.push((key_id.to_string(), public_key_b64.to_string()));
+        previous_len
+    });
+    let scope = TestLicensePublicKeyScope { previous_len };
+    let result = action();
+    drop(scope);
+    result
+}
 
 /// Formal release policy is compile-time only.  An environment variable may
 /// select the same policy for a locally reproduced build, but never weakens a
@@ -663,6 +788,21 @@ fn configured_key_for(license: &UsbLicense) -> Result<Option<String>, AppError> 
         return Ok(None);
     }
 
+    #[cfg(test)]
+    if let Some((test_key_id, public_key)) = license
+        .key_id
+        .as_deref()
+        .and_then(test_license_public_key_for)
+    {
+        let active_key_id =
+            require_active_key_binding(Some(&test_key_id), license.key_id.as_deref())?;
+        decode_configured_public_key(&public_key, "测试 USB 公钥")?;
+        if active_key_id != test_key_id {
+            return Err(engine("测试 USB 公钥 keyId 不匹配"));
+        }
+        return Ok(Some(public_key.trim().to_string()));
+    }
+
     let active_key_id =
         require_active_key_binding(COMPILETIME_PUBLIC_KEY_ID, license.key_id.as_deref())?;
     let compiletime_public_key = COMPILETIME_PUBLIC_KEY_B64;
@@ -706,6 +846,10 @@ fn configured_key_for(license: &UsbLicense) -> Result<Option<String>, AppError> 
         .as_ref()
         .ok_or_else(|| engine("许可证带签名，但构建公钥为空"))?;
     Ok(Some(public_key.trim().to_string()))
+}
+
+pub(crate) fn license_public_key_for(license: &UsbLicense) -> Result<Option<String>, String> {
+    configured_key_for(license).map_err(|error| error.to_string())
 }
 
 fn verify_configured_signature(license: &UsbLicense) -> Result<bool, AppError> {
@@ -888,12 +1032,19 @@ fn base_status(status: &str, watchdog: &str) -> UsbGuardStatus {
         },
         codex_allowed: false,
         codex_block_reason: None,
+        revocation_state: default_revocation_state(),
+        revocation_state_version: None,
+        reinstall_allowed: false,
         last_checked_at_ms: now_ms(),
         missing_since_ms: None,
         countdown_seconds: None,
         managed_processes: Vec::new(),
         message: status_message(status),
     }
+}
+
+fn default_revocation_state() -> String {
+    "not-applicable".to_string()
 }
 
 fn mark_invalid_license(status: &mut UsbGuardStatus, detail: String) {
@@ -1085,6 +1236,11 @@ pub fn require_usb_content_access(phase: &str) -> Result<(), AppError> {
 pub fn require_signed_codex_bundle(
     phase: &str,
 ) -> Result<Option<SignedUsbAuthorization>, AppError> {
+    if crate::app::usb_revocation::has_pending_revocation() {
+        return Err(engine(format!(
+            "usb_revocation_persistence_pending phase={phase}：已验签作废状态尚未安全写入 U 盘和本机，Codex 操作保持锁定"
+        )));
+    }
     if !guard_required() {
         return Ok(None);
     }
@@ -1157,11 +1313,330 @@ pub fn require_signed_codex_bundle(
         bundle_root: bundle.clone(),
         codex_root,
         fingerprint: fingerprint.clone(),
+        direct_entry_required: integrity.direct_entry_required,
         installation_id: license.installation_id,
         key_id: license.key_id.unwrap_or_default(),
         license_digest: license_digest(&bundle)?,
         checked_at_ms: now_ms(),
     }))
+}
+
+/// A narrowly scoped authorization for restoring the bundle's Codex payload
+/// after a signed active state supersedes a verified revoked receipt. This
+/// gate intentionally does not create a lease and never authorizes launch,
+/// normal update, or general bundle mutation.
+pub fn require_signed_codex_reinstall_bundle(
+    phase: &str,
+) -> Result<SignedUsbAuthorization, AppError> {
+    match require_signed_codex_reinstall_bundle_deferred(phase)? {
+        ReinstallGateOutcome::Authorized(authorization) => Ok(authorization),
+        ReinstallGateOutcome::DeferredCleanup(request) => request.cleanup_and_reject(),
+    }
+}
+
+pub(crate) fn require_signed_codex_reinstall_bundle_deferred(
+    phase: &str,
+) -> Result<ReinstallGateOutcome, AppError> {
+    if crate::app::usb_revocation::has_pending_revocation() {
+        return Err(engine(format!(
+            "usb_revocation_persistence_pending phase={phase}：作废状态尚未写入两处，不能安装或修复 Codex"
+        )));
+    }
+    validate_signed_codex_reinstall_state(phase)
+}
+
+fn validate_signed_codex_reinstall_state(phase: &str) -> Result<ReinstallGateOutcome, AppError> {
+    if !guard_required() {
+        return Err(engine(format!(
+            "usb_reinstall_not_usb phase={phase}: 当前不是受管 USB bundle"
+        )));
+    }
+    let executable =
+        std::env::current_exe().map_err(|error| engine(format!("无法确定安装器路径: {error}")))?;
+    let bundle = bundle_root_for_executable(&executable)
+        .ok_or_else(|| engine(format!("usb_reinstall_bundle_missing phase={phase}")))?;
+    let observation = observe_windows_bundle(&bundle)?;
+    let fingerprint = observation
+        .fingerprint
+        .clone()
+        .ok_or_else(|| engine(format!("usb_reinstall_media_invalid phase={phase}")))?;
+    let bundle_root = PathBuf::from(&observation.bundle_path);
+    validate_bundle_policy_binding(&bundle_root)?;
+    if crate::app::usb_revocation::policy(&bundle_root).map_err(engine)?
+        != crate::app::usb_revocation::RegistrationPolicy::Required
+    {
+        return Err(engine(format!(
+            "usb_reinstall_policy_invalid phase={phase}: 仅 schemaVersion=3 支持该恢复路径"
+        )));
+    }
+    let license = read_license(&bundle_root)?
+        .ok_or_else(|| engine(format!("usb_reinstall_license_missing phase={phase}")))?;
+    if !validate_license(&license, &fingerprint).map_err(|error| {
+        engine(format!(
+            "usb_reinstall_license_invalid phase={phase}: {error}"
+        ))
+    })? {
+        return Err(engine(format!(
+            "usb_reinstall_unsigned phase={phase}: 恢复需要有效签名许可证"
+        )));
+    }
+    let snapshot = crate::app::usb_revocation::local_snapshot(&bundle_root, &license, &fingerprint)
+        .map_err(|error| {
+            engine(format!(
+                "usb_reinstall_state_invalid phase={phase}: {error}"
+            ))
+        })?;
+    if !snapshot.had_verified_revoked_history {
+        return Err(engine(format!(
+            "usb_reinstall_no_revoked_history phase={phase}: 当前没有可验证的历史作废回执"
+        )));
+    }
+    let recovery = crate::app::usb_bundle::verify_revocation_recovery_bundle(
+        &bundle_root,
+        &license,
+        &fingerprint,
+    )
+    .map_err(|error| {
+        engine(format!(
+            "usb_reinstall_recovery_invalid phase={phase}: {error}"
+        ))
+    })?;
+    if !recovery.payload_path.is_file()
+        && fs::symlink_metadata(&recovery.payload_path)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err(engine(format!(
+            "usb_reinstall_payload_reparse phase={phase}: 缺失载荷路径被替换"
+        )));
+    }
+    let _registration =
+        crate::app::usb_revocation::load_registration(&bundle_root, &license, &fingerprint)
+            .map_err(|error| {
+                engine(format!(
+                    "usb_reinstall_registration_invalid phase={phase}: {error}"
+                ))
+            })?;
+    let decision = crate::app::usb_revocation::check_startup(&bundle_root, &license, &fingerprint)
+        .map_err(|error| {
+            engine(format!(
+                "usb_reinstall_status_check_failed phase={phase}: {error}"
+            ))
+        })?;
+    match decision {
+        crate::app::usb_revocation::Decision::ActiveOnline { state_version }
+        | crate::app::usb_revocation::Decision::ActiveOffline {
+            state_version: Some(state_version),
+        } if snapshot
+            .highest_verified_revoked_version
+            .is_some_and(|revoked| state_version > revoked) => {}
+        crate::app::usb_revocation::Decision::Revoked { state_version } => {
+            return Ok(ReinstallGateOutcome::DeferredCleanup(
+                DeferredRevocationCleanup {
+                    observation,
+                    bundle_root,
+                    license,
+                    fingerprint: fingerprint.clone(),
+                    state_version,
+                    conflict: false,
+                    phase: phase.to_string(),
+                },
+            ));
+        }
+        crate::app::usb_revocation::Decision::StatusConflict { state_version } => {
+            return Ok(ReinstallGateOutcome::DeferredCleanup(
+                DeferredRevocationCleanup {
+                    observation,
+                    bundle_root,
+                    license,
+                    fingerprint: fingerprint.clone(),
+                    state_version,
+                    conflict: true,
+                    phase: phase.to_string(),
+                },
+            ));
+        }
+        _ => {
+            return Err(engine(format!(
+                "usb_reinstall_active_not_proven phase={phase}: 当前没有高于历史作废状态的有效 active 回执"
+            )))
+        }
+    };
+    let payload_missing = !recovery.payload_path.is_file();
+    let runtime_missing = !bundle_root.join(USB_APPS_DIR_NAME).join("Codex").is_dir();
+    if !payload_missing && !runtime_missing {
+        return Err(engine(format!(
+            "usb_reinstall_not_needed phase={phase}: 当前受管载荷已恢复"
+        )));
+    }
+    let license_digest = license_digest(&bundle_root)?;
+    Ok(ReinstallGateOutcome::Authorized(SignedUsbAuthorization {
+        bundle_root: bundle_root.clone(),
+        codex_root: usb_codex_root(&bundle_root),
+        fingerprint: fingerprint.clone(),
+        direct_entry_required: recovery.direct_entry_required,
+        installation_id: license.installation_id,
+        key_id: license.key_id.unwrap_or_default(),
+        license_digest,
+        checked_at_ms: now_ms(),
+    }))
+}
+
+/// Re-authorize a pending reactivation updater transaction before it may
+/// remove the exact staged MSIX it installed. This deliberately skips the
+/// full bundle checksum pass because a crash can leave manifests and sums at
+/// different commit phases; it still verifies the live removable-volume
+/// fingerprint, signed license, registration, retained revoked history, and
+/// a higher signed active status.
+pub fn verify_signed_codex_reinstall_transaction(
+    phase: &str,
+    expected_bundle_root: &Path,
+    expected_installation_id: &str,
+    expected_fingerprint: &UsbFingerprint,
+) -> Result<SignedUsbAuthorization, AppError> {
+    if !guard_required() {
+        return Err(engine(format!(
+            "usb_reinstall_transaction_not_usb phase={phase}"
+        )));
+    }
+    let executable =
+        std::env::current_exe().map_err(|error| engine(format!("无法确定安装器路径: {error}")))?;
+    let candidate = bundle_root_for_executable(&executable).ok_or_else(|| {
+        engine(format!(
+            "usb_reinstall_transaction_bundle_missing phase={phase}"
+        ))
+    })?;
+    let observation = observe_windows_bundle(&candidate)?;
+    if !observation.removable {
+        return Err(engine(format!(
+            "usb_reinstall_transaction_media_not_removable phase={phase}"
+        )));
+    }
+    let fingerprint = observation.fingerprint.as_ref().ok_or_else(|| {
+        engine(format!(
+            "usb_reinstall_transaction_fingerprint_missing phase={phase}"
+        ))
+    })?;
+    let bundle_root = PathBuf::from(&observation.bundle_path);
+    let expected_root = fs::canonicalize(expected_bundle_root)
+        .map_err(|error| engine(format!("解析事务授权根目录失败：{error}")))?;
+    let observed_root = fs::canonicalize(&bundle_root)
+        .map_err(|error| engine(format!("解析当前 USB 根目录失败：{error}")))?;
+    if expected_root != observed_root
+        || !license_core::fingerprints_match(fingerprint, expected_fingerprint)
+    {
+        return Err(engine(format!(
+            "usb_reinstall_transaction_identity_changed phase={phase}"
+        )));
+    }
+    validate_bundle_policy_binding(&bundle_root)?;
+    if crate::app::usb_revocation::policy(&bundle_root).map_err(engine)?
+        != crate::app::usb_revocation::RegistrationPolicy::Required
+    {
+        return Err(engine(format!(
+            "usb_reinstall_transaction_policy_invalid phase={phase}"
+        )));
+    }
+    let license = read_license(&bundle_root)?.ok_or_else(|| {
+        engine(format!(
+            "usb_reinstall_transaction_license_missing phase={phase}"
+        ))
+    })?;
+    if license.installation_id != expected_installation_id
+        || !validate_license(&license, fingerprint).map_err(|error| {
+            engine(format!(
+                "usb_reinstall_transaction_license_invalid phase={phase}: {error}"
+            ))
+        })?
+    {
+        return Err(engine(format!(
+            "usb_reinstall_transaction_license_mismatch phase={phase}"
+        )));
+    }
+    let direct_entry_required = crate::app::usb_bundle::direct_entry_policy_for_signed_anchor(
+        &bundle_root,
+        &fingerprint.anchor_sha256,
+    )
+    .map_err(|error| {
+        engine(format!(
+            "usb_reinstall_transaction_entry_policy_invalid phase={phase}: {error}"
+        ))
+    })?;
+    if !direct_entry_required {
+        return Err(engine(format!(
+            "usb_reinstall_transaction_entry_policy_missing phase={phase}"
+        )));
+    }
+    let snapshot = crate::app::usb_revocation::local_snapshot(&bundle_root, &license, fingerprint)
+        .map_err(|error| {
+            engine(format!(
+                "usb_reinstall_transaction_state_invalid phase={phase}: {error}"
+            ))
+        })?;
+    if !snapshot.had_verified_revoked_history
+        || !snapshot.highest_verified_revoked_version.is_some()
+    {
+        return Err(engine(format!(
+            "usb_reinstall_transaction_history_missing phase={phase}"
+        )));
+    }
+    crate::app::usb_revocation::load_registration(&bundle_root, &license, fingerprint).map_err(
+        |error| {
+            engine(format!(
+                "usb_reinstall_transaction_registration_invalid phase={phase}: {error}"
+            ))
+        },
+    )?;
+    let decision = crate::app::usb_revocation::check_startup(&bundle_root, &license, fingerprint)
+        .map_err(|error| {
+        engine(format!(
+            "usb_reinstall_transaction_status_failed phase={phase}: {error}"
+        ))
+    })?;
+    let active_version = match decision {
+        crate::app::usb_revocation::Decision::ActiveOnline { state_version }
+        | crate::app::usb_revocation::Decision::ActiveOffline {
+            state_version: Some(state_version),
+        } if snapshot
+            .highest_verified_revoked_version
+            .is_some_and(|revoked| state_version > revoked) =>
+        {
+            state_version
+        }
+        _ => {
+            return Err(engine(format!(
+                "usb_reinstall_transaction_not_active phase={phase}"
+            )))
+        }
+    };
+    log::debug!(
+        "USB reactivation transaction authorized phase={phase} state_version={active_version} installation_id={expected_installation_id} anchor={}",
+        fingerprint.anchor_sha256
+    );
+    Ok(SignedUsbAuthorization {
+        bundle_root: bundle_root.clone(),
+        codex_root: usb_codex_root(&bundle_root),
+        fingerprint: fingerprint.clone(),
+        direct_entry_required,
+        installation_id: license.installation_id,
+        key_id: license.key_id.unwrap_or_default(),
+        license_digest: license_digest(&bundle_root)?,
+        checked_at_ms: now_ms(),
+    })
+}
+
+/// The only shared install boundary that can accept either a normal live lease
+/// or the narrowly validated reactivation reinstall state. All callers still
+/// must identify the concrete USB install path after this check.
+pub fn require_signed_codex_install_bundle(
+    phase: &str,
+) -> Result<Option<SignedUsbAuthorization>, AppError> {
+    if !guard_required() {
+        return Ok(None);
+    }
+    if let Ok(authorization) = require_signed_codex_bundle(phase) {
+        return Ok(authorization);
+    }
+    require_signed_codex_reinstall_bundle(phase).map(Some)
 }
 
 /// Re-observe and authorize the exact physical bundle owned by this manager
@@ -1265,7 +1740,7 @@ pub fn authorized_account_binding() -> Result<Option<license_core::UsbAccountBin
 /// USB product. Existing `apps`/`Codex` reparse points are rejected so a copied
 /// or tampered bundle cannot redirect the payload onto C: or another volume.
 pub fn authorized_usb_codex_root() -> Result<PathBuf, AppError> {
-    let authorization = require_signed_codex_bundle("codex-install-destination")?
+    let authorization = require_signed_codex_install_bundle("codex-install-destination")?
         .ok_or_else(|| engine("当前进程不是 USB bundle，不能解析 USB Codex 目录"))?;
     let bundle = authorization.bundle_root;
     let apps = bundle.join(USB_APPS_DIR_NAME);
@@ -1467,6 +1942,77 @@ fn wait_for_guard_helper_ready() -> bool {
     }
 }
 
+/// Check local signed revocation metadata before the manager performs any
+/// prerequisite or Codex recovery work. The returned boolean indicates that
+/// the recovery validator has authorized the reduced, missing-payload layout;
+/// callers still keep Codex blocked until `start_for_manager_inner` completes
+/// the online decision.
+fn local_revocation_preflight(
+    bundle: &Path,
+    license: &UsbLicense,
+    fingerprint: &UsbFingerprint,
+    license_is_signed: bool,
+) -> Option<(String, bool)> {
+    let policy = match crate::app::usb_revocation::policy(bundle) {
+        Ok(policy) => policy,
+        Err(error) => return Some((format!("USB 撤销策略无效：{error}"), false)),
+    };
+    if policy == crate::app::usb_revocation::RegistrationPolicy::LegacyUnenrolled {
+        return None;
+    }
+    if !license_is_signed {
+        return Some((
+            "此 U 盘要求有效签名许可证和登记声明；当前许可证不能用于联网状态校验".to_string(),
+            false,
+        ));
+    }
+    let snapshot = match crate::app::usb_revocation::local_snapshot(bundle, license, fingerprint) {
+        Ok(snapshot) => snapshot,
+        Err(error) => return Some((format!("读取本地作废状态失败：{error}"), false)),
+    };
+    if snapshot.had_verified_revoked_history {
+        let recovery =
+            crate::app::usb_bundle::verify_revocation_recovery_bundle(bundle, license, fingerprint);
+        let report = match recovery {
+            Ok(report) => report,
+            Err(error) => {
+                return Some((
+                    format!("发现历史作废记录，但当前 U 盘不满足受控恢复校验：{error}"),
+                    false,
+                ));
+            }
+        };
+        match snapshot.decision {
+            Some(crate::app::usb_revocation::Decision::Revoked { .. })
+            | Some(crate::app::usb_revocation::Decision::StatusConflict { .. }) => {
+                return Some((
+                    "U 盘有已验证的作废回执，Codex 已锁定；正在核实最新状态".to_string(),
+                    true,
+                ));
+            }
+            Some(crate::app::usb_revocation::Decision::ActiveOffline { .. }) => {
+                let payload_missing = !report.payload_path.is_file();
+                let runtime_missing = !bundle.join(USB_APPS_DIR_NAME).join("Codex").is_dir();
+                if payload_missing || runtime_missing {
+                    return Some((
+                        "U 盘收到恢复所需的本地状态，但 Codex 安装载荷不完整；联网复核后只允许重新安装".to_string(),
+                        true,
+                    ));
+                }
+            }
+            _ => {}
+        }
+    } else if let Err(error) =
+        crate::app::usb_revocation::load_registration(bundle, license, fingerprint)
+    {
+        return Some((
+            format!("缺少或无法验证登记声明，需修复后才能联网校验：{error}"),
+            false,
+        ));
+    }
+    None
+}
+
 /// Perform the small, read-only portion of startup validation. The expensive
 /// SHA/AuthentiCode walk is deliberately deferred until after the local shell
 /// exists when the machine already has the runtimes needed to render it. No
@@ -1508,7 +2054,21 @@ fn startup_preflight_impl(complete_integrity: bool) -> Result<StartupPreflight, 
         }
         Ok(None) => None,
     };
-    if complete_integrity {
+    let revocation_restriction = if license_reason.is_none() {
+        match read_license(&bundle) {
+            Ok(Some(license)) => match validate_license(&license, fingerprint) {
+                Ok(signed) => local_revocation_preflight(&bundle, &license, fingerprint, signed),
+                Err(_) => None,
+            },
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let recovery_layout_validated = revocation_restriction
+        .as_ref()
+        .is_some_and(|(_, recovery_validated)| *recovery_validated);
+    if complete_integrity && !recovery_layout_validated {
         verify_runtime_bundle_integrity(&bundle).map_err(|error| {
             engine(format!(
                 "usb_bundle_invalid：启动前完整 bundle 校验失败：{error}"
@@ -1516,6 +2076,10 @@ fn startup_preflight_impl(complete_integrity: bool) -> Result<StartupPreflight, 
         })?;
     }
     let _ = local_data_paths()?;
+    if let Some((reason, _)) = revocation_restriction {
+        STARTUP_INTEGRITY_PENDING.store(true, Ordering::SeqCst);
+        return Ok(StartupPreflight::RevocationPending { reason });
+    }
     if complete_integrity {
         STARTUP_INTEGRITY_PENDING.store(false, Ordering::SeqCst);
         Ok(match license_reason {
@@ -1666,8 +2230,181 @@ pub fn register_new_processes(before: &[u32], image_name: &str, role: &str) {
 }
 
 pub fn register_new_codex_processes(before_codex: &[u32], before_chatgpt: &[u32]) {
+    if guard_required() {
+        let Some(codex_root) = current_usb_codex_root().and_then(|root| root.canonicalize().ok())
+        else {
+            log::warn!(
+                "USB guard could not resolve the current Codex root for process registration"
+            );
+            return;
+        };
+        register_new_usb_codex_processes(before_codex, &codex_root);
+        return;
+    }
     register_new_processes(before_codex, "Codex.exe", "codex");
     register_new_processes(before_chatgpt, "ChatGPT.exe", "codex");
+}
+
+#[cfg(target_os = "windows")]
+fn register_new_usb_codex_processes(before: &[u32], codex_root: &Path) {
+    let Some(expected_entry) = usb_codex_entry_executable(codex_root) else {
+        log::warn!(
+            "USB guard could not resolve the manager-launchable Codex executable under {}",
+            codex_root.display()
+        );
+        return;
+    };
+    let Some(image_name) = expected_entry.file_name().and_then(|name| name.to_str()) else {
+        log::warn!("USB guard Codex manifest entry has a non-UTF-8 filename");
+        return;
+    };
+    for pid in snapshot_processes(image_name) {
+        if before.contains(&pid) {
+            continue;
+        }
+        let image = match process_image_path(pid) {
+            Ok(image) => image,
+            Err(error) => {
+                log::warn!("USB guard could not query Codex entry image pid={pid}: {error}");
+                continue;
+            }
+        };
+        if !codex_image_is_owned_by_root(codex_root, &image, &image) {
+            continue;
+        }
+        if let Err(error) = register_process(pid, "codex", Some(&image)) {
+            log::warn!("USB guard could not register Codex entry pid={pid}: {error}");
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn register_new_usb_codex_processes(_before: &[u32], _codex_root: &Path) {}
+
+/// Snapshot only the manager-launchable Codex image for the active USB bundle.
+/// USB overlay installs use the preserved official executable; legacy and
+/// non-overlay installs keep the manifest-declared entry.
+pub fn snapshot_usb_codex_entry_processes() -> Vec<u32> {
+    let Some(codex_root) = current_usb_codex_root() else {
+        return Vec::new();
+    };
+    let Some(executable) = usb_codex_entry_executable(&codex_root) else {
+        return Vec::new();
+    };
+    let Some(image_name) = executable.file_name().and_then(|name| name.to_str()) else {
+        return Vec::new();
+    };
+    snapshot_processes(image_name)
+}
+
+fn usb_codex_entry_executable(codex_root: &Path) -> Option<PathBuf> {
+    let canonical_root = fs::canonicalize(codex_root).ok()?;
+    let executable =
+        fs::canonicalize(codex_win_engine::installed_codex_launch_exe(&canonical_root).ok()?)
+            .ok()?;
+    if !executable.is_file()
+        || !executable
+            .parent()
+            .is_some_and(|parent| codex_win_engine::same_windows_path(parent, &canonical_root))
+    {
+        return None;
+    }
+    Some(executable)
+}
+
+/// Close only this Bundle's manifest-declared Codex entry processes before
+/// revocation cleanup. Each candidate is reopened once and its image path is
+/// checked on the same process handle that receives WM_CLOSE/TerminateProcess.
+/// The caller must still run the strict `apps/Codex` process probe before any
+/// file deletion; unknown or unqueryable live processes therefore fail closed.
+pub(crate) fn close_codex_entry_processes_for_revocation(
+    bundle_root: &Path,
+) -> Result<(), AppError> {
+    #[cfg(target_os = "windows")]
+    {
+        let canonical_bundle = fs::canonicalize(bundle_root)
+            .map_err(|error| engine(format!("无法确认 USB Bundle 路径：{error}")))?;
+        let codex_root = canonical_bundle
+            .join(USB_APPS_DIR_NAME)
+            .join(USB_CODEX_DIR_NAME);
+        let canonical_codex_root = fs::canonicalize(&codex_root)
+            .map_err(|error| engine(format!("无法确认 apps/Codex 路径：{error}")))?;
+        if !codex_win_engine::same_windows_path(&codex_root, &canonical_codex_root) {
+            return Err(engine("apps/Codex 路径发生重解析变化，拒绝关闭进程"));
+        }
+        let expected = usb_codex_entry_executable(&canonical_codex_root)
+            .ok_or_else(|| engine("无法从 AppxManifest.xml 确认 Codex 官方入口，拒绝猜测进程名"))?;
+        let image_name = expected
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| engine("AppxManifest.xml 中的 Codex 入口名称无效"))?;
+        for pid in snapshot_processes(image_name) {
+            let managed = ManagedProcess {
+                pid,
+                role: "codex".to_string(),
+                executable: Some(expected.to_string_lossy().into_owned()),
+                started_at_ms: now_ms(),
+            };
+            // A same-name executable outside this Bundle is intentionally
+            // ignored. The strict post-close probe catches a live target whose
+            // image could not be queried or whose close did not complete.
+            let _ = terminate_usb_codex_process_under_root(&canonical_codex_root, &managed);
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = bundle_root;
+        Err(engine("仅支持在 Windows 上安全核验 USB Codex 进程"))
+    }
+}
+
+fn codex_image_is_owned_by_root(codex_root: &Path, registered: &Path, actual: &Path) -> bool {
+    let Some(expected) = usb_codex_entry_executable(codex_root) else {
+        return false;
+    };
+    codex_win_engine::same_windows_path(registered, &expected)
+        && codex_win_engine::same_windows_path(actual, &expected)
+}
+
+#[cfg(target_os = "windows")]
+fn process_image_path(pid: u32) -> io::Result<PathBuf> {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
+    use windows_sys::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW};
+
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return Err(io::Error::from_raw_os_error(
+            unsafe { GetLastError() } as i32
+        ));
+    }
+    let mut buffer = vec![0_u16; 32_768];
+    let mut length = buffer.len() as u32;
+    let queried =
+        unsafe { QueryFullProcessImageNameW(process, 0, buffer.as_mut_ptr(), &mut length) };
+    let error = if queried == 0 {
+        Some(io::Error::from_raw_os_error(
+            unsafe { GetLastError() } as i32
+        ))
+    } else {
+        None
+    };
+    unsafe { CloseHandle(process) };
+    if let Some(error) = error {
+        return Err(error);
+    }
+    use std::os::windows::ffi::OsStringExt;
+    Ok(PathBuf::from(std::ffi::OsString::from_wide(
+        &buffer[..length as usize],
+    )))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn process_image_path(_pid: u32) -> io::Result<PathBuf> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "process image queries are only available on Windows",
+    ))
 }
 
 /// Return the PIDs registered by the current lease for a role.  Consumers use
@@ -1684,9 +2421,8 @@ pub fn managed_processes_for_role(role: &str) -> Vec<ManagedProcess> {
         .unwrap_or_default()
 }
 
-/// Terminate only the processes for one lease role.  This is shared by the
-/// watchdog expiry path and the CCSwitch uninstall path so both flows apply
-/// the same PID plus executable-name recheck before calling taskkill.
+/// Terminate only the processes for one lease role. This is shared by the
+/// watchdog expiry path and the CCSwitch uninstall path.
 pub fn terminate_managed_processes_for_role(role: &str) -> usize {
     let Some(lease) = read_lease() else {
         return 0;
@@ -1727,6 +2463,12 @@ fn terminate_managed_processes(lease: &UsbLease) -> usize {
         if managed.pid == self_pid {
             continue;
         }
+        if managed.role == "codex" {
+            if terminate_usb_codex_process(lease, managed) {
+                terminated += 1;
+            }
+            continue;
+        }
         let expected_image = managed
             .executable
             .as_deref()
@@ -1735,9 +2477,9 @@ fn terminate_managed_processes(lease: &UsbLease) -> usize {
         if !process_matches(managed.pid, expected_image.as_deref()) {
             continue;
         }
-        // Give the application a short graceful close window first.  The
-        // forceful retry is still PID-scoped and only happens if that exact
-        // process (and image marker) remains alive.
+        // Non-Codex helpers retain their existing PID/name based behavior.
+        // USB Codex uses a different path below: its manifest-entry image
+        // validation and termination share one process handle to avoid PID reuse.
         let pid_text = managed.pid.to_string();
         let graceful = Command::new("taskkill")
             .args(["/PID", &pid_text, "/T"])
@@ -1775,6 +2517,158 @@ fn terminate_managed_processes(lease: &UsbLease) -> usize {
         }
     }
     terminated
+}
+
+#[cfg(target_os = "windows")]
+struct OwnedProcessHandle(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(target_os = "windows")]
+impl Drop for OwnedProcessHandle {
+    fn drop(&mut self) {
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn terminate_usb_codex_process(lease: &UsbLease, managed: &ManagedProcess) -> bool {
+    let codex_root = PathBuf::from(&lease.bundle_path)
+        .join(USB_APPS_DIR_NAME)
+        .join(USB_CODEX_DIR_NAME);
+    terminate_usb_codex_process_under_root(&codex_root, managed)
+}
+
+#[cfg(target_os = "windows")]
+fn terminate_usb_codex_process_under_root(codex_root: &Path, managed: &ManagedProcess) -> bool {
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    use windows_sys::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
+
+    let Some(process) = open_verified_usb_codex_process_under_root(codex_root, managed) else {
+        return false;
+    };
+    request_graceful_close_to_verified_process(process.0, managed.pid);
+    match unsafe { WaitForSingleObject(process.0, 250) } {
+        WAIT_OBJECT_0 => return true,
+        windows_sys::Win32::Foundation::WAIT_TIMEOUT => {}
+        status => {
+            log::warn!(
+                "USB guard could not wait for verified USB Codex entry pid={} status={status}",
+                managed.pid
+            );
+            return false;
+        }
+    }
+    if unsafe { TerminateProcess(process.0, 1) } == 0 {
+        log::warn!(
+            "USB guard could not terminate verified USB Codex entry pid={} error={}",
+            managed.pid,
+            unsafe { windows_sys::Win32::Foundation::GetLastError() }
+        );
+        return false;
+    }
+    (unsafe { WaitForSingleObject(process.0, 5_000) }) == WAIT_OBJECT_0
+}
+
+#[cfg(target_os = "windows")]
+struct VerifiedCloseContext {
+    pid: u32,
+    process: windows_sys::Win32::Foundation::HANDLE,
+}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn post_close_to_verified_process(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    context: windows_sys::Win32::Foundation::LPARAM,
+) -> i32 {
+    use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindowThreadProcessId, PostMessageW, WM_CLOSE,
+    };
+
+    let context = unsafe { &*(context as *const VerifiedCloseContext) };
+    if unsafe { WaitForSingleObject(context.process, 0) } != WAIT_TIMEOUT {
+        return 0;
+    }
+    let mut window_pid = 0_u32;
+    unsafe { GetWindowThreadProcessId(hwnd, &mut window_pid) };
+    if window_pid == context.pid {
+        // WM_CLOSE is a graceful request to windows owned by the already
+        // verified process. It does not target or terminate child processes.
+        unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) };
+    }
+    1
+}
+
+#[cfg(target_os = "windows")]
+fn request_graceful_close_to_verified_process(
+    process: windows_sys::Win32::Foundation::HANDLE,
+    pid: u32,
+) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::EnumWindows;
+    let context = VerifiedCloseContext { pid, process };
+    unsafe {
+        EnumWindows(
+            Some(post_close_to_verified_process),
+            &context as *const VerifiedCloseContext as isize,
+        );
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn open_verified_usb_codex_process_under_root(
+    codex_root: &Path,
+    managed: &ManagedProcess,
+) -> Option<OwnedProcessHandle> {
+    use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, WaitForSingleObject,
+    };
+
+    if managed.role != "codex" {
+        return None;
+    }
+    let canonical_codex_root = fs::canonicalize(codex_root).ok()?;
+    if !codex_win_engine::same_windows_path(codex_root, &canonical_codex_root) {
+        return None;
+    }
+    let expected = usb_codex_entry_executable(&canonical_codex_root)?;
+    let registered = fs::canonicalize(managed.executable.as_deref().map(Path::new)?).ok()?;
+    if !codex_win_engine::same_windows_path(&expected, &registered) {
+        return None;
+    }
+
+    let raw = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | PROCESS_SYNCHRONIZE,
+            0,
+            managed.pid,
+        )
+    };
+    if raw.is_null() {
+        return None;
+    }
+    let process = OwnedProcessHandle(raw);
+    if unsafe { WaitForSingleObject(process.0, 0) } != WAIT_TIMEOUT {
+        return None;
+    }
+
+    let mut buffer = vec![0_u16; 32_768];
+    let mut length = buffer.len() as u32;
+    if unsafe { QueryFullProcessImageNameW(process.0, 0, buffer.as_mut_ptr(), &mut length) } == 0 {
+        return None;
+    }
+    use std::os::windows::ffi::OsStringExt;
+    let image = PathBuf::from(std::ffi::OsString::from_wide(&buffer[..length as usize]));
+    let image = fs::canonicalize(image).ok()?;
+    if !codex_win_engine::same_windows_path(&expected, &image) {
+        return None;
+    }
+    // Recheck liveness using the same object that TerminateProcess will
+    // receive. A PID reused after this point cannot redirect the operation.
+    if unsafe { WaitForSingleObject(process.0, 0) } != WAIT_TIMEOUT {
+        return None;
+    }
+    Some(process)
 }
 
 #[cfg(target_os = "windows")]
@@ -2084,8 +2978,234 @@ fn finish_restricted_start(status: UsbGuardStatus) -> Result<UsbGuardStatus, App
 }
 
 #[cfg(target_os = "windows")]
+fn revocation_restricted_status(
+    observation: &UsbObservation,
+    fingerprint: &UsbFingerprint,
+    signed: bool,
+    revocation_state: &str,
+    state_version: Option<u64>,
+    reinstall_allowed: bool,
+    message: impl Into<String>,
+) -> UsbGuardStatus {
+    let message = message.into();
+    let mut status = base_status("restricted", "not-running");
+    status.removable = observation.removable;
+    status.drive_root = observation.drive_root.clone();
+    status.bundle_path = Some(observation.bundle_path.clone());
+    status.bundle_relative_path = Some(fingerprint.bundle_relative_path.clone());
+    status.signed = signed;
+    status.signature_state = if signed {
+        "valid".to_string()
+    } else {
+        "invalid".to_string()
+    };
+    status.codex_allowed = false;
+    status.codex_block_reason = Some(message.clone());
+    status.revocation_state = revocation_state.to_string();
+    status.revocation_state_version = state_version;
+    status.reinstall_allowed = reinstall_allowed;
+    status.message = message;
+    status
+}
+
+#[cfg(target_os = "windows")]
+fn revoke_and_cleanup(
+    observation: &UsbObservation,
+    bundle: &Path,
+    license: &UsbLicense,
+    fingerprint: &UsbFingerprint,
+    state_version: u64,
+    conflict: bool,
+) -> Result<UsbGuardStatus, AppError> {
+    revoke_and_cleanup_with(
+        observation,
+        bundle,
+        license,
+        fingerprint,
+        state_version,
+        conflict,
+        finish_restricted_start,
+        crate::app::usb_revocation_cleanup::cleanup_revoked_bundle,
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn revoke_and_cleanup_with(
+    observation: &UsbObservation,
+    bundle: &Path,
+    license: &UsbLicense,
+    fingerprint: &UsbFingerprint,
+    state_version: u64,
+    conflict: bool,
+    mut finish: impl FnMut(UsbGuardStatus) -> Result<UsbGuardStatus, AppError>,
+    mut cleanup: impl FnMut(
+        &Path,
+        &UsbLicense,
+        &UsbFingerprint,
+    ) -> Result<crate::app::usb_revocation_cleanup::CleanupReport, AppError>,
+) -> Result<UsbGuardStatus, AppError> {
+    let pending_state = if conflict {
+        "status_conflict"
+    } else {
+        "revoked_cleanup_pending"
+    };
+    let pending_message = if conflict {
+        "服务器状态出现同版本冲突，按已作废处理；正在锁定 Codex 并清理受管文件".to_string()
+    } else {
+        "服务器已确认此 U 盘作废；正在锁定 Codex 并清理受管文件".to_string()
+    };
+    // Publish the denial and remove any old helper lease before attempting to
+    // close or delete the Codex payload. A failed status/helper handoff stops
+    // the cleanup path.
+    let pending = revocation_restricted_status(
+        observation,
+        fingerprint,
+        true,
+        pending_state,
+        Some(state_version),
+        false,
+        pending_message,
+    );
+    let _ = finish(pending)?;
+
+    match cleanup(bundle, license, fingerprint) {
+        Ok(report) => {
+            let complete = report.complete;
+            let message = if complete {
+                "U 盘许可证已作废，Codex 受管载荷已清理；授权回执仍保留在 U 盘中".to_string()
+            } else {
+                format!(
+                    "U 盘许可证已作废，部分受管文件仍需清理；请保持 U 盘连接并重试。{}",
+                    report.failed.join("；")
+                )
+            };
+            let status = revocation_restricted_status(
+                observation,
+                fingerprint,
+                true,
+                if complete {
+                    "revoked_cleaned"
+                } else {
+                    "revoked_cleanup_partial"
+                },
+                Some(state_version),
+                false,
+                message,
+            );
+            finish(status)
+        }
+        Err(error) => {
+            let status = revocation_restricted_status(
+                observation,
+                fingerprint,
+                true,
+                "revoked_cleanup_partial",
+                Some(state_version),
+                false,
+                format!("U 盘许可证已作废，清理未完成；请保持 U 盘连接并重试：{error}"),
+            );
+            finish(status)
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn handle_startup_revocation_decision(
+    decision: &crate::app::usb_revocation::Decision,
+    observation: &UsbObservation,
+    bundle: &Path,
+    license: &UsbLicense,
+    fingerprint: &UsbFingerprint,
+) -> Option<Result<UsbGuardStatus, AppError>> {
+    let result = handle_startup_revocation_decision_with(
+        decision,
+        observation,
+        bundle,
+        license,
+        fingerprint,
+        finish_restricted_start,
+        crate::app::usb_revocation_cleanup::cleanup_revoked_bundle,
+    );
+    if result.as_ref().is_some_and(cleanup_result_needs_retry) {
+        log_initial_cleanup_retry_detail(result.as_ref().expect("checked some"));
+        let state_version = match decision {
+            crate::app::usb_revocation::Decision::Revoked { state_version } => *state_version,
+            crate::app::usb_revocation::Decision::StatusConflict { state_version } => {
+                *state_version
+            }
+            _ => return result,
+        };
+        match cleanup_retry_identity(observation, bundle, license, fingerprint, state_version) {
+            Ok(identity) => ensure_revocation_cleanup_retry_worker(identity),
+            Err(error) => log::error!("USB 作废清理未完成，无法建立安全的后台重试身份：{error}"),
+        }
+    }
+    result
+}
+
+#[cfg(target_os = "windows")]
+fn handle_startup_revocation_decision_with(
+    decision: &crate::app::usb_revocation::Decision,
+    observation: &UsbObservation,
+    bundle: &Path,
+    license: &UsbLicense,
+    fingerprint: &UsbFingerprint,
+    finish: impl FnMut(UsbGuardStatus) -> Result<UsbGuardStatus, AppError>,
+    cleanup: impl FnMut(
+        &Path,
+        &UsbLicense,
+        &UsbFingerprint,
+    ) -> Result<crate::app::usb_revocation_cleanup::CleanupReport, AppError>,
+) -> Option<Result<UsbGuardStatus, AppError>> {
+    let (state_version, conflict) = match decision {
+        crate::app::usb_revocation::Decision::Revoked { state_version } => (*state_version, false),
+        crate::app::usb_revocation::Decision::StatusConflict { state_version } => {
+            (*state_version, true)
+        }
+        _ => return None,
+    };
+    Some(revoke_and_cleanup_with(
+        observation,
+        bundle,
+        license,
+        fingerprint,
+        state_version,
+        conflict,
+        finish,
+        cleanup,
+    ))
+}
+
+#[cfg(all(target_os = "windows", test))]
+pub(crate) fn handle_startup_revocation_decision_for_test(
+    decision: &crate::app::usb_revocation::Decision,
+    observation: &UsbObservation,
+    bundle: &Path,
+    license: &UsbLicense,
+    fingerprint: &UsbFingerprint,
+    cleanup: impl FnMut(
+        &Path,
+        &UsbLicense,
+        &UsbFingerprint,
+    ) -> Result<crate::app::usb_revocation_cleanup::CleanupReport, AppError>,
+) -> Option<Result<UsbGuardStatus, AppError>> {
+    handle_startup_revocation_decision_with(
+        decision,
+        observation,
+        bundle,
+        license,
+        fingerprint,
+        Ok,
+        cleanup,
+    )
+}
+
+#[cfg(target_os = "windows")]
 pub fn start_for_manager() -> Result<UsbGuardStatus, AppError> {
     let result = start_for_manager_inner();
+    if crate::app::usb_revocation::has_pending_revocation() {
+        ensure_pending_revocation_retry_worker();
+    }
     // Keep the fail-closed `starting` status visible when an unexpected
     // initialization error occurs. A stale status.json must never become the
     // apparent authorization state after the pending marker is cleared.
@@ -2093,6 +3213,686 @@ pub fn start_for_manager() -> Result<UsbGuardStatus, AppError> {
         STARTUP_INTEGRITY_PENDING.store(false, Ordering::SeqCst);
     }
     result
+}
+
+#[cfg(target_os = "windows")]
+struct PendingRevocationRetryWorker {
+    cancel: std::sync::mpsc::Sender<()>,
+    join: std::thread::JoinHandle<()>,
+}
+
+#[cfg(target_os = "windows")]
+static PENDING_REVOCATION_RETRY_WORKER: std::sync::Mutex<Option<PendingRevocationRetryWorker>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(target_os = "windows")]
+fn ensure_pending_revocation_retry_worker() {
+    let mut slot = PENDING_REVOCATION_RETRY_WORKER
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if slot
+        .as_ref()
+        .is_some_and(|worker| !worker.join.is_finished())
+    {
+        return;
+    }
+    if let Some(finished) = slot.take() {
+        let _ = finished.join.join();
+    }
+    let (cancel, receiver) = std::sync::mpsc::channel();
+    let join = std::thread::spawn(move || {
+        let mut delay_seconds = 1_u64;
+        loop {
+            match receiver.recv_timeout(Duration::from_secs(delay_seconds)) {
+                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            if !crate::app::usb_revocation::has_pending_revocation() {
+                break;
+            }
+            if let Err(error) = retry_pending_revocation_once() {
+                log::warn!("USB 作废状态后台持久化重试失败：{error}");
+            }
+            if !crate::app::usb_revocation::has_pending_revocation() {
+                break;
+            }
+            delay_seconds = (delay_seconds.saturating_mul(2)).min(10);
+        }
+    });
+    *slot = Some(PendingRevocationRetryWorker { cancel, join });
+}
+
+#[cfg(target_os = "windows")]
+fn stop_pending_revocation_retry_worker() {
+    let worker = PENDING_REVOCATION_RETRY_WORKER
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .take();
+    if let Some(worker) = worker {
+        let _ = worker.cancel.send(());
+        if worker.join.thread().id() != std::thread::current().id() {
+            let _ = worker.join.join();
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn stop_pending_revocation_retry_worker() {}
+
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone)]
+struct RevocationCleanupRetryIdentity {
+    observation: UsbObservation,
+    canonical_bundle_path: PathBuf,
+    installation_id: String,
+    license_signature_sha256: String,
+    fingerprint: UsbFingerprint,
+    state_version: u64,
+}
+
+#[cfg(target_os = "windows")]
+struct RevocationCleanupRetryWorker {
+    identity: RevocationCleanupRetryIdentity,
+    cancel: std::sync::mpsc::Sender<()>,
+    join: std::thread::JoinHandle<()>,
+}
+
+#[cfg(target_os = "windows")]
+static REVOCATION_CLEANUP_RETRY_WORKER: std::sync::Mutex<Option<RevocationCleanupRetryWorker>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(target_os = "windows")]
+fn cleanup_retry_identity(
+    observation: &UsbObservation,
+    bundle: &Path,
+    license: &UsbLicense,
+    fingerprint: &UsbFingerprint,
+    state_version: u64,
+) -> Result<RevocationCleanupRetryIdentity, AppError> {
+    if !observation.removable || observation.fingerprint.as_ref() != Some(fingerprint) {
+        return Err(engine("初始作废身份不是已验证的 removable USB"));
+    }
+    let canonical_bundle_path = fs::canonicalize(bundle)
+        .map_err(|error| engine(format!("无法固定作废清理重试路径：{error}")))?;
+    let license_signature_sha256 =
+        license_core::license_signature_sha256(license).map_err(map_license_error)?;
+    Ok(RevocationCleanupRetryIdentity {
+        observation: observation.clone(),
+        canonical_bundle_path,
+        installation_id: license.installation_id.clone(),
+        license_signature_sha256,
+        fingerprint: fingerprint.clone(),
+        state_version,
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn cleanup_result_needs_retry(result: &Result<UsbGuardStatus, AppError>) -> bool {
+    match result {
+        Ok(status) => status.revocation_state == "revoked_cleanup_partial",
+        Err(_) => true,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn log_initial_cleanup_retry_detail(result: &Result<UsbGuardStatus, AppError>) {
+    match result {
+        Ok(status) => log::warn!("USB 作废清理首轮未完成，后台将重试：{}", status.message),
+        Err(error) => log::warn!("USB 作废清理首轮失败，后台将重试：{error}"),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn revoke_and_cleanup_with_retry(
+    observation: &UsbObservation,
+    bundle: &Path,
+    license: &UsbLicense,
+    fingerprint: &UsbFingerprint,
+    state_version: u64,
+    conflict: bool,
+) -> Result<UsbGuardStatus, AppError> {
+    let result = revoke_and_cleanup(
+        observation,
+        bundle,
+        license,
+        fingerprint,
+        state_version,
+        conflict,
+    );
+    if cleanup_result_needs_retry(&result) {
+        log_initial_cleanup_retry_detail(&result);
+        match cleanup_retry_identity(observation, bundle, license, fingerprint, state_version) {
+            Ok(identity) => ensure_revocation_cleanup_retry_worker(identity),
+            Err(error) => log::error!("USB 作废清理未完成，无法建立安全的后台重试身份：{error}"),
+        }
+    }
+    result
+}
+
+#[cfg(target_os = "windows")]
+fn cleanup_retry_identity_matches(
+    identity: &RevocationCleanupRetryIdentity,
+    observation: &UsbObservation,
+    canonical_bundle_path: &Path,
+    license: &UsbLicense,
+    signed: bool,
+    signature_sha256: &str,
+) -> bool {
+    observation.removable
+        && observation.fingerprint.as_ref() == Some(&identity.fingerprint)
+        && codex_win_engine::same_windows_path(
+            &identity.canonical_bundle_path,
+            canonical_bundle_path,
+        )
+        && signed
+        && license.installation_id == identity.installation_id
+        && signature_sha256 == identity.license_signature_sha256
+        && license.fingerprint == identity.fingerprint
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CleanupRetryOutcome {
+    Retry { phase: &'static str, detail: String },
+    Complete,
+    Stop { phase: &'static str, detail: String },
+}
+
+#[cfg(target_os = "windows")]
+fn cleanup_for_verified_decision_with(
+    decision: &crate::app::usb_revocation::Decision,
+    cleanup: impl FnOnce(u64, bool) -> CleanupRetryOutcome,
+) -> Option<CleanupRetryOutcome> {
+    match decision {
+        crate::app::usb_revocation::Decision::Revoked { state_version } => {
+            Some(cleanup(*state_version, false))
+        }
+        crate::app::usb_revocation::Decision::StatusConflict { state_version } => {
+            Some(cleanup(*state_version, true))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn run_cleanup_retry_loop_with(
+    mut cancelled: impl FnMut(Duration) -> bool,
+    mut attempt: impl FnMut() -> CleanupRetryOutcome,
+    mut report_retry: impl FnMut(&'static str, &str, u64),
+) {
+    let mut delay = Duration::from_secs(1);
+    let mut retries = 0_u64;
+    loop {
+        if cancelled(delay) {
+            break;
+        }
+        match attempt() {
+            CleanupRetryOutcome::Complete | CleanupRetryOutcome::Stop { .. } => break,
+            CleanupRetryOutcome::Retry { phase, detail } => {
+                retries = retries.saturating_add(1);
+                if retries == 1 || retries % 5 == 0 {
+                    report_retry(phase, &detail, retries);
+                }
+                delay = delay.saturating_mul(2).min(Duration::from_secs(30));
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn cleanup_retry_targets_match(
+    left: &RevocationCleanupRetryIdentity,
+    right: &RevocationCleanupRetryIdentity,
+) -> bool {
+    left.installation_id == right.installation_id
+        && left.license_signature_sha256 == right.license_signature_sha256
+        && left.fingerprint == right.fingerprint
+        && codex_win_engine::same_windows_path(
+            &left.canonical_bundle_path,
+            &right.canonical_bundle_path,
+        )
+}
+
+#[cfg(target_os = "windows")]
+fn ensure_revocation_cleanup_retry_worker(identity: RevocationCleanupRetryIdentity) {
+    let mut slot = REVOCATION_CLEANUP_RETRY_WORKER
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if let Some(worker) = slot.as_ref().filter(|worker| !worker.join.is_finished()) {
+        if cleanup_retry_targets_match(&worker.identity, &identity) {
+            return;
+        }
+        log::error!("USB 作废清理重试已绑定另一安装身份；拒绝启动并行清理 worker");
+        return;
+    }
+    if let Some(finished) = slot.take() {
+        let _ = finished.join.join();
+    }
+    log::info!("USB 作废清理后台重试已启动；管理器会话保持锁定");
+    let (cancel, receiver) = std::sync::mpsc::channel();
+    let worker_identity = identity.clone();
+    let join = std::thread::spawn(move || {
+        run_cleanup_retry_loop_with(
+            |delay| match receiver.recv_timeout(delay) {
+                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => true,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
+            },
+            || retry_revocation_cleanup_once(&worker_identity),
+            |phase, detail, retry| {
+                log::warn!("USB 作废清理重试未完成 phase={phase} retry={retry}: {detail}")
+            },
+        );
+    });
+    *slot = Some(RevocationCleanupRetryWorker {
+        identity,
+        cancel,
+        join,
+    });
+}
+
+#[cfg(target_os = "windows")]
+fn stop_revocation_cleanup_retry_worker() {
+    let worker = REVOCATION_CLEANUP_RETRY_WORKER
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .take();
+    if let Some(worker) = worker {
+        let _ = worker.cancel.send(());
+        if worker.join.thread().id() != std::thread::current().id() {
+            let _ = worker.join.join();
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn stop_revocation_cleanup_retry_worker() {}
+
+#[cfg(target_os = "windows")]
+fn retry_revocation_cleanup_once(identity: &RevocationCleanupRetryIdentity) -> CleanupRetryOutcome {
+    use crate::app::usb_revocation::Decision;
+
+    let observed_at_captured_path = match observe_windows_bundle(&identity.canonical_bundle_path) {
+        Ok(observation) => observation,
+        Err(_error) if !identity.canonical_bundle_path.exists() => {
+            return CleanupRetryOutcome::Retry {
+                phase: "usb_not_present",
+                detail: "等待原 U 盘重新连接".to_string(),
+            };
+        }
+        Err(error) => {
+            return CleanupRetryOutcome::Retry {
+                phase: "usb_reobserve_failed",
+                detail: error.to_string(),
+            };
+        }
+    };
+    let observed_path = PathBuf::from(&observed_at_captured_path.bundle_path);
+    let canonical_observed_path = match fs::canonicalize(&observed_path) {
+        Ok(path) => path,
+        Err(error) => {
+            return CleanupRetryOutcome::Retry {
+                phase: "usb_canonicalize_failed",
+                detail: error.to_string(),
+            };
+        }
+    };
+    if !observed_at_captured_path.removable
+        || !codex_win_engine::same_windows_path(
+            &identity.canonical_bundle_path,
+            &canonical_observed_path,
+        )
+        || observed_at_captured_path.fingerprint.as_ref() != Some(&identity.fingerprint)
+    {
+        return stop_cleanup_retry_for_identity_change(
+            identity,
+            "观察到的 removable USB、完整指纹或 canonical bundle path 与启动时不一致",
+        );
+    }
+    // Re-scan removable volumes as well as probing the captured path. This
+    // rejects an ambiguous duplicate instead of selecting one by drive order.
+    let Some(observation) = scan_removable_for(&identity.fingerprint) else {
+        return CleanupRetryOutcome::Retry {
+            phase: "usb_not_uniquely_observed",
+            detail: "原 removable USB 暂时无法唯一识别，Codex 仍锁定".to_string(),
+        };
+    };
+    let bundle_root = PathBuf::from(&observation.bundle_path);
+    let canonical_bundle_path = match fs::canonicalize(&bundle_root) {
+        Ok(path) => path,
+        Err(error) => {
+            return CleanupRetryOutcome::Retry {
+                phase: "usb_canonicalize_failed",
+                detail: error.to_string(),
+            };
+        }
+    };
+    if !observation.removable
+        || observation.fingerprint.as_ref() != Some(&identity.fingerprint)
+        || !codex_win_engine::same_windows_path(
+            &identity.canonical_bundle_path,
+            &canonical_bundle_path,
+        )
+    {
+        return stop_cleanup_retry_for_identity_change(
+            identity,
+            "重新扫描到的 removable USB 路径或完整指纹已变化",
+        );
+    }
+    let license = match read_license(&bundle_root) {
+        Ok(Some(license)) => license,
+        Ok(None) => {
+            return stop_cleanup_retry_for_identity_change(identity, "许可证文件已移除");
+        }
+        Err(error) => {
+            return CleanupRetryOutcome::Retry {
+                phase: "license_read_failed",
+                detail: error.to_string(),
+            };
+        }
+    };
+    let signed = match validate_license(&license, &identity.fingerprint) {
+        Ok(signed) => signed,
+        Err(error) => {
+            return stop_cleanup_retry_for_identity_change(
+                identity,
+                &format!("许可证重验失败：{error}"),
+            );
+        }
+    };
+    let signature_sha256 = match license_core::license_signature_sha256(&license) {
+        Ok(digest) => digest,
+        Err(error) => {
+            return stop_cleanup_retry_for_identity_change(
+                identity,
+                &format!("许可证签名摘要计算失败：{error}"),
+            );
+        }
+    };
+    if !cleanup_retry_identity_matches(
+        identity,
+        &observation,
+        &canonical_bundle_path,
+        &license,
+        signed,
+        &signature_sha256,
+    ) {
+        return stop_cleanup_retry_for_identity_change(
+            identity,
+            "installation_id、签名摘要、许可证签名或完整 fingerprint 已变化",
+        );
+    }
+    let decision = match crate::app::usb_revocation::check_startup(
+        &bundle_root,
+        &license,
+        &identity.fingerprint,
+    ) {
+        Ok(decision) => decision,
+        Err(error) => {
+            return CleanupRetryOutcome::Retry {
+                phase: "revocation_revalidation_failed",
+                detail: error,
+            };
+        }
+    };
+    if let Some(outcome) = cleanup_for_verified_decision_with(&decision, |version, conflict| {
+        cleanup_retry_cleanup(
+            identity,
+            &observation,
+            &bundle_root,
+            &license,
+            version,
+            conflict,
+        )
+    }) {
+        return outcome;
+    }
+    match decision {
+        Decision::Revoked { .. } | Decision::StatusConflict { .. } => unreachable!(),
+        Decision::ActiveOnline { state_version }
+        | Decision::ActiveOffline {
+            state_version: Some(state_version),
+        } => stop_cleanup_retry_for_state_change(
+            identity,
+            Some(state_version),
+            "已验证到新的有效授权状态。为保持本次会话安全，Codex 仍锁定；请关闭并重新打开管理器重新校验。",
+        ),
+        Decision::ActiveOffline {
+            state_version: None,
+        }
+        | Decision::LegacyUnenrolled
+        | Decision::RegistrationRequiredRepair => stop_cleanup_retry_for_state_change(
+            identity,
+            None,
+            "当前已无法证明作废状态仍然有效。Codex 仍锁定；请关闭并重新打开管理器重新校验。",
+        ),
+        Decision::RevokedPersistencePending {
+            state_version,
+            message,
+        } => {
+            let status = revocation_restricted_status(
+                &identity.observation,
+                &identity.fingerprint,
+                true,
+                "revocation_persist_pending",
+                Some(state_version),
+                false,
+                format!("作废回执仍未能安全同步；Codex 保持锁定并重试：{message}"),
+            );
+            let _ = finish_restricted_start(status);
+            CleanupRetryOutcome::Retry {
+                phase: "revocation_persist_pending",
+                detail: message,
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn cleanup_retry_cleanup(
+    identity: &RevocationCleanupRetryIdentity,
+    observation: &UsbObservation,
+    bundle: &Path,
+    license: &UsbLicense,
+    state_version: u64,
+    conflict: bool,
+) -> CleanupRetryOutcome {
+    match revoke_and_cleanup(
+        observation,
+        bundle,
+        license,
+        &identity.fingerprint,
+        state_version,
+        conflict,
+    ) {
+        Ok(status) if status.revocation_state == "revoked_cleaned" => {
+            log::info!("USB 作废清理重试完成；当前管理器会话仍保持锁定");
+            CleanupRetryOutcome::Complete
+        }
+        Ok(status) => CleanupRetryOutcome::Retry {
+            phase: "cleanup_partial",
+            detail: status.message,
+        },
+        Err(error) => CleanupRetryOutcome::Retry {
+            phase: "cleanup_failed",
+            detail: error.to_string(),
+        },
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn stop_cleanup_retry_for_identity_change(
+    identity: &RevocationCleanupRetryIdentity,
+    detail: &str,
+) -> CleanupRetryOutcome {
+    log::error!("USB 作废清理重试身份发生变化，拒绝删除：{detail}");
+    let status = revocation_restricted_status(
+        &identity.observation,
+        &identity.fingerprint,
+        true,
+        "revoked_cleanup_partial",
+        Some(identity.state_version),
+        false,
+        format!(
+            "检测到 U 盘身份或安装路径与作废时不同，已停止后台清理；Codex 仍锁定。请关闭并重新打开管理器重新验证。{detail}"
+        ),
+    );
+    let _ = finish_restricted_start(status);
+    CleanupRetryOutcome::Stop {
+        phase: "identity_changed",
+        detail: detail.to_string(),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn stop_cleanup_retry_for_state_change(
+    identity: &RevocationCleanupRetryIdentity,
+    state_version: Option<u64>,
+    message: &str,
+) -> CleanupRetryOutcome {
+    log::info!("USB 作废清理重试未再次确认 revoked/StatusConflict；停止删除并保持当前会话锁定");
+    let status = revocation_restricted_status(
+        &identity.observation,
+        &identity.fingerprint,
+        true,
+        "revocation_persisted_restart_required",
+        state_version,
+        false,
+        message,
+    );
+    let _ = finish_restricted_start(status);
+    CleanupRetryOutcome::Stop {
+        phase: "authorization_state_changed",
+        detail: "未再次确认最高状态仍为 revoked/StatusConflict；停止删除并保留 restricted 会话"
+            .to_string(),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn retry_pending_revocation_once() -> Result<(), AppError> {
+    use crate::app::usb_revocation::Decision;
+
+    let executable = std::env::current_exe()
+        .map_err(|error| engine(format!("无法确定作废重试的管理器路径：{error}")))?;
+    let Some(bundle) = bundle_root_for_executable(&executable) else {
+        return Ok(());
+    };
+    let observation = match observe_windows_bundle(&bundle) {
+        Ok(observation) => observation,
+        Err(_) => return Ok(()),
+    };
+    let Some(fingerprint) = observation.fingerprint.as_ref() else {
+        return Ok(());
+    };
+    let bundle_root = PathBuf::from(&observation.bundle_path);
+    let license = match read_license(&bundle_root) {
+        Ok(Some(license)) => license,
+        _ => return Ok(()),
+    };
+    let signed = match validate_license(&license, fingerprint) {
+        Ok(signed) => signed,
+        Err(_) => return Ok(()),
+    };
+    let current_license_digest = match license_core::license_signature_sha256(&license) {
+        Ok(digest) => digest,
+        Err(_) => return Ok(()),
+    };
+    let Some(expected) = crate::app::usb_revocation::pending_revocation_identity_for_installation(
+        &license.installation_id,
+    ) else {
+        return Ok(());
+    };
+    if !signed
+        || license.installation_id != expected.installation_id
+        || current_license_digest != expected.license_signature_sha256
+        || *fingerprint != expected.fingerprint
+    {
+        return Ok(());
+    }
+    match crate::app::usb_revocation::check_startup(&bundle_root, &license, fingerprint)
+        .map_err(|error| engine(format!("待持久化状态重试失败：{error}")))?
+    {
+        Decision::RevokedPersistencePending {
+            state_version,
+            message,
+        } => {
+            let status = revocation_restricted_status(
+                &observation,
+                fingerprint,
+                true,
+                "revocation_persist_pending",
+                Some(state_version),
+                false,
+                format!(
+                    "已验签的作废回执尚未能同时写入 U 盘和本机；Codex 保持锁定并继续重试：{message}"
+                ),
+            );
+            finish_restricted_start(status)?;
+        }
+        Decision::Revoked { state_version } => {
+            revoke_and_cleanup_with_retry(
+                &observation,
+                &bundle_root,
+                &license,
+                fingerprint,
+                state_version,
+                false,
+            )?;
+        }
+        Decision::StatusConflict { state_version } => {
+            revoke_and_cleanup_with_retry(
+                &observation,
+                &bundle_root,
+                &license,
+                fingerprint,
+                state_version,
+                true,
+            )?;
+        }
+        Decision::ActiveOnline { state_version }
+        | Decision::ActiveOffline {
+            state_version: Some(state_version),
+        } => {
+            // Persisting the two copies completes the retry, but this worker
+            // never turns the restricted session into an authorized lease.
+            let status = revocation_restricted_status(
+                &observation,
+                fingerprint,
+                true,
+                "revocation_persisted_restart_required",
+                Some(state_version),
+                false,
+                "授权状态已安全写入 U 盘和本机。为重新使用 Codex，请关闭并重新打开管理器完成常规校验。",
+            );
+            finish_restricted_start(status)?;
+        }
+        Decision::ActiveOffline {
+            state_version: None,
+        } => {
+            let status = revocation_restricted_status(
+                &observation,
+                fingerprint,
+                true,
+                "revocation_persisted_restart_required",
+                None,
+                false,
+                "作废状态已安全同步，但当前没有可授权的 active 回执。Codex 仍保持锁定。",
+            );
+            finish_restricted_start(status)?;
+        }
+        Decision::LegacyUnenrolled | Decision::RegistrationRequiredRepair => {
+            let status = revocation_restricted_status(
+                &observation,
+                fingerprint,
+                true,
+                "revocation_persisted_restart_required",
+                None,
+                false,
+                "状态同步已完成，但当前授权不能开放 Codex；请重新打开管理器重试完整校验。",
+            );
+            finish_restricted_start(status)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
@@ -2114,17 +3914,21 @@ fn start_for_manager_inner() -> Result<UsbGuardStatus, AppError> {
     };
     let observed_bundle_root = PathBuf::from(&observation.bundle_path);
     validate_bundle_policy_binding(&observed_bundle_root)?;
-    if let Err(error) = verify_runtime_bundle_integrity(&observed_bundle_root) {
-        let mut status = base_status("mismatch", "not-running");
-        status.removable = true;
-        status.drive_root = observation.drive_root;
-        status.bundle_path = Some(observation.bundle_path);
-        status.bundle_relative_path = Some(fingerprint.bundle_relative_path);
-        status.signature_state = "invalid".to_string();
-        status.codex_block_reason = Some(error.to_string());
-        status.message = error.to_string();
-        return finish_restricted_start(status);
-    }
+    let revocation_policy = match crate::app::usb_revocation::policy(&observed_bundle_root) {
+        Ok(policy) => policy,
+        Err(error) => {
+            let status = revocation_restricted_status(
+                &observation,
+                &fingerprint,
+                false,
+                "local_invalid",
+                None,
+                false,
+                format!("U 盘撤销策略无法验证，Codex 已锁定：{error}"),
+            );
+            return finish_restricted_start(status);
+        }
+    };
 
     let existing_license = match read_license(&observed_bundle_root) {
         Ok(value) => value,
@@ -2153,16 +3957,22 @@ fn start_for_manager_inner() -> Result<UsbGuardStatus, AppError> {
                 return finish_restricted_start(status);
             }
         },
-        None if signed_required() => {
+        None if signed_required()
+            || revocation_policy == crate::app::usb_revocation::RegistrationPolicy::Required =>
+        {
             let mut status = base_status("mismatch", "not-running");
             status.removable = true;
             status.drive_root = observation.drive_root;
             status.bundle_path = Some(observation.bundle_path);
             status.bundle_relative_path = Some(fingerprint.bundle_relative_path);
             status.signature_state = "missing".to_string();
-            status.codex_block_reason =
-                Some("SignedRequired 构建缺少 usb-license.json".to_string());
-            status.message = "正式 USB 包缺少签名许可证，未创建租约".to_string();
+            status.revocation_state = "registration_required_repair".to_string();
+            status.codex_block_reason = Some(if signed_required() {
+                "SignedRequired 构建缺少 usb-license.json".to_string()
+            } else {
+                "schemaVersion=3 U 盘缺少有效签名许可证，需修复后再使用".to_string()
+            });
+            status.message = status.codex_block_reason.clone().unwrap_or_default();
             return finish_restricted_start(status);
         }
         None => {
@@ -2174,6 +3984,270 @@ fn start_for_manager_inner() -> Result<UsbGuardStatus, AppError> {
             (license, false)
         }
     };
+
+    let mut revocation_state =
+        if revocation_policy == crate::app::usb_revocation::RegistrationPolicy::LegacyUnenrolled {
+            "remote_unenrolled".to_string()
+        } else {
+            "not-applicable".to_string()
+        };
+    let mut revocation_state_version = None;
+    let mut integrity_verified = false;
+
+    if revocation_policy == crate::app::usb_revocation::RegistrationPolicy::Required {
+        if !signed {
+            let status = revocation_restricted_status(
+                &observation,
+                &fingerprint,
+                false,
+                "registration_required_repair",
+                None,
+                false,
+                "schemaVersion=3 U 盘必须有有效签名许可证和登记声明，未建立 Codex 租约".to_string(),
+            );
+            return finish_restricted_start(status);
+        }
+        let snapshot = match crate::app::usb_revocation::local_snapshot(
+            &observed_bundle_root,
+            &license,
+            &fingerprint,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let status = revocation_restricted_status(
+                    &observation,
+                    &fingerprint,
+                    true,
+                    "local_invalid",
+                    None,
+                    false,
+                    format!("本地签名状态无法验证，Codex 已锁定：{error}"),
+                );
+                return finish_restricted_start(status);
+            }
+        };
+        let has_revoked_history = snapshot.had_verified_revoked_history;
+        let locally_revoked = matches!(
+            snapshot.decision,
+            Some(crate::app::usb_revocation::Decision::Revoked { .. })
+                | Some(crate::app::usb_revocation::Decision::StatusConflict { .. })
+        );
+        let recovery_report = if has_revoked_history {
+            match crate::app::usb_bundle::verify_revocation_recovery_bundle(
+                &observed_bundle_root,
+                &license,
+                &fingerprint,
+            ) {
+                Ok(report) => Some(report),
+                Err(error) => {
+                    let status = revocation_restricted_status(
+                        &observation,
+                        &fingerprint,
+                        true,
+                        "local_invalid",
+                        None,
+                        false,
+                        format!(
+                            "发现历史作废回执，但 U 盘不满足受控恢复校验；Codex 已锁定：{error}"
+                        ),
+                    );
+                    return finish_restricted_start(status);
+                }
+            }
+        } else {
+            None
+        };
+        let recovery_payload_missing = recovery_report.as_ref().is_some_and(|report| {
+            !report.payload_path.is_file()
+                || !observed_bundle_root
+                    .join(USB_APPS_DIR_NAME)
+                    .join("Codex")
+                    .is_dir()
+        });
+
+        // A prior verified revoked receipt permits an offline revoked lock and
+        // narrow cleanup even if registration needs repair. Active/reinstall
+        // paths always require a valid current registration.
+        if !locally_revoked {
+            if let Err(error) = crate::app::usb_revocation::load_registration(
+                &observed_bundle_root,
+                &license,
+                &fingerprint,
+            ) {
+                let status = revocation_restricted_status(
+                    &observation,
+                    &fingerprint,
+                    true,
+                    "registration_required_repair",
+                    None,
+                    false,
+                    format!("登记声明缺失或无效，Codex 操作已锁定：{error}"),
+                );
+                return finish_restricted_start(status);
+            }
+        }
+
+        // When there is no outstanding revoked decision or missing payload,
+        // require the complete signed bundle before making the online check.
+        // A valid revoked receipt is the only reason to use the recovery view.
+        if !locally_revoked && !recovery_payload_missing {
+            if let Err(error) = verify_runtime_bundle_integrity(&observed_bundle_root) {
+                let status = revocation_restricted_status(
+                    &observation,
+                    &fingerprint,
+                    true,
+                    "local_invalid",
+                    None,
+                    false,
+                    format!("U 盘内容校验失败，Codex 已锁定：{error}"),
+                );
+                return finish_restricted_start(status);
+            }
+            integrity_verified = true;
+        }
+
+        let decision = match crate::app::usb_revocation::check_startup(
+            &observed_bundle_root,
+            &license,
+            &fingerprint,
+        ) {
+            Ok(decision) => decision,
+            Err(error) => {
+                let status = revocation_restricted_status(
+                    &observation,
+                    &fingerprint,
+                    true,
+                    if locally_revoked {
+                        "revoked_cleanup_partial"
+                    } else {
+                        "local_invalid"
+                    },
+                    None,
+                    false,
+                    format!("无法完成签名状态校验，Codex 已锁定：{error}"),
+                );
+                return finish_restricted_start(status);
+            }
+        };
+        if let Some(result) = handle_startup_revocation_decision(
+            &decision,
+            &observation,
+            &observed_bundle_root,
+            &license,
+            &fingerprint,
+        ) {
+            return result;
+        }
+        match decision {
+            crate::app::usb_revocation::Decision::Revoked { .. }
+            | crate::app::usb_revocation::Decision::StatusConflict { .. } => {
+                unreachable!("revoked decisions are handled before startup continues")
+            }
+            crate::app::usb_revocation::Decision::RevokedPersistencePending {
+                state_version,
+                message,
+            } => {
+                let status = revocation_restricted_status(
+                    &observation,
+                    &fingerprint,
+                    true,
+                    "revocation_persist_pending",
+                    Some(state_version),
+                    false,
+                    format!(
+                        "已收到有效作废回执，但暂时无法同时保存到 U 盘和本机；Codex 操作持续锁定，正在重试：{message}"
+                    ),
+                );
+                return finish_restricted_start(status);
+            }
+            crate::app::usb_revocation::Decision::RegistrationRequiredRepair => {
+                let status = revocation_restricted_status(
+                    &observation,
+                    &fingerprint,
+                    true,
+                    "registration_required_repair",
+                    None,
+                    false,
+                    "登记声明缺失或验证失败。修复签名登记后，管理器才能检查授权状态。".to_string(),
+                );
+                return finish_restricted_start(status);
+            }
+            crate::app::usb_revocation::Decision::ActiveOnline { state_version } => {
+                revocation_state = "active_online".to_string();
+                revocation_state_version = Some(state_version);
+            }
+            crate::app::usb_revocation::Decision::ActiveOffline { state_version } => {
+                revocation_state = "active_offline".to_string();
+                revocation_state_version = state_version;
+            }
+            crate::app::usb_revocation::Decision::LegacyUnenrolled => {
+                revocation_state = "remote_unenrolled".to_string();
+            }
+        }
+
+        if has_revoked_history {
+            let higher_active = revocation_state_version.is_some_and(|version| {
+                snapshot
+                    .highest_verified_revoked_version
+                    .is_some_and(|revoked_version| version > revoked_version)
+            });
+            if !higher_active {
+                let status = revocation_restricted_status(
+                    &observation,
+                    &fingerprint,
+                    true,
+                    "revoked_cleanup_partial",
+                    revocation_state_version,
+                    false,
+                    "当前状态尚未证明高于历史作废状态，Codex 仍保持锁定".to_string(),
+                );
+                return finish_restricted_start(status);
+            }
+            if recovery_payload_missing {
+                let status = revocation_restricted_status(
+                    &observation,
+                    &fingerprint,
+                    true,
+                    "reactivated_payload_missing",
+                    revocation_state_version,
+                    true,
+                    "授权已恢复，但 Codex 安装载荷不完整；仅可通过管理器下载并重新安装 Codex"
+                        .to_string(),
+                );
+                return finish_restricted_start(status);
+            }
+        }
+    } else if let Err(error) = verify_runtime_bundle_integrity(&observed_bundle_root) {
+        let mut status = base_status("mismatch", "not-running");
+        status.removable = true;
+        status.drive_root = observation.drive_root;
+        status.bundle_path = Some(observation.bundle_path);
+        status.bundle_relative_path = Some(fingerprint.bundle_relative_path);
+        status.signature_state = "invalid".to_string();
+        status.revocation_state = "local_invalid".to_string();
+        status.codex_block_reason = Some(error.to_string());
+        status.message = error.to_string();
+        return finish_restricted_start(status);
+    } else {
+        integrity_verified = true;
+    }
+
+    // Higher active receipts may reopen Codex only after the full immutable
+    // tree has been restored and independently verified.
+    if !integrity_verified {
+        if let Err(error) = verify_runtime_bundle_integrity(&observed_bundle_root) {
+            let status = revocation_restricted_status(
+                &observation,
+                &fingerprint,
+                signed,
+                "local_invalid",
+                revocation_state_version,
+                false,
+                format!("U 盘载荷恢复后未通过完整校验，Codex 已锁定：{error}"),
+            );
+            return finish_restricted_start(status);
+        }
+    }
 
     let startup_plan = startup_guard_plan(signed_required(), signed);
     if !startup_plan.establish_lease {
@@ -2250,6 +4324,9 @@ fn start_for_manager_inner() -> Result<UsbGuardStatus, AppError> {
     } else {
         "unsigned-development".to_string()
     };
+    status.revocation_state = revocation_state;
+    status.revocation_state_version = revocation_state_version;
+    status.reinstall_allowed = false;
     status.codex_allowed = helper_ready && signed;
     status.codex_block_reason = (!status.codex_allowed).then(|| {
         if !signed {
@@ -2286,6 +4363,8 @@ pub fn start_for_manager() -> Result<UsbGuardStatus, AppError> {
 }
 
 pub fn stop_for_manager() {
+    stop_revocation_cleanup_retry_worker();
+    stop_pending_revocation_retry_worker();
     remove_lease();
     let mut status = base_status("stopped", "not-running");
     status.message = status_message("stopped");
@@ -2531,6 +4610,224 @@ mod tests {
         assert!(!StartupPreflight::Ready.is_authorization_blocked());
         assert!(!StartupPreflight::Ready.is_integrity_pending());
         assert_eq!(StartupPreflight::Ready.reason(), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pending_revocation_worker_cancel_is_joined_before_stop_returns() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        let (cancel, receiver) = std::sync::mpsc::channel();
+        let finished = Arc::new(AtomicBool::new(false));
+        let worker_finished = Arc::clone(&finished);
+        let join = std::thread::spawn(move || {
+            let _ = receiver.recv();
+            worker_finished.store(true, Ordering::SeqCst);
+        });
+        {
+            let mut slot = PENDING_REVOCATION_RETRY_WORKER
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            assert!(slot.is_none(), "test must own the sole retry worker");
+            *slot = Some(PendingRevocationRetryWorker { cancel, join });
+        }
+
+        stop_pending_revocation_retry_worker();
+
+        assert!(finished.load(Ordering::SeqCst));
+        assert!(PENDING_REVOCATION_RETRY_WORKER
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .is_none());
+    }
+
+    #[cfg(windows)]
+    static CLEANUP_RETRY_WORKER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(windows)]
+    fn cleanup_retry_test_identity() -> RevocationCleanupRetryIdentity {
+        let fingerprint = UsbFingerprint {
+            volume_serial: 19,
+            anchor_sha256: "ab".repeat(32),
+            bundle_relative_path: "codexusb".to_string(),
+            anchor_schema: ANCHOR_SCHEMA_V3,
+        };
+        RevocationCleanupRetryIdentity {
+            observation: UsbObservation {
+                removable: true,
+                drive_root: Some(r"F:\".to_string()),
+                bundle_path: r"F:\CodexUSB".to_string(),
+                fingerprint: Some(fingerprint.clone()),
+            },
+            canonical_bundle_path: PathBuf::from(r"F:\CodexUSB"),
+            installation_id: "cleanup-retry-test".to_string(),
+            license_signature_sha256: "cd".repeat(32),
+            fingerprint,
+            state_version: 8,
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cleanup_retry_loop_retries_partial_then_stops_after_success() {
+        let mut attempts = 0;
+        run_cleanup_retry_loop_with(
+            |_| false,
+            || {
+                attempts += 1;
+                if attempts == 1 {
+                    CleanupRetryOutcome::Retry {
+                        phase: "partial",
+                        detail: "first pass incomplete".to_string(),
+                    }
+                } else {
+                    CleanupRetryOutcome::Complete
+                }
+            },
+            |_, _, _| {},
+        );
+        assert_eq!(attempts, 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cleanup_retry_worker_cancel_is_joined_before_stop_returns() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        let _test_lock = CLEANUP_RETRY_WORKER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let (cancel, receiver) = std::sync::mpsc::channel();
+        let finished = Arc::new(AtomicBool::new(false));
+        let worker_finished = Arc::clone(&finished);
+        let join = std::thread::spawn(move || {
+            run_cleanup_retry_loop_with(
+                |delay| match receiver.recv_timeout(delay) {
+                    Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => true,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
+                },
+                || CleanupRetryOutcome::Retry {
+                    phase: "test",
+                    detail: "cancelled".to_string(),
+                },
+                |_, _, _| {},
+            );
+            worker_finished.store(true, Ordering::SeqCst);
+        });
+        {
+            let mut slot = REVOCATION_CLEANUP_RETRY_WORKER
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            assert!(
+                slot.is_none(),
+                "test must own the sole cleanup retry worker"
+            );
+            *slot = Some(RevocationCleanupRetryWorker {
+                identity: cleanup_retry_test_identity(),
+                cancel,
+                join,
+            });
+        }
+
+        stop_revocation_cleanup_retry_worker();
+
+        assert!(finished.load(Ordering::SeqCst));
+        assert!(REVOCATION_CLEANUP_RETRY_WORKER
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cleanup_retry_never_deletes_after_active_decision() {
+        let mut cleanup_called = false;
+        let outcome = cleanup_for_verified_decision_with(
+            &crate::app::usb_revocation::Decision::ActiveOnline { state_version: 10 },
+            |_, _| {
+                cleanup_called = true;
+                CleanupRetryOutcome::Complete
+            },
+        );
+        assert!(outcome.is_none());
+        assert!(!cleanup_called);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cleanup_retry_identity_mismatch_prevents_destructive_action() {
+        let root = std::env::temp_dir().join(format!("cleanup-retry-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let canonical = std::fs::canonicalize(&root).unwrap();
+        let mut identity = cleanup_retry_test_identity();
+        identity.canonical_bundle_path = canonical.clone();
+        let mut license = new_unsigned_license(identity.fingerprint.clone());
+        license.installation_id = format!("{}-changed", identity.installation_id);
+        let observation = identity.observation.clone();
+        let mut cleanup_called = false;
+
+        if cleanup_retry_identity_matches(
+            &identity,
+            &observation,
+            &canonical,
+            &license,
+            true,
+            &identity.license_signature_sha256,
+        ) {
+            cleanup_called = true;
+        }
+        assert!(!cleanup_called);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pending_revocation_blocks_codex_and_reinstall_gates_without_a_lease() {
+        let installation_id = format!("guard-pending-{}", Uuid::new_v4());
+        let fingerprint = UsbFingerprint {
+            volume_serial: 7,
+            anchor_sha256: "ab".repeat(32),
+            bundle_relative_path: "CodexUSB".to_string(),
+            anchor_schema: ANCHOR_SCHEMA_V3,
+        };
+        crate::app::usb_revocation::set_test_pending_revocation(
+            crate::app::usb_revocation::PendingRevocationIdentity {
+                installation_id: installation_id.clone(),
+                license_signature_sha256: "cd".repeat(32),
+                fingerprint: fingerprint.clone(),
+            },
+            crate::app::usb_revocation::SignedEnvelope {
+                payload_b64: "test".to_string(),
+                signature_b64: "test".to_string(),
+            },
+            7,
+        );
+
+        assert!(require_signed_codex_bundle("pending-gate").is_err());
+        assert!(require_signed_codex_reinstall_bundle("pending-reinstall").is_err());
+
+        let observation = UsbObservation {
+            removable: true,
+            drive_root: Some("D:\\".to_string()),
+            bundle_path: "D:\\CodexUSB".to_string(),
+            fingerprint: Some(fingerprint.clone()),
+        };
+        let status = revocation_restricted_status(
+            &observation,
+            &fingerprint,
+            true,
+            "revocation_persist_pending",
+            Some(7),
+            false,
+            "test pending state",
+        );
+        assert_eq!(status.status, "restricted");
+        assert_eq!(status.watchdog, "not-running");
+        assert!(!status.codex_allowed);
+        assert!(!status.reinstall_allowed);
+        crate::app::usb_revocation::clear_test_pending_revocation(&installation_id);
     }
 
     #[test]
@@ -3058,6 +5355,255 @@ mod tests {
         );
         assert!(executable_name("Codex.exe").is_some());
         assert!(executable_name("C:\\Programs\\").is_none());
+    }
+
+    #[test]
+    fn manifest_entry_outside_bundle_is_not_registered_or_terminated() {
+        let temp = std::env::temp_dir().join(format!("codex-usb-entry-path-{}", Uuid::new_v4()));
+        let bundle_codex = temp.join("bundle").join("apps").join("Codex");
+        let unrelated_root = temp.join("other").join("apps").join("Codex");
+        fs::create_dir_all(&bundle_codex).unwrap();
+        fs::create_dir_all(&unrelated_root).unwrap();
+        let authorized = bundle_codex.join("ChatGPT.exe");
+        let unrelated = unrelated_root.join("ChatGPT.exe");
+        fs::write(&authorized, b"fixture").unwrap();
+        fs::write(&unrelated, b"fixture").unwrap();
+        fs::write(
+            bundle_codex.join("AppxManifest.xml"),
+            r#"<Package><Applications><Application Id="App" Executable="app/ChatGPT.exe" /></Applications></Package>"#,
+        )
+        .unwrap();
+
+        assert!(codex_image_is_owned_by_root(
+            &bundle_codex,
+            &authorized,
+            &authorized
+        ));
+        assert!(!codex_image_is_owned_by_root(
+            &bundle_codex,
+            &unrelated,
+            &unrelated
+        ));
+        assert!(!codex_image_is_owned_by_root(
+            &bundle_codex,
+            &authorized,
+            &unrelated
+        ));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn revocation_closes_only_manifest_entry_and_preserves_manager_and_other_bundle() {
+        use std::process::{Child, Stdio};
+        use std::thread;
+
+        let temp = std::env::temp_dir().join(format!("codex-usb-process-test-{}", Uuid::new_v4()));
+        let bundle_root = temp.join("bundle");
+        let bundle_codex = bundle_root.join("apps").join("Codex");
+        let other_codex = temp.join("other").join("apps").join("Codex");
+        fs::create_dir_all(&bundle_codex).unwrap();
+        fs::create_dir_all(&other_codex).unwrap();
+        let current_exe = std::env::current_exe().unwrap();
+        let authorized_entry = bundle_codex.join("ChatGPT.exe");
+        let unrelated_entry = other_codex.join("ChatGPT.exe");
+        let manager_exe = bundle_root.join("CodexAppManager.exe");
+        fs::copy(&current_exe, &authorized_entry).unwrap();
+        fs::copy(&current_exe, &unrelated_entry).unwrap();
+        fs::copy(&current_exe, &manager_exe).unwrap();
+        for root in [&bundle_codex, &other_codex] {
+            fs::write(
+                root.join("AppxManifest.xml"),
+                r#"<Package><Applications><Application Id="App" Executable="app/ChatGPT.exe" /></Applications></Package>"#,
+            )
+            .unwrap();
+        }
+
+        let target_ready = temp.join("target.ready");
+        let descendant_ready = temp.join("descendant.ready");
+        let mut target = spawn_guard_core_fixture(
+            &authorized_entry,
+            "parent",
+            &target_ready,
+            Some(&descendant_ready),
+        );
+        let target_pid = wait_for_fixture_pid(&target_ready);
+        let descendant_pid = wait_for_fixture_pid(&descendant_ready);
+        assert_eq!(target.id(), target_pid);
+
+        let unrelated_ready = temp.join("unrelated.ready");
+        let mut unrelated =
+            spawn_guard_core_fixture(&unrelated_entry, "leaf", &unrelated_ready, None);
+        let unrelated_pid = wait_for_fixture_pid(&unrelated_ready);
+        assert_eq!(unrelated.id(), unrelated_pid);
+
+        let manager_ready = temp.join("manager.ready");
+        let mut manager = spawn_guard_core_fixture(&manager_exe, "leaf", &manager_ready, None);
+        let manager_pid = wait_for_fixture_pid(&manager_ready);
+        assert_eq!(manager.id(), manager_pid);
+
+        let fingerprint = UsbFingerprint {
+            volume_serial: 123,
+            anchor_sha256: "ab".repeat(32),
+            bundle_relative_path: "fixture".to_string(),
+            anchor_schema: ANCHOR_SCHEMA_V3,
+        };
+        let lease = UsbLease {
+            schema_version: LEASE_SCHEMA_VERSION,
+            product: PRODUCT_ID.to_string(),
+            lease_id: Uuid::new_v4().to_string(),
+            bundle_path: temp.join("bundle").to_string_lossy().into_owned(),
+            fingerprint,
+            installation_id: Some(Uuid::new_v4().to_string()),
+            key_id: Some("fixture-key".to_string()),
+            license_digest: Some("cd".repeat(32)),
+            owner_pid: std::process::id(),
+            managed_processes: vec![
+                ManagedProcess {
+                    pid: target_pid,
+                    role: "codex".to_string(),
+                    executable: Some(
+                        authorized_entry
+                            .canonicalize()
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
+                    started_at_ms: 1,
+                },
+                ManagedProcess {
+                    pid: unrelated_pid,
+                    role: "codex".to_string(),
+                    executable: Some(
+                        unrelated_entry
+                            .canonicalize()
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
+                    started_at_ms: 1,
+                },
+            ],
+            issued_at: "test".to_string(),
+        };
+
+        assert_eq!(terminate_managed_processes(&lease), 1);
+        assert!(!test_process_is_running(target_pid));
+        assert!(test_process_is_running(unrelated_pid));
+        assert!(test_process_is_running(descendant_pid));
+
+        close_codex_entry_processes_for_revocation(&bundle_root).unwrap();
+        assert!(!test_process_is_running(descendant_pid));
+        assert!(test_process_is_running(unrelated_pid));
+        assert!(test_process_is_running(manager_pid));
+
+        stop_test_process(unrelated_pid);
+        stop_test_process(manager_pid);
+        let _ = target.wait();
+        let _ = unrelated.wait();
+        let _ = manager.wait();
+        fs::remove_dir_all(&temp).unwrap();
+
+        fn spawn_guard_core_fixture(
+            executable: &Path,
+            mode: &str,
+            ready_file: &Path,
+            descendant_ready: Option<&Path>,
+        ) -> Child {
+            let exact_test = "app::usb_guard::tests::usb_guard_core_child_fixture";
+            Command::new(executable)
+                .arg("--exact")
+                .arg(exact_test)
+                .arg("--nocapture")
+                .env("CODEX_USB_GUARD_CHILD_MODE", mode)
+                .env("CODEX_USB_GUARD_CHILD_READY", ready_file)
+                .env(
+                    "CODEX_USB_GUARD_DESCENDANT_READY",
+                    descendant_ready.unwrap_or(Path::new("")),
+                )
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap()
+        }
+
+        fn wait_for_fixture_pid(path: &Path) -> u32 {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Ok(text) = fs::read_to_string(path) {
+                    if let Ok(pid) = text.trim().parse() {
+                        return pid;
+                    }
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "fixture did not become ready: {path:?}"
+                );
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn usb_guard_core_child_fixture() {
+        use std::process::Stdio;
+        use std::thread;
+
+        let Ok(mode) = std::env::var("CODEX_USB_GUARD_CHILD_MODE") else {
+            return;
+        };
+        let ready_file = PathBuf::from(std::env::var_os("CODEX_USB_GUARD_CHILD_READY").unwrap());
+        fs::write(&ready_file, std::process::id().to_string()).unwrap();
+        if mode == "parent" {
+            let descendant_ready =
+                PathBuf::from(std::env::var_os("CODEX_USB_GUARD_DESCENDANT_READY").unwrap());
+            let child = Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("app::usb_guard::tests::usb_guard_core_child_fixture")
+                .arg("--nocapture")
+                .env("CODEX_USB_GUARD_CHILD_MODE", "leaf")
+                .env("CODEX_USB_GUARD_CHILD_READY", &descendant_ready)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            drop(child);
+        }
+        loop {
+            thread::sleep(Duration::from_secs(60));
+        }
+    }
+
+    #[cfg(windows)]
+    fn test_process_is_running(pid: u32) -> bool {
+        use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
+        use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
+        let process = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+        if process.is_null() {
+            return false;
+        }
+        let running = unsafe { WaitForSingleObject(process, 0) } == WAIT_TIMEOUT;
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(process) };
+        running
+    }
+
+    #[cfg(windows)]
+    fn stop_test_process(pid: u32) {
+        use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, TerminateProcess, WaitForSingleObject,
+        };
+        let process = unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid) };
+        if process.is_null() {
+            return;
+        }
+        if unsafe { WaitForSingleObject(process, 0) } == WAIT_TIMEOUT {
+            let _ = unsafe { TerminateProcess(process, 1) };
+            let _ = unsafe { WaitForSingleObject(process, 5_000) };
+        }
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(process) };
     }
 
     #[test]

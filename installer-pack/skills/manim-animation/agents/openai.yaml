@@ -1,0 +1,6 @@
+interface:
+  display_name: "Manim 数学动画"
+  short_description: "使用 Manim 制作可编辑的数学解释动画并检查渲染质量。"
+  default_prompt: "Use $manim-animation to design and render this explanatory animation."
+policy:
+  allow_implicit_invocation: false

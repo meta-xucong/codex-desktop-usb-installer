@@ -26,6 +26,7 @@ vi.mock("../../services/managerApi", async (importOriginal) => {
       installAndLaunchCcswitch: vi.fn(),
       gatewayModelProbe: vi.fn(),
       cancelGatewayModelProbe: vi.fn(),
+      manageNativeModelCatalog: vi.fn(),
       accountStatus: vi.fn(),
       accountLogin: vi.fn(),
       accountRefresh: vi.fn(),
@@ -140,8 +141,11 @@ describe("OfflineHome", () => {
       message: "launched",
     });
     api.cancelGatewayModelProbe.mockResolvedValue(true);
+    api.manageNativeModelCatalog.mockResolvedValue({
+      status: "ok", modelIds: [], restartRequired: false, message: "native list",
+    });
     api.gatewayModelProbe.mockResolvedValue({
-      status: "connected", endpoint: "https://404token.xyz/v1", credentialFingerprint: "sha256:fixture",
+      status: "connected", endpoint: "https://404token.xyz/v1", credentialFingerprint: "sha256:fixture", connectionFingerprint: "binding-fixture",
       checkedAt: 1, models: [], results: [], generatedRequests: 0, errorCode: null,
     });
     api.accountStatus.mockResolvedValue({
@@ -159,7 +163,7 @@ describe("OfflineHome", () => {
       coreReady: false,
       overallStatus: "failed",
       sourcePath: "F:\\content\\codex-starter-kit",
-      packVersion: "1.2.0",
+      packVersion: "1.4.0",
       skills: 0,
       agents: 0,
       runtimeReady: false,
@@ -177,8 +181,8 @@ describe("OfflineHome", () => {
       coreReady: true,
       overallStatus: "ready",
       sourcePath: "F:\\content\\codex-starter-kit",
-      packVersion: "1.2.0",
-      skills: 50,
+      packVersion: "1.4.0",
+      skills: 55,
       agents: 7,
       runtimeReady: true,
       runtimeStatus: "ready",
@@ -308,6 +312,22 @@ describe("OfflineHome", () => {
     expect(await screen.findByRole("button", { name: "启动 Codex" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "打开 Codex Switch" })).toBeEnabled();
     expect(api.gatewayModelProbe).not.toHaveBeenCalled();
+    expect(api.manageNativeModelCatalog).not.toHaveBeenCalled();
+  });
+
+  it("opens model management from the home page only after an explicit click", async () => {
+    const user = userEvent.setup();
+    api.winStatus.mockResolvedValue({ status: "managed", installed: USB_PORTABLE_CODEX });
+    renderView();
+    await screen.findByRole("button", { name: "启动 Codex" });
+    expect(api.gatewayModelProbe).not.toHaveBeenCalled();
+    expect(api.manageNativeModelCatalog).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: "添加模型" }));
+    await screen.findByRole("heading", { name: "管理模型" });
+    await waitFor(() => expect(api.gatewayModelProbe).toHaveBeenCalledTimes(1));
+    expect(api.gatewayModelProbe.mock.calls[0]?.[0].selectedModelIds).toEqual([]);
+    expect(api.manageNativeModelCatalog).toHaveBeenCalledWith({ operation: "state" });
   });
 
   it("disables the initial install action for an unsigned USB", async () => {
@@ -575,53 +595,14 @@ describe("OfflineHome", () => {
     expect(localStorage.getItem("codex-usb-ccswitch-injection-issue-v1")).toBe("unconfirmed");
   });
 
-  it("runs only the directory request when an advanced user asks for it", async () => {
+  it("does not expose the old model diagnostics in Advanced", async () => {
     const user = userEvent.setup();
     api.winStatus.mockResolvedValue({ status: "managed", installed: USB_PORTABLE_CODEX });
     renderView();
     await screen.findByRole("button", { name: "启动 Codex" });
     await user.click(screen.getByText("高级功能"));
-    await user.click(screen.getByRole("button", { name: "只检查模型目录（不生成）" }));
-    await waitFor(() => expect(api.gatewayModelProbe).toHaveBeenCalledWith({
-      requestId: expect.any(String),
-      selectedModelIds: [],
-      costConsent: false,
-    }));
-    expect(api.gatewayModelProbe.mock.calls[0]?.[0].selectedModelIds).toEqual([]);
-  });
-
-  it("requires separate cost consent before a selected gateway matrix", async () => {
-    const user = userEvent.setup();
-    api.winStatus.mockResolvedValue({ status: "managed", installed: USB_PORTABLE_CODEX });
-    const directoryReport = {
-      status: "connected" as const, endpoint: "https://404token.xyz/v1",
-      credentialFingerprint: "sha256:fixture", checkedAt: 1,
-      models: [{ id: "glm-5.2", ownedBy: "fixture", selectable: true }],
-      results: [], generatedRequests: 0, errorCode: null,
-    };
-    api.gatewayModelProbe.mockResolvedValueOnce(directoryReport).mockResolvedValueOnce({
-      ...directoryReport,
-      status: "passed",
-      results: [{ modelId: "glm-5.2", passed: true, generatedRequests: 12,
-        checks: [{ name: "text", passed: true }], errorCode: null }],
-      generatedRequests: 12,
-    });
-    renderView();
-    await screen.findByRole("button", { name: "启动 Codex" });
-    await user.click(screen.getByText("高级功能"));
-    await user.click(screen.getByRole("button", { name: "只检查模型目录（不生成）" }));
-    await user.click(await screen.findByRole("checkbox", { name: /glm-5.2/ }));
-    const run = screen.getByRole("button", { name: "探测所选模型（1 个）" });
-    expect(run).toBeDisabled();
-    await user.click(screen.getByRole("checkbox", { name: /我已了解费用无法预估/ }));
-    expect(run).toBeEnabled();
-    await user.click(run);
-    await waitFor(() => expect(api.gatewayModelProbe).toHaveBeenCalledTimes(2));
-    expect(api.gatewayModelProbe.mock.calls[1]?.[0]).toMatchObject({
-      selectedModelIds: ["glm-5.2"],
-      costConsent: true,
-    });
-    expect(await screen.findByText("本次所选模型通过了网关协议矩阵。")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "只检查模型目录（不生成）" })).not.toBeInTheDocument();
+    expect(screen.queryByTestId("gateway-model-probe")).not.toBeInTheDocument();
   });
   it("does not render an unplanned account password field in the USB home", async () => {
     renderView();
@@ -726,8 +707,8 @@ describe("OfflineHome", () => {
       coreReady: true,
       overallStatus: "partial",
       sourcePath: "F:\\content\\codex-starter-kit",
-      packVersion: "1.2.0",
-      skills: 50,
+      packVersion: "1.4.0",
+      skills: 55,
       agents: 7,
       runtimeReady: true,
       runtimeStatus: "ready",
@@ -743,7 +724,7 @@ describe("OfflineHome", () => {
 
     expect(
       await screen.findByText(
-        /核心能力已就绪（50 个 Skills、7 个 Agents），但 Codex 配置存在冲突\/需确认。/,
+        /核心能力已就绪（55 个 Skills、7 个 Agents），但 Codex 配置存在冲突\/需确认。/,
       ),
     ).toBeInTheDocument();
   });
@@ -764,8 +745,8 @@ describe("OfflineHome", () => {
       coreReady: true,
       overallStatus: "partial",
       sourcePath: "F:\\content\\codex-starter-kit",
-      packVersion: "1.2.0",
-      skills: 50,
+      packVersion: "1.4.0",
+      skills: 55,
       agents: 7,
       runtimeReady: false,
       runtimeStatus: "failed",
@@ -788,7 +769,7 @@ describe("OfflineHome", () => {
     renderView();
     const entry = await screen.findByRole("button", { name: "组件修复" });
     await user.click(entry);
-    expect(await screen.findByRole("heading", { name: "组件安装与修复" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "组件修复" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "单独重试 CCSwitch" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "安装 / 修复能力包" })).toBeInTheDocument();
   });

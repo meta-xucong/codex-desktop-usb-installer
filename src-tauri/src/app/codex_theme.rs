@@ -1599,55 +1599,92 @@ fn launch_codex_with_cdp(
     disable_self_updates: bool,
     codex_locale: Option<&str>,
 ) -> Result<(), AppError> {
-    if disable_self_updates {
-        crate::app::codex_self_update::sync_setting(true)?;
-    }
-    let detected = installed_windows_codex()?;
-    if !codex_win_engine::same_windows_path(Path::new(&detected.path), installed) {
-        return Err(AppError::Engine(format!(
-            "Codex 安装位置在重启前发生变化：{} -> {}",
-            installed.display(),
-            detected.path
-        )));
-    }
-    log::info!(
-        "launching Windows Codex with CDP port={port} path={}",
-        installed.display()
-    );
-    let usb_mode = crate::app::usb_guard::guard_required();
-    let launch_policy = if usb_mode {
-        if crate::app::win_update::usb_no_sandbox_compatibility_known(&detected.version) {
-            codex_win_engine::PortableLaunchPolicy::UsbCompatibleNoSandbox
-        } else {
-            codex_win_engine::PortableLaunchPolicy::UsbCompatible
+    run_gated_theme_relaunch(require_theme_relaunch_authorization, || {
+        if disable_self_updates {
+            crate::app::codex_self_update::sync_setting(true)?;
         }
-    } else {
-        codex_win_engine::PortableLaunchPolicy::Standard
-    };
-    let report = codex_win_engine::launch_codex_with_options(
-        &detected,
-        codex_win_engine::LaunchOptions {
-            disable_codex_self_updates: disable_self_updates || usb_mode,
-            remote_debugging_port: Some(port),
-            codex_home: if usb_mode {
-                Some(crate::app::usb_guard::local_data_paths()?.codex_home)
+        let detected = installed_windows_codex()?;
+        if !codex_win_engine::same_windows_path(Path::new(&detected.path), installed) {
+            return Err(AppError::Engine(format!(
+                "Codex 安装位置在重启前发生变化：{} -> {}",
+                installed.display(),
+                detected.path
+            )));
+        }
+        log::info!(
+            "launching Windows Codex with CDP port={port} path={}",
+            installed.display()
+        );
+        let usb_mode = crate::app::usb_guard::guard_required();
+        let launch_policy = if usb_mode {
+            if crate::app::win_update::usb_no_sandbox_compatibility_known(&detected.version) {
+                codex_win_engine::PortableLaunchPolicy::UsbCompatibleNoSandbox
             } else {
-                None
+                codex_win_engine::PortableLaunchPolicy::UsbCompatible
+            }
+        } else {
+            codex_win_engine::PortableLaunchPolicy::Standard
+        };
+        let direct_entry_required = if usb_mode {
+            crate::app::usb_guard::require_signed_codex_bundle("codex-theme-direct-entry-policy")?
+                .map(|authorization| authorization.direct_entry_required)
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        let report = codex_win_engine::launch_codex_with_options(
+            &detected,
+            codex_win_engine::LaunchOptions {
+                disable_codex_self_updates: disable_self_updates || usb_mode,
+                require_usb_entry_overlay: direct_entry_required,
+                remote_debugging_port: Some(port),
+                codex_home: if usb_mode {
+                    Some(crate::app::usb_guard::local_data_paths()?.codex_home)
+                } else {
+                    None
+                },
+                locale_override: codex_locale.map(str::to_string),
+                portable_launch_policy: launch_policy,
             },
-            locale_override: codex_locale.map(str::to_string),
-            portable_launch_policy: launch_policy,
-        },
-    )
-    .map_err(|e| AppError::Engine(format!("以调试模式打开 Codex 失败: {e}")))?;
-    if usb_mode && report.no_sandbox {
-        crate::app::win_update::remember_usb_no_sandbox_compatibility(&detected.version);
-    }
-    Ok(())
+        )
+        .map_err(|e| AppError::Engine(format!("以调试模式打开 Codex 失败: {e}")))?;
+        if usb_mode && report.no_sandbox {
+            crate::app::win_update::remember_usb_no_sandbox_compatibility(&detected.version);
+        }
+        Ok(())
+    })
 }
 
 #[cfg(target_os = "windows")]
 fn launch_codex_plain() -> Result<(), AppError> {
-    crate::app::win_update::launch_codex(&windows_domain_settings(), None)
+    run_gated_theme_relaunch(require_theme_relaunch_authorization, || {
+        crate::app::win_update::launch_codex(&windows_domain_settings(), None)
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn require_theme_relaunch_authorization() -> Result<(), AppError> {
+    if !crate::app::usb_guard::guard_required() {
+        return Ok(());
+    }
+    let status = crate::app::usb_guard::start_for_manager()?;
+    if !status.codex_allowed {
+        return Err(AppError::Engine(
+            status
+                .codex_block_reason
+                .unwrap_or_else(|| status.message.clone()),
+        ));
+    }
+    crate::app::usb_guard::require_signed_codex_bundle("codex-theme-relaunch").map(|_| ())
+}
+
+fn run_gated_theme_relaunch<G, L>(gate: G, launch: L) -> Result<(), AppError>
+where
+    G: FnOnce() -> Result<(), AppError>,
+    L: FnOnce() -> Result<(), AppError>,
+{
+    gate()?;
+    launch()
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -1703,6 +1740,13 @@ pub async fn launch_with_active_theme(
             // A broken/missing theme must never brick the launch button:
             // surface in logs, launch plainly.
             log::warn!("themed launch failed, falling back to plain launch: {error}");
+            #[cfg(target_os = "windows")]
+            if crate::app::usb_guard::guard_required() {
+                // The caller may immediately fall back to a plain launch.
+                // Refresh USB authorization after a failed themed relaunch so
+                // a signed revoke cannot be converted into that fallback.
+                require_theme_relaunch_authorization()?;
+            }
             Ok(false)
         }
     }
@@ -1721,6 +1765,37 @@ mod catalog_network_tests {
             Some(35),
             b"curl: (35) schannel: SEC_E_UNTRUSTED_ROOT"
         ));
+    }
+}
+
+#[cfg(test)]
+mod usb_theme_launch_gate_tests {
+    use super::run_gated_theme_relaunch;
+    use crate::errors::AppError;
+    use std::cell::Cell;
+
+    #[test]
+    fn signed_revocation_blocks_every_theme_relaunch_route_before_spawn() {
+        let routes = [
+            "apply debug relaunch",
+            "try-on debug relaunch",
+            "pre-commit rollback plain relaunch",
+            "post-launch error rollback plain relaunch",
+            "theme off success plain relaunch",
+            "theme off rollback plain relaunch",
+        ];
+        for route in routes {
+            let launched = Cell::new(false);
+            let result = run_gated_theme_relaunch(
+                || Err(AppError::Engine("signed USB revocation".to_string())),
+                || {
+                    launched.set(true);
+                    Ok(())
+                },
+            );
+            assert!(result.is_err(), "route={route}");
+            assert!(!launched.get(), "route={route} must not spawn Codex");
+        }
     }
 }
 

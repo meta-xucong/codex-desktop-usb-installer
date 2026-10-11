@@ -1,10 +1,12 @@
 use std::fs;
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::app_version::read_codex_app_version_from_install_root;
 use crate::msix::{parse_appx_manifest_xml, MsixIdentity};
@@ -53,12 +55,16 @@ pub struct PortableUninstallReport {
 /// profile: the verified payload is installed on removable media without
 /// starting Codex before CCSwitch is configured, and without publishing a
 /// direct Start Menu/uninstall entry that could bypass the USB manager.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortableInstallOptions {
     pub close_running: bool,
     pub launch_health_check: bool,
     pub relaunch: bool,
     pub create_shell_metadata: bool,
+    /// Optional USB direct-entry shim copied into the declared MSIX entry
+    /// point during the same transactional payload preparation. The original
+    /// executable is kept as a non-`.exe` payload file for manager-only launch.
+    pub usb_entry_shim: Option<PathBuf>,
 }
 
 impl PortableInstallOptions {
@@ -68,6 +74,7 @@ impl PortableInstallOptions {
             launch_health_check: manage_process,
             relaunch: manage_process && relaunch,
             create_shell_metadata: true,
+            usb_entry_shim: None,
         }
     }
 
@@ -83,6 +90,7 @@ impl PortableInstallOptions {
             // A direct shortcut would bypass the USB lease/watchdog. The fixed
             // bundle remains the supported launcher and uninstaller.
             create_shell_metadata: false,
+            usb_entry_shim: None,
         }
     }
 }
@@ -140,6 +148,12 @@ const CODEX_ASAR_UPDATER_CALLS: &[&[u8]] = &[
 const CODEX_ASAR_UPDATER_PATCH_PREFIX: &[u8] = b"await 0/*USB*/;";
 const CODEX_ASAR_PACKAGE_FAMILY_CALL: &[u8] = b"OT()?.getCurrentPackageFamily()";
 const CODEX_ASAR_PACKAGE_FAMILY_PATCH_PREFIX: &[u8] = b"void 0/*USB*/";
+// Newer Codex builds route this query through the updater's native add-on.
+// Returning an empty string makes the updater's existing "no package family"
+// branch exit normally when running from an extracted, unpackaged tree.
+const CODEX_ASAR_NATIVE_PACKAGE_FAMILY_CALL: &[u8] =
+    b"this.options.nativeAddon.getCurrentPackageFamily()";
+const CODEX_ASAR_NATIVE_PACKAGE_FAMILY_PATCH_PREFIX: &[u8] = b"\"\"/*USB-NOPACKAGE*/";
 
 // The bundled Electron bridge starts the native Codex app-server with
 // Node's `child_process.spawn`.  On Windows `resources/codex.exe` is a
@@ -307,6 +321,1098 @@ fn find_bytes_in_file(path: &Path, needle: &[u8]) -> io::Result<Option<u64>> {
     }
 }
 
+#[derive(Debug)]
+struct AsarFileMetadata {
+    offset: u64,
+    size: u64,
+    integrity: Option<serde_json::Value>,
+}
+
+#[derive(Debug)]
+struct AsarIntegrityTarget {
+    data_offset: u64,
+    file_offset: u64,
+    file_size: u64,
+    block_size: u64,
+    hash_span: Range<usize>,
+    block_spans: Vec<Range<usize>>,
+    has_blocks: bool,
+}
+
+fn skip_json_whitespace(bytes: &[u8], mut cursor: usize) -> usize {
+    while bytes
+        .get(cursor)
+        .is_some_and(|byte| matches!(byte, b' ' | b'\n' | b'\r' | b'\t'))
+    {
+        cursor += 1;
+    }
+    cursor
+}
+
+fn parse_json_string_at(bytes: &[u8], start: usize) -> Option<(String, usize, Range<usize>)> {
+    if bytes.get(start) != Some(&b'"') {
+        return None;
+    }
+    let mut cursor = start + 1;
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'\\' => cursor = cursor.checked_add(2)?,
+            b'"' => {
+                let end = cursor + 1;
+                let value = serde_json::from_slice::<String>(&bytes[start..end]).ok()?;
+                return Some((value, end, start + 1..cursor));
+            }
+            _ => cursor += 1,
+        }
+    }
+    None
+}
+
+fn json_value_end(bytes: &[u8], start: usize) -> Option<usize> {
+    match *bytes.get(start)? {
+        b'"' => parse_json_string_at(bytes, start).map(|(_, end, _)| end),
+        b'{' | b'[' => {
+            let mut closing = Vec::new();
+            closing.push(if bytes[start] == b'{' { b'}' } else { b']' });
+            let mut cursor = start + 1;
+            while cursor < bytes.len() {
+                match bytes[cursor] {
+                    b'"' => {
+                        let (_, end, _) = parse_json_string_at(bytes, cursor)?;
+                        cursor = end;
+                    }
+                    b'{' => {
+                        closing.push(b'}');
+                        cursor += 1;
+                    }
+                    b'[' => {
+                        closing.push(b']');
+                        cursor += 1;
+                    }
+                    b'}' | b']' => {
+                        if closing.pop()? != bytes[cursor] {
+                            return None;
+                        }
+                        cursor += 1;
+                        if closing.is_empty() {
+                            return Some(cursor);
+                        }
+                    }
+                    _ => cursor += 1,
+                }
+            }
+            None
+        }
+        _ => {
+            let mut cursor = start;
+            while cursor < bytes.len()
+                && !matches!(
+                    bytes[cursor],
+                    b',' | b']' | b'}' | b' ' | b'\n' | b'\r' | b'\t'
+                )
+            {
+                cursor += 1;
+            }
+            (cursor > start).then_some(cursor)
+        }
+    }
+}
+
+fn find_json_object_member_value(
+    bytes: &[u8],
+    object: Range<usize>,
+    wanted_key: &str,
+) -> Option<Range<usize>> {
+    if bytes.get(object.start) != Some(&b'{') || object.end > bytes.len() {
+        return None;
+    }
+    let mut cursor = object.start + 1;
+    loop {
+        cursor = skip_json_whitespace(bytes, cursor);
+        if bytes.get(cursor) == Some(&b'}') || cursor >= object.end {
+            return None;
+        }
+        let (key, key_end, _) = parse_json_string_at(bytes, cursor)?;
+        cursor = skip_json_whitespace(bytes, key_end);
+        if bytes.get(cursor) != Some(&b':') {
+            return None;
+        }
+        let value_start = skip_json_whitespace(bytes, cursor + 1);
+        let value_end = json_value_end(bytes, value_start)?;
+        if key == wanted_key {
+            return Some(value_start..value_end);
+        }
+        cursor = skip_json_whitespace(bytes, value_end);
+        if bytes.get(cursor) == Some(&b',') {
+            cursor += 1;
+        } else if bytes.get(cursor) != Some(&b'}') {
+            return None;
+        }
+    }
+}
+
+fn matching_json_object_end(bytes: &[u8], start: usize) -> Option<usize> {
+    if bytes.get(start) != Some(&b'{') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut cursor = start;
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'"' => {
+                let (_, end, _) = parse_json_string_at(bytes, cursor)?;
+                cursor = end;
+            }
+            b'{' => {
+                depth += 1;
+                cursor += 1;
+            }
+            b'}' => {
+                depth = depth.checked_sub(1)?;
+                cursor += 1;
+                if depth == 0 {
+                    return Some(cursor);
+                }
+            }
+            _ => cursor += 1,
+        }
+    }
+    None
+}
+
+fn find_asar_file_metadata(
+    value: &serde_json::Value,
+    changed_offset: u64,
+    changed_len: u64,
+) -> Option<AsarFileMetadata> {
+    if let Some(object) = value.as_object() {
+        let offset = object
+            .get("offset")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|offset| offset.parse::<u64>().ok())
+            .or_else(|| object.get("offset").and_then(serde_json::Value::as_u64));
+        let size = object.get("size").and_then(serde_json::Value::as_u64);
+        if let (Some(offset), Some(size)) = (offset, size) {
+            let end = offset.checked_add(size)?;
+            let changed_end = changed_offset.checked_add(changed_len)?;
+            if changed_offset >= offset && changed_end <= end {
+                return Some(AsarFileMetadata {
+                    offset,
+                    size,
+                    integrity: object.get("integrity").cloned(),
+                });
+            }
+        }
+        for child in object.values() {
+            if let Some(found) = find_asar_file_metadata(child, changed_offset, changed_len) {
+                return Some(found);
+            }
+        }
+    } else if let Some(array) = value.as_array() {
+        for child in array {
+            if let Some(found) = find_asar_file_metadata(child, changed_offset, changed_len) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+fn find_asar_file_object_span(
+    header_json: &[u8],
+    expected_offset: u64,
+    expected_size: u64,
+) -> Option<Range<usize>> {
+    let mut object_stack = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < header_json.len() {
+        match header_json[cursor] {
+            b'{' => {
+                object_stack.push(cursor);
+                cursor += 1;
+            }
+            b'}' => {
+                object_stack.pop()?;
+                cursor += 1;
+            }
+            b'"' => {
+                let (key, key_end, _) = parse_json_string_at(header_json, cursor)?;
+                let after_key = skip_json_whitespace(header_json, key_end);
+                if key == "offset" && header_json.get(after_key) == Some(&b':') {
+                    let value_start = skip_json_whitespace(header_json, after_key + 1);
+                    if let Some((value, value_end, _)) =
+                        parse_json_string_at(header_json, value_start)
+                    {
+                        if value.parse::<u64>().ok() == Some(expected_offset) {
+                            if let Some(object_start) = object_stack.last().copied() {
+                                if let Some(object_end) =
+                                    matching_json_object_end(header_json, object_start)
+                                {
+                                    let span = object_start..object_end;
+                                    let object = serde_json::from_slice::<serde_json::Value>(
+                                        &header_json[span.clone()],
+                                    )
+                                    .ok();
+                                    let size_matches = object
+                                        .as_ref()
+                                        .and_then(|object| object.get("size"))
+                                        .and_then(serde_json::Value::as_u64)
+                                        == Some(expected_size);
+                                    if size_matches {
+                                        return Some(span);
+                                    }
+                                }
+                            }
+                        }
+                        cursor = value_end;
+                    } else {
+                        cursor = key_end;
+                    }
+                } else {
+                    cursor = key_end;
+                }
+            }
+            _ => cursor += 1,
+        }
+    }
+    None
+}
+
+fn json_array_string_spans(bytes: &[u8], array: Range<usize>) -> Option<Vec<Range<usize>>> {
+    if bytes.get(array.start) != Some(&b'[') || array.end > bytes.len() {
+        return None;
+    }
+    let mut spans = Vec::new();
+    let mut cursor = array.start + 1;
+    loop {
+        cursor = skip_json_whitespace(bytes, cursor);
+        match bytes.get(cursor) {
+            Some(b']') => return Some(spans),
+            Some(b'"') => {
+                let (_, end, contents) = parse_json_string_at(bytes, cursor)?;
+                spans.push(contents);
+                cursor = skip_json_whitespace(bytes, end);
+                match bytes.get(cursor) {
+                    Some(b',') => cursor += 1,
+                    Some(b']') => return Some(spans),
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        }
+    }
+}
+
+#[cfg(test)]
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn hash_asar_file_region(
+    path: &Path,
+    absolute_offset: u64,
+    size: u64,
+    block_size: u64,
+) -> Result<(String, Vec<String>), EngineError> {
+    if block_size == 0 {
+        return Err(EngineError::Msix(
+            "Codex app.asar integrity block size is zero".to_string(),
+        ));
+    }
+    let mut file = fs::File::open(path)
+        .map_err(|error| io_err("open Codex app.asar member for integrity refresh", error))?;
+    file.seek(SeekFrom::Start(absolute_offset))
+        .map_err(|error| io_err("seek Codex app.asar member for integrity refresh", error))?;
+    let mut full_hash = Sha256::new();
+    let mut blocks = Vec::new();
+    let mut remaining = size;
+    let mut buffer = [0u8; 64 * 1024];
+    while remaining > 0 {
+        let mut block_hash = Sha256::new();
+        let mut block_remaining = remaining.min(block_size);
+        while block_remaining > 0 {
+            let read_len = block_remaining.min(buffer.len() as u64) as usize;
+            file.read_exact(&mut buffer[..read_len]).map_err(|error| {
+                io_err("read Codex app.asar member for integrity refresh", error)
+            })?;
+            full_hash.update(&buffer[..read_len]);
+            block_hash.update(&buffer[..read_len]);
+            block_remaining -= read_len as u64;
+        }
+        blocks.push(
+            block_hash
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+        );
+        remaining -= remaining.min(block_size);
+    }
+    let full_hash = full_hash
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Ok((full_hash, blocks))
+}
+
+fn asar_integrity_target(
+    app_asar: &Path,
+    changed_offset: u64,
+    changed_len: usize,
+) -> Result<Option<AsarIntegrityTarget>, EngineError> {
+    let mut file = fs::File::open(app_asar)
+        .map_err(|error| io_err("open Codex app.asar integrity header", error))?;
+    let file_len = file
+        .metadata()
+        .map_err(|error| io_err("read Codex app.asar integrity metadata", error))?
+        .len();
+    if file_len < 16 {
+        return Ok(None);
+    }
+    let mut prefix = [0u8; 16];
+    file.read_exact(&mut prefix)
+        .map_err(|error| io_err("read Codex app.asar header prefix", error))?;
+    let read_u32 = |bytes: &[u8]| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    if read_u32(&prefix[0..4]) != 4 {
+        // Small synthetic fixtures and older non-ASAR test payloads are not
+        // Electron archives, so the integrity refresh is intentionally a no-op.
+        return Ok(None);
+    }
+    let header_size = u64::from(read_u32(&prefix[4..8]));
+    let json_len = u64::from(read_u32(&prefix[12..16]));
+    let data_offset = 8u64
+        .checked_add(header_size)
+        .ok_or_else(|| EngineError::Msix("Codex app.asar header length overflow".to_string()))?;
+    let json_end = 16u64
+        .checked_add(json_len)
+        .ok_or_else(|| EngineError::Msix("Codex app.asar JSON length overflow".to_string()))?;
+    if header_size < 8 || json_end > data_offset || data_offset > file_len {
+        return Err(EngineError::Msix(
+            "Codex app.asar has an invalid header while refreshing integrity".to_string(),
+        ));
+    }
+    let json_len = usize::try_from(json_len)
+        .map_err(|_| EngineError::Msix("Codex app.asar header is too large".to_string()))?;
+    let mut header_json = vec![0u8; json_len];
+    file.seek(SeekFrom::Start(16))
+        .and_then(|_| file.read_exact(&mut header_json))
+        .map_err(|error| io_err("read Codex app.asar JSON header", error))?;
+    let root = serde_json::from_slice::<serde_json::Value>(&header_json).map_err(|error| {
+        EngineError::Msix(format!("parse Codex app.asar integrity header: {error}"))
+    })?;
+    let Some(relative_offset) = changed_offset.checked_sub(data_offset) else {
+        return Ok(None);
+    };
+    let Some(metadata) = find_asar_file_metadata(&root, relative_offset, changed_len as u64) else {
+        return Ok(None);
+    };
+    let Some(integrity) = metadata.integrity.as_ref() else {
+        return Ok(None);
+    };
+    let algorithm = integrity
+        .get("algorithm")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if !algorithm.eq_ignore_ascii_case("SHA256") {
+        return Err(EngineError::Msix(format!(
+            "unsupported Codex app.asar integrity algorithm: {algorithm}"
+        )));
+    }
+    let block_size = integrity
+        .get("blockSize")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(metadata.size.max(1));
+    if block_size == 0 {
+        return Err(EngineError::Msix(
+            "Codex app.asar integrity block size is zero".to_string(),
+        ));
+    }
+    let Some(object_span) =
+        find_asar_file_object_span(&header_json, metadata.offset, metadata.size)
+    else {
+        return Err(EngineError::Msix(
+            "could not locate the patched Codex app.asar member metadata".to_string(),
+        ));
+    };
+    let integrity_span = find_json_object_member_value(&header_json, object_span, "integrity")
+        .ok_or_else(|| {
+            EngineError::Msix(
+                "could not locate Codex app.asar member integrity metadata".to_string(),
+            )
+        })?;
+    let integrity_object =
+        serde_json::from_slice::<serde_json::Value>(&header_json[integrity_span.clone()]).map_err(
+            |error| EngineError::Msix(format!("parse Codex app.asar member integrity: {error}")),
+        )?;
+    let hash_value = find_json_object_member_value(&header_json, integrity_span.clone(), "hash")
+        .ok_or_else(|| EngineError::Msix("Codex app.asar member hash is missing".to_string()))?;
+    let (_, _, hash_span) = parse_json_string_at(&header_json, hash_value.start)
+        .filter(|(_, end, _)| *end == hash_value.end)
+        .ok_or_else(|| EngineError::Msix("Codex app.asar member hash is invalid".to_string()))?;
+    let has_blocks = integrity_object.get("blocks").is_some();
+    let block_spans = if has_blocks {
+        let blocks_value = find_json_object_member_value(&header_json, integrity_span, "blocks")
+            .ok_or_else(|| {
+                EngineError::Msix("Codex app.asar member block hashes are invalid".to_string())
+            })?;
+        json_array_string_spans(&header_json, blocks_value).ok_or_else(|| {
+            EngineError::Msix("Codex app.asar member block hashes are invalid".to_string())
+        })?
+    } else {
+        Vec::new()
+    };
+    if hash_span.len() != 64 || block_spans.iter().any(|span| span.len() != 64) {
+        return Err(EngineError::Msix(
+            "Codex app.asar SHA256 metadata has an unexpected width".to_string(),
+        ));
+    }
+    let expected_blocks = if metadata.size == 0 {
+        0
+    } else {
+        metadata.size.div_ceil(block_size) as usize
+    };
+    if has_blocks && block_spans.len() != expected_blocks {
+        return Err(EngineError::Msix(format!(
+            "Codex app.asar member block metadata has an unexpected count: expected={expected_blocks} actual={}",
+            block_spans.len()
+        )));
+    }
+    Ok(Some(AsarIntegrityTarget {
+        data_offset,
+        file_offset: metadata.offset,
+        file_size: metadata.size,
+        block_size,
+        hash_span,
+        block_spans,
+        has_blocks,
+    }))
+}
+
+fn refresh_asar_file_integrity(
+    app_asar: &Path,
+    changed_offset: u64,
+    changed_len: usize,
+) -> Result<(), EngineError> {
+    let Some(target) = asar_integrity_target(app_asar, changed_offset, changed_len)? else {
+        return Ok(());
+    };
+    let absolute_data_offset = target
+        .data_offset
+        .checked_add(target.file_offset)
+        .ok_or_else(|| EngineError::Msix("Codex app.asar member offset overflow".to_string()))?;
+    let (hash, blocks) = hash_asar_file_region(
+        app_asar,
+        absolute_data_offset,
+        target.file_size,
+        target.block_size,
+    )?;
+    if target.has_blocks && target.block_spans.len() != blocks.len() {
+        return Err(EngineError::Msix(
+            "Codex app.asar member block hash count changed".to_string(),
+        ));
+    }
+    let mut existing = fs::File::open(app_asar)
+        .map_err(|error| io_err("open Codex app.asar to verify integrity", error))?;
+    let mut current_hash = vec![0u8; target.hash_span.len()];
+    existing
+        .seek(SeekFrom::Start(16 + target.hash_span.start as u64))
+        .and_then(|_| existing.read_exact(&mut current_hash))
+        .map_err(|error| io_err("read Codex app.asar file hash", error))?;
+    let mut integrity_matches = current_hash.eq_ignore_ascii_case(hash.as_bytes());
+    for (span, block_hash) in target.block_spans.iter().zip(blocks.iter()) {
+        let mut current_block = vec![0u8; span.len()];
+        existing
+            .seek(SeekFrom::Start(16 + span.start as u64))
+            .and_then(|_| existing.read_exact(&mut current_block))
+            .map_err(|error| io_err("read Codex app.asar block hash", error))?;
+        integrity_matches &= current_block.eq_ignore_ascii_case(block_hash.as_bytes());
+    }
+    if integrity_matches {
+        return Ok(());
+    }
+    drop(existing);
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .open(app_asar)
+        .map_err(|error| io_err("open Codex app.asar to refresh integrity", error))?;
+    file.seek(SeekFrom::Start(16 + target.hash_span.start as u64))
+        .and_then(|_| file.write_all(hash.as_bytes()))
+        .map_err(|error| io_err("write Codex app.asar file hash", error))?;
+    for (span, block_hash) in target.block_spans.iter().zip(blocks.iter()) {
+        file.seek(SeekFrom::Start(16 + span.start as u64))
+            .and_then(|_| file.write_all(block_hash.as_bytes()))
+            .map_err(|error| io_err("write Codex app.asar block hash", error))?;
+    }
+    file.flush()
+        .map_err(|error| io_err("flush Codex app.asar integrity header", error))?;
+    log::info!(
+        "refreshed Codex app.asar member integrity path={} member_offset={} member_size={} blocks={}",
+        app_asar.display(),
+        target.file_offset,
+        target.file_size,
+        blocks.len()
+    );
+    Ok(())
+}
+
+#[derive(Debug)]
+enum PeResourceName {
+    Named(String),
+    Id,
+}
+
+#[derive(Debug)]
+struct PeSectionRange {
+    virtual_address: u32,
+    virtual_size: u32,
+    raw_offset: u32,
+    raw_size: u32,
+}
+
+fn read_pe_u16(bytes: &[u8], offset: usize, context: &str) -> Result<u16, EngineError> {
+    let end = offset
+        .checked_add(2)
+        .ok_or_else(|| EngineError::Msix(format!("{context} offset overflow")))?;
+    let raw = bytes
+        .get(offset..end)
+        .ok_or_else(|| EngineError::Msix(format!("{context} is outside the executable")))?;
+    Ok(u16::from_le_bytes([raw[0], raw[1]]))
+}
+
+fn read_pe_u32(bytes: &[u8], offset: usize, context: &str) -> Result<u32, EngineError> {
+    let end = offset
+        .checked_add(4)
+        .ok_or_else(|| EngineError::Msix(format!("{context} offset overflow")))?;
+    let raw = bytes
+        .get(offset..end)
+        .ok_or_else(|| EngineError::Msix(format!("{context} is outside the executable")))?;
+    Ok(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
+}
+
+fn pe_rva_to_file_offset(rva: u32, sections: &[PeSectionRange]) -> Result<usize, EngineError> {
+    for section in sections {
+        let span = section.virtual_size.max(section.raw_size);
+        let end = section
+            .virtual_address
+            .checked_add(span)
+            .ok_or_else(|| EngineError::Msix("Codex PE section range overflow".to_string()))?;
+        if rva >= section.virtual_address && rva < end {
+            let delta = rva - section.virtual_address;
+            if delta >= section.raw_size {
+                break;
+            }
+            let file_offset = section
+                .raw_offset
+                .checked_add(delta)
+                .ok_or_else(|| EngineError::Msix("Codex PE file offset overflow".to_string()))?;
+            return usize::try_from(file_offset)
+                .map_err(|_| EngineError::Msix("Codex PE file offset overflow".to_string()));
+        }
+    }
+    Err(EngineError::Msix(format!(
+        "Codex PE resource RVA {rva:#x} is not backed by file data"
+    )))
+}
+
+fn pe_resource_directory_entries(
+    bytes: &[u8],
+    resource_root: usize,
+    resource_size: usize,
+    directory_offset: usize,
+) -> Result<Vec<(PeResourceName, u32)>, EngineError> {
+    let directory_end = directory_offset
+        .checked_add(16)
+        .ok_or_else(|| EngineError::Msix("Codex PE resource directory overflow".to_string()))?;
+    if directory_end > resource_size {
+        return Err(EngineError::Msix(
+            "Codex PE resource directory is outside its declared section".to_string(),
+        ));
+    }
+    let directory = resource_root + directory_offset;
+    let named_count = usize::from(read_pe_u16(
+        bytes,
+        directory + 12,
+        "Codex PE named resource count",
+    )?);
+    let id_count = usize::from(read_pe_u16(
+        bytes,
+        directory + 14,
+        "Codex PE numeric resource count",
+    )?);
+    let entry_count = named_count
+        .checked_add(id_count)
+        .ok_or_else(|| EngineError::Msix("Codex PE resource count overflow".to_string()))?;
+    let entries_start = directory_end;
+    let entries_end = entries_start
+        .checked_add(entry_count.checked_mul(8).ok_or_else(|| {
+            EngineError::Msix("Codex PE resource entry table overflow".to_string())
+        })?)
+        .ok_or_else(|| EngineError::Msix("Codex PE resource entry table overflow".to_string()))?;
+    if entries_end > resource_size {
+        return Err(EngineError::Msix(
+            "Codex PE resource entry table is outside its declared section".to_string(),
+        ));
+    }
+
+    let mut entries = Vec::with_capacity(entry_count);
+    for index in 0..entry_count {
+        let entry = resource_root + entries_start + index * 8;
+        let raw_name = read_pe_u32(bytes, entry, "Codex PE resource name")?;
+        let target = read_pe_u32(bytes, entry + 4, "Codex PE resource target")?;
+        let name = if raw_name & 0x8000_0000 != 0 {
+            let name_offset = usize::try_from(raw_name & 0x7fff_ffff)
+                .map_err(|_| EngineError::Msix("Codex PE resource name overflow".to_string()))?;
+            let length = usize::from(read_pe_u16(
+                bytes,
+                resource_root + name_offset,
+                "Codex PE resource name length",
+            )?);
+            let name_start = resource_root
+                .checked_add(name_offset)
+                .and_then(|offset| offset.checked_add(2))
+                .ok_or_else(|| EngineError::Msix("Codex PE resource name overflow".to_string()))?;
+            let name_end = name_start
+                .checked_add(length.checked_mul(2).ok_or_else(|| {
+                    EngineError::Msix("Codex PE resource name length overflow".to_string())
+                })?)
+                .ok_or_else(|| {
+                    EngineError::Msix("Codex PE resource name length overflow".to_string())
+                })?;
+            if name_end > resource_root + resource_size {
+                return Err(EngineError::Msix(
+                    "Codex PE resource name is outside its declared section".to_string(),
+                ));
+            }
+            let utf16 = bytes.get(name_start..name_end).ok_or_else(|| {
+                EngineError::Msix("Codex PE resource name is outside the executable".to_string())
+            })?;
+            let units = utf16
+                .chunks_exact(2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]));
+            PeResourceName::Named(String::from_utf16_lossy(&units.collect::<Vec<_>>()))
+        } else {
+            PeResourceName::Id
+        };
+        entries.push((name, target));
+    }
+    Ok(entries)
+}
+
+fn collect_pe_resource_data_entries(
+    bytes: &[u8],
+    resource_root: usize,
+    resource_size: usize,
+    directory_offset: usize,
+    depth: usize,
+    leaves: &mut Vec<usize>,
+) -> Result<(), EngineError> {
+    if depth > 4 {
+        return Err(EngineError::Msix(
+            "Codex PE resource tree is deeper than expected".to_string(),
+        ));
+    }
+    for (_, target) in
+        pe_resource_directory_entries(bytes, resource_root, resource_size, directory_offset)?
+    {
+        let child_offset = usize::try_from(target & 0x7fff_ffff)
+            .map_err(|_| EngineError::Msix("Codex PE resource offset overflow".to_string()))?;
+        if target & 0x8000_0000 != 0 {
+            collect_pe_resource_data_entries(
+                bytes,
+                resource_root,
+                resource_size,
+                child_offset,
+                depth + 1,
+                leaves,
+            )?;
+        } else {
+            leaves.push(child_offset);
+        }
+    }
+    Ok(())
+}
+
+fn electron_asar_integrity_value_spans(bytes: &[u8]) -> Result<Vec<Range<usize>>, EngineError> {
+    let document = serde_json::from_slice::<serde_json::Value>(bytes).map_err(|error| {
+        EngineError::Msix(format!(
+            "parse Codex ElectronAsar integrity resource: {error}"
+        ))
+    })?;
+    let Some(records) = document.as_array() else {
+        return Err(EngineError::Msix(
+            "Codex ElectronAsar integrity resource is not a JSON array".to_string(),
+        ));
+    };
+    let mut cursor = skip_json_whitespace(bytes, 1);
+    let mut spans = Vec::new();
+    for record in records {
+        let object_start = cursor;
+        let object_end = matching_json_object_end(bytes, object_start).ok_or_else(|| {
+            EngineError::Msix("Codex ElectronAsar integrity resource has invalid JSON".to_string())
+        })?;
+        let object = object_start..object_end;
+        let is_app_asar = record
+            .get("file")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|path| {
+                path.replace('/', "\\")
+                    .eq_ignore_ascii_case("resources\\app.asar")
+            });
+        let uses_sha256 = record
+            .get("alg")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|algorithm| algorithm.eq_ignore_ascii_case("SHA256"));
+        if is_app_asar && uses_sha256 {
+            let value = find_json_object_member_value(bytes, object, "value").ok_or_else(|| {
+                EngineError::Msix("Codex ElectronAsar integrity value is missing".to_string())
+            })?;
+            let (_, value_end, value_span) = parse_json_string_at(bytes, value.start)
+                .filter(|(_, value_end, _)| *value_end == value.end)
+                .ok_or_else(|| {
+                    EngineError::Msix("Codex ElectronAsar integrity value is invalid".to_string())
+                })?;
+            if value_span.len() != 64
+                || !bytes[value_span.clone()].iter().all(u8::is_ascii_hexdigit)
+                || value_end != value.end
+            {
+                return Err(EngineError::Msix(
+                    "Codex ElectronAsar integrity value is not a 64-character SHA256".to_string(),
+                ));
+            }
+            spans.push(value_span);
+        }
+        cursor = skip_json_whitespace(bytes, object_end);
+        if bytes.get(cursor) == Some(&b',') {
+            cursor = skip_json_whitespace(bytes, cursor + 1);
+        }
+    }
+    if spans.is_empty() {
+        return Err(EngineError::Msix(
+            "Codex PE has no resources\\app.asar ElectronAsar integrity record".to_string(),
+        ));
+    }
+    Ok(spans)
+}
+
+fn patch_pe_electron_asar_integrity(
+    executable: &mut [u8],
+    expected_header_sha256: &str,
+) -> Result<Option<bool>, EngineError> {
+    if expected_header_sha256.len() != 64
+        || !expected_header_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(EngineError::Msix(
+            "Codex app.asar header hash is not a SHA256".to_string(),
+        ));
+    }
+    let pe_offset = usize::try_from(read_pe_u32(executable, 0x3c, "Codex PE header offset")?)
+        .map_err(|_| EngineError::Msix("Codex PE header offset overflow".to_string()))?;
+    if executable.get(pe_offset..pe_offset + 4) != Some(b"PE\0\0") {
+        return Err(EngineError::Msix(
+            "Codex application executable has an invalid PE signature".to_string(),
+        ));
+    }
+    let section_count = usize::from(read_pe_u16(
+        executable,
+        pe_offset + 6,
+        "Codex PE section count",
+    )?);
+    let optional_size = usize::from(read_pe_u16(
+        executable,
+        pe_offset + 20,
+        "Codex PE optional-header size",
+    )?);
+    let optional_start = pe_offset + 24;
+    let optional_end = optional_start
+        .checked_add(optional_size)
+        .ok_or_else(|| EngineError::Msix("Codex PE optional-header overflow".to_string()))?;
+    if optional_end > executable.len() {
+        return Err(EngineError::Msix(
+            "Codex PE optional header is outside the executable".to_string(),
+        ));
+    }
+    let magic = read_pe_u16(executable, optional_start, "Codex PE optional-header magic")?;
+    let data_directories = match magic {
+        0x10b => optional_start + 96,
+        0x20b => optional_start + 112,
+        _ => {
+            return Err(EngineError::Msix(
+                "Codex PE optional-header format is unsupported".to_string(),
+            ))
+        }
+    };
+    if data_directories
+        .checked_add(3 * 8)
+        .is_none_or(|end| end > optional_end)
+    {
+        return Ok(None);
+    }
+    let resource_rva = read_pe_u32(
+        executable,
+        data_directories + 2 * 8,
+        "Codex PE resource RVA",
+    )?;
+    let resource_size = usize::try_from(read_pe_u32(
+        executable,
+        data_directories + 2 * 8 + 4,
+        "Codex PE resource size",
+    )?)
+    .map_err(|_| EngineError::Msix("Codex PE resource size overflow".to_string()))?;
+    if resource_rva == 0 || resource_size < 16 {
+        return Ok(None);
+    }
+
+    let section_table = optional_end;
+    let mut sections = Vec::with_capacity(section_count);
+    for index in 0..section_count {
+        let section =
+            section_table
+                .checked_add(index.checked_mul(40).ok_or_else(|| {
+                    EngineError::Msix("Codex PE section table overflow".to_string())
+                })?)
+                .ok_or_else(|| EngineError::Msix("Codex PE section table overflow".to_string()))?;
+        sections.push(PeSectionRange {
+            virtual_size: read_pe_u32(executable, section + 8, "Codex PE virtual section size")?,
+            virtual_address: read_pe_u32(executable, section + 12, "Codex PE section RVA")?,
+            raw_size: read_pe_u32(executable, section + 16, "Codex PE raw section size")?,
+            raw_offset: read_pe_u32(executable, section + 20, "Codex PE section file offset")?,
+        });
+    }
+    let resource_root = pe_rva_to_file_offset(resource_rva, &sections)?;
+    let resource_end = resource_root
+        .checked_add(resource_size)
+        .ok_or_else(|| EngineError::Msix("Codex PE resource range overflow".to_string()))?;
+    if resource_end > executable.len() {
+        return Err(EngineError::Msix(
+            "Codex PE resource directory is outside the executable".to_string(),
+        ));
+    }
+
+    let type_entry = pe_resource_directory_entries(executable, resource_root, resource_size, 0)?
+        .into_iter()
+        .find(|(name, _)| matches!(name, PeResourceName::Named(value) if value.eq_ignore_ascii_case("INTEGRITY")));
+    let Some(type_entry) = type_entry else {
+        return Ok(None);
+    };
+    if type_entry.1 & 0x8000_0000 == 0 {
+        return Err(EngineError::Msix(
+            "Codex PE INTEGRITY resource is not a directory".to_string(),
+        ));
+    }
+    let integrity_offset = usize::try_from(type_entry.1 & 0x7fff_ffff).map_err(|_| {
+        EngineError::Msix("Codex PE integrity resource offset overflow".to_string())
+    })?;
+    let name_entry = pe_resource_directory_entries(
+        executable,
+        resource_root,
+        resource_size,
+        integrity_offset,
+    )?
+    .into_iter()
+    .find(|(name, _)| matches!(name, PeResourceName::Named(value) if value.eq_ignore_ascii_case("ELECTRONASAR")));
+    let Some(name_entry) = name_entry else {
+        return Ok(None);
+    };
+    if name_entry.1 & 0x8000_0000 == 0 {
+        return Err(EngineError::Msix(
+            "Codex PE ELECTRONASAR resource is not a directory".to_string(),
+        ));
+    }
+    let electron_asar_offset = usize::try_from(name_entry.1 & 0x7fff_ffff).map_err(|_| {
+        EngineError::Msix("Codex PE ElectronAsar resource offset overflow".to_string())
+    })?;
+    let mut data_entry_offsets = Vec::new();
+    collect_pe_resource_data_entries(
+        executable,
+        resource_root,
+        resource_size,
+        electron_asar_offset,
+        0,
+        &mut data_entry_offsets,
+    )?;
+    let mut value_spans = Vec::new();
+    for data_entry_offset in data_entry_offsets {
+        if data_entry_offset + 16 > resource_size {
+            return Err(EngineError::Msix(
+                "Codex PE ElectronAsar data entry is outside its resource section".to_string(),
+            ));
+        }
+        let data_entry = resource_root + data_entry_offset;
+        let data_rva = read_pe_u32(executable, data_entry, "Codex PE resource data RVA")?;
+        let data_size = usize::try_from(read_pe_u32(
+            executable,
+            data_entry + 4,
+            "Codex PE resource data size",
+        )?)
+        .map_err(|_| EngineError::Msix("Codex PE resource data size overflow".to_string()))?;
+        let data_start = pe_rva_to_file_offset(data_rva, &sections)?;
+        let data_end = data_start.checked_add(data_size).ok_or_else(|| {
+            EngineError::Msix("Codex PE resource data range overflow".to_string())
+        })?;
+        let data = executable.get(data_start..data_end).ok_or_else(|| {
+            EngineError::Msix("Codex PE resource data is outside the executable".to_string())
+        })?;
+        value_spans.extend(
+            electron_asar_integrity_value_spans(data)?
+                .into_iter()
+                .map(|span| (data_start + span.start)..(data_start + span.end)),
+        );
+    }
+    if value_spans.is_empty() {
+        return Err(EngineError::Msix(
+            "Codex PE has no usable ElectronAsar integrity record".to_string(),
+        ));
+    }
+    let mut changed = false;
+    for span in value_spans {
+        if span.len() != expected_header_sha256.len() {
+            return Err(EngineError::Msix(
+                "Codex PE ElectronAsar hash width changed unexpectedly".to_string(),
+            ));
+        }
+        if !executable[span.clone()].eq_ignore_ascii_case(expected_header_sha256.as_bytes()) {
+            executable[span].copy_from_slice(expected_header_sha256.as_bytes());
+            changed = true;
+        }
+    }
+    Ok(Some(changed))
+}
+
+fn app_asar_header_sha256(app_asar: &Path) -> Result<String, EngineError> {
+    let mut file =
+        fs::File::open(app_asar).map_err(|error| io_err("open Codex app.asar header", error))?;
+    let file_len = file
+        .metadata()
+        .map_err(|error| io_err("inspect Codex app.asar header", error))?
+        .len();
+    if file_len < 16 {
+        return Err(EngineError::Msix(
+            "Codex app.asar has an invalid Electron header".to_string(),
+        ));
+    }
+    let mut prefix = [0u8; 16];
+    file.read_exact(&mut prefix)
+        .map_err(|error| io_err("read Codex app.asar header prefix", error))?;
+    if u32::from_le_bytes(prefix[..4].try_into().unwrap()) != 4 {
+        return Err(EngineError::Msix(
+            "Codex app.asar has an invalid Electron header".to_string(),
+        ));
+    }
+    let header_size = u64::from(u32::from_le_bytes(prefix[4..8].try_into().unwrap()));
+    let json_size = usize::try_from(u32::from_le_bytes(prefix[12..16].try_into().unwrap()))
+        .map_err(|_| EngineError::Msix("Codex app.asar header is too large".to_string()))?;
+    let json_end = 16u64
+        .checked_add(json_size as u64)
+        .ok_or_else(|| EngineError::Msix("Codex app.asar header length overflow".to_string()))?;
+    if header_size < 8 || json_end > file_len || json_end > 8 + header_size {
+        return Err(EngineError::Msix(
+            "Codex app.asar JSON header is outside its declared bounds".to_string(),
+        ));
+    }
+    let mut header_json = vec![0u8; json_size];
+    file.seek(SeekFrom::Start(16))
+        .and_then(|_| file.read_exact(&mut header_json))
+        .map_err(|error| io_err("read Codex app.asar JSON header", error))?;
+    let hash = Sha256::digest(&header_json);
+    Ok(hash.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn refresh_embedded_asar_integrity(install_root: &Path) -> Result<bool, EngineError> {
+    let app_asar = install_root.join("resources").join("app.asar");
+    if !app_asar.is_file() {
+        return Ok(false);
+    }
+    let overlay_path = install_root.join(USB_ENTRY_OVERLAY_FILE);
+    let is_usb_overlay = overlay_path.is_file();
+    let executable = if is_usb_overlay {
+        install_root.join(USB_ENTRY_ORIGINAL_EXE)
+    } else if let Some(executable) = installed_app_exe(install_root) {
+        executable
+    } else {
+        return Ok(false);
+    };
+    if !is_regular_non_reparse_file(&executable)? {
+        return Err(EngineError::Msix(format!(
+            "Codex launch executable is not a regular file: {}",
+            executable.display()
+        )));
+    }
+    let header_hash = app_asar_header_sha256(&app_asar)?;
+    let mut executable_bytes = fs::read(&executable)
+        .map_err(|error| io_err("read Codex executable for ASAR integrity", error))?;
+    let original_executable_bytes = executable_bytes.clone();
+    let Some(executable_patched) =
+        patch_pe_electron_asar_integrity(&mut executable_bytes, &header_hash)?
+    else {
+        return Ok(false);
+    };
+    if executable_patched {
+        replace_file_atomically(&executable, &executable_bytes)?;
+        log::info!(
+            "refreshed Codex ElectronAsar PE resource path={} header_sha256={}",
+            executable.display(),
+            header_hash
+        );
+    }
+
+    let mut changed = executable_patched;
+    if is_usb_overlay {
+        let overlay_result = (|| {
+            let mut overlay = fs::read(&overlay_path)
+                .map_err(|error| io_err("read USB direct-entry overlay metadata", error))?;
+            let mut metadata: UsbEntryOverlay =
+                serde_json::from_slice(&overlay).map_err(|error| {
+                    EngineError::Msix(format!(
+                        "USB direct-entry overlay metadata is invalid: {error}"
+                    ))
+                })?;
+            if metadata.schema_version != USB_ENTRY_OVERLAY_SCHEMA
+                || metadata.original_executable != USB_ENTRY_ORIGINAL_EXE
+            {
+                return Err(EngineError::Msix(
+                    "USB direct-entry overlay metadata does not identify CodexCore.dat".to_string(),
+                ));
+            }
+            let executable_hash = crate::download::sha256_file(&executable)?;
+            if !metadata
+                .original_sha256
+                .eq_ignore_ascii_case(&executable_hash)
+            {
+                metadata.original_sha256 = executable_hash;
+                overlay = serde_json::to_vec_pretty(&metadata).map_err(|error| {
+                    EngineError::Msix(format!(
+                        "serialize USB direct-entry overlay metadata: {error}"
+                    ))
+                })?;
+                overlay.push(b'\n');
+                replace_file_atomically(&overlay_path, &overlay)?;
+                return Ok(true);
+            }
+            Ok(false)
+        })();
+        match overlay_result {
+            Ok(overlay_changed) => changed |= overlay_changed,
+            Err(error) => {
+                if executable_patched {
+                    replace_file_atomically(&executable, &original_executable_bytes).map_err(
+                        |rollback_error| {
+                            EngineError::Msix(format!(
+                                "{error}; failed to roll back CodexCore.dat after USB overlay update failed: {rollback_error}"
+                            ))
+                        },
+                    )?;
+                }
+                return Err(error);
+            }
+        }
+    }
+    Ok(changed)
+}
+
 fn patch_asar_bytes_in_place(
     app_asar: &Path,
     offset: u64,
@@ -322,7 +1428,10 @@ fn patch_asar_bytes_in_place(
             Ok::<(), io::Error>(())
         })();
         match result {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                refresh_asar_file_integrity(app_asar, offset, replacement.len())?;
+                return Ok(());
+            }
             Err(error)
                 if attempt < EXTRACT_FILE_CREATE_RETRIES
                     && matches!(
@@ -371,6 +1480,34 @@ fn patch_first_fixed_width_call(
         offset
     );
     Ok(true)
+}
+
+fn patch_all_fixed_width_calls(
+    app_asar: &Path,
+    call: &[u8],
+    replacement_prefix: &[u8],
+    label: &str,
+) -> Result<usize, EngineError> {
+    if replacement_prefix.len() > call.len() {
+        return Err(EngineError::Msix(format!(
+            "portable Codex startup patch for {label} is wider than the original call"
+        )));
+    }
+    let mut replacement = vec![b' '; call.len()];
+    replacement[..replacement_prefix.len()].copy_from_slice(replacement_prefix);
+    let mut patched = 0usize;
+    while let Some(offset) = find_bytes_in_file(app_asar, call)
+        .map_err(|error| EngineError::Io(format!("scan Codex app.asar for {label}: {error}")))?
+    {
+        patch_asar_bytes_in_place(app_asar, offset, &replacement)?;
+        patched += 1;
+        log::info!(
+            "portable Codex startup compatibility patch applied path={} offset={} reason={label}",
+            app_asar.display(),
+            offset
+        );
+    }
+    Ok(patched)
 }
 
 fn patch_codex_console_spawn(app_asar: &Path) -> Result<bool, EngineError> {
@@ -435,13 +1572,27 @@ fn patch_codex_console_spawn(app_asar: &Path) -> Result<bool, EngineError> {
         return Ok(true);
     }
 
-    let has_known_patch = [
+    let known_patches = [
         CODEX_ASAR_CONSOLE_SPAWN_SENTINEL,
         CODEX_ASAR_CONSOLE_SPAWN_CWD_SENTINEL,
         CODEX_ASAR_GENERIC_SPAWN_SENTINEL,
-    ]
-    .iter()
-    .any(|needle| bytes.windows(needle.len()).any(|window| window == *needle));
+    ];
+    let mut has_known_patch = false;
+    for needle in known_patches {
+        let mut search_from = 0usize;
+        while search_from.saturating_add(needle.len()) <= bytes.len() {
+            let Some(relative) = bytes[search_from..]
+                .windows(needle.len())
+                .position(|window| window == needle)
+            else {
+                break;
+            };
+            let offset = search_from + relative;
+            refresh_asar_file_integrity(app_asar, offset as u64, needle.len())?;
+            has_known_patch = true;
+            search_from = offset.saturating_add(needle.len());
+        }
+    }
     if !has_known_patch {
         log::warn!(
             "portable Codex console spawn did not match a known console-silence patch shape path={}",
@@ -781,6 +1932,14 @@ fn patch_codex_app_tools_mcp_config(
 pub fn ensure_portable_codex_startup_compatibility(
     install_root: &Path,
 ) -> Result<bool, EngineError> {
+    let patched = ensure_portable_codex_startup_compatibility_inner(install_root)?;
+    let integrity_patched = refresh_embedded_asar_integrity(install_root)?;
+    Ok(patched || integrity_patched)
+}
+
+fn ensure_portable_codex_startup_compatibility_inner(
+    install_root: &Path,
+) -> Result<bool, EngineError> {
     // The executable edit complements the ASAR `windowsHide` patch.  Both
     // run before the first portable launch and remain safe to repeat after an
     // in-place update or a manager restart.
@@ -805,19 +1964,55 @@ pub fn ensure_portable_codex_startup_compatibility(
         return Ok(patched);
     }
 
+    // Current updater bundles call the package-identity native add-on twice.
+    // Replace every exact call with an empty string so `.trim()` remains safe
+    // and the updater follows its existing unsupported-package early return.
+    // This avoids guessing a minified initializer name or touching unrelated
+    // updater code, while preserving every ASAR offset.
+    if let Some(offset) =
+        find_bytes_in_file(&app_asar, CODEX_ASAR_NATIVE_PACKAGE_FAMILY_PATCH_PREFIX).map_err(
+            |error| {
+                io_err(
+                    "scan Codex app.asar for existing native package-family patch",
+                    error,
+                )
+            },
+        )?
+    {
+        refresh_asar_file_integrity(
+            &app_asar,
+            offset,
+            CODEX_ASAR_NATIVE_PACKAGE_FAMILY_PATCH_PREFIX.len(),
+        )?;
+        return Ok(patched);
+    }
+    let native_calls_patched = patch_all_fixed_width_calls(
+        &app_asar,
+        CODEX_ASAR_NATIVE_PACKAGE_FAMILY_CALL,
+        CODEX_ASAR_NATIVE_PACKAGE_FAMILY_PATCH_PREFIX,
+        "unpackaged-native-package-family-query",
+    )?;
+    if native_calls_patched > 0 {
+        return Ok(true);
+    }
+
     // Check the fixed-width package-query sentinel before scanning for the
     // original call.  This keeps subsequent launches bounded to the first few
     // megabytes of app.asar instead of repeatedly reading the whole archive
     // from a slow removable drive.
-    if find_bytes_in_file(&app_asar, CODEX_ASAR_PACKAGE_FAMILY_PATCH_PREFIX)
+    if let Some(offset) = find_bytes_in_file(&app_asar, CODEX_ASAR_PACKAGE_FAMILY_PATCH_PREFIX)
         .map_err(|error| {
             io_err(
                 "scan Codex app.asar for existing package-family patch",
                 error,
             )
         })?
-        .is_some()
     {
+        refresh_asar_file_integrity(
+            &app_asar,
+            offset,
+            CODEX_ASAR_PACKAGE_FAMILY_PATCH_PREFIX.len(),
+        )?;
         return Ok(patched);
     }
 
@@ -833,17 +2028,20 @@ pub fn ensure_portable_codex_startup_compatibility(
     // Codex process from reaching its main window. Once it is repaired there
     // is no reason to scan the rest of a 300+ MB archive for an optional,
     // older updater initializer.
-    if patched {
+    // Do not use the aggregate `patched` value here. Console-spawn, locale,
+    // or executable-subsystem edits are independent from this updater fix;
+    // an unrelated earlier edit must not skip the package-dependent bootstrap.
+    if updater_patched {
         return Ok(true);
     }
 
     // A patched updater call is detected without rebuilding the archive on
     // every launch; the minified bootstrap call is near the beginning of the
     // archive and the exact sentinel is unique to this compatibility patch.
-    if find_bytes_in_file(&app_asar, b"await 0/*USB*/;")
+    if let Some(offset) = find_bytes_in_file(&app_asar, b"await 0/*USB*/;")
         .map_err(|error| io_err("scan Codex app.asar for existing startup patch", error))?
-        .is_some()
     {
+        refresh_asar_file_integrity(&app_asar, offset, CODEX_ASAR_UPDATER_PATCH_PREFIX.len())?;
         return Ok(patched);
     }
 
@@ -898,6 +2096,18 @@ pub fn ensure_portable_codex_locale_compatibility(
     if !requests_chinese_codex_locale(locale) {
         return Ok(false);
     }
+    let patched = ensure_portable_codex_locale_compatibility_inner(install_root, locale)?;
+    let integrity_patched = refresh_embedded_asar_integrity(install_root)?;
+    Ok(patched || integrity_patched)
+}
+
+fn ensure_portable_codex_locale_compatibility_inner(
+    install_root: &Path,
+    locale: Option<&str>,
+) -> Result<bool, EngineError> {
+    if !requests_chinese_codex_locale(locale) {
+        return Ok(false);
+    }
     let app_asar = install_root.join("resources").join("app.asar");
     if !app_asar.is_file() {
         return Ok(false);
@@ -922,6 +2132,12 @@ pub fn ensure_portable_codex_locale_compatibility(
             if patched {
                 return Ok(true);
             }
+        }
+        if let Some(offset) = find_bytes_in_file(&app_asar, replacement)
+            .map_err(|error| io_err("scan Codex app.asar for existing i18n patch", error))?
+        {
+            refresh_asar_file_integrity(&app_asar, offset, replacement.len())?;
+            return Ok(false);
         }
     }
 
@@ -1409,9 +2625,235 @@ pub fn installed_app_exe(install_root: &Path) -> Option<PathBuf> {
         .find(|exe| exe.is_file())
 }
 
+/// Resolve the executable the manager is allowed to launch for a portable
+/// install. USB payloads keep the official MSIX executable behind a shim at
+/// the manifest-declared path; when that overlay exists, verify its fixed
+/// filenames and recorded hashes before returning the preserved executable.
+pub fn installed_codex_launch_exe(install_root: &Path) -> Result<PathBuf, EngineError> {
+    installed_codex_launch_exe_with_usb_gate(install_root, false)
+}
+
+/// Resolve a USB Codex executable only when the direct-entry shim overlay is
+/// present and its recorded hashes match. Older USB installs without the
+/// overlay must be repaired before the manager can launch Codex.
+pub fn installed_usb_codex_launch_exe(install_root: &Path) -> Result<PathBuf, EngineError> {
+    installed_codex_launch_exe_with_usb_gate(install_root, true)
+}
+
+fn installed_codex_launch_exe_with_usb_gate(
+    install_root: &Path,
+    require_usb_overlay: bool,
+) -> Result<PathBuf, EngineError> {
+    let entry = installed_app_exe(install_root).ok_or_else(|| {
+        EngineError::Msix(format!(
+            "portable install has no manifest-declared application entry under {}",
+            install_root.display()
+        ))
+    })?;
+    let metadata_path = install_root.join(USB_ENTRY_OVERLAY_FILE);
+    if !metadata_path.exists() {
+        if require_usb_overlay {
+            return Err(EngineError::Msix(
+                "U 盘 Codex 尚未安装直接入口授权组件，请在管理器中修复或重新安装 Codex".to_string(),
+            ));
+        }
+        return Ok(entry);
+    }
+    let metadata_bytes = fs::read(&metadata_path)
+        .map_err(|error| io_err("read USB direct-entry overlay metadata", error))?;
+    let metadata: UsbEntryOverlay = serde_json::from_slice(&metadata_bytes).map_err(|error| {
+        EngineError::Msix(format!(
+            "USB direct-entry overlay metadata is invalid: {error}"
+        ))
+    })?;
+    let trusted_shim_path = install_root
+        .parent()
+        .and_then(Path::parent)
+        .map(|root| root.join("CodexEntryShim.exe"))
+        .filter(|path| path.is_file())
+        .ok_or_else(|| {
+            EngineError::Msix(
+                "USB direct-entry overlay has no bundle-root CodexEntryShim.exe".to_string(),
+            )
+        })?;
+    let trusted_shim_sha256 = crate::download::sha256_file(&trusted_shim_path)?;
+    let declared = fs::read_to_string(install_root.join("AppxManifest.xml"))
+        .map_err(|error| io_err("read USB AppxManifest.xml", error))?;
+    let declared = crate::msix::parse_appx_application_executable(&declared)
+        .and_then(|value| {
+            value
+                .replace('\\', "/")
+                .rsplit('/')
+                .next()
+                .map(str::to_string)
+        })
+        .ok_or_else(|| EngineError::Msix("USB AppxManifest.xml entry is invalid".to_string()))?;
+    if metadata.schema_version != USB_ENTRY_OVERLAY_SCHEMA
+        || metadata.original_executable != USB_ENTRY_ORIGINAL_EXE
+        || metadata.entry_executable != declared
+        || !metadata
+            .original_sha256
+            .eq_ignore_ascii_case(&crate::download::sha256_file(
+                &install_root.join(USB_ENTRY_ORIGINAL_EXE),
+            )?)
+        || !metadata
+            .shim_sha256
+            .eq_ignore_ascii_case(&crate::download::sha256_file(&entry)?)
+        || !metadata
+            .shim_sha256
+            .eq_ignore_ascii_case(&trusted_shim_sha256)
+    {
+        return Err(EngineError::Msix(
+            "USB direct-entry overlay changed or does not match its manifest".to_string(),
+        ));
+    }
+    let alias_path = install_root.join("Codex.exe");
+    if alias_path.is_file() && !same_entry_basename(&alias_path, &entry) {
+        let alias = metadata
+            .aliases
+            .iter()
+            .find(|alias| alias.executable.eq_ignore_ascii_case("Codex.exe"))
+            .ok_or_else(|| {
+                EngineError::Msix(
+                    "USB direct-entry overlay does not protect the Codex.exe package alias"
+                        .to_string(),
+                )
+            })?;
+        if alias.original_executable != USB_ENTRY_ALIAS_ORIGINAL_EXE
+            || !alias
+                .original_sha256
+                .eq_ignore_ascii_case(&crate::download::sha256_file(
+                    &install_root.join(USB_ENTRY_ALIAS_ORIGINAL_EXE),
+                )?)
+            || !alias
+                .shim_sha256
+                .eq_ignore_ascii_case(&crate::download::sha256_file(&alias_path)?)
+            || !alias.shim_sha256.eq_ignore_ascii_case(&trusted_shim_sha256)
+        {
+            return Err(EngineError::Msix(
+                "USB Codex.exe alias overlay changed or does not match its manifest".to_string(),
+            ));
+        }
+    }
+    Ok(install_root.join(USB_ENTRY_ORIGINAL_EXE))
+}
+
+const USB_ENTRY_OVERLAY_SCHEMA: u32 = 2;
+const USB_ENTRY_OVERLAY_FILE: &str = "codex-usb-entry-overlay.json";
+const USB_ENTRY_ORIGINAL_EXE: &str = "CodexCore.dat";
+const USB_ENTRY_ALIAS_ORIGINAL_EXE: &str = "CodexAliasCore.dat";
+
+fn same_entry_basename(left: &Path, right: &Path) -> bool {
+    left.file_name()
+        .zip(right.file_name())
+        .is_some_and(|(left, right)| left.eq_ignore_ascii_case(right))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UsbEntryOverlay {
+    schema_version: u32,
+    entry_executable: String,
+    original_executable: String,
+    original_sha256: String,
+    shim_sha256: String,
+    aliases: Vec<UsbEntryAliasOverlay>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UsbEntryAliasOverlay {
+    executable: String,
+    original_executable: String,
+    original_sha256: String,
+    shim_sha256: String,
+}
+
+fn install_usb_entry_overlay(
+    payload: &Path,
+    manifest_xml: &str,
+    shim_path: &Path,
+) -> Result<(), EngineError> {
+    if !shim_path.is_file() {
+        return Err(EngineError::Install(format!(
+            "USB direct-entry shim is missing: {}",
+            shim_path.display()
+        )));
+    }
+    let declared = crate::msix::parse_appx_application_executable(manifest_xml)
+        .and_then(|value| {
+            value
+                .replace('\\', "/")
+                .rsplit('/')
+                .next()
+                .map(str::to_string)
+        })
+        .filter(|value| {
+            value.eq_ignore_ascii_case("ChatGPT.exe") || value.eq_ignore_ascii_case("Codex.exe")
+        })
+        .ok_or_else(|| {
+            EngineError::Msix(
+                "USB MSIX manifest entry is not a supported Codex executable".to_string(),
+            )
+        })?;
+    let declared_path = payload.join(&declared);
+    if !declared_path.is_file() {
+        return Err(EngineError::Msix(format!(
+            "USB MSIX manifest entry is missing from extracted payload: {declared}"
+        )));
+    }
+    let original_path = payload.join(USB_ENTRY_ORIGINAL_EXE);
+    if original_path.exists() || payload.join(USB_ENTRY_OVERLAY_FILE).exists() {
+        return Err(EngineError::Install(
+            "USB direct-entry overlay destination already exists".to_string(),
+        ));
+    }
+    let original_sha256 = crate::download::sha256_file(&declared_path)?;
+    let shim_sha256 = crate::download::sha256_file(shim_path)?;
+    fs::rename(&declared_path, &original_path)
+        .map_err(|error| io_err("preserve official USB Codex executable", error))?;
+    fs::copy(shim_path, &declared_path)
+        .map_err(|error| io_err("install USB direct-entry shim", error))?;
+    let alias_path = payload.join("Codex.exe");
+    let mut aliases = Vec::new();
+    if alias_path.is_file() && !same_entry_basename(&alias_path, &declared_path) {
+        let alias_original_path = payload.join(USB_ENTRY_ALIAS_ORIGINAL_EXE);
+        if alias_original_path.exists() {
+            return Err(EngineError::Install(
+                "USB Codex alias overlay destination already exists".to_string(),
+            ));
+        }
+        let alias_original_sha256 = crate::download::sha256_file(&alias_path)?;
+        fs::rename(&alias_path, &alias_original_path)
+            .map_err(|error| io_err("preserve official USB Codex alias", error))?;
+        fs::copy(shim_path, &alias_path)
+            .map_err(|error| io_err("install USB Codex alias shim", error))?;
+        aliases.push(UsbEntryAliasOverlay {
+            executable: "Codex.exe".to_string(),
+            original_executable: USB_ENTRY_ALIAS_ORIGINAL_EXE.to_string(),
+            original_sha256: alias_original_sha256,
+            shim_sha256: shim_sha256.clone(),
+        });
+    }
+    let metadata = UsbEntryOverlay {
+        schema_version: USB_ENTRY_OVERLAY_SCHEMA,
+        entry_executable: declared,
+        original_executable: USB_ENTRY_ORIGINAL_EXE.to_string(),
+        original_sha256,
+        shim_sha256,
+        aliases,
+    };
+    let encoded = serde_json::to_vec_pretty(&metadata)
+        .map_err(|error| EngineError::Install(format!("encode USB entry overlay: {error}")))?;
+    fs::write(payload.join(USB_ENTRY_OVERLAY_FILE), encoded)
+        .map_err(|error| io_err("write USB direct-entry overlay metadata", error))?;
+    Ok(())
+}
+
 fn prepare_portable_payload(
     msix_path: &Path,
     work_dir: &Path,
+    usb_entry_shim: Option<&Path>,
     progress: Option<&PortableExtractionProgressObserver<'_>>,
 ) -> Result<PreparedPortable, EngineError> {
     let extracted = work_dir.join("extracted");
@@ -1627,8 +3069,12 @@ fn prepare_portable_payload(
         );
     }
 
-    fs::write(payload.join("AppxManifest.xml"), manifest_xml)
+    fs::write(payload.join("AppxManifest.xml"), &manifest_xml)
         .map_err(|e| io_err("write portable AppxManifest.xml", e))?;
+
+    if let Some(shim_path) = usb_entry_shim {
+        install_usb_entry_overlay(&payload, &manifest_xml, shim_path)?;
+    }
 
     // Apply the unpackaged-launch compatibility fix before the transactional
     // payload is moved into place.  The operation is idempotent and is also
@@ -2469,7 +3915,12 @@ pub fn install_portable_from_msix_with_observer_options_and_progress(
     }
     fs::create_dir_all(&work_dir).map_err(|e| io_err("create portable staging", e))?;
 
-    let prepared = match prepare_portable_payload(msix_path, &work_dir, progress) {
+    let prepared = match prepare_portable_payload(
+        msix_path,
+        &work_dir,
+        options.usb_entry_shim.as_deref(),
+        progress,
+    ) {
         Ok(prepared) => prepared,
         Err(error) => {
             return Err(match cleanup_portable_work_dir(&work_dir) {
@@ -2987,11 +4438,236 @@ mod tests {
         bytes
     }
 
+    fn fake_pe_image_with_electron_asar_hash(hash: &str) -> Vec<u8> {
+        fn write_u16(bytes: &mut [u8], offset: usize, value: u16) {
+            bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
+            bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        fn write_resource_name(bytes: &mut [u8], root: usize, offset: usize, value: &str) {
+            let encoded = value.encode_utf16().collect::<Vec<_>>();
+            write_u16(bytes, root + offset, encoded.len() as u16);
+            for (index, unit) in encoded.into_iter().enumerate() {
+                write_u16(bytes, root + offset + 2 + index * 2, unit);
+            }
+        }
+
+        let mut bytes = vec![0_u8; 0x1200];
+        bytes[..2].copy_from_slice(b"MZ");
+        write_u32(&mut bytes, 0x3c, 0x80);
+        bytes[0x80..0x84].copy_from_slice(b"PE\0\0");
+        write_u16(&mut bytes, 0x80 + 6, 1);
+        write_u16(&mut bytes, 0x80 + 20, 0xf0);
+        let optional = 0x80 + 24;
+        write_u16(&mut bytes, optional, 0x20b);
+        write_u32(&mut bytes, optional + 108, 16);
+        write_u32(&mut bytes, optional + 112 + 2 * 8, 0x1000);
+        write_u32(&mut bytes, optional + 112 + 2 * 8 + 4, 0x800);
+        let section = optional + 0xf0;
+        write_u32(&mut bytes, section + 8, 0x1000);
+        write_u32(&mut bytes, section + 12, 0x1000);
+        write_u32(&mut bytes, section + 16, 0x1000);
+        write_u32(&mut bytes, section + 20, 0x200);
+
+        let root = 0x200;
+        write_u16(&mut bytes, root + 12, 1);
+        write_u32(&mut bytes, root + 16, 0x8000_0100);
+        write_u32(&mut bytes, root + 20, 0x8000_0020);
+        write_u16(&mut bytes, root + 0x20 + 12, 1);
+        write_u32(&mut bytes, root + 0x20 + 16, 0x8000_0120);
+        write_u32(&mut bytes, root + 0x20 + 20, 0x8000_0040);
+        write_u16(&mut bytes, root + 0x40 + 14, 1);
+        write_u32(&mut bytes, root + 0x40 + 16, 1033);
+        write_u32(&mut bytes, root + 0x40 + 20, 0x60);
+        write_u32(&mut bytes, root + 0x60, 0x1200);
+
+        let resource = serde_json::to_vec(&serde_json::json!([{
+            "file": "resources\\app.asar",
+            "alg": "SHA256",
+            "value": hash,
+        }]))
+        .unwrap();
+        write_u32(&mut bytes, root + 0x60 + 4, resource.len() as u32);
+        bytes[root + 0x60 + 16..root + 0x60 + 20].copy_from_slice(&0u32.to_le_bytes());
+        bytes[0x400..0x400 + resource.len()].copy_from_slice(&resource);
+        write_resource_name(&mut bytes, root, 0x100, "INTEGRITY");
+        write_resource_name(&mut bytes, root, 0x120, "ELECTRONASAR");
+        bytes
+    }
+
+    fn fake_asar_archive_with_member(member: &[u8]) -> Vec<u8> {
+        let block_size = member.len().max(1);
+        let blocks = member
+            .chunks(block_size)
+            .map(sha256_hex)
+            .collect::<Vec<_>>();
+        let json = serde_json::to_vec(&serde_json::json!({
+            "files": {
+                "bootstrap.js": {
+                    "size": member.len(),
+                    "offset": "0",
+                    "integrity": {
+                        "algorithm": "SHA256",
+                        "hash": sha256_hex(member),
+                        "blockSize": block_size,
+                        "blocks": blocks,
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        let padded_json_len = (json.len() + 3) & !3;
+        let header_size = 8 + padded_json_len;
+        let mut archive = Vec::with_capacity(8 + header_size + member.len());
+        archive.extend_from_slice(&4u32.to_le_bytes());
+        archive.extend_from_slice(&(header_size as u32).to_le_bytes());
+        archive.extend_from_slice(&((header_size - 4) as u32).to_le_bytes());
+        archive.extend_from_slice(&(json.len() as u32).to_le_bytes());
+        archive.extend_from_slice(&json);
+        archive.resize(16 + padded_json_len, 0);
+        archive.extend_from_slice(member);
+        archive
+    }
+
     fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
         TEST_ENV_LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
             .expect("test environment lock")
+    }
+
+    #[test]
+    fn fixed_width_asar_patch_refreshes_member_integrity_hashes() {
+        let root = temp_test_dir("asar-integrity-refresh");
+        let app_asar = root.join("app.asar");
+        let original = b"abcdefghijklmnop";
+        let block_size = 8usize;
+        let blocks = original
+            .chunks(block_size)
+            .map(sha256_hex)
+            .collect::<Vec<_>>();
+        let json = serde_json::to_vec(&serde_json::json!({
+            "files": {
+                "startup.js": {
+                    "size": original.len(),
+                    "offset": "0",
+                    "integrity": {
+                        "algorithm": "SHA256",
+                        "hash": sha256_hex(original),
+                        "blockSize": block_size,
+                        "blocks": blocks,
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        let padded_json_len = (json.len() + 3) & !3;
+        let header_size = 8 + padded_json_len;
+        let data_offset = 8 + header_size;
+        let mut archive = Vec::with_capacity(data_offset + original.len());
+        archive.extend_from_slice(&4u32.to_le_bytes());
+        archive.extend_from_slice(&(header_size as u32).to_le_bytes());
+        archive.extend_from_slice(&((header_size - 4) as u32).to_le_bytes());
+        archive.extend_from_slice(&(json.len() as u32).to_le_bytes());
+        archive.extend_from_slice(&json);
+        archive.resize(16 + padded_json_len, 0);
+        assert_eq!(archive.len(), data_offset);
+        archive.extend_from_slice(original);
+        fs::write(&app_asar, &archive).unwrap();
+
+        patch_asar_bytes_in_place(&app_asar, data_offset as u64 + 2, b"XY").unwrap();
+
+        let patched = fs::read(&app_asar).unwrap();
+        assert_eq!(patched.len(), archive.len());
+        let header_json_len = u32::from_le_bytes(patched[12..16].try_into().unwrap()) as usize;
+        let header: serde_json::Value =
+            serde_json::from_slice(&patched[16..16 + header_json_len]).unwrap();
+        let member_integrity = &header["files"]["startup.js"]["integrity"];
+        let updated_member = b"abXYefghijklmnop";
+        let whole_hash = sha256_hex(updated_member);
+        let first_block_hash = sha256_hex(&updated_member[..block_size]);
+        let second_block_hash = sha256_hex(&updated_member[block_size..]);
+        assert_eq!(member_integrity["hash"].as_str(), Some(whole_hash.as_str()));
+        assert_eq!(
+            member_integrity["blocks"][0].as_str(),
+            Some(first_block_hash.as_str())
+        );
+        assert_eq!(
+            member_integrity["blocks"][1].as_str(),
+            Some(second_block_hash.as_str())
+        );
+        assert_eq!(
+            &patched[data_offset..data_offset + updated_member.len()],
+            updated_member
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn asar_integrity_refresh_skips_write_when_metadata_is_already_current() {
+        let root = temp_test_dir("asar-integrity-noop");
+        let app_asar = root.join("app.asar");
+        let member = b"already valid";
+        let archive = fake_asar_archive_with_member(member);
+        let header_size = u64::from(u32::from_le_bytes(archive[4..8].try_into().unwrap()));
+        let data_offset = 8 + header_size;
+        fs::write(&app_asar, archive).unwrap();
+        let mut permissions = fs::metadata(&app_asar).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&app_asar, permissions).unwrap();
+
+        assert!(refresh_asar_file_integrity(&app_asar, data_offset, member.len()).is_ok());
+
+        let mut permissions = fs::metadata(&app_asar).unwrap().permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(&app_asar, permissions).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pe_electron_asar_integrity_hash_refresh_is_fixed_width_and_idempotent() {
+        let original = "a".repeat(64);
+        let expected = "b".repeat(64);
+        let mut executable = fake_pe_image_with_electron_asar_hash(&original);
+
+        assert_eq!(
+            patch_pe_electron_asar_integrity(&mut executable, &expected).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            patch_pe_electron_asar_integrity(&mut executable, &expected).unwrap(),
+            Some(false)
+        );
+
+        let resource_size =
+            u32::from_le_bytes(executable[0x264..0x268].try_into().unwrap()) as usize;
+        let resource = &executable[0x400..0x400 + resource_size];
+        let value_span = electron_asar_integrity_value_spans(resource).unwrap();
+        assert_eq!(value_span.len(), 1);
+        assert_eq!(&resource[value_span[0].clone()], expected.as_bytes());
+        assert_eq!(executable.len(), 0x1200);
+    }
+
+    #[test]
+    fn older_pe_without_electron_asar_resource_remains_compatible() {
+        let expected = "b".repeat(64);
+        let mut executable = fake_pe_image(3);
+        assert_eq!(
+            patch_pe_electron_asar_integrity(&mut executable, &expected).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn pe_rva_mapping_rejects_file_offset_overflow() {
+        let sections = [PeSectionRange {
+            virtual_address: 0,
+            virtual_size: 8,
+            raw_offset: u32::MAX,
+            raw_size: 8,
+        }];
+        assert!(pe_rva_to_file_offset(1, &sections).is_err());
     }
 
     #[cfg(windows)]
@@ -3031,6 +4707,7 @@ mod tests {
                 launch_health_check: false,
                 relaunch: false,
                 create_shell_metadata: false,
+                usb_entry_shim: None,
             }
         );
     }
@@ -3294,6 +4971,74 @@ mod tests {
     }
 
     #[test]
+    fn portable_updater_patches_all_native_package_family_queries() {
+        let root = temp_test_dir("native-package-family-updater-patch");
+        let resources = root.join("resources");
+        fs::create_dir_all(&resources).unwrap();
+        let app_asar = resources.join("app.asar");
+        let native_call = CODEX_ASAR_NATIVE_PACKAGE_FAMILY_CALL;
+        let original = [
+            b"header getCurrentPackageFamily updater ".as_slice(),
+            native_call,
+            b".trim();if(!e)return; middle ".as_slice(),
+            native_call,
+            b".trim())return; trailer".as_slice(),
+        ]
+        .concat();
+        fs::write(&app_asar, &original).unwrap();
+
+        assert!(ensure_portable_codex_startup_compatibility(&root).unwrap());
+        let patched = fs::read(&app_asar).unwrap();
+        assert_eq!(patched.len(), original.len());
+        assert!(!patched
+            .windows(native_call.len())
+            .any(|window| window == native_call));
+        assert_eq!(
+            patched
+                .windows(CODEX_ASAR_NATIVE_PACKAGE_FAMILY_PATCH_PREFIX.len())
+                .filter(|window| *window == CODEX_ASAR_NATIVE_PACKAGE_FAMILY_PATCH_PREFIX)
+                .count(),
+            2
+        );
+        assert!(!ensure_portable_codex_startup_compatibility(&root).unwrap());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unrelated_console_patch_does_not_skip_updater_bootstrap_patch() {
+        let root = temp_test_dir("independent-updater-patch");
+        let resources = root.join("resources");
+        fs::create_dir_all(&resources).unwrap();
+        let app_asar = resources.join("app.asar");
+        let console_call = CODEX_ASAR_CONSOLE_SPAWN_CALLS[0].0;
+        let original = [
+            b"header getCurrentPackageFamily bootstrap ".as_slice(),
+            CODEX_ASAR_UPDATER_CALLS[0],
+            b" ".as_slice(),
+            console_call,
+            b" trailer".as_slice(),
+        ]
+        .concat();
+        fs::write(&app_asar, &original).unwrap();
+
+        assert!(ensure_portable_codex_startup_compatibility(&root).unwrap());
+        let patched = fs::read(&app_asar).unwrap();
+        assert_eq!(patched.len(), original.len());
+        assert!(!patched
+            .windows(CODEX_ASAR_UPDATER_CALLS[0].len())
+            .any(|window| window == CODEX_ASAR_UPDATER_CALLS[0]));
+        assert!(patched
+            .windows(CODEX_ASAR_UPDATER_PATCH_PREFIX.len())
+            .any(|window| window == CODEX_ASAR_UPDATER_PATCH_PREFIX));
+        assert!(patched
+            .windows(CODEX_ASAR_CONSOLE_SPAWN_SENTINEL.len())
+            .any(|window| window == CODEX_ASAR_CONSOLE_SPAWN_SENTINEL));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn portable_i18n_patch_enables_bundled_chinese_and_is_idempotent() {
         let root = temp_test_dir("i18n-patch");
         let resources = root.join("resources");
@@ -3318,6 +5063,87 @@ mod tests {
         );
         assert!(!ensure_portable_codex_locale_compatibility(&root, Some("zh-CN")).unwrap());
         assert!(!ensure_portable_codex_locale_compatibility(&root, Some("en")).unwrap());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn portable_i18n_patch_refreshes_embedded_asar_integrity() {
+        let root = temp_test_dir("i18n-asar-integrity");
+        let resources = root.join("resources");
+        fs::create_dir_all(&resources).unwrap();
+        let app_asar = resources.join("app.asar");
+        let member = b"existing get(`enable_i18n`,!0) default get(`enable_i18n`,!1)";
+        fs::write(&app_asar, fake_asar_archive_with_member(member)).unwrap();
+        let executable = root.join("ChatGPT.exe");
+        let header_hash = app_asar_header_sha256(&app_asar).unwrap();
+        fs::write(
+            &executable,
+            fake_pe_image_with_electron_asar_hash(&header_hash),
+        )
+        .unwrap();
+        fs::write(
+            root.join("AppxManifest.xml"),
+            r#"<Package><Applications><Application Executable="ChatGPT.exe" /></Applications></Package>"#,
+        )
+        .unwrap();
+
+        assert!(ensure_portable_codex_locale_compatibility(&root, Some("zh-CN")).unwrap());
+        let header_hash = app_asar_header_sha256(&app_asar).unwrap();
+        let mut executable = fs::read(&executable).unwrap();
+        assert_eq!(
+            patch_pe_electron_asar_integrity(&mut executable, &header_hash).unwrap(),
+            Some(false)
+        );
+        assert!(!ensure_portable_codex_locale_compatibility(&root, Some("zh-CN")).unwrap());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn portable_i18n_patch_updates_usb_core_hash_and_overlay_record() {
+        let root = temp_test_dir("i18n-usb-asar-integrity");
+        let resources = root.join("resources");
+        fs::create_dir_all(&resources).unwrap();
+        let app_asar = resources.join("app.asar");
+        let member = b"default get(`enable_i18n`,!1)";
+        fs::write(&app_asar, fake_asar_archive_with_member(member)).unwrap();
+        let executable = root.join(USB_ENTRY_ORIGINAL_EXE);
+        let header_hash = app_asar_header_sha256(&app_asar).unwrap();
+        fs::write(
+            &executable,
+            fake_pe_image_with_electron_asar_hash(&header_hash),
+        )
+        .unwrap();
+        let overlay_path = root.join(USB_ENTRY_OVERLAY_FILE);
+        fs::write(
+            &overlay_path,
+            serde_json::to_vec(&UsbEntryOverlay {
+                schema_version: USB_ENTRY_OVERLAY_SCHEMA,
+                entry_executable: "ChatGPT.exe".to_string(),
+                original_executable: USB_ENTRY_ORIGINAL_EXE.to_string(),
+                original_sha256: crate::download::sha256_file(&executable).unwrap(),
+                shim_sha256: "0".repeat(64),
+                aliases: Vec::new(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(ensure_portable_codex_locale_compatibility(&root, Some("zh-CN")).unwrap());
+        let header_hash = app_asar_header_sha256(&app_asar).unwrap();
+        let mut executable_bytes = fs::read(&executable).unwrap();
+        assert_eq!(
+            patch_pe_electron_asar_integrity(&mut executable_bytes, &header_hash).unwrap(),
+            Some(false)
+        );
+        let overlay: UsbEntryOverlay =
+            serde_json::from_slice(&fs::read(&overlay_path).unwrap()).unwrap();
+        assert_eq!(
+            overlay.original_sha256,
+            crate::download::sha256_file(&executable).unwrap()
+        );
+        assert!(!ensure_portable_codex_locale_compatibility(&root, Some("zh-CN")).unwrap());
 
         let _ = fs::remove_dir_all(root);
     }
@@ -3381,6 +5207,7 @@ mod tests {
         let prepared = prepare_portable_payload(
             &package,
             &work,
+            None,
             Some(&|update| {
                 progress.borrow_mut().push(update);
                 Ok(())
@@ -3402,6 +5229,226 @@ mod tests {
             .windows(2)
             .all(|window| window[1].completed_bytes >= window[0].completed_bytes));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn usb_entry_overlay_preserves_official_entry_and_fails_closed_on_tampering() {
+        let root = temp_test_dir("entry-overlay");
+        let package = root.join("fixture.msix");
+        let work = root.join("work");
+        let shim = root.join("CodexEntryShim.exe");
+        fs::create_dir_all(&work).unwrap();
+        fs::write(&shim, b"trusted test shim bytes").unwrap();
+
+        let file = fs::File::create(&package).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+        let manifest = r#"<Package><Identity Name="OpenAI.Codex" Publisher="CN=X" Version="1.0.0.0" ProcessorArchitecture="x64"/><Applications><Application Id="App" Executable="app/ChatGPT.exe"/></Applications></Package>"#;
+        zip.start_file("AppxManifest.xml", options).unwrap();
+        zip.write_all(manifest.as_bytes()).unwrap();
+        zip.start_file("app/ChatGPT.exe", options).unwrap();
+        zip.write_all(b"official entry bytes").unwrap();
+        zip.start_file("app/Codex.exe", options).unwrap();
+        zip.write_all(b"official package alias bytes").unwrap();
+        zip.start_file("app/resources/app.asar", options).unwrap();
+        zip.write_all(b"app payload").unwrap();
+        zip.finish().unwrap();
+
+        let prepared = prepare_portable_payload(&package, &work, Some(&shim), None).unwrap();
+        let payload = prepared.payload_dir;
+        assert_eq!(
+            fs::read(payload.join("CodexCore.dat")).unwrap(),
+            b"official entry bytes"
+        );
+        assert_eq!(
+            fs::read(payload.join("ChatGPT.exe")).unwrap(),
+            b"trusted test shim bytes"
+        );
+        assert_eq!(
+            fs::read(payload.join("CodexAliasCore.dat")).unwrap(),
+            b"official package alias bytes"
+        );
+        assert_eq!(
+            fs::read(payload.join("Codex.exe")).unwrap(),
+            b"trusted test shim bytes",
+            "the package's undeclared Codex.exe alias must also route through the shim"
+        );
+        assert_eq!(
+            installed_app_exe(&payload),
+            Some(payload.join("ChatGPT.exe")),
+            "the package entry remains the shim"
+        );
+        assert_eq!(
+            installed_codex_launch_exe(&payload).unwrap(),
+            payload.join("CodexCore.dat")
+        );
+
+        fs::write(payload.join("Codex.exe"), b"tampered alias").unwrap();
+        assert!(installed_codex_launch_exe(&payload).is_err());
+        fs::write(payload.join("Codex.exe"), b"trusted test shim bytes").unwrap();
+        fs::write(payload.join("ChatGPT.exe"), b"tampered shim").unwrap();
+        assert!(installed_codex_launch_exe(&payload).is_err());
+        fs::write(payload.join("ChatGPT.exe"), b"trusted test shim bytes").unwrap();
+        fs::write(root.join("CodexEntryShim.exe"), b"tampered trusted shim").unwrap();
+        assert!(installed_codex_launch_exe(&payload).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn usb_launch_requires_overlay_but_standard_portable_launch_remains_compatible() {
+        let root = temp_test_dir("entry-overlay-required");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("AppxManifest.xml"),
+            r#"<Package><Applications><Application Executable="ChatGPT.exe" /></Applications></Package>"#,
+        )
+        .unwrap();
+        fs::write(root.join("ChatGPT.exe"), b"legacy portable entry").unwrap();
+
+        assert_eq!(
+            installed_codex_launch_exe(&root).unwrap(),
+            root.join("ChatGPT.exe")
+        );
+        assert!(installed_usb_codex_launch_exe(&root).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_launches_preserved_pe_image_from_non_exe_extension() {
+        use std::process::Command;
+        let root = temp_test_dir("non-exe-launch");
+        let source = std::env::current_exe().unwrap();
+        let payload = root.join("CodexCore.dat");
+        fs::copy(source, &payload).unwrap();
+        let output = Command::new(&payload)
+            .arg("--list")
+            .output()
+            .expect("Windows should launch an explicitly named PE image without an .exe extension");
+        assert!(
+            output.status.success(),
+            "renamed test PE should execute; status={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires CODEX_REAL_MSIX_SMOKE_PATH pointing to a locally verified Codex MSIX"]
+    fn real_msix_codex_core_opens_from_portable_tree() {
+        let package_or_payload = std::env::var_os("CODEX_REAL_MSIX_SMOKE_PATH")
+            .map(PathBuf::from)
+            .expect(
+                "CODEX_REAL_MSIX_SMOKE_PATH must name a verified MSIX or extracted test payload",
+            );
+        assert!(
+            package_or_payload.is_file() || package_or_payload.is_dir(),
+            "test MSIX or payload is missing: {}",
+            package_or_payload.display()
+        );
+
+        let _env_lock = test_env_lock();
+        let root = temp_test_dir("real-msix-smoke");
+        let work = root.join("work");
+        fs::create_dir_all(&work).unwrap();
+        let result = (|| {
+            let (payload, version, arch) = if package_or_payload.is_dir() {
+                (
+                    package_or_payload.clone(),
+                    "existing-test-payload".to_string(),
+                    None,
+                )
+            } else {
+                let prepared = prepare_portable_payload(&package_or_payload, &work, None, None)
+                    .map_err(|error| format!("extract and patch real Codex MSIX: {error}"))?;
+                (
+                    prepared.payload_dir,
+                    prepared.identity.version,
+                    Some(prepared.identity.processor_architecture),
+                )
+            };
+            let installed = crate::InstalledWindowsCodex {
+                path: payload.to_string_lossy().into_owned(),
+                version,
+                arch,
+                source: "portable".to_string(),
+                package_family_name: None,
+                package_volume: None,
+                installed_at: None,
+            };
+            let options = crate::LaunchOptions {
+                disable_codex_self_updates: true,
+                codex_home: Some(root.join("isolated-codex-home")),
+                locale_override: Some("zh-CN".to_string()),
+                portable_launch_policy: crate::PortableLaunchPolicy::UsbCompatible,
+                ..crate::LaunchOptions::default()
+            };
+            let profile = root.join("isolated-profile");
+            let appdata = profile.join("Roaming");
+            let local_appdata = profile.join("Local");
+            let userprofile = profile.join("User");
+            fs::create_dir_all(&appdata).unwrap();
+            fs::create_dir_all(&local_appdata).unwrap();
+            fs::create_dir_all(&userprofile).unwrap();
+            let previous_appdata = std::env::var_os("APPDATA");
+            let previous_local_appdata = std::env::var_os("LOCALAPPDATA");
+            let previous_userprofile = std::env::var_os("USERPROFILE");
+            let previous_home = std::env::var_os("HOME");
+            std::env::set_var("APPDATA", &appdata);
+            std::env::set_var("LOCALAPPDATA", &local_appdata);
+            std::env::set_var("USERPROFILE", &userprofile);
+            std::env::set_var("HOME", &userprofile);
+            let report = crate::launch_codex_with_options(&installed, options)
+                .map_err(|error| format!("real Codex core did not start: {error}"));
+            restore_test_env("APPDATA", previous_appdata);
+            restore_test_env("LOCALAPPDATA", previous_local_appdata);
+            restore_test_env("USERPROFILE", previous_userprofile);
+            restore_test_env("HOME", previous_home);
+            let report = report?;
+            if !report.usable_window_confirmed {
+                return Err(format!(
+                    "real Codex core exited without a usable window: {report:?}"
+                ));
+            }
+            println!(
+                "real Codex smoke passed version={} launch_mode={} usable_window_confirmed={}",
+                installed.version, report.launch_mode, report.usable_window_confirmed
+            );
+            Ok(())
+        })();
+
+        let payload = if package_or_payload.is_dir() {
+            package_or_payload.clone()
+        } else {
+            work.join("payload")
+        };
+        if payload.is_dir() {
+            let _ = crate::windows_process::close_processes_for_root(20, &payload);
+        }
+        if result.is_err() && std::env::var_os("CODEX_REAL_MSIX_SMOKE_KEEP").is_some() {
+            println!("real Codex smoke scratch retained at {}", root.display());
+            panic!("{}", result.unwrap_err());
+        }
+        let cleanup = fs::remove_dir_all(&root);
+        if let Err(error) = result {
+            let cleanup_note = cleanup
+                .err()
+                .map(|cleanup_error| format!("; scratch cleanup failed: {cleanup_error}"))
+                .unwrap_or_default();
+            panic!("{error}{cleanup_note}");
+        }
+        cleanup.expect("remove isolated real Codex smoke directory");
+    }
+
+    #[cfg(windows)]
+    fn restore_test_env(name: &str, value: Option<std::ffi::OsString>) {
+        if let Some(value) = value {
+            std::env::set_var(name, value);
+        } else {
+            std::env::remove_var(name);
+        }
     }
 
     /// Release QA hook: exercises the exact USB extraction/transaction path

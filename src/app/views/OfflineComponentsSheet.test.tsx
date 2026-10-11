@@ -6,7 +6,7 @@ import { managerApi } from "../../services/managerApi";
 import type { CapabilityPackReport, CcswitchLaunchReport } from "../../shared/types";
 import { I18nProvider } from "../i18n";
 import { ThemeProvider } from "../theme";
-import { OfflineComponentsSheet } from "./OfflineComponentsSheet";
+import { OfflineComponentsSheet, type OfflineComponentsView } from "./OfflineComponentsSheet";
 
 vi.mock("../../services/managerApi", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../services/managerApi")>();
@@ -29,8 +29,8 @@ const PACK_REPORT: CapabilityPackReport = {
   coreReady: false,
   overallStatus: "failed",
   sourcePath: "F:\\content\\codex-starter-kit",
-  packVersion: "1.2.1",
-  skills: 50,
+  packVersion: "1.4.0",
+  skills: 55,
   agents: 7,
   runtimeReady: false,
   runtimeStatus: "unknown",
@@ -55,19 +55,25 @@ const CCSWITCH_REPORT: CcswitchLaunchReport = {
   message: "Codex Switch 已从 U 盘启动",
 };
 
-function SheetView({ open = true }: { open?: boolean }) {
+function SheetView({
+  open = true,
+  view = "connections",
+}: {
+  open?: boolean;
+  view?: OfflineComponentsView;
+}) {
   return (
     <ThemeProvider>
       <I18nProvider>
-        <OfflineComponentsSheet open={open} onDismiss={vi.fn()} />
+        <OfflineComponentsSheet open={open} onDismiss={vi.fn()} view={view} />
       </I18nProvider>
     </ThemeProvider>
   );
 }
 
-function renderSheet(open = true) {
+function renderSheet(open = true, view: OfflineComponentsView = "connections") {
   return render(
-    <SheetView open={open} />,
+    <SheetView open={open} view={view} />,
   );
 }
 
@@ -110,7 +116,7 @@ describe("OfflineComponentsSheet", () => {
     await user.click(screen.getByRole("checkbox", { name: "飞书 / Lark MCP" }));
     await user.type(screen.getByLabelText("飞书 App ID"), "cli_test");
     await user.type(screen.getByLabelText("飞书 App Secret"), "secret_test");
-    await user.click(screen.getByRole("button", { name: "安装 / 修复能力包" }));
+    await user.click(screen.getByRole("button", { name: "保存并应用连接" }));
 
     await waitFor(() => expect(api.installCapabilityPack).toHaveBeenCalledTimes(1));
     expect(api.installCapabilityPack).toHaveBeenCalledWith(
@@ -131,7 +137,7 @@ describe("OfflineComponentsSheet", () => {
     api.capabilityPackStatus.mockReturnValue(status.promise);
     renderSheet();
 
-    const install = await screen.findByRole("button", { name: "安装 / 修复能力包" });
+    const install = await screen.findByRole("button", { name: "保存并应用连接" });
     await waitFor(() => expect(api.capabilityPackStatus).toHaveBeenCalledTimes(1));
     expect(install).toBeDisabled();
 
@@ -155,7 +161,7 @@ describe("OfflineComponentsSheet", () => {
     rendered.rerender(<SheetView open />);
     await waitFor(() => expect(api.capabilityPackStatus).toHaveBeenCalledTimes(2));
 
-    const install = await screen.findByRole("button", { name: "安装 / 修复能力包" });
+    const install = await screen.findByRole("button", { name: "保存并应用连接" });
     await waitFor(() => expect(install).toBeEnabled());
     await user.click(install);
     await waitFor(() => expect(api.installCapabilityPack).toHaveBeenCalledTimes(1));
@@ -204,7 +210,7 @@ describe("OfflineComponentsSheet", () => {
     const user = userEvent.setup();
     renderSheet();
 
-    await user.click(screen.getByRole("button", { name: "安装 / 修复能力包" }));
+    await user.click(screen.getByRole("button", { name: "保存并应用连接" }));
 
     await waitFor(() => expect(api.installCapabilityPack).toHaveBeenCalledTimes(1));
     expect(api.installCapabilityPack).toHaveBeenCalledWith(
@@ -215,11 +221,37 @@ describe("OfflineComponentsSheet", () => {
         feishuAppId: "",
         feishuAppSecret: "",
         dashscopeApiKey: "",
-        image2ApiKey: "",
-        seedanceApiKey: "",
+        enableMediaGeneration: false,
+        mediaGenerationApiKey: "",
+        minimaxVideoModel: "",
       }),
     );
     expect(screen.queryByText("DashScope 的 Key、Base URL 和模型必须填写完整。")).not.toBeInTheDocument();
+  }, 30_000);
+
+  it("configures MiniMax as a blank future model in the same shared media MCP", async () => {
+    const user = userEvent.setup();
+    renderSheet();
+
+    await user.click(screen.getByRole("checkbox", { name: "图片与视频生成（本地 MCP）" }));
+    expect(screen.getByText("MiniMax 视频：暂未开放")).toBeInTheDocument();
+    await user.type(screen.getByLabelText("媒体上游 API 地址"), "https://api.wokey.ai");
+    await user.type(screen.getByLabelText("媒体上游 API Key（共用）"), "shared-media-test-key");
+    await user.click(screen.getByText("高级设置"));
+    await user.selectOptions(screen.getByLabelText("上游兼容模式"), "wokey");
+    await user.type(screen.getByLabelText("Grok 图片模型 ID"), "grok-imagine-test");
+    await user.click(screen.getByRole("button", { name: "保存并应用连接" }));
+
+    await waitFor(() => expect(api.installCapabilityPack).toHaveBeenCalledTimes(1));
+    const submitted = api.installCapabilityPack.mock.calls[0][0];
+    expect(submitted).toEqual(expect.objectContaining({
+      enableMediaGeneration: true,
+      mediaGenerationApiKey: "shared-media-test-key",
+      minimaxVideoModel: "",
+      enabledApiServices: [],
+    }));
+    expect(submitted).not.toHaveProperty("minimaxApiKey");
+    expect(submitted).not.toHaveProperty("minimaxBaseUrl");
   }, 30_000);
 
   it("rejects an enabled service with missing required fields before IPC", async () => {
@@ -227,7 +259,7 @@ describe("OfflineComponentsSheet", () => {
     renderSheet();
 
     await user.click(screen.getByRole("checkbox", { name: "DashScope 联网搜索" }));
-    await user.click(screen.getByRole("button", { name: "安装 / 修复能力包" }));
+    await user.click(screen.getByRole("button", { name: "保存并应用连接" }));
 
     expect(await screen.findByText("DashScope 的 Key、Base URL 和模型必须填写完整。")).toBeInTheDocument();
     expect(api.installCapabilityPack).not.toHaveBeenCalled();
@@ -235,7 +267,7 @@ describe("OfflineComponentsSheet", () => {
 
   it("retries CCSwitch independently and renders its success report", async () => {
     const user = userEvent.setup();
-    renderSheet();
+    renderSheet(true, "maintenance");
 
     await user.click(screen.getByRole("button", { name: "单独重试 CCSwitch" }));
     await waitFor(() => expect(api.installAndLaunchCcswitch).toHaveBeenCalledTimes(1));

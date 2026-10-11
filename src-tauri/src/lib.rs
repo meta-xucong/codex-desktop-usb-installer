@@ -1033,7 +1033,7 @@ pub fn run() {
             commands::usb_guard_status,
             commands::gateway_model_probe,
             commands::cancel_gateway_model_probe,
-            commands::refresh_native_model_catalog,
+            commands::manage_native_model_catalog,
             commands::install_and_launch_ccswitch,
             commands::open_ccswitch,
             commands::account_status,
@@ -1180,6 +1180,8 @@ pub fn run() {
                         summary.failed
                     );
                 }
+                #[cfg(target_os = "windows")]
+                crate::app::codex_entry_ipc::start(recovery_app.clone());
             });
             let health = app
                 .state::<state::ManagerState>()

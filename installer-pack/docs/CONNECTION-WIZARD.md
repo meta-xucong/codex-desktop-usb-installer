@@ -4,7 +4,7 @@
 
 `Install-Codex-Starter.cmd` 无参数运行时打开 `scripts/install-wizard.ps1`。向导负责两件事：
 
-1. 安装完整能力包：50 个 Skills、7 个 Agents、Python/Node 运行时、离线依赖、Feishu MCP 包和 Codex 托管配置；
+1. 安装完整能力包：55 个 Skills、7 个 Agents、Python/Node 运行时、离线依赖、Feishu 与统一媒体 MCP、以及 Codex 托管配置；
 2. 让用户按需启用外部连接，而不是把密钥或第三方服务默认打开。
 
 向导不是第二套清单。表单从以下文件生成：
@@ -13,20 +13,22 @@
 - `manifest/mcp-servers.json`：MCP 服务、关联 Skills 和运行时要求；
 - `manifest/api-services.json`：直连 HTTP/API 服务、关联 Skills 和必需字段。
 
-当前表单包含 1 个 MCP（Feishu/Lark）和 3 个直连 API（DashScope 网页搜索、Image-2、Seedance），共 19 个连接字段。
+当前表单包含 2 个本地 MCP（Feishu/Lark、统一媒体生成）、4 个远程 OAuth MCP（Cloudflare、Figma、Linear、Notion）和 1 个直连 API（DashScope 网页搜索）。Image-2、Grok 图片/视频、Seedance 和未来上游开放的 MiniMax 视频模型都由同一个媒体 MCP 和共享 API Key 接入。
 
 ## 使用规则
 
 - 每个服务默认不勾选；不勾选就不启用该服务，但完整安装仍继续；
 - 选择服务后，向导校验该服务的必填字段、长度、正则、URL 协议/主机/路径和条件必填字段；
 - Feishu 的 `user` 认证方式会额外要求 User Access Token；`tenant` 和 `oauth` 不要求该字段；
-- 选择 API 服务会同时启用它关联的非核心 Skill；没有选择的 API Skill 保持禁用；
+- 选择 API 或统一媒体 MCP 会同时启用它关联的非核心 Skill；没有选择的服务 Skill 保持禁用；
 - 选择 Feishu 会启用 `feishu-doc`、`feishu-drive`、`feishu-perm` 和 `feishu-wiki`，并将 Feishu MCP 配置为启用；
+- 选择远程 MCP 会生成单独的 HTTPS MCP 配置并开启 Codex 原生 OAuth 流程；用户仍须在 Codex 中完成账号授权。未选择的服务会生成 `enabled = false` 配置。
+- 选择统一媒体 MCP 会写入一组共享媒体 API Base URL/Key，并可选填写 Image-2、Grok 图片、Grok 视频、Seedance 和 MiniMax 视频模型名；MiniMax 模型槽位当前保持空白，仅当同一上游开放该模型后再填写。部分旧式 Image-2/Seedance 网关需要路由 ID。媒体生成每次单独确认，MCP 不猜价格或自动重试未知提交；MiniMax 不调用官方 API，也不会自动改用其他模型。
 - 点击“跳过配置，直接安装”会安装完整包，但所有外部连接保持关闭。
 
 敏感字段使用密码框。向导只把非空且已选择服务的值写入当前 Windows 用户级环境变量和当前安装进程；Codex TOML、公开安装包、
-readiness、安装清单和日志不保存密钥值。秘密字段如果已经存在于本机用户环境变量，界面不回显；留空会沿用已有值。明确勾选
-“清理本机已有环境变量”时，也只会清理本安装器此前记录拥有的变量名；没有所有权记录的变量永远不会被删除。
+readiness、安装清单和日志不保存密钥值。秘密字段如果已经存在于本机用户环境变量，界面不回显；留空会沿用已有值，除非明确勾选
+“清理本机已有环境变量”。
 
 ## 自动化入口
 

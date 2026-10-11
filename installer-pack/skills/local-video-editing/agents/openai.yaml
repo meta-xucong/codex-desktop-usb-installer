@@ -1,0 +1,6 @@
+interface:
+  display_name: "本地视频剪辑"
+  short_description: "使用 FFmpeg 在本机剪辑、转换、合并并校验视频和音频文件。"
+  default_prompt: "Use $local-video-editing to plan and perform this local media edit."
+policy:
+  allow_implicit_invocation: false

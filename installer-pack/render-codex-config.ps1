@@ -3,13 +3,16 @@ param(
     [Parameter(Mandatory = $true)][string]$OutputPath,
     [string]$SkillRoot,
     [switch]$EnableFeishu,
+    [switch]$EnableMediaGeneration,
     [string]$FeishuWrapperPath,
+    [string]$MediaMcpWrapperPath,
     [string]$FeishuPackageCache,
     [string]$PythonExe,
     [string]$TargetUserProfile,
     [ValidateSet('tenant','oauth','user')][string]$FeishuAuthMode = 'tenant',
     [string]$FeishuDomain = 'https://open.feishu.cn',
     [string[]]$EnableSkills = @(),
+    [string[]]$EnableRemoteMcps = @(),
     [switch]$Overwrite
 )
 
@@ -34,12 +37,15 @@ if ([string]::IsNullOrWhiteSpace($userProfile)) { $userProfile = [Environment]::
 if ([string]::IsNullOrWhiteSpace($userProfile)) { throw 'USERPROFILE is required.' }
 if ([string]::IsNullOrWhiteSpace($SkillRoot)) { $SkillRoot = Join-Path $userProfile '.agents\skills' }
 if ([string]::IsNullOrWhiteSpace($FeishuWrapperPath)) { $FeishuWrapperPath = Join-Path $userProfile '.codex\codex-agent-kit\bin\start-feishu-mcp.ps1' }
+if ([string]::IsNullOrWhiteSpace($MediaMcpWrapperPath)) { $MediaMcpWrapperPath = Join-Path $userProfile '.codex\codex-agent-kit\bin\start-media-generation-mcp.ps1' }
 if ([string]::IsNullOrWhiteSpace($FeishuPackageCache)) { $FeishuPackageCache = Join-Path $userProfile '.codex\codex-agent-kit\runtime\feishu' }
 
 $auditPath = Join-Path $kitRoot 'manifest\skill-audit.json'
 $templatePath = Join-Path $kitRoot 'config-fragments\feishu-official-stdio.template.toml'
+$mediaTemplatePath = Join-Path $kitRoot 'config-fragments\media-generation-stdio.template.toml'
 if (-not (Test-Path -LiteralPath $auditPath -PathType Leaf)) { throw "Missing Skill audit: $auditPath" }
 if (-not (Test-Path -LiteralPath $templatePath -PathType Leaf)) { throw "Missing Feishu template: $templatePath" }
+if (-not (Test-Path -LiteralPath $mediaTemplatePath -PathType Leaf)) { throw "Missing media generation template: $mediaTemplatePath" }
 $audit = Get-Content -LiteralPath $auditPath -Raw -Encoding UTF8 | ConvertFrom-Json
 
 $skillRootFull = [IO.Path]::GetFullPath($SkillRoot)
@@ -82,6 +88,51 @@ if ($EnableFeishu) {
     if ($dryRunText -match [regex]::Escape($secretValue)) { throw 'Feishu wrapper dry-run exposed App Secret.' }
 }
 
+$mediaTemplate = Get-Content -LiteralPath $mediaTemplatePath -Raw -Encoding UTF8
+if ($EnableMediaGeneration) {
+    $mediaKey = [Environment]::GetEnvironmentVariable('MEDIA_GENERATION_API_KEY', 'Process')
+    $mediaBaseUrl = [Environment]::GetEnvironmentVariable('MEDIA_GENERATION_API_BASE_URL', 'Process')
+    if ([string]::IsNullOrWhiteSpace($mediaKey) -or [string]::IsNullOrWhiteSpace($mediaBaseUrl)) {
+        throw 'MEDIA_GENERATION_API_KEY and MEDIA_GENERATION_API_BASE_URL are required before enabling the unified media MCP.'
+    }
+    $modelNames = @('MEDIA_IMAGE2_MODEL','MEDIA_GROK_IMAGE_MODEL','MEDIA_GROK_VIDEO_MODEL','MEDIA_SEEDANCE_MODEL','MEDIA_MINIMAX_VIDEO_MODEL')
+    $configuredModels = @($modelNames | Where-Object { -not [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_, 'Process')) })
+    if ($configuredModels.Count -eq 0) { throw 'Configure at least one actual provider model before enabling the unified media MCP.' }
+    if ((-not [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable('MEDIA_IMAGE2_MODEL', 'Process')) -or -not [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable('MEDIA_SEEDANCE_MODEL', 'Process'))) -and [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable('MEDIA_GENERATION_AGENT_ID', 'Process'))) {
+        throw 'MEDIA_GENERATION_AGENT_ID is required when enabling Image-2 or Seedance routes.'
+    }
+    $mediaUri = $null
+    if (-not [Uri]::TryCreate($mediaBaseUrl, [UriKind]::Absolute, [ref]$mediaUri) -or $mediaUri.Scheme -ne 'https' -or $mediaUri.AbsolutePath.TrimEnd('/') -ne '' -or -not [string]::IsNullOrWhiteSpace($mediaUri.Query) -or -not [string]::IsNullOrWhiteSpace($mediaUri.Fragment) -or -not [string]::IsNullOrWhiteSpace($mediaUri.UserInfo)) {
+        throw 'MEDIA_GENERATION_API_BASE_URL must be a root HTTPS URL without credentials, path, query, or fragment.'
+    }
+    if (-not (Test-Path -LiteralPath $MediaMcpWrapperPath -PathType Leaf)) { throw "Media MCP wrapper not found: $MediaMcpWrapperPath" }
+    $mediaDryRunText = & $MediaMcpWrapperPath -DryRun | Out-String
+    if ($LASTEXITCODE -ne 0) { throw 'Media MCP wrapper dry-run failed.' }
+    $mediaDryRun = $mediaDryRunText | ConvertFrom-Json
+    if (-not [bool]$mediaDryRun.pythonReady -or -not [bool]$mediaDryRun.serverReady) { throw 'Bundled Python or unified media MCP server is missing.' }
+}
+
+$mcpManifestPath = Join-Path $kitRoot 'manifest\mcp-servers.json'
+$mcpManifest = Get-Content -LiteralPath $mcpManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$remoteServers = @($mcpManifest.servers | Where-Object { [string]$_.transport -eq 'streamable-http' })
+$remoteIds = @($remoteServers | ForEach-Object { [string]$_.id })
+$requestedRemoteMcps = @($EnableRemoteMcps | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | ForEach-Object { [string]$_ } | Sort-Object -Unique)
+$unknownRemoteMcps = @($requestedRemoteMcps | Where-Object { $_ -notin $remoteIds })
+if ($unknownRemoteMcps.Count -gt 0) { throw "Cannot enable unknown remote MCP IDs: $($unknownRemoteMcps -join ', ')" }
+foreach ($server in $remoteServers) {
+    $id = [string]$server.id
+    $url = [string]$server.url
+    if ($id -notmatch '^[a-zA-Z][a-zA-Z0-9_-]*$') { throw "Remote MCP id is invalid: $id" }
+    $uri = $null
+    if (-not [Uri]::TryCreate($url, [UriKind]::Absolute, [ref]$uri) -or $uri.Scheme -ne 'https') {
+        throw "Remote MCP $id must declare a valid HTTPS url in the pack manifest."
+    }
+    $lines.Add("[mcp_servers.$id]")
+    $lines.Add('url = ' + (ConvertTo-TomlString $url))
+    $lines.Add('enabled = ' + $(if ($requestedRemoteMcps -contains $id) { 'true' } else { 'false' }))
+    $lines.Add('')
+}
+
 $template = Get-Content -LiteralPath $templatePath -Raw -Encoding UTF8
 $feishuEnvironmentNames = @('FEISHU_APP_ID', 'FEISHU_APP_SECRET')
 if ($FeishuAuthMode -eq 'user') { $feishuEnvironmentNames += 'FEISHU_USER_ACCESS_TOKEN' }
@@ -97,6 +148,10 @@ $replacements = @{
 foreach ($key in $replacements.Keys) { $template = $template.Replace($key, [string]$replacements[$key]) }
 if ($template -match '__[A-Z0-9_]+__') { throw 'Rendered Feishu config still contains placeholders.' }
 $lines.Add($template.Trim())
+$mediaTemplate = $mediaTemplate.Replace('__MEDIA_GENERATION_ENABLED__', $(if ($EnableMediaGeneration) { 'true' } else { 'false' }))
+$mediaTemplate = $mediaTemplate.Replace('__MEDIA_GENERATION_WRAPPER__', (ConvertTo-TomlString ([IO.Path]::GetFullPath($MediaMcpWrapperPath))))
+if ($mediaTemplate -match '__[A-Z0-9_]+__') { throw 'Rendered media MCP config still contains placeholders.' }
+$lines.Add($mediaTemplate.Trim())
 $content = ($lines -join [Environment]::NewLine) + [Environment]::NewLine
 if ($content -match '(?i)(app[_-]?secret\s*=|FEISHU_APP_SECRET\s*=\s*["''][^"'']+)') {
     throw 'Refusing to render a literal App Secret.'
@@ -132,5 +187,7 @@ try {
     enabledSkillCount = $enabledSkills.Count
     disabledSkillCount = $allSkills.Count - $enabledSkills.Count
     feishuEnabled = [bool]$EnableFeishu
+    mediaGenerationEnabled = [bool]$EnableMediaGeneration
+    enabledRemoteMcps = @($requestedRemoteMcps)
     containsSecrets = $false
 } | ConvertTo-Json

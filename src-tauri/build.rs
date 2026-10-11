@@ -4,6 +4,7 @@ use std::fs;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
+use ed25519_dalek::VerifyingKey;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -14,7 +15,19 @@ const BASE_RESOURCE_RELATIVE: &str = "resources/skill_repo_base_manifest.json";
 const SKILL_HUB_SOURCES_RELATIVE: &str = "resources/skill_hub_sources.json";
 const BASE_SOURCE_PATH: &str = "manifest/skill-audit.json";
 const BASE_RESOURCE_SOURCE: &str = "installer-pack/manifest/skill-audit.json";
-const BASE_SOURCE_SHA256: &str = "949853010ebfe498c829a20936a3bfd1b2d4f15484de7c648f71bbc26e489e0b";
+const BASE_SOURCE_SHA256: &str = "9a04d5f9e78af2715caf6d3d09d6e3169b8d497fae283cd70f149e9dae13d98b";
+
+// Release pins bind signed USB managers to the production license issuer and
+// the VPS that signs revocation decisions. Rotate the status public key only
+// with a coordinated server keyring and client release.
+const RELEASE_USB_REVOCATION_HOST: &str = "license.404token.xyz";
+const RELEASE_USB_LICENSE_KEY_ID: &str = "prod-2026-10-03";
+const RELEASE_USB_LICENSE_KEY_SHA256: &str =
+    "0f637ced3c7bf1cb97072b522bd1f156fe703bdc8e711a59c68698487f065aa5";
+const RELEASE_REVOCATION_KEY_PINS: &[(&str, &str)] = &[(
+    "revocation-20261010",
+    "b6eec73a151000067a41da78cd523d1e67536a3a601f6fc219f437b443016182",
+)];
 
 fn main() {
     for path in [
@@ -36,6 +49,8 @@ fn main() {
         "CODEX_USB_GUARD_PUBLIC_KEY_B64",
         "CODEX_USB_GUARD_PUBLIC_KEY_ID",
         "CODEX_USB_GUARD_KEYRING_JSON",
+        "CODEX_USB_REVOCATION_URL",
+        "CODEX_USB_REVOCATION_KEYRING_JSON",
     ] {
         println!("cargo:rerun-if-env-changed={name}");
     }
@@ -528,6 +543,110 @@ fn validate_signed_required_config() {
         panic!("SignedRequired 构建的 CODEX_USB_GUARD_PUBLIC_KEY_ID 不是合法 keyId");
     }
     validate_keyring_consistency(&key_id, &decoded);
+    validate_revocation_config(&key_id, &decoded);
+}
+
+fn validate_revocation_config(license_key_id: &str, license_public_key: &[u8]) {
+    let raw_url = required_env("CODEX_USB_REVOCATION_URL");
+    let url = url::Url::parse(&raw_url)
+        .unwrap_or_else(|error| panic!("SignedRequired 构建的授权服务 URL 无效：{error}"));
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || url.username() != ""
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || raw_url.contains("<")
+        || raw_url.contains(">")
+    {
+        panic!("SignedRequired 构建的授权服务 URL 必须是无凭据的正式 HTTPS URL");
+    }
+
+    let raw_keyring = required_env("CODEX_USB_REVOCATION_KEYRING_JSON");
+    let keyring = serde_json::from_str::<Value>(&raw_keyring)
+        .unwrap_or_else(|error| panic!("SignedRequired 构建的授权状态验签公钥环无效：{error}"));
+    let keyring_object = keyring
+        .as_object()
+        .filter(|object| object.len() == 1 && object.contains_key("keys"))
+        .unwrap_or_else(|| panic!("授权状态公钥环 JSON 只能包含 keys 字段"));
+    let keys = keyring_object
+        .get("keys")
+        .and_then(Value::as_object)
+        .filter(|keys| !keys.is_empty())
+        .unwrap_or_else(|| panic!("授权状态公钥环必须包含非空 keys 对象"));
+    let mut parsed_keys = Vec::with_capacity(keys.len());
+    for (key_id, encoded) in keys {
+        if !is_legal_key_id(key_id) {
+            panic!("授权状态公钥环包含非法 signingKeyId: {key_id}");
+        }
+        let encoded = encoded
+            .as_str()
+            .unwrap_or_else(|| panic!("授权状态公钥 {key_id} 必须是 Base64 字符串"));
+        let decoded = decode_standard_base64(encoded.trim())
+            .unwrap_or_else(|reason| panic!("授权状态公钥 {key_id} Base64 无效：{reason}"));
+        if decoded.len() != 32 {
+            panic!("授权状态公钥 {key_id} 必须是 32 字节 Ed25519 公钥");
+        }
+        let public_key: [u8; 32] = decoded
+            .as_slice()
+            .try_into()
+            .unwrap_or_else(|_| panic!("授权状态公钥 {key_id} 必须是 32 字节 Ed25519 公钥"));
+        VerifyingKey::from_bytes(&public_key).unwrap_or_else(|error| {
+            panic!("授权状态公钥 {key_id} 不是可解析的 Ed25519 公钥：{error}")
+        });
+        parsed_keys.push((key_id.as_str(), decoded));
+    }
+
+    if !release_revocation_pins_configured() {
+        panic!(
+            "SignedRequired 构建已拒绝：USB 授权服务 host、USB license 公钥 pin、revocation 公钥 allowlist 尚未配置生产值"
+        );
+    }
+    if url.host_str() != Some(RELEASE_USB_REVOCATION_HOST)
+        || url.port().is_some_and(|port| port != 443)
+    {
+        panic!(
+            "SignedRequired 构建的授权服务 URL 必须使用固定的生产 HTTPS host https://{}/",
+            RELEASE_USB_REVOCATION_HOST
+        );
+    }
+
+    let license_key_fingerprint = sha256_hex(license_public_key);
+    if license_key_id != RELEASE_USB_LICENSE_KEY_ID
+        || license_key_fingerprint != RELEASE_USB_LICENSE_KEY_SHA256
+    {
+        panic!(
+            "SignedRequired 构建的 USB license 公钥与固定生产 pin 不匹配 (keyId={license_key_id}, sha256={license_key_fingerprint})"
+        );
+    }
+
+    if parsed_keys.len() != RELEASE_REVOCATION_KEY_PINS.len() {
+        panic!("SignedRequired 构建的授权状态公钥环条目数与固定生产 allowlist 不一致");
+    }
+    for (key_id, decoded) in parsed_keys {
+        let expected_fingerprint = RELEASE_REVOCATION_KEY_PINS
+            .iter()
+            .find_map(|(pinned_key_id, fingerprint)| {
+                (*pinned_key_id == key_id).then_some(*fingerprint)
+            })
+            .unwrap_or_else(|| panic!("授权状态公钥环包含未获批准的生产 signingKeyId: {key_id}"));
+        let fingerprint = sha256_hex(&decoded);
+        if fingerprint != expected_fingerprint {
+            panic!("授权状态公钥 {key_id} 与固定生产 SHA-256 pin 不匹配 (sha256={fingerprint})");
+        }
+    }
+}
+
+fn release_revocation_pins_configured() -> bool {
+    !RELEASE_USB_REVOCATION_HOST.is_empty()
+        && !RELEASE_USB_LICENSE_KEY_ID.is_empty()
+        && is_lower_hex_digest(RELEASE_USB_LICENSE_KEY_SHA256)
+        && !RELEASE_REVOCATION_KEY_PINS.is_empty()
+        && RELEASE_REVOCATION_KEY_PINS
+            .iter()
+            .all(|(key_id, fingerprint)| {
+                is_legal_key_id(key_id) && is_lower_hex_digest(fingerprint)
+            })
 }
 
 fn validate_keyring_consistency(active_key_id: &str, active_public_key: &[u8]) {

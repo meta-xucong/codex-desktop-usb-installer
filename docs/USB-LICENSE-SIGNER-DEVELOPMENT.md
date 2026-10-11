@@ -595,7 +595,7 @@ pwsh ./tools/build-oneclick-usb-layout.ps1 -InstallerPath $installer -ManagerPat
 7. 日常始终从 CodexDesktopSetup.exe 启动；
 8. Payload 更新前后均由后端重新验证签名和 Bundle。
 
-不要直接运行 CodexAppManager.exe 或 apps/Codex/Codex.exe；这会绕过既定入口语义。
+日常启动请使用 CodexDesktopSetup.exe。直接运行 apps/Codex 中由 MSIX manifest 声明的官方入口，可能绕过管理器的远程状态检查和 U 盘租约；这是已接受的边界，不得宣称直接入口受控。
 
 ### 7.6 正式发布顺序
 

@@ -72,7 +72,7 @@ if ($packagePresent) {
 $nodePath = $null
 $configuredNode = [Environment]::GetEnvironmentVariable('CODEX_NODE', 'Process')
 foreach ($candidate in @(
-        (Join-Path $kitRoot 'runtime\node-v20.20.0-win-x64\node.exe'),
+        (Join-Path $kitRoot 'runtime\node-v22.22.0-win-x64\node.exe'),
         $configuredNode
     )) {
     if (-not [string]::IsNullOrWhiteSpace([string]$candidate) -and (Test-Path -LiteralPath $candidate -PathType Leaf)) {

@@ -6,7 +6,8 @@ param(
     [switch]$SkipNetwork,
     [switch]$InternalSigned,
     [string]$UsbSigningProfilePath = "",
-    [switch]$SkipSignature
+    [switch]$SkipSignature,
+    [switch]$SelfTestSchemaPolicy
 )
 
 $ErrorActionPreference = "Stop"
@@ -83,6 +84,58 @@ function Get-JsonInteger([object]$Object, [string]$Name) {
         return $null
     }
     return $value
+}
+
+function Assert-ManifestSchemaPair($RootManifest, $UsbManifest) {
+    $rootSchema = Get-JsonInteger $RootManifest "schemaVersion"
+    $usbSchema = Get-JsonInteger $UsbManifest "schemaVersion"
+    Assert-Condition ($rootSchema -in @(2, 3)) "根 manifest schemaVersion 只支持 2 或 3"
+    Assert-Condition ($usbSchema -in @(2, 3)) "联合清单 schemaVersion 只支持 2 或 3"
+    Assert-Condition ($rootSchema -eq $usbSchema) "根 manifest 与联合清单 schemaVersion 不一致"
+    if ($rootSchema -eq 3) {
+        $policy = Get-JsonPropertyValue $RootManifest "revocationPolicy"
+        $registrationRequired = Get-JsonPropertyValue $policy "registrationRequired"
+        Assert-Condition ($registrationRequired -is [bool] -and $registrationRequired -eq $true) "schema 3 根 manifest 必须锚定 registrationRequired=true"
+    }
+    return [int]$rootSchema
+}
+
+function Test-RevocationRuntimePath([string]$RelativePath) {
+    if ($RelativePath -ieq "usb-license-revocation-registration.json" -or
+        $RelativePath -ieq "CodexUsbState/revocation.json") {
+        return $true
+    }
+    if ($RelativePath -notmatch '(?i)^CodexUsbState/revocation\.json\.tmp-([1-9][0-9]*)-([1-9][0-9]*)$') {
+        return $false
+    }
+    [uint32]$pidValue = 0
+    [uint64]$counterValue = 0
+    return [uint32]::TryParse($Matches[1], [ref]$pidValue) -and
+        [uint64]::TryParse($Matches[2], [ref]$counterValue) -and
+        $pidValue -gt 0 -and $counterValue -gt 0
+}
+
+if ($SelfTestSchemaPolicy) {
+    $v2Root = '{"schemaVersion":2}' | ConvertFrom-Json
+    $v2Usb = '{"schemaVersion":2}' | ConvertFrom-Json
+    $v3Root = '{"schemaVersion":3,"revocationPolicy":{"registrationRequired":true}}' | ConvertFrom-Json
+    $v3Usb = '{"schemaVersion":3}' | ConvertFrom-Json
+    $v3RootWithoutPolicy = '{"schemaVersion":3}' | ConvertFrom-Json
+    $v3RootWithFalsePolicy = '{"schemaVersion":3,"revocationPolicy":{"registrationRequired":false}}' | ConvertFrom-Json
+    Assert-Condition ((Assert-ManifestSchemaPair $v2Root $v2Usb) -eq 2) "schema 2 fixture 未被接受"
+    Assert-Condition ((Assert-ManifestSchemaPair $v3Root $v3Usb) -eq 3) "schema 3 fixture 未被接受"
+    $failed = 0
+    foreach ($pair in @(
+        [pscustomobject]@{ root = $v3Root; usb = $v2Usb },
+        [pscustomobject]@{ root = $v3RootWithoutPolicy; usb = $v3Usb },
+        [pscustomobject]@{ root = $v3RootWithFalsePolicy; usb = $v3Usb }
+    )) {
+        try { [void](Assert-ManifestSchemaPair $pair.root $pair.usb) }
+        catch { $failed++ }
+    }
+    Assert-Condition ($failed -eq 3) "schema mismatch 或无效 v3 策略 fixture 未被拒绝"
+    [pscustomobject]@{ passed = $true; validSchema2 = $true; validSchema3 = $true; rejectedCases = $failed } | ConvertTo-Json -Compress
+    exit 0
 }
 
 function Normalize-BundleRelativePath([string]$RelativePath) {
@@ -195,6 +248,21 @@ foreach ($licenseEntry in $licenseEntries) {
     }
 }
 
+$registrationEntries = @(Get-ChildItem -LiteralPath $root -Recurse -Force |
+    Where-Object { $_.Name -ieq "usb-license-revocation-registration.json" })
+foreach ($registrationEntry in $registrationEntries) {
+    $registrationRelative = (Get-RelativePathCompat $root $registrationEntry.FullName).Replace('\', '/')
+    Assert-Condition ($registrationRelative -ieq "usb-license-revocation-registration.json") "登记声明只能位于 bundle 根目录：$registrationRelative"
+    Assert-Condition (-not $registrationEntry.PSIsContainer) "根登记声明必须是普通文件"
+    Assert-Condition (($registrationEntry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0) "根登记声明不能是链接或联接点"
+}
+$registrationPath = Join-Path $root "usb-license-revocation-registration.json"
+if (Test-Path -LiteralPath $registrationPath) {
+    $registrationItem = Get-Item -LiteralPath $registrationPath -Force
+    Assert-Condition (-not $registrationItem.PSIsContainer) "根登记声明必须是普通文件"
+    Assert-Condition (($registrationItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0) "根登记声明不能是链接或联接点"
+}
+
 function Assert-NoSuccessfulStateResidue([string]$RootPath) {
     foreach ($entry in Get-ChildItem -LiteralPath $RootPath -Recurse -Force) {
         $relative = (Get-RelativePathCompat $RootPath $entry.FullName).Replace('\', '/')
@@ -254,12 +322,14 @@ $launcherVerifierPath = Join-Path $root "verify-usb-launcher.ps1"
 $manifest = Read-JsonFile $manifestPath
 $usbManifest = Read-JsonFile $usbManifestPath
 
-Assert-Condition ((Get-JsonInteger $manifest "schemaVersion") -eq 2) "根 manifest 必须声明 schemaVersion=2"
+$manifestSchema = Assert-ManifestSchemaPair $manifest $usbManifest
 $rootUpdateCapability = $manifest.updateCapability
 Assert-Condition ($null -ne $rootUpdateCapability -and $rootUpdateCapability.codexPayload -eq $true) "根 manifest 未声明 Codex payload update capability"
 Assert-Condition ((Get-JsonInteger $rootUpdateCapability "schemaVersion") -eq 3) "根 manifest 的 update capability 必须声明 schemaVersion=3"
 Assert-Condition ((Get-JsonInteger $rootUpdateCapability "anchorSchema") -eq 3) "根 manifest 的 update capability 必须声明 anchorSchema=3"
-Assert-Condition ((Get-JsonInteger $usbManifest "schemaVersion") -eq 2) "联合清单必须声明 schemaVersion=2"
+Assert-Condition ($manifest.directEntryPolicy.required -eq $true) "根 manifest 未要求 U 盘 Codex 直接入口门禁"
+Assert-Condition ($manifest.directEntryPolicy.shim -eq "CodexEntryShim.exe") "根 manifest direct-entry shim 身份不正确"
+Assert-Condition ($manifest.directEntryPolicy.failure -eq "closed") "根 manifest 未声明直接入口失败时拒绝启动"
 $updateCapability = $usbManifest.updateCapability
 Assert-Condition ($null -ne $updateCapability -and $updateCapability.codexPayload -eq $true) "联合清单未声明 Codex payload update capability"
 Assert-Condition ((Get-JsonInteger $updateCapability "schemaVersion") -eq 3) "update capability 必须声明 schemaVersion=3"
@@ -323,7 +393,7 @@ Assert-Condition ($usbManifest.programLayout.codexRoot -eq "apps/Codex") "Codex 
 Assert-Condition ($usbManifest.programLayout.usesAppxVolume -eq $false) "当前架构不得使用外部 AppXVolume"
 Assert-Condition ($usbManifest.programLayout.createsWindowsApps -eq $false) "当前架构不得创建 WindowsApps"
 Assert-Condition ($usbManifest.programLayout.createsWpSystem -eq $false) "当前架构不得创建 WpSystem"
-Assert-Condition ($usbManifest.programLayout.directShellLaunch -eq $false) "不得创建绕过 U 盘管理器的直接 Codex 入口"
+Assert-Condition ($usbManifest.programLayout.directShellLaunch -eq $false) "不得创建自动生成的 Codex 开始菜单或桌面直启快捷方式"
 Assert-Condition ($usbManifest.dataLayout.codexHome -eq "%USERPROFILE%/.codex") "CODEX_HOME 本机路径声明不正确"
 Assert-Condition ($usbManifest.dataLayout.roaming -eq "%APPDATA%/Codex") "Roaming 数据路径声明不正确"
 Assert-Condition ($usbManifest.dataLayout.local -eq "%LOCALAPPDATA%/Codex") "Local 数据路径声明不正确"
@@ -411,6 +481,7 @@ Assert-Condition ($payloadReport.ready -eq $true) "MSIX 身份、架构、大小
 
 $installer = Join-Path $root "CodexDesktopSetup.exe"
 $manager = Join-Path $root "CodexAppManager.exe"
+$entryShim = Join-Path $root "CodexEntryShim.exe"
 $ccswitch = Join-Path $root "ccswitch\CodexSwitch.exe"
 $embeddedCcswitch = Join-Path $root "resources\ccswitch\CodexSwitch.exe"
 $vcRedist = Join-Path $root "resources\prerequisites\vc_redist.x64.exe"
@@ -424,6 +495,7 @@ $expectedWebView2Hash = "1F4638309F3D82C31A3028C3CF7D75998F58E4D1407380F5CB8A8E9
 $expectedVcRedistHash = "843068991DAAA1F73AD9F6239BCE4D0F6A07A51F18C37EA2A867E9BECA71295C"
 Assert-Condition (Test-Path -LiteralPath $installer -PathType Leaf) "缺少 CodexDesktopSetup.exe"
 Assert-Condition (Test-Path -LiteralPath $manager -PathType Leaf) "缺少 CodexAppManager.exe（USB 入口启动的管理器本体）"
+Assert-Condition (Test-Path -LiteralPath $entryShim -PathType Leaf) "缺少 CodexEntryShim.exe（直接双击 Codex 必须经过此门禁）"
 Assert-Condition (Test-Path -LiteralPath $launcherVerifierPath -PathType Leaf) "缺少 verify-usb-launcher.ps1"
 Assert-Condition (Test-Path -LiteralPath $ccswitch -PathType Leaf) "缺少根目录 ccswitch\CodexSwitch.exe"
 Assert-Condition (Test-Path -LiteralPath $embeddedCcswitch -PathType Leaf) "安装器资源中缺少 resources\ccswitch\CodexSwitch.exe"
@@ -463,6 +535,10 @@ $managerVerification = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File
 if ($LASTEXITCODE -ne 0) {
     throw "USB 管理器清单验证失败：$managerVerification"
 }
+$entryShimVerification = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $launcherVerifierPath -Path $entryShim -ExpectedLevel asInvoker 2>&1 | Out-String
+if ($LASTEXITCODE -ne 0) {
+    throw "USB Codex direct-entry shim 清单验证失败：$entryShimVerification"
+}
 $actualVcRedistHash = (Get-FileHash -LiteralPath $vcRedist -Algorithm SHA256).Hash
 Assert-Condition ($actualVcRedistHash -ieq $expectedVcRedistHash) "VC++ 运行库哈希不匹配：$actualVcRedistHash != $expectedVcRedistHash"
 Assert-Condition ($usbManifest.vcRuntime.file -eq "resources/prerequisites/vc_redist.x64.exe") "联合清单的 VC++ 运行库路径不正确"
@@ -475,8 +551,10 @@ Assert-Condition ((Get-JsonInteger $usbManifest.vcRuntime "size") -eq (Get-Item 
 # otherwise let a structurally valid but self-inconsistent bundle through.
 $installerItem = Get-Item -LiteralPath $installer
 $managerItem = Get-Item -LiteralPath $manager
+$entryShimItem = Get-Item -LiteralPath $entryShim
 $installerHash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
 $managerHash = (Get-FileHash -LiteralPath $manager -Algorithm SHA256).Hash.ToLowerInvariant()
+$entryShimHash = (Get-FileHash -LiteralPath $entryShim -Algorithm SHA256).Hash.ToLowerInvariant()
 $ccswitchItem = Get-Item -LiteralPath $ccswitch
 $ccswitchHash = (Get-FileHash -LiteralPath $ccswitch -Algorithm SHA256).Hash.ToLowerInvariant()
 $embeddedCcswitchHash = (Get-FileHash -LiteralPath $embeddedCcswitch -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -491,6 +569,10 @@ Assert-Condition ($usbManifest.manager.file -eq "CodexAppManager.exe") "联合�
 Assert-Condition ($usbManifest.manager.role -eq "requireAdministrator USB Tauri manager started by the launcher or directly") "联合清单未声明 USB 管理器 requireAdministrator 边界"
 Assert-Condition ($usbManifest.manager.sha256 -ieq $managerHash) "联合清单中的管理器本体哈希与实际文件不一致"
 Assert-Condition ((Get-JsonInteger $usbManifest.manager "size") -eq $managerItem.Length) "联合清单中的管理器本体大小与实际文件不一致"
+Assert-Condition ($usbManifest.entryShim.file -eq "CodexEntryShim.exe") "联合清单的 direct-entry shim 路径不正确"
+Assert-Condition ($usbManifest.entryShim.sha256 -ieq $entryShimHash) "联合清单中的 direct-entry shim 哈希与实际文件不一致"
+Assert-Condition ((Get-JsonInteger $usbManifest.entryShim "size") -eq $entryShimItem.Length) "联合清单中的 direct-entry shim 大小不正确"
+Assert-Condition ($usbManifest.entryShim.role -eq "asInvoker Codex manifest-entry shim; every launch is handed to manager authorization") "联合清单未声明 direct-entry 授权链"
 Assert-Condition ($usbManifest.ccswitch.executable -eq "ccswitch/CodexSwitch.exe") "联合清单的 CCSwitch 路径不正确"
 Assert-Condition ($usbManifest.ccswitch.sha256 -ieq $ccswitchHash) "联合清单中的 CCSwitch 哈希与实际文件不一致"
 Assert-Condition ((Get-JsonInteger $usbManifest.ccswitch "size") -eq $ccswitchItem.Length) "联合清单中的 CCSwitch 大小与实际文件不一致"
@@ -500,6 +582,7 @@ if (-not $SkipSignature) {
     if (-not $InternalSigned) {
         Assert-AuthenticodePe $installer "CodexDesktopSetup.exe"
         Assert-AuthenticodePe $manager "CodexAppManager.exe"
+        Assert-AuthenticodePe $entryShim "CodexEntryShim.exe"
         Assert-AuthenticodePe $ccswitch "CCSwitch"
         Assert-AuthenticodePe $embeddedCcswitch "embedded CCSwitch"
     }
@@ -524,6 +607,9 @@ foreach ($line in Get-Content -LiteralPath $sumsPath) {
     $relative = Normalize-BundleRelativePath $relative
     Assert-Condition ($relative -ine "SHA256SUMS.txt") "SHA256SUMS.txt 不得列出自身"
     Assert-Condition ($relative -ine "usb-license.json") "SHA256SUMS.txt 不得列出运行期 usb-license.json"
+    Assert-Condition (-not (Test-RevocationRuntimePath $relative)) "SHA256SUMS.txt 不得列出登记声明或 revocation runtime metadata：$relative"
+    $leafName = [System.IO.Path]::GetFileName($relative)
+    Assert-Condition ($leafName -inotmatch '(?i)^revocation\.json(?:\.tmp-.*)?$') "revocation state 名称只能出现在精确运行期路径：$relative"
     if (-not $listed.Add($relative)) {
         $failed += "$relative（SHA256SUMS.txt 重复清单项）"
         continue
@@ -549,6 +635,13 @@ foreach ($fileItem in Get-ChildItem -LiteralPath $root -File -Recurse -Force) {
     # The manager-created license is mutable runtime identity metadata and is
     # deliberately outside the immutable release checksum set.
     if ($relative -ieq "usb-license.json") { continue }
+    if (Test-RevocationRuntimePath $relative) {
+        Assert-Condition (-not $fileItem.PSIsContainer) "revocation runtime metadata 必须是普通文件：$relative"
+        Assert-Condition (($fileItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0) "revocation runtime metadata 不能是链接或联接点：$relative"
+        continue
+    }
+    $leafName = [System.IO.Path]::GetFileName($relative)
+    Assert-Condition ($leafName -inotmatch '(?i)^revocation\.json(?:\.tmp-.*)?$') "revocation state 名称只能出现在精确运行期路径：$relative"
     if (-not $listed.Contains($relative)) {
         $failed += "$relative（未列入 SHA256SUMS.txt）"
     }

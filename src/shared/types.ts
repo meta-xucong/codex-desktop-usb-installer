@@ -232,26 +232,6 @@ export interface CcswitchLaunchReport {
   message: string;
 }
 
-export interface NativeModelCatalogReport {
-  status: string;
-  modelCount: number;
-  catalogPath: string | null;
-  fetchedAt: string | null;
-  message: string;
-  attempts: number;
-  errorKind: string | null;
-  runId: string;
-  gatewayStatus: string;
-  readyCount: number;
-  quarantinedCount: number;
-  defaultModel: string | null;
-  sidecarPath: string | null;
-  nativeStatus: string;
-  activationStatus: string;
-  serviceRevision: string | null;
-  models: Array<unknown>;
-}
-
 export interface AccountStatus {
   bound: boolean;
   accountName: string | null;
@@ -265,6 +245,7 @@ export interface GatewayModelProbeRequest {
   requestId: string;
   selectedModelIds: string[];
   costConsent: boolean;
+  connectivityModelId?: string | null;
 }
 export interface GatewayProbeModel {
   id: string;
@@ -286,11 +267,31 @@ export interface GatewayModelProbeReport {
   status: "connected" | "passed" | "failed" | "cancelled" | "skipped" | string;
   endpoint: string;
   credentialFingerprint: string;
+  connectionFingerprint: string;
   checkedAt: number;
   models: GatewayProbeModel[];
   results: GatewayProbeModelResult[];
   generatedRequests: number;
   errorCode: string | null;
+  connectivityModelId?: string;
+  connectivityProofId?: string;
+  connectivityProofExpiresAt?: number;
+}
+
+export interface NativeModelCatalogActionRequest {
+  operation: "state" | "add" | "reset";
+  requestId?: string;
+  modelId?: string;
+  connectivityProofId?: string;
+}
+
+export interface NativeModelCatalogActionReport {
+  status: string;
+  modelIds: string[];
+  restartRequired: boolean;
+  message: string;
+  connectionFingerprint?: string | null;
+  credentialFingerprint?: string | null;
 }
 /** Options for the offline capability-pack installer. Secrets are never
  * serialized to the USB bundle; the native command uses them only for the
@@ -305,20 +306,20 @@ export interface CapabilityPackInstallOptions {
   feishuDomain: string;
   feishuAuthMode: string;
   enabledApiServices: string[];
+  enabledRemoteMcps: string[];
+  enableMediaGeneration: boolean;
   dashscopeApiKey: string;
   dashscopeBaseUrl: string;
   dashscopeModel: string;
-  image2ApiKey: string;
-  image2BaseUrl: string;
+  mediaGenerationApiBaseUrl: string;
+  mediaGenerationApiProfile: string;
+  mediaGenerationApiKey: string;
+  mediaGenerationAgentId: string;
   image2Model: string;
-  image2AgentId: string;
-  seedanceApiKey: string;
-  seedanceBaseUrl: string;
+  grokImageModel: string;
+  grokVideoModel: string;
   seedanceModel: string;
-  seedanceAgentId: string;
-  seedancePrechargePoints: string;
-  seedanceOfficialLinkTtlHours: string;
-  seedanceRefundRule: string;
+  minimaxVideoModel: string;
 }
 
 export interface CapabilityPackReport {
@@ -1049,6 +1050,11 @@ export interface UsbGuardStatus {
   /** Backend's current signed Codex decision; never trusted as authorization. */
   codexAllowed?: boolean;
   codexBlockReason?: string | null;
+  /** Signed remote license decision from the manager's USB startup gate. */
+  revocationState?: string;
+  revocationStateVersion?: number | null;
+  /** Only true for the narrowly authorized active-after-revoked reinstall state. */
+  reinstallAllowed?: boolean;
   lastCheckedAtMs: number;
   missingSinceMs: number | null;
   countdownSeconds: number | null;

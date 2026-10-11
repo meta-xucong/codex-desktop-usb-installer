@@ -322,6 +322,11 @@ impl<'a> ProbeClient<'a> {
         }
         Ok(response)
     }
+    /// Send one bounded text challenge and require an exact echo. This is the
+    /// only generation request used by the selective catalog quick test.
+    pub async fn quick_text(&self, model: &str, token: &str) -> Result<(), ProbeError> {
+        self.text(model, token, None).await.map(|_| ())
+    }
     async fn tool_start(
         &self,
         model: &str,

@@ -1,4 +1,4 @@
-use crate::{bundle, key_blob, media, path_security, transaction, windows};
+use crate::{activation, bundle, key_blob, media, path_security, transaction, windows};
 
 use std::env;
 use std::ffi::OsString;
@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 
 use crate::error::SignerError;
 use bundle::{deep_verify_bundle_with_mode, read_signing_binding, AuthenticodeMode};
-use codex_usb_license::{validate_key_id, UsbAccountBinding, ANCHOR_SCHEMA_V3};
+use codex_usb_license::{
+    sign_registration, validate_key_id, verify_registration, UsbAccountBinding, ANCHOR_SCHEMA_V3,
+};
 use key_blob::{
     auto_resolve_key, default_key_blob_path, default_portable_vault_path, read_dpapi_key_blob,
     read_portable_key_vault, write_portable_key_vault, write_portable_key_vault_descriptor,
@@ -24,8 +26,9 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use transaction::{
     build_signing_candidate_with_account_binding, digest_bytes, inspect_license, license_path,
-    load_existing_license, now_ms, read_back_license, sign_candidate, verify_signed_license,
-    write_license_atomic, write_old_license_audit,
+    load_existing_license, load_registration, now_ms, read_back_license,
+    replace_registration_atomic, sign_candidate, verify_signed_license, verify_signed_pair,
+    write_old_license_audit, write_registration_atomic, write_signed_pair_atomic,
 };
 use windows::{acquire_signing_mutex, atomic_replace, ensure_local_path};
 use zeroize::Zeroizing;
@@ -73,12 +76,16 @@ struct SignOutput {
     installation_id: String,
     key_id: String,
     license_digest: String,
+    registration_digest: String,
     payload_sha256: String,
     payload_size: u64,
     authenticode_mode: &'static str,
     old_license_audit_path: Option<String>,
     account_asset_id: Option<String>,
     sub2api_user_id: Option<u64>,
+    activation_status: &'static str,
+    activation_state_version: Option<i64>,
+    activation_error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -137,17 +144,17 @@ where
     let parsed = parse_args(arguments)?;
     let password_command = matches!(
         parsed.command.as_str(),
-        "sign" | "verify" | "export-portable" | "inspect-portable"
+        "sign" | "register" | "verify" | "export-portable" | "inspect-portable"
     );
     if parsed.password_stdin && !password_command {
         return Err(SignerError::InvalidArgument(
-            "--password-stdin is valid only for sign, verify, export-portable, or inspect-portable"
+                "--password-stdin is valid only for sign, register, verify, export-portable, or inspect-portable"
                 .to_string(),
         ));
     }
     if supplied_password.is_some() && !password_command {
         return Err(SignerError::InvalidArgument(
-            "a portable password is valid only for sign, verify, export-portable, or inspect-portable"
+                "a portable password is valid only for sign, register, verify, export-portable, or inspect-portable"
                 .to_string(),
         ));
     }
@@ -163,16 +170,22 @@ where
         None
     };
     let password = supplied_password.or(stdin_password.as_ref().map(|value| value.as_str()));
+    if account_binding.is_some() && parsed.command != "sign" {
+        return Err(SignerError::InvalidArgument(
+            "Sub2API account binding may be supplied only to sign".to_string(),
+        ));
+    }
     match parsed.command.as_str() {
         "scan" => run_scan(&parsed),
         "inspect" => run_inspect(&parsed),
         "sign" => run_sign(&parsed, password, account_binding.as_ref()),
+        "register" => run_register(&parsed, password),
         "verify" => run_verify(&parsed, password),
         "init-key" => run_init_key(&parsed),
         "export-portable" => run_export_portable(&parsed, password),
         "inspect-portable" => run_inspect_portable(&parsed, password),
         _ => Err(SignerError::InvalidArgument(format!(
-            "unknown command {}; use scan, inspect, sign, verify, init-key, export-portable, or inspect-portable",
+            "unknown command {}; use scan, inspect, sign, register, verify, init-key, export-portable, or inspect-portable",
             parsed.command
         ))),
     }
@@ -431,6 +444,25 @@ fn run_inspect(arguments: &Arguments) -> Result<Value, SignerError> {
     let license = inspect_license(&observation.bundle_path, Some(&observation.fingerprint))?;
     let deep_verify =
         inspect_deep_verify_with_mode(&observation.bundle_path, authenticode_mode(arguments))?;
+    let manifest_schema = deep_verify
+        .pointer("/summary/manifestSchemaVersion")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let registration = if manifest_schema == 2 {
+        json!({"state": "not-required"})
+    } else {
+        match load_registration(&observation.bundle_path) {
+            Ok(Some((bytes, _))) => json!({
+                "state": "present",
+                "digest": digest_bytes(&bytes),
+            }),
+            Ok(None) => json!({"state": "missing"}),
+            Err(error) => json!({
+                "state": "invalid",
+                "error": error.to_string(),
+            }),
+        }
+    };
     let signing = match read_signing_binding(&observation.bundle_path) {
         Ok(binding) => json!({
             "ok": true,
@@ -449,6 +481,7 @@ fn run_inspect(arguments: &Arguments) -> Result<Value, SignerError> {
         "license": license,
         "deepVerify": deep_verify,
         "signing": signing,
+        "registration": registration,
     });
     if let Some(report) = arguments.report.as_deref() {
         write_local_report(report, &drive, &output)?;
@@ -499,13 +532,14 @@ fn run_sign(
     sole_candidate_is_target(&candidates, &drive, &relative)?;
     let before = observe_target(&drive, &relative)?;
     let preflight = deep_verify_bundle_with_mode(&before.bundle_path, authenticode)?;
-    if preflight.anchor_schema != ANCHOR_SCHEMA_V3 {
+    if preflight.anchor_schema != ANCHOR_SCHEMA_V3 || preflight.manifest_schema_version != 3 {
         return Err(SignerError::BundleVerification(
             "该 Bundle 使用旧签名锚点，只能验证不能重新签名；请使用 schema 3 安装包".to_string(),
         ));
     }
     let binding = read_signing_binding(&before.bundle_path)?;
     let old_inspection = inspect_license(&before.bundle_path, Some(&before.fingerprint))?;
+    let old_registration = load_registration(&before.bundle_path)?;
     let key = if let Some(vault_path) = arguments.portable_vault.as_deref() {
         if arguments.key_id.is_some() || arguments.key_blob.is_some() {
             return Err(SignerError::InvalidArgument(
@@ -583,13 +617,27 @@ fn run_sign(
     let audit_directory = default_audit_directory(&drive)?;
     let old_audit = write_old_license_audit(&old_license.bytes, &audit_directory)?;
     sign_candidate(&mut candidate, &key)?;
-    verify_signed_license(&candidate, &before, &key.public_key_b64())?;
+    let registration = sign_registration(&candidate, &key.signing_key)?;
+    verify_signed_pair(
+        &candidate,
+        &registration,
+        &before.fingerprint,
+        &key.public_key_b64(),
+    )?;
 
     let pre_write = observe_target(&drive, &relative).map_err(|error| {
         SignerError::DriveChanged(format!("pre-write physical observation failed: {error}"))
     })?;
     ensure_observation_unchanged(&before, &pre_write)?;
-    write_license_atomic(&pre_write.bundle_path, &candidate)?;
+    write_signed_pair_atomic(
+        &pre_write.bundle_path,
+        &candidate,
+        &registration,
+        &old_license,
+        old_registration.as_ref().map(|(bytes, _)| bytes.as_slice()),
+        &before.fingerprint,
+        &key.public_key_b64(),
+    )?;
 
     let after = observe_target(&drive, &relative).map_err(|error| {
         SignerError::OutcomeUnknown(format!("post-write physical observation failed: {error}"))
@@ -600,8 +648,20 @@ fn run_sign(
     let readback = read_back_license(&after.bundle_path).map_err(|error| {
         SignerError::OutcomeUnknown(format!("post-write license readback failed: {error}"))
     })?;
-    verify_signed_license(&readback, &after, &key.public_key_b64()).map_err(|error| {
-        SignerError::OutcomeUnknown(format!("post-write license verification failed: {error}"))
+    let (registration_bytes, readback_registration) = load_registration(&after.bundle_path)?
+        .ok_or_else(|| {
+            SignerError::OutcomeUnknown("post-write registration sidecar is missing".to_string())
+        })?;
+    verify_signed_pair(
+        &readback,
+        &readback_registration,
+        &after.fingerprint,
+        &key.public_key_b64(),
+    )
+    .map_err(|error| {
+        SignerError::OutcomeUnknown(format!(
+            "post-write signed pair verification failed: {error}"
+        ))
     })?;
     let postflight =
         deep_verify_bundle_with_mode(&after.bundle_path, authenticode).map_err(|error| {
@@ -612,6 +672,8 @@ fn run_sign(
     let written_bytes = fs::read(license_path(&after.bundle_path)).map_err(|error| {
         SignerError::OutcomeUnknown(format!("post-write license digest read failed: {error}"))
     })?;
+    let (activation_status, activation_state_version, activation_error) =
+        activation_summary(&readback_registration, &readback.installation_id);
     let output = serde_json::to_value(SignOutput {
         command: "sign",
         status: "success",
@@ -619,6 +681,7 @@ fn run_sign(
         installation_id: readback.installation_id,
         key_id,
         license_digest: digest_bytes(&written_bytes),
+        registration_digest: digest_bytes(&registration_bytes),
         payload_sha256: postflight.payload_sha256,
         payload_size: postflight.payload_size,
         authenticode_mode: authenticode_mode_label(authenticode),
@@ -631,12 +694,351 @@ fn run_sign(
             .account_binding
             .as_ref()
             .map(|binding| binding.sub2api_user_id),
+        activation_status,
+        activation_state_version,
+        activation_error,
     })
     .map_err(|error| SignerError::Report(format!("serializing sign report failed: {error}")))?;
     if let Some(report) = arguments.report.as_deref() {
         write_local_report(report, &drive, &output)?;
     }
     Ok(output)
+}
+
+fn run_register(arguments: &Arguments, password: Option<&str>) -> Result<Value, SignerError> {
+    let _signing_mutex = acquire_signing_mutex()?;
+    let (drive, relative) = target_arguments(arguments)?;
+    let confirm = required_string(arguments.confirm.as_deref(), "--confirm")?;
+    if arguments.output.is_some() || arguments.public_key_b64.is_some() {
+        return Err(SignerError::InvalidArgument(
+            "register does not accept --output or --public-key-b64".to_string(),
+        ));
+    }
+    let authenticode = authenticode_mode(arguments);
+    let candidates = scan_removable_candidates()?;
+    sole_candidate_is_target(&candidates, &drive, &relative)?;
+    let before = observe_target(&drive, &relative)?;
+    let bundle = deep_verify_bundle_with_mode(&before.bundle_path, authenticode)?;
+    if bundle.manifest_schema_version != 3 || bundle.anchor_schema != ANCHOR_SCHEMA_V3 {
+        return Err(SignerError::BundleVerification(
+            "register only supports schema 3 bundles with the required registration policy"
+                .to_string(),
+        ));
+    }
+    let binding = read_signing_binding(&before.bundle_path)?;
+    let existing = load_existing_license(&before.bundle_path)?;
+    let license = existing.license.ok_or_else(|| {
+        SignerError::ExistingLicense("register requires an existing signed license".to_string())
+    })?;
+    if license.signature.is_none() {
+        return Err(SignerError::ExistingLicense(
+            "register requires an existing signed license".to_string(),
+        ));
+    }
+    let license_key_id = license.key_id.as_deref().ok_or_else(|| {
+        SignerError::ExistingLicense("signed license is missing keyId".to_string())
+    })?;
+    validate_key_id(license_key_id)?;
+    if arguments
+        .key_id
+        .as_deref()
+        .is_some_and(|requested| requested != license_key_id)
+    {
+        return Err(SignerError::ExistingLicense(
+            "requested keyId does not match the existing license".to_string(),
+        ));
+    }
+    if binding.key_id != license_key_id {
+        return Err(SignerError::ExistingLicense(
+            "existing license keyId does not match the Bundle signing binding".to_string(),
+        ));
+    }
+    let key = if let Some(vault_path) = arguments.portable_vault.as_deref() {
+        if arguments.key_id.is_some() || arguments.key_blob.is_some() {
+            return Err(SignerError::InvalidArgument(
+                "--portable-vault cannot be combined with --key-id or --key-blob".to_string(),
+            ));
+        }
+        let password = password.ok_or_else(|| {
+            SignerError::KeyBlob(
+                "portable vault registration requires a password; use the GUI prompt or --password-stdin"
+                    .to_string(),
+            )
+        })?;
+        ensure_local_path(vault_path, &drive)?;
+        let key = read_portable_key_vault(vault_path, password)?;
+        write_portable_key_vault_descriptor(vault_path, &key)?;
+        key
+    } else if let Some(key_id) = arguments.key_id.as_deref() {
+        validate_key_id(key_id)?;
+        let path = arguments
+            .key_blob
+            .clone()
+            .unwrap_or(default_key_blob_path(key_id)?);
+        ensure_local_path(&path, &drive)?;
+        read_dpapi_key_blob(&path, key_id)?
+    } else if let Some(path) = arguments.key_blob.as_deref() {
+        ensure_local_path(path, &drive)?;
+        read_dpapi_key_blob(path, license_key_id)?
+    } else {
+        auto_resolve_key()?.key
+    };
+    ensure_key_matches_binding(&binding, &key)?;
+    if key.key_id != license_key_id {
+        return Err(SignerError::KeyBlob(
+            "resolved signing key does not match the existing license keyId".to_string(),
+        ));
+    }
+    verify_signed_license(&license, &before, &key.public_key_b64())?;
+    let expected_confirmation = format!(
+        "REGISTER {}-{}",
+        before.volume.volume_serial,
+        before
+            .fingerprint
+            .anchor_sha256
+            .chars()
+            .take(12)
+            .collect::<String>()
+    );
+    if confirm != expected_confirmation {
+        return Err(SignerError::ConfirmationRequired {
+            expected: expected_confirmation,
+        });
+    }
+
+    if let Some((bytes, registration)) = load_registration(&before.bundle_path)? {
+        verify_registration(
+            &registration,
+            &license,
+            &before.fingerprint,
+            &key.public_key_b64(),
+        )?;
+        let current_registration = sign_registration(&license, &key.signing_key)?;
+        verify_registration(
+            &current_registration,
+            &license,
+            &before.fingerprint,
+            &key.public_key_b64(),
+        )?;
+        if registration != current_registration {
+            let pre_write = observe_target(&drive, &relative).map_err(|error| {
+                SignerError::DriveChanged(format!(
+                    "pre-registration-update physical observation failed: {error}"
+                ))
+            })?;
+            ensure_observation_unchanged(&before, &pre_write)?;
+            let current_license = load_existing_license(&pre_write.bundle_path)?;
+            if current_license.bytes != existing.bytes {
+                return Err(SignerError::DriveChanged(
+                    "license bytes changed before registration update".to_string(),
+                ));
+            }
+            let latest_registration = load_registration(&pre_write.bundle_path)?.ok_or_else(|| {
+                SignerError::DriveChanged(
+                    "registration sidecar disappeared before update".to_string(),
+                )
+            })?;
+            if latest_registration.0 != bytes {
+                return Err(SignerError::DriveChanged(
+                    "registration sidecar changed before update".to_string(),
+                ));
+            }
+            replace_registration_atomic(&pre_write.bundle_path, &current_registration)?;
+
+            let after = observe_target(&drive, &relative).map_err(|error| {
+                SignerError::OutcomeUnknown(format!(
+                    "post-registration-update observation failed: {error}"
+                ))
+            })?;
+            ensure_observation_unchanged(&before, &after).map_err(|error| {
+                SignerError::OutcomeUnknown(format!(
+                    "post-registration-update observation changed: {error}"
+                ))
+            })?;
+            let after_license = load_existing_license(&after.bundle_path).map_err(|error| {
+                SignerError::OutcomeUnknown(format!(
+                    "post-registration-update license read failed: {error}"
+                ))
+            })?;
+            if after_license.bytes != existing.bytes {
+                return Err(SignerError::OutcomeUnknown(
+                    "registration update changed the signed license bytes".to_string(),
+                ));
+            }
+            let (registration_bytes, readback_registration) =
+                load_registration(&after.bundle_path)?.ok_or_else(|| {
+                    SignerError::OutcomeUnknown(
+                        "updated registration sidecar is missing".to_string(),
+                    )
+                })?;
+            verify_registration(
+                &readback_registration,
+                &license,
+                &after.fingerprint,
+                &key.public_key_b64(),
+            )
+            .map_err(|error| {
+                SignerError::OutcomeUnknown(format!(
+                    "updated registration readback verification failed: {error}"
+                ))
+            })?;
+            let (activation_status, activation_state_version, activation_error) =
+                activation_summary(&readback_registration, &license.installation_id);
+            let output = json!({
+                "command": "register",
+                "status": "success",
+                "activationStatus": activation_status,
+                "activationStateVersion": activation_state_version,
+                "activationError": activation_error,
+                "observation": observation_report(&after),
+                "installationId": license.installation_id,
+                "keyId": license_key_id,
+                "licenseDigest": digest_bytes(&existing.bytes),
+                "registrationDigest": digest_bytes(&registration_bytes),
+                "accountAssetId": license
+                    .account_binding
+                    .as_ref()
+                    .map(|binding| binding.usb_asset_id.clone()),
+                "authenticodeMode": authenticode_mode_label(authenticode),
+            });
+            if let Some(report) = arguments.report.as_deref() {
+                write_local_report(report, &drive, &output)?;
+            }
+            return Ok(output);
+        }
+        let current = observe_target(&drive, &relative).map_err(|error| {
+            SignerError::DriveChanged(format!(
+                "pre-activation physical observation failed: {error}"
+            ))
+        })?;
+        ensure_observation_unchanged(&before, &current)?;
+        let (activation_status, activation_state_version, activation_error) =
+            activation_summary(&registration, &license.installation_id);
+        let output = json!({
+            "command": "register",
+            "status": "already-present",
+            "activationStatus": activation_status,
+            "activationStateVersion": activation_state_version,
+            "activationError": activation_error,
+            "observation": observation_report(&current),
+            "installationId": license.installation_id,
+            "keyId": license_key_id,
+            "accountAssetId": license
+                .account_binding
+                .as_ref()
+                .map(|binding| binding.usb_asset_id.clone()),
+            "licenseDigest": digest_bytes(&existing.bytes),
+            "registrationDigest": digest_bytes(&bytes),
+            "authenticodeMode": authenticode_mode_label(authenticode),
+        });
+        if let Some(report) = arguments.report.as_deref() {
+            write_local_report(report, &drive, &output)?;
+        }
+        return Ok(output);
+    }
+
+    let registration = sign_registration(&license, &key.signing_key)?;
+    verify_registration(
+        &registration,
+        &license,
+        &before.fingerprint,
+        &key.public_key_b64(),
+    )?;
+    let pre_write = observe_target(&drive, &relative).map_err(|error| {
+        SignerError::DriveChanged(format!("pre-register physical observation failed: {error}"))
+    })?;
+    ensure_observation_unchanged(&before, &pre_write)?;
+    let current_license = load_existing_license(&pre_write.bundle_path)?;
+    if current_license.bytes != existing.bytes {
+        return Err(SignerError::DriveChanged(
+            "license bytes changed before registration repair".to_string(),
+        ));
+    }
+    if load_registration(&pre_write.bundle_path)?.is_some() {
+        return Err(SignerError::DriveChanged(
+            "registration sidecar appeared before repair; refusing to overwrite it".to_string(),
+        ));
+    }
+    write_registration_atomic(&pre_write.bundle_path, &registration)?;
+
+    let after = observe_target(&drive, &relative).map_err(|error| {
+        SignerError::OutcomeUnknown(format!("post-register observation failed: {error}"))
+    })?;
+    ensure_observation_unchanged(&before, &after).map_err(|error| {
+        SignerError::OutcomeUnknown(format!("post-register observation changed: {error}"))
+    })?;
+    let after_license = load_existing_license(&after.bundle_path).map_err(|error| {
+        SignerError::OutcomeUnknown(format!("post-register license read failed: {error}"))
+    })?;
+    if after_license.bytes != existing.bytes {
+        return Err(SignerError::OutcomeUnknown(
+            "register modified the existing license bytes".to_string(),
+        ));
+    }
+    let (registration_bytes, readback_registration) = load_registration(&after.bundle_path)?
+        .ok_or_else(|| {
+            SignerError::OutcomeUnknown("registration readback is missing".to_string())
+        })?;
+    verify_registration(
+        &readback_registration,
+        &license,
+        &after.fingerprint,
+        &key.public_key_b64(),
+    )
+    .map_err(|error| {
+        SignerError::OutcomeUnknown(format!(
+            "registration readback verification failed: {error}"
+        ))
+    })?;
+    let postflight =
+        deep_verify_bundle_with_mode(&after.bundle_path, authenticode).map_err(|error| {
+            SignerError::OutcomeUnknown(format!(
+                "post-register bundle verification failed: {error}"
+            ))
+        })?;
+    let (activation_status, activation_state_version, activation_error) =
+        activation_summary(&readback_registration, &license.installation_id);
+    let output = json!({
+        "command": "register",
+        "status": "success",
+        "activationStatus": activation_status,
+        "activationStateVersion": activation_state_version,
+        "activationError": activation_error,
+        "observation": observation_report(&after),
+        "installationId": license.installation_id,
+        "keyId": license_key_id,
+        "accountAssetId": license
+            .account_binding
+            .as_ref()
+            .map(|binding| binding.usb_asset_id.clone()),
+        "licenseDigest": digest_bytes(&existing.bytes),
+        "registrationDigest": digest_bytes(&registration_bytes),
+        "payloadSha256": postflight.payload_sha256,
+        "authenticodeMode": authenticode_mode_label(authenticode),
+    });
+    if let Some(report) = arguments.report.as_deref() {
+        write_local_report(report, &drive, &output)?;
+    }
+    Ok(output)
+}
+
+fn activation_summary(
+    registration: &codex_usb_license::RevocationRegistrationEnvelope,
+    installation_id: &str,
+) -> (&'static str, Option<i64>, Option<String>) {
+    match activation::activate_registration(registration, installation_id) {
+        Ok(version) => ("active", Some(version), None),
+        Err(error) => {
+            let status = match error {
+                activation::ActivationError::Revoked => "revoked",
+                activation::ActivationError::Conflict => "conflict",
+                activation::ActivationError::Network
+                | activation::ActivationError::InvalidResponse
+                | activation::ActivationError::Rejected => "pending",
+            };
+            (status, None, Some(error.to_string()))
+        }
+    }
 }
 
 fn ensure_observation_unchanged(
@@ -804,6 +1206,23 @@ fn run_verify(arguments: &Arguments, password: Option<&str>) -> Result<Value, Si
         key.public_key_b64()
     };
     verify_signed_license(&license, &observation, &public_key_b64)?;
+    let registration_digest = if bundle.manifest_schema_version == 3 {
+        let (bytes, registration) =
+            load_registration(&observation.bundle_path)?.ok_or_else(|| {
+                SignerError::ExistingLicense(
+                    "schema 3 bundle requires a signed registration sidecar".to_string(),
+                )
+            })?;
+        verify_registration(
+            &registration,
+            &license,
+            &observation.fingerprint,
+            &public_key_b64,
+        )?;
+        Some(digest_bytes(&bytes))
+    } else {
+        None
+    };
     let output = serde_json::to_value(VerifyOutput {
         command: "verify",
         verified: true,
@@ -816,6 +1235,12 @@ fn run_verify(arguments: &Arguments, password: Option<&str>) -> Result<Value, Si
         authenticode_mode: authenticode_mode_label(authenticode),
     })
     .map_err(|error| SignerError::Report(format!("serializing verify report failed: {error}")))?;
+    let mut output = output;
+    if let Some(digest) = registration_digest {
+        output["registrationDigest"] = json!(digest);
+    } else {
+        output["registrationState"] = json!("not-required");
+    }
     if let Some(report) = arguments.report.as_deref() {
         write_local_report(report, &drive, &output)?;
     }

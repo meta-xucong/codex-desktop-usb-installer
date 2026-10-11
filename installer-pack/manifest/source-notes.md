@@ -19,12 +19,12 @@
 
 ## 已纳入
 
-- 50 个带独立元数据和功能说明的 Skill
+- 55 个带独立元数据和功能说明的 Skill；5 个竞品能力被改写/归并为原创、可移植工作流
 - 7 个按功能命名的 Agent TOML
 - Windows 10/11 优先的安装、打包和验证脚本
-- MCP/API 清单、连接字段、无密钥配置模板和环境依赖说明
-- 43 个默认启用 Skill（含 15 个离线运行时 Skill 和 3 个安全降级 Skill）、完整依赖闭包与 SHA-256 文件清单
-- Python 运行时直接输入、CPython 3.12 安装器、52-wheel 离线 wheelhouse、Node/Feishu 介质、逐文件哈希和 Windows per-user 安装契约
+- Feishu 与统一媒体生成本地 MCP（含预留 MiniMax 模型槽位）、4 个官方远程 OAuth MCP；DashScope 直连 API 的无密钥配置清单
+- 47 个默认启用 Skill（含 18 个可自动安装运行时 Skill、4 个新增本地流程 Skill 和 3 个安全降级 Skill）、完整依赖闭包与 SHA-256 文件清单
+- Python 运行时直接输入、CPython 3.12 安装器、77-wheel 离线 wheelhouse、Manim 哈希锁、Node 22/FFmpeg/Feishu 介质、逐文件哈希和 Windows per-user 安装契约
 
 ## 明确不纳入
 

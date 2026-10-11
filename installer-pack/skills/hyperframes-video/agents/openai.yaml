@@ -1,0 +1,6 @@
+interface:
+  display_name: "Hyperframes 程序化视频"
+  short_description: "使用本地 Hyperframes 编排网页场景、动画和音视频并渲染成片。"
+  default_prompt: "Use $hyperframes-video to plan and render this programmatic video locally."
+policy:
+  allow_implicit_invocation: false

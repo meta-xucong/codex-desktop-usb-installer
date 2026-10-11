@@ -43,7 +43,7 @@ const NETWORK_METADATA_TIMEOUT: Duration = Duration::from_secs(8);
 const NETWORK_ARCHIVE_TIMEOUT: Duration = Duration::from_secs(20);
 const NETWORK_OPERATION_TIMEOUT: Duration = Duration::from_secs(45);
 const BASE_MANIFEST_SHA256: &str =
-    "949853010ebfe498c829a20936a3bfd1b2d4f15484de7c648f71bbc26e489e0b";
+    "9a04d5f9e78af2715caf6d3d09d6e3169b8d497fae283cd70f149e9dae13d98b";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

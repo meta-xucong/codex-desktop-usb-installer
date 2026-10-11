@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>U 盘授权管理</title>
+  <link rel="stylesheet" href="/admin/static/style.css">
+  <script src="/admin/static/app.js" defer></script>
+</head>
+<body>
+  <main class="shell">
+    <section id="login-panel" class="login-card" hidden>
+      <div class="brand-mark">L</div>
+      <p class="eyebrow">404TOKEN · LICENSE</p>
+      <h1>U 盘授权管理</h1>
+      <p class="muted">登录后查看已登记的 U 盘授权并管理作废状态。</p>
+      <form id="login-form" class="stack">
+        <label>账号<input id="username" name="username" autocomplete="username" required maxlength="64"></label>
+        <label>密码<input id="password" name="password" type="password" autocomplete="current-password" required maxlength="1024"></label>
+        <button class="primary" type="submit">登录</button>
+        <p id="login-error" class="error" role="alert"></p>
+      </form>
+    </section>
+
+    <section id="first-setup-panel" class="login-card" hidden>
+      <div class="brand-mark">L</div>
+      <p class="eyebrow">首次登录 · 账号安全</p>
+      <h1>完成安全设置</h1>
+      <p class="muted">你好，<span id="setup-user"></span>。先设置新的管理密码，再把动态验证码添加到 Google Authenticator。</p>
+      <div class="setup-key-box">
+        <strong>Google Authenticator 设置密钥</strong>
+        <p class="muted">打开验证器，选择“添加账号”→“输入设置密钥”，输入以下密钥并选择“基于时间”。</p>
+        <code id="totp-secret" class="setup-secret">正在生成密钥…</code>
+      </div>
+      <form id="first-setup-form" class="stack">
+        <label>新管理密码（至少 12 位）<input id="setup-new-password" type="password" autocomplete="new-password" required minlength="12" maxlength="128"></label>
+        <label>再次输入新密码<input id="setup-confirm-password" type="password" autocomplete="new-password" required minlength="12" maxlength="128"></label>
+        <label>验证器中的 6 位验证码<input id="setup-totp-code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" required></label>
+        <p id="setup-error" class="error" role="alert"></p>
+        <button id="complete-setup-button" class="primary" type="submit">保存密码并完成绑定</button>
+        <button id="setup-logout-button" class="quiet" type="button">退出登录</button>
+      </form>
+    </section>
+
+    <section id="app-panel" hidden>
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">LICENSE CONSOLE</p>
+          <h1>U 盘授权管理</h1>
+        </div>
+        <div class="account-actions"><span id="signed-in-user" class="muted"></span><button id="change-password-button" class="quiet" type="button">修改密码</button><button id="logout-button" class="quiet" type="button">退出登录</button></div>
+      </header>
+
+      <div class="notice">
+        作废后，U 盘需在联网状态下通过本管理器启动，才能同步作废状态并清理受管 Codex 文件。离线时按当前离线规则处理；直接运行原始 Codex 程序不会经过管理器检查。
+      </div>
+
+      <section class="stats" aria-label="授权数量">
+        <article class="stat"><span>全部授权</span><strong id="total-count">0</strong></article>
+        <article class="stat"><span>当前页可用</span><strong id="active-count">0</strong></article>
+        <article class="stat"><span>当前页已作废</span><strong id="revoked-count">0</strong></article>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading">
+          <div><h2>已登记 U 盘</h2><p class="muted">列表展示安装编号、404token 编号和签名密钥编号，不包含 API 密钥。</p></div>
+          <div class="toolbar">
+            <label class="file-button">登记新 U 盘<input id="registration-file" type="file" accept="application/json,.json" hidden></label>
+            <button id="refresh-button" class="quiet" type="button">刷新</button>
+          </div>
+        </div>
+        <p id="app-message" class="message" role="status"></p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>安装编号</th><th>404token 编号</th><th>签名密钥 ID</th><th>状态</th><th>版本</th><th>登记时间</th><th>许可证摘要</th><th>USB 指纹摘要</th><th>操作</th></tr></thead>
+            <tbody id="license-rows"></tbody>
+          </table>
+          <div id="empty-state" class="empty" hidden>还没有登记 U 盘。选择签名器生成的登记 JSON 文件即可添加。</div>
+        </div>
+        <footer class="pagination">
+          <span id="page-info" class="muted"></span>
+          <div><button id="previous-page" class="quiet" type="button">上一页</button><button id="next-page" class="quiet" type="button">下一页</button></div>
+        </footer>
+      </section>
+      <p class="footnote">撤销记录会进入服务端审计日志。USB 指纹和许可证摘要只显示部分字符。</p>
+    </section>
+  </main>
+
+  <dialog id="revoke-dialog" class="confirm-dialog">
+    <form id="revoke-form" method="dialog" class="stack">
+      <p class="eyebrow danger-text">确认作废</p>
+      <h2>停用这份 U 盘授权？</h2>
+      <p>安装编号：<code id="revoke-installation-id"></code></p>
+      <p class="muted">状态同步到 U 盘后，将清理该 U 盘中由安装器管理的 Codex 文件。离线启动时不会收到新作废状态。</p>
+      <label>作废原因（写入审计记录）<input id="revoke-reason" required maxlength="200" autocomplete="off" placeholder="例如：订单退款"></label>
+      <label class="check-row"><input id="revoke-confirm-check" type="checkbox"><span>我确认作废上方这份授权</span></label>
+      <label>再次输入安装编号<input id="revoke-confirm-id" autocomplete="off" spellcheck="false"></label>
+      <div class="dialog-actions"><button id="cancel-revoke" class="quiet" type="button">取消</button><button id="confirm-revoke" class="danger" type="submit" disabled>确认作废</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="password-dialog" class="confirm-dialog">
+    <form id="password-form" method="dialog" class="stack">
+      <p class="eyebrow">账号安全</p>
+      <h2>修改管理密码</h2>
+      <p class="muted">请使用当前密码和 Google Authenticator 中的 6 位动态验证码。修改成功后需要重新登录。</p>
+      <label>当前密码<input id="current-password" type="password" autocomplete="current-password" required maxlength="1024"></label>
+      <label>新密码（至少 12 位）<input id="new-password" type="password" autocomplete="new-password" required minlength="12" maxlength="128"></label>
+      <label>再次输入新密码<input id="confirm-new-password" type="password" autocomplete="new-password" required minlength="12" maxlength="128"></label>
+      <label>动态验证码<input id="change-totp" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" required></label>
+      <p id="password-error" class="error" role="alert"></p>
+      <div class="dialog-actions"><button id="cancel-password" class="quiet" type="button">取消</button><button id="confirm-password" class="primary" type="submit">保存新密码</button></div>
+    </form>
+  </dialog>
+</body>
+</html>

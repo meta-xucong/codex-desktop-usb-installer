@@ -3,6 +3,11 @@ name: travel-planner
 description: This skill should be used whenever users need help planning trips, creating travel itineraries, managing travel budgets, seeking destination advice, or researching flights and transportation. It collects travel preferences, generates day-by-day plans, budget breakdowns, packing lists, cultural guidance, and can maintain local trip preferences. For live prices, schedules, entry rules, weather, or safety information, use the current Codex session's native web tools when available and state freshness limits.
 ---
 
+## 旅行体验与内容素材模式
+
+当用户的目标是旅行路线、酒店/餐饮体验或旅行内容拍摄，先标明行程日期、出发地、预算、同行人和无障碍/节奏要求。用当前来源核验营业时间、交通、门票、签证与安全信息，并为关键安排留出备选；不要把过时的示例价格当报价。拍摄或社交内容规划可附上黄金时段、机位/镜头清单、天气备选和素材授权注意事项，但不得默认代订、付款或公开发布。
+
+
 # Travel Planner
 
 ## Script path

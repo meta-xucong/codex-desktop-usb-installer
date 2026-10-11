@@ -2,6 +2,7 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$InstallerPath,
+    [string]$EntryShimPath = "",
     [string]$BundlePath = "",
     [string]$OutputPath = "",
     [string]$CapabilityPackSource = "",
@@ -90,8 +91,14 @@ function Assert-NoSuccessfulStateResidue([string]$RootPath) {
     if (Test-Path -LiteralPath $rootLicensePath) {
         throw "静态发行目录不得携带 usb-license.json；请在真实 U 盘复制完成后使用签名工具写入运行期授权"
     }
+    if (Test-Path -LiteralPath (Join-Path $RootPath "usb-license-revocation-registration.json")) {
+        throw "静态发行目录不得携带登记声明 sidecar"
+    }
     foreach ($entry in Get-ChildItem -LiteralPath $RootPath -Recurse -Force) {
         $relative = (Get-RelativePathCompat $RootPath $entry.FullName).Replace('\', '/')
+        if ($entry.Name -ieq "usb-license-revocation-registration.json" -or $relative -imatch '^CodexUsbState(/|$)') {
+            throw "静态发行目录不得携带登记声明或作废运行期状态：$relative"
+        }
         if ($entry.Name -ieq "usb-license.json" -and $relative -ine "usb-license.json") {
             throw "usb-license.json 只能出现在 U 盘 bundle 根目录：$relative"
         }
@@ -174,13 +181,22 @@ if ($installerItem.Name -ieq "CodexUsbLauncher.exe" -or $installerItem.Name -ieq
 & (Join-Path $PSScriptRoot "verify-payload.ps1") -BundlePath $bundle -SkipSignature:$SkipSignature
 
 $managerSource = Join-Path $installerItem.DirectoryName "CodexAppManager.exe"
+$entryShimSource = if ([string]::IsNullOrWhiteSpace($EntryShimPath)) {
+    Join-Path $installerItem.DirectoryName "CodexEntryShim.exe"
+} else {
+    (Resolve-Path -LiteralPath $EntryShimPath -ErrorAction Stop).Path
+}
 if ($isUsbLauncher) {
     if (-not (Test-Path -LiteralPath $managerSource -PathType Leaf)) {
         throw "CodexUsbLauncher.exe 必须与同目录 CodexAppManager.exe 一起构建"
     }
+    if (-not (Test-Path -LiteralPath $entryShimSource -PathType Leaf)) {
+        throw "USB 管理器构建目录缺少 CodexEntryShim.exe；U 盘 Codex 直接入口必须经过授权检查"
+    }
     if (-not $SkipSignature -and -not $InternalSigned) {
         Assert-AuthenticodePe $installer "CodexUsbLauncher.exe"
         Assert-AuthenticodePe $managerSource "CodexAppManager.exe"
+        Assert-AuthenticodePe $entryShimSource "CodexEntryShim.exe"
     }
 }
 
@@ -266,7 +282,10 @@ foreach ($packFile in Get-ChildItem -LiteralPath $capabilityPackSourceFull -Recu
 Copy-Item -LiteralPath $installer -Destination (Join-Path $output "CodexDesktopSetup.exe") -Force
 if ($isUsbLauncher) {
     Copy-Item -LiteralPath $managerSource -Destination (Join-Path $output "CodexAppManager.exe") -Force
+    Copy-Item -LiteralPath $entryShimSource -Destination (Join-Path $output "CodexEntryShim.exe") -Force
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot "verify-usb-launcher.ps1") -Destination (Join-Path $output "verify-usb-launcher.ps1") -Force
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "verify-usb-launcher.ps1") -Path (Join-Path $output "CodexEntryShim.exe") -ExpectedLevel asInvoker
+    if ($LASTEXITCODE -ne 0) { throw "USB Codex direct-entry shim 未通过 asInvoker 清单验证" }
 }
 $resourceSource = Join-Path $installerItem.DirectoryName "resources"
 # Reject resource drift before copying a stale provider default into either
@@ -307,7 +326,26 @@ $webView2Output = Join-Path $output "resources\prerequisites\MicrosoftEdgeWebVie
 if (-not (Test-Path -LiteralPath $webView2Output -PathType Leaf)) {
     throw "安装器资源中缺少 WebView2 x64 完整离线安装包：$webView2Output"
 }
-[void](Add-Member -InputObject $sourceManifest -MemberType NoteProperty -Name "schemaVersion" -Value 2 -Force)
+[void](Add-Member -InputObject $sourceManifest -MemberType NoteProperty -Name "schemaVersion" -Value 3 -Force)
+[void](Add-Member -InputObject $sourceManifest -MemberType NoteProperty -Name "revocationPolicy" -Value ([ordered]@{
+    registrationRequired = $true
+}) -Force)
+[void](Add-Member -InputObject $sourceManifest -MemberType NoteProperty -Name "directEntryPolicy" -Value ([ordered]@{
+    required = $true
+    shim = "CodexEntryShim.exe"
+    route = "same-user-session named pipe to USB manager"
+    launchGate = "signed local license plus fresh signed revocation status when online"
+    offline = "allow only when the local license is valid and no signed revoked state is stored"
+    failure = "closed"
+}) -Force)
+[void](Add-Member -InputObject $sourceManifest -MemberType NoteProperty -Name "programLayout" -Value ([ordered]@{
+    mode = "verified-msix-extraction"
+    codexRoot = "apps/Codex"
+    usesAppxVolume = $false
+    createsWindowsApps = $false
+    createsWpSystem = $false
+    directShellLaunch = $false
+}) -Force)
 [void](Add-Member -InputObject $sourceManifest -MemberType NoteProperty -Name "updateCapability" -Value ([ordered]@{
     codexPayload = $true
     schemaVersion = 3
@@ -325,7 +363,8 @@ if (-not (Test-Path -LiteralPath $webView2Output -PathType Leaf)) {
     transactionDirectory = ".staging"
     successState = "clean"
 }) -Force)
-if ((Get-JsonInteger $sourceManifest "schemaVersion") -ne 2 -or
+if ((Get-JsonInteger $sourceManifest "schemaVersion") -ne 3 -or
+    $sourceManifest.revocationPolicy.registrationRequired -ne $true -or
     (Get-JsonInteger $sourceManifest.updateCapability "schemaVersion") -ne 3 -or
     (Get-JsonInteger $sourceManifest.updateCapability "anchorSchema") -ne 3) {
     throw "输出 root manifest 的 schema/capability 数字字段无效"

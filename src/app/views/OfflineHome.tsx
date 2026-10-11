@@ -28,10 +28,10 @@ import { useI18n, type TFn } from "../i18n";
 import { FailureBanner, Ring, StatusBanner, Tooltip, TopBar } from "../components";
 import { mib } from "../format";
 import { Sheet } from "../Sheet";
-import { OfflineComponentsSheet } from "./OfflineComponentsSheet";
+import { OfflineComponentsSheet, type OfflineComponentsView } from "./OfflineComponentsSheet";
 import { AccountCard, type AccountAuthorizationState } from "./AccountCard";
 import { SkillRepoUpdateCard } from "./SkillRepoUpdateCard";
-import { GatewayModelProbePanel } from "./GatewayModelProbePanel";
+import { UpstreamModelManagerSheet } from "./UpstreamModelManagerSheet";
 import { ProgressScreen } from "./ProgressScreen";
 import { useDownloadProgress } from "./useDownloadProgress";
 
@@ -46,8 +46,6 @@ type PayloadUpdateProgress = {
 const USB_GUARD_STARTUP_FAST_POLL_LIMIT = 60;
 const USB_GUARD_STARTUP_FAST_POLL_MS = 250;
 const USB_GUARD_NORMAL_POLL_MS = 1_000;
-const NATIVE_MODEL_REFRESH_TIMEOUT_MS = 75_000;
-const NATIVE_MODEL_REFRESH_START_DELAY_MS = 250;
 
 const DEFAULT_CAPABILITY_PACK_OPTIONS: CapabilityPackInstallOptions = {
   enableFeishu: false,
@@ -58,20 +56,20 @@ const DEFAULT_CAPABILITY_PACK_OPTIONS: CapabilityPackInstallOptions = {
   feishuDomain: "https://open.feishu.cn",
   feishuAuthMode: "tenant",
   enabledApiServices: [],
+  enabledRemoteMcps: [],
+  enableMediaGeneration: false,
   dashscopeApiKey: "",
   dashscopeBaseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
   dashscopeModel: "",
-  image2ApiKey: "",
-  image2BaseUrl: "",
+  mediaGenerationApiBaseUrl: "",
+  mediaGenerationApiProfile: "auto",
+  mediaGenerationApiKey: "",
+  mediaGenerationAgentId: "",
   image2Model: "",
-  image2AgentId: "",
-  seedanceApiKey: "",
-  seedanceBaseUrl: "",
+  grokImageModel: "",
+  grokVideoModel: "",
   seedanceModel: "",
-  seedanceAgentId: "",
-  seedancePrechargePoints: "",
-  seedanceOfficialLinkTtlHours: "",
-  seedanceRefundRule: "",
+  minimaxVideoModel: "",
 };
 
 function versionParts(value: string): number[] {
@@ -124,12 +122,15 @@ function expectedFromStatus(status: WinInstallStatus | null) {
 
 function canUpdateCodexPayload(guard: UsbGuardStatus | null): boolean {
   return Boolean(
-    guard?.status === "authorized" &&
-      guard.watchdog === "running" &&
-      guard.signed &&
-      guard.codexAllowed !== false &&
+    guard?.signed &&
       guard.removable &&
-      guard.bundlePath,
+      guard.bundlePath &&
+      ((guard.status === "authorized" &&
+        guard.watchdog === "running" &&
+        guard.codexAllowed !== false) ||
+        (guard.status === "restricted" &&
+          guard.revocationState === "reactivated_payload_missing" &&
+          guard.reinstallAllowed === true)),
   );
 }
 
@@ -228,6 +229,22 @@ function codexActionsAllowedOnCurrentRuntime(
   // A null guard is the ordinary installed-manager path. Once the USB guard
   // is present, every Codex action must wait for live signed authorization.
   return !guardQueryFailed && (guard === null || codexReadyOnAuthorizedUsb(guard));
+}
+
+function codexInstallAllowedOnCurrentRuntime(
+  guard: UsbGuardStatus | null,
+  guardQueryFailed = false,
+): boolean {
+  if (guardQueryFailed) return false;
+  return Boolean(
+    codexActionsAllowedOnCurrentRuntime(guard, guardQueryFailed) ||
+      (guard?.status === "restricted" &&
+        guard.signed &&
+        guard.removable &&
+        Boolean(guard.bundlePath) &&
+        guard.revocationState === "reactivated_payload_missing" &&
+        guard.reinstallAllowed === true),
+  );
 }
 
 function programIsOnCurrentUsb(
@@ -333,17 +350,14 @@ export function OfflineHome({
   const [notice, setNotice] = useState<string | null>(null);
   const [ccswitchInjectionIssue, setCcswitchInjectionIssue] =
     useState<CcswitchInjectionIssue | null>(readStoredCcswitchInjectionIssue);
-  const [nativeModelNotice, setNativeModelNotice] = useState<{
-    message: string;
-    tone: "info" | "ok" | "warn" | "err";
-  } | null>(null);
   const [installationDetail, setInstallationDetail] = useState<string | null>(null);
   const [componentsOpen, setComponentsOpen] = useState(false);
+  const [componentsView, setComponentsView] = useState<OfflineComponentsView>("connections");
   const [pendingCodexUpdate, setPendingCodexUpdate] = useState<UpdateInfo | null>(null);
   const [codexUpdateConfirmOpen, setCodexUpdateConfirmOpen] = useState(false);
+  const [modelManagerOpen, setModelManagerOpen] = useState(false);
   const [payloadUpdateProgress, setPayloadUpdateProgress] =
     useState<PayloadUpdateProgress | null>(null);
-  const [nativeModelBusy, setNativeModelBusy] = useState(false);
   const [busyAction, setBusyAction] = useState<
     "install" | "update" | "launch" | "ccswitch" | "logs" | null
   >(null);
@@ -352,7 +366,6 @@ export function OfflineHome({
   const loadGeneration = useRef(0);
   const usbGuardStartupPolls = useRef(0);
   const progressScopeRef = useRef<HTMLDivElement | null>(null);
-  const nativeModelRefreshStarted = useRef(false);
   const usbGuardWasReady = useRef(false);
 
   const updateCcswitchInjectionIssue = useCallback((issue: CcswitchInjectionIssue | null) => {
@@ -455,7 +468,45 @@ export function OfflineHome({
       // immutable package probe continues. Actions remain disabled until the
       // payload is available.
       setPhase("ready");
-      const nextPayload = await managerApi.offlinePayloadProbe();
+      let nextPayload: OfflinePayloadReport;
+      try {
+        nextPayload = await managerApi.offlinePayloadProbe();
+      } catch (probeError) {
+        // A revoked cleanup deliberately removes the bundle MSIX. Keep the
+        // manager shell available so the signed, backend-gated payload
+        // recovery action can download it again. `starting` is also allowed
+        // here because the startup integrity worker may still be resolving
+        // this exact state.
+        let recoveryGuard = nextUsbGuard;
+        if (!nextUsbGuardResult.failed) {
+          try {
+            recoveryGuard = await managerApi.usbGuardStatus();
+            if (loadGeneration.current !== generation) return;
+            setUsbGuard(recoveryGuard);
+            setUsbGuardQueryFailed(false);
+          } catch {
+            recoveryGuard = null;
+          }
+        }
+        if (
+          usbGuardStartupPending(recoveryGuard) ||
+          (!nextUsbGuardResult.failed &&
+            recoveryGuard?.status === "restricted" &&
+            recoveryGuard.revocationState === "reactivated_payload_missing" &&
+            recoveryGuard.reinstallAllowed === true)
+        ) {
+          setPayload(null);
+          setPayloadLoading(false);
+          setPhase("ready");
+          setNotice(
+            recoveryGuard?.reinstallAllowed
+              ? t("offline.reactivationPayloadMissing")
+              : null,
+          );
+          return;
+        }
+        throw probeError;
+      }
       if (loadGeneration.current !== generation) return;
 
       // The initial guard snapshot can legitimately be `starting`: the
@@ -594,54 +645,6 @@ export function OfflineHome({
     return compareVersions(status.installed.version, payload.codexDesktopVersion) > 0;
   }, [payload, status]);
 
-  const refreshNativeModels = useCallback(async (automatic = false) => {
-    if (nativeModelBusy) return;
-    setNativeModelBusy(true);
-    setNativeModelNotice({ message: t("offline.nativeModelsRefreshing"), tone: "info" });
-    try {
-      const result = await new Promise<Awaited<ReturnType<typeof managerApi.refreshNativeModelCatalog>>>((resolve, reject) => {
-        const timer = window.setTimeout(
-          () => reject(new Error("native model catalog refresh timed out")),
-          NATIVE_MODEL_REFRESH_TIMEOUT_MS,
-        );
-        void managerApi.refreshNativeModelCatalog(true).then(
-          (value) => {
-            window.clearTimeout(timer);
-            resolve(value);
-          },
-          (cause) => {
-            window.clearTimeout(timer);
-            reject(cause);
-          },
-        );
-      });
-      const ready = result.status === "ready" || result.status === "fresh";
-      setNativeModelNotice({
-        message: ready
-          ? t("offline.nativeModelsReady", { count: result.modelCount })
-          : result.message || t("offline.nativeModelsUnavailable"),
-        tone: ready ? "ok" : "warn",
-      });
-      if (!ready && !automatic) setFailure(resolveFailure(new Error(result.message), t));
-    } catch (cause) {
-      const detail = cause instanceof Error ? cause.message : String(cause ?? "");
-      setNativeModelNotice({
-        message: automatic
-          ? t("offline.nativeModelsUpstreamUnavailable")
-          : `${t("offline.nativeModelsUnavailable")} ${detail}`,
-        tone: automatic ? "warn" : "err",
-      });
-      if (!automatic) setFailure(resolveFailure(cause, t));
-    } finally {
-      setNativeModelBusy(false);
-    }
-  }, [nativeModelBusy, t]);
-
-  const refreshNativeModelsRef = useRef(refreshNativeModels);
-  useEffect(() => {
-    refreshNativeModelsRef.current = refreshNativeModels;
-  }, [refreshNativeModels]);
-
   const performInstall = useCallback(async (sourcePayload: OfflinePayloadReport) => {
     setPayload(sourcePayload);
     setPhase("staging");
@@ -661,7 +664,7 @@ export function OfflineHome({
         .then((value) => ({ value, failed: false }))
         .catch(() => ({ value: null, failed: true }));
       const preflightGuard = preflightGuardResult.value;
-      if (!codexActionsAllowedOnCurrentRuntime(preflightGuard, preflightGuardResult.failed)) {
+      if (!codexInstallAllowedOnCurrentRuntime(preflightGuard, preflightGuardResult.failed)) {
         if (preflightGuardResult.failed) setUsbGuardQueryFailed(true);
         if (preflightGuard) setUsbGuard(preflightGuard);
         setPhase("ready");
@@ -676,7 +679,7 @@ export function OfflineHome({
         .then((value) => ({ value, failed: false }))
         .catch(() => ({ value: null, failed: true }));
       const currentGuard = currentGuardResult.value;
-      if (!codexActionsAllowedOnCurrentRuntime(currentGuard, currentGuardResult.failed)) {
+      if (!codexInstallAllowedOnCurrentRuntime(currentGuard, currentGuardResult.failed)) {
         if (currentGuardResult.failed) setUsbGuardQueryFailed(true);
         throw new Error(t("offline.updateRequiresSigned"));
       }
@@ -819,12 +822,6 @@ export function OfflineHome({
         notices.push(t("offline.ccswitchFailed"));
       }
       setNotice(notices.join(" "));
-      // Model-menu discovery is metadata-only and must not gate the normal
-      // install/CCSwitch path. Run it after the successful hand-off so a
-      // transient upstream outage remains retryable from Advanced.
-      if (ccswitchReport?.launched) {
-        void refreshNativeModels(true);
-      }
       return true;
     } catch (cause) {
       if (verifiedInstalled) setStatus(verifiedInstalled);
@@ -837,11 +834,11 @@ export function OfflineHome({
       }
       return false;
     }
-  }, [refreshNativeModels, resetStop, t, updateCcswitchInjectionIssue]);
+  }, [resetStop, t, updateCcswitchInjectionIssue]);
 
   const install = useCallback(async () => {
     if (!payload || busyAction) return;
-    if (!codexActionsAllowedOnCurrentRuntime(usbGuard, usbGuardQueryFailed)) {
+    if (!codexInstallAllowedOnCurrentRuntime(usbGuard, usbGuardQueryFailed)) {
       setNotice(t("offline.installRequiresAuthorized"));
       return;
     }
@@ -1020,6 +1017,7 @@ export function OfflineHome({
   const installed = status?.installed;
   const codexReady = !usbGuardQueryFailed && codexReadyOnAuthorizedUsb(usbGuard);
   const codexActionsAllowed = codexActionsAllowedOnCurrentRuntime(usbGuard, usbGuardQueryFailed);
+  const codexInstallAllowed = codexInstallAllowedOnCurrentRuntime(usbGuard, usbGuardQueryFailed);
   const accountAuthorizationState: AccountAuthorizationState = usbGuardQueryFailed
     ? "unavailable"
     : !usbGuard
@@ -1032,18 +1030,6 @@ export function OfflineHome({
   const usbGuardIsStarting = usbGuardStartupPending(usbGuard);
   const currentUsbInstalled = currentUsbInstallMatchesPayload(status, usbGuard, payload);
   const showInstalled = codexReady && (phase === "installed" || currentUsbInstalled);
-  useEffect(() => {
-    if (!showInstalled) {
-      nativeModelRefreshStarted.current = false;
-      return;
-    }
-    if (!codexActionsAllowed || nativeModelRefreshStarted.current) return;
-    nativeModelRefreshStarted.current = true;
-    const timer = window.setTimeout(() => {
-      void refreshNativeModelsRef.current(true);
-    }, NATIVE_MODEL_REFRESH_START_DELAY_MS);
-    return () => window.clearTimeout(timer);
-  }, [codexActionsAllowed, showInstalled]);
   const displayInstalled = codexReady ? installed : null;
   const startupReadinessPending =
     payloadLoading || phase === "loading" || usbGuardIsStarting;
@@ -1363,7 +1349,7 @@ export function OfflineHome({
             </>
           ) : (
             <>
-              <button className="btn primary big" onClick={() => void install()} disabled={disabled || newerInstalled || !codexActionsAllowed}>
+              <button className="btn primary big" onClick={() => void install()} disabled={disabled || newerInstalled || !codexInstallAllowed}>
                 {busyAction === "install" ? <Icon name="loader" className="spinicon" /> : <Icon name="download" />}
                 {busyAction === "install" ? t("offline.installing") : status?.recoveryPending ? t("offline.resumeInstall") : t("offline.install")}
               </button>
@@ -1374,7 +1360,9 @@ export function OfflineHome({
               <Tooltip
                 content={
                   codexPayloadAvailable
-                    ? t("offline.updateHint")
+                    ? usbGuard?.reinstallAllowed === true
+                      ? t("offline.reactivationUpdateHint")
+                      : t("offline.updateHint")
                     : t("offline.updateRequiresSigned")
                 }
               >
@@ -1391,7 +1379,9 @@ export function OfflineHome({
                   )}
                   {busyAction === "update"
                     ? t("offline.updateChecking")
-                    : t("offline.updateEntry")}
+                    : usbGuard?.reinstallAllowed === true
+                      ? t("offline.reactivationUpdateEntry")
+                      : t("offline.updateEntry")}
                 </button>
               </Tooltip>
             </span>
@@ -1402,6 +1392,28 @@ export function OfflineHome({
             </button>
           ) : null}
         </div>
+
+        {showInstalled ? (
+          <button
+            className="btn ghost connection-entry"
+            onClick={() => setModelManagerOpen(true)}
+            disabled={disabled || !codexActionsAllowed}
+            data-testid="manage-upstream-models"
+          >
+            <Icon name="list" />{t("offline.nativeModelsManage")}
+          </button>
+        ) : null}
+
+        <button
+          className="btn ghost connection-entry"
+          onClick={() => {
+            setComponentsView("connections");
+            setComponentsOpen(true);
+          }}
+          disabled={disabled}
+        >
+          <Icon name="sliders" />{t("offline.components.entry")}
+        </button>
 
         <details className="advanced-tools" data-testid="advanced-tools">
           <summary>{t("offline.advancedTools")}</summary>
@@ -1423,10 +1435,13 @@ export function OfflineHome({
               </button>
               <button
                 className="btn ghost"
-                onClick={() => setComponentsOpen(true)}
+                onClick={() => {
+                  setComponentsView("maintenance");
+                  setComponentsOpen(true);
+                }}
                 disabled={disabled}
               >
-                <Icon name="sliders" />{t("offline.components.entry")}
+                <Icon name="sliders" />{t("offline.components.repairEntry")}
               </button>
             </div>
             {installationDetail ? (
@@ -1435,24 +1450,7 @@ export function OfflineHome({
                 <div>{installationDetail}</div>
               </details>
             ) : null}
-            {nativeModelNotice ? (
-              <StatusBanner tone={nativeModelNotice.tone}>
-                {nativeModelNotice.message}
-              </StatusBanner>
-            ) : null}
-            {showInstalled ? (
-              <button
-                className="btn ghost"
-                onClick={() => void refreshNativeModels(false)}
-                disabled={disabled || nativeModelBusy}
-                data-testid="refresh-native-models"
-              >
-                {nativeModelBusy ? <Icon name="loader" className="spinicon" /> : <Icon name="refresh" />}
-                {nativeModelBusy ? t("offline.nativeModelsRefreshing") : t("offline.nativeModelsRefresh")}
-              </button>
-            ) : null}
           </div>
-          {showInstalled ? <GatewayModelProbePanel /> : null}
         </details>
 
         <SkillRepoUpdateCard />
@@ -1526,6 +1524,11 @@ export function OfflineHome({
       <OfflineComponentsSheet
         open={componentsOpen}
         onDismiss={() => setComponentsOpen(false)}
+        view={componentsView}
+      />
+      <UpstreamModelManagerSheet
+        open={modelManagerOpen && showInstalled}
+        onDismiss={() => setModelManagerOpen(false)}
       />
     </div>
   );

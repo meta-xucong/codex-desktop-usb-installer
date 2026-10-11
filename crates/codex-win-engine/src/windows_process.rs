@@ -137,8 +137,9 @@ mod imp {
     use std::time::{Duration, Instant};
 
     use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_NO_MORE_FILES, HANDLE, HWND, INVALID_HANDLE_VALUE, LPARAM, RECT,
-        WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        CloseHandle, GetLastError, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER,
+        ERROR_NO_MORE_FILES, HANDLE, HWND, INVALID_HANDLE_VALUE, LPARAM, RECT, WAIT_FAILED,
+        WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
     use windows_sys::Win32::Graphics::Gdi::{
         GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
@@ -1069,6 +1070,226 @@ mod imp {
             .any(TargetProcess::is_running))
     }
 
+    fn strict_process_open_failure<F>(
+        pid: u32,
+        snapshot_image_name: &std::ffi::OsStr,
+        error_code: u32,
+        fresh_snapshot_contains_pid: F,
+    ) -> Result<bool, EngineError>
+    where
+        F: FnOnce(u32) -> Result<bool, EngineError>,
+    {
+        if pid == 0 || pid == 4 {
+            // Kernel idle/System pseudo-processes have no queryable user image.
+            return Ok(false);
+        }
+        if error_code == ERROR_INVALID_PARAMETER {
+            // A PID may be skipped only if a second, fresh Toolhelp snapshot
+            // proves it disappeared after the original process snapshot.
+            // If it is still present, or the fresh snapshot is unreadable,
+            // keep the scan fail-closed.
+            return match fresh_snapshot_contains_pid(pid) {
+                Ok(false) => Ok(false),
+                Ok(true) => Err(EngineError::Install(format!(
+                    "process {pid} is still present in a fresh snapshot after OpenProcess returned ERROR_INVALID_PARAMETER"
+                ))),
+                Err(error) => Err(EngineError::Install(format!(
+                    "cannot confirm process {pid} exited after ERROR_INVALID_PARAMETER: {error}"
+                ))),
+            };
+        }
+        if matches!(
+            snapshot_image_name,
+            name if name == std::ffi::OsStr::new("Secure System")
+                || name == std::ffi::OsStr::new("Registry")
+        ) && error_code == ERROR_INVALID_HANDLE
+        {
+            // VBS secure-kernel processes are protected OS processes with no
+            // ordinary query handle. Require an exact snapshot name and the
+            // exact expected error; all other inaccessible PIDs fail closed.
+            return Ok(false);
+        }
+        Err(EngineError::Install(format!(
+            "cannot determine image path for process {pid}: {}",
+            std::io::Error::from_raw_os_error(error_code as i32)
+        )))
+    }
+
+    fn fresh_snapshot_contains_pid(pid: u32) -> Result<bool, EngineError> {
+        let snapshot = OwnedHandle::new(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) })
+            .ok_or_else(|| last_error("create fresh process snapshot after invalid parameter"))?;
+        let mut entry = PROCESSENTRY32W {
+            dwSize: size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        if unsafe { Process32FirstW(snapshot.raw(), &mut entry) } == 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
+                return Ok(false);
+            }
+            return Err(EngineError::Install(format!(
+                "read first fresh process snapshot entry: {error}"
+            )));
+        }
+        loop {
+            if entry.th32ProcessID == pid {
+                return Ok(true);
+            }
+            if unsafe { Process32NextW(snapshot.raw(), &mut entry) } == 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
+                    return Ok(false);
+                }
+                return Err(EngineError::Install(format!(
+                    "read next fresh process snapshot entry: {error}"
+                )));
+            }
+        }
+    }
+
+    fn strict_process_image_is_under_root(
+        pid: u32,
+        root: &Path,
+        snapshot_image_name: &std::ffi::OsStr,
+    ) -> Result<bool, EngineError> {
+        let query_access = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE;
+        let Some(handle) = OwnedHandle::new(unsafe { OpenProcess(query_access, 0, pid) }) else {
+            return strict_process_open_failure(
+                pid,
+                snapshot_image_name,
+                unsafe { GetLastError() },
+                fresh_snapshot_contains_pid,
+            );
+        };
+
+        let mut buffer = vec![0u16; MAX_PROCESS_PATH_UTF16];
+        let mut length = buffer.len() as u32;
+        if unsafe { QueryFullProcessImageNameW(handle.raw(), 0, buffer.as_mut_ptr(), &mut length) }
+            == 0
+        {
+            let code = unsafe { GetLastError() } as i32;
+            match unsafe { WaitForSingleObject(handle.raw(), 0) } {
+                WAIT_OBJECT_0 => return Ok(false),
+                WAIT_TIMEOUT => {
+                    return Err(EngineError::Install(format!(
+                        "cannot query image path for live process {pid}: {}",
+                        std::io::Error::from_raw_os_error(code)
+                    )))
+                }
+                WAIT_FAILED => {
+                    return Err(EngineError::Install(format!(
+                        "cannot query image path or process state for pid {pid}: image error {}; wait error {}",
+                        std::io::Error::from_raw_os_error(code),
+                        std::io::Error::last_os_error()
+                    )))
+                }
+                status => {
+                    return Err(EngineError::Install(format!(
+                        "cannot query image path for process {pid}; unexpected wait status {status}"
+                    )))
+                }
+            }
+        }
+        if length == 0 || length as usize > buffer.len() {
+            return Err(EngineError::Install(format!(
+                "process {pid} returned an invalid image path length"
+            )));
+        }
+        let image_path = PathBuf::from(OsString::from_wide(&buffer[..length as usize]));
+        if !path_is_within_root(&image_path, root) {
+            return Ok(false);
+        }
+        match unsafe { WaitForSingleObject(handle.raw(), 0) } {
+            WAIT_OBJECT_0 => Ok(false),
+            WAIT_TIMEOUT => Ok(true),
+            WAIT_FAILED => Err(EngineError::Install(format!(
+                "cannot confirm whether managed process {pid} is still running: {}",
+                std::io::Error::last_os_error()
+            ))),
+            status => Err(EngineError::Install(format!(
+                "managed process {pid} returned unexpected wait status {status}"
+            ))),
+        }
+    }
+
+    fn strict_probe_process<F>(
+        pid: u32,
+        snapshot_image_name: &std::ffi::OsStr,
+        root: &Path,
+        probe: F,
+    ) -> Result<Option<bool>, EngineError>
+    where
+        F: FnOnce(u32, &Path, &std::ffi::OsStr) -> Result<bool, EngineError>,
+    {
+        // PID 0 is the kernel idle pseudo-process; PID 4 is the protected
+        // Windows System process. Neither can be a user-launched Codex image,
+        // and Windows does not permit querying PID 4's ordinary process image
+        // handle. Do not broaden this exception to other protected processes.
+        if pid == 0 || pid == 4 {
+            return Ok(None);
+        }
+        probe(pid, root, snapshot_image_name).map(Some)
+    }
+
+    /// Strict cleanup probe. Unlike the ordinary process query, it does not
+    /// silently skip live processes whose executable path cannot be queried.
+    pub fn processes_running_for_root_strict(root: &Path) -> Result<bool, EngineError> {
+        let snapshot = OwnedHandle::new(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) })
+            .ok_or_else(|| last_error("create strict process snapshot"))?;
+        let mut entry = PROCESSENTRY32W {
+            dwSize: size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        if unsafe { Process32FirstW(snapshot.raw(), &mut entry) } == 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
+                return Ok(false);
+            }
+            return Err(EngineError::Install(format!(
+                "read first strict process snapshot entry: {error}"
+            )));
+        }
+
+        let manager_pid = std::process::id();
+        let mut unresolved = None;
+        loop {
+            let pid = entry.th32ProcessID;
+            if pid != manager_pid {
+                let image_name_length = entry
+                    .szExeFile
+                    .iter()
+                    .position(|unit| *unit == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                let snapshot_image_name =
+                    OsString::from_wide(&entry.szExeFile[..image_name_length]);
+                match strict_probe_process(
+                    pid,
+                    &snapshot_image_name,
+                    root,
+                    strict_process_image_is_under_root,
+                ) {
+                    Ok(Some(true)) => return Ok(true),
+                    Ok(Some(false)) | Ok(None) => {}
+                    Err(error) if unresolved.is_none() => unresolved = Some(error),
+                    Err(_) => {}
+                }
+            }
+            if unsafe { Process32NextW(snapshot.raw(), &mut entry) } == 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
+                    break;
+                }
+                return Err(EngineError::Install(format!(
+                    "read next strict process snapshot entry: {error}"
+                )));
+            }
+        }
+        if let Some(error) = unresolved {
+            return Err(error);
+        }
+        Ok(false)
+    }
+
     pub(crate) fn codex_processes_running_for_root(root: &Path) -> Result<bool, EngineError> {
         processes_running_for_root(root)
     }
@@ -1179,6 +1400,161 @@ mod imp {
         use super::*;
 
         const HELPER_ENV: &str = "CODEX_APP_MANAGER_PROCESS_HELPER";
+        const STRICT_HELPER_ENV: &str = "CODEX_USB_REVOCATION_PROCESS_HELPER";
+
+        #[test]
+        fn strict_probe_skips_only_known_system_pids_and_preserves_other_errors() {
+            let root = Path::new("C:\\fixture");
+            for pid in [0, 4] {
+                assert_eq!(
+                    strict_probe_process(pid, std::ffi::OsStr::new("System"), root, |_, _, _| {
+                        panic!("known Windows system PID {pid} must not be queried")
+                    })
+                    .unwrap(),
+                    None
+                );
+            }
+            let ordinary_error = EngineError::Install("image query denied".to_string());
+            let error = strict_probe_process(
+                1234,
+                std::ffi::OsStr::new("helper.exe"),
+                root,
+                |pid, _, _| {
+                    assert_eq!(pid, 1234);
+                    Err(ordinary_error)
+                },
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("image query denied"));
+        }
+
+        #[test]
+        fn protected_system_exception_requires_exact_name_and_invalid_handle_error() {
+            let invalid_handle = ERROR_INVALID_HANDLE;
+            let other_error = windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
+            for (pid, name) in [(236, "Secure System"), (276, "Registry")] {
+                assert!(!strict_process_open_failure(
+                    pid,
+                    std::ffi::OsStr::new(name),
+                    invalid_handle,
+                    |_| panic!("protected process exception must not request a fresh snapshot"),
+                )
+                .unwrap());
+            }
+            assert!(strict_process_open_failure(
+                237,
+                std::ffi::OsStr::new("Other System"),
+                invalid_handle,
+                |_| panic!("non-exit error must not request a fresh snapshot"),
+            )
+            .is_err());
+            assert!(strict_process_open_failure(
+                238,
+                std::ffi::OsStr::new("Secure System"),
+                other_error,
+                |_| panic!("non-exit error must not request a fresh snapshot"),
+            )
+            .is_err());
+            assert!(strict_process_open_failure(
+                239,
+                std::ffi::OsStr::new("Registry"),
+                other_error,
+                |_| panic!("non-exit error must not request a fresh snapshot"),
+            )
+            .is_err());
+        }
+
+        #[test]
+        fn invalid_parameter_is_skipped_only_after_fresh_snapshot_proves_pid_vanished() {
+            assert!(!strict_process_open_failure(
+                1234,
+                std::ffi::OsStr::new("fixture.exe"),
+                ERROR_INVALID_PARAMETER,
+                |pid| {
+                    assert_eq!(pid, 1234);
+                    Ok(false)
+                },
+            )
+            .unwrap());
+        }
+
+        #[test]
+        fn invalid_parameter_fails_closed_when_pid_remains_in_fresh_snapshot() {
+            let error = strict_process_open_failure(
+                1234,
+                std::ffi::OsStr::new("fixture.exe"),
+                ERROR_INVALID_PARAMETER,
+                |pid| {
+                    assert_eq!(pid, 1234);
+                    Ok(true)
+                },
+            )
+            .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("still present in a fresh snapshot"));
+        }
+
+        #[test]
+        fn invalid_parameter_fails_closed_when_fresh_snapshot_cannot_be_read() {
+            let error = strict_process_open_failure(
+                1234,
+                std::ffi::OsStr::new("fixture.exe"),
+                ERROR_INVALID_PARAMETER,
+                |_| Err(EngineError::Install("snapshot fixture failure".to_string())),
+            )
+            .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("cannot confirm process 1234 exited"));
+            assert!(error.to_string().contains("snapshot fixture failure"));
+        }
+
+        #[test]
+        fn strict_probe_helper_child() {
+            if std::env::var_os(STRICT_HELPER_ENV).is_some() {
+                thread::sleep(Duration::from_secs(30));
+            }
+        }
+
+        #[test]
+        fn strict_probe_finds_a_live_process_under_the_managed_root() {
+            if std::env::var_os(STRICT_HELPER_ENV).is_some() {
+                return;
+            }
+            let root = std::env::temp_dir().join(format!(
+                "codex-strict-process-probe-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let helper = root.join("Managed.Child.exe");
+            std::fs::copy(std::env::current_exe().unwrap(), &helper).unwrap();
+            let mut child = Command::new(&helper)
+                .args([
+                    "--exact",
+                    "windows_process::imp::windows_tests::strict_probe_helper_child",
+                    "--nocapture",
+                ])
+                .env(STRICT_HELPER_ENV, "1")
+                .spawn()
+                .unwrap();
+
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let found = loop {
+                match processes_running_for_root_strict(&root) {
+                    Ok(true) => break true,
+                    Ok(false) | Err(_) if Instant::now() < deadline => {
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                    Ok(false) | Err(_) => break false,
+                }
+            };
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_dir_all(&root);
+            assert!(found, "strict process probe missed a live managed process");
+        }
 
         #[test]
         fn closes_unlisted_helper_process_without_powershell() {
@@ -1235,8 +1611,8 @@ mod imp {
 #[cfg(windows)]
 pub use imp::{
     close_processes_for_root, hide_codex_auxiliary_windows_for_root, hide_console_windows_for_root,
-    hide_windows_for_root, processes_running_for_root, show_windows_for_root,
-    start_console_window_watcher, wait_for_usable_window_for_root,
+    hide_windows_for_root, processes_running_for_root, processes_running_for_root_strict,
+    show_windows_for_root, start_console_window_watcher, wait_for_usable_window_for_root,
 };
 
 #[cfg(windows)]
@@ -1288,6 +1664,13 @@ pub(crate) fn codex_processes_running_for_root(_root: &Path) -> Result<bool, Eng
 #[cfg(not(windows))]
 pub fn processes_running_for_root(_root: &Path) -> Result<bool, EngineError> {
     Ok(false)
+}
+
+#[cfg(not(windows))]
+pub fn processes_running_for_root_strict(_root: &Path) -> Result<bool, EngineError> {
+    Err(EngineError::Install(
+        "strict process image query is supported only on Windows".to_string(),
+    ))
 }
 
 #[cfg(not(windows))]

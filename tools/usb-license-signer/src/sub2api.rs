@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::blocking::{Client, RequestBuilder};
+use reqwest::redirect::Policy;
 use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -310,7 +311,7 @@ fn validate_pending_provision(
     )
     .map_err(|_| Sub2ApiError::Recovery("恢复记录中的邮箱无效".to_string()))?;
     if !pending.login_email.contains('@')
-        || pending.sub2api_user_id == 0
+        || (pending.sub2api_user_id == 0 && pending.device_api_key.is_some())
         || pending.group_id == 0
         || pending.created_at_unix_ms == 0
     {
@@ -357,8 +358,24 @@ fn save_pending_provision(
     validate_pending_provision(pending, recovery_key)?;
     let path = pending_provision_path(recovery_key)?;
     if let Some(existing) = load_pending_provision(recovery_key)? {
-        if existing.usb_asset_id != pending.usb_asset_id
-            || existing.sub2api_user_id != pending.sub2api_user_id
+        let candidate_changed = existing.usb_asset_id != pending.usb_asset_id
+            || existing.login_email != pending.login_email;
+        let identity_changed = existing.recovery_key_digest != pending.recovery_key_digest
+            || existing.group_id != pending.group_id
+            || existing.password != pending.password
+            || existing.created_at_unix_ms != pending.created_at_unix_ms;
+        let user_id_changed_unsafely =
+            existing.sub2api_user_id != 0 && existing.sub2api_user_id != pending.sub2api_user_id;
+        let candidate_changed_after_creation =
+            candidate_changed && (existing.sub2api_user_id != 0 || pending.sub2api_user_id != 0);
+        let key_changed = existing
+            .device_api_key
+            .as_deref()
+            .is_some_and(|key| pending.device_api_key.as_deref() != Some(key));
+        if identity_changed
+            || user_id_changed_unsafely
+            || candidate_changed_after_creation
+            || key_changed
         {
             return Err(Sub2ApiError::Recovery(
                 "已有不同账号占用当前 Bundle 的恢复记录".to_string(),
@@ -578,6 +595,20 @@ pub fn validate_config(config: &Sub2ApiConfig) -> Result<(), Sub2ApiError> {
     Ok(())
 }
 
+/// Validate the production destination before sending the compiled-in
+/// administrator credential. Generic `Sub2ApiClient::new` remains available
+/// for loopback contract tests, while the shipped GUI must use this pinned
+/// constructor so a changed local preference cannot redirect the admin key.
+pub fn validate_trusted_admin_endpoint(config: &Sub2ApiConfig) -> Result<(), Sub2ApiError> {
+    let normalized = normalize_base_url(&config.base_url)?;
+    if normalized != DEFAULT_BASE_URL {
+        return Err(Sub2ApiError::Config(
+            "管理员凭据仅允许发送到固定的 404token 服务地址".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 pub fn parse_preload_amount(raw: &str) -> Result<f64, Sub2ApiError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -628,6 +659,20 @@ pub fn make_provision_idempotency_key(asset_id: &str) -> String {
     )
 }
 
+/// Stable key for creating the per-USB user API key. A retry after an
+/// ambiguous response must refer to the same key-creation operation.
+pub fn make_user_api_key_idempotency_key(asset_id: &str) -> String {
+    let digest = Sha256::digest(asset_id.as_bytes());
+    format!(
+        "usb-user-key-{asset_id}-{}",
+        digest
+            .iter()
+            .take(16)
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    )
+}
+
 pub fn generate_initial_password() -> Result<Zeroizing<String>, Sub2ApiError> {
     Ok(Zeroizing::new(DEFAULT_INITIAL_PASSWORD.to_string()))
 }
@@ -658,10 +703,20 @@ impl Sub2ApiClient {
             .user_agent(USER_AGENT)
             .connect_timeout(Duration::from_secs(15))
             .timeout(Duration::from_secs(45))
-            .redirect(reqwest::redirect::Policy::limited(3))
+            // Admin requests carry x-api-key. Never forward it through an
+            // HTTP redirect to a second host.
+            .redirect(Policy::none())
             .build()
             .map_err(|_| Sub2ApiError::Config("网络客户端初始化失败".to_string()))?;
         Ok(Self { config, client })
+    }
+
+    /// Construct the production client used by the signer GUI. The generic
+    /// constructor is retained for local loopback fixtures only.
+    pub fn new_for_trusted_admin(config: Sub2ApiConfig) -> Result<Self, Sub2ApiError> {
+        validate_config(&config)?;
+        validate_trusted_admin_endpoint(&config)?;
+        Self::new(config)
     }
 
     pub fn provision_account(
@@ -703,6 +758,37 @@ impl Sub2ApiClient {
         let recovery_key = recovery_key
             .map(str::trim)
             .filter(|value| !value.is_empty());
+
+        if let Some(recovery_key) = recovery_key {
+            if let Some(mut pending) = load_pending_provision(recovery_key)? {
+                let mut group_checked = false;
+                if pending.sub2api_user_id == 0 {
+                    let mut users = self.list_usb_users()?;
+                    if let Some(user) =
+                        find_user_identity(&users, &pending.usb_asset_id, &pending.login_email)
+                    {
+                        pending.sub2api_user_id = user.id;
+                        save_pending_provision(recovery_key, &pending)?;
+                    } else {
+                        let current_group = self.ensure_group_available()?;
+                        if current_group != pending.group_id {
+                            return Err(Sub2ApiError::Recovery(
+                                "目标统一 API 分组已变化，不能自动续作旧账号".to_string(),
+                            ));
+                        }
+                        group_checked = true;
+                        self.create_pending_user(&mut pending, &mut users, Some(recovery_key))?;
+                    }
+                }
+                return self.finish_pending_provision(
+                    pending,
+                    Some(recovery_key),
+                    true,
+                    group_checked,
+                );
+            }
+        }
+
         let password = match initial_password {
             Some(value) => {
                 validate_initial_password(value)?;
@@ -711,58 +797,50 @@ impl Sub2ApiClient {
             None => generate_initial_password()?,
         };
         let group_id = self.ensure_group_available()?;
-
-        if let Some(recovery_key) = recovery_key {
-            if let Some(mut pending) = load_pending_provision(recovery_key)? {
-                if pending.group_id != group_id {
-                    return Err(Sub2ApiError::Recovery(
-                        "目标统一 API 分组已变化，不能自动续作旧账号".to_string(),
-                    ));
-                }
-                let recovered_password = Zeroizing::new(pending.password.clone());
-                let device_api_key = match pending.device_api_key.clone() {
-                    Some(api_key) => api_key,
-                    None => {
-                        let user_token = self.login(&pending.login_email, &pending.password)?;
-                        let api_key = self.create_user_api_key(
-                            &user_token,
-                            &pending.usb_asset_id,
-                            pending.group_id,
-                        )?;
-                        pending.device_api_key = Some(api_key.clone());
-                        save_pending_provision(recovery_key, &pending)?;
-                        api_key
-                    }
-                };
-                let binding = UsbAccountBinding {
-                    schema_version: 1,
-                    usb_asset_id: pending.usb_asset_id.clone(),
-                    account_ref: pending.usb_asset_id.clone(),
-                    account_name: pending.usb_asset_id.clone(),
-                    login_email: pending.login_email.clone(),
-                    sub2api_user_id: pending.sub2api_user_id,
-                    ccswitch: UsbCcswitchBinding {
-                        provider_id: "404token-sub2api".to_string(),
-                        credential_id: format!("sub2api-user-key-{}", pending.sub2api_user_id),
-                        device_api_key,
-                        group_id: pending.group_id,
-                    },
-                };
-                codex_usb_license::validate_account_binding(&binding)
-                    .map_err(|error| Sub2ApiError::Recovery(error.to_string()))?;
-                return Ok(ProvisionedAccount {
-                    binding,
-                    initial_password: recovered_password,
-                    reused: false,
-                    recovered: true,
-                });
-            }
-        }
-
         let mut users = self.list_usb_users()?;
+        let number = next_usb_number(&users);
+        let asset_id = format!("USB-{number:04}");
+        let email = short_email(number, &self.config.fake_email_domain)?;
+        let mut pending = PendingProvisionRecord {
+            schema_version: PROVISION_RECOVERY_SCHEMA_VERSION,
+            recovery_key_digest: recovery_key
+                .map(recovery_key_digest)
+                .transpose()?
+                .unwrap_or_default(),
+            usb_asset_id: asset_id,
+            login_email: email,
+            sub2api_user_id: 0,
+            group_id,
+            password: password.to_string(),
+            device_api_key: None,
+            created_at_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| Sub2ApiError::Recovery("系统时间无效".to_string()))?
+                .as_millis(),
+        };
+        // Write the intended identity before the remote POST. If the response
+        // is lost or the process exits, the next launch can reconcile this same
+        // account instead of allocating a new USB number.
+        if let Some(recovery_key) = recovery_key {
+            save_pending_provision(recovery_key, &pending)?;
+        }
+        self.create_pending_user(&mut pending, &mut users, recovery_key)?;
+        self.finish_pending_provision(pending, recovery_key, false, true)
+    }
+
+    fn create_pending_user(
+        &self,
+        pending: &mut PendingProvisionRecord,
+        users: &mut Vec<UserRecord>,
+        recovery_key: Option<&str>,
+    ) -> Result<(), Sub2ApiError> {
+        let mut number = pending
+            .usb_asset_id
+            .strip_prefix("USB-")
+            .and_then(|suffix| suffix.parse::<u64>().ok())
+            .ok_or_else(|| Sub2ApiError::Recovery("恢复记录中的 U 盘编号无效".to_string()))?;
         let mut attempted_numbers = BTreeSet::new();
         for _ in 0..8 {
-            let mut number = next_usb_number(&users);
             while attempted_numbers.contains(&number) {
                 number = number.saturating_add(1);
             }
@@ -772,78 +850,97 @@ impl Sub2ApiClient {
                 .iter()
                 .any(|user| user.username == asset_id || user.email == email)
             {
-                return Err(Sub2ApiError::ExistingAccount(format!(
-                    "{asset_id} 已存在，但没有可安全续作的签名绑定"
-                )));
+                attempted_numbers.insert(number);
+                number = next_usb_number(users).max(number.saturating_add(1));
+                continue;
             }
-
-            let user_id = match self
-                .create_user_with_recovery(&asset_id, &email, &password, group_id, &mut users)
-            {
-                Ok(id) => id,
+            pending.usb_asset_id = asset_id.clone();
+            pending.login_email = email.clone();
+            if let Some(recovery_key) = recovery_key {
+                save_pending_provision(recovery_key, pending)?;
+            }
+            match self.create_user_with_recovery(
+                &asset_id,
+                &email,
+                &pending.password,
+                pending.group_id,
+                users,
+            ) {
+                Ok(user_id) => {
+                    pending.sub2api_user_id = user_id;
+                    if let Some(recovery_key) = recovery_key {
+                        save_pending_provision(recovery_key, pending)?;
+                    }
+                    return Ok(());
+                }
                 Err(error) if error.is_conflict() => {
                     attempted_numbers.insert(number);
-                    users = self.list_usb_users()?;
-                    continue;
+                    number = next_usb_number(users).max(number.saturating_add(1));
                 }
                 Err(error) => return Err(error),
-            };
-
-            let mut pending = PendingProvisionRecord {
-                schema_version: PROVISION_RECOVERY_SCHEMA_VERSION,
-                recovery_key_digest: recovery_key
-                    .map(recovery_key_digest)
-                    .transpose()?
-                    .unwrap_or_default(),
-                usb_asset_id: asset_id.clone(),
-                login_email: email.clone(),
-                sub2api_user_id: user_id,
-                group_id,
-                password: password.to_string(),
-                device_api_key: None,
-                created_at_unix_ms: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map_err(|_| Sub2ApiError::Recovery("系统时间无效".to_string()))?
-                    .as_millis(),
-            };
-            if let Some(recovery_key) = recovery_key {
-                // Persist immediately after account creation. If login or key
-                // creation fails, the next run can resume the same user rather
-                // than allocating a second USB number.
-                save_pending_provision(recovery_key, &pending)?;
             }
-            let user_token = self.login(&email, &password)?;
-            let device_api_key = self.create_user_api_key(&user_token, &asset_id, group_id)?;
-            pending.device_api_key = Some(device_api_key.clone());
-            if let Some(recovery_key) = recovery_key {
-                save_pending_provision(recovery_key, &pending)?;
-            }
-            let binding = UsbAccountBinding {
-                schema_version: 1,
-                usb_asset_id: asset_id,
-                account_ref: format!("USB-{number:04}"),
-                account_name: format!("USB-{number:04}"),
-                login_email: email,
-                sub2api_user_id: user_id,
-                ccswitch: UsbCcswitchBinding {
-                    provider_id: "404token-sub2api".to_string(),
-                    credential_id: format!("sub2api-user-key-{user_id}"),
-                    device_api_key,
-                    group_id,
-                },
-            };
-            codex_usb_license::validate_account_binding(&binding)
-                .map_err(|error| Sub2ApiError::ExistingAccount(error.to_string()))?;
-            return Ok(ProvisionedAccount {
-                binding,
-                initial_password: password,
-                reused: false,
-                recovered: false,
-            });
         }
         Err(Sub2ApiError::ExistingAccount(
-            "连续发生编号冲突，未继续创建账号；请确认后台编号接口正常后重试".to_string(),
+            "连续发生编号冲突，未继续创建账号；下次可自动续作".to_string(),
         ))
+    }
+
+    fn finish_pending_provision(
+        &self,
+        mut pending: PendingProvisionRecord,
+        recovery_key: Option<&str>,
+        recovered: bool,
+        group_checked: bool,
+    ) -> Result<ProvisionedAccount, Sub2ApiError> {
+        if pending.sub2api_user_id == 0 {
+            return Err(Sub2ApiError::Recovery(
+                "账号恢复记录尚未关联远端用户".to_string(),
+            ));
+        }
+        let recovered_password = Zeroizing::new(pending.password.clone());
+        let device_api_key = match pending.device_api_key.clone() {
+            Some(api_key) => api_key,
+            None => {
+                if !group_checked {
+                    let group_id = self.ensure_group_available()?;
+                    if group_id != pending.group_id {
+                        return Err(Sub2ApiError::Recovery(
+                            "目标统一 API 分组已变化，不能自动续作旧账号".to_string(),
+                        ));
+                    }
+                }
+                let user_token = self.login(&pending.login_email, &pending.password)?;
+                let api_key =
+                    self.create_user_api_key(&user_token, &pending.usb_asset_id, pending.group_id)?;
+                pending.device_api_key = Some(api_key.clone());
+                if let Some(recovery_key) = recovery_key {
+                    save_pending_provision(recovery_key, &pending)?;
+                }
+                api_key
+            }
+        };
+        let binding = UsbAccountBinding {
+            schema_version: 1,
+            usb_asset_id: pending.usb_asset_id.clone(),
+            account_ref: pending.usb_asset_id.clone(),
+            account_name: pending.usb_asset_id.clone(),
+            login_email: pending.login_email.clone(),
+            sub2api_user_id: pending.sub2api_user_id,
+            ccswitch: UsbCcswitchBinding {
+                provider_id: "404token-sub2api".to_string(),
+                credential_id: format!("sub2api-user-key-{}", pending.sub2api_user_id),
+                device_api_key,
+                group_id: pending.group_id,
+            },
+        };
+        codex_usb_license::validate_account_binding(&binding)
+            .map_err(|error| Sub2ApiError::Recovery(error.to_string()))?;
+        Ok(ProvisionedAccount {
+            binding,
+            initial_password: recovered_password,
+            reused: false,
+            recovered,
+        })
     }
 
     /// Remove the encrypted registration recovery record after the same
@@ -1071,6 +1168,7 @@ impl Sub2ApiClient {
             &format!("{API_PREFIX}/auth/login"),
             Some(&json!({ "email": email, "password": password })),
             None,
+            None,
         )?;
         find_string(&value, &["access_token", "accessToken", "token"])
             .ok_or(Sub2ApiError::Response { operation: "login" })
@@ -1082,6 +1180,7 @@ impl Sub2ApiClient {
         asset_id: &str,
         group_id: u64,
     ) -> Result<String, Sub2ApiError> {
+        let idempotency_key = make_user_api_key_idempotency_key(asset_id);
         let value = self.user_request(
             "create-api-key",
             Method::POST,
@@ -1091,6 +1190,7 @@ impl Sub2ApiClient {
                 "group_id": group_id,
             })),
             Some(token),
+            Some(&idempotency_key),
         )?;
         find_string(&value, &["key", "api_key", "apiKey", "token"]).ok_or(Sub2ApiError::Response {
             operation: "create-api-key",
@@ -1162,6 +1262,7 @@ impl Sub2ApiClient {
         path: &str,
         body: Option<&Value>,
         bearer_token: Option<&str>,
+        idempotency_key: Option<&str>,
     ) -> Result<Value, Sub2ApiError> {
         let mut request = self.request(operation, method, path)?;
         if let Some(token) = bearer_token {
@@ -1169,6 +1270,9 @@ impl Sub2ApiClient {
         }
         if let Some(body) = body {
             request = request.json(body);
+        }
+        if let Some(key) = idempotency_key {
+            request = request.header("Idempotency-Key", key);
         }
         self.send_json(operation, request)
     }
@@ -1457,7 +1561,7 @@ fn find_user_identity<'a>(
 ) -> Option<&'a UserRecord> {
     users
         .iter()
-        .find(|user| user.username == asset_id || user.email == email)
+        .find(|user| user.username == asset_id && user.email == email)
 }
 
 #[cfg(test)]
@@ -1538,6 +1642,32 @@ mod tests {
         assert!(normalize_base_url("http://127.0.0.1:18080").is_ok());
         assert!(normalize_base_url("http://404token.xyz").is_err());
         assert!(normalize_base_url("https://user:pass@404token.xyz").is_err());
+    }
+
+    #[test]
+    fn production_admin_credential_is_pinned_to_the_404token_origin() {
+        let mut config = Sub2ApiConfig {
+            admin_api_key: "test-key".to_string(),
+            ..Sub2ApiConfig::default()
+        };
+        assert!(validate_trusted_admin_endpoint(&config).is_ok());
+
+        config.base_url = "https://404token.xyz/".to_string();
+        assert!(validate_trusted_admin_endpoint(&config).is_ok());
+
+        for unsafe_destination in [
+            "https://example.invalid",
+            "https://404token.xyz.example.invalid",
+            "https://404token.xyz:443",
+            "https://404token.xyz/api/v1",
+            "http://127.0.0.1:18080",
+        ] {
+            config.base_url = unsafe_destination.to_string();
+            assert!(
+                validate_trusted_admin_endpoint(&config).is_err(),
+                "unexpectedly accepted admin destination: {unsafe_destination}"
+            );
+        }
     }
 
     #[test]
@@ -1668,23 +1798,30 @@ mod tests {
             recovery_key_digest: recovery_key_digest(&recovery_key).unwrap(),
             usb_asset_id: "USB-0042".to_string(),
             login_email: "u42@u.404token.xyz".to_string(),
-            sub2api_user_id: 23,
+            sub2api_user_id: 0,
             group_id: 7,
             password: "Test-only-USB-password-42".to_string(),
-            device_api_key: Some("sk-device-key".to_string()),
+            device_api_key: None,
             created_at_unix_ms: 1,
         };
         save_pending_provision(&recovery_key, &pending).expect("save recovery record");
         let path = pending_provision_path(&recovery_key).unwrap();
         let raw = fs::read(&path).expect("read encrypted recovery record");
+        assert!(!String::from_utf8_lossy(&raw).contains("Test-only-USB-password-42"));
+        let mut linked = pending;
+        linked.sub2api_user_id = 23;
+        save_pending_provision(&recovery_key, &linked).expect("link created remote account");
+        linked.device_api_key = Some("sk-device-key".to_string());
+        save_pending_provision(&recovery_key, &linked).expect("save generated user key");
+        let raw = fs::read(&path).expect("read encrypted completed recovery record");
         assert!(!String::from_utf8_lossy(&raw).contains("sk-device-key"));
         assert!(!String::from_utf8_lossy(&raw).contains("Test-only-USB-password-42"));
         assert_eq!(
             load_pending_provision(&recovery_key)
                 .unwrap()
                 .unwrap()
-                .usb_asset_id,
-            "USB-0042"
+                .sub2api_user_id,
+            23
         );
         clear_pending_provision(&recovery_key).expect("clear recovery record");
         assert!(!path.exists());
@@ -1766,6 +1903,37 @@ mod tests {
         assert_eq!(provision, make_provision_idempotency_key("USB-0002"));
         assert!(provision.starts_with("usb-provision-USB-0002-"));
         assert!(!provision.contains("password"));
+
+        let user_key = make_user_api_key_idempotency_key("USB-0002");
+        assert_eq!(user_key, make_user_api_key_idempotency_key("USB-0002"));
+        assert!(user_key.starts_with("usb-user-key-USB-0002-"));
+        assert!(!user_key.contains("password"));
+    }
+
+    #[test]
+    fn account_recovery_requires_both_usb_username_and_generated_email() {
+        let users = vec![
+            UserRecord {
+                id: 1,
+                username: "USB-0001".to_string(),
+                email: "someone-else@example.test".to_string(),
+            },
+            UserRecord {
+                id: 2,
+                username: "ordinary-user".to_string(),
+                email: "u1@u.404token.xyz".to_string(),
+            },
+            UserRecord {
+                id: 3,
+                username: "USB-0001".to_string(),
+                email: "u1@u.404token.xyz".to_string(),
+            },
+        ];
+        assert_eq!(
+            find_user_identity(&users, "USB-0001", "u1@u.404token.xyz").map(|u| u.id),
+            Some(3)
+        );
+        assert!(find_user_identity(&users[..2], "USB-0001", "u1@u.404token.xyz").is_none());
     }
 
     #[test]
@@ -1871,6 +2039,7 @@ mod tests {
                         assert!(request.starts_with("POST /api/v1/keys "));
                         assert!(request_lower.contains("authorization: bearer user-token"));
                         assert!(!request_lower.contains("admin-test-key"));
+                        assert!(request_lower.contains("idempotency-key: usb-user-key-usb-0001-"));
                         assert!(request.contains(r#""name":"CCSwitch-USB-0001""#));
                         assert!(request.contains(r#""group_id":7"#));
                         send_json(&mut stream, r#"{"key":"sk-device-key"}"#);
@@ -1963,6 +2132,7 @@ mod tests {
                     5 => {
                         assert!(request.starts_with("POST /api/v1/keys "));
                         assert!(request_lower.contains("authorization: bearer user-token"));
+                        assert!(request_lower.contains("idempotency-key: usb-user-key-usb-0001-"));
                         send_json(&mut stream, r#"{"key":"sk-device-key"}"#);
                     }
                     _ => unreachable!(),
@@ -1985,6 +2155,105 @@ mod tests {
             None => std::env::remove_var("LOCALAPPDATA"),
         }
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn key_creation_retry_reuses_the_same_idempotency_key_and_saved_account() {
+        let _guard = CONFIG_TEST_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!("usb-signer-key-recovery-{}", Uuid::new_v4()));
+        let previous = std::env::var_os("LOCALAPPDATA");
+        std::env::set_var("LOCALAPPDATA", &root);
+        let recovery_key = make_provision_recovery_key(123, &"a".repeat(64), "CodexUsb");
+        let fixture_recovery_key = recovery_key.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind key recovery fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let handle = thread::spawn(move || {
+            let mut first_key_idempotency = None;
+            for step in 0..8 {
+                let (mut stream, _) = listener.accept().expect("accept key recovery request");
+                let request = read_http_request(&mut stream);
+                let request_lower = request.to_ascii_lowercase();
+                match step {
+                    0 | 5 => {
+                        assert!(request.starts_with("GET /api/v1/admin/groups/all "));
+                        send_json(
+                            &mut stream,
+                            r#"{"data":[{"id":7,"name":"unified-api-internal","status":"active"}]}"#,
+                        );
+                    }
+                    1 => {
+                        assert!(request.starts_with("GET /api/v1/admin/users?search=USB-"));
+                        send_json(&mut stream, r#"{"data":[]}"#);
+                    }
+                    2 => {
+                        assert!(request.starts_with("POST /api/v1/admin/users "));
+                        assert!(request_lower.contains("idempotency-key: usb-provision-usb-0001-"));
+                        let persisted = load_pending_provision(&fixture_recovery_key)
+                            .expect("load write-ahead recovery record")
+                            .expect("intent saved before account POST");
+                        assert_eq!(persisted.usb_asset_id, "USB-0001");
+                        assert_eq!(persisted.login_email, "u1@u.404token.xyz");
+                        assert_eq!(persisted.sub2api_user_id, 0);
+                        assert!(persisted.device_api_key.is_none());
+                        send_json(&mut stream, r#"{"id":23}"#);
+                    }
+                    3 | 6 => {
+                        assert!(request.starts_with("POST /api/v1/auth/login "));
+                        send_json(&mut stream, r#"{"access_token":"user-token"}"#);
+                    }
+                    4 => {
+                        assert!(request.starts_with("POST /api/v1/keys "));
+                        let key = request_lower
+                            .lines()
+                            .find_map(|line| line.strip_prefix("idempotency-key:"))
+                            .expect("API key idempotency header")
+                            .trim()
+                            .to_string();
+                        first_key_idempotency = Some(key);
+                        send_error(&mut stream, "503 Service Unavailable");
+                    }
+                    7 => {
+                        assert!(request.starts_with("POST /api/v1/keys "));
+                        let key = request_lower
+                            .lines()
+                            .find_map(|line| line.strip_prefix("idempotency-key:"))
+                            .expect("retry API key idempotency header")
+                            .trim();
+                        assert_eq!(Some(key.to_string()), first_key_idempotency);
+                        send_json(&mut stream, r#"{"key":"sk-device-key"}"#);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        });
+
+        let client = Sub2ApiClient::new(Sub2ApiConfig {
+            base_url: format!("http://{address}"),
+            admin_api_key: "admin-test-key".to_string(),
+            fake_email_domain: DEFAULT_EMAIL_DOMAIN.to_string(),
+        })
+        .expect("fixture client");
+        assert!(client
+            .provision_account_with_recovery(None, None, Some(&recovery_key))
+            .is_err());
+        let pending = load_pending_provision(&recovery_key)
+            .expect("load pending after ambiguous key response")
+            .expect("pending record retained");
+        assert_eq!(pending.sub2api_user_id, 23);
+        assert!(pending.device_api_key.is_none());
+
+        let provisioned = client
+            .provision_account_with_recovery(None, None, Some(&recovery_key))
+            .expect("resume API key operation");
+        assert!(provisioned.recovered);
+        assert_eq!(provisioned.binding.sub2api_user_id, 23);
+        assert_eq!(provisioned.binding.ccswitch.device_api_key, "sk-device-key");
+        handle.join().expect("key recovery fixture thread");
+        match previous {
+            Some(value) => std::env::set_var("LOCALAPPDATA", value),
+            None => std::env::remove_var("LOCALAPPDATA"),
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -37,7 +37,8 @@ import type {
   MacUpdateReport,
   GatewayModelProbeReport,
   GatewayModelProbeRequest,
-  NativeModelCatalogReport,
+  NativeModelCatalogActionReport,
+  NativeModelCatalogActionRequest,
   OfflinePayloadReport,
   OfflineStageReport,
   OperationKind,
@@ -1943,36 +1944,23 @@ export const managerApi = {
     }
     return invoke<CcswitchLaunchReport>("open_ccswitch");
   },
-  /** Refresh Codex's native menu metadata without probing model generation. */
-  refreshNativeModelCatalog(force = false): Promise<NativeModelCatalogReport> {
+  /** Read or explicitly mutate the manager-owned Codex model catalog. */
+  manageNativeModelCatalog(request: NativeModelCatalogActionRequest): Promise<NativeModelCatalogActionReport> {
     if (!hasTauriRuntime()) {
       return Promise.resolve({
-        status: "skipped",
-        modelCount: 0,
-        catalogPath: null,
-        fetchedAt: null,
+        status: "unavailable",
+        modelIds: [],
+        restartRequired: false,
         message: "browser preview: native model catalog is unavailable",
-        attempts: 0,
-        errorKind: "tauri-runtime-unavailable",
-        runId: "browser-preview",
-        gatewayStatus: "unavailable",
-        readyCount: 0,
-        quarantinedCount: 0,
-        defaultModel: null,
-        sidecarPath: null,
-        nativeStatus: "metadata_only",
-        activationStatus: "not_requested",
-        serviceRevision: null,
-        models: [],
       });
     }
-    return invoke<NativeModelCatalogReport>("refresh_native_model_catalog", { force });
+    return invoke<NativeModelCatalogActionReport>("manage_native_model_catalog", { request });
   },
   /** Explicit, read-only 404token directory and gateway diagnostics. */
   gatewayModelProbe(request: GatewayModelProbeRequest): Promise<GatewayModelProbeReport> {
     if (!hasTauriRuntime()) {
       return Promise.resolve({
-        status: "skipped", endpoint: "", credentialFingerprint: "", checkedAt: 0,
+        status: "skipped", endpoint: "", credentialFingerprint: "", connectionFingerprint: "", checkedAt: 0,
         models: [], results: [], generatedRequests: 0, errorCode: "tauri-runtime-unavailable",
       });
     }

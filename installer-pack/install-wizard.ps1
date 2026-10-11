@@ -63,10 +63,30 @@ foreach ($service in @($apiManifest.services)) {
     $serviceSpecs.Add([pscustomobject]@{
             id = [string]$service.id
             kind = 'api'
-            title = [string]$service.id
+            title = if ([string]::IsNullOrWhiteSpace([string]$service.displayName)) { [string]$service.id } else { [string]$service.displayName }
             purpose = if ([string]::IsNullOrWhiteSpace([string]$service.failureMessage)) { [string]$service.protocol } else { [string]$service.failureMessage }
             fieldIds = $ids
             relatedSkills = @($service.relatedSkills | ForEach-Object { [string]$_ })
+        })
+}
+foreach ($server in @($mcpManifest.servers | Where-Object { [string]$_.transport -eq 'streamable-http' })) {
+    $serviceSpecs.Add([pscustomobject]@{
+            id = [string]$server.id
+            kind = 'remote-mcp'
+            title = [string]$server.name
+            purpose = ([string]$server.purpose + ' ' + [string]$server.accountRequirement).Trim()
+            fieldIds = @()
+            relatedSkills = @()
+        })
+}
+foreach ($server in @($mcpManifest.servers | Where-Object { [string]$_.transport -eq 'stdio' -and [string]$_.id -ne 'feishu' })) {
+    $serviceSpecs.Add([pscustomobject]@{
+            id = [string]$server.id
+            kind = 'local-mcp'
+            title = [string]$server.name
+            purpose = [string]$server.purpose
+            fieldIds = Get-UniqueFieldIds @($server.connectionFields)
+            relatedSkills = @($server.relatedSkills | ForEach-Object { [string]$_ })
         })
 }
 
@@ -244,10 +264,26 @@ function Invoke-WizardInstall([switch]$SkipConnections) {
             }
         }
     }
+    if (@($selectedServices | Where-Object { [string]$_.id -eq 'media-generation' }).Count -gt 0) {
+        $mediaModelFieldIds = @('media-generation.image2-model','media-generation.grok-image-model','media-generation.grok-video-model','media-generation.seedance-model','media-generation.minimax-video-model')
+        $configuredMediaModelIds = @($mediaModelFieldIds | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$values[$_]) })
+        if ($configuredMediaModelIds.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show($script:Form, '统一媒体 MCP 至少需要填写一个服务方实际支持的模型名。', '请补全媒体配置', 'OK', 'Warning') | Out-Null
+            return
+        }
+        $mediaModelsNeedingAgent = @('media-generation.image2-model','media-generation.seedance-model')
+        $selectedModelsNeedingAgent = @($mediaModelsNeedingAgent | Where-Object { $_ -in $configuredMediaModelIds })
+        if ($selectedModelsNeedingAgent.Count -gt 0 -and [string]::IsNullOrWhiteSpace([string]$values['media-generation.agent-id'])) {
+            [System.Windows.Forms.MessageBox]::Show($script:Form, '使用 Image-2 或 Seedance 网关时，必须填写服务方提供的媒体路由 ID。', '请补全媒体配置', 'OK', 'Warning') | Out-Null
+            return
+        }
+    }
 
     $enabledSkills = New-Object System.Collections.Generic.List[string]
     $enabledApiServices = New-Object System.Collections.Generic.List[string]
+    $enabledRemoteMcps = New-Object System.Collections.Generic.List[string]
     $feishuEnabled = $false
+    $mediaGenerationEnabled = $false
     $feishuDomain = 'https://open.feishu.cn'
     $feishuAuthMode = 'tenant'
     foreach ($service in $script:ServiceStates.ToArray()) {
@@ -261,6 +297,8 @@ function Invoke-WizardInstall([switch]$SkipConnections) {
             if (-not $enabledSkills.Contains([string]$skill)) { $enabledSkills.Add([string]$skill) }
         }
         if ($service.kind -eq 'api') { $enabledApiServices.Add([string]$service.id) }
+        if ($service.kind -eq 'remote-mcp') { $enabledRemoteMcps.Add([string]$service.id) }
+        if ($service.id -eq 'media-generation') { $mediaGenerationEnabled = $true }
         if ($service.id -eq 'feishu') {
             $feishuEnabled = $true
             $feishuDomain = [string]$values['feishu.base-url']
@@ -288,8 +326,10 @@ function Invoke-WizardInstall([switch]$SkipConnections) {
         # wrapper reject the call before the real installer starts.
         $installArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', $installScript, '-FeishuAuthMode', $feishuAuthMode, '-FeishuDomain', $feishuDomain)
         if ($feishuEnabled) { $installArgs += '-EnableFeishu' } else { $installArgs += '-DisableFeishu' }
+        if ($mediaGenerationEnabled) { $installArgs += '-EnableMediaGeneration' }
         if ($enabledSkills.Count -gt 0) { $installArgs += '-EnableSkills'; $installArgs += @($enabledSkills.ToArray()) }
         if ($enabledApiServices.Count -gt 0) { $installArgs += '-EnabledApiServices'; $installArgs += @($enabledApiServices.ToArray()) }
+        if ($enabledRemoteMcps.Count -gt 0) { $installArgs += '-EnabledRemoteMcps'; $installArgs += @($enabledRemoteMcps.ToArray()) }
         $output = @(& powershell.exe @installArgs 2>&1)
         foreach ($line in $output) { Write-WizardStatus ([string]$line) }
         if ($LASTEXITCODE -ne 0) { throw "安装失败，退出码 $LASTEXITCODE。" }
@@ -334,7 +374,7 @@ $intro.Width = 1050
 $intro.Height = 76
 $intro.AutoSize = $false
 $intro.Font = New-Object -TypeName System.Drawing.Font -ArgumentList ('Microsoft YaHei UI', 10)
-$intro.Text = '本向导会安装全部 50 个 Skills、7 个 Agents、Python/Node/Feishu 运行时和本地 MCP 包。外部连接全部默认关闭；不勾选或不填写就跳过。敏感值只写入当前 Windows 用户环境变量，不写入安装包、Codex TOML、日志或 readiness。'
+$intro.Text = '本向导会安装全部 Skills、7 个 Agents、Python/Node 运行时、Feishu 与统一媒体本地 MCP。外部连接默认关闭；不勾选或不填写就跳过。敏感值只写入当前 Windows 用户环境变量，不写入安装包、Codex TOML、日志或 readiness。'
 $scroll.Controls.Add($intro)
 
 $inventory = New-Object System.Windows.Forms.Label

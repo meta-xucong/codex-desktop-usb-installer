@@ -1,0 +1,32 @@
+# Caddy
+# terminates HTTPS and obtains/renews the certificate. The fallback is 404.
+license.404token.xyz {
+	@license_check {
+		method POST
+		path /v1/licenses/check
+	}
+	@license_register {
+		method POST
+		path /v1/licenses/register
+	}
+	@health {
+		method GET
+		path /healthz
+	}
+	@admin path /admin /admin/*
+	handle @license_check {
+		reverse_proxy 127.0.0.1:8787
+	}
+	handle @license_register {
+		reverse_proxy 127.0.0.1:8787
+	}
+	handle @health {
+		reverse_proxy 127.0.0.1:8787
+	}
+	handle @admin {
+		reverse_proxy 127.0.0.1:8787
+	}
+	handle {
+		respond "Not Found" 404
+	}
+}

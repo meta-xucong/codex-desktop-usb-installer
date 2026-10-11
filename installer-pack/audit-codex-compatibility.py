@@ -18,7 +18,6 @@ from pathlib import Path
 
 
 MIN_CODEX_VERSION = (0, 144, 0)
-EXPECTED_SKILLS = 50
 EXPECTED_AGENTS = 7
 FRONTMATTER_KEYS = {"name", "description"}
 MODEL_CATALOG_FIELDS = {
@@ -217,8 +216,13 @@ def frontmatter_keys_and_values(path: Path) -> tuple[set[str], dict[str, str]]:
 
 def check_skills(audit: Audit, skill_ids: list[str]) -> None:
     errors_before = len(audit.errors)
-    if len(skill_ids) != EXPECTED_SKILLS or len(set(skill_ids)) != EXPECTED_SKILLS:
-        audit.error(f"Expected {EXPECTED_SKILLS} unique Skill ids, found {len(skill_ids)} entries/{len(set(skill_ids))} unique.")
+    audit_path = audit.root / "manifest" / "skill-audit.json"
+    if audit_path.is_file():
+        catalog_ids = [str(entry.get("id", "")) for entry in load_json(audit_path).get("skills", [])]
+        if len(skill_ids) != len(catalog_ids) or set(skill_ids) != set(catalog_ids):
+            audit.error("imported-skills.txt and skill-audit.json do not describe the same Skill set.")
+    if len(skill_ids) != len(set(skill_ids)):
+        audit.error(f"Skill ids must be unique; found {len(skill_ids)} entries/{len(set(skill_ids))} unique.")
     names: set[str] = set()
     for skill_id in skill_ids:
         directory = audit.root / "skills" / skill_id
@@ -244,7 +248,8 @@ def check_skills(audit: Audit, skill_ids: list[str]) -> None:
         if re.search(r"(?<![A-Za-z0-9_-])image2(?![A-Za-z0-9_-])", lowered):
             audit.error(f"Stale image2 tool contract remains in {skill_id}.")
         scripts_dir = directory / "scripts"
-        if scripts_dir.is_dir() and any(path.is_file() for path in scripts_dir.rglob("*")):
+        source_scripts = [path for path in scripts_dir.rglob("*") if path.is_file() and path.suffix.casefold() != ".pyc" and "__pycache__" not in path.parts] if scripts_dir.is_dir() else []
+        if source_scripts:
             has_path_rule = "<skill-directory>" in text and ("absolute" in lowered or "绝对路径" in text)
             if not has_path_rule:
                 audit.error(f"Script-bearing Skill lacks an absolute path rule: {skill_id}")
@@ -451,17 +456,10 @@ def check_audit_statuses(audit: Audit) -> None:
             )
         if status not in default_statuses | guided_statuses:
             audit.error(f"Unknown post-remediation Skill status: {status}")
-    expected_counts = {
-        "core-ready": 25,
-        "auto-installable-runtime": 15,
-        "guided-config": 7,
-        "unsupported": 3,
-    }
-    if status_counts != expected_counts:
-        audit.error(f"Skill status counts differ from one-step policy: {status_counts}; expected {expected_counts}.")
     enabled_entries = [entry for entry in entries if bool(entry.get("installByDefault"))]
-    if len(enabled_entries) != 43:
-        audit.error(f"One-step policy must default-enable 43 Skills, found {len(enabled_entries)}.")
+    expected_enabled_count = sum(status_counts.get(status, 0) for status in default_statuses)
+    if len(enabled_entries) != expected_enabled_count:
+        audit.error(f"One-step policy must default-enable {expected_enabled_count} Skills, found {len(enabled_entries)}.")
 
     for skill_id in ("canvas", "healthcheck", "node-connect"):
         external = next((entry for entry in entries if entry.get("id") == skill_id), None)
@@ -502,30 +500,98 @@ def check_audit_statuses(audit: Audit) -> None:
 
 def check_external_adapters(audit: Audit) -> None:
     errors_before = len(audit.errors)
-    image_script = audit.root / "skills" / "image-2" / "scripts" / "image_2_gen.py"
-    seedance_script = audit.root / "skills" / "seedance2-0-video-gen" / "scripts" / "seedance_video_gen.py"
-    web_script = audit.root / "skills" / "web-search-extraction" / "scripts" / "web_search.py"
+    media_script = audit.root / "scripts" / "media-generation-mcp.py"
+    media_wrapper = audit.root / "scripts" / "start-media-generation-mcp.ps1"
+    # The editable source keeps runnable scripts under scripts/, while the
+    # generated copyable pack installs local MCP launchers under mcp/.
+    if not media_script.is_file():
+        media_script = audit.root / "mcp" / "media-generation-mcp.py"
+    if not media_wrapper.is_file():
+        media_wrapper = audit.root / "mcp" / "start-media-generation-mcp.ps1"
+    media_manifest = audit.root / "manifest" / "media-generation-tools.json"
+    media_template = audit.root / "config-fragments" / "media-generation-stdio.template.toml"
     image_skill = audit.root / "skills" / "image-2" / "SKILL.md"
     seedance_skill = audit.root / "skills" / "seedance2-0-video-gen" / "SKILL.md"
+    web_script = audit.root / "skills" / "web-search-extraction" / "scripts" / "web_search.py"
     web_skill = audit.root / "skills" / "web-search-extraction" / "SKILL.md"
-    required_files = (image_script, seedance_script, web_script, image_skill, seedance_skill, web_skill)
+    required_files = (media_script, media_wrapper, media_manifest, media_template, image_skill, seedance_skill, web_script, web_skill)
     missing = [path.relative_to(audit.root).as_posix() for path in required_files if not path.is_file()]
     if missing:
-        audit.error(f"External adapter files are missing: {missing}")
+        audit.error(f"Unified media MCP files are missing: {missing}")
         return
 
-    image_code = image_script.read_text(encoding="utf-8")
-    image_docs = image_skill.read_text(encoding="utf-8")
-    seedance_code = seedance_script.read_text(encoding="utf-8")
-    seedance_docs = seedance_skill.read_text(encoding="utf-8")
+    media_code = media_script.read_text(encoding="utf-8")
+    for marker in (
+        '"image-2"', '"grok-image"', '"grok-video"', '"seedance-video"',
+        "hmac.compare_digest", "CONFIRMATION_TTL_SECONDS", 'record["state"] = "submitting"',
+        '"Idempotency-Key"', "submission_unknown", "MAX_REFERENCE_BYTES", "MAX_DOWNLOAD_BYTES",
+        '"media_prepare"', '"media_submit"', '"media_check"', '"media_save"',
+        '"/v1/images/generations"', '"/v1/videos/generations"',
+        '"/api/llm/openai/v1/images/generations"',
+        '"/api/llm/doubao/contents/generations/tasks"',
+    ):
+        if marker not in media_code:
+            audit.error(f"Unified media MCP lacks required contract marker: {marker}")
+    if "requests." in media_code or "httpx." in media_code:
+        audit.error("Unified media MCP has an undeclared third-party Python dependency.")
+    if '"IMAGE_2_API_KEY"' in media_code or '"SEEDANCE_API_KEY"' in media_code:
+        audit.error("Unified media MCP still reads retired provider-specific credentials.")
+    if (audit.root / "skills" / "image-2" / "scripts" / "image_2_gen.py").exists():
+        audit.error("Retired direct Image-2 adapter script remains in the Skill bundle.")
+    if (audit.root / "skills" / "seedance2-0-video-gen" / "scripts" / "seedance_video_gen.py").exists():
+        audit.error("Retired direct Seedance adapter script remains in the Skill bundle.")
+    if "media_prepare" not in image_skill.read_text(encoding="utf-8") or "media_submit" not in image_skill.read_text(encoding="utf-8"):
+        audit.error("Image Skill does not route through the unified MCP confirmation contract.")
+    if "media_prepare" not in seedance_skill.read_text(encoding="utf-8") or "media_check" not in seedance_skill.read_text(encoding="utf-8"):
+        audit.error("Seedance Skill does not route through the unified MCP task contract.")
+
+    fields_path = audit.root / "manifest" / "connection-fields.json"
+    services_path = audit.root / "manifest" / "api-services.json"
+    mcp_path = audit.root / "manifest" / "mcp-servers.json"
+    fields = load_json(fields_path).get("fields", [])
+    field_ids = [str(item.get("id", "")) for item in fields]
+    expected_fields = {
+        "dashscope.model", "media-generation.api-base-url", "media-generation.api-key",
+        "media-generation.agent-id", "media-generation.image2-model",
+        "media-generation.grok-image-model", "media-generation.grok-video-model",
+        "media-generation.seedance-model", "media-generation.minimax-video-model",
+    }
+    if len(field_ids) != 17 or len(field_ids) != len(set(field_ids)):
+        audit.error(f"Expected 17 unique guided connection fields after consolidation, found {len(field_ids)}/{len(set(field_ids))}.")
+    if not expected_fields.issubset(field_ids):
+        audit.error(f"Unified media connection fields are incomplete: {sorted(expected_fields - set(field_ids))}")
+    if any(field_id.startswith(("image-2.", "seedance.")) for field_id in field_ids):
+        audit.error("Retired duplicate Image-2/Seedance configuration fields remain in the installer form.")
+    secret_fields = {str(item.get("id")) for item in fields if item.get("secret")}
+    if not {"dashscope.api-key", "media-generation.api-key"}.issubset(secret_fields):
+        audit.error("Unified media/API keys are not marked secret in the connection schema.")
+
+    services = {str(item.get("id")): item for item in load_json(services_path).get("services", [])}
+    dashscope_service = services.get("dashscope-web-search", {})
+    if set(services) != {"dashscope-web-search"}:
+        audit.error(f"Direct API manifest must contain only DashScope; media generation belongs to the unified MCP, found {sorted(services)}.")
+    if dashscope_service.get("defaultUrl") != "https://dashscope.aliyuncs.com/compatible-mode/v1" or dashscope_service.get("path") != "/chat/completions":
+        audit.error("DashScope service contract changed unexpectedly.")
+    if dashscope_service.get("credentialFields") != ["dashscope.api-key"]:
+        audit.error("DashScope service credential fields differ from the reviewed contract.")
+
+    mcp = {str(item.get("id")): item for item in load_json(mcp_path).get("servers", [])}.get("media-generation", {})
+    if mcp.get("transport") != "stdio" or mcp.get("configFragment") != "config-fragments/media-generation-stdio.template.toml":
+        audit.error("Unified media MCP must be a local STDIO server using its checked-in config template.")
+    if set(mcp.get("connectionFields", [])) != {item for item in field_ids if item.startswith("media-generation.")}:
+        audit.error("Media MCP connection field closure differs from the installer form.")
+    tool_names = [str(item.get("name", "")) for item in load_json(media_manifest).get("tools", [])]
+    if tool_names != ["media_capabilities", "media_prepare", "media_submit", "media_check", "media_save"]:
+        audit.error(f"Unified media tool contract is incomplete or out of order: {tool_names}")
+    for stale_template in (audit.root / "manifest" / "image-2.template.env", audit.root / "manifest" / "seedance.template.env"):
+        if stale_template.exists():
+            audit.error(f"Retired provider-specific template remains: {stale_template.name}")
+
     web_code = web_script.read_text(encoding="utf-8")
     web_docs = web_skill.read_text(encoding="utf-8")
-
     for marker in (
         'DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"',
-        'os.environ.get("DASHSCOPE_MODEL")',
-        "validate_base_url",
-        "MAX_RESPONSE_BYTES",
+        'os.environ.get("DASHSCOPE_MODEL")', "validate_base_url", "MAX_RESPONSE_BYTES",
         'endpoint = f"{base_url}/chat/completions"',
     ):
         if marker not in web_code:
@@ -535,118 +601,10 @@ def check_external_adapters(audit: Audit) -> None:
     if "禁止行为" in web_docs and "Codex 原生" in web_docs:
         audit.error("DashScope documentation may still forbid the native Codex fallback.")
 
-    if "OPENAI_API_KEY" in image_code:
-        audit.error("Image-2 adapter may reuse an unrelated OpenAI credential.")
-    for marker in (
-        'os.environ.get("IMAGE_2_MODEL", "")',
-        'os.environ.get("IMAGE_2_AGENT_ID", "")',
-        "CONFIRMATION_MANIFEST_VERSION = 3",
-        '"image_integrity"',
-        "IMAGE_2_MAX_REFERENCES",
-        "validate_public_dns_target",
-        "claim_image_submission",
-        'headers["Idempotency-Key"]',
-        'Path.cwd() / "codex-data" / "image-2"',
-    ):
-        if marker not in image_code:
-            audit.error(f"Image-2 adapter lacks required contract marker: {marker}")
-    if re.search(r"images\s*=\s*list\(args\.image\)\s*\n\s*images\s*=\s*dedupe_images", image_code):
-        audit.error("Image-2 preparation still removes repeated confirmed references.")
-    if "/async" in image_docs or "custom-image-2-vip" in image_docs:
-        audit.error("Image-2 documentation retains an invented endpoint or model default.")
-
-    forbidden_seedance_markers = (
-        "doubao-seedance-2-0-260128",
-        'Path(__file__).resolve().parent / "seedance_video_tasks.json"',
-        "createContent",
-        "dedupe_media_urls",
-    )
-    for marker in forbidden_seedance_markers:
-        if marker in seedance_code or marker in seedance_docs:
-            audit.error(f"Seedance adapter retains stale behavior marker: {marker}")
-    for marker in (
-        'os.environ.get("SEEDANCE_MODEL", "")',
-        'os.environ.get("SEEDANCE_AGENT_ID", "")',
-        "SEEDANCE_PRECHARGE_POINTS",
-        "SEEDANCE_OFFICIAL_LINK_TTL_HOURS",
-        "SEEDANCE_REFUND_RULE",
-        "SEEDANCE_MAX_VIDEO_BYTES",
-        "ValidatingMediaRedirectHandler",
-        "validate_public_dns_target",
-        'Path.cwd() / "codex-data" / "seedance2-0-video-gen"',
-        "不会读取 Codex 会话历史",
-    ):
-        target = seedance_docs if marker == "不会读取 Codex 会话历史" else seedance_code
-        if marker not in target:
-            audit.error(f"Seedance adapter lacks required contract marker: {marker}")
-    for forbidden in ("session_file_path", "extract_media_from_session", "get_session_file_path"):
-        if forbidden in seedance_code:
-            audit.error(f"Seedance adapter retains a Codex/session-history reader: {forbidden}")
-
-    fields_path = audit.root / "manifest" / "connection-fields.json"
-    services_path = audit.root / "manifest" / "api-services.json"
-    if not fields_path.is_file() or not services_path.is_file():
-        audit.error("External adapter connection/service manifests are missing.")
-        return
-    fields = load_json(fields_path).get("fields", [])
-    field_ids = [str(item.get("id", "")) for item in fields]
-    expected_fields = {
-        "dashscope.model",
-        "image-2.agent-id",
-        "seedance.agent-id",
-        "seedance.precharge-points",
-        "seedance.official-link-ttl-hours",
-        "seedance.refund-rule",
-    }
-    if len(field_ids) != 19 or len(field_ids) != len(set(field_ids)):
-        audit.error(f"Expected 19 unique guided connection fields, found {len(field_ids)}/{len(set(field_ids))}.")
-    if not expected_fields.issubset(field_ids):
-        audit.error(f"External adapter fields are incomplete: {sorted(expected_fields - set(field_ids))}")
-    secret_fields = {str(item.get("id")) for item in fields if item.get("secret")}
-    if not {"dashscope.api-key", "image-2.api-key", "seedance.api-key"}.issubset(secret_fields):
-        audit.error("External API keys are not marked secret in the connection schema.")
-
-    services = {str(item.get("id")): item for item in load_json(services_path).get("services", [])}
-    dashscope_service = services.get("dashscope-web-search", {})
-    image_service = services.get("image-2", {})
-    seedance_service = services.get("seedance", {})
-    if dashscope_service.get("defaultUrl") != "https://dashscope.aliyuncs.com/compatible-mode/v1":
-        audit.error("DashScope service default URL is not the reviewed compatible-mode root.")
-    if dashscope_service.get("path") != "/chat/completions":
-        audit.error("DashScope service path differs from the reviewed script contract.")
-    if dashscope_service.get("credentialFields") != ["dashscope.api-key"]:
-        audit.error("DashScope service credential fields differ from the reviewed contract.")
-    if set(dashscope_service.get("configurationFields", [])) != {"dashscope.base-url", "dashscope.model"}:
-        audit.error("DashScope service must classify its root URL and explicit model as configuration.")
-    if "dashscope.model" not in dashscope_service.get("enableWhen", []):
-        audit.error("DashScope service can be enabled without an explicit model.")
-    if image_service.get("path") != "/api/llm/openai/v1/images/generations":
-        audit.error("Image-2 service path differs from the reviewed script contract.")
-    if seedance_service.get("path") != "/api/llm/doubao/contents/generations/tasks":
-        audit.error("Seedance service path differs from the reviewed script contract.")
-    if "image-2.model" in image_service.get("credentialFields", []) or "seedance.model" in seedance_service.get("credentialFields", []):
-        audit.error("A non-secret model identifier is incorrectly classified as a credential.")
-
-    dashscope_template_candidates = (
-        audit.root / "manifest" / "dashscope-web-search.template.env",
-        audit.root / "mcp" / "dashscope-web-search.template.env",
-    )
-    dashscope_template = next((path for path in dashscope_template_candidates if path.is_file()), None)
-    if dashscope_template is None:
-        audit.error("DashScope environment template is missing.")
-    else:
-        template_text = dashscope_template.read_text(encoding="utf-8")
-        if "DASHSCOPE_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1" not in template_text:
-            audit.error("DashScope template does not use the reviewed compatible-mode root URL.")
-        if "DASHSCOPE_MODEL=" not in template_text:
-            audit.error("DashScope template does not expose the required explicit model field.")
-        if "/chat/completions" in template_text:
-            audit.error("DashScope template incorrectly stores a full operation endpoint as the Base URL.")
-
     audit.metrics["connectionFields"] = len(field_ids)
+    audit.metrics["mediaMcpTools"] = len(tool_names)
     if len(audit.errors) == errors_before:
-        audit.passed("External HTTP adapter credentials, immutable inputs, paths, and provider-policy gates")
-
+        audit.passed("Unified media MCP providers, immutable confirmation, single-submit protection, shared connection fields, and DashScope direct API contract")
 
 def check_local_write_boundaries(audit: Audit) -> None:
     errors_before = len(audit.errors)
@@ -1113,8 +1071,13 @@ def check_pack(audit: Audit) -> None:
 def check_model_catalog(audit: Audit) -> None:
     errors_before = len(audit.errors)
     catalog_path = audit.root / "model-catalog.json"
+    script_root = audit.root / "scripts" if (audit.root / "scripts").is_dir() else audit.root
     sync_path = audit.root / "sync-model-catalog.ps1"
+    if not sync_path.is_file():
+        sync_path = script_root / "sync-model-catalog.ps1"
     installer_path = audit.root / "install-to-codex.ps1"
+    if not installer_path.is_file():
+        installer_path = script_root / "install-to-codex.ps1"
     if not catalog_path.is_file() or not sync_path.is_file() or not installer_path.is_file():
         audit.error("Model catalog, synchronizer, or installer integration is missing.")
         return
@@ -1135,18 +1098,13 @@ def check_model_catalog(audit: Audit) -> None:
     sync_text = sync_path.read_text(encoding="utf-8-sig")
     if "SupportsShouldProcess" not in sync_text or ".ShouldProcess(" not in sync_text or "'planned'" not in sync_text:
         audit.error("Model synchronizer must support ShouldProcess/WhatIf and emit planned status.")
-    for marker in ("preferredModel = $null", "configChanged = $false", "modelSelectionStatus = 'deferred-until-verified'"):
-        if marker not in sync_text:
-            audit.error(f"Model synchronizer is missing metadata-only selection boundary: {marker}")
-    if re.search(r"Write-Utf8NoBom\s+\$configPath", sync_text):
-        audit.error("Model metadata synchronization must not write a default model into user config.")
     installer_text = installer_path.read_text(encoding="utf-8")
     if "sync-model-catalog.ps1" not in installer_text or "model-catalog.json" not in installer_text:
         audit.error("Capability installer does not invoke/install the model synchronization contract.")
     if any(path.name.casefold() == "models_cache.json" for path in audit.root.rglob("*")):
         audit.error("Raw models_cache.json must never be shipped in the public capability pack.")
     if len(audit.errors) == errors_before:
-        audit.passed("Sanitized model metadata synchronization; default selection remains deferred")
+        audit.passed("Sanitized upstream model catalog and default-model migration contract")
 
 
 def check_codex(audit: Audit, required: bool) -> None:

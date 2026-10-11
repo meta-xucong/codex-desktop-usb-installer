@@ -5,32 +5,32 @@
 
 ## 模型目录与默认模型
 
-能力包安装只校验并同步包内脱敏的 `model-catalog.json` 元数据，不创建或迁移 Codex 默认模型，也不修改已有模型选择。模型目录和上游可用性检查不是安装、启动 Codex 或 CCSwitch 切换 Provider 的门槛。U 盘管理器中的上游模型探测属于高级可选诊断：只读显示探测结果，不应用模型、不改写配置；完整矩阵可能产生上游请求并消耗额度，运行前需单独确认。目录不包含用户的 `models_cache.json`、会话、账号、API Key 或服务端隐藏运行指令。
+安装器会校验并安装包内脱敏的 `model-catalog.json`，并在用户没有默认模型或默认模型已停用时，将 Codex 默认模型迁移到目录中的 `gpt-6-astra`。目录只包含模型元数据，不包含用户的 `models_cache.json`、会话、账号、API Key 或服务端隐藏运行指令。
 
 模型目录是离线快照。Codex 联网后仍按官方协议刷新自己的运行时模型缓存；发布新能力包时更新快照即可跟随上游。网络不可用时，安装器可以保证默认策略和目录状态，但不能替代官方账号授权或服务端模型可用性。
 
 ## 包里有什么
 
 - `agents/`：7 个按功能命名的 Codex Agent TOML。
-- `skills/`：50 个独立 Skill；非核心 Skill 额外带 `agents/openai.yaml`，默认关闭隐式调用，避免缺依赖时误触发。
-- `manifest/`：50 个 Skill 的逐项审计、7 个 Agent 的依赖闭包、运行时、MCP、API 和连接字段契约。
-- `runtime/`：Windows x64 / CPython 3.12 的直接依赖输入、完整离线 wheelhouse、Node/Feishu 介质、物化脚本和健康检查。
+- `skills/`：55 个独立 Skill；非核心 Skill 额外带 `agents/openai.yaml`，默认关闭隐式调用，避免缺依赖时误触发。
+- `manifest/`：55 个 Skill 的逐项审计、7 个 Agent 的依赖闭包、运行时、MCP、API 和连接字段契约。Node 22/FFmpeg/Manim 随包部署；HyperFrames CLI/Chrome 首装需要网络。
+- `runtime/`：Windows x64 / CPython 3.12 的直接依赖输入、完整离线 wheelhouse、Node 22、FFmpeg、Manim/Feishu 介质、物化脚本和健康检查。
 - `config-fragments/`：无密钥的 Codex MCP、Skill gating 和连接配置模板。
 - `installer-pack/`：由脚本生成、可复制到其他电脑的完整能力包。
 - `scripts/`：构建、契约审计、配置渲染、验收和安装脚本。
 - `docs/CODEX-ADAPTATION-DEVELOPMENT.md`：本轮 Codex 适配的设计、改造步骤、测试矩阵与完成标准。
 
-## 50 个 Skill 的最终状态
+## 55 个 Skill 的最终状态
 
 | 状态 | 数量 | 含义 |
 |---|---:|---|
-| `core-ready` | 25 | 复制后即可使用工作流说明和 Codex 原生能力，默认安装 |
+| `core-ready` | 29 | 复制后即可使用工作流说明和 Codex 原生能力，默认安装 |
 | `auto-installable-runtime` | 15 | 需要安装包提供的 Python 3.12、离线 wheelhouse 和本机健康检查；包含 PDF 工具 |
-| `guided-config` | 7 | 需要用户在连接向导中配置 API、MCP 或网络服务 |
+| `guided-config` | 8 | 需要用户在连接向导中配置 API、MCP 或网络服务 |
 | `unsupported` | 3 | 配置层面默认启用，但外部后端缺失时必须安全失败并明确报告 |
 
-默认脚本安装 43 个可直接使用、可自动准备运行时或可安全降级的 Skill 和 7 个 Agent；7 个 guided-config
-Skill 仍然复制到一键安装包中但保持关闭，待用户填入凭据或 MCP 配置。需要一键装入全部 50 个 Skill 时，使用安装包根目录的向导或
+默认脚本安装 47 个可直接使用、可自动准备运行时或可安全降级的 Skill 和 7 个 Agent；8 个 guided-config
+Skill 仍然复制到一键安装包中但保持关闭，待用户填入凭据或 MCP 配置。需要一键装入全部 55 个 Skill 时，使用安装包根目录的向导或
 `install-all.ps1`。
 
 ```powershell
@@ -45,13 +45,15 @@ Skill 仍然复制到一键安装包中但保持关闭，待用户填入凭据�
 
 ## 已知限制
 
-- 15 个 `auto-installable-runtime` Skill 所需的 CPython 3.12、52-wheel 离线依赖闭包、Node.js 20 和 Feishu npm
+- 18 个 `auto-installable-runtime` Skill 所需的 CPython 3.12、77-wheel 离线依赖闭包、Node.js 22、FFmpeg、隔离 Manim 环境和 Feishu npm
   closure 已进入安装包；安装器会在目标机完成哈希校验、隔离环境安装和健康检查。
-- 7 个 `guided-config` Skill 需要真实凭据、模型、端点、飞书租户权限或本地锁定 npm cache；默认不启用，本轮也没有
+- 8 个 `guided-config` Skill 需要真实凭据、模型、端点、服务账号/OAuth 权限或本地锁定 npm cache；默认不启用，本轮也没有
   使用真实租户或付费 API 做端到端调用。
+- MiniMax 视频 Skill 使用统一媒体 MCP；当前 MiniMax 模型槽位为空，只有统一上游实际开放模型后才可用，不提供官方 MiniMax API 直连。
+  Cloudflare、Figma、Linear、Notion MCP 以 Codex 原生 Streamable HTTP/OAuth 配置进入向导；连接仍需相应账号、工作区权限和 Codex OAuth 授权。
 - `canvas`、`healthcheck`、`node-connect` 3 个外部 Skill 会写入启用配置，但没有后端或权限时必须明确安全失败；
   `pdf-processing-toolkit` 已补齐自维护许可证、离线依赖和读写/提取/生成 smoke test。
-- 当前完整验收平台是 Windows x64、CPython 3.12 和 Codex CLI 0.147.0；Linux、macOS、Windows ARM64 及其他
+- 当前完整验收平台是 Windows x64、CPython 3.12 和 Codex CLI 0.157.1；Linux、macOS、Windows ARM64 及其他
   Python ABI 尚未进入发布矩阵。
 - 外部行情、基金、政策、公告和第三方网关会变化；离线契约测试不等于真实数据源、真实权限、计费和生产环境验收。
 
@@ -112,7 +114,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\scripts\install-to-codex.ps1
 ```
 
-完整一键安装（50 个 Skill、7 个 Agent、运行时、离线依赖和 Codex 配置）：
+完整一键安装（55 个 Skill、7 个 Agent、运行时、离线依赖和 Codex 配置）：
 
 ```powershell
 .\Install-Codex-Starter.cmd
@@ -122,7 +124,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 双击 `Install-Codex-Starter.cmd` 会打开 Windows 图形向导。向导根据
 [`manifest/connection-fields.json`](manifest/connection-fields.json)、[`manifest/mcp-servers.json`](manifest/mcp-servers.json)
-和 [`manifest/api-services.json`](manifest/api-services.json) 动态列出 1 个 MCP 与 3 个直连 API 的配置项，共 19 个
+和 [`manifest/api-services.json`](manifest/api-services.json) 动态列出 6 个 MCP 与 1 个直连 API 的配置项，共 17 个连接字段
 连接字段。每个外部连接默认不勾选；不填写或点击“跳过配置，直接安装”不会启用连接，但仍会把全部 Skill、Agent、运行时、
 离线依赖和 MCP 包安装到本机。需要启用某项服务时，勾选它并填写该组必填字段；密钥输入框会遮罩，非空值只写入当前 Windows
 用户环境变量，Codex 配置只保存环境变量名。留空的密钥会沿用已有的本机用户环境变量（若存在），不会在界面或日志中显示。
@@ -146,9 +148,9 @@ Skill 或全局 `AGENTS.md`。它会校验 `file-manifest.json` 与 `checksums.s
 
 ### 运行时策略
 
-需要真实 Python 功能的 Skill 使用安装包提供的 Windows x64 CPython 3.12.10 per-user 运行时和 52 个 wheel，
-默认部署到安装记录下的独立 `runtime/python-env`，不依赖系统 PATH。Node.js 20 和锁定的 Feishu npm closure
-同样从安装包离线解压。安装器会校验介质字节数、SHA-256、Python 签名、wheel lock 和导入探针；具体文件名、
+需要真实 Python 功能的 Skill 使用安装包提供的 Windows x64 CPython 3.12.10 per-user 运行时和 77 个 wheel，
+默认部署到安装记录下的独立 `runtime/python-env`，不依赖系统 PATH。Node.js 22、FFmpeg 和 Manim 环境
+同样从安装包离线部署；锁定的 Feishu npm closure 离线解压。HyperFrames CLI/Chrome 缺失时需联网初始化。安装器会校验介质字节数、SHA-256、Python 签名、wheel lock 和导入探针；具体文件名、
 签名、返回码、健康检查和回滚策略见 [`manifest/runtime-artifacts.json`](manifest/runtime-artifacts.json) 与
 [`docs/FULL-BUNDLE-ONE-CLICK-DEVELOPMENT.md`](docs/FULL-BUNDLE-ONE-CLICK-DEVELOPMENT.md)。
 
@@ -156,16 +158,12 @@ Skill 或全局 `AGENTS.md`。它会校验 `file-manifest.json` 与 `checksums.s
 
 三类内容分开管理：
 
-- MCP：当前只登记一个需向导配置的 `feishu` 服务，见 [`manifest/mcp-servers.json`](manifest/mcp-servers.json)。安装包携带已锁定的离线 npm closure 和本机 wrapper；wrapper 只执行包内的 `lark-mcp`，不调用 `npx` 或联网下载。
-- 直连 API：DashScope 网页搜索、图像服务、视频服务，见 [`manifest/api-services.json`](manifest/api-services.json)。DashScope 只接受 `compatible-mode/v1` 根地址，并要求显式填写当前可用的联网搜索模型；脚本自行拼接 `/chat/completions`，不保留猜测模型。
+- MCP：登记 Feishu/Lark、统一媒体生成 2 个本地 STDIO 服务及 Cloudflare、Figma、Linear、Notion 4 个 Streamable HTTP OAuth 服务，见 [`manifest/mcp-servers.json`](manifest/mcp-servers.json)。远程 MCP 由向导可选写入 Codex 配置，授权由 Codex 与各服务完成；本地 Feishu 使用已锁定的离线 npm closure 和 wrapper。
+- 直连 API：仅 DashScope 网页搜索，见 [`manifest/api-services.json`](manifest/api-services.json)。Image-2、Grok 图片/视频、Seedance 视频和预留的 MiniMax 视频模型槽位统一经本地 `media_generation` MCP 调用。
 - 连接字段：统一的密钥、端点、认证方式、校验和能力映射，见 [`manifest/connection-fields.json`](manifest/connection-fields.json)。
   图形向导按这些清单生成表单，不在脚本中另维护一套凭据字段；所有外部连接都是显式选择后才启用。
 
-Image-2 和 Seedance 都是用户明确选择后才启用的外部兼容网关，不是 Codex 原生能力。两者要求专用 API Key、
-根级 HTTPS 地址、实际模型和服务方给出的外部路由 ID；不得把 Codex 任务 ID 猜作 `agent-id`。Image-2 会锁定
-本地参考图哈希并限制远程下载地址/大小；Seedance 还要求显式配置当前预扣积分、返还规则和官方链接有效期，
-不再内置 `20000`、`24 小时` 等未经端点证明的值。任务数据默认进入项目 `codex-data/`，不写入 Skill 安装目录。
-
+统一媒体 MCP 包含 Image-2、Grok 图片/视频、Seedance 视频，以及待上游开放后使用的 MiniMax 视频 provider。安装时只配置一组媒体 API Base URL/Key，可按需填写各 provider 模型名；MiniMax 模型槽位当前留空，并仅接受统一上游的 Wokey 兼容路由，不访问 MiniMax 官方 API，也不会回退到其他模型。Image-2/Seedance 的部分旧网关还需路由 ID。MCP 使用本地 Python 3.12 标准库，无额外第三方运行时。它不会猜价格、退款、账户余额或模型名；计费调用必须走准备清单、明确确认、单次提交和原任务查询，未知提交状态不会重试。Seedance 参考媒体目前使用服务端可访问的 HTTPS URL。
 模板在 `config-fragments/` 中，默认保持禁用。可先生成待人工合并的无密钥片段：
 
 ```powershell
@@ -195,9 +193,9 @@ python .\scripts\audit-codex-compatibility.py --root . --require-codex
 `scripts/verify-package.ps1` 可在没有 Python 的 Windows 机器上先完成包闭包与哈希校验；开发机若有
 Python，还会自动运行完整兼容性审计。安装器只消费已通过这些门禁的生成包，不把校验脚本当成用户运行时依赖。
 
-验收会检查 50 个 Skill、7 个 Agent、当前 Codex 版本、依赖闭包、非核心 Skill 的显式门控、
+验收会检查 55 个 Skill、7 个 Agent、当前 Codex 版本、依赖闭包、非核心 Skill 的显式门控、
 运行时/MCP/API 清单、PowerShell/Python/TOML 语法、哈希、路径安全、旧工具名和疑似密钥；还会执行飞书
- wrapper 脱敏 dry-run、配置渲染、DashScope/Image-2/Seedance 与高时效金融脚本的无网络契约回归、网页抓取帮助入口、天气/复盘/公众号草稿写入边界/技能搜索/运行时探测，以及临时用户目录中的
+ wrapper 脱敏 dry-run、统一媒体 MCP 配置渲染与离线协议/本地 mock 验收、DashScope 与高时效金融脚本的无网络契约回归、网页抓取帮助入口、天气/复盘/公众号草稿写入边界/技能搜索/运行时探测，以及临时用户目录中的
 隔离安装 smoke test。完整实施依据见 [`docs/CODEX-ADAPTATION-DEVELOPMENT.md`](docs/CODEX-ADAPTATION-DEVELOPMENT.md)，
 合并后 provenance 与公共许可隔离整改见 [`docs/POST-MERGE-CORRECTIVE-DEVELOPMENT.md`](docs/POST-MERGE-CORRECTIVE-DEVELOPMENT.md)。
 
@@ -208,3 +206,7 @@ Python，还会自动运行完整兼容性审计。安装器只消费已通过�
 
 公开仓库不包含 API Key、Token、Cookie、`.env` 实值、私有 MCP 配置、会话历史、记忆数据库、日志、缓存、
 个人草稿或生成结果。外部服务必须通过本机环境变量或私有密钥管理服务配置，并在执行前确认权限、费用和数据范围。
+
+### 预留 MiniMax 模型槽位与可选远程 MCP
+
+能力包保留 MiniMax 视频工作流 Skill，但请求只经统一媒体 MCP，并与 Image-2、Grok、Seedance 共用端点和 API Key。当前没有配置 MiniMax 模型；只有统一上游开放模型并由用户填写模型名后才会启用，不存在官方 API 直连。远程 MCP 需相应服务账号/工作区权限并由 Codex 完成 OAuth。

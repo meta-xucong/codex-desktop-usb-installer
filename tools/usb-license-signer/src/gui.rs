@@ -41,10 +41,11 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetWindowTextLengthW, GetWindowTextW, LoadCursorW, MessageBoxW, PostMessageW, PostQuitMessage,
     RegisterClassW, SendMessageW, SetForegroundWindow, ShowWindow, TranslateMessage,
     CBS_DROPDOWNLIST, CBS_HASSTRINGS, CB_ADDSTRING, CB_RESETCONTENT, CB_SETCURSEL, CW_USEDEFAULT,
-    ES_AUTOVSCROLL, ES_LEFT, ES_MULTILINE, ES_PASSWORD, ES_READONLY, HMENU, IDC_ARROW,
-    MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, WM_APP, WM_CLOSE, WM_COMMAND,
-    WM_CREATE, WM_DESTROY, WM_SETFONT, WM_SIZE, WNDCLASSW, WS_BORDER, WS_CHILD, WS_CLIPCHILDREN,
-    WS_EX_CLIENTEDGE, WS_HSCROLL, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    ES_AUTOVSCROLL, ES_LEFT, ES_MULTILINE, ES_PASSWORD, ES_READONLY, HMENU, IDC_ARROW, IDOK,
+    MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_OKCANCEL, WM_APP, WM_CLOSE,
+    WM_COMMAND, WM_CREATE, WM_DESTROY, WM_SETFONT, WM_SIZE, WNDCLASSW, WS_BORDER, WS_CHILD,
+    WS_CLIPCHILDREN, WS_EX_CLIENTEDGE, WS_HSCROLL, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
+    WS_VSCROLL,
 };
 use zeroize::Zeroizing;
 
@@ -59,6 +60,7 @@ const ID_EMAIL_DOMAIN: i32 = 1013;
 const ID_PRELOAD: i32 = 1014;
 const ID_RETRY_PRELOAD: i32 = 1015;
 const ID_ACCOUNT_PASSWORD: i32 = 1016;
+const ID_REGISTER: i32 = 1017;
 
 const WM_APP_WORK_COMPLETE: u32 = WM_APP + 41;
 const WM_APP_REFRESH_CONTROLS: u32 = WM_APP + 42;
@@ -109,11 +111,21 @@ struct RetryPreloadRequest {
     license_digest: String,
 }
 
+struct RegisterRequest {
+    drive: String,
+    relative: String,
+    portable_vault: String,
+    password: Zeroizing<String>,
+    confirm: String,
+    report_path: String,
+}
+
 #[derive(Debug)]
 enum WorkerEvent {
     Scan(Result<Vec<GuiCandidate>, String>),
     Inspect { index: usize, result: InspectView },
     ProvisionSign(Box<ProvisionSignOutcome>),
+    Register(Result<Value, String>),
     RetryPreload(Result<sub2api::RetryPreloadResult, String>),
 }
 
@@ -123,7 +135,7 @@ struct GuiState {
     targets: HwndValue,
     refresh: HwndValue,
     provision_sign: HwndValue,
-    base_url: HwndValue,
+    register: HwndValue,
     admin_key: HwndValue,
     email_domain: HwndValue,
     preload: HwndValue,
@@ -150,7 +162,7 @@ impl GuiState {
             targets: 0,
             refresh: 0,
             provision_sign: 0,
-            base_url: 0,
+            register: 0,
             admin_key: 0,
             email_domain: 0,
             preload: 0,
@@ -445,20 +457,20 @@ unsafe fn create_controls(hwnd: HWND) {
         22,
         0,
     );
-    create_label(hwnd, instance, "API 地址", 20, 330, 90, 22, 0);
-    let base_url = hwnd_value(create_control(
+    create_label(hwnd, instance, "API 地址（固定）", 20, 330, 90, 22, 0);
+    create_control(
         hwnd,
         instance,
         "EDIT",
-        &config.base_url,
-        WS_TABSTOP | ES_LEFT as u32 | WS_BORDER,
+        sub2api::DEFAULT_BASE_URL,
+        ES_LEFT as u32 | ES_READONLY as u32 | WS_BORDER,
         WS_EX_CLIENTEDGE,
         105,
         326,
         270,
         26,
         ID_BASE_URL,
-    ));
+    );
     create_label(
         hwnd,
         instance,
@@ -585,17 +597,27 @@ unsafe fn create_controls(hwnd: HWND) {
         "注册账号并签名",
         20,
         650,
-        510,
+        300,
         38,
         ID_PROVISION_SIGN,
+    );
+    let register = create_button(
+        hwnd,
+        instance,
+        "同步/补发并激活",
+        330,
+        650,
+        205,
+        38,
+        ID_REGISTER,
     );
     let retry_preload = create_button(
         hwnd,
         instance,
         "重试预充值",
-        540,
+        545,
         650,
-        230,
+        225,
         38,
         ID_RETRY_PRELOAD,
     );
@@ -606,7 +628,7 @@ unsafe fn create_controls(hwnd: HWND) {
     state.summary = summary;
     state.status = status;
     state.provision_sign = provision_sign;
-    state.base_url = base_url;
+    state.register = register;
     state.admin_key = admin_key;
     state.email_domain = email_domain;
     state.preload = preload;
@@ -745,8 +767,8 @@ fn start_provision_sign(request: ProvisionSignRequest) {
     let report_path = request.sign.report_path.clone();
     thread::spawn(move || {
         let result = (|| {
-            let client =
-                Sub2ApiClient::new(request.config.clone()).map_err(|error| error.to_string())?;
+            let client = Sub2ApiClient::new_for_trusted_admin(request.config.clone())
+                .map_err(|error| error.to_string())?;
             // Validate the encrypted portable vault before any remote account
             // mutation. A wrong password or a damaged signer directory must
             // never create an orphan account.
@@ -785,33 +807,38 @@ fn start_provision_sign(request: ProvisionSignRequest) {
                 None
             };
             let mut preload_applied = false;
-            let preload = if sign.is_ok() && verify.as_ref().is_some_and(Result::is_ok) {
-                if sub2api::should_precharge(request.preload_amount, account.reused) {
-                    let digest = sign
-                        .as_ref()
-                        .ok()
-                        .and_then(|value| value.get("licenseDigest"))
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| "签名结果缺少许可证摘要，未执行预充值".to_string())?;
-                    let result = client
-                        .precharge_with_pending(
-                            account.binding.sub2api_user_id,
-                            request.preload_amount,
-                            digest,
-                            &account.binding.usb_asset_id,
-                        )
-                        .map(|_| ())
-                        .map_err(|error| error.to_string());
-                    if result.is_ok() {
-                        preload_applied = true;
+            let preload = maybe_precharge_after_signed_pair(
+                sign.is_ok(),
+                verify.as_ref().is_some_and(Result::is_ok),
+                sign.as_ref()
+                    .ok()
+                    .is_some_and(|value| activation_status(value) == "active"),
+                || {
+                    if sub2api::should_precharge(request.preload_amount, account.reused) {
+                        let digest = sign
+                            .as_ref()
+                            .ok()
+                            .and_then(|value| value.get("licenseDigest"))
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| "签名结果缺少许可证摘要，未执行预充值".to_string())?;
+                        let result = client
+                            .precharge_with_pending(
+                                account.binding.sub2api_user_id,
+                                request.preload_amount,
+                                digest,
+                                &account.binding.usb_asset_id,
+                            )
+                            .map(|_| ())
+                            .map_err(|error| error.to_string());
+                        if result.is_ok() {
+                            preload_applied = true;
+                        }
+                        result
+                    } else {
+                        Ok(())
                     }
-                    Some(result)
-                } else {
-                    Some(Ok(()))
-                }
-            } else {
-                None
-            };
+                },
+            );
             let recovery_cleared = if sign.is_ok() && verify.as_ref().is_some_and(Result::is_ok) {
                 client
                     .clear_provision_recovery(&request.recovery_key)
@@ -851,6 +878,19 @@ fn start_provision_sign(request: ProvisionSignRequest) {
     });
 }
 
+fn maybe_precharge_after_signed_pair<R>(
+    sign_succeeded: bool,
+    verify_succeeded: bool,
+    activation_succeeded: bool,
+    precharge: impl FnOnce() -> R,
+) -> Option<R> {
+    if sign_succeeded && verify_succeeded && activation_succeeded {
+        Some(precharge())
+    } else {
+        None
+    }
+}
+
 fn start_retry_preload(request: RetryPreloadRequest) {
     let Some((token, window)) = begin_operation("正在按原幂等记录重试预充值，请勿关闭工具…")
     else {
@@ -858,12 +898,42 @@ fn start_retry_preload(request: RetryPreloadRequest) {
     };
     thread::spawn(move || {
         let result = (|| {
-            let client = Sub2ApiClient::new(request.config).map_err(|error| error.to_string())?;
+            let client = Sub2ApiClient::new_for_trusted_admin(request.config)
+                .map_err(|error| error.to_string())?;
             client
                 .retry_pending_precharge(&request.binding, &request.license_digest)
                 .map_err(|error| error.to_string())
         })();
         publish(token, WorkerEvent::RetryPreload(result), window);
+    });
+}
+
+fn start_register(request: RegisterRequest) {
+    let Some((token, window)) = begin_operation("正在验证登记凭证并同步 VPS；请勿拔出 U 盘…")
+    else {
+        return;
+    };
+    thread::spawn(move || {
+        let arguments = [
+            "register".to_string(),
+            "--drive".to_string(),
+            request.drive,
+            "--bundle-relative-path".to_string(),
+            request.relative,
+            "--portable-vault".to_string(),
+            request.portable_vault,
+            "--confirm".to_string(),
+            request.confirm,
+            "--report".to_string(),
+            request.report_path,
+            "--skip-authenticode".to_string(),
+        ];
+        let result = run_with_portable_password(
+            arguments.into_iter().map(OsString::from),
+            request.password.as_str(),
+        )
+        .map_err(|error| error.to_string());
+        publish(token, WorkerEvent::Register(result), window);
     });
 }
 
@@ -1050,18 +1120,24 @@ unsafe fn handle_worker_event(_hwnd: HWND) {
                     &outcome.verify,
                     &outcome.preload,
                 ) {
-                    (Ok(account), Some(Ok(_sign)), Some(Ok(_verify)), Some(preload)) => {
+                    (Ok(account), Some(Ok(sign)), Some(Ok(_verify)), Some(preload)) => {
+                        let activation_text = activation_status_text(sign);
                         match preload {
                             Err(error) => {
-                                state.status_text = if outcome.recovery_cleared {
-                                    "账号和签名已完成，但预充值未确认；请勿重复点击。"
+                                state.status_text = if activation_status(sign) == "active" {
+                                    if outcome.recovery_cleared {
+                                        "签名与 VPS 激活已完成，但预充值未确认；可单独重试预充值。"
+                                    } else {
+                                        "签名与 VPS 激活已完成，但预充值未确认且恢复记录清理失败；请保留此签名器处理。"
+                                    }
                                 } else {
-                                    "账号和签名已完成，但预充值未确认；本机恢复记录清理失败，请保留此签名器处理。"
+                                    "U 盘已签名，但 VPS 激活未完成；预充值也未确认。请重试同步激活。"
                                 }
                                 .to_string();
                                 state.last_result = Some(format!(
-                                    "U盘编号：{}\n账号：{}\n用户 ID：{}\n预充值错误：{}\n报告：{}",
+                                    "U盘编号：{}\nVPS授权：{}\n账号：{}\n用户 ID：{}\n预充值错误：{}\n报告：{}",
                                     account.binding.usb_asset_id,
+                                    activation_text,
                                     account.binding.account_name,
                                     account.binding.sub2api_user_id,
                                     error,
@@ -1069,10 +1145,14 @@ unsafe fn handle_worker_event(_hwnd: HWND) {
                                 ));
                             }
                             Ok(()) => {
-                                state.status_text = if outcome.recovery_cleared {
-                                    "注册、签名和回读验证完成。"
+                                state.status_text = if activation_status(sign) == "active" {
+                                    if outcome.recovery_cleared {
+                                        "账号、签名、VPS 激活和回读验证均完成。"
+                                    } else {
+                                        "账号、签名、VPS 激活和回读验证已完成，但本机恢复记录清理失败。"
+                                    }
                                 } else {
-                                    "注册、签名和回读验证完成，但本机恢复记录清理失败。"
+                                    "账号和签名已完成，但 VPS 尚未确认激活；可点击“同步/补发并激活”重试。"
                                 }
                                 .to_string();
                                 let password_text = if account.initial_password.is_empty() {
@@ -1091,8 +1171,9 @@ unsafe fn handle_worker_event(_hwnd: HWND) {
                                     "本次未预充值"
                                 };
                                 state.last_result = Some(format!(
-                                    "U盘编号：{}\n账号：{}\n用户 ID：{}\n{}{}\n报告：{}",
+                                    "U盘编号：{}\nVPS授权：{}\n账号：{}\n用户 ID：{}\n{}{}\n报告：{}",
                                     account.binding.usb_asset_id,
+                                    activation_text,
                                     account.binding.account_name,
                                     account.binding.sub2api_user_id,
                                     preload_text,
@@ -1103,21 +1184,42 @@ unsafe fn handle_worker_event(_hwnd: HWND) {
                         }
                         inspect_after_sign = true;
                     }
-                    (Ok(account), Some(Ok(_)), Some(Err(error)), _) => {
+                    (Ok(account), Some(Ok(sign)), Some(Err(error)), _) => {
                         state.status_text = if outcome.recovery_available {
-                            "账号已创建，自动复核失败；已保留加密恢复记录，请重新扫描后继续同一账号。"
+                            if activation_status(sign) == "active" {
+                                "VPS 激活已完成，但自动复核失败；已保留恢复记录，请重新扫描后继续同一账号。"
+                            } else {
+                                "签名已写入但 VPS 激活未确认，自动复核也失败；已保留恢复记录，请重新扫描并重试同步。"
+                            }
                         } else {
-                            "账号和签名已完成，但自动复核失败；预充值未执行。"
+                            "账号和签名已完成，但自动复核失败；预充值未执行，请检查 VPS 激活状态。"
                         }
                         .to_string();
                         state.last_result = Some(format!(
-                            "U盘编号：{}\n账号：{}\n用户 ID：{}\n复核错误：{}\n报告：{}",
+                            "U盘编号：{}\nVPS授权：{}\n账号：{}\n用户 ID：{}\n复核错误：{}\n报告：{}",
                             account.binding.usb_asset_id,
+                            activation_status_text(sign),
                             account.binding.account_name,
                             account.binding.sub2api_user_id,
                             error,
                             outcome.report_path
                         ));
+                    }
+                    (Ok(account), Some(Ok(sign)), Some(Ok(_verify)), None) => {
+                        state.status_text = match activation_status(sign) {
+                            "revoked" => "VPS 已确认此授权作废；未重新激活，也未执行预充值。".to_string(),
+                            "conflict" => "VPS 中存在冲突授权；未覆盖记录，也未执行预充值。".to_string(),
+                            _ => "U 盘已签名并通过复核，但 VPS 激活未确认；未执行预充值，可重试同步。".to_string(),
+                        };
+                        state.last_result = Some(format!(
+                            "U盘编号：{}\nVPS授权：{}\n账号：{}\n用户 ID：{}\n预充值：未执行（VPS 未确认 active）\n报告：{}",
+                            account.binding.usb_asset_id,
+                            activation_status_text(sign),
+                            account.binding.account_name,
+                            account.binding.sub2api_user_id,
+                            outcome.report_path
+                        ));
+                        inspect_after_sign = true;
                     }
                     (Ok(account), Some(Err(error)), _, _) => {
                         state.status_text = if outcome.recovery_available {
@@ -1175,6 +1277,64 @@ unsafe fn handle_worker_event(_hwnd: HWND) {
                     }
                 }
             }
+            WorkerEvent::Register(result) => {
+                state.busy = false;
+                state.sign_blocked = true;
+                inspect_after_sign = true;
+                match result {
+                    Ok(value) => {
+                        let activation = value
+                            .get("activationStatus")
+                            .and_then(Value::as_str)
+                            .unwrap_or("pending");
+                        state.status_text = match activation {
+                            "active" => "VPS 已确认授权可用。许可证未改动，也未创建账号或预充值。"
+                                .to_string(),
+                            "revoked" => "VPS 中此授权已作废；同步没有将其重新激活。".to_string(),
+                            "conflict" => {
+                                "此安装编号与 VPS 现有记录冲突；没有覆盖记录。".to_string()
+                            }
+                            _ => "登记凭证已在本地验证，但 VPS 尚未确认激活；可重新扫描后重试。"
+                                .to_string(),
+                        };
+                        state.last_result = Some(format!(
+                            "VPS授权：{}\n安装编号：{}\n404token 编号：{}\n状态版本：{}\n错误：{}\n许可证摘要：{}\n登记声明摘要：{}",
+                            activation,
+                            value
+                                .get("installationId")
+                                .and_then(Value::as_str)
+                                .unwrap_or("unknown"),
+                            value
+                                .get("accountAssetId")
+                                .and_then(Value::as_str)
+                                .unwrap_or("—"),
+                            value
+                                .get("activationStateVersion")
+                                .and_then(Value::as_i64)
+                                .map(|version| version.to_string())
+                                .unwrap_or_else(|| "—".to_string()),
+                            value
+                                .get("activationError")
+                                .and_then(Value::as_str)
+                                .unwrap_or("—"),
+                            value
+                                .get("licenseDigest")
+                                .and_then(Value::as_str)
+                                .unwrap_or("unknown"),
+                            value
+                                .get("registrationDigest")
+                                .and_then(Value::as_str)
+                                .unwrap_or("unknown"),
+                        ));
+                    }
+                    Err(error) => {
+                        state.status_text =
+                            "授权同步未完成；许可证未修改，登记凭证状态请重新扫描确认后重试。"
+                                .to_string();
+                        state.last_result = Some(format!("同步错误：{error}"));
+                    }
+                }
+            }
         }
         let window_value = state.window;
         startup_log(&format!(
@@ -1219,6 +1379,9 @@ unsafe fn handle_command(hwnd: HWND, wparam: WPARAM) {
         }
         (ID_PROVISION_SIGN, windows_sys::Win32::UI::WindowsAndMessaging::BN_CLICKED) => {
             prepare_provision_sign_from_ui(hwnd);
+        }
+        (ID_REGISTER, windows_sys::Win32::UI::WindowsAndMessaging::BN_CLICKED) => {
+            prepare_register_from_ui(hwnd);
         }
         (ID_RETRY_PRELOAD, windows_sys::Win32::UI::WindowsAndMessaging::BN_CLICKED) => {
             prepare_retry_preload_from_ui();
@@ -1277,11 +1440,10 @@ fn prepare_provision_sign_from_ui(hwnd: HWND) {
             return;
         }
         let mut config = Sub2ApiConfig {
-            base_url: window_text(state.base_url),
+            base_url: sub2api::DEFAULT_BASE_URL.to_string(),
             admin_api_key: window_text(state.admin_key),
             fake_email_domain: window_text(state.email_domain),
         };
-        config.base_url = config.base_url.trim().to_string();
         config.fake_email_domain = config.fake_email_domain.trim().to_string();
         if let Err(error) = sub2api::validate_config(&config) {
             state.status_text = error.to_string();
@@ -1368,6 +1530,73 @@ fn prepare_provision_sign_from_ui(hwnd: HWND) {
         preload_amount,
         existing_binding,
         recovery_key,
+    });
+}
+
+fn prepare_register_from_ui(hwnd: HWND) {
+    let candidate = {
+        let Some(lock) = STATE.get() else { return };
+        let Ok(mut state) = lock.lock() else { return };
+        if !can_register_locked(&state) {
+            state.status_text =
+                "只有完整检查通过、签名有效且密钥匹配的 schema 3 U 盘才能同步授权。".to_string();
+            update_controls_locked(&mut state);
+            return;
+        }
+        state.candidates.first().cloned()
+    };
+    let Some(candidate) = candidate else { return };
+    let anchor = candidate.anchor_sha256.chars().take(12).collect::<String>();
+    let confirmation = format!(
+        "将验证此已签名 U 盘的登记凭证，并同步到 VPS 激活：\n盘符：{}\n卷序列号：{}\nAnchor：{}…\n\n登记凭证缺失或过旧时会自动补发，补录 404token 编号，不会重签许可证。已作废的授权不会被重新激活；不会创建账号或预充值。继续吗？",
+        candidate.drive_root, candidate.volume_serial, anchor
+    );
+    let confirmed = unsafe {
+        show_message(
+            hwnd,
+            &confirmation,
+            "确认同步授权",
+            MB_ICONWARNING | MB_OKCANCEL,
+        ) == IDOK
+    };
+    if !confirmed {
+        return;
+    }
+    let vault_path = match usb_license_signer::key_blob::default_portable_vault_path() {
+        Ok(path) => path,
+        Err(error) => {
+            set_status_text(format!("便携签名库路径准备失败：{error}"));
+            return;
+        }
+    };
+    if !vault_path.is_file() {
+        set_status_text("签名器缺少加密签名库，无法验证现有许可证；U 盘未改动。".to_string());
+        return;
+    }
+    let Some(password) = (unsafe { prompt_signing_password(hwnd, false) }) else {
+        set_status_text("已取消同步，未修改 U 盘。".to_string());
+        return;
+    };
+    if let Err(error) = usb_license_signer::key_blob::portable_password_is_valid(&password) {
+        set_status_text(format!("签名密码不符合要求：{error}"));
+        return;
+    }
+    let report_path = local_app_data()
+        .join("CodexUsbLicenseSigner")
+        .join("reports")
+        .join(format!(
+            "register-{}-{anchor}.json",
+            candidate.volume_serial
+        ))
+        .display()
+        .to_string();
+    start_register(RegisterRequest {
+        drive: candidate.drive_root,
+        relative: candidate.bundle_relative_path,
+        portable_vault: vault_path.display().to_string(),
+        password,
+        confirm: format!("REGISTER {}-{anchor}", candidate.volume_serial),
+        report_path,
     });
 }
 
@@ -1460,11 +1689,10 @@ fn prepare_retry_preload_from_ui() {
             }
         }
         let mut config = Sub2ApiConfig {
-            base_url: window_text(state.base_url),
+            base_url: sub2api::DEFAULT_BASE_URL.to_string(),
             admin_api_key: window_text(state.admin_key),
             fake_email_domain: window_text(state.email_domain),
         };
-        config.base_url = config.base_url.trim().to_string();
         config.fake_email_domain = config.fake_email_domain.trim().to_string();
         if let Err(error) = sub2api::validate_config(&config) {
             state.status_text = error.to_string();
@@ -1651,6 +1879,54 @@ fn can_provision_sign_locked(state: &GuiState) -> bool {
         && json_bool(value, &["signingReady", "ok"]) == Some(true)
 }
 
+fn can_register_locked(state: &GuiState) -> bool {
+    if state.busy || state.sign_blocked || state.candidates.len() != 1 || state.selected != Some(0)
+    {
+        return false;
+    }
+    let Some(value) = state
+        .inspection
+        .as_ref()
+        .and_then(|inspection| inspection.value.as_ref())
+    else {
+        return false;
+    };
+    let registration_state = json_string(value, &["registration", "state"]);
+    json_bool(value, &["deepVerify", "ok"]) == Some(true)
+        && json_string(value, &["license", "state"]).eq_ignore_ascii_case("signed")
+        && (registration_state.eq_ignore_ascii_case("missing")
+            || registration_state.eq_ignore_ascii_case("present"))
+        && json_bool(value, &["signing", "ok"]) == Some(true)
+        && json_bool(value, &["signingReady", "ok"]) == Some(true)
+}
+
+fn activation_status(value: &Value) -> &str {
+    value
+        .get("activationStatus")
+        .and_then(Value::as_str)
+        .unwrap_or("pending")
+}
+
+fn activation_status_text(value: &Value) -> String {
+    let version = value
+        .get("activationStateVersion")
+        .and_then(Value::as_i64)
+        .map(|version| format!("（状态版本 {version}）"))
+        .unwrap_or_default();
+    match activation_status(value) {
+        "active" => format!("已激活{version}"),
+        "revoked" => "已作废，未重新激活".to_string(),
+        "conflict" => "安装编号冲突，未覆盖".to_string(),
+        _ => format!(
+            "尚未确认激活：{}",
+            value
+                .get("activationError")
+                .and_then(Value::as_str)
+                .unwrap_or("可重试同步")
+        ),
+    }
+}
+
 fn can_retry_preload_locked(state: &GuiState) -> bool {
     if state.busy || state.candidates.len() != 1 || state.selected != Some(0) {
         return false;
@@ -1696,6 +1972,7 @@ struct ControlsSnapshot {
     targets: HwndValue,
     refresh: HwndValue,
     provision_sign: HwndValue,
+    register: HwndValue,
     retry_preload: HwndValue,
     summary: HwndValue,
     status: HwndValue,
@@ -1705,6 +1982,7 @@ struct ControlsSnapshot {
     status_text: String,
     busy: bool,
     can_provision_sign: bool,
+    can_register: bool,
     can_retry_preload: bool,
 }
 
@@ -1714,6 +1992,7 @@ fn refresh_controls() {
             targets: state.targets,
             refresh: state.refresh,
             provision_sign: state.provision_sign,
+            register: state.register,
             retry_preload: state.retry_preload,
             summary: state.summary,
             status: state.status,
@@ -1723,6 +2002,7 @@ fn refresh_controls() {
             status_text: state.status_text.clone(),
             busy: state.busy,
             can_provision_sign: can_provision_sign_locked(&state),
+            can_register: can_register_locked(&state),
             can_retry_preload: can_retry_preload_locked(&state),
         })
     });
@@ -1789,6 +2069,9 @@ unsafe fn apply_controls(snapshot: ControlsSnapshot) {
             snapshot.can_retry_preload as i32,
         );
     }
+    if snapshot.register != 0 {
+        EnableWindow(to_hwnd(snapshot.register), snapshot.can_register as i32);
+    }
 }
 
 fn worker_event_name(event: &WorkerEvent) -> &'static str {
@@ -1796,6 +2079,7 @@ fn worker_event_name(event: &WorkerEvent) -> &'static str {
         WorkerEvent::Scan(_) => "scan",
         WorkerEvent::Inspect { .. } => "inspect",
         WorkerEvent::ProvisionSign(_) => "provision-sign",
+        WorkerEvent::Register(_) => "register",
         WorkerEvent::RetryPreload(_) => "retry-preload",
     }
 }
@@ -1844,6 +2128,10 @@ fn summary_text(state: &GuiState) -> String {
                         "License 状态：{}",
                         json_string(value, &["license", "state"])
                     ));
+                    let registration_state = json_string(value, &["registration", "state"]);
+                    if !registration_state.is_empty() {
+                        lines.push(format!("登记声明：{registration_state}"));
+                    }
                     lines.push(format!(
                         "installationId：{}",
                         json_string(value, &["license", "installationId"])
@@ -2141,6 +2429,50 @@ mod tests {
         let status = inspection_status_text(&result, true);
         assert!(status.contains("已完成签名"));
         assert!(!status.contains("可以注册账号并签名"));
+    }
+
+    #[test]
+    fn registration_precharge_mock_is_never_called_when_pair_registration_fails() {
+        use std::cell::Cell;
+
+        let called = Cell::new(false);
+        let sign_result: Result<(), String> = Err("registration write failed".to_string());
+        let verify_result: Option<Result<(), String>> = None;
+        let result = maybe_precharge_after_signed_pair(
+            sign_result.is_ok(),
+            verify_result.as_ref().is_some_and(Result::is_ok),
+            false,
+            || {
+                called.set(true);
+            },
+        );
+        assert!(result.is_none());
+        assert!(!called.get());
+    }
+
+    #[test]
+    fn registration_precharge_runs_only_after_pair_and_readback_verify() {
+        let sign_result: Result<(), String> = Ok(());
+        let verify_result: Result<(), String> = Ok(());
+        let result = maybe_precharge_after_signed_pair(
+            sign_result.is_ok(),
+            verify_result.is_ok(),
+            true,
+            || "mock precharge",
+        );
+        assert_eq!(result, Some("mock precharge"));
+    }
+
+    #[test]
+    fn pending_vps_activation_never_triggers_precharge() {
+        use std::cell::Cell;
+
+        let called = Cell::new(false);
+        let result = maybe_precharge_after_signed_pair(true, true, false, || {
+            called.set(true);
+        });
+        assert!(result.is_none());
+        assert!(!called.get());
     }
 
     #[test]

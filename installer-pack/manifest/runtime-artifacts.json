@@ -3,16 +3,16 @@
   "releaseGate": {
     "materializationStatus": "ready",
     "installReady": true,
-    "rule": "Bundled Windows x64 media is accepted only when every artifact has exact bytes, SHA-256, source/provenance evidence and a passing offline health check. Credentials and tenant authorization remain first-run configuration."
+    "rule": "Python 3.12, Node.js 22, FFmpeg and Manim are hash-locked bundled Windows x64 runtimes for offline installation. HyperFrames CLI/Chrome bootstrap is separately reported and requires network only when no usable local copy is present. Credentials and tenant authorization remain first-run configuration."
   },
   "policy": {
-    "starterKitContains": "metadata, source inputs, bundled Windows x64 media, lock contracts and verification instructions",
+    "starterKitContains": "metadata, source inputs, bundled Windows x64 runtimes, locked Python closures and explicit online-bootstrap metadata for HyperFrames CLI/browser.",
     "installerOwns": "offline media, exact artifact hashes, Authenticode verification, package materialization, installation and rollback",
     "pythonStrategy": {
       "choice": "per-user-cpython-3.12-x64",
       "abi": "cp312",
       "platform": "win_amd64",
-      "reason": "The wheelhouse is compiled/selected for CPython 3.12 cp312 on Windows x64. A per-user install avoids administrator elevation and USB drive-letter fragility.",
+      "reason": "CPython 3.12 cp312 Windows x64 supports the hashed base and Manim wheel closures. Manim is isolated from the base application environment.",
       "installRoot": "%LocalAppData%\\Programs\\Python\\Python312",
       "reuseRule": "Reuse only a healthy CPython 3.12 win_amd64 interpreter whose cache tag is cpython-312. Python 3.11, 3.13, non-CPython and other architectures do not satisfy this contract.",
       "fallback": "If no exact ABI-compatible interpreter is healthy, install the locked private 3.12.10 artifact; never silently switch ABI."
@@ -24,13 +24,38 @@
       "materializationStatus": "ready",
       "installReady": true,
       "purpose": "CPython runtime for local data, document, PDF, media and optional stateful Skills",
-      "relatedSkills": ["china-stock-analysis", "data-assistant", "docx-butler", "excel-xlsx", "fitness-coach", "fund-portfolio", "macro-research", "meal-planner", "pdf-processing-toolkit", "powerpoint-pptx", "travel-planner", "venture-analysis", "wealth-allocation", "wechat-article-creator", "word-docx", "image-2", "seedance2-0-video-gen", "web-search-extraction"],
+      "relatedSkills": [
+        "china-stock-analysis",
+        "data-assistant",
+        "docx-butler",
+        "excel-xlsx",
+        "fitness-coach",
+        "fund-portfolio",
+        "macro-research",
+        "meal-planner",
+        "pdf-processing-toolkit",
+        "powerpoint-pptx",
+        "travel-planner",
+        "venture-analysis",
+        "wealth-allocation",
+        "wechat-article-creator",
+        "word-docx",
+        "image-2",
+        "seedance2-0-video-gen",
+        "web-search-extraction"
+      ],
       "required": true,
       "optional": false,
       "detect": {
         "command": "python -c \"import platform,sys,sysconfig; print(sys.version_info[:3],sys.implementation.cache_tag,sysconfig.get_platform(),platform.machine())\"",
         "expected": "3.12.x | cpython-312 | win-amd64 | AMD64/x86_64",
-        "reject": ["3.11", "3.13", "pypy", "win32", "arm64"]
+        "reject": [
+          "3.11",
+          "3.13",
+          "pypy",
+          "win32",
+          "arm64"
+        ]
       },
       "source": {
         "directUrl": "https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe",
@@ -44,11 +69,18 @@
         "materializationStatus": "ready",
         "sha256": "67b5635e80ea51072b87941312d00ec8927c4db9ba18938f7ad2d27b328b95fb",
         "sha256Source": "SHA-256 of runtime/bundled/python-3.12.10-amd64.exe; downloaded from the official Python release URL.",
-        "authenticode": {"required": true, "publisher": "Python Software Foundation", "evidence": "Get-AuthenticodeSignature returned Valid on the bundled installer."}
+        "authenticode": {
+          "required": true,
+          "publisher": "Python Software Foundation",
+          "evidence": "Get-AuthenticodeSignature returned Valid on the bundled installer."
+        }
       },
       "install": {
         "silentArgs": "/quiet InstallAllUsers=0 PrependPath=0 Include_test=0",
-        "acceptedReturnCodes": [0, 3010],
+        "acceptedReturnCodes": [
+          0,
+          3010
+        ],
         "timeoutSeconds": 300,
         "restart": "none",
         "scope": "current-user",
@@ -62,26 +94,56 @@
       "materializationStatus": "ready",
       "installReady": true,
       "purpose": "Complete offline Python wheelhouse for Skills that retain real Python functionality",
-      "relatedSkills": ["china-stock-analysis", "data-assistant", "docx-butler", "excel-xlsx", "fitness-coach", "fund-portfolio", "macro-research", "meal-planner", "pdf-processing-toolkit", "powerpoint-pptx", "travel-planner", "venture-analysis", "wealth-allocation", "wechat-article-creator", "word-docx", "web-content-fetcher", "image-2", "seedance2-0-video-gen", "web-search-extraction"],
+      "relatedSkills": [
+        "china-stock-analysis",
+        "data-assistant",
+        "docx-butler",
+        "excel-xlsx",
+        "fitness-coach",
+        "fund-portfolio",
+        "macro-research",
+        "meal-planner",
+        "pdf-processing-toolkit",
+        "powerpoint-pptx",
+        "travel-planner",
+        "venture-analysis",
+        "wealth-allocation",
+        "wechat-article-creator",
+        "word-docx",
+        "web-content-fetcher",
+        "image-2",
+        "seedance2-0-video-gen",
+        "web-search-extraction"
+      ],
       "required": false,
       "optional": true,
-      "target": {"platform": "win_amd64", "python": "cpython-312", "abi": "cp312"},
+      "target": {
+        "platform": "win_amd64",
+        "python": "cpython-312",
+        "abi": "cp312"
+      },
       "source": {
         "directRequirements": "runtime/requirements-python-win-x64-py312.in",
         "materializer": "runtime/materialize-python-wheelhouse.ps1",
         "indexPolicy": "approved package index; record the index URL and timestamp in the private media manifest",
         "archiveFilename": "runtime/bundled/python-wheels/",
-        "archiveBytes": 85236661
+        "archiveBytes": 167504800,
+        "wheelCount": 77
       },
       "integrity": {
         "materializationStatus": "ready",
         "sha256": null,
-        "sha256Source": "Each of the 52 bundled wheels has an individual SHA-256 in runtime/bundled/python-wheelhouse-manifest.json and is verified before installation.",
-        "authenticode": {"required": false, "evidence": "per-wheel SHA-256, PyPI/index provenance and signed media manifest"}
+        "sha256Source": "Each of the 77 bundled wheels has an individual SHA-256 in runtime/bundled/python-wheelhouse-manifest.json and is verified before installation.",
+        "authenticode": {
+          "required": false,
+          "evidence": "per-wheel SHA-256, PyPI/index provenance and signed media manifest"
+        }
       },
       "install": {
         "command": "CODEX_PYTHON -m pip install --no-index --find-links <wheelhouse> --require-hashes -r <generated-lock>",
-        "acceptedReturnCodes": [0],
+        "acceptedReturnCodes": [
+          0
+        ],
         "timeoutSeconds": 600,
         "scope": "current-user CPython 3.12 environment",
         "path": "No global PATH change"
@@ -90,38 +152,17 @@
       "uninstallUpgrade": "Install a new versioned per-user environment and switch the runtime pointer only after all wheel hashes and import checks pass; retain the old environment for rollback."
     },
     {
-      "artifactId": "runtime.node20-feishu-optional",
-      "materializationStatus": "ready",
-      "installReady": true,
-      "purpose": "Optional Node.js runtime for the locked official Feishu/Lark MCP package",
-      "relatedSkills": ["feishu-doc", "feishu-drive", "feishu-perm", "feishu-wiki"],
-      "required": false,
-      "optional": true,
-      "source": {
-        "directUrl": "https://nodejs.org/dist/v20.20.0/node-v20.20.0-win-x64.zip",
-        "checksumUrl": "https://nodejs.org/dist/v20.20.0/SHASUMS256.txt",
-        "productVersion": "20.20.0",
-        "architecture": "x64",
-        "filename": "node-v20.20.0-win-x64.zip",
-        "bytes": 29902899
-      },
-      "integrity": {
-        "materializationStatus": "ready",
-        "sha256": "32f24e1405b113d4e01ad2585c92024df673b6156ef6f43a5469a75bf52c0a5a",
-        "sha256Source": "SHA-256 of runtime/bundled/node-v20.20.0-win-x64.zip; matches the official Node.js SHASUMS256.txt.",
-        "authenticode": {"required": false, "publisher": "Node.js / OpenJS Foundation", "evidence": "Official SHASUMS256.txt plus exact archive hash; ZIP archives do not carry Authenticode signatures."}
-      },
-      "install": {"method": "extract-per-user", "archive": "runtime/bundled/node-v20.20.0-win-x64.zip", "scope": "current-user", "path": "User-local runtime pointer and PATH entry; no administrator elevation."},
-      "healthCheck": "node --version; npm --version; npm exec --offline --prefix <private-feishu-cache> -- @larksuiteoapi/lark-mcp@0.5.1 mcp --help",
-      "offlineConstraint": "Never use npx --yes for a health check or enabled Codex configuration. The package must already be present in the private cache and npm must run with --offline.",
-      "uninstallUpgrade": "Manage through Windows installed apps; upgrade Node and the MCP package together under a new media lock."
-    },
-    {
       "artifactId": "runtime.feishu-mcp-package",
       "materializationStatus": "ready",
       "installReady": true,
       "purpose": "Offline npm package cache for the official Feishu/Lark MCP",
-      "package": {"name": "@larksuiteoapi/lark-mcp", "version": "0.5.1", "license": "MIT", "nodeEngine": ">=20.0.0", "bin": "lark-mcp"},
+      "package": {
+        "name": "@larksuiteoapi/lark-mcp",
+        "version": "0.5.1",
+        "license": "MIT",
+        "nodeEngine": ">=20.0.0",
+        "bin": "lark-mcp"
+      },
       "source": {
         "tarballUrl": "https://registry.npmjs.org/@larksuiteoapi/lark-mcp/-/lark-mcp-0.5.1.tgz",
         "packageJsonUrl": "https://registry.npmjs.org/@larksuiteoapi/lark-mcp/0.5.1",
@@ -136,6 +177,159 @@
         "configCommand": "Use the private wrapper command from config-fragments/feishu-official-stdio.template.toml; do not put App Secret in Codex TOML."
       },
       "offlineConstraint": "The bundled ZIP contains the locked npm node_modules closure and package-lock.json. The installer extracts it without network access; Feishu still remains disabled until credentials and tenant permissions are supplied."
+    },
+    {
+      "artifactId": "runtime.node22-common",
+      "materializationStatus": "ready",
+      "installReady": true,
+      "purpose": "Shared user-local Node runtime for HyperFrames CLI and optional Feishu MCP",
+      "relatedSkills": [
+        "hyperframes-video",
+        "feishu-doc",
+        "feishu-drive",
+        "feishu-perm",
+        "feishu-wiki"
+      ],
+      "required": true,
+      "optional": false,
+      "source": {
+        "directUrl": "https://nodejs.org/dist/v22.22.0/node-v22.22.0-win-x64.zip",
+        "checksumUrl": "https://nodejs.org/dist/v22.22.0/SHASUMS256.txt",
+        "productVersion": "22.22.0",
+        "architecture": "x64",
+        "filename": "node-v22.22.0-win-x64.zip",
+        "bytes": 35556852
+      },
+      "integrity": {
+        "materializationStatus": "ready",
+        "sha256": "c97fa376d2becdc8863fcd3ca2dd9a83a9f3468ee7ccf7a6d076ec66a645c77a",
+        "sha256Source": "Official Node.js v22.22.0 SHASUMS256.txt; checked against the bundled archive.",
+        "authenticode": {
+          "required": false,
+          "publisher": "Node.js / OpenJS Foundation",
+          "evidence": "Official SHASUMS256.txt plus exact archive hash; ZIP does not carry Authenticode signatures."
+        }
+      },
+      "install": {
+        "method": "extract-per-user",
+        "archive": "runtime/bundled/node-v22.22.0-win-x64.zip",
+        "scope": "current-user",
+        "path": "Shared runtime under the private Codex Agent Kit home; no system PATH mutation."
+      },
+      "healthCheck": "node --version; require major version >=22",
+      "uninstallUpgrade": "Upgrade only with a newly pinned archive and matching checksum."
+    },
+    {
+      "artifactId": "runtime.ffmpeg-windows-x64",
+      "materializationStatus": "ready",
+      "installReady": true,
+      "purpose": "Local video editing and HyperFrames render encoding/probing",
+      "relatedSkills": [
+        "local-video-editing",
+        "hyperframes-video"
+      ],
+      "required": true,
+      "optional": false,
+      "source": {
+        "directUrl": "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n9.0-latest-win64-lgpl-shared-9.0.zip",
+        "releaseProject": "https://github.com/BtbN/FFmpeg-Builds",
+        "filename": "ffmpeg-n9.0-latest-win64-lgpl-shared-9.0.zip",
+        "bytes": 77221060
+      },
+      "integrity": {
+        "materializationStatus": "ready",
+        "sha256": "3f67595fb8c7be0c48d8f54b2a5a89175426a6d7b194065d0c08cca9bd95eb19",
+        "sha256Source": "Exact SHA-256 of the bundled BtbN release asset.",
+        "license": "Archive is the LGPL shared build; retain its included license notices and see runtime/THIRD-PARTY-NOTICES.md."
+      },
+      "install": {
+        "method": "extract-per-user",
+        "archive": "runtime/bundled/ffmpeg-n9.0-latest-win64-lgpl-shared-9.0.zip",
+        "scope": "current-user",
+        "path": "Private Codex Agent Kit runtime; wrappers ffmpeg.cmd, ffprobe.cmd and ffplay.cmd."
+      },
+      "healthCheck": "ffmpeg.cmd -version; ffprobe.cmd -version",
+      "uninstallUpgrade": "Replace only through a new exact-hash runtime pack."
+    },
+    {
+      "artifactId": "runtime.manim",
+      "materializationStatus": "ready",
+      "installReady": true,
+      "purpose": "Isolated Manim Community animation authoring/rendering environment",
+      "relatedSkills": [
+        "manim-animation"
+      ],
+      "required": true,
+      "optional": false,
+      "version": "0.21.0",
+      "source": {
+        "package": "manim==0.21.0",
+        "lock": "runtime/bundled/manim-requirements.lock",
+        "wheelhouse": "runtime/bundled/python-wheels/"
+      },
+      "integrity": {
+        "materializationStatus": "ready",
+        "hashPolicy": "Every wheel in the lock has SHA-256; installed offline with pip --require-hashes."
+      },
+      "install": {
+        "method": "offline-python-venv",
+        "scope": "current-user",
+        "path": "runtime/manim-env; independent of runtime/python-env."
+      },
+      "healthCheck": "CODEX_MANIM_PYTHON -c \"import manim,av,manimpango; import importlib.metadata as m; assert m.version('manim') == '0.21.0'\"",
+      "optionalLatex": "MiKTeX/LaTeX only for Tex/MathTex formulas; basic scenes do not require it."
+    },
+    {
+      "artifactId": "runtime.hyperframes-cli",
+      "materializationStatus": "network-bootstrap",
+      "installReady": true,
+      "purpose": "Local HyperFrames composition CLI, pinned to npm package 0.8.134",
+      "relatedSkills": [
+        "hyperframes-video"
+      ],
+      "required": true,
+      "optional": false,
+      "source": {
+        "registry": "https://registry.npmjs.org/hyperframes",
+        "package": "hyperframes@0.8.134",
+        "license": "Apache-2.0",
+        "nodeEngine": ">=22"
+      },
+      "integrity": {
+        "materializationStatus": "version-pinned",
+        "lock": "runtime/bundled/hyperframes-package-lock.json; every npm package tarball has registry integrity in the lock."
+      },
+      "install": {
+        "method": "npm user-prefix install",
+        "networkRequired": true,
+        "scope": "current-user",
+        "path": "runtime/hyperframes; exposes hyperframes.cmd only when installed",
+        "command": "npm ci --prefix <private-hyperframes-runtime> using the bundled, hashed package.json/package-lock.json contract"
+      },
+      "healthCheck": "hyperframes.cmd --version; runtime-state.json hyperframes.cliHealth == passed",
+      "offlineConstraint": "Without access to npm tarball URLs on first install, this capability is marked requires-network; later installs reuse the per-user lock marker and npm cache."
+    },
+    {
+      "artifactId": "runtime.hyperframes-browser",
+      "materializationStatus": "network-bootstrap",
+      "installReady": true,
+      "purpose": "Chrome browser required for HyperFrames local rendering",
+      "relatedSkills": [
+        "hyperframes-video"
+      ],
+      "required": true,
+      "optional": false,
+      "source": {
+        "installer": "HyperFrames browser ensure",
+        "systemBrowser": "Use a compatible locally installed Chrome when available"
+      },
+      "install": {
+        "method": "hyperframes browser ensure",
+        "networkRequired": "only when no usable system/cached Chrome is found",
+        "scope": "current-user browser cache"
+      },
+      "healthCheck": "hyperframes.cmd doctor; runtime-state.json hyperframes.browserHealth == passed",
+      "offlineConstraint": "Offline install can use a previously available supported browser; otherwise mark requires-network."
     }
   ]
 }

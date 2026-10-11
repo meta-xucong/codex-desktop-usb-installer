@@ -49,6 +49,8 @@ const RECOVERY: &[&str] = &[
     "SHA256SUMS.txt",
     "usb-license.json",
     "usb-license.json.bak",
+    "usb-license-revocation-registration.json",
+    "CodexUsbState/revocation.json",
 ];
 // These are not ordinary release files.  SHA256SUMS is the immutable
 // inventory itself; the two root-level license names are manager-owned
@@ -56,6 +58,10 @@ const RECOVERY: &[&str] = &[
 // validated against the active lease before source-media deletion.
 const EXTRA: &[&str] = &["SHA256SUMS.txt"];
 const ROOT_RUNTIME_LICENSES: &[&str] = &["usb-license.json", "usb-license.json.bak"];
+const ROOT_RUNTIME_REVOCATION: &[&str] = &[
+    "usb-license-revocation-registration.json",
+    "CodexUsbState/revocation.json",
+];
 const CAPABILITY_PACK_PREFIX: &str = "content/codex-starter-kit/";
 const DIRS: &[&str] = &[
     "content/skills",
@@ -67,6 +73,7 @@ const DIRS: &[&str] = &[
     "resources",
     "ccswitch",
     "payload",
+    "CodexUsbState",
 ];
 
 fn is_capability_pack_path(name: &str) -> bool {
@@ -86,14 +93,51 @@ fn is_allowed_release_file(name: &str) -> bool {
     if nested_runtime_license && !is_root_runtime_license(name) {
         return false;
     }
+    if is_revocation_filename(name) && !is_root_runtime_revocation(name) {
+        return false;
+    }
     FILES.contains(&name)
         || EXTRA.contains(&name)
         || is_root_runtime_license(name)
+        || is_root_runtime_revocation(name)
         || is_capability_pack_path(name)
 }
 
 fn is_root_runtime_license(name: &str) -> bool {
     ROOT_RUNTIME_LICENSES.contains(&name)
+}
+
+fn is_revocation_temp(name: &str) -> bool {
+    let Some(suffix) = name
+        .strip_prefix("CodexUsbState/revocation.json.tmp-")
+        .or_else(|| name.strip_prefix("codexusbstate/revocation.json.tmp-"))
+    else {
+        return false;
+    };
+    let mut values = suffix.split('-');
+    let (Some(pid), Some(counter), None) = (values.next(), values.next(), values.next()) else {
+        return false;
+    };
+    pid.parse::<u32>()
+        .is_ok_and(|value| value > 0 && value.to_string() == pid)
+        && counter
+            .parse::<u64>()
+            .is_ok_and(|value| value > 0 && value.to_string() == counter)
+}
+
+fn is_root_runtime_revocation(name: &str) -> bool {
+    ROOT_RUNTIME_REVOCATION.contains(&name)
+        || name.eq_ignore_ascii_case("usb-license-revocation-registration.json")
+        || name.eq_ignore_ascii_case("CodexUsbState/revocation.json")
+        || is_revocation_temp(name)
+}
+
+fn is_revocation_filename(name: &str) -> bool {
+    let leaf = name.rsplit('/').next().unwrap_or(name);
+    leaf.eq_ignore_ascii_case("revocation.json")
+        || leaf
+            .to_ascii_lowercase()
+            .starts_with("revocation.json.tmp-")
 }
 
 fn is_allowed_release_dir(name: &str) -> bool {
@@ -361,6 +405,11 @@ fn parse_checksums(text: &str) -> Result<BTreeMap<String, String>, String> {
         if is_root_runtime_license(name) {
             return Err(format!("运行期许可文件不得进入 SHA256SUMS.txt：{name}"));
         }
+        if is_root_runtime_revocation(name) || is_revocation_filename(name) {
+            return Err(format!(
+                "登记声明和 revocation state 不得进入 SHA256SUMS.txt：{name}"
+            ));
+        }
         if hash.len() != 64
             || !hash.bytes().all(|c| c.is_ascii_hexdigit())
             || !is_allowed_release_file(name)
@@ -377,6 +426,7 @@ fn parse_checksums(text: &str) -> Result<BTreeMap<String, String>, String> {
     for name in [
         "CodexAppManager.exe",
         "CodexDesktopSetup.exe",
+        "manifest.json",
         "usb-manifest.json",
     ] {
         if !entries.contains_key(name) {
@@ -384,6 +434,32 @@ fn parse_checksums(text: &str) -> Result<BTreeMap<String, String>, String> {
         }
     }
     Ok(entries)
+}
+
+fn require_supported_manifest_schemas(
+    root: &serde_json::Value,
+    usb: &serde_json::Value,
+) -> Result<u64, String> {
+    let root_schema = root
+        .get("schemaVersion")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or("root manifest 缺少有效 schemaVersion")?;
+    let usb_schema = usb
+        .get("schemaVersion")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or("usb-manifest 缺少有效 schemaVersion")?;
+    if !matches!(root_schema, 2 | 3) || root_schema != usb_schema {
+        return Err("root 与 USB manifest schema 不匹配或不受支持".into());
+    }
+    if root_schema == 3
+        && root
+            .pointer("/revocationPolicy/registrationRequired")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+    {
+        return Err("schema 3 root manifest 必须要求 registrationRequired=true".into());
+    }
+    Ok(root_schema)
 }
 
 struct BundlePins {
@@ -476,7 +552,15 @@ impl BundlePins {
                 blockers.join("\n- ")
             ));
         }
-        let manifest: serde_json::Value = serde_json::from_str(
+        let root_manifest: serde_json::Value = serde_json::from_str(
+            &pins
+                .files
+                .get_mut("manifest.json")
+                .ok_or("缺少 manifest.json")?
+                .text()?,
+        )
+        .map_err(|e| e.to_string())?;
+        let usb_manifest: serde_json::Value = serde_json::from_str(
             &pins
                 .files
                 .get_mut("usb-manifest.json")
@@ -484,9 +568,8 @@ impl BundlePins {
                 .text()?,
         )
         .map_err(|e| e.to_string())?;
-        if manifest["product"].as_str() != Some("codex-usb-oneclick")
-            || manifest["schemaVersion"].as_u64() != Some(2)
-        {
+        require_supported_manifest_schemas(&root_manifest, &usb_manifest)?;
+        if usb_manifest["product"].as_str() != Some("codex-usb-oneclick") {
             return Err("不是本产品可清理的 U 盘发行包".into());
         }
         let sums = parse_checksums(
@@ -503,6 +586,7 @@ impl BundlePins {
                 }
             } else if !EXTRA.contains(&name.as_str())
                 && !is_root_runtime_license(name)
+                && !is_root_runtime_revocation(name)
                 && !is_capability_pack_path(name)
             {
                 return Err(format!("保留清单外文件：{name}"));
@@ -586,6 +670,15 @@ impl BundlePins {
             }
             let path = self.root.join(name);
             let outcome = (|| -> Result<(), String> {
+                if name.eq_ignore_ascii_case("CodexUsbState/revocation.json") {
+                    let state_dir = self.root.join("CodexUsbState");
+                    match metadata(&state_dir)? {
+                        None => fs::create_dir(&state_dir)
+                            .map_err(|error| format!("恢复 revocation state 目录失败：{error}"))?,
+                        Some(meta) if meta.is_dir() && !is_reparse(&meta) => {}
+                        Some(_) => return Err("恢复时拒绝替换 CodexUsbState 非普通目录".into()),
+                    }
+                }
                 check_path(&path)?;
                 let mut options = OpenOptions::new();
                 options.write(true).create_new(true);
@@ -696,7 +789,7 @@ fn cleanup_inner(
         let mut directories = pins
             .dirs
             .keys()
-            .filter(|name| !name.is_empty())
+            .filter(|name| !name.is_empty() && !name.eq_ignore_ascii_case("CodexUsbState"))
             .cloned()
             .collect::<Vec<_>>();
         directories.sort_by(|left, right| {
@@ -715,7 +808,7 @@ fn cleanup_inner(
                 .file_name()
                 .to_string_lossy()
                 .into_owned();
-            if !RECOVERY.contains(&name.as_str()) {
+            if !RECOVERY.contains(&name.as_str()) && !name.eq_ignore_ascii_case("CodexUsbState") {
                 return Err(format!("出现非发行包内容，保留重试入口：{name}"));
             }
         }
@@ -723,6 +816,7 @@ fn cleanup_inner(
         for name in RECOVERY {
             pins.remove_file(name)?;
         }
+        pins.remove_dir("CodexUsbState")?;
         pins.remove_dir("")?;
         Ok(())
     })();
@@ -757,7 +851,7 @@ mod tests {
         for (name, content) in [
             ("CodexAppManager.exe", "manager"),
             ("CodexDesktopSetup.exe", "setup"),
-            ("manifest.json", "{}"),
+            ("manifest.json", r#"{"schemaVersion":2}"#),
             (
                 "usb-manifest.json",
                 r#"{"schemaVersion":2,"product":"codex-usb-oneclick"}"#,
@@ -774,6 +868,19 @@ mod tests {
         }
         fs::write(root.join("SHA256SUMS.txt"), list).unwrap();
         root
+    }
+    fn refresh_fixture_checksums(root: &Path) {
+        let old = fs::read_to_string(root.join("SHA256SUMS.txt")).unwrap();
+        let mut rows = Vec::new();
+        for line in old.lines() {
+            let (_, name) = line.split_once("  ").unwrap();
+            let path = root.join(name.replace('/', std::path::MAIN_SEPARATOR_STR));
+            rows.push(format!(
+                "{}  {name}",
+                Pin::open(&path, false, false).unwrap().hash().unwrap()
+            ));
+        }
+        fs::write(root.join("SHA256SUMS.txt"), rows.join("\n") + "\n").unwrap();
     }
     fn fingerprint() -> UsbFingerprint {
         UsbFingerprint {
@@ -824,6 +931,97 @@ mod tests {
             "{hash}  CodexAppManager.exe\n{hash}  CodexAppManager.exe"
         ))
         .is_err());
+    }
+
+    #[test]
+    fn supported_manifest_schemas_require_matching_v3_policy() {
+        let v2_root = serde_json::json!({"schemaVersion": 2});
+        let v2_usb = serde_json::json!({"schemaVersion": 2});
+        assert_eq!(require_supported_manifest_schemas(&v2_root, &v2_usb), Ok(2));
+
+        let v3_root = serde_json::json!({
+            "schemaVersion": 3,
+            "revocationPolicy": {"registrationRequired": true}
+        });
+        let v3_usb = serde_json::json!({"schemaVersion": 3});
+        assert_eq!(require_supported_manifest_schemas(&v3_root, &v3_usb), Ok(3));
+
+        assert!(require_supported_manifest_schemas(&v3_root, &v2_usb).is_err());
+        assert!(require_supported_manifest_schemas(
+            &serde_json::json!({"schemaVersion": 3}),
+            &v3_usb
+        )
+        .is_err());
+        assert!(require_supported_manifest_schemas(
+            &serde_json::json!({
+                "schemaVersion": 3,
+                "revocationPolicy": {"registrationRequired": false}
+            }),
+            &v3_usb
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn root_revocation_runtime_paths_are_allowed_but_unlisted_in_sums() {
+        for path in [
+            "usb-license-revocation-registration.json",
+            "CodexUsbState/revocation.json",
+            "CodexUsbState/revocation.json.tmp-123-4",
+        ] {
+            assert!(is_allowed_release_file(path), "{path}");
+            assert!(parse_checksums(&format!("{}  {path}", "a".repeat(64))).is_err());
+        }
+        assert!(!is_allowed_release_file(
+            "nested/usb-license-revocation-registration.json"
+        ));
+        assert!(!is_allowed_release_file(
+            "CodexUsbState/revocation.json.tmp-01-4"
+        ));
+    }
+
+    // This exercises the existing full USB media-uninstall path, not remote
+    // revocation cleanup. Remote revocation uses usb_revocation_cleanup's
+    // narrow Codex-only deletion plan and preserves its receipts/state.
+    #[test]
+    fn schema3_full_media_uninstall_accepts_required_policy_and_runtime_state() {
+        let root = fixture();
+        fs::write(
+            root.join("manifest.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 3,
+                "revocationPolicy": {"registrationRequired": true}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            root.join("usb-manifest.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 3,
+                "product": "codex-usb-oneclick"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            root.join("usb-license-revocation-registration.json"),
+            "runtime registration",
+        )
+        .unwrap();
+        let state_dir = root.join("CodexUsbState");
+        fs::create_dir(&state_dir).unwrap();
+        fs::write(state_dir.join("revocation.json"), "runtime state").unwrap();
+        fs::write(
+            state_dir.join("revocation.json.tmp-123-4"),
+            "interrupted atomic state write",
+        )
+        .unwrap();
+        refresh_fixture_checksums(&root);
+
+        preflight_bundle(&root).unwrap();
+        cleanup_bundle(&root).unwrap();
+        assert!(!root.exists());
     }
     #[test]
     fn unicode_space_apostrophe_root_cleans_successfully() {

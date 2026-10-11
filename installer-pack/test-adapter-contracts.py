@@ -1,14 +1,16 @@
-"""Offline regression tests for provider adapters and financial data integrity."""
+"""Offline regression tests for package adapters and financial data integrity."""
 
 from __future__ import annotations
 
 import importlib.util
+import http.server
 import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import tomllib
 import unittest
 import uuid
@@ -21,8 +23,8 @@ sys.dont_write_bytecode = True
 
 _SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 ROOT = _SCRIPT_DIRECTORY if (_SCRIPT_DIRECTORY / "skills").is_dir() else _SCRIPT_DIRECTORY.parent
-IMAGE_SCRIPT = ROOT / "skills" / "image-2" / "scripts" / "image_2_gen.py"
-SEEDANCE_SCRIPT = ROOT / "skills" / "seedance2-0-video-gen" / "scripts" / "seedance_video_gen.py"
+SCRIPT_ROOT = _SCRIPT_DIRECTORY if (_SCRIPT_DIRECTORY / "configure-codex.ps1").is_file() else ROOT / "scripts"
+MEDIA_MCP_SCRIPT = (ROOT / "mcp" / "media-generation-mcp.py") if (ROOT / "mcp" / "media-generation-mcp.py").is_file() else (SCRIPT_ROOT / "media-generation-mcp.py")
 WEB_SCRIPT = ROOT / "skills" / "web-search-extraction" / "scripts" / "web_search.py"
 TECHNICAL_SCRIPT = ROOT / "skills" / "china-stock-analysis" / "scripts" / "technical_analysis.py"
 A_SHARE_VALUATION_SCRIPT = ROOT / "skills" / "china-stock-analysis" / "scripts" / "valuation_calculator.py"
@@ -31,10 +33,10 @@ REALTIME_QUOTE_SCRIPT = ROOT / "skills" / "china-stock-analysis" / "scripts" / "
 STOCK_DATA_FETCHER_SCRIPT = ROOT / "skills" / "china-stock-analysis" / "scripts" / "data_fetcher.py"
 FINANCIAL_ANALYZER_SCRIPT = ROOT / "skills" / "china-stock-analysis" / "scripts" / "financial_analyzer.py"
 STOCK_REPORT_TEMPLATE = ROOT / "skills" / "china-stock-analysis" / "templates" / "analysis_report.md"
-CONFIGURE_SCRIPT = ROOT / "configure-codex.ps1"
-RENDER_SCRIPT = ROOT / "render-codex-config.ps1"
+CONFIGURE_SCRIPT = SCRIPT_ROOT / "configure-codex.ps1"
+RENDER_SCRIPT = SCRIPT_ROOT / "render-codex-config.ps1"
 PDF_TOOL_SCRIPT = ROOT / "skills" / "pdf-processing-toolkit" / "scripts" / "pdf_tool.py"
-MODEL_SYNC_SCRIPT = ROOT / "sync-model-catalog.ps1"
+MODEL_SYNC_SCRIPT = SCRIPT_ROOT / "sync-model-catalog.ps1"
 POWERSHELL = shutil.which("powershell.exe") or shutil.which("pwsh.exe") or shutil.which("pwsh")
 MACRO_CYCLE_SCRIPT = ROOT / "skills" / "macro-research" / "scripts" / "cycle_analyzer.py"
 POLICY_SCRIPT = ROOT / "skills" / "macro-research" / "scripts" / "policy_analyzer.py"
@@ -51,7 +53,7 @@ BUSINESS_EVALUATOR_SCRIPT = ROOT / "skills" / "venture-analysis" / "scripts" / "
 FINANCIAL_MODEL_SCRIPT = ROOT / "skills" / "venture-analysis" / "scripts" / "financial_model.py"
 DUE_DILIGENCE_SCRIPT = ROOT / "skills" / "venture-analysis" / "scripts" / "due_diligence.py"
 REFLECTION_SCRIPT = ROOT / "skills" / "daily-reflection" / "scripts" / "reflection_db.py"
-ADAPTER_ENV_PREFIXES = ("IMAGE_2_", "SEEDANCE_", "DASHSCOPE_")
+ADAPTER_ENV_PREFIXES = ("MEDIA_", "IMAGE_2_", "SEEDANCE_", "DASHSCOPE_")
 
 
 @contextmanager
@@ -208,19 +210,17 @@ class CodexConfigureContractTests(unittest.TestCase):
 
 @unittest.skipUnless(POWERSHELL, "PowerShell is required for Skill activation contract tests")
 class SkillActivationContractTests(unittest.TestCase):
-    expected_guided = {
-        "feishu-doc",
-        "feishu-drive",
-        "feishu-perm",
-        "feishu-wiki",
-        "image-2",
-        "seedance2-0-video-gen",
-        "web-search-extraction",
-    }
-
-    def test_renderer_emits_43_enabled_and_7_guided_entries(self):
+    def test_renderer_emits_manifest_derived_skill_entries(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            audit = json.loads((ROOT / "manifest" / "skill-audit.json").read_text(encoding="utf-8"))
+            expected_guided = {
+                skill["id"]
+                for skill in audit["skills"]
+                if skill.get("afterRemediationStatus") == "guided-config"
+            }
+            expected_total = len(audit["skills"])
+            expected_enabled = expected_total - len(expected_guided)
             output = root / "generated.toml"
             completed = subprocess.run(
                 [
@@ -248,15 +248,15 @@ class SkillActivationContractTests(unittest.TestCase):
             )
             self.assertEqual(completed.returncode, 0, completed.stdout + "\n" + completed.stderr)
             status = json.loads(completed.stdout.lstrip("\ufeff"))
-            self.assertEqual(status["totalSkills"], 50)
-            self.assertEqual(status["enabledSkillCount"], 43)
-            self.assertEqual(status["disabledSkillCount"], 7)
-            self.assertEqual(set(status["disabledSkills"]), self.expected_guided)
+            self.assertEqual(status["totalSkills"], expected_total)
+            self.assertEqual(status["enabledSkillCount"], expected_enabled)
+            self.assertEqual(status["disabledSkillCount"], len(expected_guided))
+            self.assertEqual(set(status["disabledSkills"]), expected_guided)
             config = tomllib.loads(output.read_text(encoding="utf-8-sig"))
             entries = config["skills"]["config"]
-            self.assertEqual(len(entries), 50)
-            self.assertEqual(sum(1 for entry in entries if entry["enabled"]), 43)
-            self.assertEqual(sum(1 for entry in entries if not entry["enabled"]), 7)
+            self.assertEqual(len(entries), expected_total)
+            self.assertEqual(sum(1 for entry in entries if entry["enabled"]), expected_enabled)
+            self.assertEqual(sum(1 for entry in entries if not entry["enabled"]), len(expected_guided))
 
     @unittest.skipUnless(PDF_TOOL_SCRIPT.is_file(), "Bundled PDF helper is missing")
     def test_pdf_smoke_uses_read_extract_write_and_generate_paths(self):
@@ -369,31 +369,24 @@ class ModelCatalogSyncContractTests(unittest.TestCase):
             self.assertFalse(config_path.exists())
             self.assertFalse(kit_home.exists())
 
-    def test_metadata_sync_preserves_all_existing_model_selections(self):
-        for model_id in ("gpt-reserve", "gpt-5.3-codex-spark", "gpt-5.2", "vendor-private-model"):
+    def test_hidden_and_api_unsupported_official_models_migrate_but_third_party_is_preserved(self):
+        for model_id in ("gpt-reserve", "gpt-5.3-codex-spark"):
             with self.subTest(model_id=model_id), tempfile.TemporaryDirectory() as directory:
                 config = f'model = "{model_id}"\n\n[other]\nvalue = 1\n'
                 completed, result, config_path, _ = self.invoke(Path(directory), self.catalog(), config=config)
                 self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
                 self.assertEqual(result["status"], "ready")
-                self.assertEqual(result["migration"], "preserved-existing-model")
-                self.assertEqual(result["modelSelectionStatus"], "deferred-until-verified")
-                self.assertIsNone(result["preferredModel"])
-                self.assertFalse(result["configChanged"])
-                self.assertEqual(result["currentModel"], model_id)
-                self.assertEqual(config_path.read_text(encoding="utf-8"), config)
+                self.assertEqual(result["migration"], "unavailable-official-model-migrated")
+                migrated = config_path.read_text(encoding="utf-8")
+                self.assertIn('model = "gpt-6-astra"', migrated)
+                self.assertIn("[other]", migrated)
 
-    def test_metadata_sync_does_not_invent_missing_model_configuration(self):
         with tempfile.TemporaryDirectory() as directory:
-            completed, result, config_path, kit_home = self.invoke(Path(directory), self.catalog())
+            config = 'model = "vendor-private-model"\n\n[other]\nvalue = 1\n'
+            completed, result, config_path, _ = self.invoke(Path(directory), self.catalog(), config=config)
             self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
-            self.assertEqual(result["migration"], "default-selection-deferred")
-            self.assertEqual(result["modelSelectionStatus"], "deferred-until-verified")
-            self.assertIsNone(result["preferredModel"])
-            self.assertIsNone(result["currentModel"])
-            self.assertFalse(result["configChanged"])
-            self.assertFalse(config_path.exists())
-            self.assertTrue((kit_home / "model-catalog.json").is_file())
+            self.assertEqual(result["migration"], "preserved-active-model")
+            self.assertEqual(config_path.read_text(encoding="utf-8"), config)
 
     def test_strict_catalog_field_validation_and_idempotence(self):
         invalid = self.catalog()
@@ -437,208 +430,166 @@ class ModelCatalogSyncContractTests(unittest.TestCase):
             self.assertIn("retired model", (completed.stdout + completed.stderr).lower())
 
 
-class ImageAdapterTests(unittest.TestCase):
-    def test_does_not_reuse_openai_api_key(self):
-        module = load_module(IMAGE_SCRIPT, {"OPENAI_API_KEY": "must-not-leak"})
-        self.assertEqual(module.API_KEY, "")
-        self.assertEqual(module.DEFAULT_MODEL, "")
+class MediaGenerationMcpTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.data_dir = Path(self.temp.name) / "media-data"
+        self.server = None
+        self.thread = None
+        self.module = load_module(MEDIA_MCP_SCRIPT)
+        self.env = {
+            "MEDIA_GENERATION_TEST_MODE": "1",
+            "MEDIA_GENERATION_DATA_DIR": str(self.data_dir),
+            "MEDIA_GENERATION_API_KEY": "contract-test-key",
+            "MEDIA_GENERATION_AGENT_ID": "contract-test-route",
+            "MEDIA_GENERATION_API_BASE_URL": "https://media.example.invalid",
+            "MEDIA_IMAGE2_MODEL": "test-image-model",
+            "MEDIA_GROK_IMAGE_MODEL": "test-grok-image",
+            "MEDIA_GROK_VIDEO_MODEL": "test-grok-video",
+            "MEDIA_SEEDANCE_MODEL": "test-seedance",
+        }
 
-    def test_sync_and_async_submission_each_post_once(self):
-        module = load_module(IMAGE_SCRIPT)
-        module.print = lambda *_args, **_kwargs: None
-        calls = []
+    def tearDown(self):
+        if self.server:
+            self.server.shutdown()
+            self.server.server_close()
+        if self.thread:
+            self.thread.join(timeout=2)
+        self.temp.cleanup()
 
-        with tempfile.TemporaryDirectory() as directory:
-            module.resolve_image_data_dir = lambda: Path(directory)
+    def test_prepare_is_offline_and_confirmation_is_hmac_bound(self):
+        with adapter_environment(self.env):
+            prepared = self.module.media_prepare({"provider": "image-2", "prompt": "A test poster"})
+            self.assertFalse(prepared["api_request_sent"])
+            self.assertEqual(prepared["provider"], "image-2")
+            self.assertEqual(prepared["price_estimate"].split(";")[0], "unknown")
+            record_path = self.data_dir / "confirmations" / f"{prepared['confirmation_id']}.json"
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            record["request"]["prompt"] = "tampered"
+            record_path.write_text(json.dumps(record), encoding="utf-8")
+            with self.assertRaises(self.module.MediaError):
+                self.module._validated_record({"confirmation_id": prepared["confirmation_id"], "confirmation_fingerprint": prepared["confirmation_fingerprint"]})
 
-            def sync_request(*args, **kwargs):
-                calls.append((args, kwargs))
-                return {"data": [{"b64_json": "not-decoded-in-this-test"}]}
+    def test_submit_once_and_query_existing_async_task(self):
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                pass
+            def do_POST(self):
+                self.server.posts += 1
+                self.server.last_headers = dict(self.headers)
+                self.server.last_payload = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
+                body = json.dumps({"task_id": "fixture-task-1", "status": "queued"}).encode()
+                self.send_response(200); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+            def do_GET(self):
+                self.server.gets += 1
+                body = json.dumps({"status": "completed", "data": [{"url": "https://assets.example.invalid/result.png"}]}).encode()
+                self.send_response(200); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+        self.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.server.posts = 0; self.server.gets = 0; self.server.last_headers = {}; self.server.last_payload = {}
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        env = dict(self.env, MEDIA_GENERATION_API_BASE_URL=f"http://127.0.0.1:{self.server.server_port}")
+        with adapter_environment(env):
+            prepared = self.module.media_prepare({"provider": "image-2", "prompt": "A billable call"})
+            submitted = self.module.media_submit({"confirmation_id": prepared["confirmation_id"], "confirmation_fingerprint": prepared["confirmation_fingerprint"], "user_confirmation": "确认"})
+            self.assertEqual(submitted["task_id"], "fixture-task-1")
+            self.assertEqual(self.server.posts, 1)
+            self.assertEqual(self.server.last_payload["model"], "test-image-model")
+            self.assertTrue(self.server.last_headers.get("Idempotency-Key"))
+            with self.assertRaises(self.module.MediaError):
+                self.module.media_submit({"confirmation_id": prepared["confirmation_id"], "confirmation_fingerprint": prepared["confirmation_fingerprint"], "user_confirmation": "确认"})
+            checked = self.module.media_check({"confirmation_id": prepared["confirmation_id"], "confirmation_fingerprint": prepared["confirmation_fingerprint"]})
+            self.assertEqual(checked["state"], "completed")
+            self.assertEqual(self.server.gets, 1)
 
-            module.request_json = sync_request
-            result = module.submit_image_task(
-                "https://images.example/api",
-                {"prompt": "test"},
-                agent_id="gateway-route",
-                idempotency_key="a" * 64,
-                confirmation_id="confirmation-sync",
-            )
-            self.assertEqual(result["kind"], "sync")
-            self.assertEqual(len(calls), 1)
-            self.assertEqual(calls[0][1]["headers"]["Idempotency-Key"], "a" * 64)
-            with self.assertRaisesRegex(RuntimeError, "拒绝再次 POST"):
-                module.submit_image_task(
-                    "https://images.example/api",
-                    {"prompt": "test"},
-                    agent_id="gateway-route",
-                    idempotency_key="a" * 64,
-                    confirmation_id="confirmation-sync",
-                )
-            self.assertEqual(len(calls), 1)
+    def test_minimax_is_reserved_for_the_shared_wokey_media_slot(self):
+        with adapter_environment(self.env):
+            capabilities = self.module._configured()
+            self.assertFalse(capabilities["providers"]["minimax-video"]["configured"])
+            with self.assertRaisesRegex(self.module.MediaError, "尚未配置 MiniMax 视频模型"):
+                self.module.media_prepare({"provider": "minimax-video", "prompt": "No fallback"})
 
-            calls.clear()
+        env = dict(
+            self.env,
+            MEDIA_GENERATION_API_PROFILE="wokey",
+            MEDIA_GENERATION_API_BASE_URL="https://api.wokey.ai",
+            MEDIA_MINIMAX_VIDEO_MODEL="upstream-minimax-video",
+        )
+        with adapter_environment(env):
+            prepared = self.module.media_prepare({"provider": "minimax-video", "prompt": "Use the configured shared-upstream model"})
+            self.assertEqual(prepared["model"], "upstream-minimax-video")
+            record = self.module._load_json(self.data_dir / "confirmations" / f"{prepared['confirmation_id']}.json")
+            path, payload = self.module._request_payload(record["request"])
+            self.assertEqual(path, "/v1/videos")
+            self.assertEqual(payload["model"], "upstream-minimax-video")
+            self.assertEqual(self.module._query_path("minimax-video", "minimax-task"), "/v1/videos/minimax-task")
+            with self.assertRaisesRegex(self.module.MediaError, "只能使用统一媒体配置"):
+                self.module.media_prepare({"provider": "minimax-video", "model": "unconfigured-model", "prompt": "No model override"})
 
-            def async_request(*args, **kwargs):
-                calls.append((args, kwargs))
-                return {"task_id": "task-1", "status": "processing"}
+    def test_provider_payloads_and_mcp_stdio_contract(self):
+        with adapter_environment(self.env):
+            grok = self.module._validate_request({"provider": "grok-video", "prompt": "Move forward", "parameters": {"duration": 5, "aspect_ratio": "16:9"}})
+            path, payload = self.module._request_payload(grok)
+            self.assertEqual(path, "/v1/videos/generations")
+            self.assertEqual(payload["duration"], 5)
+            seedance = self.module._validate_request({"provider": "seedance-video", "prompt": "Keep order", "reference_media": [{"kind": "image", "url": "https://one.example/ref.png"}, {"kind": "video", "url": "https://two.example/ref.mp4"}]})
+            path, payload = self.module._request_payload(seedance)
+            self.assertEqual(path, "/api/llm/doubao/contents/generations/tasks")
+            self.assertEqual([item["role"] for item in payload["content"][1:]], ["reference_image", "reference_video"])
+            self.assertTrue(payload["generate_audio"])
+            self.assertTrue(payload["return_last_frame"])
+            self.assertFalse(payload["watermark"])
+            with self.assertRaisesRegex(self.module.MediaError, "generate_audio 必须为 true"):
+                self.module._validate_request({"provider": "seedance-video", "prompt": "silent output", "parameters": {"generate_audio": False}})
+        environment = os.environ.copy()
+        for name in list(environment):
+            if name.startswith(ADAPTER_ENV_PREFIXES):
+                environment.pop(name, None)
+        environment["MEDIA_GENERATION_DATA_DIR"] = str(self.data_dir / "protocol-data")
+        messages = [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "contract-test", "version": "1"}}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+        ]
+        result = subprocess.run([sys.executable, str(MEDIA_MCP_SCRIPT)], input="\n".join(json.dumps(item) for item in messages) + "\n", text=True, capture_output=True, env=environment, timeout=10, check=True)
+        responses = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+        self.assertEqual(responses[0]["result"]["serverInfo"]["name"], "codex-starter-media-generation")
+        self.assertEqual([item["name"] for item in responses[1]["result"]["tools"]], ["media_capabilities", "media_prepare", "media_submit", "media_check", "media_save"])
 
-            module.request_json = async_request
-            result = module.submit_image_task(
-                "https://images.example/api",
-                {"prompt": "test"},
-                agent_id="gateway-route",
-                idempotency_key="b" * 64,
-                confirmation_id="confirmation-async",
-            )
-            self.assertEqual(result, {"kind": "async", "task_id": "task-1"})
-            self.assertEqual(len(calls), 1)
-            repeated = module.submit_image_task(
-                "https://images.example/api",
-                {"prompt": "test"},
-                agent_id="gateway-route",
-                idempotency_key="b" * 64,
-                confirmation_id="confirmation-async",
-            )
-            self.assertTrue(repeated["deduplicated"])
-            self.assertEqual(repeated["task_id"], "task-1")
-            self.assertEqual(len(calls), 1)
-            module.update_image_submission(
-                "b" * 64,
-                "completed",
-                result={"success": True, "images": ["https://images.example/result.png"]},
-            )
-            completed = module.submit_image_task(
-                "https://images.example/api",
-                {"prompt": "test"},
-                agent_id="gateway-route",
-                idempotency_key="b" * 64,
-                confirmation_id="confirmation-async",
-            )
-            self.assertEqual(completed["kind"], "completed")
-            self.assertEqual(len(calls), 1)
+    def test_wokey_profile_uses_wokey_image_and_video_contracts(self):
+        env = dict(self.env, MEDIA_GENERATION_API_PROFILE="wokey", MEDIA_GENERATION_API_BASE_URL="https://api.wokey.ai")
+        with adapter_environment(env):
+            image = self.module._validate_request({"provider": "image-2", "model": "gpt-image-2", "prompt": "A test image", "parameters": {"size": "2048x2048", "n": 1}})
+            path, payload = self.module._request_payload(image)
+            self.assertEqual(path, "/v1/images/generations")
+            self.assertEqual(payload["model"], "gpt-image-2")
 
-    def test_service_and_remote_url_guards(self):
-        module = load_module(IMAGE_SCRIPT)
-        for value in (
-            "http://images.example",
-            "https://user:pass@images.example",
-            "https://images.example/api",
-        ):
-            with self.subTest(value=value), self.assertRaises(RuntimeError):
-                module.validate_service_base_url(value)
-        for value in (
-            "http://example.com/a.png",
-            "https://localhost/a.png",
-            "https://127.0.0.1/a.png",
-            "https://169.254.169.254/latest/meta-data",
-        ):
-            with self.subTest(value=value), self.assertRaises(RuntimeError):
-                module.validate_remote_image_url(value)
+            grok = self.module._validate_request({"provider": "grok-video", "model": "grok-imagine-video-1.5", "prompt": "A one second test", "parameters": {"duration": 1, "aspect_ratio": "16:9", "resolution": "480p"}})
+            path, payload = self.module._request_payload(grok)
+            self.assertEqual(path, "/v1/videos")
+            self.assertEqual(payload["duration_seconds"], 1)
+            self.assertEqual(payload["video_resolution"], "480p")
+            self.assertEqual(payload["mode"], "text_to_video")
+            self.assertEqual(self.module._query_path("grok-video", "video-test"), "/v1/videos/video-test")
 
-    def test_duplicate_local_references_are_kept_and_hash_locked(self):
-        module = load_module(IMAGE_SCRIPT)
-        with tempfile.TemporaryDirectory() as directory:
-            image = Path(directory) / "reference.png"
-            original = b"\x89PNG\r\n\x1a\ncontract"
-            image.write_bytes(original)
-            manifest = module.build_confirmation_manifest(
-                prompt="保留两次相同参考图",
-                images=[str(image), str(image)],
-                size="2048x2048",
-                model="configured-model",
-                agent_id="gateway-route",
-            )
-            request = manifest["request"]
-            self.assertEqual(request["image_count"], 2)
-            self.assertEqual(request["images"], [str(image.resolve()), str(image.resolve())])
-            self.assertEqual(len(request["image_integrity"]), 2)
-            module.validate_confirmation_manifest(manifest, manifest["fingerprint"])
+            seedance = self.module._validate_request({"provider": "seedance-video", "model": "jimeng-seedance-2.0-mini", "prompt": "A four second test", "parameters": {"duration": 4, "ratio": "16:9"}})
+            path, payload = self.module._request_payload(seedance)
+            self.assertEqual(path, "/v1/videos")
+            self.assertEqual(payload["duration_seconds"], 4)
+            self.assertEqual(payload["video_resolution"], "720p")
+            self.assertEqual(self.module._query_path("seedance-video", "video-test"), "/v1/videos/video-test")
 
-            image.write_bytes(original[:-1] + b"X")
-            with self.assertRaisesRegex(RuntimeError, "内容发生变化"):
-                module.validate_confirmation_manifest(manifest, manifest["fingerprint"])
+            artifacts = self.module._artifacts({"status": "completed", "content_url": "/v1/videos/video-test/content"})
+            self.assertEqual(artifacts, [{"kind": "video", "url": "https://api.wokey.ai/v1/videos/video-test/content"}])
 
-    def test_model_and_agent_are_not_guessed(self):
-        module = load_module(IMAGE_SCRIPT)
-        with self.assertRaisesRegex((ValueError, RuntimeError), "MODEL|模型"):
-            module.build_confirmation_manifest("prompt", [], "2048x2048", "", "route")
-        with self.assertRaisesRegex(RuntimeError, "agent_id"):
-            module.build_confirmation_manifest("prompt", [], "2048x2048", "model", "")
+    def test_wokey_auto_profile_removes_legacy_agent_requirement(self):
+        env = dict(self.env, MEDIA_GENERATION_API_PROFILE="auto", MEDIA_GENERATION_API_BASE_URL="https://api.wokey.ai")
+        env.pop("MEDIA_GENERATION_AGENT_ID")
+        with adapter_environment(env):
+            configured = self.module._configured()
+            self.assertEqual(configured["api_profile"], "wokey")
+            self.assertTrue(configured["providers"]["image-2"]["configured"])
+            self.assertTrue(configured["providers"]["seedance-video"]["configured"])
 
-
-class SeedanceAdapterTests(unittest.TestCase):
-    def test_model_and_provider_policy_are_not_guessed(self):
-        module = load_module(SEEDANCE_SCRIPT)
-        error = module.adapter_policy_configuration_error()
-        self.assertIn("SEEDANCE_MODEL", error)
-        self.assertIn("SEEDANCE_PRECHARGE_POINTS", error)
-        self.assertIn("SEEDANCE_OFFICIAL_LINK_TTL_HOURS", error)
-        self.assertIn("SEEDANCE_REFUND_RULE", error)
-
-    def test_duplicate_media_order_is_preserved(self):
-        with tempfile.TemporaryDirectory() as directory:
-            module = load_module(
-                SEEDANCE_SCRIPT,
-                {
-                    "SEEDANCE_MODEL": "configured-video-model",
-                    "SEEDANCE_AGENT_ID": "gateway-route",
-                    "SEEDANCE_PRECHARGE_POINTS": "321",
-                    "SEEDANCE_OFFICIAL_LINK_TTL_HOURS": "12",
-                    "SEEDANCE_REFUND_RULE": "以服务方最终账单为准",
-                    "SEEDANCE_DATA_DIR": directory,
-                },
-            )
-            repeated = "https://media.example/reference.png?token=opaque"
-            built = module.build_video_request_payload(
-                prompt="制作一段城市日出短片",
-                duration=8,
-                image_paths=[repeated, repeated],
-            )
-            self.assertTrue(built["success"])
-            self.assertEqual(built["images"], [repeated, repeated])
-            self.assertEqual(
-                [item["image_url"]["url"] for item in built["payload"]["content"][1:]],
-                [repeated, repeated],
-            )
-
-            confirmation = module.build_confirmation_manifest(
-                agent_id="gateway-route",
-                prompt="制作一段城市日出短片",
-                duration=8,
-                image_paths=[repeated, repeated],
-            )
-            self.assertTrue(confirmation["success"])
-            self.assertEqual(confirmation["manifest"]["confirmation_policy"]["precharge_points"], 321)
-            self.assertEqual(confirmation["manifest"]["confirmation_policy"]["official_link_ttl_hours"], 12)
-            self.assertEqual(confirmation["manifest"]["request"]["images"], [repeated, repeated])
-
-    def test_https_and_root_service_url_are_required(self):
-        module = load_module(SEEDANCE_SCRIPT)
-        self.assertFalse(module.is_image_url("http://media.example/a.png"))
-        self.assertFalse(module.is_video_url("https://127.0.0.1/a.mp4"))
-        self.assertTrue(module.is_audio_url("https://media.example/a.mp3?token=opaque"))
-        for value in (
-            "http://video.example",
-            "https://user:pass@video.example",
-            "https://video.example/api",
-        ):
-            with self.subTest(value=value), self.assertRaises(ValueError):
-                module.validate_service_base_url(value)
-
-    def test_records_and_outputs_are_outside_installed_skill(self):
-        module = load_module(SEEDANCE_SCRIPT)
-        installed_script_dir = SEEDANCE_SCRIPT.parent.resolve()
-        self.assertNotEqual(module.TASK_RECORDS_PATH.parent.resolve(), installed_script_dir)
-        self.assertNotIn("createContent", str(module.resolve_video_output_dir("main")))
-        with self.assertRaisesRegex(ValueError, "Skill 目录"):
-            module.resolve_video_output_dir("main", output_dir=installed_script_dir)
-        with self.assertRaises(ValueError):
-            module.normalize_agent_id("bad\r\nheader")
-
-    def test_adapter_contains_no_session_history_reader(self):
-        code = SEEDANCE_SCRIPT.read_text(encoding="utf-8")
-        for marker in ("session_file_path", "extract_media_from_session", "get_session_file_path"):
-            self.assertNotIn(marker, code)
 
 
 class DashScopeAdapterTests(unittest.TestCase):

@@ -22,6 +22,9 @@ pub const ANCHOR_SCHEMA_V2: u32 = 2;
 pub const ANCHOR_SCHEMA_V3: u32 = 3;
 pub const PRODUCT_ID: &str = "codex-usb-oneclick";
 pub const LICENSE_FILE_NAME: &str = "usb-license.json";
+pub const REVOCATION_REGISTRATION_FILE_NAME: &str = "usb-license-revocation-registration.json";
+pub const REVOCATION_REGISTRATION_DOMAIN: &str = "codex-usb-revocation-registration-v1";
+pub const REVOCATION_REGISTRATION_DOMAIN_V2: &str = "codex-usb-revocation-registration-v2";
 
 /// Errors are deliberately owned by this crate so an adapter can map them to
 /// its application error type without making the core depend on the manager.
@@ -145,6 +148,283 @@ pub struct UsbLicense {
     pub account_binding: Option<UsbAccountBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
+}
+
+/// Minimal, signed registration data sent to the revocation service. It is
+/// intentionally separate from UsbLicense: only the public 404token asset
+/// number may be copied from accountBinding; account details and credentials
+/// are never transmitted.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RevocationRegistrationPayload {
+    pub schema_version: u32,
+    pub domain: String,
+    pub product: String,
+    pub installation_id: String,
+    pub license_key_id: String,
+    pub license_signature_sha256: String,
+    pub fingerprint_sha256: String,
+    pub issued_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usb_asset_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RevocationRegistrationEnvelope {
+    pub payload_b64: String,
+    pub signature_b64: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RegistrationPayloadFields<'a> {
+    schema_version: u32,
+    domain: &'a str,
+    product: &'a str,
+    installation_id: &'a str,
+    license_key_id: &'a str,
+    license_signature_sha256: &'a str,
+    fingerprint_sha256: &'a str,
+    issued_at: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usb_asset_id: Option<&'a str>,
+}
+
+/// Canonical binary digest for the USB fingerprint registration protocol.
+/// This deliberately avoids JSON serialization differences between clients
+/// and the VPS implementation.
+pub fn fingerprint_digest(fingerprint: &UsbFingerprint) -> Result<String> {
+    validate_fingerprint(fingerprint)?;
+    let anchor = hex_decode_32(&fingerprint.anchor_sha256)
+        .ok_or_else(|| LicenseError::InvalidAnchorSha256(fingerprint.anchor_sha256.clone()))?;
+    let relative = fingerprint
+        .bundle_relative_path
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    validate_bundle_relative_path(&relative)?;
+    let relative_bytes = relative.as_bytes();
+    let relative_len = u32::try_from(relative_bytes.len())
+        .map_err(|_| LicenseError::InvalidBundleRelativePath(relative.clone()))?;
+    let mut digest = Sha256::new();
+    digest.update(b"codex-usb-fingerprint-v1\0");
+    digest.update(fingerprint.anchor_schema.to_be_bytes());
+    digest.update(fingerprint.volume_serial.to_be_bytes());
+    digest.update(anchor);
+    digest.update(relative_len.to_be_bytes());
+    digest.update(relative_bytes);
+    Ok(hex_lower(&digest.finalize()))
+}
+
+pub fn license_signature_sha256(license: &UsbLicense) -> Result<String> {
+    let signature = license
+        .signature
+        .as_deref()
+        .ok_or(LicenseError::MissingSignature)?;
+    let decoded = BASE64
+        .decode(signature.trim())
+        .map_err(|source| LicenseError::Base64 {
+            what: "license signature",
+            source,
+        })?;
+    if decoded.len() != 64 {
+        return Err(LicenseError::InvalidSignature);
+    }
+    Ok(hex_lower(&Sha256::digest(decoded)))
+}
+
+/// Return the exact UTF-8 bytes covered by the registration signature. V1
+/// keeps its original byte layout; v2 appends only `usbAssetId`.
+pub fn registration_payload_bytes(payload: &RevocationRegistrationPayload) -> Result<Vec<u8>> {
+    validate_registration_payload(payload)?;
+    serde_json::to_vec(&RegistrationPayloadFields {
+        schema_version: payload.schema_version,
+        domain: &payload.domain,
+        product: &payload.product,
+        installation_id: &payload.installation_id,
+        license_key_id: &payload.license_key_id,
+        license_signature_sha256: &payload.license_signature_sha256,
+        fingerprint_sha256: &payload.fingerprint_sha256,
+        issued_at: &payload.issued_at,
+        usb_asset_id: payload.usb_asset_id.as_deref(),
+    })
+    .map_err(LicenseError::from)
+}
+
+pub fn new_registration_payload(license: &UsbLicense) -> Result<RevocationRegistrationPayload> {
+    validate_license_metadata(license)?;
+    let license_key_id = license
+        .key_id
+        .as_deref()
+        .ok_or(LicenseError::MissingKeyId)?;
+    let usb_asset_id = license
+        .account_binding
+        .as_ref()
+        .map(|binding| binding.usb_asset_id.clone());
+    let (schema_version, domain) = if usb_asset_id.is_some() {
+        (2, REVOCATION_REGISTRATION_DOMAIN_V2)
+    } else {
+        (1, REVOCATION_REGISTRATION_DOMAIN)
+    };
+    let payload = RevocationRegistrationPayload {
+        schema_version,
+        domain: domain.to_string(),
+        product: PRODUCT_ID.to_string(),
+        installation_id: license.installation_id.clone(),
+        license_key_id: license_key_id.to_string(),
+        license_signature_sha256: license_signature_sha256(license)?,
+        fingerprint_sha256: fingerprint_digest(&license.fingerprint)?,
+        issued_at: license.issued_at.clone(),
+        usb_asset_id,
+    };
+    validate_registration_payload(&payload)?;
+    Ok(payload)
+}
+
+pub fn sign_registration(
+    license: &UsbLicense,
+    signing_key: &SigningKey,
+) -> Result<RevocationRegistrationEnvelope> {
+    let payload = new_registration_payload(license)?;
+    let payload_bytes = registration_payload_bytes(&payload)?;
+    Ok(RevocationRegistrationEnvelope {
+        payload_b64: BASE64.encode(&payload_bytes),
+        signature_b64: BASE64.encode(signing_key.sign(&payload_bytes).to_bytes()),
+    })
+}
+
+pub fn verify_registration(
+    envelope: &RevocationRegistrationEnvelope,
+    license: &UsbLicense,
+    expected: &UsbFingerprint,
+    public_key_b64: &str,
+) -> Result<RevocationRegistrationPayload> {
+    let payload_bytes = BASE64
+        .decode(envelope.payload_b64.trim())
+        .map_err(|source| LicenseError::Base64 {
+            what: "registration payload",
+            source,
+        })?;
+    let signature_bytes = BASE64
+        .decode(envelope.signature_b64.trim())
+        .map_err(|source| LicenseError::Base64 {
+            what: "registration signature",
+            source,
+        })?;
+    let signature_array: [u8; 64] = signature_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| LicenseError::InvalidSignature)?;
+    let key_bytes =
+        BASE64
+            .decode(public_key_b64.trim())
+            .map_err(|source| LicenseError::Base64 {
+                what: "public key",
+                source,
+            })?;
+    let key_array: [u8; 32] = key_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| LicenseError::InvalidPublicKeyLength)?;
+    let key = VerifyingKey::from_bytes(&key_array).map_err(LicenseError::PublicKey)?;
+    let signature = Signature::from_bytes(&signature_array);
+    key.verify(&payload_bytes, &signature)
+        .map_err(|_| LicenseError::InvalidSignature)?;
+    let payload: RevocationRegistrationPayload = serde_json::from_slice(&payload_bytes)?;
+    validate_registration_payload(&payload)?;
+    let expected_payload = new_registration_payload(license)?;
+    let legacy_payload = RevocationRegistrationPayload {
+        schema_version: 1,
+        domain: REVOCATION_REGISTRATION_DOMAIN.to_string(),
+        product: expected_payload.product.clone(),
+        installation_id: expected_payload.installation_id.clone(),
+        license_key_id: expected_payload.license_key_id.clone(),
+        license_signature_sha256: expected_payload.license_signature_sha256.clone(),
+        fingerprint_sha256: expected_payload.fingerprint_sha256.clone(),
+        issued_at: expected_payload.issued_at.clone(),
+        usb_asset_id: None,
+    };
+    let payload_matches = payload == expected_payload
+        || (expected_payload.usb_asset_id.is_some() && payload == legacy_payload);
+    if !payload_matches || !fingerprints_match(&license.fingerprint, expected) {
+        return Err(LicenseError::FingerprintMismatch);
+    }
+    Ok(payload)
+}
+
+fn validate_registration_payload(payload: &RevocationRegistrationPayload) -> Result<()> {
+    let version_matches = match (payload.schema_version, payload.domain.as_str()) {
+        (1, REVOCATION_REGISTRATION_DOMAIN) => payload.usb_asset_id.is_none(),
+        (2, REVOCATION_REGISTRATION_DOMAIN_V2) => payload
+            .usb_asset_id
+            .as_deref()
+            .is_some_and(valid_usb_asset_id),
+        _ => false,
+    };
+    if !version_matches || payload.product != PRODUCT_ID {
+        return Err(LicenseError::InvalidProduct {
+            expected: PRODUCT_ID,
+            actual: payload.product.clone(),
+        });
+    }
+    if Uuid::parse_str(&payload.installation_id).is_err() {
+        return Err(LicenseError::InvalidInstallationId(
+            payload.installation_id.clone(),
+        ));
+    }
+    validate_key_id(&payload.license_key_id)?;
+    for (name, value) in [
+        (
+            "licenseSignatureSha256",
+            payload.license_signature_sha256.as_str(),
+        ),
+        ("fingerprintSha256", payload.fingerprint_sha256.as_str()),
+    ] {
+        if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(LicenseError::InvalidAnchorSha256(format!(
+                "{name}: {value}"
+            )));
+        }
+    }
+    if payload.issued_at.parse::<u64>().is_err() {
+        return Err(LicenseError::InvalidIssuedAt(payload.issued_at.clone()));
+    }
+    Ok(())
+}
+
+fn valid_usb_asset_id(value: &str) -> bool {
+    let Some(suffix) = value.strip_prefix("USB-") else {
+        return false;
+    };
+    !suffix.is_empty()
+        && value.len() <= 64
+        && suffix.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn hex_decode_32(value: &str) -> Option<[u8; 32]> {
+    if value.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let hi = hex_nibble(pair[0])?;
+        let lo = hex_nibble(pair[1])?;
+        out[index] = (hi << 4) | lo;
+    }
+    Some(out)
+}
+
+fn hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// Return whether an anchor schema is understood by this version of the
@@ -513,10 +793,11 @@ pub fn raw_anchor_sha256(bundle_root: &Path) -> Result<String> {
     Ok(finish_anchor(hasher))
 }
 
-fn read_anchor_json(bundle_root: &Path, name: &str) -> Result<serde_json::Value> {
-    let path = bundle_root.join(name);
-    let bytes = fs::read(&path).map_err(|source| io_error(&path, source))?;
-    serde_json::from_slice(&bytes).map_err(LicenseError::from)
+fn raw_anchor_sha256_from_bytes(manifest_bytes: &[u8], usb_manifest_bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    update_anchor_part(&mut hasher, "manifest.json", manifest_bytes);
+    update_anchor_part(&mut hasher, "usb-manifest.json", usb_manifest_bytes);
+    finish_anchor(hasher)
 }
 
 fn remove_v2_mutable_fields(value: &mut serde_json::Value, name: &str) {
@@ -589,12 +870,6 @@ fn canonical_json_bytes(value: &serde_json::Value) -> Result<Vec<u8>> {
     let mut output = Vec::new();
     write_canonical_json(value, &mut output)?;
     Ok(output)
-}
-
-fn canonical_checksum_rows(bundle_root: &Path, payload_relative_path: &str) -> Result<Vec<u8>> {
-    let path = bundle_root.join("SHA256SUMS.txt");
-    let bytes = fs::read(&path).map_err(|source| io_error(&path, source))?;
-    canonical_checksum_rows_from_bytes(&bytes, payload_relative_path, ChecksumRowsMode::LegacyV2)
 }
 
 #[derive(Clone, Copy)]
@@ -750,10 +1025,30 @@ fn canonical_checksum_rows_from_bytes(
 /// Hash the v2 canonical representation.  Only the explicitly allow-listed
 /// mutable release metadata is removed; every other JSON value participates.
 pub fn canonical_anchor_sha256(bundle_root: &Path) -> Result<String> {
+    let manifest_path = bundle_root.join("manifest.json");
+    let usb_manifest_path = bundle_root.join("usb-manifest.json");
+    let checksum_path = bundle_root.join("SHA256SUMS.txt");
+    let manifest_bytes =
+        fs::read(&manifest_path).map_err(|source| io_error(&manifest_path, source))?;
+    let usb_manifest_bytes =
+        fs::read(&usb_manifest_path).map_err(|source| io_error(&usb_manifest_path, source))?;
+    let checksum_bytes =
+        fs::read(&checksum_path).map_err(|source| io_error(&checksum_path, source))?;
+    canonical_anchor_sha256_from_bytes(&manifest_bytes, &usb_manifest_bytes, &checksum_bytes)
+}
+
+fn canonical_anchor_sha256_from_bytes(
+    manifest_bytes: &[u8],
+    usb_manifest_bytes: &[u8],
+    checksum_bytes: &[u8],
+) -> Result<String> {
     let mut hasher = Sha256::new();
     let mut payload_relative_path = None;
-    for name in ["manifest.json", "usb-manifest.json"] {
-        let mut value = read_anchor_json(bundle_root, name)?;
+    for (name, bytes) in [
+        ("manifest.json", manifest_bytes),
+        ("usb-manifest.json", usb_manifest_bytes),
+    ] {
+        let mut value = serde_json::from_slice::<serde_json::Value>(bytes)?;
         if name == "manifest.json" {
             let payload_path = value
                 .pointer("/payload/path")
@@ -773,7 +1068,11 @@ pub fn canonical_anchor_sha256(bundle_root: &Path) -> Result<String> {
     let payload_relative_path = payload_relative_path.ok_or_else(|| {
         LicenseError::InvalidChecksumFile("无法确定当前 payload 路径".to_string())
     })?;
-    let canonical_sums = canonical_checksum_rows(bundle_root, &payload_relative_path)?;
+    let canonical_sums = canonical_checksum_rows_from_bytes(
+        checksum_bytes,
+        &payload_relative_path,
+        ChecksumRowsMode::LegacyV2,
+    )?;
     update_anchor_part(&mut hasher, "SHA256SUMS.txt", &canonical_sums);
     Ok(finish_anchor(hasher))
 }
@@ -864,6 +1163,10 @@ pub fn stable_anchor_sha256(bundle_root: &Path) -> Result<String> {
 pub fn bundle_anchor_schema(bundle_root: &Path) -> Result<u32> {
     let path = bundle_root.join("usb-manifest.json");
     let bytes = fs::read(&path).map_err(|source| io_error(&path, source))?;
+    bundle_anchor_schema_from_bytes(&bytes)
+}
+
+fn bundle_anchor_schema_from_bytes(bytes: &[u8]) -> Result<u32> {
     let value = match serde_json::from_slice::<serde_json::Value>(&bytes) {
         Ok(value) => value,
         Err(_) => return Ok(ANCHOR_SCHEMA_V1),
@@ -895,10 +1198,54 @@ pub fn bundle_anchor_schema(bundle_root: &Path) -> Result<u32> {
 /// Hash the bundle using the representation selected by its explicit
 /// capability.
 pub fn anchor_sha256(bundle_root: &Path) -> Result<String> {
-    match bundle_anchor_schema(bundle_root)? {
-        ANCHOR_SCHEMA_V1 => raw_anchor_sha256(bundle_root),
-        ANCHOR_SCHEMA_V2 => canonical_anchor_sha256(bundle_root),
-        ANCHOR_SCHEMA_V3 => stable_anchor_sha256(bundle_root),
+    let manifest_path = bundle_root.join("manifest.json");
+    let usb_manifest_path = bundle_root.join("usb-manifest.json");
+    let manifest_bytes =
+        fs::read(&manifest_path).map_err(|source| io_error(&manifest_path, source))?;
+    let usb_manifest_bytes =
+        fs::read(&usb_manifest_path).map_err(|source| io_error(&usb_manifest_path, source))?;
+    let anchor_schema = bundle_anchor_schema_from_bytes(&usb_manifest_bytes)?;
+    let checksum_bytes = if matches!(anchor_schema, ANCHOR_SCHEMA_V2 | ANCHOR_SCHEMA_V3) {
+        let checksum_path = bundle_root.join("SHA256SUMS.txt");
+        Some(fs::read(&checksum_path).map_err(|source| io_error(&checksum_path, source))?)
+    } else {
+        None
+    };
+    anchor_sha256_from_bytes(
+        &manifest_bytes,
+        &usb_manifest_bytes,
+        checksum_bytes.as_deref(),
+    )
+}
+
+/// Compute the anchor using a caller-captured metadata snapshot. This lets a
+/// verifier bind policy decisions made from parsed JSON to the exact same
+/// bytes that participate in the license anchor, avoiding a manifest reread
+/// window between policy parsing and signature verification.
+pub fn anchor_sha256_from_bytes(
+    manifest_bytes: &[u8],
+    usb_manifest_bytes: &[u8],
+    checksum_bytes: Option<&[u8]>,
+) -> Result<String> {
+    match bundle_anchor_schema_from_bytes(usb_manifest_bytes)? {
+        ANCHOR_SCHEMA_V1 => Ok(raw_anchor_sha256_from_bytes(
+            manifest_bytes,
+            usb_manifest_bytes,
+        )),
+        ANCHOR_SCHEMA_V2 => canonical_anchor_sha256_from_bytes(
+            manifest_bytes,
+            usb_manifest_bytes,
+            checksum_bytes.ok_or_else(|| {
+                LicenseError::InvalidChecksumFile("schema 2 缺少 SHA256SUMS.txt 快照".to_string())
+            })?,
+        ),
+        ANCHOR_SCHEMA_V3 => stable_anchor_sha256_from_bytes(
+            manifest_bytes,
+            usb_manifest_bytes,
+            checksum_bytes.ok_or_else(|| {
+                LicenseError::InvalidChecksumFile("schema 3 缺少 SHA256SUMS.txt 快照".to_string())
+            })?,
+        ),
         other => Err(LicenseError::UnsupportedAnchorSchema(other)),
     }
 }
@@ -1453,5 +1800,64 @@ mod tests {
             Err(LicenseError::InvalidAnchorSchemaType)
         ));
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn registration_payload_is_minimal_fixed_order_and_round_trips() {
+        let signing_key = key();
+        let public_key = BASE64.encode(signing_key.verifying_key().to_bytes());
+        let mut license = sample(ANCHOR_SCHEMA_V3);
+        license.account_binding = Some(UsbAccountBinding {
+            schema_version: 1,
+            usb_asset_id: "USB-123".into(),
+            account_ref: "USB-123".into(),
+            account_name: "USB-123".into(),
+            login_email: "private@example.invalid".into(),
+            sub2api_user_id: 7,
+            ccswitch: UsbCcswitchBinding {
+                provider_id: "provider".into(),
+                credential_id: "credential".into(),
+                device_api_key: "secret-key".into(),
+                group_id: 9,
+            },
+        });
+        sign_license(&mut license, &signing_key).unwrap();
+        let envelope = sign_registration(&license, &signing_key).unwrap();
+        let bytes = BASE64.decode(&envelope.payload_b64).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.starts_with(
+            r#"{"schemaVersion":2,"domain":"codex-usb-revocation-registration-v2","product":"codex-usb-oneclick","installationId":"00000000-0000-0000-0000-000000000001","licenseKeyId":"prod-2026-01","licenseSignatureSha256":""#
+        ));
+        assert!(text.ends_with(r#","usbAssetId":"USB-123"}"#));
+        assert!(!text.contains("accountBinding"));
+        assert!(!text.contains("private@example.invalid"));
+        assert!(!text.contains("secret-key"));
+        let verified =
+            verify_registration(&envelope, &license, &license.fingerprint, &public_key).unwrap();
+        assert_eq!(verified.installation_id, license.installation_id);
+        assert_eq!(
+            verified.fingerprint_sha256,
+            fingerprint_digest(&license.fingerprint).unwrap()
+        );
+
+        let mut tampered = envelope;
+        tampered.payload_b64 = BASE64.encode(br#"{"schemaVersion":1}"#);
+        assert!(
+            verify_registration(&tampered, &license, &license.fingerprint, &public_key,).is_err()
+        );
+    }
+
+    #[test]
+    fn fingerprint_digest_normalizes_case_slashes_and_rejects_escape_paths() {
+        let mut first = sample(ANCHOR_SCHEMA_V3).fingerprint;
+        let mut second = first.clone();
+        second.anchor_sha256 = second.anchor_sha256.to_ascii_uppercase();
+        second.bundle_relative_path = "CODEX-USB".into();
+        assert_eq!(
+            fingerprint_digest(&first).unwrap(),
+            fingerprint_digest(&second).unwrap()
+        );
+        first.bundle_relative_path = "../outside".into();
+        assert!(fingerprint_digest(&first).is_err());
     }
 }

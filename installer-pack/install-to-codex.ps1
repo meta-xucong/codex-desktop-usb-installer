@@ -9,8 +9,10 @@ param(
     [string]$FeishuDomain = 'https://open.feishu.cn',
     [string[]]$EnableSkills = @(),
     [string[]]$EnabledApiServices = @(),
+    [string[]]$EnabledRemoteMcps = @(),
     [switch]$EnableFeishu,
-    [switch]$DisableFeishu
+    [switch]$DisableFeishu,
+    [switch]$EnableMediaGeneration
 )
 
 $ErrorActionPreference = 'Stop'
@@ -151,6 +153,10 @@ foreach ($targetRoot in @($agentTarget, $skillTarget, $ownershipRoot)) {
 $previousFiles = @()
 if (Test-Path -LiteralPath $ownershipFile -PathType Leaf) {
     try {
+        # The ownership manifest contains the absolute user profile path.  It
+        # can therefore contain non-ASCII characters (for example a Chinese
+        # Windows account/folder name); Windows PowerShell 5.1 otherwise reads
+        # the UTF-8 JSON using the legacy code page and rejects valid escapes.
         $previousRecord = Get-Content -LiteralPath $ownershipFile -Raw -Encoding UTF8 | ConvertFrom-Json
         if ([int]$previousRecord.schemaVersion -notin @(3,4) -or [string]$previousRecord.packId -ne [string]$pack.id) { throw 'Ownership record identity is invalid.' }
         if (-not ([IO.Path]::GetFullPath([string]$previousRecord.agentRoot)).Equals([IO.Path]::GetFullPath($agentTarget), [StringComparison]::OrdinalIgnoreCase) -or
@@ -270,6 +276,26 @@ if ($IncludeNonDefault) {
     $skillNames = @($skillAudit.skills | Where-Object { $IncludeUnsupported -or ([string]$_.afterRemediationStatus) -ne 'unsupported' } | ForEach-Object { [string]$_.id })
 }
 
+# The native USB installer selects API services directly, bypassing the PowerShell
+# connection wizard. Keep each selected API usable by enabling its companion Skill.
+$apiServicesFile = Join-Path $PackRoot 'manifest\api-services.json'
+if (@($EnabledApiServices).Count -gt 0 -and (Test-Path -LiteralPath $apiServicesFile -PathType Leaf)) {
+    $apiServiceManifest = Get-Content -LiteralPath $apiServicesFile -Raw -Encoding UTF8 | ConvertFrom-Json
+    $selectedApiSkills = @(
+        $apiServiceManifest.services |
+            Where-Object { @($EnabledApiServices) -contains [string]$_.id } |
+            ForEach-Object { @($_.relatedSkills) }
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }
+    $skillNames = @(@($skillNames) + @($selectedApiSkills) | Select-Object -Unique)
+}
+if ($EnableMediaGeneration) {
+    $mcpServicesFile = Join-Path $PackRoot 'manifest\mcp-servers.json'
+    if (-not (Test-Path -LiteralPath $mcpServicesFile -PathType Leaf)) { throw "Missing MCP manifest in pack: $mcpServicesFile" }
+    $mediaService = Get-Content -LiteralPath $mcpServicesFile -Raw -Encoding UTF8 | ConvertFrom-Json
+    $mediaSkills = @($mediaService.servers | Where-Object { [string]$_.id -eq 'media-generation' } | ForEach-Object { @($_.relatedSkills) })
+    $skillNames = @(@($skillNames) + @($mediaSkills) | Select-Object -Unique)
+}
+
 Write-Host "Agents target: $agentTarget"
 foreach ($relativeAgent in $agentFiles) {
     $relative = ([string]$relativeAgent) -replace '/', '\'
@@ -310,17 +336,21 @@ foreach ($skillName in $skillNames) {
 
 $supportFiles = @(
     @{ source = 'mcp/start-feishu-mcp.ps1'; destination = (Join-Path $ownershipRoot 'bin\start-feishu-mcp.ps1'); kind = 'mcp-wrapper' },
+    @{ source = 'mcp/start-media-generation-mcp.ps1'; destination = (Join-Path $ownershipRoot 'bin\start-media-generation-mcp.ps1'); kind = 'mcp-wrapper' },
+    @{ source = 'mcp/media-generation-mcp.py'; destination = (Join-Path $ownershipRoot 'bin\media-generation-mcp.py'); kind = 'mcp-server' },
     @{ source = 'sync-model-catalog.ps1'; destination = (Join-Path $ownershipRoot 'bin\sync-model-catalog.ps1'); kind = 'model-sync' },
     @{ source = 'model-catalog.json'; destination = (Join-Path $ownershipRoot 'model-catalog.json'); kind = 'model-catalog' },
     @{ source = 'render-codex-config.ps1'; destination = (Join-Path $ownershipRoot 'bin\render-codex-config.ps1'); kind = 'config-renderer' },
     @{ source = 'configure-codex.ps1'; destination = (Join-Path $ownershipRoot 'bin\configure-codex.ps1'); kind = 'config-merger' },
     @{ source = 'audit-codex-compatibility.py'; destination = (Join-Path $ownershipRoot 'bin\audit-codex-compatibility.py'); kind = 'compatibility-auditor' },
     @{ source = 'manifest/feishu-tools.json'; destination = (Join-Path $ownershipRoot 'manifest\feishu-tools.json'); kind = 'tool-contract' },
+    @{ source = 'manifest/media-generation-tools.json'; destination = (Join-Path $ownershipRoot 'manifest\media-generation-tools.json'); kind = 'tool-contract' },
+    @{ source = 'manifest/mcp-servers.json'; destination = (Join-Path $ownershipRoot 'manifest\mcp-servers.json'); kind = 'mcp-catalog' },
     @{ source = 'manifest/skill-audit.json'; destination = (Join-Path $ownershipRoot 'manifest\skill-audit.json'); kind = 'audit-contract' },
     @{ source = 'config-fragments/feishu-official-stdio.template.toml'; destination = (Join-Path $ownershipRoot 'config-fragments\feishu-official-stdio.template.toml'); kind = 'config-template' },
     @{ source = 'mcp/dashscope-web-search.template.env'; destination = (Join-Path $ownershipRoot 'connections\dashscope-web-search.template.env'); kind = 'connection-template' },
-    @{ source = 'mcp/image-2.template.env'; destination = (Join-Path $ownershipRoot 'connections\image-2.template.env'); kind = 'connection-template' },
-    @{ source = 'mcp/seedance.template.env'; destination = (Join-Path $ownershipRoot 'connections\seedance.template.env'); kind = 'connection-template' }
+    @{ source = 'config-fragments/media-generation-stdio.template.toml'; destination = (Join-Path $ownershipRoot 'config-fragments\media-generation-stdio.template.toml'); kind = 'config-template' },
+    @{ source = 'mcp/media-generation.template.env'; destination = (Join-Path $ownershipRoot 'connections\media-generation.template.env'); kind = 'connection-template' }
 )
 foreach ($supportFile in $supportFiles) {
     $source = Resolve-PackOwnedFile ([string]$supportFile.source)
@@ -338,10 +368,33 @@ function Test-CurrentOwnership([string]$Path, [string]$Kind) {
 $feishuAppId = [Environment]::GetEnvironmentVariable('FEISHU_APP_ID', 'Process')
 $feishuAppSecret = [Environment]::GetEnvironmentVariable('FEISHU_APP_SECRET', 'Process')
 $feishuEnabled = if ($DisableFeishu) { $false } elseif ($EnableFeishu) { $true } else { (-not [string]::IsNullOrWhiteSpace($feishuAppId) -and $feishuAppId -match '^cli_[A-Za-z0-9_-]+$' -and -not [string]::IsNullOrWhiteSpace($feishuAppSecret) -and $feishuAppSecret.Length -ge 8) }
+$mediaApiBaseUrl = [Environment]::GetEnvironmentVariable('MEDIA_GENERATION_API_BASE_URL', 'Process')
+$mediaApiKey = [Environment]::GetEnvironmentVariable('MEDIA_GENERATION_API_KEY', 'Process')
+$mediaGenerationEnabled = [bool]$EnableMediaGeneration
+if ($mediaGenerationEnabled -and ([string]::IsNullOrWhiteSpace($mediaApiBaseUrl) -or [string]::IsNullOrWhiteSpace($mediaApiKey))) {
+    throw 'EnableMediaGeneration requires MEDIA_GENERATION_API_BASE_URL and MEDIA_GENERATION_API_KEY in the installer process.'
+}
+if ($mediaGenerationEnabled) {
+    $mediaModelEnvNames = @('MEDIA_IMAGE2_MODEL','MEDIA_GROK_IMAGE_MODEL','MEDIA_GROK_VIDEO_MODEL','MEDIA_SEEDANCE_MODEL','MEDIA_MINIMAX_VIDEO_MODEL')
+    $configuredMediaModels = @($mediaModelEnvNames | Where-Object { -not [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_, 'Process')) })
+    if ($configuredMediaModels.Count -eq 0) { throw 'EnableMediaGeneration requires at least one provider model ID.' }
+    if ((-not [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable('MEDIA_IMAGE2_MODEL', 'Process')) -or -not [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable('MEDIA_SEEDANCE_MODEL', 'Process'))) -and [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable('MEDIA_GENERATION_AGENT_ID', 'Process'))) {
+        throw 'EnableMediaGeneration requires MEDIA_GENERATION_AGENT_ID for Image-2 or Seedance.'
+    }
+    $minimaxVideoModel = [Environment]::GetEnvironmentVariable('MEDIA_MINIMAX_VIDEO_MODEL', 'Process')
+    if (-not [string]::IsNullOrWhiteSpace($minimaxVideoModel)) {
+        $mediaProfile = [Environment]::GetEnvironmentVariable('MEDIA_GENERATION_API_PROFILE', 'Process')
+        $mediaUri = $null
+        $baseIsWokey = [Uri]::TryCreate($mediaApiBaseUrl, [UriKind]::Absolute, [ref]$mediaUri) -and $mediaUri.Host.Equals('api.wokey.ai', [StringComparison]::OrdinalIgnoreCase)
+        if ($mediaProfile -eq 'legacy' -or ($mediaProfile -ne 'wokey' -and -not ($mediaProfile -eq 'auto' -and $baseIsWokey))) {
+            throw 'MiniMax video model is supported only through the shared upstream Wokey-compatible profile; the official MiniMax API is not used.'
+        }
+    }
+}
 
 function Redact-Diagnostic([string]$Text) {
     $result = if ($null -eq $Text) { '' } else { [string]$Text }
-    foreach ($name in @('FEISHU_APP_SECRET','FEISHU_USER_ACCESS_TOKEN','DASHSCOPE_API_KEY','IMAGE_2_API_KEY','SEEDANCE_API_KEY')) {
+    foreach ($name in @('FEISHU_APP_SECRET','FEISHU_USER_ACCESS_TOKEN','DASHSCOPE_API_KEY','MEDIA_GENERATION_API_KEY','MINIMAX_API_KEY')) {
         $value = [Environment]::GetEnvironmentVariable($name, 'Process')
         if (-not [string]::IsNullOrWhiteSpace($value)) { $result = $result.Replace($value, '<redacted>') }
     }
@@ -368,8 +421,14 @@ function Write-AsciiFile([string]$Path, [string]$Text) {
 }
 
 function Test-RuntimeReady([object]$State) {
-    if ([string]$State.status -ne 'ready' -or [string]$State.python.health -ne 'passed') { return $false }
-    if ([string]$State.node.health -notin @('passed','skipped')) { return $false }
+    if ([string]$State.status -notin @('ready','partial') -or [string]$State.python.health -ne 'passed') { return $false }
+    foreach ($key in @('manim','node','ffmpeg')) {
+        $component = $State.PSObject.Properties[$key]
+        if (-not $component -or [string]$component.Value.health -ne 'passed') { return $false }
+    }
+    $hyperframes = $State.PSObject.Properties['hyperframes']
+    if (-not $hyperframes -or [string]$hyperframes.Value.cliHealth -notin @('passed','requires-network')) { return $false }
+    if ([string]$hyperframes.Value.cliHealth -eq 'passed' -and [string]$hyperframes.Value.browserHealth -notin @('passed','requires-network')) { return $false }
     return [string]$State.feishu.health -in @('passed','disabled','skipped')
 }
 
@@ -385,8 +444,12 @@ $runtimeState = [ordered]@{
     status = 'failed'
     targetUserProfile = $userProfile
     python = [ordered]@{ executable = ''; baseInterpreter = ''; version = ''; wheelCount = 0; health = 'unknown' }
-    node = [ordered]@{ executable = ''; version = ''; health = 'disabled' }
+    manim = [ordered]@{ executable = ''; version = ''; health = 'unknown'; latex = 'optional-not-installed' }
+    node = [ordered]@{ executable = ''; version = ''; health = 'unknown' }
+    ffmpeg = [ordered]@{ executable = ''; ffprobe = ''; version = ''; health = 'unknown' }
+    hyperframes = [ordered]@{ executable = ''; command = ''; version = ''; cliHealth = 'unknown'; browserHealth = 'unknown'; health = 'unknown'; error = '' }
     feishu = [ordered]@{ packageRoot = ''; package = '@larksuiteoapi/lark-mcp@0.5.1'; health = if ($feishuEnabled) { 'unknown' } else { 'disabled' } }
+    mediaGeneration = [ordered]@{ health = if ($mediaGenerationEnabled) { 'unknown' } else { 'disabled' }; server = 'media-generation-mcp.py' }
     paths = [ordered]@{ kitHome = $ownershipRoot; runtimeRoot = (Join-Path $ownershipRoot 'runtime'); binRoot = (Join-Path $ownershipRoot 'bin') }
     secretsStored = $false
 }
@@ -431,9 +494,26 @@ if ([string]$runtimeState.python.health -eq 'passed') {
 }
 if ([string]$runtimeState.node.health -eq 'passed') {
     $newline = [Environment]::NewLine
-    Write-AsciiFile (Join-Path $ownershipRoot 'bin\node.cmd') ('@echo off' + $newline + '"%~dp0..\runtime\node-v20.20.0-win-x64\node.exe" %*' + $newline)
-    Write-AsciiFile (Join-Path $ownershipRoot 'bin\npm.cmd') ('@echo off' + $newline + '"%~dp0..\runtime\node-v20.20.0-win-x64\node.exe" "%~dp0..\runtime\node-v20.20.0-win-x64\node_modules\npm\bin\npm-cli.js" %*' + $newline)
-    $runtimeBinFiles += @((Join-Path $ownershipRoot 'bin\node.cmd'), (Join-Path $ownershipRoot 'bin\npm.cmd'))
+    Write-AsciiFile (Join-Path $ownershipRoot 'bin\node.cmd') ('@echo off' + $newline + '"%~dp0..\runtime\node-v22.22.0-win-x64\node.exe" %*' + $newline)
+    Write-AsciiFile (Join-Path $ownershipRoot 'bin\npm.cmd') ('@echo off' + $newline + '"%~dp0..\runtime\node-v22.22.0-win-x64\node.exe" "%~dp0..\runtime\node-v22.22.0-win-x64\node_modules\npm\bin\npm-cli.js" %*' + $newline)
+    Write-AsciiFile (Join-Path $ownershipRoot 'bin\npx.cmd') ('@echo off' + $newline + '"%~dp0..\runtime\node-v22.22.0-win-x64\node.exe" "%~dp0..\runtime\node-v22.22.0-win-x64\node_modules\npm\bin\npx-cli.js" %*' + $newline)
+    $runtimeBinFiles += @((Join-Path $ownershipRoot 'bin\node.cmd'), (Join-Path $ownershipRoot 'bin\npm.cmd'), (Join-Path $ownershipRoot 'bin\npx.cmd'))
+}
+if ([string]$runtimeState.manim.health -eq 'passed') {
+    Write-AsciiFile (Join-Path $ownershipRoot 'bin\manim.cmd') ('@echo off' + [Environment]::NewLine + '"%~dp0..\runtime\manim-env\Scripts\manim.exe" %*' + [Environment]::NewLine)
+    $runtimeBinFiles += (Join-Path $ownershipRoot 'bin\manim.cmd')
+}
+if ([string]$runtimeState.ffmpeg.health -eq 'passed') {
+    $newline = [Environment]::NewLine
+    $ffmpegRel = 'ffmpeg\ffmpeg-n9.0-latest-win64-lgpl-shared-9.0\bin'
+    foreach ($tool in @('ffmpeg','ffprobe','ffplay')) {
+        Write-AsciiFile (Join-Path $ownershipRoot ("bin\{0}.cmd" -f $tool)) ('@echo off' + $newline + ('"%~dp0..\runtime\{0}\{1}.exe" %*' -f $ffmpegRel,$tool) + $newline)
+        $runtimeBinFiles += (Join-Path $ownershipRoot ("bin\{0}.cmd" -f $tool))
+    }
+}
+if ([string]$runtimeState.hyperframes.cliHealth -eq 'passed') {
+    Write-AsciiFile (Join-Path $ownershipRoot 'bin\hyperframes.cmd') ('@echo off' + [Environment]::NewLine + 'call "%~dp0..\runtime\hyperframes\hyperframes.cmd" %*' + [Environment]::NewLine)
+    $runtimeBinFiles += (Join-Path $ownershipRoot 'bin\hyperframes.cmd')
 }
 foreach ($runtimeOwnedPath in @($runtimeStatePath, $pdfSmokeDiagnosticPath) + $runtimeBinFiles) {
     if (Test-Path -LiteralPath $runtimeOwnedPath -PathType Leaf) {
@@ -443,6 +523,7 @@ foreach ($runtimeOwnedPath in @($runtimeStatePath, $pdfSmokeDiagnosticPath) + $r
 }
 
 $wrapperTarget = Join-Path $ownershipRoot 'bin\start-feishu-mcp.ps1'
+$mediaWrapperTarget = Join-Path $ownershipRoot 'bin\start-media-generation-mcp.ps1'
 $rendererTarget = Join-Path $ownershipRoot 'bin\render-codex-config.ps1'
 $generatedConfig = Join-Path $ownershipRoot 'config\codex-starter.generated.toml'
 $feishuPackageCacheForRender = [string]$runtimeState.feishu.packageRoot
@@ -458,6 +539,7 @@ $renderArguments = @(
     '-OutputPath', $generatedConfig,
     '-SkillRoot', $skillTarget,
     '-FeishuWrapperPath', $wrapperTarget,
+    '-MediaMcpWrapperPath', $mediaWrapperTarget,
     '-FeishuPackageCache', $feishuPackageCacheForRender,
     '-TargetUserProfile', $userProfile,
     '-FeishuAuthMode', $FeishuAuthMode,
@@ -468,6 +550,11 @@ if (-not [string]::IsNullOrWhiteSpace([string]$runtimeState.python.executable)) 
     $renderArguments += @('-PythonExe', [string]$runtimeState.python.executable)
 }
 if ($feishuEnabled) { $renderArguments += '-EnableFeishu' }
+if ($mediaGenerationEnabled) { $renderArguments += '-EnableMediaGeneration' }
+if (@($EnabledRemoteMcps).Count -gt 0) {
+    $renderArguments += '-EnableRemoteMcps'
+    $renderArguments += @($EnabledRemoteMcps)
+}
 if (@($EnableSkills).Count -gt 0) {
     $renderArguments += '-EnableSkills'
     $renderArguments += @($EnableSkills)
@@ -539,6 +626,9 @@ foreach ($modelOwnedPath in @((Join-Path $ownershipRoot 'model-catalog.json'), (
     }
 }
 $connectionStatusPath = Join-Path $ownershipRoot 'connection-status.json'
+$localMcpsEnabled = @()
+if ($feishuEnabled) { $localMcpsEnabled += 'feishu' }
+if ($mediaGenerationEnabled) { $localMcpsEnabled += 'media-generation' }
 $connectionStatus = [ordered]@{
     schemaVersion = 1
     feishu = if ($feishuEnabled) { 'enabled-awaiting-tenant-health' } else { 'disabled-awaiting-credentials' }
@@ -547,11 +637,11 @@ $connectionStatus = [ordered]@{
         templatesInstalled = $true
         enabled = [ordered]@{
             'dashscope-web-search' = @($EnabledApiServices) -contains 'dashscope-web-search'
-            'image-2' = @($EnabledApiServices) -contains 'image-2'
-            'seedance' = @($EnabledApiServices) -contains 'seedance'
         }
         credentialsStored = $false
-        note = 'DashScope, Image-2 and Seedance values remain user-provided environment variables.'
+        remoteMcpsEnabled = @($EnabledRemoteMcps)
+        localMcpsEnabled = $localMcpsEnabled
+        note = 'API credentials remain user-provided environment variables; remote MCP OAuth authorization is handled by Codex.'
     }
     secretsStored = $false
 }
@@ -577,7 +667,7 @@ $runtimeReady = Test-RuntimeReady $runtimeState
 $pdfReady = [string]$pdfSmokeStatus.status -eq 'passed'
 $configReady = [string]$configStatus.status -notin @('failed', 'partial', 'conflict')
 $modelReady = [string]$modelSyncStatus.status -eq 'ready'
-$overallStatus = if (-not $coreReady) { 'failed' } elseif ($runtimeReady -and $pdfReady -and $configReady -and $modelReady) { 'ready' } else { 'partial' }
+$overallStatus = if (-not $coreReady) { 'failed' } elseif ($runtimeReady -and [string]$runtimeState.status -eq 'ready' -and $pdfReady -and $configReady -and $modelReady) { 'ready' } else { 'partial' }
 $diagnostics = [ordered]@{
     path = (Join-Path $diagnosticsRoot 'capability-pack.log')
     runtime = $runtimeDiagnosticPath
@@ -587,7 +677,7 @@ $diagnostics = [ordered]@{
 }
 $diagnosticText = @(
     "runtime status=$([string]$runtimeState.status)",
-    "runtime health=$([string]$runtimeState.python.health)/$([string]$runtimeState.node.health)/$([string]$runtimeState.feishu.health)",
+    "runtime health=python:$([string]$runtimeState.python.health),manim:$([string]$runtimeState.manim.health),node:$([string]$runtimeState.node.health),ffmpeg:$([string]$runtimeState.ffmpeg.health),hyperframes-cli:$([string]$runtimeState.hyperframes.cliHealth),hyperframes-browser:$([string]$runtimeState.hyperframes.browserHealth),feishu:$([string]$runtimeState.feishu.health)",
     "pdf smoke status=$([string]$pdfSmokeStatus.status)",
     "config status=$([string]$configStatus.status)",
     "model sync status=$([string]$modelSyncStatus.status) preferred=$([string]$modelSyncStatus.preferredModel) migration=$([string]$modelSyncStatus.migration)",
@@ -624,6 +714,7 @@ $readiness = [ordered]@{
         skills = $installedSkillCount
         agents = $installedAgentCount
         feishuWrapper = Test-CurrentOwnership $wrapperTarget 'mcp-wrapper'
+        mediaGenerationMcp = Test-CurrentOwnership $mediaWrapperTarget 'mcp-wrapper'
         configRenderer = Test-CurrentOwnership $rendererTarget 'config-renderer'
         modelCatalog = Test-CurrentOwnership (Join-Path $ownershipRoot 'model-catalog.json') 'model-catalog'
         modelSync = Test-CurrentOwnership (Join-Path $ownershipRoot 'bin\sync-model-catalog.ps1') 'model-sync'

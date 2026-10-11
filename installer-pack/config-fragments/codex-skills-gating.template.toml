@@ -1,4 +1,5 @@
-# Render absolute paths after installation. The installer-generated fragment includes all 50 Skills;
+# Render absolute paths after installation. The installer-generated fragment includes every Skill in
+# manifest/skill-audit.json (55 Skills in pack 1.5.0);
 # core-ready, auto-installable-runtime and unsupported entries default to enabled=true, while guided
 # credential/MCP entries remain disabled until their connection health checks pass.
 [[skills.config]]

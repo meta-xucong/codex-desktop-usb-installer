@@ -152,20 +152,17 @@ MCP server 固定使用 `feishu`，wrapper 启动官方包并强制 `--tool-name
 
 Skill 中的脚本均以当前 Skill 目录为基准。说明文本必须要求 Codex 根据已加载 Skill 的文件路径解析绝对脚本路径，不得假设当前工作目录是仓库根目录。
 
-### 4.6 外部图像/视频网关
+### 4.6 统一图像/视频 MCP
 
-Image-2 与 Seedance 是直连 HTTP 适配器，不是 MCP，也不是 Codex 原生工具：
+Image-2、Grok 图片/视频和 Seedance 由同一个本地 STDIO `media_generation` MCP 提供，不再各自安装直连 HTTP 脚本。Codex 原生图片能力仍是普通图片请求的默认入口；只有用户明确选择外部 provider 时，才使用对应 Skill 和配置模型。
 
-1. 仅在用户显式选择对应 Skill 且连接字段完整时启用；普通图像请求仍优先走 Codex 原生图片能力。
-2. API Key 只能读取对应服务的专用环境变量；Image-2 禁止回退读取 `OPENAI_API_KEY`。
-3. Base URL 必须是根级 HTTPS 地址，清单明确记录脚本实际拼接的固定兼容路径。
-4. 模型与外部 `agent-id` 必须由服务方配置；Codex 没有可猜测替代的标准外部网关路由 ID。
-5. Seedance 的预扣积分、返还规则和官方链接有效期必须显式配置；不保留 `20000`、`24 小时` 或模型名猜测值。
-6. 两个适配器都严格保留参考素材的顺序、数量和重复项；不得静默去重。
-7. Image-2 本地参考图写入大小和 SHA-256，正式执行前复验；远程下载只允许 HTTPS 公网目标，逐次校验重定向，限制为 25 MiB，并在任一图片失败时整体停止。
-8. Seedance 不读取 Codex 会话/session 文件；调用者必须显式传入当前用户消息中的完整媒体 URL。
-9. 确认清单、任务记录和 base64 产物进入项目 `codex-data/` 或明确数据目录，不写入安装后的 Skill 树。
-10. 确认指纹、哈希、幂等键和清单路径仅供执行器内部校验；用户确认的是完整业务输入和真实服务方费用策略。
+1. `media_capabilities` 只检查本机配置；`media_prepare` 离线校验请求并写入 30 分钟有效的确认记录；只有用户明确确认后才能调用 `media_submit`。
+2. 用户共用一个媒体 Base URL 与 Key；模型名按 provider 分别配置。Image-2 和 Seedance 网关还要求服务方提供 `agent-id`。所有值均由用户输入，不从其他 API Key 回退，也不猜模型、价格或退款规则。
+3. MCP 将 provider 请求映射到已约定的兼容路径：Image-2 `/api/llm/openai/v1/images/*`、Grok `/v1/images/*` 与 `/v1/videos/*`、Seedance `/api/llm/doubao/contents/generations/tasks*`。这些是本项目的网关适配契约；安装器不会验证某个账户或中转服务是否开通这些路由。
+4. 图片任务的本地参考图会锁定字节数与 SHA-256；Seedance 参考素材须为服务方可访问的 HTTPS URL，并按输入顺序保留，不排序或去重。MCP 不扫描 Codex 会话或从附件名称推断远程素材地址。
+5. Seedance 延续旧适配器约定：显式传入视频时长/比例，默认不加水印，启用音频并要求返回最后一帧。费用、积分预扣、退款规则、模型能力与任务链接有效期以用户的服务方为准，MCP 不自行补值。
+6. `media_submit` 在网络请求前持久化单次提交状态；超时、5xx、限流或响应无法解析时视为结果未知，不自动再次 POST。已有任务只允许经 `media_check` 查询，结果由 `media_save` 保存到本机数据目录。
+7. 确认记录、任务响应和输出保存在 Codex Kit 数据目录，不写入安装后的 Skill 树；Base URL 限定为无凭据、路径、查询参数的根级 HTTPS 地址。
 
 ### 4.7 数据、假设与决策边界
 

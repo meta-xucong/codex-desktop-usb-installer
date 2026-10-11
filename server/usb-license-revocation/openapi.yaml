@@ -1,0 +1,121 @@
+openapi: 3.1.0
+info:
+  title: Codex USB license activation and revocation API
+  version: 1.2.0
+  description: Public v1/v2 signed-proof registration and read-only status check API. Version 2 may include the signed 404token USB asset number only. Administration remains separately authenticated.
+servers:
+  - url: https://license.404token.xyz
+paths:
+  /healthz:
+    get:
+      operationId: health
+      responses:
+        '200':
+          description: Process liveness only; does not expose license state.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { const: ok }
+                required: [status]
+  /v1/licenses/check:
+    post:
+      operationId: checkLicense
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CheckRequest'
+      responses:
+        '200':
+          description: Ed25519 response envelope, signed over the decoded payload bytes.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SignedEnvelope'
+        '400': { description: Malformed request or rejected registration proof; unsigned. }
+        '413': { description: Request exceeds 64 KiB; unsigned. }
+        '415': { description: Content-Type is not application/json; unsigned. }
+        '429': { description: Rate limit exceeded; unsigned. }
+        '503': { description: State unknown, record absent, or storage unavailable; unsigned. }
+  /v1/licenses/register:
+    post:
+      operationId: registerUsbLicense
+      description: Verify a v1 or v2 signer Ed25519 proof and activate a new USB license. V2 may contain only the signed usbAssetId; an exact active v1 record may be enriched once from a matching v2 proof. Retries do not reactivate revoked records. No bearer credential is accepted or required.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegistrationUploadRequest'
+      responses:
+        '200':
+          description: Proof matches an active record already registered, or its signed 404token number was safely added to that record.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RegistrationResult' }
+        '201':
+          description: New license was activated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RegistrationResult' }
+        '400': { description: Malformed request or rejected registration signature. }
+        '409': { description: Conflicting installation proof or existing revoked license. }
+        '413': { description: Request exceeds 64 KiB. }
+        '415': { description: Content-Type is not application/json. }
+        '429': { description: Registration rate limit exceeded. }
+        '503': { description: State unknown or storage unavailable. }
+components:
+  schemas:
+    RegistrationEnvelope:
+      type: object
+      additionalProperties: false
+      properties:
+        payloadB64: { type: string, contentEncoding: base64 }
+        signatureB64: { type: string, contentEncoding: base64 }
+      required: [payloadB64, signatureB64]
+    RegistrationUploadRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        registration: { $ref: '#/components/schemas/RegistrationEnvelope' }
+      required: [registration]
+    RegistrationResult:
+      type: object
+      additionalProperties: false
+      properties:
+        status: { const: active }
+        installationId: { type: string, minLength: 1, maxLength: 128 }
+        stateVersion: { type: integer, minimum: 1 }
+        created: { type: boolean }
+      required: [status, installationId, stateVersion, created]
+    ObservedFingerprint:
+      type: object
+      additionalProperties: false
+      properties:
+        volumeSerial: { type: integer, minimum: 0, maximum: 4294967295 }
+        anchorSha256: { type: string, pattern: '^[0-9A-Fa-f]{64}$' }
+        bundleRelativePath: { type: string, minLength: 1 }
+        anchorSchema: { type: integer, minimum: 0, maximum: 4294967295 }
+      required: [volumeSerial, anchorSha256, bundleRelativePath, anchorSchema]
+    CheckRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        schemaVersion: { const: 1 }
+        requestId: { type: string, pattern: '^[0-9a-f]{32}$' }
+        product: { const: codex-usb-oneclick }
+        installationId: { type: string, minLength: 1, maxLength: 128 }
+        licenseSignatureSha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+        registration: { $ref: '#/components/schemas/RegistrationEnvelope' }
+        observedFingerprint: { $ref: '#/components/schemas/ObservedFingerprint' }
+      required: [schemaVersion, requestId, product, installationId, licenseSignatureSha256, registration, observedFingerprint]
+    SignedEnvelope:
+      type: object
+      additionalProperties: false
+      properties:
+        payloadB64: { type: string, contentEncoding: base64 }
+        signatureB64: { type: string, contentEncoding: base64 }
+      required: [payloadB64, signatureB64]

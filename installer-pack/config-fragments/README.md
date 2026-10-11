@@ -14,8 +14,9 @@ generated fragment, and merge only the selected blocks into the user's `config.t
 - The upstream CLI still receives App Secret as a child-process argument. A trusted local process inspector
   may therefore observe it while the server runs; this is an upstream interface limitation, not a secret-store
   guarantee.
-- `codex-skills-gating.template.toml` documents the `[[skills.config]]` shape. The installer renderer writes
-  50 explicit entries: 43 default-on entries and 7 guided credential/MCP entries kept disabled until configured.
+- `codex-skills-gating.template.toml` documents the `[[skills.config]]` shape. The installer renderer derives
+  its complete entry list from `manifest/skill-audit.json`; in pack 1.5.0 that is 55 entries, with 47
+  default-on and 8 guided credential/MCP entries kept disabled until configured.
 - `connections.template.json` is a configuration-UI input contract, not a secret store.
 
 Never copy a template containing placeholders into an enabled configuration. Health-check the rendered

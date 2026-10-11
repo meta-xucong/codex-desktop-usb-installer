@@ -33,12 +33,23 @@ The CLI also supports `export-portable` and `inspect-portable` with
 password in a script, repository, environment variable, or command history;
 the normal workflow is the GUI password prompt.
 
-`sign` requires an exact confirmation string printed in its review line. A
-previous unsigned license keeps its `installationId`; a signed, malformed,
-or fingerprint-mismatched license is not overwritten. A post-write readback,
-physical re-observation, signature check, and deep bundle check are required
-before the command can return `status: success`. Failure or an unknown
-post-write state returns a non-zero exit code (unknown state uses exit code 2).
+`sign` requires an exact confirmation string printed in its review line. After
+the atomic USB write and local readback checks succeed, the signer automatically
+uploads only the signed registration envelope to `https://license.404token.xyz`
+to activate the license. Registration v2 carries only the public `USB-####`
+asset number from the signed account binding; it never carries the rest of the
+account binding or any account credential. The GUI's “同步/补发并激活” flow
+upgrades an older v1 registration sidecar without changing the signed license.
+VPS registration retries are idempotent; a revoked
+record is never reactivated by this operation. Network failure leaves a valid
+local signature with VPS activation marked pending; use the GUI's
+“同步/补发并激活” action after rescanning to retry. A previous unsigned license
+keeps its `installationId`; a signed, malformed, or fingerprint-mismatched
+license is not overwritten. A post-write readback, physical re-observation,
+signature check, and deep bundle check are required before the command can
+return `status: success`; the separate `activationStatus` field must be `active`
+before claiming VPS activation. Failure or an unknown post-write state returns
+a non-zero exit code (unknown state uses exit code 2).
 
 ## Key storage
 
@@ -94,8 +105,11 @@ same structural inspection as the CLI with Authenticode skipped, automatically
 discovers the encrypted portable vault beside the EXE and enables one-click
 signing only when the Bundle's formal public-key binding is valid. The GUI asks
 only for the vault password; it never checks the current computer's DPAPI key.
-It automatically runs internal-license `verify` after signing. If the vault is
-absent, the GUI fails closed and asks for the complete signer directory.
+It automatically submits the signed registration proof to the VPS after local
+readback verification, then runs internal-license `verify`. If VPS networking
+fails, the window reports activation as pending and allows a later retry after
+rescan. An existing revoked VPS record remains revoked. If the vault is absent,
+the GUI fails closed and asks for the complete signer directory.
 The GUI calls the shared `run_with_args` pipeline in this crate; it is not a
 second signing implementation. It never asks the user to select a key file or
 enter a KeyId, and never generates or stores plaintext private keys. See
@@ -108,12 +122,15 @@ tests in this repository.
 
 ### Optional 404token/Sub2API provisioning
 
-The GUI also has a “register account and sign” flow. It accepts the existing
-Sub2API base URL, short email domain, and a non-negative preload amount; the
-administrator credential is compiled into the trusted production executable.
+The GUI also has a “register account and sign” flow. It uses the fixed
+`https://404token.xyz` Sub2API endpoint and accepts the short email domain and
+a non-negative preload amount; the administrator credential is compiled into
+the trusted production executable. The address is read-only, the production
+client rejects other destinations, and HTTP redirects are disabled for
+requests carrying the administrator credential.
 The target CCSwitch group is fixed to `unified-api-internal`; there is no
-group-ID field and no per-model key selection. A random initial password is
-generated per new account and shown only once after success. The signer allocates the next
+group-ID field and no per-model key selection. New accounts use the fixed
+initial password `12345678`. The signer allocates the next
 `USB-xxxx` account, creates the user API key through the user login flow, injects
 the binding into the signed `usb-license.json`, verifies the writeback, and only
 then performs the first balance addition with a stable idempotency key.
@@ -126,13 +143,22 @@ non-secret endpoint preferences are saved in the normal signer-local
 configuration.
 The administrator key is never put in the runtime USB bundle, license, reports,
 logs, or CCSwitch. Existing bindings are
-reused and do not trigger an implicit second preload. If account creation
-finishes before signing is interrupted, the signer stores the password and
-generated key only in a DPAPI-encrypted recovery record for the current Windows
-user/machine, then resumes the same account on the next attempt. The record is
-deleted after successful license readback. Production registration and preload
-still require a separately authorized disposable test account/amount;
+reused and do not trigger an implicit second preload. Before sending the
+account-creation request, the signer records the intended USB number and email
+in a DPAPI-encrypted recovery record. It then records the remote user ID and
+generated key as each step succeeds, allowing the next attempt to reconcile or
+resume the same account after an interrupted request. The user-key request uses
+a stable `Idempotency-Key` across retries; duplicate prevention after an
+ambiguous response depends on the Sub2API server honoring that header. The
+record is deleted after successful license readback. Production registration
+and preload still require a separately authorized disposable test
+account/amount;
 the repository tests use a local HTTP fixture only.
+
+In this one-click flow, initial balance addition runs only after the signed USB
+license is locally verified and the VPS confirms a matching active registration.
+Pending, conflicting, or revoked VPS states skip the preload; syncing the same
+proof later does not create another account or repeat a completed preload.
 
 If signing and readback succeed but the preload request fails, the GUI keeps a
 non-secret pending record under

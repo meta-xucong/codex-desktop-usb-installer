@@ -1,0 +1,6 @@
+interface:
+  display_name: "MiniMax 视频工作流（统一媒体 MCP）"
+  short_description: "整理 MiniMax 视频请求；仅在统一上游开放模型后通过共享媒体 MCP 生成。"
+  default_prompt: "Use $minimax-video-gen to prepare this request. Check the unified media MCP first; if its MiniMax model is unavailable, explain that and do not fall back to another provider."
+policy:
+  allow_implicit_invocation: false

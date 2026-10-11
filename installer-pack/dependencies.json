@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
   "id": "codex-starter",
-  "version": "1.3.0",
+  "version": "1.5.2",
   "policy": "No secrets, caches, history, databases, drafts or user content.",
   "system": [
     {
@@ -60,45 +60,6 @@
       ]
     },
     {
-      "id": "api.image-2",
-      "kind": "api-service",
-      "required": true,
-      "autoInstallable": false,
-      "healthCheck": "IMAGE_2_API_BASE_URL is a root HTTPS URL; IMAGE_2_MODEL and IMAGE_2_AGENT_ID are explicit; offline adapter tests pass",
-      "failureMessage": "未配置图像模型或网关路由 ID 时不生成清单；未配置端点或专用凭据时不提交任务。",
-      "dependentCapabilities": [
-        "异步文生图",
-        "图生图",
-        "两阶段确认"
-      ],
-      "dependentSkills": [
-        "image-2",
-        "wechat-article-creator"
-      ],
-      "dependentAgents": [
-        "content"
-      ]
-    },
-    {
-      "id": "api.seedance",
-      "kind": "api-service",
-      "required": true,
-      "autoInstallable": false,
-      "healthCheck": "SEEDANCE_API_BASE_URL is a root HTTPS URL; model, gateway routing ID, precharge points, refund rule, and link TTL are explicit; offline adapter tests pass",
-      "failureMessage": "未配置模型、网关路由 ID 或服务方费用策略时不生成清单；未配置端点或专用凭据时不提交任务。",
-      "dependentCapabilities": [
-        "视频生成",
-        "媒体顺序保护",
-        "幂等提交与轮询"
-      ],
-      "dependentSkills": [
-        "seedance2-0-video-gen"
-      ],
-      "dependentAgents": [
-        "content"
-      ]
-    },
-    {
       "id": "capability.codex-web",
       "kind": "capability",
       "required": true,
@@ -136,6 +97,21 @@
         "weather",
         "weather-forecast",
         "web-search-extraction"
+      ]
+    },
+    {
+      "id": "config.MEDIA_MINIMAX_VIDEO_MODEL",
+      "kind": "configuration",
+      "required": true,
+      "autoInstallable": false,
+      "healthCheck": "MEDIA_MINIMAX_VIDEO_MODEL exactly matches a video model enabled by the shared upstream",
+      "failureMessage": "当前尚未配置 MiniMax 视频模型；Skill 不会自动改用 Grok 或 Seedance。",
+      "dependentCapabilities": [
+        "MiniMax 视频生成",
+        "异步任务查询"
+      ],
+      "dependentSkills": [
+        "minimax-video-gen"
       ]
     },
     {
@@ -186,36 +162,21 @@
       ]
     },
     {
-      "id": "credential.image-2-api-key",
+      "id": "credential.media-generation-api-key",
       "kind": "credential",
       "required": true,
       "autoInstallable": false,
       "secret": true,
-      "healthCheck": "IMAGE_2_API_KEY non-empty",
-      "failureMessage": "未配置凭据时不触发计费请求。",
+      "healthCheck": "MEDIA_GENERATION_API_KEY and MEDIA_GENERATION_API_BASE_URL are configured",
+      "failureMessage": "缺少媒体 API 配置时不访问网络。",
       "dependentCapabilities": [
         "异步文生图",
         "图生图",
-        "两阶段确认"
+        "统一 MCP 两阶段确认"
       ],
       "dependentSkills": [
-        "image-2"
-      ]
-    },
-    {
-      "id": "credential.seedance-api-key",
-      "kind": "credential",
-      "required": true,
-      "autoInstallable": false,
-      "secret": true,
-      "healthCheck": "SEEDANCE_API_KEY non-empty",
-      "failureMessage": "未配置凭据时不触发计费请求。",
-      "dependentCapabilities": [
-        "视频生成",
-        "媒体顺序保护",
-        "幂等提交与轮询"
-      ],
-      "dependentSkills": [
+        "image-2",
+        "minimax-video-gen",
         "seedance2-0-video-gen"
       ]
     },
@@ -276,6 +237,29 @@
         "feishu-drive",
         "feishu-perm",
         "feishu-wiki"
+      ]
+    },
+    {
+      "id": "mcp.media-generation",
+      "kind": "mcp",
+      "required": true,
+      "autoInstallable": true,
+      "transport": "stdio",
+      "healthCheck": "media_generation tools/list includes media_prepare, media_submit, media_check and media_save",
+      "failureMessage": "统一媒体 MCP 未安装、未启用或不可用时，不提交外部计费请求。",
+      "dependentCapabilities": [
+        "异步文生图",
+        "图生图",
+        "统一 MCP 两阶段确认"
+      ],
+      "dependentSkills": [
+        "image-2",
+        "minimax-video-gen",
+        "seedance2-0-video-gen",
+        "wechat-article-creator"
+      ],
+      "dependentAgents": [
+        "content"
       ]
     },
     {
@@ -543,6 +527,77 @@
       ]
     },
     {
+      "id": "runtime.ffmpeg-windows-x64",
+      "kind": "runtime",
+      "required": true,
+      "autoInstallable": true,
+      "healthCheck": "runtime-state.json ffmpeg.health == passed",
+      "failureMessage": "需要随包 FFmpeg/FFprobe。",
+      "dependentCapabilities": [
+        "hyperframes video"
+      ],
+      "dependentSkills": [
+        "hyperframes-video",
+        "local-video-editing"
+      ]
+    },
+    {
+      "id": "runtime.hyperframes-browser",
+      "kind": "runtime",
+      "required": true,
+      "autoInstallable": true,
+      "healthCheck": "runtime-state.json hyperframes.browserHealth == passed",
+      "failureMessage": "需要可用 Chrome；没有系统 Chrome 时首次初始化需联网下载。",
+      "dependentCapabilities": [
+        "hyperframes video"
+      ],
+      "dependentSkills": [
+        "hyperframes-video"
+      ]
+    },
+    {
+      "id": "runtime.hyperframes-cli",
+      "kind": "runtime",
+      "required": true,
+      "autoInstallable": true,
+      "healthCheck": "runtime-state.json hyperframes.cliHealth == passed",
+      "failureMessage": "首次部署需联网从 npm 获取锁定版 CLI。",
+      "dependentCapabilities": [
+        "hyperframes video"
+      ],
+      "dependentSkills": [
+        "hyperframes-video"
+      ]
+    },
+    {
+      "id": "runtime.manim",
+      "kind": "runtime",
+      "required": true,
+      "autoInstallable": true,
+      "healthCheck": "runtime-state.json manim.health == passed",
+      "failureMessage": "需要随包安装的隔离 Manim 0.21 环境。",
+      "dependentCapabilities": [
+        "manim animation"
+      ],
+      "dependentSkills": [
+        "manim-animation"
+      ]
+    },
+    {
+      "id": "runtime.node22-common",
+      "kind": "runtime",
+      "required": true,
+      "autoInstallable": true,
+      "healthCheck": "runtime-state.json node.health == passed",
+      "failureMessage": "需要随包 Node.js 22。",
+      "dependentCapabilities": [
+        "hyperframes video"
+      ],
+      "dependentSkills": [
+        "hyperframes-video"
+      ]
+    },
+    {
       "id": "runtime.python312",
       "kind": "runtime",
       "required": true,
@@ -568,6 +623,7 @@
         "fund-portfolio",
         "image-2",
         "macro-research",
+        "manim-animation",
         "meal-planner",
         "pdf-processing-toolkit",
         "powerpoint-pptx",
@@ -1218,8 +1274,8 @@
       "dependentCapabilities": [
         "HTML 原型说明"
       ],
-      "healthCheck": "safe-failure contract: missing Canvas backend is reported explicitly",
-      "notes": "配置层面默认启用；缺少外部 Canvas 后端时安全失败，不伪造外部画布操作。"
+      "healthCheck": "safe-failure contract: missing Canvas backend is reported explicitly; no external action is claimed",
+      "notes": "配置层面默认启用；当前能力包没有可验证的远程 Canvas 节点/画布运行时，运行时必须明确返回后端未连接，不得伪造画布操作成功。"
     },
     {
       "id": "china-stock-analysis",
@@ -1248,6 +1304,24 @@
       ],
       "healthCheck": "frontmatter, pack-copy, dependency health-check path, provider-failure closure, provenance, neutral financial analysis, and fake AkShare no-network contract tests",
       "notes": "行情缓存已迁移到项目 CODEX_DATA_DIR/CHINA_STOCK_CACHE_DIR，按代码与允许的数据类型生成路径且只缓存完整结果；实时和 AkShare 数据入口记录来源/时点/完整性并对全量或部分失败返回非零状态。技术分析不再模拟行情或生成交易信号；财务分析和报告模板已删除固定评级、综合分、排名、目标价与行业均值占位。筛选和估值只执行实际字段或显式、可归因假设。"
+    },
+    {
+      "id": "codex-skin-design",
+      "path": "skills/codex-skin-design",
+      "status": "ready",
+      "afterRemediationStatus": "core-ready",
+      "installByDefault": true,
+      "enableWhen": [
+        "skill-installed",
+        "required-capabilities-available"
+      ],
+      "dependencyTypes": [],
+      "dependencies": [],
+      "dependentCapabilities": [
+        "codex skin design"
+      ],
+      "healthCheck": "frontmatter, pack-copy, and dependency health-check path",
+      "notes": "由 U-CODE 竞品能力清单提炼为原创、通用 Skill；无服务端账号依赖。"
     },
     {
       "id": "competitor-intelligence",
@@ -1621,7 +1695,32 @@
         "主机安全检查说明"
       ],
       "healthCheck": "safe-failure contract: missing Windows security backend or permission is reported explicitly",
-      "notes": "配置层面默认启用；缺少安全工具或权限时安全失败，不伪造审计结果。"
+      "notes": "配置层面默认启用；真实审计仍受 Windows 安全工具、管理员权限、系统策略和设备状态约束。后端或权限不足时必须返回明确的不可用状态，不得伪造检查结果。"
+    },
+    {
+      "id": "hyperframes-video",
+      "path": "skills/hyperframes-video",
+      "status": "requires-runtime",
+      "afterRemediationStatus": "auto-installable-runtime",
+      "installByDefault": true,
+      "enableWhen": [
+        "skill-installed",
+        "runtime-healthy"
+      ],
+      "dependencyTypes": [
+        "runtime"
+      ],
+      "dependencies": [
+        "runtime.node22-common",
+        "runtime.ffmpeg-windows-x64",
+        "runtime.hyperframes-cli",
+        "runtime.hyperframes-browser"
+      ],
+      "dependentCapabilities": [
+        "hyperframes video"
+      ],
+      "healthCheck": "runtime-state.json records the locked CLI/library and local executable health; no billable API is called",
+      "notes": "本地渲染链路需要 Node 22、FFmpeg/FFprobe、HyperFrames CLI 与 Chrome；安装器自动部署本地运行时，首次获取 CLI/Chrome 需联网。云端发布或特定在线 AI 功能另需账号。"
     },
     {
       "id": "image-2",
@@ -1632,26 +1731,26 @@
       "enableWhen": [
         "skill-installed",
         "runtime.python312",
-        "api.image-2",
-        "credential.image-2-api-key"
+        "mcp.media-generation",
+        "credential.media-generation-api-key"
       ],
       "dependencyTypes": [
-        "api-service",
         "credential",
+        "mcp",
         "runtime"
       ],
       "dependencies": [
         "runtime.python312",
-        "api.image-2",
-        "credential.image-2-api-key"
+        "mcp.media-generation",
+        "credential.media-generation-api-key"
       ],
       "dependentCapabilities": [
         "异步文生图",
         "图生图",
-        "两阶段确认"
+        "统一 MCP 两阶段确认"
       ],
       "healthCheck": "frontmatter, pack-copy, and dependency health-check path",
-      "notes": "专用 API Key 不回退到 OPENAI_API_KEY；外部 agent-id 不是 Codex 任务 ID。远程参考图受 HTTPS、公网地址、重定向和 25MB 限制，本地参考图按 SHA-256 锁定。"
+      "notes": "通过统一 media_generation MCP 调用 Image-2 路由；确认清单、本地文件 SHA-256、单次幂等提交和异步任务查询都在 MCP 中处理。图生图参考图仅接受本地图片。"
     },
     {
       "id": "image-prompt-generator",
@@ -1697,6 +1796,28 @@
       "notes": ""
     },
     {
+      "id": "local-video-editing",
+      "path": "skills/local-video-editing",
+      "status": "requires-runtime",
+      "afterRemediationStatus": "auto-installable-runtime",
+      "installByDefault": true,
+      "enableWhen": [
+        "skill-installed",
+        "runtime-healthy"
+      ],
+      "dependencyTypes": [
+        "runtime"
+      ],
+      "dependencies": [
+        "runtime.ffmpeg-windows-x64"
+      ],
+      "dependentCapabilities": [
+        "local video editing"
+      ],
+      "healthCheck": "runtime-state.json records the locked CLI/library and local executable health; no billable API is called",
+      "notes": "安装器随包部署 FFmpeg/FFprobe；不依赖系统 PATH 或第三方账号。"
+    },
+    {
       "id": "macro-research",
       "path": "skills/macro-research",
       "status": "requires-runtime",
@@ -1723,6 +1844,29 @@
       ],
       "healthCheck": "frontmatter, pack-copy, dependency health-check path, explicit cycle-rule, policy-evidence, sentiment-weight, and neutral-output contract tests",
       "notes": "周期阶段只由显式增长/通胀变化和用户审阅规则场景计算；政策分析要求原文证据、传导依据和条件场景。情绪监控删除固定 mock 指标、情绪档位和仓位建议，并要求六项完整指标、显式合计为 1 的权重、数据时点和来源；缺字段时非零退出。"
+    },
+    {
+      "id": "manim-animation",
+      "path": "skills/manim-animation",
+      "status": "requires-runtime",
+      "afterRemediationStatus": "auto-installable-runtime",
+      "installByDefault": true,
+      "enableWhen": [
+        "skill-installed",
+        "runtime-healthy"
+      ],
+      "dependencyTypes": [
+        "runtime"
+      ],
+      "dependencies": [
+        "runtime.python312",
+        "runtime.manim"
+      ],
+      "dependentCapabilities": [
+        "manim animation"
+      ],
+      "healthCheck": "runtime-state.json records the locked CLI/library and local executable health; no billable API is called",
+      "notes": "安装器离线部署隔离 Manim 0.21 环境；MiKTeX/LaTeX 仅用于 Tex/MathTex 公式，是可选依赖。"
     },
     {
       "id": "market-sizing-analysis",
@@ -1793,6 +1937,36 @@
       "notes": ""
     },
     {
+      "id": "minimax-video-gen",
+      "path": "skills/minimax-video-gen",
+      "status": "requires-credential",
+      "afterRemediationStatus": "guided-config",
+      "installByDefault": false,
+      "enableWhen": [
+        "skill-installed",
+        "mcp.media-generation.ready",
+        "MEDIA_GENERATION_API_KEY",
+        "MEDIA_MINIMAX_VIDEO_MODEL",
+        "user-approved-paid-task"
+      ],
+      "dependencyTypes": [
+        "configuration",
+        "credential",
+        "mcp"
+      ],
+      "dependencies": [
+        "mcp.media-generation",
+        "credential.media-generation-api-key",
+        "config.MEDIA_MINIMAX_VIDEO_MODEL"
+      ],
+      "dependentCapabilities": [
+        "MiniMax 视频生成",
+        "异步任务查询"
+      ],
+      "healthCheck": "MCP reports the MiniMax slot unavailable when the model is blank and prepares a single-use request only when configured",
+      "notes": "保留 MiniMax 专用创作流程 Skill，但所有请求只经统一媒体 MCP，并共用媒体 API Key/Base URL。当前模型槽位留空；只有统一上游实际开放 MiniMax 视频模型后才可启用。无官方 MiniMax API 直连，也不回退到其他视频模型。"
+    },
+    {
       "id": "multi-search-engine",
       "path": "skills/multi-search-engine",
       "status": "ready",
@@ -1836,7 +2010,7 @@
         "连接问题排查说明"
       ],
       "healthCheck": "safe-failure contract: missing device pairing backend is reported explicitly",
-      "notes": "配置层面默认启用；缺少设备配对后端时安全失败，不将网页可达或二维码存在误报为已配对。"
+      "notes": "配置层面默认启用；设备配对协议、节点后端和网关仍需外部提供。后端未连接时必须明确返回不可用，不得把网页可达或二维码存在误报为已配对。"
     },
     {
       "id": "offer-designer",
@@ -1903,8 +2077,8 @@
         "合并拆分",
         "表单与生成"
       ],
-      "healthCheck": "PDF read, text extraction, write/merge, and generation smoke test using bundled Python",
-      "notes": "本项目自行维护的 PDF 工具，许可证和 smoke test 已随包提供；第三方依赖仍按各自许可证使用。"
+      "healthCheck": "PDF read, text extraction, write/merge, and generation smoke test using the bundled Python runtime",
+      "notes": "已替换为本项目自行维护的最小 PDF 工具实现，补充 LICENSE.txt；pypdf、pdfplumber、reportlab 通过离线 wheelhouse 安装并在运行时健康检查。"
     },
     {
       "id": "powerpoint-pptx",
@@ -1989,26 +2163,26 @@
       "enableWhen": [
         "skill-installed",
         "runtime.python312",
-        "api.seedance",
-        "credential.seedance-api-key"
+        "mcp.media-generation",
+        "credential.media-generation-api-key"
       ],
       "dependencyTypes": [
-        "api-service",
         "credential",
+        "mcp",
         "runtime"
       ],
       "dependencies": [
         "runtime.python312",
-        "api.seedance",
-        "credential.seedance-api-key"
+        "mcp.media-generation",
+        "credential.media-generation-api-key"
       ],
       "dependentCapabilities": [
         "视频生成",
         "媒体顺序保护",
-        "幂等提交与轮询"
+        "统一 MCP 确认与任务查询"
       ],
       "healthCheck": "frontmatter, pack-copy, and dependency health-check path",
-      "notes": "不再猜测模型、20000 积分或 24 小时策略；媒体 URL 必须为 HTTPS，重复素材严格保留；任务记录写入项目数据目录而不是已安装 Skill。已删除无法可靠绑定当前 Codex 会话的旧会话历史读取入口。"
+      "notes": "通过统一 media_generation MCP 调用 Seedance 路由；当前参考媒体需为服务方可访问的 HTTPS URL，按输入顺序保留。不猜测价格、预扣积分、退款规则或链接期限。"
     },
     {
       "id": "self-improvement-agent",
@@ -2312,14 +2486,14 @@
         "runtime-healthy"
       ],
       "dependencyTypes": [
-        "api-service",
+        "mcp",
         "python-package",
         "runtime"
       ],
       "dependencies": [
         "runtime.python312",
         "python.package.Pillow",
-        "api.image-2"
+        "mcp.media-generation"
       ],
       "dependentCapabilities": [
         "公众号选题",
@@ -2716,8 +2890,7 @@
       "blockedSkills": [],
       "connectionDependencies": [
         "api.dashscope-web-search",
-        "api.image-2",
-        "api.seedance"
+        "mcp.media-generation"
       ],
       "runtimeDependencies": [
         "runtime.python312",
@@ -2843,24 +3016,12 @@
           ]
         },
         {
-          "id": "api.image-2",
+          "id": "mcp.media-generation",
           "kind": "connection",
-          "name": "api.image-2",
+          "name": "mcp.media-generation",
           "required": false,
           "autoInstallable": false,
-          "healthCheck": "api.image-2.healthy",
-          "failureMessage": "可选增强未就绪时保留 Agent 基础能力并明确降级。",
-          "dependentCapabilities": [
-            "新媒体内容架构与创意生产，覆盖公众号、小红书、图片提示词、视频提示词和脚本。"
-          ]
-        },
-        {
-          "id": "api.seedance",
-          "kind": "connection",
-          "name": "api.seedance",
-          "required": false,
-          "autoInstallable": false,
-          "healthCheck": "api.seedance.healthy",
+          "healthCheck": "mcp.media-generation.healthy",
           "failureMessage": "可选增强未就绪时保留 Agent 基础能力并明确降级。",
           "dependentCapabilities": [
             "新媒体内容架构与创意生产，覆盖公众号、小红书、图片提示词、视频提示词和脚本。"

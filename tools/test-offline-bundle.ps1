@@ -129,12 +129,28 @@ try {
         "content/codex-starter-kit/pack.json",
         "content/codex-starter-kit/install-all.ps1",
         "content/codex-starter-kit/runtime/provision-runtime.ps1",
+        "content/codex-starter-kit/mcp/media-generation-mcp.py",
+        "content/codex-starter-kit/mcp/start-media-generation-mcp.ps1",
+        "content/codex-starter-kit/mcp/media-generation.template.env",
+        "content/codex-starter-kit/manifest/media-generation-tools.json",
+        "content/codex-starter-kit/config-fragments/media-generation-stdio.template.toml",
         "resources/prerequisites/vc_redist.x64.exe",
         "resources/prerequisites/MicrosoftEdgeWebView2RuntimeInstallerX64.exe"
     )
     foreach ($relativePath in $requiredFiles) {
         $candidate = Join-Path $outputDir ($relativePath.Replace('/', '\'))
         Assert-Condition (Test-Path -LiteralPath $candidate -PathType Leaf) "U 盘目录缺少 $relativePath"
+    }
+    $capabilityRoot = Join-Path $outputDir "content\codex-starter-kit"
+    $capabilityPack = Get-Content -LiteralPath (Join-Path $capabilityRoot "pack.json") -Raw | ConvertFrom-Json
+    Assert-Condition ($capabilityPack.version -eq "1.5.0") "U 盘能力包版本不是 1.5.0"
+    foreach ($retiredPath in @(
+        "skills\image-2\scripts\image_2_gen.py",
+        "skills\seedance2-0-video-gen\scripts\seedance_video_gen.py",
+        "mcp\image-2.template.env",
+        "mcp\seedance.template.env"
+    )) {
+        Assert-Condition (-not (Test-Path -LiteralPath (Join-Path $capabilityRoot $retiredPath))) "U 盘能力包仍含已整合的旧适配器：$retiredPath"
     }
     Assert-Condition (-not (Test-Path -LiteralPath (Join-Path $outputDir "WindowsApps"))) "便携布局不得预建 WindowsApps"
     Assert-Condition (-not (Test-Path -LiteralPath (Join-Path $outputDir "WpSystem"))) "便携布局不得预建 WpSystem"

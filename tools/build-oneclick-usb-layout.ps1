@@ -2,6 +2,7 @@
 param(
     [string]$InstallerPath = "",
     [string]$ManagerPath = "",
+    [string]$EntryShimPath = "",
     [string]$BundlePath = "",
     [string]$OutputPath = "",
     [string]$CapabilityPackSource = "",
@@ -21,6 +22,7 @@ if ([string]::IsNullOrWhiteSpace($releaseVersion)) {
 }
 if ([string]::IsNullOrWhiteSpace($InstallerPath)) { $InstallerPath = Join-Path $repo "release\setup\CodexUsbLauncher.exe" }
 if ([string]::IsNullOrWhiteSpace($ManagerPath)) { $ManagerPath = Join-Path $repo "release\setup\CodexAppManager.exe" }
+if ([string]::IsNullOrWhiteSpace($EntryShimPath)) { $EntryShimPath = Join-Path $repo "release\setup\CodexEntryShim.exe" }
 if ([string]::IsNullOrWhiteSpace($BundlePath)) { $BundlePath = Join-Path $repo "release\usb-final" }
 if ([string]::IsNullOrWhiteSpace($OutputPath)) { $OutputPath = Join-Path $repo "release\usb-oneclick" }
 if ([string]::IsNullOrWhiteSpace($CapabilityPackSource)) {
@@ -95,7 +97,11 @@ if ($UsbPolicy -eq "SignedRequired") {
 }
 $installer = (Resolve-Path -LiteralPath $InstallerPath).Path
 $manager = (Resolve-Path -LiteralPath $ManagerPath).Path
+$entryShim = (Resolve-Path -LiteralPath $EntryShimPath).Path
 $bundle = (Resolve-Path -LiteralPath $BundlePath).Path
+if ((Get-Item -LiteralPath $entryShim).Name -ine "CodexEntryShim.exe") {
+    throw "EntryShimPath 必须指向名为 CodexEntryShim.exe 的 direct-entry shim"
+}
 
 # Windows PowerShell 5.1/.NET Framework lacks Path.GetRelativePath. Use a
 # root-scoped compatibility helper so release packaging works on a stock
@@ -230,8 +236,14 @@ function Assert-NoSuccessfulStateResidue([string]$RootPath) {
     if (Test-Path -LiteralPath $rootLicensePath) {
         throw "静态发行目录不得携带 usb-license.json；请在真实 U 盘复制完成后使用签名工具写入运行期授权"
     }
+    if (Test-Path -LiteralPath (Join-Path $RootPath "usb-license-revocation-registration.json")) {
+        throw "静态发行目录不得携带登记声明 sidecar"
+    }
     foreach ($entry in Get-ChildItem -LiteralPath $RootPath -Recurse -Force) {
         $relative = (Get-RelativePathCompat $RootPath $entry.FullName).Replace('\', '/')
+        if ($entry.Name -ieq "usb-license-revocation-registration.json" -or $relative -imatch '^CodexUsbState(/|$)') {
+            throw "静态发行目录不得携带登记声明或作废运行期状态：$relative"
+        }
         if ($entry.Name -ieq "usb-license.json" -and $relative -ine "usb-license.json") {
             throw "usb-license.json 只能出现在 U 盘 bundle 根目录：$relative"
         }
@@ -256,6 +268,7 @@ function Assert-NoSuccessfulStateResidue([string]$RootPath) {
 
 & (Join-Path $PSScriptRoot "build-usb-layout.ps1") `
     -InstallerPath $installer `
+    -EntryShimPath $entryShim `
     -BundlePath $bundle `
     -OutputPath $OutputPath `
     -CapabilityPackSource $CapabilityPackSource `
@@ -294,8 +307,21 @@ foreach ($relativeCcswitchManifest in @("resources\ccswitch\manifest.json", "ccs
 }
 $manifestPath = Join-Path $output "manifest.json"
 $manifest = Read-JsonFile $manifestPath
-if ((Get-JsonInteger $manifest "schemaVersion") -ne 2) {
-    throw "输出 root manifest 必须声明 schemaVersion=2"
+[void](Add-Member -InputObject $manifest -MemberType NoteProperty -Name "schemaVersion" -Value 3 -Force)
+[void](Add-Member -InputObject $manifest -MemberType NoteProperty -Name "directEntryPolicy" -Value ([ordered]@{
+    required = $true
+    shim = "CodexEntryShim.exe"
+    route = "same-user-session named pipe to USB manager"
+    launchGate = "signed local license plus fresh signed revocation status when online"
+    offline = "allow only when the local license is valid and no signed revoked state is stored"
+    failure = "closed"
+}) -Force)
+[void](Add-Member -InputObject $manifest -MemberType NoteProperty -Name "revocationPolicy" -Value ([ordered]@{
+    registrationRequired = $true
+}) -Force)
+if ((Get-JsonInteger $manifest "schemaVersion") -ne 3 -or
+    $manifest.revocationPolicy.registrationRequired -ne $true) {
+    throw "输出 root manifest 必须声明 schemaVersion=3 和 registrationRequired=true"
 }
 $architecture = [string]$manifest.architecture
 if ($architecture -notin @("x64", "arm64")) {
@@ -320,6 +346,8 @@ if ($null -eq $rootUpdateCapability -or
     (Get-JsonInteger $rootUpdateCapability "anchorSchema") -ne 3) {
     throw "输出 root manifest 未声明 Codex payload update capability"
 }
+[System.Text.UTF8Encoding]$utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+[System.IO.File]::WriteAllText($manifestPath, ($manifest | ConvertTo-Json -Depth 8), $utf8NoBom)
 if ((Get-Item -LiteralPath $manager).Name -ine "CodexAppManager.exe") {
     throw "ManagerPath 必须指向名为 CodexAppManager.exe 的 Tauri 管理器本体"
 }
@@ -331,13 +359,13 @@ if ($UsbPolicy -eq "DevelopmentAutoEnroll") {
     Assert-CompiledUsbManagerPolicy $manager $UsbPolicy
 }
 Copy-Item -LiteralPath $manager -Destination (Join-Path $output "CodexAppManager.exe") -Force
+Copy-Item -LiteralPath $entryShim -Destination (Join-Path $output "CodexEntryShim.exe") -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "verify-payload.ps1") -Destination (Join-Path $output "verify-payload.ps1") -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "verify-oneclick-usb.ps1") -Destination (Join-Path $output "verify-usb.ps1") -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "verify-usb-launcher.ps1") -Destination (Join-Path $output "verify-usb-launcher.ps1") -Force
 $verificationOutput = Join-Path $output "verification"
 New-Item -ItemType Directory -Force -Path $verificationOutput | Out-Null
 Copy-Item -LiteralPath (Join-Path $repo "tools\usb-signing-profile.ps1") -Destination (Join-Path $verificationOutput "usb-signing-profile.ps1") -Force
-$utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 if ($null -ne $signingProfile) {
     # Only emit the public verification fields. Never copy the source profile
     # verbatim: a future local signing profile may contain private or
@@ -362,6 +390,10 @@ $launcherVerifier = Join-Path $output "verify-usb-launcher.ps1"
 if ($LASTEXITCODE -ne 0) {
     throw "CodexAppManager.exe 未通过 USB requireAdministrator 清单验证"
 }
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $launcherVerifier -Path (Join-Path $output "CodexEntryShim.exe") -ExpectedLevel asInvoker
+if ($LASTEXITCODE -ne 0) {
+    throw "CodexEntryShim.exe 未通过 asInvoker 清单验证"
+}
 # Tauri deliberately does not ship PowerShell files through the Windows
 # resource bundle. Keep the verifier in the user-visible root ccswitch
 # directory so offline diagnostics still work on a blank machine. Prefer the
@@ -384,6 +416,7 @@ if ($ccswitchVerifier) {
 
 $installerItem = Get-Item -LiteralPath (Join-Path $output "CodexDesktopSetup.exe")
 $managerItem = Get-Item -LiteralPath (Join-Path $output "CodexAppManager.exe")
+$entryShimItem = Get-Item -LiteralPath (Join-Path $output "CodexEntryShim.exe")
 if ($UsbPolicy -eq "SignedRequired") {
     Assert-CompiledUsbManagerPolicy $managerItem.FullName $UsbPolicy
     Assert-CompiledUsbManagerBinding $managerItem.FullName $publicKeyId $publicKeyB64 $publicKeySha256
@@ -437,6 +470,7 @@ if (-not $SkipSignature -and -not $InternalSigned) {
 }
 $installerHash = (Get-FileHash -LiteralPath $installerItem.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
 $managerHash = (Get-FileHash -LiteralPath $managerItem.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+$entryShimHash = (Get-FileHash -LiteralPath $entryShimItem.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
 $payloadHash = (Get-FileHash -LiteralPath $payloadItem.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
 $ccswitchHash = (Get-FileHash -LiteralPath $ccswitchItem.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
 $vcRedistHash = (Get-FileHash -LiteralPath $vcRedistItem.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -446,7 +480,7 @@ if ($webView2Hash -ine "1F4638309F3D82C31A3028C3CF7D75998F58E4D1407380F5CB8A8E91
 }
 
 $usbManifest = [ordered]@{
-    schemaVersion = 2
+    schemaVersion = 3
     product = "codex-usb-oneclick"
     releaseVersion = $releaseVersion
     status = "oneclick"
@@ -484,6 +518,12 @@ $usbManifest = [ordered]@{
         size = [int64]$managerItem.Length
         sha256 = $managerHash
         role = "requireAdministrator USB Tauri manager started by the launcher or directly"
+    }
+    entryShim = [ordered]@{
+        file = "CodexEntryShim.exe"
+        size = [int64]$entryShimItem.Length
+        sha256 = $entryShimHash
+        role = "asInvoker Codex manifest-entry shim; every launch is handed to manager authorization"
     }
     ccswitch = [ordered]@{
         directory = "ccswitch"
@@ -625,7 +665,7 @@ $usbManifest = [ordered]@{
         "Unsigned development bundles auto-enroll on first run; strict anti-copy releases require a pre-provisioned signed usb-license.json."
     )
 }
-if ((Get-JsonInteger $usbManifest "schemaVersion") -ne 2 -or
+if ((Get-JsonInteger $usbManifest "schemaVersion") -ne 3 -or
     (Get-JsonInteger $usbManifest.updateCapability "schemaVersion") -ne 3 -or
     (Get-JsonInteger $usbManifest.updateCapability "anchorSchema") -ne 3 -or
     (Get-JsonInteger $usbManifest.sourceMediaCleanup "planSchema") -ne 3) {

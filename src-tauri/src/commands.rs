@@ -35,7 +35,6 @@ use crate::app::mac_update::{
     HistoricalMacEvidence, HistoricalMacExpectation, InstalledCodex, MacInstallStatus,
     MacPerformReport, MacStageReport, MacUninstallReport, MacUpdateReport, PerformExpectation,
 };
-use crate::app::model_catalog::NativeModelCatalogReport;
 use crate::app::offline_payload::{
     cleanup_staged_payload, probe_offline_payload, stage_offline_payload, OfflinePayloadReport,
     OfflineStageReport,
@@ -544,6 +543,27 @@ pub async fn manager_install_update(
 
 // ── Codex payload update channel (docs/UPDATE-CHANNELS.md § "Channel: codex")
 
+/// Resolve the payload update mode only from the backend USB authorization
+/// state. The renderer cannot select a recovery mode or provide a bundle path.
+fn authorized_codex_payload_root() -> Result<(PathBuf, bool), AppError> {
+    match crate::app::usb_guard::authorized_signed_bundle_identity() {
+        Ok((root, _)) => Ok((root, false)),
+        Err(normal_error) if crate::app::usb_guard::guard_required() => {
+            crate::app::usb_guard::require_signed_codex_reinstall_bundle(
+                "codex-payload-command-route",
+            )
+            .map(|authorization| (authorization.bundle_root, true))
+            .map_err(|reinstall_error| {
+                log::debug!(
+                    "restricted Codex reinstall route denied after normal gate: {reinstall_error}"
+                );
+                normal_error
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Read-only check of the USB payload against the configured codex payload
 /// repo. Returns `None` when up to date. Network failures surface as errors;
 /// the frontend decides how softly to present them.
@@ -554,16 +574,22 @@ pub async fn payload_check_codex(
     if !matches!(state.target.os, OperatingSystem::Windows) {
         return Err(AppError::UnsupportedPlatform.into());
     }
-    let bundle_root = crate::app::usb_guard::authorized_signed_bundle_identity()?.0;
+    let (bundle_root, reactivation_reinstall) = authorized_codex_payload_root()?;
     let settings = PersistedAppSettings::load();
     let ctx = crate::app::update_channel::UpdateContext {
         bundle_root,
         settings,
     };
-    tauri::async_runtime::spawn_blocking(move || crate::app::channels::codex::check(&ctx))
-        .await
-        .map_err(|e| AppError::Internal(format!("join: {e}")))?
-        .map_err(Into::into)
+    tauri::async_runtime::spawn_blocking(move || {
+        if reactivation_reinstall {
+            crate::app::channels::codex::check_reinstall(&ctx)
+        } else {
+            crate::app::channels::codex::check(&ctx)
+        }
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("join: {e}")))?
+    .map_err(Into::into)
 }
 
 /// Phase-1 apply: refresh the USB payload after the user clicks. Re-validates
@@ -580,7 +606,7 @@ pub async fn payload_apply_codex(
         return Err(AppError::UnsupportedPlatform.into());
     }
     reject_uninstall_handoff(&state)?;
-    let bundle_root = crate::app::usb_guard::authorized_signed_bundle_identity()?.0;
+    let (bundle_root, reactivation_reinstall) = authorized_codex_payload_root()?;
     let settings = PersistedAppSettings::load();
     let ctx = crate::app::update_channel::UpdateContext {
         bundle_root,
@@ -606,7 +632,11 @@ pub async fn payload_apply_codex(
         }),
     );
     let update_result = tauri::async_runtime::spawn_blocking(move || {
-        crate::app::channels::codex::apply(&ctx, &info, &progress)
+        if reactivation_reinstall {
+            crate::app::channels::codex::apply_reinstall(&ctx, &info, &progress)
+        } else {
+            crate::app::channels::codex::apply(&ctx, &info, &progress)
+        }
     })
     .await
     .map_err(|e| AppError::Internal(format!("join: {e}")))?;
@@ -616,6 +646,13 @@ pub async fn payload_apply_codex(
             error.code()
         );
         return Err(error.into());
+    }
+    if reactivation_reinstall {
+        // The updater never creates a lease. Re-run manager startup so it can
+        // retain the restricted reinstall state or authorize only after the
+        // complete USB bundle has been verified again.
+        let status = crate::app::usb_guard::start_for_manager()?;
+        let _ = app.emit("usb-guard-status-changed", status);
     }
     let _ = app.emit(
         "payload-update-progress",
@@ -1249,7 +1286,7 @@ pub async fn offline_payload_stage(
         return Err(AppError::UnsupportedPlatform.into());
     }
     reject_uninstall_handoff(&state)?;
-    crate::app::usb_guard::require_signed_codex_bundle("offline-payload-stage")?;
+    crate::app::usb_guard::require_signed_codex_install_bundle("offline-payload-stage")?;
     let executable = std::env::current_exe()
         .map_err(|error| AppError::Internal(format!("无法确定安装器路径: {error}")))?;
     let expected_architecture = state.target.arch.as_str().to_string();
@@ -3235,14 +3272,34 @@ pub async fn win_launch_codex(
     if !matches!(state.target.os, OperatingSystem::Windows) {
         return Err(AppError::UnsupportedPlatform.into());
     }
-    crate::app::usb_guard::require_signed_codex_bundle("win-launch-codex")?;
+    if crate::app::usb_guard::guard_required() {
+        // Manager startup already performs the online revocation decision and
+        // starts the USB watchdog. Re-running start_for_manager here tears
+        // down and respawns that helper for every launch click, then the
+        // launch implementation performs the full signed-bundle check again.
+        // Keep this command boundary cheap and live; win_update::launch_codex
+        // repeats the signed bundle verification immediately before spawn.
+        crate::app::usb_guard::require_authorized()?;
+        let authorization = crate::app::usb_guard::current_status();
+        if !authorization.codex_allowed {
+            return Err(AppError::Engine(
+                authorization
+                    .codex_block_reason
+                    .unwrap_or_else(|| authorization.message),
+            )
+            .into());
+        }
+    }
     let persisted = PersistedAppSettings::load();
     let codex_locale = locale
         .as_deref()
         .map(str::trim)
         .filter(|locale| matches!(*locale, "zh-CN" | "zh-TW"))
         .map(str::to_owned);
-    let before_codex = crate::app::usb_guard::snapshot_processes("Codex.exe");
+    let mut before_codex = crate::app::usb_guard::snapshot_processes("Codex.exe");
+    if crate::app::usb_guard::guard_required() {
+        before_codex.extend(crate::app::usb_guard::snapshot_usb_codex_entry_processes());
+    }
     let before_chatgpt = crate::app::usb_guard::snapshot_processes("ChatGPT.exe");
     if persisted.codex_theme.is_some() && state.operations.snapshot().is_none() {
         let themed = crate::app::codex_theme::launch_with_active_theme(
@@ -3296,14 +3353,12 @@ pub fn cancel_gateway_model_probe(request_id: String) -> bool {
     crate::app::gateway_model_probe::cancel(&request_id)
 }
 
-/// Refresh only the signed provider's model metadata for the Codex menu.
-/// This path never sends a generation request and never gates CCSwitch or
-/// Codex installation; full capability/native verification remains advanced.
+/// Read, selectively extend, or reset the manager-owned native model catalog.
 #[tauri::command]
-pub async fn refresh_native_model_catalog(
-    force: bool,
-) -> Result<NativeModelCatalogReport, CommandError> {
-    crate::app::model_catalog::refresh_native_model_catalog(force)
+pub async fn manage_native_model_catalog(
+    request: crate::app::model_catalog::NativeModelCatalogActionRequest,
+) -> Result<crate::app::model_catalog::NativeModelCatalogActionReport, CommandError> {
+    crate::app::model_catalog::manage_native_model_catalog(request)
         .await
         .map_err(Into::into)
 }
@@ -3614,7 +3669,12 @@ pub async fn win_install_historical_release(
     if !matches!(state.target.os, OperatingSystem::Windows) {
         return Err(AppError::UnsupportedPlatform.into());
     }
-    crate::app::usb_guard::require_signed_codex_bundle("win-install-historical")?;
+    let install_to_usb = install_to_usb.unwrap_or(false);
+    if install_to_usb {
+        crate::app::usb_guard::require_signed_codex_install_bundle("win-install-historical")?;
+    } else {
+        crate::app::usb_guard::require_signed_codex_bundle("win-install-historical")?;
+    }
     if !confirm {
         return Err(AppError::Internal(
             "拒绝执行：Windows 历史版本安装必须带显式 confirm".to_string(),
@@ -3630,7 +3690,6 @@ pub async fn win_install_historical_release(
     // the next operation.
     let _abort_scope = WinAbortGuard::new();
     let mut settings = windows_domain_settings_for_persisted(&state);
-    let install_to_usb = install_to_usb.unwrap_or(false);
     // Match the normal fresh-install flow: validate the one-shot destination
     // before use, but remember it only after the historical install succeeds.
     let pending_install_root = if install_to_usb {
@@ -3782,11 +3841,12 @@ pub async fn win_install_historical_release(
         };
         let before_commit = || {
             if install_to_usb {
-                let authorization =
-                    crate::app::usb_guard::require_signed_codex_bundle("historical-usb-precommit")?
-                        .ok_or_else(|| {
-                            AppError::Engine("USB 历史安装提交前未获得当前 bundle 授权".to_string())
-                        })?;
+                let authorization = crate::app::usb_guard::require_signed_codex_install_bundle(
+                    "historical-usb-precommit",
+                )?
+                .ok_or_else(|| {
+                    AppError::Engine("USB 历史安装提交前未获得当前 bundle 授权".to_string())
+                })?;
                 if !codex_win_engine::same_windows_path(
                     Path::new(&settings.install_root),
                     &authorization.codex_root,
@@ -3852,6 +3912,13 @@ pub async fn win_install_historical_release(
     if report.success && install_to_usb {
         if let Err(error) = crate::app::codex_agents_hint::ensure_portable_usb_hint() {
             log::warn!("could not add the USB Codex mojibake hint to AGENTS.md: {error}");
+        }
+        // A reactivated USB stays without a lease throughout the reinstall.
+        // Only after the install has succeeded does startup repeat the signed
+        // status check and full bundle validation before publishing an active
+        // guard lease.
+        if let Err(error) = crate::app::usb_guard::start_for_manager() {
+            log::error!("USB authorization refresh after reactivation install failed: {error}");
         }
     }
     if report.success && !was_local {

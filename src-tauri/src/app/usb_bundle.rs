@@ -30,17 +30,58 @@ const USB_MANIFEST: &str = "usb-manifest.json";
 const SUMS_FILE: &str = "SHA256SUMS.txt";
 const LICENSE_FILE: &str = "usb-license.json";
 const LICENSE_BACKUP: &str = "usb-license.json.bak";
+const REVOCATION_REGISTRATION_FILE: &str = codex_usb_license::REVOCATION_REGISTRATION_FILE_NAME;
+const REVOCATION_STATE_FILE: &str = "CodexUsbState/revocation.json";
+const MAX_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
+const MAX_SHA_SUMS_BYTES: usize = 64 * 1024 * 1024;
 const PORTABLE_STAGING_DIR: &str = "apps/.codex-app-manager-staging";
 const EXPECTED_WEBVIEW2_SHA256: &str =
     "1f4638309f3d82c31a3028c3cf7d75998f58e4d1407380f5cb8a8e9172caf17d";
 const EXPECTED_VC_REDIST_SHA256: &str =
     "843068991daaa1f73ad9f6239bce4d0f6a07a51f18c37ea2a867e9beca71295c";
 
+#[cfg(test)]
+thread_local! {
+    static TEST_EXPECTED_RUNTIME_HASHES: std::cell::RefCell<HashMap<&'static str, String>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+#[cfg(test)]
+fn with_test_runtime_hashes<T>(vc: &str, webview: &str, action: impl FnOnce() -> T) -> T {
+    TEST_EXPECTED_RUNTIME_HASHES.with(|hashes| {
+        hashes.borrow_mut().insert("vc", vc.to_ascii_lowercase());
+        hashes
+            .borrow_mut()
+            .insert("webview", webview.to_ascii_lowercase());
+    });
+    let result = action();
+    TEST_EXPECTED_RUNTIME_HASHES.with(|hashes| hashes.borrow_mut().clear());
+    result
+}
+
+fn expected_runtime_hash(kind: &'static str) -> String {
+    #[cfg(test)]
+    if let Some(hash) =
+        TEST_EXPECTED_RUNTIME_HASHES.with(|hashes| hashes.borrow().get(kind).cloned())
+    {
+        return hash;
+    }
+    match kind {
+        "vc" => EXPECTED_VC_REDIST_SHA256.to_string(),
+        "webview" => EXPECTED_WEBVIEW2_SHA256.to_string(),
+        _ => unreachable!("unknown fixed runtime kind"),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BundleIntegrityReport {
     pub root: PathBuf,
     pub anchor_schema: u32,
     pub anchor_sha256: String,
+    /// True only when the signed root manifest requires Codex to be launched
+    /// through the manager's direct-entry shim. Legacy schema 2 bundles keep
+    /// their previous launch behavior.
+    pub direct_entry_required: bool,
     pub files_verified: usize,
     pub payload_path: PathBuf,
     pub payload_sha256: String,
@@ -251,11 +292,35 @@ fn sha256_file(path: &Path) -> Result<String, AppError> {
 }
 
 fn read_json(root: &Path, name: &str) -> Result<serde_json::Value, AppError> {
+    read_json_snapshot(root, name).map(|(value, _)| value)
+}
+
+fn read_json_snapshot(root: &Path, name: &str) -> Result<(serde_json::Value, Vec<u8>), AppError> {
     let path = root.join(name);
-    let bytes =
-        fs::read(&path).map_err(|error| bundle_error(format!("读取 {name} 失败：{error}")))?;
-    serde_json::from_slice(&bytes)
-        .map_err(|error| bundle_error(format!("解析 {name} 失败：{error}")))
+    let bytes = read_bounded_file(&path, MAX_MANIFEST_BYTES, name)?;
+    let value = serde_json::from_slice(&bytes)
+        .map_err(|error| bundle_error(format!("解析 {name} 失败：{error}")))?;
+    Ok((value, bytes))
+}
+
+fn read_bounded_file(path: &Path, max_bytes: usize, label: &str) -> Result<Vec<u8>, AppError> {
+    let mut file = fs::File::open(path)
+        .map_err(|error| bundle_error(format!("读取 {label} 失败：{error}")))?;
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(max_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| bundle_error(format!("读取 {label} 失败：{error}")))?;
+    if bytes.len() > max_bytes {
+        return Err(bundle_error(format!("{label} 超过读取上限")));
+    }
+    Ok(bytes)
+}
+
+fn read_sums_text(root: &Path) -> Result<String, AppError> {
+    let bytes = read_bounded_file(&root.join(SUMS_FILE), MAX_SHA_SUMS_BYTES, SUMS_FILE)?;
+    String::from_utf8(bytes)
+        .map_err(|error| bundle_error(format!("{SUMS_FILE} 不是 UTF-8：{error}")))
 }
 
 fn listed_path(root: &Path, relative: &str) -> Result<PathBuf, AppError> {
@@ -362,13 +427,23 @@ pub fn validate_backup_layout(
 fn verify_sums(
     root: &Path,
     payload_relative: &str,
+    allow_missing_targets: Option<&HashSet<String>>,
 ) -> Result<(usize, String, VerifiedFileLedger), AppError> {
-    let sums_path = root.join(SUMS_FILE);
-    let text = fs::read_to_string(&sums_path)
-        .map_err(|error| bundle_error(format!("读取 {SUMS_FILE} 失败：{error}")))?;
+    let text = read_sums_text(root)?;
+    verify_sums_from_text(root, payload_relative, allow_missing_targets, &text, None)
+}
+
+fn verify_sums_from_text(
+    root: &Path,
+    payload_relative: &str,
+    allow_missing_targets: Option<&HashSet<String>>,
+    text: &str,
+    metadata_snapshot: Option<(&[u8], &[u8])>,
+) -> Result<(usize, String, VerifiedFileLedger), AppError> {
     let mut listed = HashSet::<String>::new();
     let mut ledger = VerifiedFileLedger::new();
     let mut payload_sha = None;
+    let mut atomic_temp_count = 0usize;
     for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
         let mut parts = line.split_whitespace();
         let expected = parts
@@ -384,20 +459,59 @@ fn verify_sums(
             return Err(bundle_error(format!("SHA 清单格式错误：{line}")));
         }
         let relative = relative_path(raw_relative)?;
-        if relative.eq_ignore_ascii_case(SUMS_FILE) || relative.eq_ignore_ascii_case(LICENSE_FILE) {
+        if relative.eq_ignore_ascii_case(SUMS_FILE)
+            || relative.eq_ignore_ascii_case(LICENSE_FILE)
+            || is_mutable_revocation_file(&relative)
+        {
             return Err(bundle_error(format!("SHA 清单不得包含 {relative}")));
         }
         if !listed.insert(relative.clone()) {
             return Err(bundle_error(format!("SHA 清单存在重复项：{relative}")));
         }
-        let path = listed_path(root, &relative)?;
-        let actual = sha256_file(&path)?;
+        if let Some((label, bytes)) = metadata_snapshot.and_then(|(manifest, usb_manifest)| {
+            if relative.eq_ignore_ascii_case(ROOT_MANIFEST) {
+                Some((ROOT_MANIFEST, manifest))
+            } else if relative.eq_ignore_ascii_case(USB_MANIFEST) {
+                Some((USB_MANIFEST, usb_manifest))
+            } else {
+                None
+            }
+        }) {
+            let digest = Sha256::digest(bytes);
+            let snapshot_hash = digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            if !snapshot_hash.eq_ignore_ascii_case(expected) {
+                return Err(bundle_error(format!(
+                    "SHA 清单与已解析的 {label} 快照不一致"
+                )));
+            }
+        }
+        let path = root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
+        let allowed_missing = allow_missing_targets.is_some_and(|targets| {
+            targets
+                .iter()
+                .any(|target| target.eq_ignore_ascii_case(&relative))
+        }) && !path.exists();
+        let actual = if allowed_missing {
+            expected.to_ascii_lowercase()
+        } else {
+            let path = listed_path(root, &relative)?;
+            sha256_file(&path)?
+        };
         if !actual.eq_ignore_ascii_case(expected) {
             return Err(bundle_error(format!("SHA 不匹配：{relative}")));
         }
-        let size = fs::metadata(&path)
-            .map_err(|error| bundle_error(format!("读取文件大小失败 {}：{error}", path.display())))?
-            .len();
+        let size = if allowed_missing {
+            0
+        } else {
+            fs::metadata(&path)
+                .map_err(|error| {
+                    bundle_error(format!("读取文件大小失败 {}：{error}", path.display()))
+                })?
+                .len()
+        };
         ledger.insert(relative.clone(), (actual.clone(), size));
         if relative.eq_ignore_ascii_case(payload_relative) {
             payload_sha = Some(actual);
@@ -425,6 +539,10 @@ fn verify_sums(
             if relative.eq_ignore_ascii_case(PORTABLE_STAGING_DIR) && !file_type.is_dir() {
                 return Err(bundle_error("apps/.codex-app-manager-staging 必须是目录"));
             }
+            if is_mutable_revocation_sidecar(&relative) {
+                validate_mutable_revocation_sidecar(&path)?;
+                continue;
+            }
             if is_mutable_runtime_path(&relative) {
                 if file_type.is_dir() {
                     continue;
@@ -438,6 +556,14 @@ fn verify_sums(
             if relative.eq_ignore_ascii_case(SUMS_FILE)
                 || relative.eq_ignore_ascii_case(LICENSE_FILE)
             {
+                continue;
+            }
+            if crate::app::usb_revocation::is_atomic_state_tmp_relative(&relative) {
+                atomic_temp_count += 1;
+                if atomic_temp_count > crate::app::usb_revocation::MAX_ATOMIC_STATE_TEMPS {
+                    return Err(bundle_error("授权状态原子临时项超过安全数量上限"));
+                }
+                validate_atomic_state_temp(&path)?;
                 continue;
             }
             if !listed.contains(&relative) {
@@ -454,31 +580,90 @@ fn verify_sums(
     ))
 }
 
+pub(crate) fn validate_mutable_revocation_sidecar(path: &Path) -> Result<(), AppError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| bundle_error(format!("读取授权运行时文件属性失败：{error}")))?;
+    if !metadata.is_file() || is_reparse(path)? || !has_exactly_one_link(path) {
+        return Err(bundle_error(format!(
+            "授权运行时文件必须是单链接普通文件：{}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_atomic_state_temp(path: &Path) -> Result<(), AppError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| bundle_error(format!("读取授权状态临时项属性失败：{error}")))?;
+    if !metadata.is_file() || is_reparse(path)? || !has_exactly_one_link(path) {
+        return Err(bundle_error("授权状态原子临时项必须是单链接普通文件"));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn has_exactly_one_link(path: &Path) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+
+    let Ok(file) = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+    else {
+        return false;
+    };
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    (unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) != 0 })
+        && info.nNumberOfLinks == 1
+        && info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) == 0
+}
+
+#[cfg(unix)]
+fn has_exactly_one_link(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    fs::symlink_metadata(path).is_ok_and(|metadata| {
+        metadata.is_file() && !metadata.file_type().is_symlink() && metadata.nlink() == 1
+    })
+}
+
+#[cfg(not(any(windows, unix)))]
+fn has_exactly_one_link(_path: &Path) -> bool {
+    false
+}
+
+pub(crate) fn is_mutable_revocation_file(relative: &str) -> bool {
+    is_mutable_revocation_sidecar(relative)
+        || crate::app::usb_revocation::is_atomic_state_tmp_relative(relative)
+}
+
+fn is_mutable_revocation_sidecar(relative: &str) -> bool {
+    relative.eq_ignore_ascii_case(REVOCATION_REGISTRATION_FILE)
+        || relative.eq_ignore_ascii_case(REVOCATION_STATE_FILE)
+}
+
 fn verify_manifest_contract(
     root: &Path,
-) -> Result<(u32, PathBuf, String, serde_json::Value, serde_json::Value), AppError> {
-    let manifest = read_json(root, ROOT_MANIFEST)?;
-    let usb_manifest = read_json(root, USB_MANIFEST)?;
-    if manifest
-        .get("schemaVersion")
-        .and_then(serde_json::Value::as_u64)
-        != Some(2)
-    {
-        return Err(bundle_error("root manifest 必须是 schemaVersion=2"));
-    }
-    if usb_manifest
-        .get("schemaVersion")
-        .and_then(serde_json::Value::as_u64)
-        != Some(2)
-        || usb_manifest
-            .get("product")
-            .and_then(serde_json::Value::as_str)
-            != Some("codex-usb-oneclick")
-    {
-        return Err(bundle_error(
-            "usb-manifest 必须是 codex-usb-oneclick schemaVersion=2",
-        ));
-    }
+    allow_missing_payload: bool,
+) -> Result<
+    (
+        u32,
+        bool,
+        PathBuf,
+        String,
+        serde_json::Value,
+        serde_json::Value,
+        Vec<u8>,
+        Vec<u8>,
+    ),
+    AppError,
+> {
+    let (manifest, manifest_bytes) = read_json_snapshot(root, ROOT_MANIFEST)?;
+    let (usb_manifest, usb_manifest_bytes) = read_json_snapshot(root, USB_MANIFEST)?;
     let root_schema = manifest
         .get("schemaVersion")
         .and_then(serde_json::Value::as_u64)
@@ -487,6 +672,31 @@ fn verify_manifest_contract(
         .get("schemaVersion")
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| bundle_error("usb-manifest schemaVersion 无效"))?;
+    if !matches!(root_schema, 2 | 3) {
+        return Err(bundle_error("root manifest 必须是 schemaVersion=2 或 3"));
+    }
+    if !matches!(usb_schema, 2 | 3)
+        || usb_schema != root_schema
+        || usb_manifest
+            .get("product")
+            .and_then(serde_json::Value::as_str)
+            != Some("codex-usb-oneclick")
+    {
+        return Err(bundle_error(
+            "usb-manifest 必须与 root 同为 codex-usb-oneclick schemaVersion=2 或 3",
+        ));
+    }
+    if root_schema == 3
+        && manifest
+            .pointer("/revocationPolicy/registrationRequired")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+    {
+        return Err(bundle_error(
+            "schemaVersion=3 root manifest 必须锚定 revocationPolicy.registrationRequired=true",
+        ));
+    }
+    let direct_entry_required = direct_entry_policy_required(&manifest, root_schema)?;
     let anchor_schema = declared_anchor_schema(&usb_manifest, usb_schema)?;
     for (label, value) in [
         (
@@ -530,9 +740,6 @@ fn verify_manifest_contract(
             }
         }
     }
-    if root_schema != 2 || usb_schema != 2 {
-        return Err(bundle_error("bundle 顶层 manifest schema 必须是 2"));
-    }
     if manifest
         .pointer("/updateCapability/codexPayload")
         .and_then(serde_json::Value::as_bool)
@@ -572,14 +779,94 @@ fn verify_manifest_contract(
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| bundle_error("root manifest 缺少 architecture"))?;
     validate_backup_layout(root, &payload_relative, architecture)?;
-    let payload = listed_path(root, &payload_relative)?;
+    let payload = root.join(payload_relative.replace('/', std::path::MAIN_SEPARATOR_STR));
+    if payload.exists() {
+        let _ = ensure_inside(root, &payload)?;
+    } else if !allow_missing_payload {
+        return Err(bundle_error(format!(
+            "SHA 清单文件不存在：{payload_relative}"
+        )));
+    } else {
+        reject_reparse_ancestors(root, &payload)?;
+    }
     Ok((
         anchor_schema,
+        direct_entry_required,
         payload,
         payload_relative,
         manifest,
         usb_manifest,
+        manifest_bytes,
+        usb_manifest_bytes,
     ))
+}
+
+fn direct_entry_policy_required(
+    manifest: &serde_json::Value,
+    root_schema: u64,
+) -> Result<bool, AppError> {
+    match root_schema {
+        2 => Ok(false),
+        3 => {
+            if manifest
+                .pointer("/directEntryPolicy/required")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+                || manifest
+                    .pointer("/directEntryPolicy/shim")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("CodexEntryShim.exe")
+                || manifest
+                    .pointer("/directEntryPolicy/failure")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("closed")
+            {
+                return Err(bundle_error(
+                    "schemaVersion=3 root manifest 必须要求 CodexEntryShim.exe 且声明 failure=closed",
+                ));
+            }
+            Ok(true)
+        }
+        _ => Err(bundle_error(format!(
+            "不支持的 direct-entry manifest schema：{root_schema}"
+        ))),
+    }
+}
+
+/// Read the direct-entry policy only when it is bound to the expected signed
+/// anchor. Recovery transactions cannot always run the full tree verifier
+/// because an interrupted update may leave payload metadata in a transitional
+/// state, but they must still reject a policy read from a different manifest
+/// snapshot than the signed USB identity.
+pub(crate) fn direct_entry_policy_for_signed_anchor(
+    root: &Path,
+    expected_anchor_sha256: &str,
+) -> Result<bool, AppError> {
+    let (manifest, manifest_bytes) = read_json_snapshot(root, ROOT_MANIFEST)?;
+    let schema = manifest
+        .get("schemaVersion")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| bundle_error("root manifest schemaVersion 无效"))?;
+    if !matches!(schema, 2 | 3) {
+        return Err(bundle_error("不支持的 root manifest schemaVersion"));
+    }
+    let direct_entry_required = direct_entry_policy_required(&manifest, schema)?;
+    if !direct_entry_required {
+        return Ok(false);
+    }
+
+    let (_, usb_manifest_bytes) = read_json_snapshot(root, USB_MANIFEST)?;
+    let checksum_bytes = read_bounded_file(&root.join(SUMS_FILE), MAX_SHA_SUMS_BYTES, SUMS_FILE)?;
+    let anchor_sha256 = codex_usb_license::anchor_sha256_from_bytes(
+        &manifest_bytes,
+        &usb_manifest_bytes,
+        Some(&checksum_bytes),
+    )
+    .map_err(|error| bundle_error(format!("校验入口策略签名锚点失败：{error}")))?;
+    if !anchor_sha256.eq_ignore_ascii_case(expected_anchor_sha256) {
+        return Err(bundle_error("入口策略与当前签名许可证锚点不一致"));
+    }
+    Ok(true)
 }
 
 fn required_value<'a>(
@@ -710,8 +997,22 @@ fn verify_cross_file_metadata(
     payload_relative: &str,
     payload_sha256: &str,
     ledger: &VerifiedFileLedger,
+    allow_missing_payload: bool,
 ) -> Result<(), AppError> {
-    require_u64(manifest, "/schemaVersion", 2)?;
+    let document_schema = required_u64(manifest, "/schemaVersion")?;
+    if !matches!(document_schema, 2 | 3) {
+        return Err(bundle_error("root manifest schemaVersion 必须是 2 或 3"));
+    }
+    if document_schema == 3
+        && required_value(manifest, "/revocationPolicy")?
+            .get("registrationRequired")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+    {
+        return Err(bundle_error(
+            "schemaVersion=3 必须锚定 registrationRequired=true",
+        ));
+    }
     require_string(manifest, "/packageName", "OpenAI.Codex")?;
     let architecture = required_string(manifest, "/architecture")?;
     if !matches!(architecture, "x64" | "arm64") {
@@ -721,7 +1022,9 @@ fn verify_cross_file_metadata(
     }
     let root_payload = required_value(manifest, "/payload")?;
     require_string(root_payload, "/path", payload_relative)?;
-    let _payload_path = required_bundle_file(root, payload_relative)?;
+    if !allow_missing_payload || root.join(payload_relative).is_file() {
+        let _payload_path = required_bundle_file(root, payload_relative)?;
+    }
     let (actual_payload_hash, actual_payload_size) = ledger
         .iter()
         .find(|(relative, _)| relative.eq_ignore_ascii_case(payload_relative))
@@ -731,12 +1034,13 @@ fn verify_cross_file_metadata(
     let expected_payload_size = required_u64(root_payload, "/size")?;
     if !actual_payload_hash.eq_ignore_ascii_case(payload_sha256)
         || !actual_payload_hash.eq_ignore_ascii_case(&expected_payload_hash)
-        || actual_payload_size != expected_payload_size
+        || (actual_payload_size != expected_payload_size
+            && !(allow_missing_payload && actual_payload_size == 0))
     {
         return Err(bundle_error("MSIX 载荷与 root manifest/SHA256SUMS 不一致"));
     }
 
-    require_u64(usb_manifest, "/schemaVersion", 2)?;
+    require_u64(usb_manifest, "/schemaVersion", document_schema)?;
     require_string(usb_manifest, "/product", "codex-usb-oneclick")?;
     require_string(usb_manifest, "/status", "oneclick")?;
     let installer = required_value(usb_manifest, "/codexInstaller")?;
@@ -751,7 +1055,11 @@ fn verify_cross_file_metadata(
             ))
         }
     })?;
-    require_u64(installer, "/payloadSize", actual_payload_size)?;
+    if allow_missing_payload && actual_payload_size == 0 {
+        require_u64(installer, "/payloadSize", expected_payload_size)?;
+    } else {
+        require_u64(installer, "/payloadSize", actual_payload_size)?;
+    }
     let _ = verify_file_metadata(
         root,
         ledger,
@@ -810,7 +1118,7 @@ fn verify_cross_file_metadata(
         "/size",
         "resources/prerequisites/vc_redist.x64.exe",
     )?;
-    if !vc_hash.eq_ignore_ascii_case(EXPECTED_VC_REDIST_SHA256) {
+    if !vc_hash.eq_ignore_ascii_case(&expected_runtime_hash("vc")) {
         return Err(bundle_error("VC++ runtime hash 不是固定发布输入"));
     }
     let webview = required_value(usb_manifest, "/webView2Runtime")?;
@@ -824,7 +1132,7 @@ fn verify_cross_file_metadata(
         "/size",
         "resources/prerequisites/MicrosoftEdgeWebView2RuntimeInstallerX64.exe",
     )?;
-    if !webview_hash.eq_ignore_ascii_case(EXPECTED_WEBVIEW2_SHA256) {
+    if !webview_hash.eq_ignore_ascii_case(&expected_runtime_hash("webview")) {
         return Err(bundle_error("WebView2 runtime hash 不是固定发布输入"));
     }
     Ok(())
@@ -834,6 +1142,15 @@ fn verify_formal_signing_binding(usb_manifest: &serde_json::Value) -> Result<(),
     let signing = required_value(usb_manifest, "/usbGuard/signing")?;
     require_string(signing, "/policy", "SignedRequired")?;
     let declared_key_id = required_string(signing, "/keyId")?;
+    #[cfg(test)]
+    let test_key_config = crate::app::usb_guard::test_license_public_key_config(declared_key_id);
+    #[cfg(test)]
+    let active_key_id = test_key_config
+        .as_ref()
+        .map(|(key_id, _)| key_id.as_str())
+        .or(option_env!("CODEX_USB_GUARD_PUBLIC_KEY_ID"))
+        .ok_or_else(|| bundle_error("SignedRequired 构建缺少编译期 USB active keyId"))?;
+    #[cfg(not(test))]
     let active_key_id = option_env!("CODEX_USB_GUARD_PUBLIC_KEY_ID")
         .ok_or_else(|| bundle_error("SignedRequired 构建缺少编译期 USB active keyId"))?;
     if declared_key_id != active_key_id {
@@ -850,6 +1167,13 @@ fn verify_formal_signing_binding(usb_manifest: &serde_json::Value) -> Result<(),
             "Bundle signing publicKeySha256 必须是 64 位十六进制摘要",
         ));
     }
+    #[cfg(test)]
+    let public_key_b64 = test_key_config
+        .as_ref()
+        .map(|(_, public_key)| public_key.as_str())
+        .or(option_env!("CODEX_USB_GUARD_PUBLIC_KEY_B64"))
+        .ok_or_else(|| bundle_error("SignedRequired 构建缺少编译期 USB 公钥"))?;
+    #[cfg(not(test))]
     let public_key_b64 = option_env!("CODEX_USB_GUARD_PUBLIC_KEY_B64")
         .ok_or_else(|| bundle_error("SignedRequired 构建缺少编译期 USB 公钥"))?;
     let public_key = BASE64
@@ -965,9 +1289,26 @@ fn verify_bundle_integrity_mode(
         )));
     }
     reject_reparse_tree(root)?;
-    let (anchor_schema, payload_path, payload_relative, manifest, usb_manifest) =
-        verify_manifest_contract(root)?;
-    let (files_verified, payload_sha256, ledger) = verify_sums(root, &payload_relative)?;
+    let (
+        anchor_schema,
+        direct_entry_required,
+        payload_path,
+        payload_relative,
+        manifest,
+        usb_manifest,
+        manifest_bytes,
+        usb_manifest_bytes,
+    ) = verify_manifest_contract(root, false)?;
+    let checksum_bytes = read_bounded_file(&root.join(SUMS_FILE), MAX_SHA_SUMS_BYTES, SUMS_FILE)?;
+    let checksum_text = String::from_utf8(checksum_bytes.clone())
+        .map_err(|error| bundle_error(format!("{SUMS_FILE} 不是 UTF-8：{error}")))?;
+    let (files_verified, payload_sha256, ledger) = verify_sums_from_text(
+        root,
+        &payload_relative,
+        None,
+        &checksum_text,
+        Some((&manifest_bytes, &usb_manifest_bytes)),
+    )?;
     verify_cross_file_metadata(
         root,
         &manifest,
@@ -976,6 +1317,7 @@ fn verify_bundle_integrity_mode(
         &payload_relative,
         &payload_sha256,
         &ledger,
+        false,
     )?;
     match mode {
         BundleVerificationMode::HashOnly => {}
@@ -988,16 +1330,209 @@ fn verify_bundle_integrity_mode(
             verify_strict_authenticode(root, &payload_path)?;
         }
     }
-    let anchor_sha256 = codex_usb_license::anchor_sha256(root)
-        .map_err(|error| bundle_error(format!("计算 bundle 锚点失败：{error}")))?;
+    let anchor_sha256 = codex_usb_license::anchor_sha256_from_bytes(
+        &manifest_bytes,
+        &usb_manifest_bytes,
+        Some(&checksum_bytes),
+    )
+    .map_err(|error| bundle_error(format!("计算 bundle 锚点失败：{error}")))?;
     Ok(BundleIntegrityReport {
         root: root.to_path_buf(),
         anchor_schema,
         anchor_sha256,
+        direct_entry_required,
         files_verified,
         payload_path,
         payload_sha256,
     })
+}
+
+/// Verify a bundle after signed revocation cleanup. Only the manifest-declared
+/// MSIX payload and the single exact payload backup row may be missing. Every
+/// other immutable row remains fully SHA-256 checked; manager runtime/staging
+/// paths remain governed by their existing narrow mutable-path rules.
+pub fn verify_revocation_recovery_bundle(
+    root: &Path,
+    license: &crate::app::usb_guard::UsbLicense,
+    fingerprint: &crate::app::usb_guard::UsbFingerprint,
+) -> Result<BundleIntegrityReport, AppError> {
+    verify_revocation_recovery_bundle_with_observer(
+        root,
+        license,
+        fingerprint,
+        crate::app::usb_guard::observe_bundle,
+    )
+}
+
+fn verify_revocation_recovery_bundle_with_observer(
+    root: &Path,
+    license: &crate::app::usb_guard::UsbLicense,
+    fingerprint: &crate::app::usb_guard::UsbFingerprint,
+    observe: impl FnOnce(&Path) -> Result<crate::app::usb_guard::UsbObservation, AppError>,
+) -> Result<BundleIntegrityReport, AppError> {
+    reject_reparse_tree(root)?;
+    if !root.is_dir() {
+        return Err(bundle_error("作废恢复时 Bundle 根目录不可用"));
+    }
+    let observation =
+        observe(root).map_err(|error| bundle_error(format!("重新读取 U 盘身份失败：{error}")))?;
+    if !observation.removable {
+        return Err(bundle_error("作废恢复要求原 U 盘仍处于连接状态"));
+    }
+    let current_fingerprint = observation
+        .fingerprint
+        .as_ref()
+        .ok_or_else(|| bundle_error("无法从当前 Bundle 根目录读取完整 U 盘指纹"))?;
+    validate_recovery_fingerprint_binding(license, fingerprint, current_fingerprint)?;
+    match crate::app::usb_guard::validate_license(license, current_fingerprint) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(bundle_error(
+                "作废恢复需要与当前 U 盘身份匹配的有效签名许可证",
+            ));
+        }
+        Err(error) => {
+            return Err(bundle_error(format!("作废恢复许可证校验失败：{error}")));
+        }
+    }
+    validate_recovery_authorization(root, license, fingerprint, current_fingerprint)?;
+    let (
+        anchor_schema,
+        direct_entry_required,
+        payload_path,
+        payload_relative,
+        manifest,
+        usb_manifest,
+        manifest_bytes,
+        usb_manifest_bytes,
+    ) = verify_manifest_contract(root, true)?;
+    if manifest
+        .pointer("/revocationPolicy/registrationRequired")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        return Err(bundle_error(
+            "作废恢复只允许登记策略必需的 schemaVersion=3 Bundle",
+        ));
+    }
+    let architecture = required_string(&manifest, "/architecture")?;
+    let payload_parent = payload_relative
+        .rsplit_once('/')
+        .map(|(parent, _)| parent)
+        .unwrap_or("");
+    let backup_directory = if payload_parent.is_empty() {
+        "_backup".to_string()
+    } else {
+        format!("{payload_parent}/_backup")
+    };
+    let mut allowed_missing = HashSet::new();
+    allowed_missing.insert(payload_relative.to_ascii_lowercase());
+    let checksum_bytes = read_bounded_file(&root.join(SUMS_FILE), MAX_SHA_SUMS_BYTES, SUMS_FILE)?;
+    let sums = String::from_utf8(checksum_bytes.clone())
+        .map_err(|error| bundle_error(format!("{SUMS_FILE} 不是 UTF-8：{error}")))?;
+    let backup_prefix = format!("{backup_directory}/OpenAI.Codex_{architecture}_");
+    let mut backup_rows = 0usize;
+    for line in sums.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let mut parts = line.split_whitespace();
+        let _digest = parts.next().unwrap_or_default();
+        let Some(path) = parts.next() else { continue };
+        if parts.next().is_some() {
+            continue;
+        }
+        let normalized = relative_path(path)?;
+        if normalized
+            .to_ascii_lowercase()
+            .starts_with(&backup_prefix.to_ascii_lowercase())
+        {
+            let file_name = normalized.rsplit('/').next().unwrap_or_default();
+            let Some(version) = file_name
+                .strip_prefix(&format!("OpenAI.Codex_{architecture}_"))
+                .and_then(|name| name.strip_suffix(".msix"))
+            else {
+                return Err(bundle_error("payload backup 清单行名称无效"));
+            };
+            if version.is_empty()
+                || !version
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_'))
+            {
+                return Err(bundle_error("payload backup 清单行版本无效"));
+            }
+            backup_rows += 1;
+            if backup_rows > 1 {
+                return Err(bundle_error("作废恢复检测到多条 payload backup 清单行"));
+            }
+            allowed_missing.insert(normalized.to_ascii_lowercase());
+        }
+    }
+    let (files_verified, payload_sha256, ledger) = verify_sums_from_text(
+        root,
+        &payload_relative,
+        Some(&allowed_missing),
+        &sums,
+        Some((&manifest_bytes, &usb_manifest_bytes)),
+    )?;
+    verify_cross_file_metadata(
+        root,
+        &manifest,
+        &usb_manifest,
+        &payload_path,
+        &payload_relative,
+        &payload_sha256,
+        &ledger,
+        true,
+    )?;
+    verify_formal_signing_binding(&usb_manifest)?;
+    if payload_path.is_file() {
+        verify_external_authenticode(root, &payload_path)?;
+    }
+    let anchor_sha256 = codex_usb_license::anchor_sha256_from_bytes(
+        &manifest_bytes,
+        &usb_manifest_bytes,
+        Some(&checksum_bytes),
+    )
+    .map_err(|error| bundle_error(format!("计算 Bundle 锚点失败：{error}")))?;
+    Ok(BundleIntegrityReport {
+        root: root.to_path_buf(),
+        anchor_schema,
+        anchor_sha256,
+        direct_entry_required,
+        files_verified,
+        payload_path,
+        payload_sha256,
+    })
+}
+
+fn validate_recovery_fingerprint_binding(
+    license: &crate::app::usb_guard::UsbLicense,
+    supplied: &crate::app::usb_guard::UsbFingerprint,
+    observed: &crate::app::usb_guard::UsbFingerprint,
+) -> Result<(), AppError> {
+    if !codex_usb_license::fingerprints_match(observed, supplied)
+        || !codex_usb_license::fingerprints_match(observed, &license.fingerprint)
+    {
+        return Err(bundle_error(
+            "当前 Bundle 根目录的卷序列号、锚点或相对路径与许可证和恢复请求不一致",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_recovery_authorization(
+    root: &Path,
+    license: &crate::app::usb_guard::UsbLicense,
+    supplied: &crate::app::usb_guard::UsbFingerprint,
+    observed: &crate::app::usb_guard::UsbFingerprint,
+) -> Result<crate::app::usb_revocation::RevocationStateFile, AppError> {
+    validate_recovery_fingerprint_binding(license, supplied, observed)?;
+    let state = crate::app::usb_revocation::read_merged_state_for_recovery(root, license, observed)
+        .map_err(|error| bundle_error(format!("作废恢复状态回执无效：{error}")))?;
+    if !crate::app::usb_revocation::has_verified_revoked_history(&state, license, observed) {
+        return Err(bundle_error(
+            "作废恢复缺少与当前许可证和 U 盘身份绑定的已作废签名回执",
+        ));
+    }
+    Ok(state)
 }
 
 /// Verify the complete immutable release tree using the legacy boolean API.
@@ -1027,7 +1562,112 @@ pub fn verify_signed_internal_bundle(root: &Path) -> Result<BundleIntegrityRepor
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::usb_guard::{UsbFingerprint, UsbLicense};
     use serde_json::json;
+
+    #[test]
+    fn direct_entry_policy_preserves_schema2_and_requires_signed_schema3_values() {
+        assert!(!direct_entry_policy_required(&json!({}), 2).unwrap());
+        let policy = json!({
+            "directEntryPolicy": {
+                "required": true,
+                "shim": "CodexEntryShim.exe",
+                "failure": "closed"
+            }
+        });
+        assert!(direct_entry_policy_required(&policy, 3).unwrap());
+        for invalid in [
+            json!({}),
+            json!({"directEntryPolicy": {"required": false, "shim": "CodexEntryShim.exe", "failure": "closed"}}),
+            json!({"directEntryPolicy": {"required": true, "shim": "other.exe", "failure": "closed"}}),
+            json!({"directEntryPolicy": {"required": true, "shim": "CodexEntryShim.exe", "failure": "open"}}),
+        ] {
+            assert!(direct_entry_policy_required(&invalid, 3).is_err());
+        }
+        assert!(direct_entry_policy_required(&policy, 4).is_err());
+    }
+
+    #[test]
+    fn direct_entry_policy_and_anchor_stay_bound_to_the_same_manifest_snapshot() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-usb-entry-policy-snapshot-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let original_manifest = json!({
+            "schemaVersion": 3,
+            "architecture": "x64",
+            "payload": {"path": "payload/current.msix"},
+            "updateCapability": {"schemaVersion": 3, "anchorSchema": 3},
+            "directEntryPolicy": {
+                "required": true,
+                "shim": "CodexEntryShim.exe",
+                "failure": "closed"
+            }
+        });
+        let usb_manifest = json!({
+            "schemaVersion": 3,
+            "updateCapability": {"schemaVersion": 3, "anchorSchema": 3}
+        });
+        let original_manifest_bytes = serde_json::to_vec(&original_manifest).unwrap();
+        let usb_manifest_bytes = serde_json::to_vec(&usb_manifest).unwrap();
+        let checksum_bytes = format!(
+            "{}  manifest.json\n{}  usb-manifest.json\n{}  payload/current.msix\n",
+            "a".repeat(64),
+            "b".repeat(64),
+            "c".repeat(64)
+        )
+        .into_bytes();
+        fs::write(root.join(ROOT_MANIFEST), &original_manifest_bytes).unwrap();
+        fs::write(root.join(USB_MANIFEST), &usb_manifest_bytes).unwrap();
+        fs::write(root.join(SUMS_FILE), &checksum_bytes).unwrap();
+
+        let (captured_manifest, captured_manifest_bytes) =
+            read_json_snapshot(&root, ROOT_MANIFEST).unwrap();
+        let (_, captured_usb_manifest_bytes) = read_json_snapshot(&root, USB_MANIFEST).unwrap();
+        let requires_shim = direct_entry_policy_required(
+            &captured_manifest,
+            captured_manifest["schemaVersion"].as_u64().unwrap(),
+        )
+        .unwrap();
+        let signed_snapshot_anchor = codex_usb_license::anchor_sha256_from_bytes(
+            &captured_manifest_bytes,
+            &captured_usb_manifest_bytes,
+            Some(&checksum_bytes),
+        )
+        .unwrap();
+        assert!(direct_entry_policy_for_signed_anchor(&root, &signed_snapshot_anchor).unwrap());
+
+        let changed_manifest = json!({
+            "schemaVersion": 3,
+            "architecture": "arm64",
+            "payload": {"path": "payload/current.msix"},
+            "updateCapability": {"schemaVersion": 3, "anchorSchema": 3},
+            "directEntryPolicy": {
+                "required": true,
+                "shim": "CodexEntryShim.exe",
+                "failure": "closed"
+            }
+        });
+        fs::write(
+            root.join(ROOT_MANIFEST),
+            serde_json::to_vec(&changed_manifest).unwrap(),
+        )
+        .unwrap();
+        assert!(direct_entry_policy_for_signed_anchor(&root, &signed_snapshot_anchor).is_err());
+
+        assert!(requires_shim);
+        assert_eq!(
+            signed_snapshot_anchor,
+            codex_usb_license::anchor_sha256_from_bytes(
+                &original_manifest_bytes,
+                &usb_manifest_bytes,
+                Some(&checksum_bytes),
+            )
+            .unwrap()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn relative_paths_reject_escape_and_absolute_forms() {
@@ -1072,12 +1712,754 @@ mod tests {
         )
         .unwrap();
 
-        assert!(verify_sums(&root, "payload/OpenAI.Codex_x64.msix").is_ok());
+        assert!(verify_sums(&root, "payload/OpenAI.Codex_x64.msix", None).is_ok());
 
         fs::write(root.join("unowned-runtime.bin"), b"must be listed").unwrap();
-        let error = verify_sums(&root, "payload/OpenAI.Codex_x64.msix").unwrap_err();
+        let error = verify_sums(&root, "payload/OpenAI.Codex_x64.msix", None).unwrap_err();
         assert!(error.to_string().contains("unowned-runtime.bin"));
 
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn checksum_rows_must_match_captured_manifest_bytes_as_well_as_live_files() {
+        let root =
+            std::env::temp_dir().join(format!("codex-usb-snapshot-sums-{}", uuid::Uuid::new_v4()));
+        let payload = root.join("payload/OpenAI.Codex_x64.msix");
+        fs::create_dir_all(payload.parent().unwrap()).unwrap();
+        let manifest_bytes = b"captured root manifest";
+        let usb_manifest_bytes = b"captured usb manifest";
+        fs::write(root.join(ROOT_MANIFEST), manifest_bytes).unwrap();
+        fs::write(root.join(USB_MANIFEST), usb_manifest_bytes).unwrap();
+        fs::write(&payload, b"payload").unwrap();
+        let (manifest_hash, _) = hash_and_size(&root.join(ROOT_MANIFEST)).unwrap();
+        let (usb_manifest_hash, _) = hash_and_size(&root.join(USB_MANIFEST)).unwrap();
+        let (payload_hash, _) = hash_and_size(&payload).unwrap();
+        let sums = format!(
+            "{manifest_hash}  {ROOT_MANIFEST}\n{usb_manifest_hash}  {USB_MANIFEST}\n{payload_hash}  payload/OpenAI.Codex_x64.msix\n"
+        );
+
+        assert!(verify_sums_from_text(
+            &root,
+            "payload/OpenAI.Codex_x64.msix",
+            None,
+            &sums,
+            Some((manifest_bytes, usb_manifest_bytes)),
+        )
+        .is_ok());
+
+        // Keep the captured snapshot and checksum fixed while replacing the
+        // live file. The independent live hash check must still reject it.
+        fs::write(root.join(ROOT_MANIFEST), b"replacement on disk").unwrap();
+        let live_mismatch = verify_sums_from_text(
+            &root,
+            "payload/OpenAI.Codex_x64.msix",
+            None,
+            &sums,
+            Some((manifest_bytes, usb_manifest_bytes)),
+        )
+        .unwrap_err();
+        assert!(live_mismatch.to_string().contains("SHA 不匹配"));
+        fs::write(root.join(ROOT_MANIFEST), manifest_bytes).unwrap();
+        let error = verify_sums_from_text(
+            &root,
+            "payload/OpenAI.Codex_x64.msix",
+            None,
+            &sums,
+            Some((b"different captured root manifest", usb_manifest_bytes)),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("快照不一致"));
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn only_exact_revocation_sidecars_are_mutable_and_unhashed() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-usb-revocation-sums-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let payload = root.join("payload/OpenAI.Codex_x64.msix");
+        fs::create_dir_all(payload.parent().unwrap()).unwrap();
+        fs::write(&payload, b"payload").unwrap();
+        fs::create_dir_all(root.join("CodexUsbState")).unwrap();
+        fs::write(
+            root.join(REVOCATION_REGISTRATION_FILE),
+            b"registration sidecar",
+        )
+        .unwrap();
+        fs::write(root.join(REVOCATION_STATE_FILE), b"state sidecar").unwrap();
+        let (payload_hash, _) = hash_and_size(&payload).unwrap();
+        fs::write(
+            root.join(SUMS_FILE),
+            format!("{payload_hash}  payload/OpenAI.Codex_x64.msix\n"),
+        )
+        .unwrap();
+        assert!(verify_sums(&root, "payload/OpenAI.Codex_x64.msix", None).is_ok());
+
+        fs::write(root.join("CodexUsbState/revocation-extra.json"), b"unowned").unwrap();
+        let error = verify_sums(&root, "payload/OpenAI.Codex_x64.msix", None).unwrap_err();
+        assert!(error.to_string().contains("revocation-extra.json"));
+        fs::remove_file(root.join("CodexUsbState/revocation-extra.json")).unwrap();
+
+        fs::write(
+            root.join(SUMS_FILE),
+            format!(
+                "{payload_hash}  payload/OpenAI.Codex_x64.msix\n{}  {}\n",
+                "0".repeat(64),
+                REVOCATION_REGISTRATION_FILE
+            ),
+        )
+        .unwrap();
+        let error = verify_sums(&root, "payload/OpenAI.Codex_x64.msix", None).unwrap_err();
+        assert!(error.to_string().contains("SHA 清单不得包含"));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn mutable_sidecar_fixture(relative: &str) -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "codex-usb-mutable-sidecar-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let payload = root.join("payload/OpenAI.Codex_x64.msix");
+        fs::create_dir_all(payload.parent().unwrap()).unwrap();
+        fs::write(&payload, b"payload").unwrap();
+        let sidecar = root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
+        if let Some(parent) = sidecar.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let (payload_hash, _) = hash_and_size(&payload).unwrap();
+        fs::write(
+            root.join(SUMS_FILE),
+            format!("{payload_hash}  payload/OpenAI.Codex_x64.msix\n"),
+        )
+        .unwrap();
+        (root, sidecar)
+    }
+
+    #[test]
+    fn mutable_revocation_sidecars_must_be_regular_files_not_directories() {
+        for relative in [REVOCATION_REGISTRATION_FILE, REVOCATION_STATE_FILE] {
+            let (root, sidecar) = mutable_sidecar_fixture(relative);
+            fs::create_dir(&sidecar).unwrap();
+
+            let error = verify_sums(&root, "payload/OpenAI.Codex_x64.msix", None).unwrap_err();
+            assert!(error.to_string().contains("单链接普通文件"), "{error}");
+
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(any(windows, unix))]
+    #[test]
+    fn mutable_revocation_sidecars_reject_hardlinks() {
+        for relative in [REVOCATION_REGISTRATION_FILE, REVOCATION_STATE_FILE] {
+            let (root, sidecar) = mutable_sidecar_fixture(relative);
+            let payload = root.join("payload/OpenAI.Codex_x64.msix");
+            fs::hard_link(&payload, &sidecar).unwrap();
+
+            let error = verify_sums(&root, "payload/OpenAI.Codex_x64.msix", None).unwrap_err();
+            assert!(error.to_string().contains("单链接普通文件"), "{error}");
+
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn exact_atomic_state_temp_is_tolerated_only_when_single_link_and_bounded() {
+        let root =
+            std::env::temp_dir().join(format!("codex-usb-revocation-tmp-{}", uuid::Uuid::new_v4()));
+        let payload = root.join("payload/OpenAI.Codex_x64.msix");
+        fs::create_dir_all(payload.parent().unwrap()).unwrap();
+        fs::write(&payload, b"payload").unwrap();
+        fs::create_dir_all(root.join("CodexUsbState")).unwrap();
+        let exact = root.join("CodexUsbState/revocation.json.tmp-321-7");
+        fs::write(&exact, b"interrupted atomic write").unwrap();
+        let (payload_hash, _) = hash_and_size(&payload).unwrap();
+        fs::write(
+            root.join(SUMS_FILE),
+            format!("{payload_hash}  payload/OpenAI.Codex_x64.msix\n"),
+        )
+        .unwrap();
+        assert!(verify_sums(&root, "payload/OpenAI.Codex_x64.msix", None).is_ok());
+        assert!(verify_sums(
+            &root,
+            "payload/OpenAI.Codex_x64.msix",
+            Some(&HashSet::new())
+        )
+        .is_ok());
+
+        fs::rename(&exact, root.join("CodexUsbState/revocation.json.tmp-321-x")).unwrap();
+        assert!(verify_sums(
+            &root,
+            "payload/OpenAI.Codex_x64.msix",
+            Some(&HashSet::new())
+        )
+        .is_err());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn bounded_bundle_metadata_reads_reject_streamed_oversize_files() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-usb-bounded-metadata-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        for (name, limit) in [
+            (ROOT_MANIFEST, MAX_MANIFEST_BYTES),
+            (USB_MANIFEST, MAX_MANIFEST_BYTES),
+            (SUMS_FILE, MAX_SHA_SUMS_BYTES),
+        ] {
+            let path = root.join(name);
+            let file = fs::File::create(&path).unwrap();
+            file.set_len(limit as u64 + 1).unwrap();
+            drop(file);
+            if name == SUMS_FILE {
+                assert!(read_sums_text(&root)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("读取上限"));
+            } else {
+                assert!(read_json(&root, name)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("读取上限"));
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn strict_bundle_verifier_rejects_hardlinked_or_excess_state_temps() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-usb-bounded-state-temps-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let payload = root.join("payload/OpenAI.Codex_x64.msix");
+        fs::create_dir_all(payload.parent().unwrap()).unwrap();
+        fs::create_dir_all(root.join("CodexUsbState")).unwrap();
+        fs::write(&payload, b"payload").unwrap();
+        let (payload_hash, _) = hash_and_size(&payload).unwrap();
+        fs::write(
+            root.join(SUMS_FILE),
+            format!("{payload_hash}  payload/OpenAI.Codex_x64.msix\n"),
+        )
+        .unwrap();
+        let outside = root.join("outside.txt");
+        let linked_temp = root.join("CodexUsbState/revocation.json.tmp-321-7");
+        fs::write(&outside, b"keep").unwrap();
+        fs::hard_link(&outside, &linked_temp).unwrap();
+        assert!(verify_sums(&root, "payload/OpenAI.Codex_x64.msix", None).is_err());
+        fs::remove_file(&linked_temp).unwrap();
+        fs::remove_file(&outside).unwrap();
+
+        for index in 1..=crate::app::usb_revocation::MAX_ATOMIC_STATE_TEMPS + 1 {
+            fs::write(
+                root.join(format!("CodexUsbState/revocation.json.tmp-321-{index}")),
+                b"interrupted",
+            )
+            .unwrap();
+        }
+        assert!(verify_sums(&root, "payload/OpenAI.Codex_x64.msix", None)
+            .unwrap_err()
+            .to_string()
+            .contains("数量上限"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn recovery_fixture(name: &str) -> (PathBuf, UsbLicense, UsbFingerprint) {
+        let root = std::env::temp_dir().join(format!(
+            "codex-usb-recovery-auth-{name}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let fingerprint = UsbFingerprint {
+            volume_serial: 42,
+            anchor_sha256: "a".repeat(64),
+            bundle_relative_path: "bundle".to_string(),
+            anchor_schema: 3,
+        };
+        let license = UsbLicense {
+            schema_version: codex_usb_license::LICENSE_SCHEMA_VERSION,
+            product: codex_usb_license::PRODUCT_ID.to_string(),
+            installation_id: uuid::Uuid::new_v4().to_string(),
+            fingerprint: fingerprint.clone(),
+            issued_at: "1760000000000".to_string(),
+            key_id: Some("test-license-key".to_string()),
+            account_binding: None,
+            signature: Some(BASE64.encode([0_u8; 64])),
+        };
+        (root, license, fingerprint)
+    }
+
+    #[test]
+    fn signed_revoked_history_authorizes_only_same_identity_recovery_with_missing_payload() {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let (root, mut license, fingerprint) = recovery_fixture("signed-recovery");
+        let license_signing_key = SigningKey::from_bytes(&[17_u8; 32]);
+        let license_public_key = BASE64.encode(license_signing_key.verifying_key().as_bytes());
+        license.signature = None;
+        codex_usb_license::sign_license(&mut license, &license_signing_key).unwrap();
+        codex_usb_license::verify_signature_with_key(&license, &license_public_key).unwrap();
+
+        let status_signing_key = SigningKey::from_bytes(&[23_u8; 32]);
+        let status_key_id = "test-recovery-status-key";
+        let status_public_key = BASE64.encode(status_signing_key.verifying_key().as_bytes());
+        let payload = crate::app::usb_revocation::StatusPayload {
+            schema_version: 1,
+            product: codex_usb_license::PRODUCT_ID.to_string(),
+            installation_id: license.installation_id.clone(),
+            license_signature_sha256: codex_usb_license::license_signature_sha256(&license)
+                .unwrap(),
+            request_id: "ab".repeat(16),
+            status: "revoked".to_string(),
+            state_version: 7,
+            issued_at: "2026-10-09T00:00:00Z".to_string(),
+            signing_key_id: status_key_id.to_string(),
+        };
+        let payload_bytes = serde_json::to_vec(&payload).unwrap();
+        let envelope = json!({
+            "payloadB64": BASE64.encode(&payload_bytes),
+            "signatureB64": BASE64.encode(status_signing_key.sign(&payload_bytes).to_bytes()),
+        });
+        fs::create_dir_all(root.join("CodexUsbState")).unwrap();
+        fs::write(
+            root.join(REVOCATION_STATE_FILE),
+            serde_json::to_vec(&json!({
+                "schemaVersion": 1,
+                "product": codex_usb_license::PRODUCT_ID,
+                "installationId": license.installation_id,
+                "licenseSignatureSha256": payload.license_signature_sha256,
+                "fingerprintSha256": codex_usb_license::fingerprint_digest(&fingerprint).unwrap(),
+                "receipts": [envelope],
+                "cleanup": {
+                    "payloadRemoved": false,
+                    "runtimeRemoved": false,
+                    "stagingRemoved": false,
+                    "lastError": null,
+                    "updatedAt": null
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        crate::app::usb_revocation::with_test_status_public_key(
+            status_key_id,
+            &status_public_key,
+            || {
+                crate::app::usb_revocation::verify_status_envelope(
+                    &serde_json::from_value(envelope.clone()).unwrap(),
+                    &payload.request_id,
+                    &license,
+                    &codex_usb_license::license_signature_sha256(&license).unwrap(),
+                )
+                .unwrap();
+                let state =
+                    validate_recovery_authorization(&root, &license, &fingerprint, &fingerprint)
+                        .unwrap();
+                assert!(crate::app::usb_revocation::has_verified_revoked_history(
+                    &state,
+                    &license,
+                    &fingerprint
+                ));
+
+                let payload_hash = "c".repeat(64);
+                fs::write(
+                    root.join(SUMS_FILE),
+                    format!("{payload_hash}  payload/OpenAI.Codex_x64.msix\n"),
+                )
+                .unwrap();
+                let allowed_missing = HashSet::from(["payload/OpenAI.Codex_x64.msix".to_string()]);
+                assert!(verify_sums(
+                    &root,
+                    "payload/OpenAI.Codex_x64.msix",
+                    Some(&allowed_missing)
+                )
+                .is_ok());
+
+                let different_volume = UsbFingerprint {
+                    volume_serial: fingerprint.volume_serial + 1,
+                    ..fingerprint.clone()
+                };
+                assert!(validate_recovery_authorization(
+                    &root,
+                    &license,
+                    &fingerprint,
+                    &different_volume
+                )
+                .is_err());
+                let different_root = UsbFingerprint {
+                    bundle_relative_path: "another/bundle".to_string(),
+                    ..fingerprint.clone()
+                };
+                assert!(validate_recovery_authorization(
+                    &root,
+                    &license,
+                    &fingerprint,
+                    &different_root
+                )
+                .is_err());
+            },
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn full_recovery_verifier_accepts_signed_revocation_and_only_missing_payload_for_observed_identity(
+    ) {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let (root, mut license, mut fingerprint) = recovery_fixture("full-signed-recovery");
+        fs::create_dir_all(root.join("payload")).unwrap();
+        let files = [
+            ("CodexDesktopSetup.exe", b"test installer".as_slice()),
+            ("CodexAppManager.exe", b"test manager".as_slice()),
+            ("ccswitch/CodexSwitch.exe", b"test switch".as_slice()),
+            (
+                "resources/ccswitch/CodexSwitch.exe",
+                b"test switch".as_slice(),
+            ),
+            (
+                "resources/prerequisites/vc_redist.x64.exe",
+                b"test vc runtime".as_slice(),
+            ),
+            (
+                "resources/prerequisites/MicrosoftEdgeWebView2RuntimeInstallerX64.exe",
+                b"test webview runtime".as_slice(),
+            ),
+        ];
+        let mut file_metadata = HashMap::new();
+        for (relative, bytes) in files {
+            let path = root.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, bytes).unwrap();
+            file_metadata.insert(relative.to_string(), hash_and_size(&path).unwrap());
+        }
+
+        let payload_relative = "payload/OpenAI.Codex_x64.msix";
+        let payload_hash = "c".repeat(64);
+        let payload_size = 123_u64;
+        let root_manifest = json!({
+            "schemaVersion": 3,
+            "packageName": "OpenAI.Codex",
+            "architecture": "x64",
+            "revocationPolicy": {"registrationRequired": true},
+            "directEntryPolicy": {
+                "required": true,
+                "shim": "CodexEntryShim.exe",
+                "failure": "closed"
+            },
+            "updateCapability": {
+                "schemaVersion": 3,
+                "anchorSchema": 3,
+                "codexPayload": true,
+                "checksumFile": SUMS_FILE
+            },
+            "payload": {
+                "path": payload_relative,
+                "sha256": payload_hash,
+                "size": payload_size
+            }
+        });
+        let (switch_hash, switch_size) = file_metadata.get("ccswitch/CodexSwitch.exe").unwrap();
+        let (installer_hash, installer_size) = file_metadata.get("CodexDesktopSetup.exe").unwrap();
+        let (manager_hash, manager_size) = file_metadata.get("CodexAppManager.exe").unwrap();
+        let (vc_hash, vc_size) = file_metadata
+            .get("resources/prerequisites/vc_redist.x64.exe")
+            .unwrap();
+        let (webview_hash, webview_size) = file_metadata
+            .get("resources/prerequisites/MicrosoftEdgeWebView2RuntimeInstallerX64.exe")
+            .unwrap();
+        let test_license_key = SigningKey::from_bytes(&[17_u8; 32]);
+        let license_public_key_digest: String =
+            Sha256::digest(test_license_key.verifying_key().as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+        let usb_manifest = json!({
+            "schemaVersion": 3,
+            "product": "codex-usb-oneclick",
+            "status": "oneclick",
+            "updateCapability": {
+                "schemaVersion": 3,
+                "anchorSchema": 3,
+                "codexPayload": true,
+                "checksumFile": SUMS_FILE
+            },
+            "codexInstaller": {
+                "architecture": "x64",
+                "payload": payload_relative,
+                "payloadSha256": payload_hash,
+                "payloadSize": payload_size,
+                "file": "CodexDesktopSetup.exe",
+                "sha256": installer_hash,
+                "size": installer_size
+            },
+            "manager": {
+                "file": "CodexAppManager.exe",
+                "sha256": manager_hash,
+                "size": manager_size
+            },
+            "ccswitch": {
+                "executable": "ccswitch/CodexSwitch.exe",
+                "embeddedExecutable": "resources/ccswitch/CodexSwitch.exe",
+                "sha256": switch_hash,
+                "size": switch_size
+            },
+            "vcRuntime": {
+                "file": "resources/prerequisites/vc_redist.x64.exe",
+                "sha256": vc_hash,
+                "size": vc_size
+            },
+            "webView2Runtime": {
+                "file": "resources/prerequisites/MicrosoftEdgeWebView2RuntimeInstallerX64.exe",
+                "sha256": webview_hash,
+                "size": webview_size
+            },
+            "usbGuard": {
+                "signing": {
+                    "policy": "SignedRequired",
+                    "keyId": "test-license-key",
+                    "publicKeySha256": license_public_key_digest
+                }
+            }
+        });
+        fs::write(
+            root.join(ROOT_MANIFEST),
+            serde_json::to_vec(&root_manifest).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            root.join(USB_MANIFEST),
+            serde_json::to_vec(&usb_manifest).unwrap(),
+        )
+        .unwrap();
+
+        let mut checksum_rows = Vec::new();
+        for (relative, _) in files {
+            let (hash, _) = file_metadata.get(relative).unwrap();
+            checksum_rows.push(format!("{hash}  {relative}"));
+        }
+        for relative in [ROOT_MANIFEST, USB_MANIFEST] {
+            let (hash, _) = hash_and_size(&root.join(relative)).unwrap();
+            checksum_rows.push(format!("{hash}  {relative}"));
+        }
+        checksum_rows.push(format!("{payload_hash}  {payload_relative}"));
+        checksum_rows.sort();
+        fs::write(
+            root.join(SUMS_FILE),
+            format!("{}\n", checksum_rows.join("\n")),
+        )
+        .unwrap();
+
+        fingerprint.anchor_sha256 = codex_usb_license::anchor_sha256(&root).unwrap();
+        license.fingerprint = fingerprint.clone();
+        license.key_id = Some("test-license-key".to_string());
+        license.signature = None;
+        codex_usb_license::sign_license(&mut license, &test_license_key).unwrap();
+
+        let status_signing_key = SigningKey::from_bytes(&[23_u8; 32]);
+        let status_key_id = "test-full-recovery-status-key";
+        let status_public_key = BASE64.encode(status_signing_key.verifying_key().as_bytes());
+        let payload = crate::app::usb_revocation::StatusPayload {
+            schema_version: 1,
+            product: codex_usb_license::PRODUCT_ID.to_string(),
+            installation_id: license.installation_id.clone(),
+            license_signature_sha256: codex_usb_license::license_signature_sha256(&license)
+                .unwrap(),
+            request_id: "de".repeat(16),
+            status: "revoked".to_string(),
+            state_version: 9,
+            issued_at: "2026-10-09T00:00:00Z".to_string(),
+            signing_key_id: status_key_id.to_string(),
+        };
+        let payload_bytes = serde_json::to_vec(&payload).unwrap();
+        let envelope = json!({
+            "payloadB64": BASE64.encode(&payload_bytes),
+            "signatureB64": BASE64.encode(status_signing_key.sign(&payload_bytes).to_bytes()),
+        });
+        fs::create_dir_all(root.join("CodexUsbState")).unwrap();
+        fs::write(
+            root.join(REVOCATION_STATE_FILE),
+            serde_json::to_vec(&json!({
+                "schemaVersion": 1,
+                "product": codex_usb_license::PRODUCT_ID,
+                "installationId": license.installation_id,
+                "licenseSignatureSha256": payload.license_signature_sha256,
+                "fingerprintSha256": codex_usb_license::fingerprint_digest(&fingerprint).unwrap(),
+                "receipts": [envelope],
+                "cleanup": {
+                    "payloadRemoved": false,
+                    "runtimeRemoved": false,
+                    "stagingRemoved": false,
+                    "lastError": null,
+                    "updatedAt": null
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let observed = crate::app::usb_guard::UsbObservation {
+            removable: true,
+            drive_root: Some(root.to_string_lossy().into_owned()),
+            bundle_path: root.to_string_lossy().into_owned(),
+            fingerprint: Some(fingerprint.clone()),
+        };
+        let (vc_hash, _) = file_metadata
+            .get("resources/prerequisites/vc_redist.x64.exe")
+            .unwrap();
+        let (webview_hash, _) = file_metadata
+            .get("resources/prerequisites/MicrosoftEdgeWebView2RuntimeInstallerX64.exe")
+            .unwrap();
+        let license_public_key = BASE64.encode(test_license_key.verifying_key().as_bytes());
+        let result = crate::app::usb_guard::with_test_license_public_key(
+            "test-license-key",
+            &license_public_key,
+            || {
+                crate::app::usb_revocation::with_test_status_public_key(
+                    status_key_id,
+                    &status_public_key,
+                    || {
+                        with_test_runtime_hashes(vc_hash, webview_hash, || {
+                            verify_revocation_recovery_bundle_with_observer(
+                                &root,
+                                &license,
+                                &fingerprint,
+                                |_| Ok(observed.clone()),
+                            )
+                        })
+                    },
+                )
+            },
+        );
+        let report = result.unwrap();
+        assert!(!report.payload_path.exists());
+        assert_eq!(report.payload_sha256, payload_hash);
+
+        let mismatched_observation = crate::app::usb_guard::UsbObservation {
+            fingerprint: Some(UsbFingerprint {
+                volume_serial: fingerprint.volume_serial + 1,
+                ..fingerprint.clone()
+            }),
+            ..observed
+        };
+        let error =
+            verify_revocation_recovery_bundle_with_observer(&root, &license, &fingerprint, |_| {
+                Ok(mismatched_observation)
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("卷序列号"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_identity_accepts_same_root_and_rejects_other_usb_or_bundle_path() {
+        let (root, license, same_root) = recovery_fixture("identity-binding");
+        assert!(validate_recovery_fingerprint_binding(&license, &same_root, &same_root).is_ok());
+
+        for different_root in [
+            UsbFingerprint {
+                volume_serial: same_root.volume_serial + 1,
+                ..same_root.clone()
+            },
+            UsbFingerprint {
+                anchor_schema: same_root.anchor_schema - 1,
+                ..same_root.clone()
+            },
+            UsbFingerprint {
+                anchor_sha256: "b".repeat(64),
+                ..same_root.clone()
+            },
+            UsbFingerprint {
+                bundle_relative_path: "another/bundle".to_string(),
+                ..same_root.clone()
+            },
+        ] {
+            assert!(
+                validate_recovery_fingerprint_binding(&license, &different_root, &same_root)
+                    .is_err()
+            );
+            assert!(
+                validate_recovery_fingerprint_binding(&license, &same_root, &different_root)
+                    .is_err()
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_requires_current_identity_bound_revoked_receipt_before_missing_payload_exception() {
+        let (root, license, fingerprint) = recovery_fixture("none");
+        let error = crate::app::usb_revocation::read_merged_state_for_recovery(
+            &root,
+            &license,
+            &fingerprint,
+        )
+        .unwrap_err();
+        assert!(error.contains("没有可验证的授权状态回执"));
+        let error = verify_revocation_recovery_bundle(&root, &license, &fingerprint).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("作废恢复要求原 U 盘仍处于连接状态"));
+        fs::remove_dir_all(&root).unwrap();
+
+        let (root, license, fingerprint) = recovery_fixture("invalid");
+        let signature_digest = codex_usb_license::license_signature_sha256(&license).unwrap();
+        let fingerprint_digest = codex_usb_license::fingerprint_digest(&fingerprint).unwrap();
+        fs::create_dir_all(root.join("CodexUsbState")).unwrap();
+        fs::write(
+            root.join(REVOCATION_STATE_FILE),
+            serde_json::to_vec(&json!({
+                "schemaVersion": 1,
+                "product": "codex-usb-oneclick",
+                "installationId": license.installation_id,
+                "licenseSignatureSha256": signature_digest,
+                "fingerprintSha256": fingerprint_digest,
+                "receipts": [{"payloadB64": "not-base64", "signatureB64": "invalid"}],
+                "cleanup": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let error = crate::app::usb_revocation::read_merged_state_for_recovery(
+            &root,
+            &license,
+            &fingerprint,
+        )
+        .unwrap_err();
+        assert!(error.contains("没有可验证的授权状态回执"));
+        fs::remove_dir_all(&root).unwrap();
+
+        let (root, license, fingerprint) = recovery_fixture("identity");
+        let signature_digest = codex_usb_license::license_signature_sha256(&license).unwrap();
+        let fingerprint_digest = codex_usb_license::fingerprint_digest(&fingerprint).unwrap();
+        fs::create_dir_all(root.join("CodexUsbState")).unwrap();
+        fs::write(
+            root.join(REVOCATION_STATE_FILE),
+            serde_json::to_vec(&json!({
+                "schemaVersion": 1,
+                "product": "codex-usb-oneclick",
+                "installationId": "other-installation",
+                "licenseSignatureSha256": signature_digest,
+                "fingerprintSha256": fingerprint_digest,
+                "receipts": [{"payloadB64": "not-base64", "signatureB64": "invalid"}],
+                "cleanup": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let error = crate::app::usb_revocation::read_merged_state_for_recovery(
+            &root,
+            &license,
+            &fingerprint,
+        )
+        .unwrap_err();
+        assert!(error.contains("没有可验证的授权状态回执"));
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -1100,7 +2482,7 @@ mod tests {
         fs::create_dir_all(root.join("apps")).unwrap();
         fs::write(root.join(PORTABLE_STAGING_DIR), b"not a directory").unwrap();
 
-        let error = verify_sums(&root, "payload/OpenAI.Codex_x64.msix").unwrap_err();
+        let error = verify_sums(&root, "payload/OpenAI.Codex_x64.msix", None).unwrap_err();
         assert!(error
             .to_string()
             .contains("apps/.codex-app-manager-staging 必须是目录"));
@@ -1228,6 +2610,7 @@ mod tests {
             "payload/OpenAI.Codex_x64.msix",
             &actual_hash,
             &ledger,
+            false,
         );
         assert!(result.is_err());
         fs::remove_dir_all(&root).unwrap();
