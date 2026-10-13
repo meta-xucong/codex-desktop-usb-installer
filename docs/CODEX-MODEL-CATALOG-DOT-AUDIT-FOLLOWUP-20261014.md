@@ -93,7 +93,7 @@
 - 新发现 P2：安装目录 CLI 的 raw SHA-256 和 PE Subsystem 3→2 归一化 SHA-256 现在由同一打开文件的一次顺序字节流产生。实现先缓存并解析有界 PE 头前缀，然后对同一前缀与后续流同时计算 raw/normalized 摘要；验收只返回这次被归一化摘要认证的 raw 摘要，不再混用两轮路径读取。
 - 新增可控回归：源包在预检 hash 后替换会导致暂存摘要校验失败；已暂存快照不受之后 USB 源包替换影响；MSIX 成员提取仍只接受快照摘要；分段变化输入验证 raw/normalized 两个结果都来自同一实际读取流。所有用例使用合成字节/ZIP fixture，不运行测试二进制。
 - 验证收据：4 条新增替换/摘要回归分别通过；完整 `src-tauri --lib` **717 passed、0 failed、6 ignored**；`codex-win-engine --lib` **236 passed、0 failed、2 ignored**；三个变更 Rust 文件的 `rustfmt --check` 与 `git diff --check` 通过。测试使用合成 ZIP/PE fixture，不执行 Codex 或其他不可信二进制。
-- 独立 A2 只读审计待在固定提交上完成。当前只安装 `x86_64-pc-windows-msvc` target，非 Windows 交叉编译未运行；最终发行包、随包 MSIX 和实体 U 盘冷启动仍是独立验收项。
+- 本段测试收据对应提交 `439098c`；其后独立 A2 复审发现暂存 MSIX 文件可在按路径验签与成员读取之间被替换，已在下文补强。当前只安装 `x86_64-pc-windows-msvc` target，非 Windows 交叉编译未运行；最终发行包、随包 MSIX 和实体 U 盘冷启动仍是独立验收项。
 
 ## 439098c 独立复审后的暂存快照补强（2026-10-14）
 
@@ -103,3 +103,4 @@
 - 新增 Windows 合成文件回归：Authenticode 回调期间的写入和替换失败；将固定句柄克隆给探测任务后释放原句柄，替换仍失败；释放最后一个句柄后替换可成功。测试不调用 Authenticode、Codex CLI 或真实 Provider。
 - 验证收据：新增暂存句柄锁回归 **1 passed**；完整 Tauri `cargo test --lib` **718 passed、0 failed、6 ignored**（当前最终测试代码重跑后更新收据）；本轮修改 Rust 文件的 rustfmt 与 `git diff --check` 通过。既有 `codex-win-engine` **236 passed、0 failed、2 ignored** 代码未变。
 - 限制：未构建发行安装器、未取得正式 USB MSIX 或实体 U 盘，未进行冷启动验收；本轮验证的是 Windows 文件共享锁行为与合成包路径。当前工具链仍只安装 `x86_64-pc-windows-msvc`，非 Windows 交叉编译未运行。
+- 固定提交 `176b03def5097b94196c21e1e926d1af08f25e59` 的独立 A2 代码复审结论：**PASS**（P1/P2 闭环，既有四项/Add-Reset/sidecar/tokens 未见回退）。审计员未编辑代码、未独立重跑测试；审计证据与本地测试收据分开记录。新增 pin 测试没有覆盖 pin 前已有 writer 或父目录替换，也未实测真实 Authenticode/Codex；源码审查未发现绕过路径。正式包、MSIX 与实体 U 盘冷启动仍为独立发布验收项。
