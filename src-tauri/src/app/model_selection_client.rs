@@ -375,6 +375,13 @@ pub(crate) fn lock_configuration() -> Result<ConfigurationLock, &'static str> {
     })
 }
 
+#[cfg(not(windows))]
+pub(crate) struct ConfigurationLock;
+#[cfg(not(windows))]
+pub(crate) fn lock_configuration() -> Result<ConfigurationLock, &'static str> {
+    Ok(ConfigurationLock)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -589,10 +596,4 @@ mod tests {
         );
         assert!(matches!(oversized, Err("selection-read-failed")));
     }
-}
-#[cfg(not(windows))]
-pub(crate) struct ConfigurationLock;
-#[cfg(not(windows))]
-pub(crate) fn lock_configuration() -> Result<ConfigurationLock, &'static str> {
-    Ok(ConfigurationLock)
 }

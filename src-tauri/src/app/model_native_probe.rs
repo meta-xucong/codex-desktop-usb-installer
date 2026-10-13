@@ -4,6 +4,7 @@
 //! constructed only after the current gateway, the current native catalog
 //! parser, and one isolated app-server turn have all been observed by this
 //! process.
+#![cfg_attr(not(windows), allow(dead_code))]
 
 #[cfg(windows)]
 use crate::app::model_capability::CapabilityState;

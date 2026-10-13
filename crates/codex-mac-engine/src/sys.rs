@@ -402,7 +402,7 @@ pub fn read_bundle_short_version(app: &str) -> Option<String> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod quarantine_tests {
     use super::quarantine_flags_indicate_translocation;
 

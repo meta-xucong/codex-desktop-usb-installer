@@ -47,6 +47,7 @@ pub struct ManagerState {
     pub webview_gate_failed: AtomicBool,
     /// Prevent repeated native startup notices when multiple startup
     /// fallbacks observe the same stalled WebView.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub(crate) startup_notice_shown: AtomicBool,
     pub operations: OperationManager,
     pub config_health: Mutex<ConfigHealth>,

@@ -1080,6 +1080,7 @@ pub fn current_status() -> UsbGuardStatus {
         status.message = "正在校验 U 盘能力包，完成后才会开放 Codex 操作".to_string();
         return status;
     }
+    #[allow(unused_mut)]
     let mut status = status_path()
         .ok()
         .and_then(|path| read_json::<UsbGuardStatus>(&path))

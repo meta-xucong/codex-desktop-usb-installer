@@ -1039,7 +1039,10 @@ fn sync_directory(path: &Path) -> Result<(), HotError> {
 
 fn safe_create_dir_all(path: &Path, context: &str) -> Result<(), HotError> {
     ensure_safe_parent(path)?;
+    #[cfg(windows)]
     let _parent_guards = guard_parent_chain(path)?;
+    #[cfg(not(windows))]
+    guard_parent_chain(path)?;
     if let Some(metadata) = metadata_optional(path)? {
         if !metadata.is_dir() {
             return Err(io_error(
@@ -1066,7 +1069,10 @@ fn safe_create_dir_all(path: &Path, context: &str) -> Result<(), HotError> {
 
 fn safe_read_file(path: &Path, context: &str) -> Result<Vec<u8>, HotError> {
     ensure_safe_parent(path)?;
+    #[cfg(windows)]
     let _parent_guards = guard_parent_chain(path)?;
+    #[cfg(not(windows))]
+    guard_parent_chain(path)?;
     let metadata = metadata_required(path, context)?;
     if !metadata.is_file() {
         return Err(io_error(
@@ -1088,7 +1094,10 @@ fn safe_read_file(path: &Path, context: &str) -> Result<Vec<u8>, HotError> {
 
 fn safe_write_new_file(path: &Path, bytes: &[u8], context: &str) -> Result<(), HotError> {
     ensure_safe_parent(path)?;
+    #[cfg(windows)]
     let _parent_guards = guard_parent_chain(path)?;
+    #[cfg(not(windows))]
+    guard_parent_chain(path)?;
     let parent = path
         .parent()
         .ok_or_else(|| io_error(context, format!("文件路径无父目录: {}", path.display())))?;
@@ -1139,8 +1148,14 @@ fn same_volume(left: &Path, right: &Path) -> Result<(), HotError> {
 fn safe_rename(source: &Path, destination: &Path, context: &str) -> Result<(), HotError> {
     ensure_safe_parent(source)?;
     ensure_safe_parent(destination)?;
+    #[cfg(windows)]
     let _source_guards = guard_parent_chain(source)?;
+    #[cfg(not(windows))]
+    guard_parent_chain(source)?;
+    #[cfg(windows)]
     let _destination_guards = guard_parent_chain(destination)?;
+    #[cfg(not(windows))]
+    guard_parent_chain(destination)?;
     let source_parent = source
         .parent()
         .ok_or_else(|| io_error(context, "源路径无父目录"))?;
@@ -1182,8 +1197,14 @@ fn safe_rename(source: &Path, destination: &Path, context: &str) -> Result<(), H
 fn safe_replace_file(source: &Path, destination: &Path, context: &str) -> Result<(), HotError> {
     ensure_safe_parent(source)?;
     ensure_safe_parent(destination)?;
+    #[cfg(windows)]
     let _source_guards = guard_parent_chain(source)?;
+    #[cfg(not(windows))]
+    guard_parent_chain(source)?;
+    #[cfg(windows)]
     let _destination_guards = guard_parent_chain(destination)?;
+    #[cfg(not(windows))]
+    guard_parent_chain(destination)?;
     let source_parent = source
         .parent()
         .ok_or_else(|| io_error(context, "源路径无父目录"))?;
@@ -1238,7 +1259,10 @@ fn safe_replace_file(source: &Path, destination: &Path, context: &str) -> Result
 
 fn safe_remove_file(path: &Path, context: &str) -> Result<(), HotError> {
     ensure_safe_parent(path)?;
+    #[cfg(windows)]
     let _parent_guards = guard_parent_chain(path)?;
+    #[cfg(not(windows))]
+    guard_parent_chain(path)?;
     let Some(metadata) = metadata_optional(path)? else {
         return Ok(());
     };
@@ -1266,7 +1290,10 @@ fn safe_remove_file(path: &Path, context: &str) -> Result<(), HotError> {
 
 fn safe_remove_dir_all(path: &Path, context: &str) -> Result<(), HotError> {
     ensure_safe_parent(path)?;
+    #[cfg(windows)]
     let _parent_guards = guard_parent_chain(path)?;
+    #[cfg(not(windows))]
+    guard_parent_chain(path)?;
     let Some(metadata) = metadata_optional(path)? else {
         return Ok(());
     };
@@ -1309,8 +1336,14 @@ fn safe_remove_dir_all(path: &Path, context: &str) -> Result<(), HotError> {
 }
 
 fn safe_copy_file(source: &Path, destination: &Path, context: &str) -> Result<(), HotError> {
+    #[cfg(windows)]
     let _source_guards = guard_parent_chain(source)?;
+    #[cfg(not(windows))]
+    guard_parent_chain(source)?;
+    #[cfg(windows)]
     let _destination_guards = guard_parent_chain(destination)?;
+    #[cfg(not(windows))]
+    guard_parent_chain(destination)?;
     let bytes = safe_read_file(source, context)?;
     safe_write_new_file(destination, &bytes, context)
 }
@@ -1485,7 +1518,10 @@ fn valid_id(id: &str) -> bool {
 
 fn file_identity(path: &Path) -> Result<(String, String), HotError> {
     ensure_safe_parent(path)?;
+    #[cfg(windows)]
     let _parent_guards = guard_parent_chain(path)?;
+    #[cfg(not(windows))]
+    guard_parent_chain(path)?;
     #[cfg(windows)]
     {
         use windows_sys::Win32::Foundation::GENERIC_READ;
@@ -1541,7 +1577,10 @@ fn file_identity(path: &Path) -> Result<(String, String), HotError> {
 
 fn record_file(root: &Path, rel: &str) -> Result<FileRecord, HotError> {
     let path = root.join(rel);
+    #[cfg(windows)]
     let _parent_guards = guard_parent_chain(&path)?;
+    #[cfg(not(windows))]
+    guard_parent_chain(&path)?;
     let metadata = metadata_required(&path, "读取 Skill 文件失败")?;
     if !metadata.is_file() {
         return Err(invalid(format!("Skill 文件不是普通文件: {rel}")));
@@ -1559,7 +1598,10 @@ fn record_file(root: &Path, rel: &str) -> Result<FileRecord, HotError> {
 
 fn list_files(root: &Path) -> Result<Vec<FileRecord>, HotError> {
     ensure_directory(root, "枚举 Skill 目录失败")?;
+    #[cfg(windows)]
     let _parent_guards = guard_parent_chain(root)?;
+    #[cfg(not(windows))]
+    guard_parent_chain(root)?;
     let mut out = Vec::new();
     fn walk(root: &Path, dir: &Path, out: &mut Vec<FileRecord>) -> Result<(), HotError> {
         ensure_directory(dir, "枚举 Skill 目录失败")?;

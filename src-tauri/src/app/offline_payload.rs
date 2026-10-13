@@ -5,6 +5,7 @@
 //! executable, validates the release manifest and package identity, and stages
 //! a byte-for-byte copy in the local temporary directory before the existing
 //! Windows engine performs the AppX deployment.
+#![cfg_attr(not(windows), allow(dead_code))]
 
 use std::fs::{self, File};
 use std::io::Read;

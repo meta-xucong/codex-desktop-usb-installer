@@ -21,8 +21,10 @@ use crate::app::shell::{
 const FRONTEND_READY_GLOBAL: &str = "__CAM_FRONTEND_READY__";
 const FRONTEND_READY_EVENT: &str = "cam:frontend-readiness";
 /// Native event routing may wait for this handshake, but it must never be the
-/// condition for showing the local startup shell.
-const FRONTEND_READY_TIMEOUT_SECS: u64 = 3;
+/// condition for showing the local startup shell. Packaged WebViews can take
+/// several seconds to initialize on slower macOS x64 hosts; keep the fallback
+/// watchdog from racing a valid first readiness event.
+const FRONTEND_READY_TIMEOUT_SECS: u64 = 15;
 /// The native WebView2 safety callback is normally immediate. If it is not,
 /// the user must still receive visible feedback instead of a silent process.
 #[cfg(target_os = "windows")]
@@ -799,6 +801,7 @@ pub fn run() {
     // This read-only gate must precede WebView2/VC probing, logging, recovery,
     // lease creation and any automatic launch. A formal USB binary therefore
     // cannot perform prerequisite or recovery writes on an unlicensed medium.
+    #[allow(unused_mut)]
     let mut usb_startup = match crate::app::usb_guard::startup_preflight() {
         Ok(result) => result,
         Err(error) => {
@@ -824,6 +827,7 @@ pub fn run() {
             }
         };
     }
+    #[cfg(target_os = "windows")]
     let usb_authorization_blocked = usb_startup.is_authorization_blocked();
     if let Some(reason) = usb_startup.reason() {
         if usb_startup.is_integrity_pending() {
