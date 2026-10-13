@@ -45,6 +45,9 @@ pub(crate) struct NativeProbeInput {
     /// be run. This is separate from the USB CLI because the installer may
     /// make the documented PE subsystem adjustment to its portable copy.
     pub trusted_payload_path: PathBuf,
+    /// Keeps the staged MSIX snapshot pinned against later write/delete opens
+    /// from verification through extraction of the private CLI copy.
+    pub _trusted_payload_pin: std::fs::File,
     pub trusted_cli_entry_path: String,
     pub trusted_cli_sha256: String,
     pub context: CapabilityContext,

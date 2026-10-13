@@ -40,6 +40,9 @@ pub(crate) struct VerifiedRuntime {
     pub trusted_payload_path: PathBuf,
     pub trusted_cli_entry_path: String,
     pub trusted_cli_sha256: String,
+    /// Keeps the staged MSIX opened with write/delete sharing denied until
+    /// all candidate probes have extracted their verified CLI copy.
+    pub trusted_payload_pin: fs::File,
 }
 pub struct NativeBatch {
     pub results: Vec<NativeProbeResult>,
@@ -322,15 +325,31 @@ fn verified_runtime_inner(
     // Stage first: the release-manifest hash and Authenticode check are both
     // applied to a local package snapshot. All later ZIP reads use this same
     // staged package, never the mutable removable-drive path.
-    let staged = crate::app::offline_payload::stage_offline_payload(&manager, None, None, true)
+    let staged = crate::app::offline_payload::stage_offline_payload(&manager, None, None, false)
         .map_err(|_| "native-package-unavailable")?;
     let trusted_payload_path = PathBuf::from(&staged.staged_path);
     let payload = staged.payload;
-    if !payload.hash_verified
-        || !payload
-            .authenticode
-            .as_ref()
-            .is_some_and(|report| report.trusted && report.publisher_is_openai)
+    if !payload.hash_verified || !staged.sha256.eq_ignore_ascii_case(&payload.sha256) {
+        return Err("native-package-unavailable");
+    }
+    let mut authenticode = None;
+    let trusted_payload_pin = crate::app::offline_payload::verify_pinned_staged_payload(
+        &trusted_payload_path,
+        &staged.sha256,
+        |path| {
+            let report = codex_win_engine::verify_openai_authenticode(path)
+                .map_err(|_| engine("native-package-unavailable"))?;
+            if !report.trusted || !report.publisher_is_openai {
+                return Err(engine("native-package-unavailable"));
+            }
+            authenticode = Some(report);
+            Ok(())
+        },
+    )
+    .map_err(|_| "native-package-unavailable")?;
+    if !authenticode
+        .as_ref()
+        .is_some_and(|report| report.trusted && report.publisher_is_openai)
     {
         return Err("native-package-unavailable");
     }
@@ -399,6 +418,7 @@ fn verified_runtime_inner(
         trusted_payload_path,
         trusted_cli_entry_path,
         trusted_cli_sha256: packaged,
+        trusted_payload_pin,
     })
 }
 #[cfg(not(windows))]
@@ -516,12 +536,20 @@ pub async fn collect(
             continue;
         }
         let model_id = model.model_id.clone();
+        let trusted_payload_pin = match verified_runtime.trusted_payload_pin.try_clone() {
+            Ok(pin) => pin,
+            Err(_) => {
+                model.error_code = Some("native-package-unavailable".into());
+                continue;
+            }
+        };
         let input = NativeProbeInput {
             executable: executable.clone(),
             expected_executable_sha256: expected_hash.clone(),
             trusted_payload_path: verified_runtime.trusted_payload_path.clone(),
             trusted_cli_entry_path: verified_runtime.trusted_cli_entry_path.clone(),
             trusted_cli_sha256: verified_runtime.trusted_cli_sha256.clone(),
+            _trusted_payload_pin: trusted_payload_pin,
             context: context.clone(),
             model: model.clone(),
             gateway_base: base.into(),

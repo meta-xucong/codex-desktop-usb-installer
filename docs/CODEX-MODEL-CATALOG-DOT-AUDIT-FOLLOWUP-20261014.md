@@ -89,8 +89,17 @@
 
 ## 7ed42cd 后续复审补充（2026-10-14）
 
-- 新发现 P1：不再在 Authenticode 通过后重新从可变 U 盘 MSIX 路径派生 CLI 摘要。能力验证复用 `stage_offline_payload`：复制时将暂存内容与发行 manifest 的整包 SHA-256 比对，并在同一暂存路径做 Authenticode 校验；入口元数据、CLI 成员摘要和最终提取都只读取暂存快照。源包在预检后被替换时，暂存整包摘要不匹配会拒绝；源包在快照建立后替换，不影响后续 ZIP 成员读取。
+- 新发现 P1：能力验证不再在 Authenticode 通过后从可变 U 盘路径派生 CLI 摘要。暂存整包哈希拒绝预检后被替换的 U 盘源；随后仍需固定本地暂存文件，避免本地暂存路径在哈希、Authenticode 和 ZIP 成员读取之间变化（见下方 439098c 复审补强）。
 - 新发现 P2：安装目录 CLI 的 raw SHA-256 和 PE Subsystem 3→2 归一化 SHA-256 现在由同一打开文件的一次顺序字节流产生。实现先缓存并解析有界 PE 头前缀，然后对同一前缀与后续流同时计算 raw/normalized 摘要；验收只返回这次被归一化摘要认证的 raw 摘要，不再混用两轮路径读取。
 - 新增可控回归：源包在预检 hash 后替换会导致暂存摘要校验失败；已暂存快照不受之后 USB 源包替换影响；MSIX 成员提取仍只接受快照摘要；分段变化输入验证 raw/normalized 两个结果都来自同一实际读取流。所有用例使用合成字节/ZIP fixture，不运行测试二进制。
 - 验证收据：4 条新增替换/摘要回归分别通过；完整 `src-tauri --lib` **717 passed、0 failed、6 ignored**；`codex-win-engine --lib` **236 passed、0 failed、2 ignored**；三个变更 Rust 文件的 `rustfmt --check` 与 `git diff --check` 通过。测试使用合成 ZIP/PE fixture，不执行 Codex 或其他不可信二进制。
 - 独立 A2 只读审计待在固定提交上完成。当前只安装 `x86_64-pc-windows-msvc` target，非 Windows 交叉编译未运行；最终发行包、随包 MSIX 和实体 U 盘冷启动仍是独立验收项。
+
+## 439098c 独立复审后的暂存快照补强（2026-10-14）
+
+- A2 复审确认 U 盘源替换已被 staging SHA-256 拒绝，但指出本地 TEMP 中的暂存 MSIX 仍会被按路径多次重新打开；哈希、Authenticode、Appx 元数据、成员摘要和提取尚未锁定到同一文件对象。该结论成立，不能以“U 盘源已复制”替代对暂存对象的固定。
+- 修复后，模型能力验证先完成本地暂存，再以 Windows `FILE_SHARE_READ` 打开暂存 MSIX：允许 Authenticode/ZIP 只读打开，拒绝后续写入、删除或替换句柄；从固定文件句柄重新计算整包 SHA-256，执行路径型 Authenticode 检查，再从同一句柄复算 SHA-256。任一阶段无法取得锁、摘要不符或验签失败都 fail closed。
+- 固定句柄由 `VerifiedRuntime` 持有，并克隆传入每个 `NativeProbeInput`，直到该次 CLI 成员提取结束；Catalog 探测的路径也在 `verified_catalog_runtime` 返回对象存活期间完成提取。因此入口元数据、CLI 成员摘要和最终提取路径在文件句柄存活期间只能读取被锁定的 staged 文件；不会从 U 盘原始路径重新派生摘要。
+- 新增 Windows 合成文件回归：Authenticode 回调期间的写入和替换失败；将固定句柄克隆给探测任务后释放原句柄，替换仍失败；释放最后一个句柄后替换可成功。测试不调用 Authenticode、Codex CLI 或真实 Provider。
+- 验证收据：新增暂存句柄锁回归 **1 passed**；完整 Tauri `cargo test --lib` **718 passed、0 failed、6 ignored**（当前最终测试代码重跑后更新收据）；本轮修改 Rust 文件的 rustfmt 与 `git diff --check` 通过。既有 `codex-win-engine` **236 passed、0 failed、2 ignored** 代码未变。
+- 限制：未构建发行安装器、未取得正式 USB MSIX 或实体 U 盘，未进行冷启动验收；本轮验证的是 Windows 文件共享锁行为与合成包路径。当前工具链仍只安装 `x86_64-pc-windows-msvc`，非 Windows 交叉编译未运行。

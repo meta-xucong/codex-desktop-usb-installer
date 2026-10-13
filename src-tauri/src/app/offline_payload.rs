@@ -13,8 +13,14 @@ use std::os::windows::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 #[cfg(windows)]
 use std::process::Command;
+#[cfg(windows)]
+use std::{
+    io::{Seek, SeekFrom},
+    os::windows::fs::OpenOptionsExt,
+};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::app::disk::available_space;
 use crate::app::release_install::{
@@ -782,6 +788,65 @@ fn verify_staged_authenticode(
     }
 }
 
+/// Open one staged package while denying later write/delete opens, then bind
+/// the path-based Authenticode check to the bytes held by this handle. The
+/// handle must stay alive while callers parse or extract package members.
+#[cfg(windows)]
+pub(super) fn verify_pinned_staged_payload(
+    path: &Path,
+    expected_sha256: &str,
+    verify_signature: impl FnOnce(&Path) -> Result<(), AppError>,
+) -> Result<File, AppError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| engine_error(format!("读取暂存 MSIX 属性失败: {error}")))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(engine_error("暂存 MSIX 不是普通文件"));
+    }
+    // FILE_SHARE_READ lets Authenticode and ZIP readers open the same file for
+    // reading while denying new writers and delete/rename handles. If an
+    // incompatible writer already exists, opening this pin fails closed.
+    let mut pinned = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0x0000_0001)
+        .open(path)
+        .map_err(|error| engine_error(format!("锁定暂存 MSIX 失败: {error}")))?;
+    let before = sha256_reader(&mut pinned)?;
+    if !before.eq_ignore_ascii_case(expected_sha256) {
+        return Err(engine_error("暂存 MSIX 在固定快照前发生变化"));
+    }
+    verify_signature(path)?;
+    pinned
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| engine_error(format!("重置暂存 MSIX 校验位置失败: {error}")))?;
+    let after = sha256_reader(&mut pinned)?;
+    if !after.eq_ignore_ascii_case(expected_sha256) {
+        return Err(engine_error("暂存 MSIX 在签名校验期间发生变化"));
+    }
+    pinned
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| engine_error(format!("重置暂存 MSIX 读取位置失败: {error}")))?;
+    Ok(pinned)
+}
+
+fn sha256_reader(input: &mut impl Read) -> Result<String, AppError> {
+    let mut hash = Sha256::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let count = input
+            .read(&mut buffer)
+            .map_err(|error| engine_error(format!("读取暂存 MSIX 失败: {error}")))?;
+        if count == 0 {
+            break;
+        }
+        hash.update(&buffer[..count]);
+    }
+    Ok(hash
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
 pub fn stage_offline_payload(
     executable: &Path,
     package_override: Option<&Path>,
@@ -1381,6 +1446,35 @@ mod tests {
             permissions.set_readonly(false);
             fs::set_permissions(&staged, permissions).unwrap();
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pinned_staged_payload_blocks_write_and_replacement_during_signature_check() {
+        let root = test_root("stage-pin");
+        fs::create_dir_all(&root).unwrap();
+        let payload = root.join("codex.msix");
+        let replacement = root.join("replacement.msix");
+        fs::write(&payload, b"verified package bytes").unwrap();
+        fs::write(&replacement, b"replacement bytes").unwrap();
+        let expected = codex_win_engine::sha256_file(&payload).unwrap();
+
+        let pin = verify_pinned_staged_payload(&payload, &expected, |path| {
+            assert!(fs::write(path, b"changed bytes").is_err());
+            assert!(fs::rename(&replacement, path).is_err());
+            assert_eq!(codex_win_engine::sha256_file(path).unwrap(), expected);
+            Ok(())
+        })
+        .unwrap();
+
+        let probe_pin = pin.try_clone().unwrap();
+        drop(pin);
+        assert!(fs::rename(&replacement, &payload).is_err());
+        assert_eq!(codex_win_engine::sha256_file(&payload).unwrap(), expected);
+        drop(probe_pin);
+        fs::remove_file(&payload).unwrap();
+        fs::rename(&replacement, &payload).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 
