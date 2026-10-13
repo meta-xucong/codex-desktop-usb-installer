@@ -426,6 +426,11 @@ pub fn show_startup_error(message: &str) {
     }
 }
 
+#[cfg(not(target_os = "windows"))]
+pub fn show_startup_error(message: &str) {
+    eprintln!("Codex App 管理器启动检查失败：{message}");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
