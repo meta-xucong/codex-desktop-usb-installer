@@ -21,10 +21,8 @@ use crate::app::shell::{
 const FRONTEND_READY_GLOBAL: &str = "__CAM_FRONTEND_READY__";
 const FRONTEND_READY_EVENT: &str = "cam:frontend-readiness";
 /// Native event routing may wait for this handshake, but it must never be the
-/// condition for showing the local startup shell. Packaged WebViews can take
-/// several seconds to initialize on slower macOS x64 hosts; keep the fallback
-/// watchdog from racing a valid first readiness event.
-const FRONTEND_READY_TIMEOUT_SECS: u64 = 15;
+/// condition for showing the local startup shell.
+const FRONTEND_READY_TIMEOUT_SECS: u64 = 3;
 /// The native WebView2 safety callback is normally immediate. If it is not,
 /// the user must still receive visible feedback instead of a silent process.
 #[cfg(target_os = "windows")]
