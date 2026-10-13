@@ -47,8 +47,25 @@
 - `git diff --check`: passed (Git emitted only existing LF-to-CRLF working-copy warnings for installer PowerShell files).
 - Independent read-only audit: **PASS** after fixing theme restart coverage and conditional rollback. Auditor confirmed the documented test receipts against source conditions; the auditor did not rerun tests.
 - A re-entrant external writer can still race in the narrow interval between the final byte comparison and atomic replacement; no arbitrary external editor/script can be serialized unless it cooperates with a shared lock. On detecting a later write during post-write validation, rollback is now conditional and preserves the newer content.
-- No installer/USB package was built or exercised; this change is not a release acceptance receipt.
+- At the initial implementation handoff, no installer/USB package had been built. A later validation pass is recorded below; it supersedes that statement only for the local signed-policy candidate package, not for a physically licensed USB device.
 
 ## Release boundary
 
 This guard protects manager, theme-restart, and USB direct-entry launch flows. A bare external Codex executable started outside the manager cannot run this preflight. It is still protected from installer-generated BOMs by the no-BOM, validate-before-atomic-replace writers in `configure-codex.ps1` and `render-codex-config.ps1`. Final Windows installer/USB artifact and physical-device launch acceptance remain separate release gates.
+
+## Follow-up validation receipt — 2026-10-14
+
+This section records a later local validation pass against the current source tree and a `SignedRequired` build candidate. It does not change the implementation contract above.
+
+- Fixed a Windows PowerShell 5.1 build-script parsing issue: `tools/build-installer.ps1` contained Chinese UTF-8 text but lacked a UTF-8 BOM, so Windows PowerShell 5.1 could parse it using the active legacy code page. The script now has a UTF-8 BOM. A standard `powershell.exe -File ...` invocation reached normal parameter binding (with an intentionally invalid parameter) instead of failing at parse time.
+- Built local candidates for installer `0.5.24` and USB one-click layout using the production `SignedRequired` policy profile `g42-media-ui-20261007` / key id `prod-2026-10-03`. Candidate paths: `release/setup-v0.5.24-signed-validation-20261014/` and `release/usb-oneclick-signed-validation-20261014/`.
+- `tools/verify-oneclick-usb.ps1` passed for the signed-policy candidate with `-SkipNetwork`; payload hash, VC++/WebView2/CCSwitch assets, manager policy and execution manifests, and capability-pack manifest/checksums verified. This was package verification, not a production license issuance or physical USB signing operation.
+- `tools/test-offline-bundle.ps1` passed after redirecting Windows temp storage into the repository's writable test directory: 339 extracted files and 338 SHA entries. The test bundle used a synthetic MSIX and did not prove Authenticode verification or a real Codex GUI launch.
+- The packaged `media-generation-mcp.py --healthcheck` returned `ready: true`, runtime/protocol passed, Python 3.12.10, UTF-8, and six tools. It explicitly reported `gatewayCatalogStatus: not_checked` and `generationCapability: not_tested`; no live gateway request or media generation was performed.
+- Fresh focused regression runs passed: Rust modules `model_catalog` (94), `model_native_probe` (21), `media_generation` (3), `capability_pack` (10), and `codex_config_guard` (6); adapter contracts (59); `OfflineComponentsSheet` (14); `npm run check`; and capability metadata check (308 manifest entries / 309 checksum entries). The focused model-catalog tests cover append-without-dropping-existing-models, first-add native model seeding, and the verified-snapshot / single-observation hash paths.
+- A fresh unrestricted library-suite attempt in the current sandbox ended with 609 passed, 115 failed, and 6 ignored. Failures were concentrated in Windows filesystem/registry access and loopback/network fixture restrictions. This environment run is not a full-suite PASS; the focused affected modules above passed.
+- `git diff --check` passed. The candidate packages were built locally and have not been tested on a physical USB drive. No real license activation, Codex GUI cold start, online model addition, API-key injection into a live profile, or real image/video generation was performed in this validation pass.
+
+### Validation conclusion
+
+The earlier source-level startup/config guard and model-catalog fixes have passing focused regression coverage, and a `SignedRequired` local candidate package passes static package verification. The evidence is sufficient to proceed to manual release acceptance, but not to claim final production release acceptance: the full Rust suite remains sandbox-limited, and real-device startup plus online Codex/MCP operation still need an environment that can exercise them.
