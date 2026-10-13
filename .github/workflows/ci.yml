@@ -64,6 +64,11 @@ jobs:
         run: npm run build
       - name: Clippy (deny warnings)
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --workspace --all-targets -- -D warnings
+      - name: Use a physical temporary root for macOS tests
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          printf 'TMPDIR=%s\n' "$(cd "$RUNNER_TEMP" && pwd -P)" >> "$GITHUB_ENV"
       - name: Test (src-tauri)
         run: cargo test --manifest-path src-tauri/Cargo.toml --workspace
       # Path deps are not workspace members, so their unit/integration tests are
