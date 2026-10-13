@@ -7,7 +7,7 @@ use crate::app::model_capability::{
 };
 use crate::app::model_diagnostics::{digest_hex, safe_identifier, ProbeError};
 use crate::app::model_probe::{ProbeClient, BODY_LIMIT, REFRESH_BUDGET};
-use crate::app::{atomic_file, paths, usb_guard};
+use crate::app::{atomic_file, model_native_probe, paths, usb_guard};
 use crate::errors::AppError;
 use serde::{Deserialize, Serialize};
 #[path = "model_catalog_activation.rs"]
@@ -31,12 +31,14 @@ const SIDECAR_FILE_NAME: &str = "codex-usb-model-capabilities.json";
 const CONFIG_FILE_NAME: &str = "config.toml";
 const RELOAD_MARKER_FILE_NAME: &str = "codex-usb-native-model-catalog.reload";
 const CATALOG_IDENTITY: &str = "404token-unified-api-internal";
-const CATALOG_CLIENT_VERSION: &str = "codex-usb-gateway-2";
+pub(crate) const CATALOG_CLIENT_VERSION: &str = "codex-usb-gateway-2";
+pub(crate) const MODEL_BASE_INSTRUCTIONS: &str = "You are Codex, a coding agent. Help the user with software engineering tasks by inspecting the workspace, making focused changes, and verifying your work.";
 const CONFIG_BEGIN: &str = "# BEGIN CODEX-USB-NATIVE-MODEL-CATALOG v1";
 const CONFIG_END: &str = "# END CODEX-USB-NATIVE-MODEL-CATALOG v1";
 static REFRESH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static CATALOG_MUTATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 pub(crate) static FILE_LOCK: Mutex<()> = Mutex::new(());
+static RELOAD_MARKER_LOCK: Mutex<()> = Mutex::new(());
 const RUN_HISTORY_LIMIT: usize = 256;
 static RUNS: Mutex<RunRegistry> = Mutex::new(RunRegistry {
     active: None,
@@ -882,6 +884,22 @@ fn reload_marker_path() -> Result<PathBuf, AppError> {
         .ok_or_else(|| engine("无法确定 Codex 用户目录，模型目录重载标记未写入"))
 }
 
+fn restart_marker_at(path: &Path) -> Result<Option<Vec<u8>>, AppError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            if metadata.len() > 256 {
+                return Err(engine("模型目录重载标记格式无效，已阻止启动"));
+            }
+            fs::read(path)
+                .map(Some)
+                .map_err(|_| engine("无法读取模型目录重载标记，已阻止启动"))
+        }
+        Ok(_) => Err(engine("模型目录重载标记不是普通文件，已阻止启动")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(engine("无法读取模型目录重载标记，已阻止启动")),
+    }
+}
+
 fn parse_gateway_models(payload: &Value) -> Vec<GatewayModel> {
     let Some(items) = payload
         .get("data")
@@ -1046,14 +1064,12 @@ fn conservative_tested_model_entry(model_id: &str, owner: Option<&str>, priority
         "include_skills_usage_instructions": false,
         "include_plugin_usage_instructions": false,
         "include_apps_usage_instructions": false,
-        "default_reasoning_summary": null,
         "default_verbosity": null,
         "apply_patch_tool_type": null,
-        "web_search_tool_type": null,
-        "truncation_policy": null,
+        "truncation_policy": {"mode": "bytes", "limit": 10000},
+        "base_instructions": MODEL_BASE_INSTRUCTIONS,
         "supports_image_detail_original": false,
         "comp_hash": null,
-        "effective_context_window_percent": null,
         "experimental_supported_tools": [],
         "input_modalities": ["text"],
         "supports_search_tool": false,
@@ -1179,29 +1195,25 @@ fn catalog_state_for_home(home: &Path) -> Result<NativeModelCatalogActionReport,
         .map_err(|_| engine("Codex 配置不是 UTF-8"))?
         .unwrap_or("");
     let (_, managed) = cleaned_config_without_external_catalog(text, &config)?;
-    let catalog_bytes = read_optional(&catalog)?;
-    let Some(bytes) = catalog_bytes else {
-        if managed {
-            return Err(engine("模型目录配置存在但文件缺失；请先复位模型目录"));
-        }
+    if !managed {
+        // The catalog file is inert unless the exact manager block references
+        // it. Reset intentionally leaves detached files in place so an
+        // external config writer or a preserved config backup can never be
+        // left pointing at a path that this process deleted.
         return Ok(action_report(
             "ok",
             Vec::new(),
             "当前没有启用由管理器添加的上游模型",
         ));
+    }
+    let catalog_bytes = read_optional(&catalog)?;
+    let Some(bytes) = catalog_bytes else {
+        return Err(engine("模型目录配置存在但文件缺失；请先复位模型目录"));
     };
     let value: Value =
         serde_json::from_slice(&bytes).map_err(|_| engine("本地模型目录格式无效；已保留原文件"))?;
     let ids = catalog_model_ids(&value)?;
-    if managed {
-        Ok(action_report("ok", ids, "已读取当前启用的上游模型目录"))
-    } else {
-        Ok(action_report(
-            "orphaned",
-            Vec::new(),
-            "检测到未启用的管理器目录文件；请复位后再添加模型",
-        ))
-    }
+    Ok(action_report("ok", ids, "已读取当前启用的上游模型目录"))
 }
 
 fn catalog_state() -> Result<NativeModelCatalogActionReport, AppError> {
@@ -1231,6 +1243,242 @@ fn empty_native_catalog() -> Value {
     })
 }
 
+fn validated_catalog_candidate<V>(
+    bytes: &[u8],
+    validate_catalog: &V,
+) -> Result<(Vec<u8>, Vec<String>), AppError>
+where
+    V: Fn(&[u8]) -> Result<(), AppError>,
+{
+    let normalized = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    if normalized.len() > BODY_LIMIT {
+        return Err(engine("模型目录超过本地大小限制"));
+    }
+    let mut value: Value =
+        serde_json::from_slice(normalized).map_err(|_| engine("管理器模型目录不是有效 JSON"))?;
+    let ids = catalog_model_ids(&value)?;
+    let unique: BTreeSet<_> = ids.iter().collect();
+    if unique.len() != ids.len() {
+        return Err(engine("管理器模型目录包含重复模型标识"));
+    }
+    if ids.is_empty() {
+        return Err(engine("管理器模型目录没有可用模型"));
+    }
+    let migrated = normalize_legacy_model_entries(&mut value)?;
+    let normalized = if migrated {
+        serde_json::to_vec_pretty(&value).map_err(|_| engine("模型目录迁移失败；原文件已保留"))?
+    } else {
+        normalized.to_vec()
+    };
+    validate_catalog(&normalized)?;
+    Ok((normalized, ids))
+}
+
+/// Repair the exact legacy shape emitted by earlier manager builds. This is
+/// intentionally limited to manager-owned catalogs: unknown values are
+/// preserved and rejected rather than guessed at.
+fn normalize_legacy_model_entries(catalog: &mut Value) -> Result<bool, AppError> {
+    let rows = catalog
+        .get_mut("models")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| engine("本地模型目录格式无效，已保留原文件"))?;
+    let mut changed = false;
+    for row in rows {
+        let entry = row
+            .as_object_mut()
+            .ok_or_else(|| engine("模型目录包含无效条目，已保留原文件"))?;
+
+        for key in [
+            "default_reasoning_summary",
+            "web_search_tool_type",
+            "effective_context_window_percent",
+        ] {
+            if entry.get(key).is_some_and(Value::is_null) {
+                entry.remove(key);
+                changed = true;
+            }
+        }
+
+        match entry.get("truncation_policy") {
+            None | Some(Value::Null) => {
+                entry.insert(
+                    "truncation_policy".into(),
+                    json!({"mode": "bytes", "limit": 10000}),
+                );
+                changed = true;
+            }
+            Some(Value::Object(policy))
+                if policy.get("mode").and_then(Value::as_str) == Some("bytes")
+                    && policy
+                        .get("limit")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|limit| limit > 0) => {}
+            _ => return Err(engine("模型目录的截断策略无法安全修复；原文件已保留")),
+        }
+
+        let has_instructions = entry
+            .get("base_instructions")
+            .and_then(Value::as_str)
+            .is_some()
+            || entry
+                .get("model_messages")
+                .and_then(|messages| messages.get("instructions_template"))
+                .and_then(Value::as_str)
+                .is_some();
+        if !has_instructions {
+            if entry.get("base_instructions").is_some()
+                || entry
+                    .get("model_messages")
+                    .and_then(|messages| messages.get("instructions_template"))
+                    .is_some()
+            {
+                return Err(engine("模型目录的系统指令无法安全修复；原文件已保留"));
+            }
+            entry.insert(
+                "base_instructions".into(),
+                Value::String(MODEL_BASE_INSTRUCTIONS.into()),
+            );
+            changed = true;
+        }
+
+        for (key, is_valid) in [
+            (
+                "default_reasoning_summary",
+                entry
+                    .get("default_reasoning_summary")
+                    .is_none_or(Value::is_string),
+            ),
+            (
+                "web_search_tool_type",
+                entry
+                    .get("web_search_tool_type")
+                    .is_none_or(Value::is_string),
+            ),
+            (
+                "effective_context_window_percent",
+                entry
+                    .get("effective_context_window_percent")
+                    .is_none_or(Value::is_u64),
+            ),
+        ] {
+            if !is_valid {
+                return Err(engine(format!("模型目录字段 {key} 类型无效；原文件已保留")));
+            }
+        }
+    }
+    Ok(changed)
+}
+
+fn ensure_managed_config_unchanged(config: &Path, snapshot: &[u8]) -> Result<(), AppError> {
+    if read_optional(config)?.as_deref() != Some(snapshot) {
+        return Err(engine(
+            "Codex 配置在模型目录校验期间发生变化；未修改文件，请重新点击启动",
+        ));
+    }
+    let text = std::str::from_utf8(snapshot)
+        .map_err(|_| engine("Codex 配置不是 UTF-8；未修改模型目录"))?;
+    let (_, managed) = cleaned_config_without_external_catalog(text, config)?;
+    if !managed {
+        return Err(engine(
+            "模型目录配置已不再由安装器管理；未修改目录，请重新点击启动",
+        ));
+    }
+    Ok(())
+}
+
+fn preflight_managed_catalog_at_home<V>(home: &Path, validate_catalog: V) -> Result<bool, AppError>
+where
+    V: Fn(&[u8]) -> Result<(), AppError>,
+{
+    let _files = FILE_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let config = config_path_for(home);
+    let catalog = catalog_path_for(home);
+    let Some(config_bytes) = read_optional(&config)? else {
+        return Ok(false);
+    };
+    let config_text = std::str::from_utf8(&config_bytes)
+        .map_err(|_| engine("Codex 配置不是 UTF-8；未修改模型目录"))?;
+    if !config_text.contains(CONFIG_BEGIN) && !config_text.contains(CONFIG_END) {
+        return Ok(false);
+    }
+    let (_, managed) = cleaned_config_without_external_catalog(config_text, &config)?;
+    if !managed {
+        return Ok(false);
+    }
+
+    regular_or_absent(&catalog)?;
+    let catalog_backup = atomic_file::backup_path(&catalog);
+    regular_or_absent(&catalog_backup)?;
+    let config_snapshot = config_bytes;
+    let current_snapshot = read_optional(&catalog)?;
+    let backup_snapshot = read_optional(&catalog_backup)?;
+    let current_valid = current_snapshot
+        .as_deref()
+        .and_then(|bytes| validated_catalog_candidate(bytes, &validate_catalog).ok());
+
+    if let Some((normalized, _)) = current_valid {
+        ensure_managed_config_unchanged(&config, &config_snapshot)?;
+        if read_optional(&catalog)? != current_snapshot {
+            return Err(engine("模型目录在校验期间发生变化；请重新点击启动"));
+        }
+        if current_snapshot.as_deref() != Some(normalized.as_slice()) {
+            if read_optional(&catalog_backup)? != backup_snapshot {
+                return Err(engine("模型目录备份在校验期间发生变化；请重新点击启动"));
+            }
+            let write = if backup_snapshot
+                .as_deref()
+                .is_some_and(|bytes| !owned_json_bytes(bytes, CATALOG_IDENTITY))
+            {
+                // Never let the normal rotating writer delete a file that is
+                // not positively identified as a manager-owned backup.
+                atomic_file::write_atomic_preserving_backup(&catalog, &normalized)
+            } else {
+                atomic_file::write_atomic(&catalog, &normalized)
+            };
+            write.map_err(|_| engine("模型目录 BOM 修复未完成；原目录已保留在备份中"))?;
+            if read_optional(&catalog)?.as_deref() != Some(normalized.as_slice()) {
+                return Err(engine("模型目录 BOM 修复回读不一致；请重试启动"));
+            }
+            log::info!("removed UTF-8 BOM from validated manager-owned model catalog");
+        }
+        return Ok(true);
+    }
+
+    let Some(backup_bytes) = backup_snapshot.as_deref() else {
+        return Err(engine(
+            "本地模型目录格式无效，且没有可用的管理器备份；请在模型管理中复位后重新添加",
+        ));
+    };
+    let (normalized_backup, _) = validated_catalog_candidate(backup_bytes, &validate_catalog)
+        .map_err(|_| {
+            engine("当前模型目录和备份均未通过本地目录校验；未修改文件，请复位模型目录")
+        })?;
+    if read_optional(&catalog)? != current_snapshot
+        || read_optional(&catalog_backup)? != backup_snapshot
+    {
+        return Err(engine("模型目录在恢复前发生变化；请重新点击启动"));
+    }
+    ensure_managed_config_unchanged(&config, &config_snapshot)?;
+    // Preserve the known-good .bak while atomically replacing the rejected
+    // current file. `write_atomic` would rotate/delete the backup source.
+    atomic_file::write_atomic_preserving_backup(&catalog, &normalized_backup)
+        .map_err(|_| engine("已验证备份恢复失败；保留原文件，请重试启动"))?;
+    if read_optional(&catalog)?.as_deref() != Some(normalized_backup.as_slice()) {
+        return Err(engine("恢复后的模型目录回读不一致；请重试启动"));
+    }
+    log::warn!("restored manager-owned model catalog from a locally validated backup");
+    Ok(true)
+}
+
+pub(crate) fn preflight_usb_catalog() -> Result<(), AppError> {
+    let home = codex_home_dir().ok_or_else(|| engine("无法确定 Codex 用户目录"))?;
+    // Startup validation is intentionally local and bounded. Launching the
+    // Codex runtime here made every USB start spawn a second heavyweight
+    // process, and the CLI's debug output is not a stable import contract.
+    preflight_managed_catalog_at_home(&home, |_| Ok(()))?;
+    Ok(())
+}
+
 pub(crate) fn add_tested_model_to_catalog(
     request_id: &str,
     model_id: &str,
@@ -1240,7 +1488,11 @@ pub(crate) fn add_tested_model_to_catalog(
 ) -> Result<NativeModelCatalogActionReport, AppError> {
     let home = codex_home_dir().ok_or_else(|| engine("无法确定 Codex 用户目录"))?;
     let expected_home = home.clone();
-    add_tested_model_files(
+    #[cfg(windows)]
+    let codex_cli = usb_guard::authorized_usb_codex_root()?
+        .join("resources")
+        .join("codex.exe");
+    add_tested_model_files_with_validator(
         &home,
         model_id,
         owner,
@@ -1250,6 +1502,48 @@ pub(crate) fn add_tested_model_to_catalog(
                 usb_guard::authorized_account_binding()?.as_ref() == Some(expected_binding)
                     && codex_home_dir().as_deref() == Some(expected_home.as_path()),
             )
+        },
+        || {
+            #[cfg(windows)]
+            {
+                model_native_probe::native_default_catalog(
+                    &codex_cli,
+                    cancelled,
+                    Instant::now() + Duration::from_secs(30),
+                )
+                .map_err(|error| {
+                    engine(format!(
+                        "无法读取当前 Codex 原生模型目录（{}）；未写入模型",
+                        error.code()
+                    ))
+                })
+            }
+            #[cfg(not(windows))]
+            {
+                Err(engine("当前平台无法读取 Codex 原生模型目录；未写入模型"))
+            }
+        },
+        |bytes| {
+            #[cfg(windows)]
+            {
+                model_native_probe::validate_final_catalog(
+                    &codex_cli,
+                    bytes,
+                    cancelled,
+                    Instant::now() + Duration::from_secs(30),
+                )
+                .map_err(|error| {
+                    engine(format!(
+                        "当前 Codex 不接受此模型目录（{}）；未写入配置",
+                        error.code()
+                    ))
+                })
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = bytes;
+                Ok(())
+            }
         },
         || crate::app::gateway_model_probe::mark_catalog_commit_started(request_id),
         mark_restart_required,
@@ -1267,6 +1561,37 @@ fn add_tested_model_files<F, C, M>(
 ) -> Result<NativeModelCatalogActionReport, AppError>
 where
     F: Fn() -> Result<bool, AppError>,
+    C: Fn(),
+    M: Fn() -> Result<(), AppError>,
+{
+    add_tested_model_files_with_validator(
+        home,
+        model_id,
+        owner,
+        cancelled,
+        is_current,
+        || Ok(empty_native_catalog()),
+        |_| Ok(()),
+        mark_commit,
+        mark_restart,
+    )
+}
+
+fn add_tested_model_files_with_validator<F, I, V, C, M>(
+    home: &Path,
+    model_id: &str,
+    owner: Option<&str>,
+    cancelled: &AtomicBool,
+    is_current: F,
+    initial_catalog: I,
+    validate_catalog: V,
+    mark_commit: C,
+    mark_restart: M,
+) -> Result<NativeModelCatalogActionReport, AppError>
+where
+    F: Fn() -> Result<bool, AppError>,
+    I: FnOnce() -> Result<Value, AppError>,
+    V: Fn(&[u8]) -> Result<(), AppError>,
     C: Fn(),
     M: Fn() -> Result<(), AppError>,
 {
@@ -1294,6 +1619,7 @@ where
 
     let config_snapshot = read_optional(&config)?;
     let config_backup_snapshot = read_optional(&config_backup)?;
+    let catalog_backup_snapshot = read_optional(&catalog_backup)?;
     let config_text = config_snapshot
         .as_deref()
         .map(std::str::from_utf8)
@@ -1304,16 +1630,42 @@ where
     let catalog_snapshot = read_optional(&catalog)?;
     let mut catalog_value = match catalog_snapshot.as_deref() {
         Some(bytes) => {
+            let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
             let value: Value = serde_json::from_slice(bytes)
                 .map_err(|_| engine("本地模型目录格式无效；请先复位模型目录"))?;
-            let _ = catalog_model_ids(&value)?;
-            if !managed {
-                return Err(engine("发现未启用的管理器目录文件；请先复位模型目录"));
+            if value.get("identity").and_then(Value::as_str) != Some(CATALOG_IDENTITY) {
+                return Err(engine("模型目录不归本管理器所有；未写入，请先复位模型目录"));
             }
-            value
+            let ids = catalog_model_ids(&value)?;
+            if ids.iter().collect::<BTreeSet<_>>().len() != ids.len() {
+                return Err(engine("模型目录包含重复模型标识；未写入，请先复位模型目录"));
+            }
+            if ids.is_empty() {
+                if managed {
+                    return Err(engine(
+                        "当前启用的管理器模型目录为空；未写入，请先恢复默认模型后再添加",
+                    ));
+                }
+                // Reset intentionally leaves an empty, manager-owned file so
+                // old config backups never point at a deleted path. Treat
+                // that empty detached file as a reset marker and reseed from
+                // the current Codex defaults before the next Add.
+                initial_catalog()?
+            } else {
+                // Add is always additive for a valid manager-owned catalog,
+                // including a catalog whose config reference was detached by an
+                // interrupted/manual config edit. Only Reset empties this list.
+                value
+            }
         }
-        None => empty_native_catalog(),
+        None if managed => {
+            return Err(engine(
+                "Codex 已引用管理器模型目录但目录文件缺失；未重建或覆盖，请先恢复默认模型",
+            ))
+        }
+        None => initial_catalog()?,
     };
+    normalize_legacy_model_entries(&mut catalog_value)?;
     let existing_ids = catalog_model_ids(&catalog_value)?;
     if existing_ids.iter().any(|id| id == model_id) {
         return Ok(action_report(
@@ -1337,6 +1689,10 @@ where
     if catalog_bytes.len() > BODY_LIMIT {
         return Err(engine("模型目录超过本地大小限制"));
     }
+    if catalog_bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        return Err(engine("模型目录序列化结果包含 UTF-8 BOM；已阻止写入"));
+    }
+    validate_catalog(&catalog_bytes)?;
     let merged = if managed {
         None
     } else {
@@ -1346,6 +1702,7 @@ where
         || read_optional(&config)? != config_snapshot
         || read_optional(&config_backup)? != config_backup_snapshot
         || read_optional(&catalog)? != catalog_snapshot
+        || read_optional(&catalog_backup)? != catalog_backup_snapshot
         || cancelled.load(AtomicOrdering::Acquire)
     {
         return Err(engine("配置或账户在写入前已变化；未覆盖其他修改"));
@@ -1360,18 +1717,56 @@ where
         if let Err(_) = atomic_file::write_atomic_preserving_backup(&config, merged.as_bytes()) {
             let current = read_optional(&catalog).ok().flatten();
             let safe_to_remove = current.as_deref() == Some(catalog_bytes.as_slice());
-            let removed = safe_to_remove && fs::remove_file(&catalog).is_ok();
-            if removed {
+            let restored = if safe_to_remove {
+                match catalog_snapshot.as_deref() {
+                    Some(previous) => {
+                        let main_restored =
+                            atomic_file::write_atomic_preserving_backup(&catalog, previous).is_ok()
+                                && read_optional(&catalog).ok().flatten().as_deref()
+                                    == Some(previous);
+                        let backup_restored = match catalog_backup_snapshot.as_deref() {
+                            Some(previous_backup) => {
+                                atomic_file::write_atomic_preserving_backup(
+                                    &catalog_backup,
+                                    previous_backup,
+                                )
+                                .is_ok()
+                                    && read_optional(&catalog_backup).ok().flatten().as_deref()
+                                        == Some(previous_backup)
+                            }
+                            None => {
+                                let _ = fs::remove_file(&catalog_backup);
+                                read_optional(&catalog_backup).ok().flatten().is_none()
+                            }
+                        };
+                        main_restored && backup_restored
+                    }
+                    None => {
+                        fs::remove_file(&catalog).is_ok()
+                            && read_optional(&catalog).ok().flatten().is_none()
+                    }
+                }
+            } else {
+                false
+            };
+            if restored {
                 return Err(engine(
-                    "Codex 配置写入失败；未启用新模型，已清理临时目录文件",
+                    "Codex 配置写入失败；未启用新模型，已恢复添加前的模型目录",
                 ));
             }
             return Ok(action_report(
                 "cleanup_pending",
-                Vec::new(),
-                "Codex 配置写入失败；新目录文件清理待重试，请先复位目录",
+                catalog_model_ids(&catalog_value).unwrap_or_default(),
+                "Codex 配置写入失败；原模型目录恢复待检查，已保留可恢复文件",
             ));
         }
+    }
+    // Keep a known-good manager-owned recovery point after the first real
+    // catalog commit too. The atomic writer's first backup can be an empty
+    // bootstrap catalog, which is not a usable rollback candidate.
+    if let Err(error) = atomic_file::write_atomic_preserving_backup(&catalog_backup, &catalog_bytes)
+    {
+        log::warn!("could not refresh validated model catalog recovery point: {error}");
     }
     let readback_catalog = read_optional(&catalog)?
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
@@ -1452,33 +1847,26 @@ where
     let sidecar_snapshot = read_optional(&sidecar)?;
     let catalog_backup_snapshot = read_optional(&catalog_backup)?;
     let sidecar_backup_snapshot = read_optional(&sidecar_backup)?;
-    for (bytes, identity, label) in [
-        (catalog_snapshot.as_deref(), CATALOG_IDENTITY, "模型目录"),
+    let snapshots = [
+        (&catalog, catalog_snapshot.as_deref(), CATALOG_IDENTITY),
         (
+            &catalog_backup,
             catalog_backup_snapshot.as_deref(),
             CATALOG_IDENTITY,
-            "模型目录备份",
         ),
-        (sidecar_snapshot.as_deref(), SIDECAR_IDENTITY, "能力文件"),
+        (&sidecar, sidecar_snapshot.as_deref(), SIDECAR_IDENTITY),
         (
+            &sidecar_backup,
             sidecar_backup_snapshot.as_deref(),
             SIDECAR_IDENTITY,
-            "能力文件备份",
         ),
-    ] {
-        if let Some(bytes) = bytes {
-            let value: Value = serde_json::from_slice(bytes)
-                .map_err(|_| engine(format!("{label}无法确认所有权；原文件均未改动")))?;
-            if value.get("identity").and_then(Value::as_str) != Some(identity) {
-                return Err(engine(format!("{label}不归本管理器所有；原文件均未改动")));
-            }
-        }
-    }
-    if managed && catalog_snapshot.is_some() && !owned_json(&catalog, CATALOG_IDENTITY) {
-        return Err(engine(
-            "模型目录文件所有权无法确认；原配置和模型目录均未改动",
-        ));
-    }
+    ];
+    // An exact manager config block is sufficient authority to detach the
+    // reference, but not to delete adjacent files whose identity is unclear.
+    // If any member is malformed or unowned, preserve the whole file family.
+    let uncertain_catalog_files = snapshots
+        .iter()
+        .any(|(_, bytes, identity)| bytes.is_some_and(|bytes| !owned_json_bytes(bytes, identity)));
     if read_optional(&config)? != config_snapshot
         || read_optional(&config_backup)? != config_backup_snapshot
         || read_optional(&catalog)? != catalog_snapshot
@@ -1488,30 +1876,50 @@ where
     {
         return Err(engine("模型目录或配置已被其他进程修改；本次复位未执行"));
     }
+    if !uncertain_catalog_files {
+        let empty_catalog = serde_json::to_vec_pretty(&empty_native_catalog())
+            .map_err(|_| engine("无法生成空模型目录；本次复位未执行"))?;
+        if catalog_snapshot.is_some() {
+            atomic_file::write_atomic_preserving_backup(&catalog, &empty_catalog)
+                .map_err(|_| engine("清空已验证的模型目录失败；请重试复位"))?;
+            if read_optional(&catalog)?.as_deref() != Some(empty_catalog.as_slice()) {
+                return Err(engine("空模型目录回读不一致；请重试复位"));
+            }
+        }
+        if catalog_backup_snapshot.is_some() {
+            fs::remove_file(&catalog_backup)
+                .map_err(|_| engine("清理已验证的旧模型备份失败；请重试复位"))?;
+            if read_optional(&catalog_backup)?.is_some() {
+                return Err(engine("旧模型备份仍存在；请重试复位"));
+            }
+        }
+    }
     if managed {
         atomic_file::write_atomic_preserving_backup(&config, cleaned_config.as_bytes())
             .map_err(|_| engine("复位时无法安全移除管理器配置块；模型目录未清理"))?;
     }
-    let mut cleanup_failed = false;
-    for path in [&catalog, &catalog_backup, &sidecar, &sidecar_backup] {
-        match fs::remove_file(path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => cleanup_failed = true,
-        }
-    }
-    let changed = managed
-        || catalog_snapshot.is_some()
-        || catalog_backup_snapshot.is_some()
-        || sidecar_snapshot.is_some()
-        || sidecar_backup_snapshot.is_some();
+    // Keep the manager-owned path valid for config backups that still refer to
+    // it, but clear its active rows so a later Add starts from an empty list.
+    // Uncertain files are left untouched above and are never auto-activated.
+    let changed = managed;
     let marker_ok = !changed || mark_restart().is_ok();
-    if cleanup_failed {
-        return Ok(action_report(
-            "cleanup_pending",
-            Vec::new(),
-            "Codex 已切回原生模型目录；管理器文件清理待重试",
-        ));
+    if uncertain_catalog_files {
+        let (status, message) = if managed {
+            (
+                "applied_restart_pending",
+                if marker_ok {
+                    "已切回 Codex 默认模型；未启用的目录文件已保留，请重启 Codex"
+                } else {
+                    "已切回 Codex 默认模型；目录文件已保留，重载标记未写入，请手动重启 Codex"
+                },
+            )
+        } else {
+            (
+                "already_native",
+                "当前已使用 Codex 默认模型；损坏或无法确认归属的目录文件已保留",
+            )
+        };
+        return Ok(action_report(status, Vec::new(), message));
     }
     if !marker_ok {
         return Ok(action_report(
@@ -1528,7 +1936,7 @@ where
         },
         Vec::new(),
         if changed {
-            "已恢复 Codex 原生模型目录；重启 Codex 后生效"
+            "已恢复 Codex 原生模型目录；未启用的目录文件已保留，重启 Codex 后生效"
         } else {
             "当前已使用 Codex 原生模型目录"
         },
@@ -1611,17 +2019,47 @@ pub fn cancel(request_id: &str) -> bool {
         .cancel(request_id)
 }
 pub fn restart_required() -> bool {
-    reload_marker_path()
-        .ok()
-        .is_some_and(|p| fs::metadata(p).is_ok_and(|m| m.is_file()))
+    restart_marker_snapshot_checked().ok().flatten().is_some()
+}
+pub fn restart_required_checked() -> Result<bool, AppError> {
+    Ok(restart_marker_snapshot_checked()?.is_some())
+}
+pub fn restart_marker_snapshot_checked() -> Result<Option<Vec<u8>>, AppError> {
+    let _marker = RELOAD_MARKER_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    restart_marker_at(&reload_marker_path()?)
 }
 pub fn mark_restart_required() -> Result<(), AppError> {
-    atomic_file::write_atomic(&reload_marker_path()?, b"catalog-updated\n")
+    let _marker = RELOAD_MARKER_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let marker = format!("catalog-updated {}\n", uuid::Uuid::new_v4());
+    atomic_file::write_atomic(&reload_marker_path()?, marker.as_bytes())
         .map_err(|_| engine("写入模型目录重载标记失败"))
 }
 pub fn clear_restart_required() {
+    let _marker = RELOAD_MARKER_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     if let Ok(p) = reload_marker_path() {
         let _ = fs::remove_file(p);
+    }
+}
+pub fn clear_restart_marker_if_matches(expected: &[u8]) -> Result<(), AppError> {
+    let _marker = RELOAD_MARKER_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let path = reload_marker_path()?;
+    clear_restart_marker_at(&path, expected)
+}
+fn clear_restart_marker_at(path: &Path, expected: &[u8]) -> Result<(), AppError> {
+    match restart_marker_at(path)? {
+        Some(current) if current == expected => {
+            fs::remove_file(path).map_err(|_| engine("清除已应用的模型目录重载标记失败"))?;
+            Ok(())
+        }
+        Some(_) | None => Ok(()),
     }
 }
 fn regular_or_absent(path: &Path) -> Result<(), AppError> {
@@ -1764,8 +2202,12 @@ fn owned_json(path: &Path, identity: &str) -> bool {
     read_optional(path)
         .ok()
         .flatten()
-        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-        .is_some_and(|v| v.get("identity").and_then(Value::as_str) == Some(identity))
+        .is_some_and(|bytes| owned_json_bytes(&bytes, identity))
+}
+fn owned_json_bytes(bytes: &[u8], identity: &str) -> bool {
+    serde_json::from_slice::<Value>(bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes))
+        .ok()
+        .is_some_and(|value| value.get("identity").and_then(Value::as_str) == Some(identity))
 }
 pub fn cleanup() -> Result<bool, AppError> {
     activation::invalidate_live();
@@ -2711,15 +3153,485 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn reload_marker_check_only_treats_a_confirmed_missing_file_as_clear() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-model-reload-marker-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let marker = root.join(RELOAD_MARKER_FILE_NAME);
+
+        assert!(restart_marker_at(&marker).unwrap().is_none());
+        fs::write(&marker, b"catalog-updated generation-1\n").unwrap();
+        let first_generation = restart_marker_at(&marker).unwrap().unwrap();
+        fs::write(&marker, b"catalog-updated generation-2\n").unwrap();
+        let second_generation = restart_marker_at(&marker).unwrap().unwrap();
+        clear_restart_marker_at(&marker, &first_generation).unwrap();
+        assert_eq!(
+            restart_marker_at(&marker).unwrap(),
+            Some(second_generation.clone())
+        );
+        clear_restart_marker_at(&marker, &second_generation).unwrap();
+        assert!(restart_marker_at(&marker).unwrap().is_none());
+        fs::create_dir(&marker).unwrap();
+        assert!(restart_marker_at(&marker).is_err());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn tested_catalog_entry_preserves_exact_id_and_claims_only_text_input() {
         let entry = conservative_tested_model_entry("vendor/model-latest", Some("vendor"), 3);
         assert_eq!(entry["slug"], "vendor/model-latest");
         assert_eq!(entry["input_modalities"], json!(["text"]));
         assert_eq!(entry["supports_search_tool"], false);
         assert_eq!(entry["supported_reasoning_levels"], json!([]));
+        assert!(entry.get("default_reasoning_summary").is_none());
+        assert!(entry.get("web_search_tool_type").is_none());
+        assert_eq!(
+            entry["truncation_policy"],
+            json!({"mode":"bytes","limit":10000})
+        );
+        assert!(entry["base_instructions"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()));
+        assert!(entry.get("effective_context_window_percent").is_none());
         assert!(entry.get("context_window").is_none());
         assert!(entry.get("tool_mode").is_none());
         assert!(!entry.to_string().contains("image\""));
+        let bytes = serde_json::to_vec_pretty(&json!({
+            "identity": CATALOG_IDENTITY,
+            "models": [entry]
+        }))
+        .unwrap();
+        assert!(!bytes.starts_with(&[0xEF, 0xBB, 0xBF]));
+    }
+
+    #[test]
+    fn legacy_manager_catalog_schema_is_migrated_without_losing_model_metadata() {
+        let mut catalog = json!({
+            "identity": CATALOG_IDENTITY,
+            "models": [{
+                "slug": "vendor/legacy-model",
+                "display_name": "Legacy model",
+                "default_reasoning_summary": null,
+                "web_search_tool_type": null,
+                "effective_context_window_percent": null,
+                "truncation_policy": null
+            }]
+        });
+
+        assert!(normalize_legacy_model_entries(&mut catalog).unwrap());
+        let model = &catalog["models"][0];
+        assert_eq!(model["slug"], "vendor/legacy-model");
+        assert_eq!(model["display_name"], "Legacy model");
+        assert!(model.get("default_reasoning_summary").is_none());
+        assert!(model.get("web_search_tool_type").is_none());
+        assert!(model.get("effective_context_window_percent").is_none());
+        assert_eq!(
+            model["truncation_policy"],
+            json!({"mode":"bytes","limit":10000})
+        );
+        assert_eq!(model["base_instructions"], MODEL_BASE_INSTRUCTIONS);
+        assert!(!normalize_legacy_model_entries(&mut catalog).unwrap());
+    }
+
+    #[test]
+    fn legacy_catalog_migration_rejects_unknown_shapes_without_mutating_them() {
+        let mut catalog = json!({
+            "identity": CATALOG_IDENTITY,
+            "models": [{
+                "slug": "vendor/model",
+                "truncation_policy": {"mode":"tokens","limit":10}
+            }]
+        });
+        let before = catalog.clone();
+        assert!(normalize_legacy_model_entries(&mut catalog).is_err());
+        assert_eq!(catalog, before);
+    }
+
+    fn managed_catalog_config(home: &Path) -> Vec<u8> {
+        let config = config_path_for(home);
+        format!(
+            "{CONFIG_BEGIN}\n{}\n{CONFIG_END}\n",
+            expected_catalog_reference(&config).unwrap()
+        )
+        .into_bytes()
+    }
+
+    fn fixture_catalog(model_id: &str) -> Vec<u8> {
+        serde_json::to_vec_pretty(&json!({
+            "identity": CATALOG_IDENTITY,
+            "models": [conservative_tested_model_entry(model_id, None, 1)]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn startup_catalog_gate_rejects_wrong_identity_duplicate_and_invalid_model_ids() {
+        let cases = [
+            json!({"identity":"some-other-tool", "models":[{"slug":"vendor/model"}]}),
+            json!({"identity":CATALOG_IDENTITY, "models":[{"slug":"vendor/model"},{"slug":"vendor/model"}]}),
+            json!({"identity":CATALOG_IDENTITY, "models":[{"slug":"not a safe model id"}]}),
+        ];
+        for value in cases {
+            let bytes = serde_json::to_vec(&value).unwrap();
+            assert!(validated_catalog_candidate(&bytes, &|_| Ok(())).is_err());
+        }
+    }
+
+    #[test]
+    fn startup_preflight_strips_bom_only_after_candidate_validation() {
+        let home = CatalogTempHome::new();
+        let config = config_path_for(home.path());
+        let catalog = catalog_path_for(home.path());
+        std::fs::write(&config, managed_catalog_config(home.path())).unwrap();
+        let good = fixture_catalog("vendor/model");
+        let mut with_bom = vec![0xEF, 0xBB, 0xBF];
+        with_bom.extend_from_slice(&good);
+        std::fs::write(&catalog, &with_bom).unwrap();
+
+        let validated = preflight_managed_catalog_at_home(home.path(), |bytes| {
+            assert_eq!(bytes, good.as_slice());
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(validated);
+        assert_eq!(std::fs::read(&catalog).unwrap(), good);
+        assert_eq!(
+            std::fs::read(atomic_file::backup_path(&catalog)).unwrap(),
+            with_bom
+        );
+    }
+
+    #[test]
+    fn startup_preflight_migrates_legacy_manager_catalog_before_codex_launch() {
+        let home = CatalogTempHome::new();
+        let config = config_path_for(home.path());
+        let catalog_path = catalog_path_for(home.path());
+        std::fs::write(&config, managed_catalog_config(home.path())).unwrap();
+        let legacy = json!({
+            "identity": CATALOG_IDENTITY,
+            "models": [{
+                "slug": "vendor/legacy-model",
+                "display_name": "Legacy model",
+                "default_reasoning_summary": null,
+                "web_search_tool_type": null,
+                "effective_context_window_percent": null,
+                "truncation_policy": null
+            }]
+        });
+        let legacy_bytes = serde_json::to_vec_pretty(&legacy).unwrap();
+        std::fs::write(&catalog_path, &legacy_bytes).unwrap();
+
+        assert!(preflight_managed_catalog_at_home(home.path(), |_| Ok(())).unwrap());
+
+        let migrated: Value =
+            serde_json::from_slice(&std::fs::read(&catalog_path).unwrap()).unwrap();
+        assert_eq!(migrated["models"][0]["slug"], "vendor/legacy-model");
+        assert_eq!(
+            migrated["models"][0]["truncation_policy"],
+            json!({"mode":"bytes","limit":10000})
+        );
+        assert_eq!(
+            migrated["models"][0]["base_instructions"],
+            MODEL_BASE_INSTRUCTIONS
+        );
+        assert!(migrated["models"][0]
+            .get("default_reasoning_summary")
+            .is_none());
+        assert!(migrated["models"][0].get("web_search_tool_type").is_none());
+        assert!(migrated["models"][0]
+            .get("effective_context_window_percent")
+            .is_none());
+        assert_eq!(
+            std::fs::read(atomic_file::backup_path(&catalog_path)).unwrap(),
+            legacy_bytes
+        );
+    }
+
+    #[test]
+    fn startup_preflight_restores_only_a_locally_validated_manager_backup() {
+        let home = CatalogTempHome::new();
+        let config = config_path_for(home.path());
+        let catalog = catalog_path_for(home.path());
+        let backup = atomic_file::backup_path(&catalog);
+        std::fs::write(&config, managed_catalog_config(home.path())).unwrap();
+        let good = fixture_catalog("vendor/known-good");
+        let rejected = b"{invalid current catalog";
+        std::fs::write(&catalog, rejected).unwrap();
+        std::fs::write(&backup, &good).unwrap();
+
+        preflight_managed_catalog_at_home(home.path(), |bytes| {
+            let value: Value =
+                serde_json::from_slice(bytes).map_err(|_| engine("fixture rejected"))?;
+            if value["models"][0]["slug"] == "vendor/known-good" {
+                Ok(())
+            } else {
+                Err(engine("fixture rejected"))
+            }
+        })
+        .unwrap();
+
+        assert_eq!(std::fs::read(&catalog).unwrap(), good);
+        assert_eq!(std::fs::read(&backup).unwrap(), good);
+    }
+
+    #[test]
+    fn bom_repair_preserves_an_unowned_adjacent_backup() {
+        let home = CatalogTempHome::new();
+        let config = config_path_for(home.path());
+        let catalog = catalog_path_for(home.path());
+        let backup = atomic_file::backup_path(&catalog);
+        std::fs::write(&config, managed_catalog_config(home.path())).unwrap();
+        let good = fixture_catalog("vendor/model");
+        let mut with_bom = vec![0xEF, 0xBB, 0xBF];
+        with_bom.extend_from_slice(&good);
+        let unowned_backup = b"user-owned neighboring backup";
+        std::fs::write(&catalog, &with_bom).unwrap();
+        std::fs::write(&backup, unowned_backup).unwrap();
+
+        preflight_managed_catalog_at_home(home.path(), |_| Ok(())).unwrap();
+
+        assert_eq!(std::fs::read(&catalog).unwrap(), good);
+        assert_eq!(std::fs::read(&backup).unwrap(), unowned_backup);
+    }
+
+    #[test]
+    fn startup_preflight_keeps_unrecoverable_and_external_catalogs_untouched() {
+        let home = CatalogTempHome::new();
+        let config = config_path_for(home.path());
+        let catalog = catalog_path_for(home.path());
+        let backup = atomic_file::backup_path(&catalog);
+        let rejected = b"{invalid catalog";
+        std::fs::write(&config, managed_catalog_config(home.path())).unwrap();
+        std::fs::write(&catalog, rejected).unwrap();
+        std::fs::write(&backup, b"also invalid").unwrap();
+
+        assert!(
+            preflight_managed_catalog_at_home(home.path(), |_| Err(engine("fixture rejected")))
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&catalog).unwrap(), rejected);
+        assert_eq!(std::fs::read(&backup).unwrap(), b"also invalid");
+
+        std::fs::write(&config, b"model_catalog_json = \"user-owned.json\"\n").unwrap();
+        let before = std::fs::read(&catalog).unwrap();
+        assert!(!preflight_managed_catalog_at_home(home.path(), |_| {
+            panic!("external catalog must not be modified or validated")
+        })
+        .unwrap());
+        assert_eq!(std::fs::read(&catalog).unwrap(), before);
+    }
+
+    #[test]
+    fn startup_preflight_rejects_catalog_changed_during_cli_validation() {
+        let home = CatalogTempHome::new();
+        let config = config_path_for(home.path());
+        let catalog = catalog_path_for(home.path());
+        std::fs::write(&config, managed_catalog_config(home.path())).unwrap();
+        let good = fixture_catalog("vendor/model");
+        std::fs::write(&catalog, &good).unwrap();
+
+        let result = preflight_managed_catalog_at_home(home.path(), |_| {
+            std::fs::write(&catalog, b"external concurrent change")
+                .map_err(|_| engine("fixture write failed"))?;
+            Ok(())
+        });
+
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read(&catalog).unwrap(),
+            b"external concurrent change"
+        );
+    }
+
+    #[test]
+    fn startup_preflight_rejects_manager_ownership_revoked_during_validation() {
+        let home = CatalogTempHome::new();
+        let config = config_path_for(home.path());
+        let catalog = catalog_path_for(home.path());
+        let original_config = managed_catalog_config(home.path());
+        let good = fixture_catalog("vendor/model");
+        let mut with_bom = vec![0xEF, 0xBB, 0xBF];
+        with_bom.extend_from_slice(&good);
+        std::fs::write(&config, &original_config).unwrap();
+        std::fs::write(&catalog, &with_bom).unwrap();
+
+        let result = preflight_managed_catalog_at_home(home.path(), |_| {
+            std::fs::write(&config, b"model_catalog_json = \"user-owned.json\"\n")
+                .map_err(|_| engine("fixture config edit failed"))?;
+            Ok(())
+        });
+
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read(&config).unwrap(),
+            b"model_catalog_json = \"user-owned.json\"\n"
+        );
+        assert_eq!(std::fs::read(&catalog).unwrap(), with_bom);
+    }
+
+    #[test]
+    fn rejected_catalog_candidate_does_not_cross_commit_boundary() {
+        let home = CatalogTempHome::new();
+        let config = config_path_for(home.path());
+        let original = b"model = \"keep-me\"\n";
+        std::fs::write(&config, original).unwrap();
+        let committed = AtomicBool::new(false);
+        let result = add_tested_model_files_with_validator(
+            home.path(),
+            "vendor/model",
+            None,
+            &AtomicBool::new(false),
+            || Ok(true),
+            || Ok(empty_native_catalog()),
+            |_| Err(engine("fixture Codex CLI schema rejection")),
+            || committed.store(true, AtomicOrdering::Release),
+            || Ok(()),
+        );
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("fixture Codex CLI schema rejection"));
+        assert!(!committed.load(AtomicOrdering::Acquire));
+        assert_eq!(std::fs::read(&config).unwrap(), original);
+        assert!(!catalog_path_for(home.path()).exists());
+    }
+
+    #[test]
+    fn add_rejects_preexisting_duplicate_model_ids_without_writes() {
+        let home = CatalogTempHome::new();
+        let config = config_path_for(home.path());
+        let catalog = catalog_path_for(home.path());
+        let duplicate = serde_json::to_vec(&json!({
+            "identity": CATALOG_IDENTITY,
+            "models": [
+                conservative_tested_model_entry("vendor/duplicate", None, 1),
+                conservative_tested_model_entry("vendor/duplicate", None, 2),
+            ]
+        }))
+        .unwrap();
+        std::fs::write(&config, managed_catalog_config(home.path())).unwrap();
+        std::fs::write(&catalog, &duplicate).unwrap();
+        let committed = AtomicBool::new(false);
+
+        let result = add_tested_model_files(
+            home.path(),
+            "vendor/new-model",
+            None,
+            &AtomicBool::new(false),
+            || Ok(true),
+            || committed.store(true, AtomicOrdering::Release),
+            || Ok(()),
+        );
+
+        assert!(result.unwrap_err().to_string().contains("重复模型标识"));
+        assert!(!committed.load(AtomicOrdering::Acquire));
+        assert_eq!(std::fs::read(&catalog).unwrap(), duplicate);
+        assert_eq!(
+            std::fs::read(&config).unwrap(),
+            managed_catalog_config(home.path())
+        );
+    }
+
+    #[test]
+    fn reset_detaches_exact_manager_config_and_preserves_uncertain_catalog_files() {
+        let uncertain_files = [
+            CATALOG_FILE_NAME,
+            "codex-usb-native-model-catalog.json.bak",
+            SIDECAR_FILE_NAME,
+            "codex-usb-model-capabilities.json.bak",
+        ];
+        for uncertain_file in uncertain_files {
+            let home = CatalogTempHome::new();
+            let config = config_path_for(home.path());
+            std::fs::write(&config, managed_catalog_config(home.path())).unwrap();
+            let catalog = catalog_path_for(home.path());
+            let sidecar = home.path().join(SIDECAR_FILE_NAME);
+            let catalog_backup = atomic_file::backup_path(&catalog);
+            let sidecar_backup = atomic_file::backup_path(&sidecar);
+            std::fs::write(&catalog, fixture_catalog("vendor/model")).unwrap();
+            std::fs::write(
+                &sidecar,
+                serde_json::to_vec(&json!({"identity": SIDECAR_IDENTITY})).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(&catalog_backup, fixture_catalog("vendor/backup")).unwrap();
+            std::fs::write(
+                &sidecar_backup,
+                serde_json::to_vec(&json!({"identity": SIDECAR_IDENTITY})).unwrap(),
+            )
+            .unwrap();
+            let uncertain_path = home.path().join(uncertain_file);
+            let invalid_bytes = b"{malformed and ownership cannot be confirmed";
+            std::fs::write(&uncertain_path, invalid_bytes).unwrap();
+            let snapshots = [
+                (catalog.clone(), std::fs::read(&catalog).unwrap()),
+                (
+                    sidecar,
+                    std::fs::read(home.path().join(SIDECAR_FILE_NAME)).unwrap(),
+                ),
+                (
+                    catalog_backup,
+                    std::fs::read(atomic_file::backup_path(&catalog)).unwrap(),
+                ),
+                (
+                    sidecar_backup.clone(),
+                    std::fs::read(&sidecar_backup).unwrap(),
+                ),
+            ];
+
+            let result = reset_owned_catalog_at(home.path(), || Ok(())).unwrap();
+
+            assert_eq!(result.status, "applied_restart_pending", "{uncertain_file}");
+            assert!(!std::fs::read_to_string(&config)
+                .unwrap()
+                .contains(CONFIG_BEGIN));
+            for (path, expected) in snapshots {
+                assert_eq!(std::fs::read(path).unwrap(), expected, "{uncertain_file}");
+            }
+            assert_eq!(std::fs::read(uncertain_path).unwrap(), invalid_bytes);
+        }
+    }
+
+    #[test]
+    fn reset_is_idempotent_with_malformed_orphan_catalog() {
+        let home = CatalogTempHome::new();
+        let config = config_path_for(home.path());
+        let catalog = catalog_path_for(home.path());
+        let invalid_bytes = b"{malformed orphan catalog";
+        std::fs::write(&config, b"model = \"keep-me\"\n").unwrap();
+        std::fs::write(&catalog, invalid_bytes).unwrap();
+
+        let result = reset_owned_catalog_at(home.path(), || Ok(())).unwrap();
+
+        assert_eq!(result.status, "already_native");
+        assert_eq!(std::fs::read(&config).unwrap(), b"model = \"keep-me\"\n");
+        assert_eq!(std::fs::read(&catalog).unwrap(), invalid_bytes);
+    }
+
+    #[test]
+    fn reset_clears_valid_detached_catalog_and_its_recovery_copy() {
+        let home = CatalogTempHome::new();
+        let config = config_path_for(home.path());
+        let catalog = catalog_path_for(home.path());
+        let backup = atomic_file::backup_path(&catalog);
+        std::fs::write(&config, b"model = \"keep-me\"\n").unwrap();
+        std::fs::write(&catalog, fixture_catalog("vendor/old-model")).unwrap();
+        std::fs::write(&backup, fixture_catalog("vendor/older-model")).unwrap();
+
+        let reset = reset_owned_catalog_at(home.path(), || Ok(())).unwrap();
+
+        assert_eq!(reset.status, "already_native");
+        let value: Value = serde_json::from_slice(&std::fs::read(&catalog).unwrap()).unwrap();
+        assert!(catalog_model_ids(&value).unwrap().is_empty());
+        assert!(!backup.exists());
+        assert_eq!(std::fs::read(&config).unwrap(), b"model = \"keep-me\"\n");
     }
 
     #[test]
@@ -2803,7 +3715,24 @@ mod tests {
             catalog_state_for_home(home.path()).unwrap().model_ids,
             ["vendor/model-latest"]
         );
+        add_tested_model_files(
+            home.path(),
+            "vendor/model-next",
+            Some("vendor"),
+            &cancelled,
+            || Ok(true),
+            || {},
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            catalog_state_for_home(home.path()).unwrap().model_ids,
+            ["vendor/model-latest", "vendor/model-next"]
+        );
 
+        // A prior config backup may still reference the manager catalog.
+        let config_with_manager_block = std::fs::read(&config).unwrap();
+        std::fs::write(&config_backup, &config_with_manager_block).unwrap();
         let reset = reset_owned_catalog_at(home.path(), || Ok(())).unwrap();
         assert_eq!(reset.status, "applied_restart_pending");
         let reset_config = std::fs::read_to_string(&config).unwrap();
@@ -2812,16 +3741,180 @@ mod tests {
             toml::from_str::<toml::Value>(std::str::from_utf8(original).unwrap()).unwrap()
         );
         assert!(!reset_config.contains("model_catalog_json"));
-        assert_eq!(std::fs::read(&config_backup).unwrap(), user_backup);
-        assert!(!catalog_path_for(home.path()).exists());
-        assert!(catalog_state_for_home(home.path())
-            .unwrap()
-            .model_ids
-            .is_empty());
+        assert_eq!(
+            std::fs::read(&config_backup).unwrap(),
+            config_with_manager_block
+        );
+        let detached_catalog = std::fs::read(catalog_path_for(home.path())).unwrap();
+        assert!(owned_json_bytes(&detached_catalog, CATALOG_IDENTITY));
+        assert!(
+            catalog_model_ids(&serde_json::from_slice(&detached_catalog).unwrap())
+                .unwrap()
+                .is_empty()
+        );
+        let detached_state = catalog_state_for_home(home.path()).unwrap();
+        assert_eq!(detached_state.status, "ok");
+        assert!(detached_state.model_ids.is_empty());
+
+        let cancelled = AtomicBool::new(false);
+        add_tested_model_files(
+            home.path(),
+            "vendor/fresh-model",
+            Some("vendor"),
+            &cancelled,
+            || Ok(true),
+            || {},
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            catalog_state_for_home(home.path()).unwrap().model_ids,
+            ["vendor/fresh-model"]
+        );
     }
 
     #[test]
-    fn catalog_state_marks_unreferenced_owned_json_as_orphaned() {
+    fn first_add_seeds_native_models_and_each_later_add_only_appends() {
+        let home = CatalogTempHome::new();
+        let native = json!({
+            "schema_version": 1,
+            "fetched_at": "unix:1",
+            "client_version": CATALOG_CLIENT_VERSION,
+            "identity": CATALOG_IDENTITY,
+            "models": [
+                conservative_tested_model_entry("gpt-native-a", None, 1),
+                conservative_tested_model_entry("gpt-native-b", None, 2),
+            ]
+        });
+        let cancelled = AtomicBool::new(false);
+        let add = |model_id: &str| {
+            add_tested_model_files_with_validator(
+                home.path(),
+                model_id,
+                Some("vendor"),
+                &cancelled,
+                || Ok(true),
+                || Ok(native.clone()),
+                |_| Ok(()),
+                || {},
+                || Ok(()),
+            )
+            .unwrap()
+        };
+
+        add("vendor/model-a");
+        assert_eq!(
+            catalog_state_for_home(home.path()).unwrap().model_ids,
+            ["gpt-native-a", "gpt-native-b", "vendor/model-a"]
+        );
+        add("vendor/model-b");
+        assert_eq!(
+            catalog_state_for_home(home.path()).unwrap().model_ids,
+            [
+                "gpt-native-a",
+                "gpt-native-b",
+                "vendor/model-a",
+                "vendor/model-b"
+            ]
+        );
+    }
+
+    #[test]
+    fn add_after_reset_reseeds_native_models_and_does_not_restore_cleared_models() {
+        let home = CatalogTempHome::new();
+        let native = json!({
+            "schema_version": 1,
+            "fetched_at": "unix:1",
+            "client_version": CATALOG_CLIENT_VERSION,
+            "identity": CATALOG_IDENTITY,
+            "models": [
+                conservative_tested_model_entry("gpt-native-a", None, 1),
+                conservative_tested_model_entry("gpt-native-b", None, 2),
+            ]
+        });
+        let cancelled = AtomicBool::new(false);
+        for id in ["vendor/old-a", "vendor/old-b"] {
+            add_tested_model_files_with_validator(
+                home.path(),
+                id,
+                Some("vendor"),
+                &cancelled,
+                || Ok(true),
+                || Ok(native.clone()),
+                |_| Ok(()),
+                || {},
+                || Ok(()),
+            )
+            .unwrap();
+        }
+        reset_owned_catalog_at(home.path(), || Ok(())).unwrap();
+        add_tested_model_files_with_validator(
+            home.path(),
+            "vendor/new-after-reset",
+            Some("vendor"),
+            &cancelled,
+            || Ok(true),
+            || Ok(native),
+            |_| Ok(()),
+            || {},
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            catalog_state_for_home(home.path()).unwrap().model_ids,
+            ["gpt-native-a", "gpt-native-b", "vendor/new-after-reset"]
+        );
+    }
+
+    #[test]
+    fn missing_referenced_catalog_is_not_recreated_from_native_defaults() {
+        let home = CatalogTempHome::new();
+        let config = config_path_for(home.path());
+        let original = managed_catalog_config(home.path());
+        std::fs::write(&config, &original).unwrap();
+        let result = add_tested_model_files_with_validator(
+            home.path(),
+            "vendor/model",
+            None,
+            &AtomicBool::new(false),
+            || Ok(true),
+            || panic!("must not silently recreate a referenced manager catalog"),
+            |_| Ok(()),
+            || {},
+            || Ok(()),
+        );
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&config).unwrap(), original);
+        assert!(!catalog_path_for(home.path()).exists());
+    }
+
+    #[test]
+    fn empty_referenced_catalog_is_rejected_without_reseeding_or_writes() {
+        let home = CatalogTempHome::new();
+        let config = config_path_for(home.path());
+        let catalog = catalog_path_for(home.path());
+        let original_config = managed_catalog_config(home.path());
+        let empty = serde_json::to_vec(&empty_native_catalog()).unwrap();
+        std::fs::write(&config, &original_config).unwrap();
+        std::fs::write(&catalog, &empty).unwrap();
+        let result = add_tested_model_files_with_validator(
+            home.path(),
+            "vendor/model",
+            None,
+            &AtomicBool::new(false),
+            || Ok(true),
+            || panic!("an active empty manager catalog must not be reseeded"),
+            |_| Ok(()),
+            || {},
+            || Ok(()),
+        );
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&config).unwrap(), original_config);
+        assert_eq!(std::fs::read(&catalog).unwrap(), empty);
+    }
+
+    #[test]
+    fn catalog_state_ignores_unreferenced_owned_json() {
         let home = CatalogTempHome::new();
         let catalog = json!({
             "identity": CATALOG_IDENTITY,
@@ -2834,9 +3927,90 @@ mod tests {
         .unwrap();
 
         let state = catalog_state_for_home(home.path()).unwrap();
-        assert_eq!(state.status, "orphaned");
+        assert_eq!(state.status, "ok");
         assert!(state.model_ids.is_empty());
-        assert!(state.message.contains("请复位"));
+        assert!(state.message.contains("当前没有启用"));
+    }
+
+    #[test]
+    fn add_never_replaces_detached_owned_catalog_when_existing_rows_are_invalid() {
+        for stale_catalog in [
+            json!({
+                "identity": CATALOG_IDENTITY,
+                "models": [
+                    conservative_tested_model_entry("vendor/duplicate", None, 1),
+                    conservative_tested_model_entry("vendor/duplicate", None, 2)
+                ]
+            }),
+            json!({
+                "identity": CATALOG_IDENTITY,
+                "models": "malformed-but-owned"
+            }),
+        ] {
+            let home = CatalogTempHome::new();
+            std::fs::write(
+                catalog_path_for(home.path()),
+                serde_json::to_vec(&stale_catalog).unwrap(),
+            )
+            .unwrap();
+            let original_config = std::fs::read(config_path_for(home.path())).ok();
+            let cancelled = AtomicBool::new(false);
+            let result = add_tested_model_files(
+                home.path(),
+                "vendor/fresh-model",
+                Some("vendor"),
+                &cancelled,
+                || Ok(true),
+                || {},
+                || Ok(()),
+            );
+            assert!(result.is_err());
+            assert_eq!(
+                std::fs::read(catalog_path_for(home.path())).unwrap(),
+                serde_json::to_vec(&stale_catalog).unwrap()
+            );
+            assert_eq!(
+                std::fs::read(config_path_for(home.path())).ok(),
+                original_config
+            );
+        }
+    }
+
+    #[test]
+    fn add_appends_to_a_valid_detached_owned_catalog_instead_of_dropping_old_models() {
+        let home = CatalogTempHome::new();
+        let config = config_path_for(home.path());
+        let catalog = catalog_path_for(home.path());
+        let previous = json!({
+            "identity": CATALOG_IDENTITY,
+            "models": [
+                conservative_tested_model_entry("vendor/old-a", None, 1),
+                conservative_tested_model_entry("vendor/old-b", None, 2),
+            ]
+        });
+        std::fs::write(&catalog, serde_json::to_vec(&previous).unwrap()).unwrap();
+        std::fs::write(&config, b"model = \"keep-me\"\n").unwrap();
+
+        let added = add_tested_model_files(
+            home.path(),
+            "vendor/new-model",
+            Some("vendor"),
+            &AtomicBool::new(false),
+            || Ok(true),
+            || {},
+            || Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(added.status, "applied_restart_pending");
+        assert_eq!(
+            added.model_ids,
+            ["vendor/old-a", "vendor/old-b", "vendor/new-model"]
+        );
+        assert_eq!(
+            catalog_state_for_home(home.path()).unwrap().model_ids,
+            ["vendor/old-a", "vendor/old-b", "vendor/new-model"]
+        );
     }
 
     #[test]

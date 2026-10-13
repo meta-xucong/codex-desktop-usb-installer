@@ -8,6 +8,7 @@
 use crate::app::model_capability::{
     CapabilityContext, CapabilityState, ModelCapabilityReport, NativeRuntimeEvidence,
 };
+use crate::app::model_catalog::MODEL_BASE_INSTRUCTIONS;
 use crate::app::model_diagnostics::safe_identifier;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -24,11 +25,14 @@ const OPENAI_API_KEY: &str = "OPENAI_API_KEY";
 
 const MAX_PROTOCOL_LINE_BYTES: usize = 256 * 1024;
 const MAX_PROTOCOL_STDOUT_BYTES: usize = 8 * 1024 * 1024;
-const MAX_CAPTURE_BYTES: usize = 256 * 1024;
+// `debug models` serializes a normalized catalog and may add runtime defaults
+// and derived fields. Keep the capture bounded while leaving room for the
+// largest accepted 1 MiB candidate plus JSON formatting/normalization.
+const MAX_CAPTURE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_PROTOCOL_MESSAGES: usize = 512;
 const MAX_PROTOCOL_REQUESTS: usize = 128;
 const MAX_STREAM_BYTES: usize = 256 * 1024;
-const MAX_CATALOG_BYTES: usize = 256 * 1024;
+const MAX_CATALOG_BYTES: usize = crate::app::model_probe::BODY_LIMIT;
 const MAX_VERSION_BYTES: usize = 16 * 1024;
 const MAX_EXECUTABLE_BYTES: u64 = 1024 * 1024 * 1024;
 
@@ -116,6 +120,89 @@ pub(crate) fn probe(input: NativeProbeInput) -> Result<NativeProbeResult, Native
     }
 }
 
+/// Read the unmodified model list compiled into the bundled Codex runtime.
+/// This is used only when the manager creates its first overlay, so adding a
+/// gateway model does not hide the client's existing native models.
+#[cfg(windows)]
+pub(crate) fn native_default_catalog(
+    executable: &Path,
+    cancelled: &AtomicBool,
+    deadline: std::time::Instant,
+) -> Result<Value, NativeProbeError> {
+    check_limits(cancelled, deadline)?;
+    let mut area = TemporaryArea::create(cancelled, deadline)?;
+    let result = win_process::capture(
+        executable,
+        &["debug", "models"],
+        &area,
+        None,
+        cancelled,
+        deadline,
+    )?;
+    if !result.status.success() {
+        return Err(NativeProbeError::CatalogUnsupported);
+    }
+    let models = native_models_from_debug_output(&result.stdout)?;
+    let catalog = json!({
+        "schema_version": 1,
+        "fetched_at": format!("unix:{}", unix_seconds()),
+        "client_version": crate::app::model_catalog::CATALOG_CLIENT_VERSION,
+        "identity": CATALOG_IDENTITY,
+        "models": models,
+    });
+    let bytes = serde_json::to_vec(&catalog).map_err(|_| NativeProbeError::CatalogUnsupported)?;
+    if !within_catalog_limit(bytes.len()) {
+        return Err(NativeProbeError::OutputLimit);
+    }
+    area.cleanup()?;
+    Ok(catalog)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn native_default_catalog(
+    _: &Path,
+    _: &AtomicBool,
+    _: std::time::Instant,
+) -> Result<Value, NativeProbeError> {
+    Err(NativeProbeError::UnsupportedPlatform)
+}
+
+fn native_models_from_debug_output(bytes: &[u8]) -> Result<Vec<Value>, NativeProbeError> {
+    if !within_capture_limit(bytes.len()) {
+        return Err(NativeProbeError::OutputLimit);
+    }
+    let output: Value =
+        serde_json::from_slice(bytes).map_err(|_| NativeProbeError::CatalogUnsupported)?;
+    let object = output
+        .as_object()
+        .ok_or(NativeProbeError::CatalogUnsupported)?;
+    let models = output
+        .get("models")
+        .and_then(Value::as_array)
+        .filter(|models| !models.is_empty() && models.len() < 512)
+        .ok_or(NativeProbeError::CatalogUnsupported)?;
+    if object.len() != 1 {
+        return Err(NativeProbeError::CatalogUnsupported);
+    }
+    let mut slugs = std::collections::BTreeSet::new();
+    for model in models {
+        let slug = model
+            .get("slug")
+            .and_then(Value::as_str)
+            .filter(|slug| safe_identifier(slug))
+            .ok_or(NativeProbeError::CatalogUnsupported)?;
+        if !slugs.insert(slug) {
+            return Err(NativeProbeError::CatalogUnsupported);
+        }
+    }
+    let models = models.clone();
+    let encoded = serde_json::to_vec(&models).map_err(|_| NativeProbeError::CatalogUnsupported)?;
+    if !within_catalog_limit(encoded.len()) {
+        return Err(NativeProbeError::OutputLimit);
+    }
+    Ok(models)
+}
+
 fn check_limits(
     cancelled: &AtomicBool,
     deadline: std::time::Instant,
@@ -165,14 +252,12 @@ fn neutral_catalog_entry(model: &ModelCapabilityReport) -> Value {
         "include_skills_usage_instructions": true,
         "include_plugin_usage_instructions": false,
         "include_apps_usage_instructions": false,
-        "default_reasoning_summary": null,
         "default_verbosity": null,
         "apply_patch_tool_type": null,
-        "web_search_tool_type": null,
-        "truncation_policy": null,
+        "truncation_policy": {"mode": "bytes", "limit": 10000},
+        "base_instructions": MODEL_BASE_INSTRUCTIONS,
         "supports_image_detail_original": false,
         "comp_hash": null,
-        "effective_context_window_percent": null,
         "experimental_supported_tools": [],
         "input_modalities": ["text"],
         "supports_search_tool": false,
@@ -207,7 +292,16 @@ fn catalog_is_neutral(entry: &Value) -> bool {
             .and_then(Value::as_array)
             .is_some_and(Vec::is_empty)
         && entry.get("default_verbosity").is_some_and(Value::is_null)
-        && entry.get("truncation_policy").is_some_and(Value::is_null)
+        && entry
+            .get("truncation_policy")
+            .is_some_and(|value| value == &json!({"mode":"bytes","limit":10000}))
+        && entry
+            .get("base_instructions")
+            .and_then(Value::as_str)
+            .is_some()
+        && entry.get("default_reasoning_summary").is_none()
+        && entry.get("web_search_tool_type").is_none()
+        && entry.get("effective_context_window_percent").is_none()
         && entry.get("comp_hash").is_some_and(Value::is_null)
         && entry
             .get("input_modalities")
@@ -273,10 +367,8 @@ fn catalog_output_matches(bytes: &[u8], expected: &Value) -> bool {
                 v.strip_prefix("unix:")
                     .is_some_and(|t| t.parse::<u64>().is_ok())
             })
-        || actual_root.len() != expected_root.len()
-        || expected_root
-            .iter()
-            .any(|(key, expected)| key != "models" && actual_root.get(key) != Some(expected))
+        || actual_root.len() != 1
+        || !actual_root.contains_key("models")
     {
         return false;
     }
@@ -289,22 +381,125 @@ fn catalog_output_matches(bytes: &[u8], expected: &Value) -> bool {
     if entries.is_empty() || entries.len() > 512 || models.len() != entries.len() {
         return false;
     }
-    let mut slugs = std::collections::BTreeSet::new();
-    entries.iter().all(|entry| {
-        let Some(slug) = entry.get("slug").and_then(Value::as_str) else {
+    let mut expected_slugs = std::collections::BTreeSet::new();
+    let mut actual_slugs = std::collections::BTreeSet::new();
+    if !entries.iter().all(|entry| {
+        entry
+            .get("slug")
+            .and_then(Value::as_str)
+            .is_some_and(|slug| safe_identifier(slug) && expected_slugs.insert(slug))
+    }) || !models.iter().all(|model| {
+        model
+            .get("slug")
+            .and_then(Value::as_str)
+            .is_some_and(|slug| safe_identifier(slug) && actual_slugs.insert(slug))
+    }) || expected_slugs != actual_slugs
+    {
+        return false;
+    }
+
+    entries.iter().all(|expected_entry| {
+        let Some(slug) = expected_entry.get("slug").and_then(Value::as_str) else {
             return false;
         };
-        if !safe_identifier(slug) || !slugs.insert(slug) {
+        let Some(actual_entry) = models
+            .iter()
+            .find(|model| model.get("slug").and_then(Value::as_str) == Some(slug))
+        else {
+            return false;
+        };
+        catalog_model_entry_matches(actual_entry, expected_entry)
+    })
+}
+
+/// `codex debug models` prints only its normalized `models` array, not the
+/// input catalog wrapper. It also materializes known runtime defaults and
+/// `model_messages` from `base_instructions`. Match every submitted field,
+/// allowing the two verified null fields to be omitted, documented runtime
+/// defaults, and false-only legacy flags that this runtime ignores.
+fn catalog_model_entry_matches(actual: &Value, expected: &Value) -> bool {
+    let (Some(actual), Some(expected)) = (actual.as_object(), expected.as_object()) else {
+        return false;
+    };
+    for (key, expected_value) in expected {
+        let Some(actual_value) = actual.get(key) else {
+            // This runtime omits these two verified optional null fields from
+            // `debug models`; no other expected null field may be omitted.
+            if expected_value.is_null()
+                && matches!(key.as_str(), "comp_hash" | "default_reasoning_level")
+            {
+                continue;
+            }
+            let ignored_false_flag = matches!(
+                key.as_str(),
+                "supports_parallel_tool_calls" | "supports_reasoning_summaries"
+            ) && expected_value.as_bool() == Some(false);
+            if ignored_false_flag {
+                continue;
+            }
+            return false;
+        };
+        if actual_value == expected_value {
+            continue;
+        }
+        let known_normalization = match key.as_str() {
+            "default_reasoning_summary" => {
+                expected_value.is_null() && actual_value.as_str() == Some("auto")
+            }
+            "web_search_tool_type" => {
+                expected_value.is_null() && actual_value.as_str() == Some("text")
+            }
+            "effective_context_window_percent" => {
+                expected_value.is_null() && actual_value.as_u64() == Some(95)
+            }
+            _ => false,
+        };
+        if !known_normalization {
             return false;
         }
-        let matching = models
-            .iter()
-            .filter(|m| m.get("slug").and_then(Value::as_str) == Some(slug))
-            .collect::<Vec<_>>();
-        // No added defaults or silently ignored fields can certify a different
-        // capability shape. Unsupported native output remains unverified.
-        matching.len() == 1 && matching[0] == entry
-    })
+    }
+    for (key, actual_value) in actual {
+        if expected.contains_key(key) {
+            continue;
+        }
+        let runtime_default = match key.as_str() {
+            "model_messages" => {
+                let instructions = expected
+                    .get("base_instructions")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                actual_value
+                    == &json!({
+                        "instructions_template": instructions,
+                        "instructions_variables": null,
+                        "approvals": null,
+                        "collaboration_modes": null,
+                        "auto_review": null,
+                        "permissions": null,
+                        "multi_agent": null
+                    })
+            }
+            "default_reasoning_summary" => actual_value.as_str() == Some("auto"),
+            "web_search_tool_type" => actual_value.as_str() == Some("text"),
+            "effective_context_window_percent" => actual_value.as_u64() == Some(95),
+            "supports_experimental_context"
+            | "use_responses_lite"
+            | "supports_reasoning_effort_updates" => actual_value.as_bool() == Some(false),
+            _ => false,
+        };
+        if !runtime_default {
+            return false;
+        }
+    }
+    true
+}
+
+fn within_catalog_limit(length: usize) -> bool {
+    length <= MAX_CATALOG_BYTES
+}
+
+fn within_capture_limit(length: usize) -> bool {
+    length <= MAX_CAPTURE_BYTES
 }
 
 /// Method-specific negative responses. Unknown methods use a JSON-RPC
@@ -644,7 +839,7 @@ struct PreparedProbe {
 
 #[cfg(windows)]
 fn write_owned_file(path: &Path, bytes: &[u8]) -> Result<(), NativeProbeError> {
-    if bytes.len() > MAX_CATALOG_BYTES {
+    if !within_catalog_limit(bytes.len()) {
         return Err(NativeProbeError::OutputLimit);
     }
     let mut file = std::fs::OpenOptions::new()
@@ -882,8 +1077,8 @@ fn configure_command(
 #[cfg(windows)]
 mod win_process {
     use super::{
-        check_limits, same_id, server_request_rejection, NativeProbeError, MAX_CAPTURE_BYTES,
-        MAX_PROTOCOL_LINE_BYTES, MAX_PROTOCOL_MESSAGES, MAX_PROTOCOL_REQUESTS,
+        check_limits, same_id, server_request_rejection, within_capture_limit, NativeProbeError,
+        MAX_CAPTURE_BYTES, MAX_PROTOCOL_LINE_BYTES, MAX_PROTOCOL_MESSAGES, MAX_PROTOCOL_REQUESTS,
         MAX_PROTOCOL_STDOUT_BYTES,
     };
     use serde_json::{json, Value};
@@ -1049,7 +1244,7 @@ mod win_process {
                     .read_to_end(&mut bytes)
                     .map_err(|_| NativeProbeError::ProcessFailed)
                     .and_then(|_| {
-                        if bytes.len() > MAX_CAPTURE_BYTES {
+                        if !within_capture_limit(bytes.len()) {
                             Err(NativeProbeError::OutputLimit)
                         } else {
                             Ok(bytes)
@@ -1601,7 +1796,7 @@ fn run_catalog_gate(
         .take((MAX_CATALOG_BYTES + 1) as u64)
         .read_to_end(&mut candidate_bytes)
         .map_err(|_| NativeProbeError::CatalogUnsupported)?;
-    if candidate_bytes.len() > MAX_CATALOG_BYTES {
+    if !within_catalog_limit(candidate_bytes.len()) {
         return Err(NativeProbeError::OutputLimit);
     }
     let expected: Value = serde_json::from_slice(&candidate_bytes)
@@ -1627,8 +1822,9 @@ fn run_catalog_gate(
     Ok(())
 }
 
-/// Check the exact final wrapper and every model entry using the same official
-/// runtime. No model request or credential is needed for this parser gate.
+/// Validate a candidate against the bundled Codex parser before an explicit
+/// model Add/setup commit. Startup uses bounded local validation instead of
+/// spawning a second Codex process on every launch.
 #[cfg(windows)]
 pub(crate) fn validate_final_catalog(
     executable: &Path,
@@ -1637,7 +1833,7 @@ pub(crate) fn validate_final_catalog(
     deadline: std::time::Instant,
 ) -> Result<(), NativeProbeError> {
     check_limits(cancelled, deadline)?;
-    if catalog.len() > MAX_CATALOG_BYTES {
+    if !within_catalog_limit(catalog.len()) {
         return Err(NativeProbeError::OutputLimit);
     }
     let value: Value =
@@ -2598,55 +2794,260 @@ fn probe_windows(input: NativeProbeInput) -> Result<NativeProbeResult, NativePro
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
-    fn native_catalog_admission_requires_exact_wrapper_and_model_fields() {
+    fn generated_neutral_catalog_entry_uses_codex_required_fields() {
+        let model = ModelCapabilityReport::discovered("vendor/model".into(), None);
+        let entry = neutral_catalog_entry(&model);
+
+        assert!(catalog_is_neutral(&entry));
+        assert_eq!(
+            entry["truncation_policy"],
+            json!({"mode":"bytes","limit":10000})
+        );
+        assert_eq!(entry["base_instructions"], MODEL_BASE_INSTRUCTIONS);
+        for key in [
+            "default_reasoning_summary",
+            "web_search_tool_type",
+            "effective_context_window_percent",
+        ] {
+            assert!(
+                entry.get(key).is_none(),
+                "unexpected null/default field: {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_default_models_are_parsed_without_reordering_or_duplicates() {
+        let output = json!({
+            "models": [
+                {"slug":"gpt-native-a","shell_type":"unified_exec"},
+                {"slug":"gpt-native-b","shell_type":"unified_exec"}
+            ]
+        });
+        let bytes = serde_json::to_vec(&output).unwrap();
+        let models = native_models_from_debug_output(&bytes).unwrap();
+        assert_eq!(models, output["models"].as_array().unwrap().clone());
+        assert!(native_models_from_debug_output(b"not json").is_err());
+        assert!(native_models_from_debug_output(
+            br#"{"models":[{"slug":"duplicate"},{"slug":"duplicate"}]}"#
+        )
+        .is_err());
+        assert!(native_models_from_debug_output(
+            br#"{"models":[{"slug":"valid"}],"unexpected":true}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn native_catalog_admission_matches_the_codex_debug_models_output() {
         let entry = json!({"slug":"arbitrary/model","shell_type":"unified_exec"});
         let expected = neutral_catalog_root(&entry, "fixture-runtime");
+        let normalized = json!({
+            "slug":"arbitrary/model",
+            "shell_type":"unified_exec",
+            "model_messages": {
+                "instructions_template":null,
+                "instructions_variables":null,
+                "approvals":null,
+                "collaboration_modes":null,
+                "auto_review":null,
+                "permissions":null,
+                "multi_agent":null
+            },
+            "default_reasoning_summary":"auto",
+            "web_search_tool_type":"text",
+            "effective_context_window_percent":95,
+            "supports_experimental_context":false,
+            "use_responses_lite":false,
+            "supports_reasoning_effort_updates":false
+        });
+        let runtime_output = json!({"models":[normalized]});
         assert!(!catalog_output_matches(
             b"warning mentions arbitrary/model",
             &expected
         ));
         assert!(catalog_output_matches(
-            &serde_json::to_vec(&expected).unwrap(),
+            &serde_json::to_vec(&runtime_output).unwrap(),
             &expected
         ));
-        let mut changed = expected.clone();
+        let mut changed = runtime_output.clone();
         changed["models"][0]["shell_type"] = json!("other");
         assert!(!catalog_output_matches(
             &serde_json::to_vec(&changed).unwrap(),
             &expected
         ));
-        let mut added = expected.clone();
+        let mut added = runtime_output.clone();
         added["models"][0]["use_responses_lite"] = json!(true);
         assert!(!catalog_output_matches(
             &serde_json::to_vec(&added).unwrap(),
             &expected
         ));
-        let mut duplicate = expected.clone();
-        duplicate["models"] = json!([entry.clone(), entry]);
+        let mut duplicate = runtime_output.clone();
+        duplicate["models"] = json!([normalized, normalized]);
         assert!(!catalog_output_matches(
             &serde_json::to_vec(&duplicate).unwrap(),
             &expected
         ));
-        for key in ["schema_version", "identity", "client_version", "fetched_at"] {
+        for key in ["schema_version", "identity", "fetched_at"] {
             let mut wrong = expected.clone();
             wrong[key] = json!("different");
             assert!(!catalog_output_matches(
-                &serde_json::to_vec(&wrong).unwrap(),
-                &expected
+                &serde_json::to_vec(&runtime_output).unwrap(),
+                &wrong
             ));
             wrong.as_object_mut().unwrap().remove(key);
             assert!(!catalog_output_matches(
-                &serde_json::to_vec(&wrong).unwrap(),
-                &expected
+                &serde_json::to_vec(&runtime_output).unwrap(),
+                &wrong
             ));
         }
-        let mut extra = expected.clone();
+        let mut invalid_client_version = expected.clone();
+        invalid_client_version["client_version"] = json!("");
+        assert!(!catalog_output_matches(
+            &serde_json::to_vec(&runtime_output).unwrap(),
+            &invalid_client_version
+        ));
+        invalid_client_version
+            .as_object_mut()
+            .unwrap()
+            .remove("client_version");
+        assert!(!catalog_output_matches(
+            &serde_json::to_vec(&runtime_output).unwrap(),
+            &invalid_client_version
+        ));
+        let mut extra = runtime_output.clone();
         extra["unknownRoot"] = json!(true);
         assert!(!catalog_output_matches(
             &serde_json::to_vec(&extra).unwrap(),
             &expected
         ));
+    }
+
+    #[test]
+    fn native_catalog_admission_accepts_only_omitted_null_optional_fields() {
+        let entry = json!({
+            "slug":"claude-haiku-4-5",
+            "display_name":"claude-haiku-4-5",
+            "description":"Text model supplied by the configured gateway.",
+            "shell_type":"unified_exec",
+            "visibility":"list",
+            "supported_in_api":true,
+            "priority":0,
+            "support_verbosity":false,
+            "additional_speed_tiers":[],
+            "service_tiers":[],
+            "availability_nux":null,
+            "upgrade":null,
+            "include_skills_usage_instructions":false,
+            "include_plugin_usage_instructions":false,
+            "include_apps_usage_instructions":false,
+            "default_verbosity":null,
+            "apply_patch_tool_type":null,
+            "truncation_policy":{"mode":"bytes","limit":10000},
+            "base_instructions":"Use this model for the current conversation.",
+            "supports_image_detail_original":false,
+            "comp_hash":null,
+            "experimental_supported_tools":[],
+            "input_modalities":["text"],
+            "supports_search_tool":false,
+            "node_repl_auto_review_required":false,
+            "node_repl_disabled":true,
+            "default_reasoning_level":null,
+            "supported_reasoning_levels":[]
+        });
+        let expected = neutral_catalog_root(&entry, "codex-cli 0.162.0-alpha.2");
+        let mut normalized = entry.clone();
+        normalized.as_object_mut().unwrap().remove("comp_hash");
+        normalized
+            .as_object_mut()
+            .unwrap()
+            .remove("default_reasoning_level");
+        normalized["model_messages"] = json!({
+            "instructions_template":"Use this model for the current conversation.",
+            "instructions_variables":null,
+            "approvals":null,
+            "collaboration_modes":null,
+            "auto_review":null,
+            "permissions":null,
+            "multi_agent":null
+        });
+        normalized["default_reasoning_summary"] = json!("auto");
+        normalized["web_search_tool_type"] = json!("text");
+        normalized["effective_context_window_percent"] = json!(95);
+        normalized["supports_experimental_context"] = json!(false);
+        normalized["use_responses_lite"] = json!(false);
+        normalized["supports_reasoning_effort_updates"] = json!(false);
+        let output = json!({"models":[normalized]});
+        let output_bytes = serde_json::to_vec(&output).unwrap();
+
+        assert!(catalog_output_matches(&output_bytes, &expected));
+
+        let mut missing_required = output.clone();
+        missing_required["models"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("display_name");
+        assert!(!catalog_output_matches(
+            &serde_json::to_vec(&missing_required).unwrap(),
+            &expected
+        ));
+
+        for key in ["comp_hash", "default_reasoning_level"] {
+            let mut explicit_null = output.clone();
+            explicit_null["models"][0][key] = Value::Null;
+            assert!(catalog_output_matches(
+                &serde_json::to_vec(&explicit_null).unwrap(),
+                &expected
+            ));
+
+            let mut wrong_null_normalization = output.clone();
+            wrong_null_normalization["models"][0][key] = json!("unexpected");
+            assert!(!catalog_output_matches(
+                &serde_json::to_vec(&wrong_null_normalization).unwrap(),
+                &expected
+            ));
+        }
+
+        let mut unknown_null = expected.clone();
+        unknown_null["models"][0]["future_optional_field"] = Value::Null;
+        assert!(!catalog_output_matches(&output_bytes, &unknown_null));
+
+        let mut altered_identity = expected.clone();
+        altered_identity["identity"] = json!("another-provider");
+        assert!(!catalog_output_matches(&output_bytes, &altered_identity));
+
+        let mut duplicate = output;
+        duplicate["models"] = json!([
+            duplicate["models"][0].clone(),
+            duplicate["models"][0].clone()
+        ]);
+        assert!(!catalog_output_matches(
+            &serde_json::to_vec(&duplicate).unwrap(),
+            &expected
+        ));
+    }
+
+    #[test]
+    fn native_catalog_and_cli_capture_limits_cover_the_supported_catalog_size() {
+        assert_eq!(MAX_CATALOG_BYTES, crate::app::model_probe::BODY_LIMIT);
+        assert!(MAX_CAPTURE_BYTES >= MAX_CATALOG_BYTES * 2);
+        assert_eq!(MAX_CAPTURE_BYTES, 2 * 1024 * 1024);
+        for (limit, allows) in [
+            (MAX_CATALOG_BYTES - 1, true),
+            (MAX_CATALOG_BYTES, true),
+            (MAX_CATALOG_BYTES + 1, false),
+        ] {
+            assert_eq!(within_catalog_limit(limit), allows);
+        }
+        for (limit, allows) in [
+            (MAX_CAPTURE_BYTES - 1, true),
+            (MAX_CAPTURE_BYTES, true),
+            (MAX_CAPTURE_BYTES + 1, false),
+        ] {
+            assert_eq!(within_capture_limit(limit), allows);
+        }
     }
 
     #[test]
