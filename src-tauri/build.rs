@@ -714,7 +714,7 @@ fn decode_standard_base64(value: &str) -> Result<Vec<u8>, &'static str> {
     }
 
     let mut decoded = Vec::with_capacity(bytes.len() / 4 * 3);
-    for (index, chunk) in bytes.chunks_exact(4).enumerate() {
+    for (index, chunk) in bytes.as_chunks::<4>().0.iter().enumerate() {
         let is_last = index + 1 == bytes.len() / 4;
         let padding_two = chunk[2] == b'=';
         let padding_one = chunk[3] == b'=';
