@@ -838,9 +838,13 @@ fn prepare_model_catalog_launch(
         root,
         reload_marker.is_some(),
         |root| {
-            codex_win_engine::processes_running_for_executable_under_root_strict(
+            codex_win_engine::processes_running_for_executables_under_root_strict(
                 root,
-                std::ffi::OsStr::new("Codex.exe"),
+                &[
+                    std::ffi::OsStr::new("Codex.exe"),
+                    std::ffi::OsStr::new("CodexCore.dat"),
+                    std::ffi::OsStr::new("ChatGPT.exe"),
+                ],
             )
             .map_err(|error| error.to_string())
         },

@@ -51,7 +51,7 @@ static RUNS: Mutex<RunRegistry> = Mutex::new(RunRegistry {
 pub(crate) fn verified_codex_runtime_for_catalog(
     cancelled: &AtomicBool,
     deadline: Instant,
-) -> Result<(PathBuf, String), &'static str> {
+) -> Result<activation::VerifiedRuntime, &'static str> {
     activation::verified_catalog_runtime(cancelled, deadline)
 }
 
@@ -2032,10 +2032,15 @@ where
             .as_deref()
             .is_some_and(|bytes| !owned_json_bytes(bytes, CATALOG_IDENTITY));
     let changed = managed;
-    let marker_ok = !changed || mark_restart().is_ok();
+    // A pending reset is also durable restart intent. On retries the config
+    // may already be clean (so `managed` is false), but the previous attempt
+    // may have failed to persist the restart marker. Keep retrying that write
+    // until it succeeds, and only then clear the reset-pending marker.
+    let restart_required = changed || pending_snapshot.is_some();
+    let marker_ok = !restart_required || mark_restart().is_ok();
     if unknown_catalog_files {
         return Ok(action_report(
-            if changed {
+            if restart_required {
                 "applied_restart_pending"
             } else {
                 "already_native"
@@ -2049,26 +2054,27 @@ where
         ));
     }
 
+    if !marker_ok {
+        return Ok(action_report(
+            "applied_restart_pending",
+            Vec::new(),
+            "模型目录已恢复，但重载标记写入失败；恢复状态已保留，请再次执行恢复默认",
+        ));
+    }
+
     remove_file(&reset_pending)
         .map_err(|_| engine("模型目录已清理，但恢复标记无法移除；请再次执行恢复默认"))?;
     if read_optional(&reset_pending)?.is_some() {
         return Err(engine("恢复标记仍存在；请再次执行恢复默认后再添加模型"));
     }
-    if !marker_ok {
-        return Ok(action_report(
-            "applied_restart_pending",
-            Vec::new(),
-            "已恢复 Codex 原生模型目录，但未能写入重载标记；请手动重启 Codex",
-        ));
-    }
     Ok(action_report(
-        if changed {
+        if restart_required {
             "applied_restart_pending"
         } else {
             "already_native"
         },
         Vec::new(),
-        if changed {
+        if restart_required {
             "已恢复 Codex 原生模型目录；重启 Codex 后生效"
         } else {
             "当前已使用 Codex 原生模型目录"
@@ -3793,7 +3799,7 @@ mod tests {
 
         fs::remove_file(&catalog).unwrap();
         let finished = reset_owned_catalog_at(home.path(), || Ok(())).unwrap();
-        assert_eq!(finished.status, "already_native");
+        assert_eq!(finished.status, "applied_restart_pending");
         assert!(!reset_pending_path(home.path()).exists());
         let recovered = add_tested_model_files_with_validator(
             home.path(),
@@ -3905,7 +3911,57 @@ mod tests {
         .contains("恢复默认"));
 
         let retry = reset_owned_catalog_at(home.path(), || Ok(())).unwrap();
-        assert_eq!(retry.status, "already_native");
+        assert_eq!(retry.status, "applied_restart_pending");
+        assert!(!reset_pending_path(home.path()).exists());
+        let cleared: Value = serde_json::from_slice(&std::fs::read(&catalog).unwrap()).unwrap();
+        assert!(catalog_model_ids(&cleared).unwrap().is_empty());
+    }
+
+    #[test]
+    fn reset_restart_marker_failure_preserves_intent_and_retries_on_next_reset() {
+        use std::cell::Cell;
+
+        let home = CatalogTempHome::new();
+        let config = config_path_for(home.path());
+        let catalog = catalog_path_for(home.path());
+        std::fs::write(&config, managed_catalog_config(home.path())).unwrap();
+        std::fs::write(&catalog, fixture_catalog("vendor/old-model")).unwrap();
+
+        let first = reset_owned_catalog_at(home.path(), || {
+            Err(engine("injected restart marker failure"))
+        })
+        .unwrap();
+
+        assert_eq!(first.status, "applied_restart_pending");
+        assert!(!std::fs::read_to_string(&config)
+            .unwrap()
+            .contains(CONFIG_BEGIN));
+        assert_eq!(
+            std::fs::read(reset_pending_path(home.path())).unwrap(),
+            RESET_PENDING_CONTENTS
+        );
+        assert!(add_tested_model_files(
+            home.path(),
+            "vendor/new-model",
+            None,
+            &AtomicBool::new(false),
+            || Ok(true),
+            || {},
+            || Ok(()),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("恢复默认"));
+
+        let retried_marker = Cell::new(false);
+        let retry = reset_owned_catalog_at(home.path(), || {
+            retried_marker.set(true);
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(retried_marker.get(), "retry must persist restart intent");
+        assert_eq!(retry.status, "applied_restart_pending");
         assert!(!reset_pending_path(home.path()).exists());
         let cleared: Value = serde_json::from_slice(&std::fs::read(&catalog).unwrap()).unwrap();
         assert!(catalog_model_ids(&cleared).unwrap().is_empty());

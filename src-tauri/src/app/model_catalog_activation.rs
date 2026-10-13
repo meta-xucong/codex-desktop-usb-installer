@@ -6,6 +6,7 @@ use crate::app::model_native_probe::{self, NativeProbeInput, NativeProbeResult};
 use crate::app::model_selection_client::{self, SelectionReply, SelectionRequest};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::io::{Read, Seek, SeekFrom};
 
 pub const NATIVE_REFRESH_BUDGET: Duration = Duration::from_secs(600);
 pub const AUTO_SETUP_BUDGET: Duration = Duration::from_secs(1920);
@@ -29,6 +30,16 @@ impl NativeVerificationOptions {
 pub struct NativeRuntimeTarget {
     pub installation_root: PathBuf,
     pub desktop_version: String,
+}
+pub(crate) struct VerifiedRuntime {
+    /// Current USB CLI path, retained only for identity and mutation checks.
+    pub executable: PathBuf,
+    pub executable_sha256: String,
+    /// The original CLI is always executed from this verified MSIX member,
+    /// never from the subsystem-patched USB copy.
+    pub trusted_payload_path: PathBuf,
+    pub trusted_cli_entry_path: String,
+    pub trusted_cli_sha256: String,
 }
 pub struct NativeBatch {
     pub results: Vec<NativeProbeResult>,
@@ -108,12 +119,109 @@ fn hash_runtime(
     }
     Ok(hash.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
+
+/// Hash the documented USB-only Codex CLI transformation after restoring its
+/// single PE OptionalHeader.Subsystem field from GUI (2) to console (3).
+/// Every other byte remains covered by the signed MSIX member hash.
+fn hash_runtime_with_restored_console_subsystem(
+    path: &Path,
+    cancelled: &AtomicBool,
+    deadline: Instant,
+) -> Result<Option<String>, &'static str> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| "native-executable-unavailable")?;
+    if !metadata.is_file() || metadata.len() > 1024 * 1024 * 1024 {
+        return Err("native-executable-unavailable");
+    }
+    let mut input = fs::File::open(path).map_err(|_| "native-executable-unavailable")?;
+    let mut dos = [0u8; 64];
+    input
+        .read_exact(&mut dos)
+        .map_err(|_| "native-executable-changed")?;
+    if &dos[..2] != b"MZ" {
+        return Ok(None);
+    }
+    let nt_offset = u32::from_le_bytes(dos[0x3c..0x40].try_into().unwrap()) as u64;
+    if nt_offset > 1024 * 1024 || nt_offset.saturating_add(94) > metadata.len() {
+        return Ok(None);
+    }
+    input
+        .seek(SeekFrom::Start(nt_offset))
+        .map_err(|_| "native-executable-unavailable")?;
+    let mut nt = [0u8; 24];
+    input
+        .read_exact(&mut nt)
+        .map_err(|_| "native-executable-changed")?;
+    if &nt[..4] != b"PE\0\0" {
+        return Ok(None);
+    }
+    let optional_size = u16::from_le_bytes([nt[20], nt[21]]) as u64;
+    let optional_offset = nt_offset + 24;
+    let subsystem_offset = optional_offset + 68;
+    if optional_size < 70 || subsystem_offset.saturating_add(2) > metadata.len() {
+        return Ok(None);
+    }
+    input
+        .seek(SeekFrom::Start(subsystem_offset))
+        .map_err(|_| "native-executable-unavailable")?;
+    let mut subsystem = [0u8; 2];
+    input
+        .read_exact(&mut subsystem)
+        .map_err(|_| "native-executable-changed")?;
+    if u16::from_le_bytes(subsystem) != 2 {
+        return Ok(None);
+    }
+
+    input
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| "native-executable-unavailable")?;
+    let mut buffer = vec![0u8; 1024 * 1024];
+    let mut hash = Sha256::new();
+    let mut offset = 0u64;
+    loop {
+        check(cancelled, deadline)?;
+        let size = input
+            .read(&mut buffer)
+            .map_err(|_| "native-executable-unavailable")?;
+        if size == 0 {
+            break;
+        }
+        let end = offset + size as u64;
+        let field_end = subsystem_offset + 2;
+        if offset < field_end && end > subsystem_offset {
+            let start_in_chunk = subsystem_offset.saturating_sub(offset) as usize;
+            let end_in_chunk = (field_end.min(end) - offset) as usize;
+            let source_field = &buffer[start_in_chunk..end_in_chunk];
+            if source_field
+                != &subsystem[(subsystem_offset.max(offset) - subsystem_offset) as usize
+                    ..(field_end.min(end) - subsystem_offset) as usize]
+            {
+                return Err("native-executable-changed");
+            }
+            let original = 3u16.to_le_bytes();
+            let original_start = (subsystem_offset.max(offset) - subsystem_offset) as usize;
+            buffer[start_in_chunk..end_in_chunk].copy_from_slice(
+                &original[original_start..original_start + end_in_chunk - start_in_chunk],
+            );
+        }
+        hash.update(&buffer[..size]);
+        offset = end;
+    }
+    if offset != metadata.len() {
+        return Err("native-executable-changed");
+    }
+    Ok(Some(
+        hash.finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    ))
+}
 #[cfg(windows)]
 fn verified_runtime(
     target: &NativeRuntimeTarget,
     cancelled: &AtomicBool,
     deadline: Instant,
-) -> Result<(PathBuf, String), &'static str> {
+) -> Result<VerifiedRuntime, &'static str> {
     verified_runtime_inner(
         &target.installation_root,
         Some(&target.desktop_version),
@@ -126,7 +234,7 @@ fn verified_runtime(
 pub(crate) fn verified_catalog_runtime(
     cancelled: &AtomicBool,
     deadline: Instant,
-) -> Result<(PathBuf, String), &'static str> {
+) -> Result<VerifiedRuntime, &'static str> {
     if !usb_guard::guard_required() {
         return Err("native-usb-required");
     }
@@ -140,7 +248,7 @@ fn verified_runtime_inner(
     expected_version: Option<&str>,
     cancelled: &AtomicBool,
     deadline: Instant,
-) -> Result<(PathBuf, String), &'static str> {
+) -> Result<VerifiedRuntime, &'static str> {
     use std::os::windows::fs::MetadataExt;
     if !usb_guard::guard_required() {
         return Err("native-usb-required");
@@ -204,10 +312,18 @@ fn verified_runtime_inner(
         .rsplit_once('/')
         .map(|(p, _)| p)
         .ok_or("native-package-unavailable")?;
+    if parent.is_empty()
+        || parent
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == ".." || part.contains(':'))
+    {
+        return Err("native-package-unavailable");
+    }
+    let trusted_cli_entry_path = format!("{parent}/resources/codex.exe");
     let file = fs::File::open(&payload.payload_path).map_err(|_| "native-package-unavailable")?;
     let mut archive = zip::ZipArchive::new(file).map_err(|_| "native-package-unavailable")?;
     let mut entry = archive
-        .by_name(&format!("{parent}/resources/codex.exe"))
+        .by_name(&trusted_cli_entry_path)
         .map_err(|_| "native-package-unavailable")?;
     if entry.size() > 1024 * 1024 * 1024 {
         return Err("native-package-unavailable");
@@ -225,17 +341,28 @@ fn verified_runtime_inner(
         hash.update(&buffer[..n]);
     }
     let packaged: String = hash.finalize().iter().map(|b| format!("{b:02x}")).collect();
-    if packaged != actual_hash {
+    let portable_normalized_hash = if packaged != actual_hash {
+        hash_runtime_with_restored_console_subsystem(&executable, cancelled, deadline)?
+    } else {
+        None
+    };
+    if packaged != actual_hash && portable_normalized_hash.as_deref() != Some(packaged.as_str()) {
         return Err("native-executable-changed");
     }
-    Ok((executable, actual_hash))
+    Ok(VerifiedRuntime {
+        executable,
+        executable_sha256: actual_hash,
+        trusted_payload_path: PathBuf::from(payload.payload_path),
+        trusted_cli_entry_path,
+        trusted_cli_sha256: packaged,
+    })
 }
 #[cfg(not(windows))]
 fn verified_runtime(
     _: &NativeRuntimeTarget,
     _: &AtomicBool,
     _: Instant,
-) -> Result<(PathBuf, String), &'static str> {
+) -> Result<VerifiedRuntime, &'static str> {
     Err("native-platform-unsupported")
 }
 
@@ -243,7 +370,7 @@ fn verified_runtime(
 pub(crate) fn verified_catalog_runtime(
     _: &AtomicBool,
     _: Instant,
-) -> Result<(PathBuf, String), &'static str> {
+) -> Result<VerifiedRuntime, &'static str> {
     Err("native-platform-unsupported")
 }
 
@@ -283,7 +410,7 @@ pub async fn collect(
     let verified =
         tauri::async_runtime::spawn_blocking(move || verified_runtime(&target, &flag, deadline))
             .await;
-    let (executable, expected_hash) = match verified {
+    let verified_runtime = match verified {
         Ok(Ok(value)) => value,
         Ok(Err(code)) => {
             batch.error = Some(code);
@@ -294,6 +421,8 @@ pub async fn collect(
             return batch;
         }
     };
+    let executable = verified_runtime.executable.clone();
+    let expected_hash = verified_runtime.executable_sha256.clone();
     batch.executable = Some(executable.clone());
     let snapshot_binding = binding.clone();
     let snapshot_home = home.to_path_buf();
@@ -346,6 +475,9 @@ pub async fn collect(
         let input = NativeProbeInput {
             executable: executable.clone(),
             expected_executable_sha256: expected_hash.clone(),
+            trusted_payload_path: verified_runtime.trusted_payload_path.clone(),
+            trusted_cli_entry_path: verified_runtime.trusted_cli_entry_path.clone(),
+            trusted_cli_sha256: verified_runtime.trusted_cli_sha256.clone(),
             context: context.clone(),
             model: model.clone(),
             gateway_base: base.into(),
@@ -1050,6 +1182,60 @@ mod integration_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn synthetic_codex_pe(subsystem: u16) -> Vec<u8> {
+        let mut bytes = vec![0x5a; 2048];
+        bytes[..2].copy_from_slice(b"MZ");
+        bytes[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        bytes[0x80..0x84].copy_from_slice(b"PE\0\0");
+        bytes[0x94..0x96].copy_from_slice(&0xe0u16.to_le_bytes());
+        let subsystem_offset = 0x80 + 24 + 68;
+        bytes[subsystem_offset..subsystem_offset + 2].copy_from_slice(&subsystem.to_le_bytes());
+        bytes
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    #[test]
+    fn portable_cli_hash_allows_only_console_to_gui_subsystem_patch() {
+        let dir =
+            std::env::temp_dir().join(format!("codex-pe-normalization-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("codex.exe");
+        let signed_msix_member = synthetic_codex_pe(3);
+        let mut portable_copy = synthetic_codex_pe(2);
+        fs::write(&path, &portable_copy).unwrap();
+        let normalized = hash_runtime_with_restored_console_subsystem(
+            &path,
+            &AtomicBool::new(false),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(
+            normalized.as_deref(),
+            Some(sha256_hex(&signed_msix_member).as_str())
+        );
+
+        portable_copy[0x500] ^= 0x01;
+        fs::write(&path, &portable_copy).unwrap();
+        let tampered = hash_runtime_with_restored_console_subsystem(
+            &path,
+            &AtomicBool::new(false),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_ne!(
+            tampered.as_deref(),
+            Some(sha256_hex(&signed_msix_member).as_str())
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn launch_proof_requires_final_checkpoint_and_matching_live_state() {
         assert!(!launch_proof_is_current(false, true));

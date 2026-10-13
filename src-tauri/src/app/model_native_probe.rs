@@ -38,10 +38,15 @@ const MAX_EXECUTABLE_BYTES: u64 = 1024 * 1024 * 1024;
 
 pub(crate) struct NativeProbeInput {
     pub executable: std::path::PathBuf,
-    /// SHA-256 of the CLI entry extracted from the verified signed MSIX.
-    /// The source path is on removable media, so every probe executes only a
-    /// private copy whose bytes are checked against this value.
+    /// Hash of the authorized USB CLI. This binds evidence to the installation
+    /// being configured, but this mutable path is never executed.
     pub expected_executable_sha256: String,
+    /// Verified MSIX source and member identity for the executable that may
+    /// be run. This is separate from the USB CLI because the installer may
+    /// make the documented PE subsystem adjustment to its portable copy.
+    pub trusted_payload_path: PathBuf,
+    pub trusted_cli_entry_path: String,
+    pub trusted_cli_sha256: String,
     pub context: CapabilityContext,
     pub model: ModelCapabilityReport,
     pub gateway_base: String,
@@ -946,6 +951,8 @@ fn prepare_probe(
 #[cfg(windows)]
 fn validate_input(input: &NativeProbeInput) -> Result<(), NativeProbeError> {
     if !input.executable.is_absolute()
+        || !input.trusted_payload_path.is_absolute()
+        || !valid_msix_cli_entry(&input.trusted_cli_entry_path)
         || !input
             .executable
             .extension()
@@ -955,6 +962,7 @@ fn validate_input(input: &NativeProbeInput) -> Result<(), NativeProbeError> {
         || !valid_metadata(&input.device_key, 4096)
         || input.gateway_base.contains(input.device_key.as_str())
         || !valid_sha256(&input.expected_executable_sha256)
+        || !valid_sha256(&input.trusted_cli_sha256)
         || !valid_sha256(&input.context.binding_fingerprint)
         || !input
             .context
@@ -1890,7 +1898,7 @@ fn verified_catalog_runtime(
     cancelled: &AtomicBool,
     deadline: std::time::Instant,
 ) -> Result<PathBuf, NativeProbeError> {
-    let (source, expected_sha256) =
+    let verified =
         crate::app::model_catalog::verified_codex_runtime_for_catalog(cancelled, deadline)
             .map_err(|code| match code {
                 "native-executable-changed" => NativeProbeError::ExecutableChanged,
@@ -1899,36 +1907,101 @@ fn verified_catalog_runtime(
                 _ => NativeProbeError::ExecutableUnavailable,
             })?;
     let copy = area.root.join("codex-verified.exe");
-    copy_verified_executable(&source, &expected_sha256, &copy, cancelled, deadline)?;
+    extract_verified_cli_from_msix(
+        &verified.trusted_payload_path,
+        &verified.trusted_cli_entry_path,
+        &verified.trusted_cli_sha256,
+        &copy,
+        cancelled,
+        deadline,
+    )?;
     Ok(copy)
 }
 
-fn copy_verified_executable(
-    source: &Path,
+#[cfg(windows)]
+fn verified_probe_executable(
+    input: &NativeProbeInput,
+    area: &TemporaryArea,
+) -> Result<PathBuf, NativeProbeError> {
+    verified_probe_executable_path(
+        &input.trusted_payload_path,
+        &input.trusted_cli_entry_path,
+        &input.trusted_cli_sha256,
+        &area.root,
+        &input.cancelled,
+        input.deadline,
+    )
+}
+
+fn verified_probe_executable_path(
+    payload_path: &Path,
+    entry_path: &str,
+    expected_sha256: &str,
+    temporary_root: &Path,
+    cancelled: &AtomicBool,
+    deadline: std::time::Instant,
+) -> Result<PathBuf, NativeProbeError> {
+    let copy = temporary_root.join("codex-native-probe-verified.exe");
+    extract_verified_cli_from_msix(
+        payload_path,
+        entry_path,
+        expected_sha256,
+        &copy,
+        cancelled,
+        deadline,
+    )?;
+    Ok(copy)
+}
+
+fn valid_msix_cli_entry(value: &str) -> bool {
+    value.len() <= 4096
+        && !value.is_empty()
+        && !value.starts_with('/')
+        && !value.contains('\\')
+        && value
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != ".." && !part.contains(':'))
+        && value.to_ascii_lowercase().ends_with("/resources/codex.exe")
+}
+
+fn extract_verified_cli_from_msix(
+    payload_path: &Path,
+    entry_path: &str,
     expected_sha256: &str,
     destination: &Path,
     cancelled: &AtomicBool,
     deadline: std::time::Instant,
 ) -> Result<(), NativeProbeError> {
+    if !payload_path.is_absolute()
+        || !valid_msix_cli_entry(entry_path)
+        || !valid_sha256(expected_sha256)
+    {
+        return Err(NativeProbeError::InvalidInput);
+    }
     let result = (|| {
-        let metadata = std::fs::symlink_metadata(source)
+        check_limits(cancelled, deadline)?;
+        let payload = std::fs::File::open(payload_path)
             .map_err(|_| NativeProbeError::ExecutableUnavailable)?;
-        if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_EXECUTABLE_BYTES {
+        let mut archive =
+            zip::ZipArchive::new(payload).map_err(|_| NativeProbeError::ExecutableUnavailable)?;
+        let mut entry = archive
+            .by_name(entry_path)
+            .map_err(|_| NativeProbeError::ExecutableUnavailable)?;
+        let declared_size = entry.size();
+        if declared_size == 0 || declared_size > MAX_EXECUTABLE_BYTES {
             return Err(NativeProbeError::ExecutableUnavailable);
         }
-        let mut input =
-            std::fs::File::open(source).map_err(|_| NativeProbeError::ExecutableUnavailable)?;
         let mut output = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(destination)
             .map_err(|_| NativeProbeError::TemporaryStorage)?;
-        let mut buffer = vec![0u8; 1024 * 1024];
         let mut hasher = Sha256::new();
         let mut copied = 0u64;
+        let mut buffer = vec![0u8; 1024 * 1024];
         loop {
             check_limits(cancelled, deadline)?;
-            let count = input
+            let count = entry
                 .read(&mut buffer)
                 .map_err(|_| NativeProbeError::ExecutableUnavailable)?;
             if count == 0 {
@@ -1947,7 +2020,7 @@ fn copy_verified_executable(
             .flush()
             .and_then(|_| output.sync_all())
             .map_err(|_| NativeProbeError::TemporaryStorage)?;
-        if copied != metadata.len() {
+        if copied != declared_size {
             return Err(NativeProbeError::ExecutableChanged);
         }
         let copied_sha256: String = hasher
@@ -1955,7 +2028,7 @@ fn copy_verified_executable(
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect();
-        if copied_sha256 != expected_sha256 {
+        if !copied_sha256.eq_ignore_ascii_case(expected_sha256) {
             return Err(NativeProbeError::ExecutableChanged);
         }
         Ok(())
@@ -1964,31 +2037,6 @@ fn copy_verified_executable(
         let _ = std::fs::remove_file(destination);
     }
     result
-}
-
-fn verified_probe_executable(
-    input: &NativeProbeInput,
-    area: &TemporaryArea,
-) -> Result<PathBuf, NativeProbeError> {
-    verified_probe_executable_path(
-        &input.executable,
-        &input.expected_executable_sha256,
-        &area.root,
-        &input.cancelled,
-        input.deadline,
-    )
-}
-
-fn verified_probe_executable_path(
-    source: &Path,
-    expected_sha256: &str,
-    temporary_root: &Path,
-    cancelled: &AtomicBool,
-    deadline: std::time::Instant,
-) -> Result<PathBuf, NativeProbeError> {
-    let copy = temporary_root.join("codex-native-probe-verified.exe");
-    copy_verified_executable(source, expected_sha256, &copy, cancelled, deadline)?;
-    Ok(copy)
 }
 
 fn run_after_runtime_verification<T>(
@@ -2779,11 +2827,11 @@ fn matching_command_approval(params: Option<&Value>, observation: &mut TurnObser
 fn probe_windows(input: NativeProbeInput) -> Result<NativeProbeResult, NativeProbeError> {
     validate_input(&input)?;
     let area = TemporaryArea::create(&input.cancelled, input.deadline)?;
-    // The removable source is never passed to a process API. Copy it into the
-    // operation's private workspace and bind the copy to the signed MSIX hash
-    // captured by the verifier before any Codex process is started.
+    // The removable source is never passed to a process API. Rebuild the
+    // trusted executable from the verified MSIX member so the documented PE
+    // subsystem patch on the USB copy cannot alter or invalidate execution.
     let verified_executable = verified_probe_executable(&input, &area)?;
-    let hash_before = input.expected_executable_sha256.clone();
+    let hash_before = input.trusted_cli_sha256.clone();
     let runtime_version = read_runtime_version(
         &verified_executable,
         &area,
@@ -2925,7 +2973,10 @@ fn probe_windows(input: NativeProbeInput) -> Result<NativeProbeResult, NativePro
         proof,
         catalog_entry,
         runtime_version,
-        executable_sha256: hash_after,
+        // Evidence and later activation remain tied to the USB executable
+        // whose exact (possibly permitted PE-normalized) hash was checked by
+        // verified_runtime. The process itself ran the MSIX-sourced hash.
+        executable_sha256: input.expected_executable_sha256,
     })
 }
 
@@ -2970,7 +3021,8 @@ mod tests {
             uuid::Uuid::new_v4().simple()
         ));
         std::fs::create_dir(&root).unwrap();
-        let source = root.join("source.exe");
+        let source = root.join("payload.msix");
+        let entry = "app/resources/codex.exe";
         let trusted = b"trusted signed package bytes";
         let mut hash = Sha256::new();
         hash.update(trusted);
@@ -2979,13 +3031,14 @@ mod tests {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect();
-        std::fs::write(&source, b"changed after source verification").unwrap();
+        write_test_msix_cli(&source, entry, b"changed after verification");
         let launched = std::sync::atomic::AtomicBool::new(false);
         let cancelled = AtomicBool::new(false);
         let result = run_after_runtime_verification(
             || {
                 verified_probe_executable_path(
                     &source,
+                    entry,
                     &expected,
                     &root,
                     &cancelled,
@@ -3005,16 +3058,17 @@ mod tests {
     }
 
     #[test]
-    fn capability_probe_runner_receives_only_the_signed_hash_copy() {
+    fn capability_probe_runner_receives_copy_extracted_from_signed_msix_entry() {
         let root = std::env::temp_dir().join(format!(
             "codex-native-probe-copy-test-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4().simple()
         ));
         std::fs::create_dir(&root).unwrap();
-        let source = root.join("usb-codex.exe");
+        let source = root.join("payload.msix");
+        let entry = "app/resources/codex.exe";
         let expected_bytes = b"signed MSIX CLI bytes";
-        std::fs::write(&source, expected_bytes).unwrap();
+        write_test_msix_cli(&source, entry, expected_bytes);
         let mut hasher = Sha256::new();
         hasher.update(expected_bytes);
         let expected: String = hasher
@@ -3028,6 +3082,7 @@ mod tests {
             || {
                 verified_probe_executable_path(
                     &source,
+                    entry,
                     &expected,
                     &root,
                     &cancelled,
@@ -3047,6 +3102,24 @@ mod tests {
             Some(root.join("codex-native-probe-verified.exe"))
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn write_test_msix_cli(path: &Path, entry: &str, bytes: &[u8]) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        writer
+            .start_file(entry, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(bytes).unwrap();
+        writer.finish().unwrap();
+    }
+
+    #[test]
+    fn msix_cli_entry_path_rejects_zip_traversal() {
+        assert!(valid_msix_cli_entry("app/resources/codex.exe"));
+        assert!(!valid_msix_cli_entry("../app/resources/codex.exe"));
+        assert!(!valid_msix_cli_entry("app/../resources/codex.exe"));
+        assert!(!valid_msix_cli_entry("app\\resources\\codex.exe"));
     }
 
     #[test]

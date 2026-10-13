@@ -75,3 +75,14 @@
 - 第三轮独立只读复审结论 PASS：能力探测所有 `--version`、`debug models` 和 app-server Session 启动都使用同一份按签名 MSIX CLI 哈希核验的临时副本；当前代码路径未发现 USB 原始 CLI 的进程启动绕过。Add/Reset 命名 mutex、sidecar 清理、恢复标记事务和 tokens 兼容均未回退。
 - 残余边界：临时副本使用随机临时目录和独占新建，但没有显式专用 ACL；本修复抵御 USB 文件在验签后被替换，不覆盖同一 Windows 用户权限下的恶意进程在副本哈希后、进程启动前再次改写文件。若该威胁进入产品范围，需另行设计受保护临时目录/ACL。尚未通过正式发行包或实体 U 盘冷启动验证随包 Codex CLI；单测和源码审计不代表该项已验收。
 - 本轮未构建发行安装包或操作实体 U 盘；完成源码审计不等于正式 USB 包验收。
+
+## Dot 对 544e147 复审后的补充修复（2026-10-14）
+
+- P1（非 Windows 编译）：给引用 Windows-only `TemporaryArea` 的 `verified_probe_executable` 增加 `#[cfg(windows)]`；MSIX entry 提取和纯路径校验 helper 保持跨平台可测。
+- P1（PE subsystem 兼容）：USB portable CLI 仅作身份核验；仍要求其完整字节在恢复 `Subsystem` 后与已验签 MSIX 成员哈希一致。能力探测不再复制/执行 USB 上经过 PE 调整的文件，而从本次已验签 payload 中读取精确 `app/.../resources/codex.exe` 成员，写入独占临时文件并核对成员 SHA-256 后执行。MSIX 路径、成员名和摘要都来自 `verified_runtime`；目录穿越、空文件、超大文件、截断或摘要不符均在启动前失败并清理副本。`NativeProbeResult` 继续绑定经核验的 USB 文件摘要，以便提交前重新确认安装身份。
+- P2（复位重试）：确认恢复标记仍存在时，后续 Reset 即使配置已解除，也会再次写入 reload marker；只有 marker 成功后才清除恢复标记。测试断言重试仍返回 `applied_restart_pending`。
+- P2（启动重载进程检测）：启动前除 `Codex.exe` 外还识别安装根目录内的 `CodexCore.dat` 与旧名 `ChatGPT.exe`；进程快照名只作筛选，并检查真实进程路径及叶名称。Windows 子进程回归覆盖两个别名。
+- 验证收据：`model_native_probe` 定向测试 **20 passed**；`model_catalog` 定向测试 **98 passed**；Windows 进程别名回归 **1 passed**；完整 `cargo test --lib` **713 passed、0 failed、6 ignored**；`codex-win-engine` 全量测试 **236 passed、0 failed、2 ignored**。修改 Rust 文件的 rustfmt 和 `git diff --check` 通过。
+- 本机工具链为 `x86_64-pc-windows-msvc`；实际 Windows 编译和测试已运行。未运行非 Windows 目标交叉编译；`TemporaryArea` 引用函数已明确限定为 Windows。未取得随包 MSIX/最终发行包，未做正式 USB 冷启动，因此发行包验收仍待做。
+- 同用户权限下恶意进程可能改写哈希后临时副本的威胁不纳入本次修复范围；此限制已披露。
+- 第四轮独立只读复审结论 PASS：确认上述四项均闭环，并复核 Add/Reset 锁、sidecar 与 tokens 兼容没有回退。审计方未编辑文件、未重跑测试；其源码结论与本地测试收据相符。

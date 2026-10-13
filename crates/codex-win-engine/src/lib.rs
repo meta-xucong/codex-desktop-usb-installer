@@ -86,7 +86,8 @@ pub use sys::{
 /// termination is exposed to callers.
 pub use windows_process::{
     close_processes_for_root, hide_console_windows_for_root, hide_windows_for_root,
-    processes_running_for_executable_under_root_strict, processes_running_for_root,
+    processes_running_for_executable_under_root_strict,
+    processes_running_for_executables_under_root_strict, processes_running_for_root,
     processes_running_for_root_strict, show_windows_for_root, wait_for_usable_window_for_root,
     UsableWindowReport,
 };

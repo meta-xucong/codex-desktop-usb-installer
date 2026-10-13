@@ -1196,7 +1196,16 @@ mod imp {
             )));
         }
         let image_path = PathBuf::from(OsString::from_wide(&buffer[..length as usize]));
-        if !path_is_within_root(&image_path, root) {
+        // Verify both the canonical process image path and its leaf against
+        // the Toolhelp snapshot. This prevents a stale/reused PID from making
+        // an alias-name snapshot entry match an unrelated image under root.
+        if !path_is_within_root(&image_path, root)
+            || !image_path.file_name().is_some_and(|actual_name| {
+                actual_name
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&snapshot_image_name.to_string_lossy())
+            })
+        {
             return Ok(false);
         }
         match unsafe { WaitForSingleObject(handle.raw(), 0) } {
@@ -1235,7 +1244,7 @@ mod imp {
     /// silently skip live processes whose executable path cannot be queried.
     fn processes_running_for_root_strict_matching(
         root: &Path,
-        executable_name: Option<&std::ffi::OsStr>,
+        executable_names: Option<&[&std::ffi::OsStr]>,
     ) -> Result<bool, EngineError> {
         let snapshot = OwnedHandle::new(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) })
             .ok_or_else(|| last_error("create strict process snapshot"))?;
@@ -1265,10 +1274,12 @@ mod imp {
                     .unwrap_or(entry.szExeFile.len());
                 let snapshot_image_name =
                     OsString::from_wide(&entry.szExeFile[..image_name_length]);
-                if executable_name.is_some_and(|expected| {
-                    !snapshot_image_name
-                        .to_string_lossy()
-                        .eq_ignore_ascii_case(&expected.to_string_lossy())
+                if executable_names.is_some_and(|expected_names| {
+                    !expected_names.iter().any(|expected| {
+                        snapshot_image_name
+                            .to_string_lossy()
+                            .eq_ignore_ascii_case(&expected.to_string_lossy())
+                    })
                 }) {
                     if unsafe { Process32NextW(snapshot.raw(), &mut entry) } == 0 {
                         let error = std::io::Error::last_os_error();
@@ -1317,7 +1328,21 @@ mod imp {
         root: &Path,
         executable_name: &std::ffi::OsStr,
     ) -> Result<bool, EngineError> {
-        processes_running_for_root_strict_matching(root, Some(executable_name))
+        processes_running_for_root_strict_matching(root, Some(&[executable_name]))
+    }
+
+    /// Strictly inspect only processes whose image name is one of the exact
+    /// supplied aliases and whose queried image path is under `root`.
+    /// Snapshot names are only a prefilter; the live process image path and
+    /// final path component are verified before reporting a match.
+    pub fn processes_running_for_executables_under_root_strict(
+        root: &Path,
+        executable_names: &[&std::ffi::OsStr],
+    ) -> Result<bool, EngineError> {
+        if executable_names.is_empty() {
+            return Ok(false);
+        }
+        processes_running_for_root_strict_matching(root, Some(executable_names))
     }
 
     pub fn processes_running_for_root_strict(root: &Path) -> Result<bool, EngineError> {
@@ -1633,6 +1658,52 @@ mod imp {
         }
 
         #[test]
+        fn executable_alias_strict_probe_finds_codex_core_dat_under_managed_root() {
+            if std::env::var_os(STRICT_HELPER_ENV).is_some() {
+                return;
+            }
+            for alias in ["CodexCore.dat", "ChatGPT.exe"] {
+                let root = std::env::temp_dir().join(format!(
+                    "codex-alias-process-probe-{}-{}",
+                    std::process::id(),
+                    uuid::Uuid::new_v4()
+                ));
+                std::fs::create_dir_all(&root).unwrap();
+                let helper = root.join(alias);
+                std::fs::copy(std::env::current_exe().unwrap(), &helper).unwrap();
+                let mut child = Command::new(&helper)
+                    .args([
+                        "--exact",
+                        "windows_process::imp::windows_tests::strict_probe_helper_child",
+                        "--nocapture",
+                    ])
+                    .env(STRICT_HELPER_ENV, "1")
+                    .spawn()
+                    .unwrap();
+
+                let aliases = [
+                    std::ffi::OsStr::new("Codex.exe"),
+                    std::ffi::OsStr::new("CodexCore.dat"),
+                    std::ffi::OsStr::new("ChatGPT.exe"),
+                ];
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let found = loop {
+                    match processes_running_for_executables_under_root_strict(&root, &aliases) {
+                        Ok(true) => break true,
+                        Ok(false) | Err(_) if Instant::now() < deadline => {
+                            thread::sleep(Duration::from_millis(50));
+                        }
+                        Ok(false) | Err(_) => break false,
+                    }
+                };
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_dir_all(&root);
+                assert!(found, "alias-filtered strict probe missed {alias}");
+            }
+        }
+
+        #[test]
         fn closes_unlisted_helper_process_without_powershell() {
             if std::env::var_os(HELPER_ENV).is_some() {
                 thread::sleep(Duration::from_secs(30));
@@ -1688,8 +1759,9 @@ mod imp {
 pub use imp::{
     close_processes_for_root, hide_codex_auxiliary_windows_for_root, hide_console_windows_for_root,
     hide_windows_for_root, processes_running_for_executable_under_root_strict,
-    processes_running_for_root, processes_running_for_root_strict, show_windows_for_root,
-    start_console_window_watcher, wait_for_usable_window_for_root,
+    processes_running_for_executables_under_root_strict, processes_running_for_root,
+    processes_running_for_root_strict, show_windows_for_root, start_console_window_watcher,
+    wait_for_usable_window_for_root,
 };
 
 #[cfg(windows)]
@@ -1754,6 +1826,16 @@ pub fn processes_running_for_root_strict(_root: &Path) -> Result<bool, EngineErr
 pub fn processes_running_for_executable_under_root_strict(
     _root: &Path,
     _executable_name: &std::ffi::OsStr,
+) -> Result<bool, EngineError> {
+    Err(EngineError::Install(
+        "strict process image query is supported only on Windows".to_string(),
+    ))
+}
+
+#[cfg(not(windows))]
+pub fn processes_running_for_executables_under_root_strict(
+    _root: &Path,
+    _executable_names: &[&std::ffi::OsStr],
 ) -> Result<bool, EngineError> {
     Err(EngineError::Install(
         "strict process image query is supported only on Windows".to_string(),
