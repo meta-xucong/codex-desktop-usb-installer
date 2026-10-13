@@ -176,7 +176,8 @@ impl ManagerState {
             .uninstall_handoff
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let matches = match &*state {
+
+        match &*state {
             UninstallHandoffState::Pending(handoff) if handoff.id == id => {
                 *state = UninstallHandoffState::Exiting(handoff.clone());
                 true
@@ -185,8 +186,7 @@ impl ManagerState {
             // safe and should be allowed to re-issue the controlled exit.
             UninstallHandoffState::Exiting(handoff) if handoff.id == id => true,
             _ => false,
-        };
-        matches
+        }
     }
 
     pub(crate) fn uninstall_handoff_active(&self) -> bool {

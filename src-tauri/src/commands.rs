@@ -3300,7 +3300,7 @@ pub async fn win_launch_codex(
             return Err(AppError::Engine(
                 authorization
                     .codex_block_reason
-                    .unwrap_or_else(|| authorization.message),
+                    .unwrap_or(authorization.message),
             )
             .into());
         }

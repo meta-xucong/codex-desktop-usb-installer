@@ -5,8 +5,9 @@ pub mod capability_pack;
 pub mod ccswitch;
 pub mod channels;
 pub mod codex_agents_hint;
-pub(crate) mod codex_config_readback;
 pub mod codex_config_guard;
+#[cfg(test)]
+pub(crate) mod codex_config_readback;
 #[cfg(target_os = "windows")]
 pub mod codex_entry_ipc;
 pub mod codex_self_update;

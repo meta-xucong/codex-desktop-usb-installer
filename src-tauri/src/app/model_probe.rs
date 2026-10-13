@@ -344,12 +344,11 @@ impl<'a> ProbeClient<'a> {
             "input":format!("Call codex_usb_echo exactly once for each token: {}. After receiving all function outputs, sort them by token and reply with their challenge values joined by |, prefixed with {}. If an output contains fixture_error, still read its challenge. Do not answer with a token or invent a challenge.",tokens.join(","), if prefix.is_empty() { "nothing" } else { prefix }),
             "tools":[echo_tool()],"tool_choice":"required","parallel_tool_calls":multiple});
         let response = self.response(model, body, "tool-call").await?;
-        let calls = validate_calls(&response, &tokens).map_err(|error| {
+        let calls = validate_calls(&response, &tokens).inspect_err(|&error| {
             let mut diag = self.diagnostic("tool-call", Some(model));
             diag.response(response.get("id").and_then(Value::as_str));
             diag.fail(error);
             diag.record();
-            error
         })?;
         for call in &calls {
             let mut diag = self.diagnostic("tool-call", Some(model));

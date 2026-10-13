@@ -6,8 +6,10 @@ use crate::app::model_capability::{
     EVIDENCE_TTL_SECONDS, SIDECAR_IDENTITY,
 };
 use crate::app::model_diagnostics::{digest_hex, safe_identifier, ProbeError};
+#[cfg(windows)]
+use crate::app::model_native_probe;
 use crate::app::model_probe::{ProbeClient, BODY_LIMIT, REFRESH_BUDGET};
-use crate::app::{atomic_file, model_native_probe, model_selection_client, paths, usb_guard};
+use crate::app::{atomic_file, model_selection_client, paths, usb_guard};
 use crate::errors::AppError;
 use serde::{Deserialize, Serialize};
 #[path = "model_catalog_activation.rs"]
@@ -298,7 +300,7 @@ fn read_auto_setup_checkpoint(
         .get("schemaVersion")
         .and_then(Value::as_u64)
         .unwrap_or_default();
-    if !matches!(version, 1 | 2 | 3) {
+    if !matches!(version, 1..=3) {
         return Err(engine("能力 sidecar schema 不支持，未覆盖"));
     }
     let Some(checkpoint) = value.get("autoSetup").filter(|value| !value.is_null()) else {
@@ -471,6 +473,7 @@ where
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn complete_auto_setup_after_apply<R, W, C>(
     applied: bool,
     checkpoint: Option<&mut AutoSetupCheckpoint>,
@@ -1555,6 +1558,7 @@ pub(crate) fn add_tested_model_to_catalog(
     )
 }
 
+#[cfg(test)]
 fn add_tested_model_files<F, C, M>(
     home: &Path,
     model_id: &str,
@@ -1582,6 +1586,7 @@ where
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn add_tested_model_files_with_validator<F, I, V, C, M>(
     home: &Path,
     model_id: &str,
@@ -1722,7 +1727,7 @@ where
     atomic_file::write_atomic(&catalog, &catalog_bytes)
         .map_err(|_| engine("模型目录写入未完成；请重新读取状态后再试"))?;
     if let Some(merged) = merged {
-        if let Err(_) = atomic_file::write_atomic_preserving_backup(&config, merged.as_bytes()) {
+        if atomic_file::write_atomic_preserving_backup(&config, merged.as_bytes()).is_err() {
             let current = read_optional(&catalog).ok().flatten();
             let safe_to_remove = current.as_deref() == Some(catalog_bytes.as_slice());
             let restored = if safe_to_remove {
@@ -1852,7 +1857,7 @@ where
     reset_owned_catalog_at_with_ops(
         home,
         mark_restart,
-        |path, bytes| atomic_file::write_atomic_preserving_backup(path, bytes),
+        atomic_file::write_atomic_preserving_backup,
         |path| fs::remove_file(path),
     )
 }
@@ -2453,7 +2458,7 @@ fn read_sidecar(
     }
     let mut sidecar: CapabilitySidecar = serde_json::from_value(cache_value)
         .map_err(|_| engine("能力 sidecar schema 不支持，未覆盖"))?;
-    if !matches!(sidecar.schema_version, 1 | 2 | 3) || sidecar.models.len() > 512 {
+    if !matches!(sidecar.schema_version, 1..=3) || sidecar.models.len() > 512 {
         return Err(engine("能力 sidecar schema 不支持，未覆盖"));
     }
     // Persisted runtime information is display/scheduling data, not proof.
@@ -2504,6 +2509,7 @@ fn finalize_report(
     report.default_model = None;
 }
 
+#[cfg(test)]
 fn activation_failure_status(report: &NativeModelCatalogReport) -> &'static str {
     if report.default_model.is_some() {
         "applied_restart_pending"

@@ -184,7 +184,7 @@ fn handle_response(body: &Value, state: &mut GatewayState) -> (&'static str, Vec
         let response = json!({"id":id,"model":model,"status":"completed","output":[item.clone()]});
         let mut added = item.clone();
         added["arguments"] = json!("");
-        let mut events = vec![
+        let mut events = [
             json!({"type":"response.created","sequence_number":0,"response":{"id":id}}),
             json!({"type":"response.in_progress","sequence_number":1,"response":{"id":id}}),
             json!({"type":"response.output_item.added","sequence_number":2,"output_index":0,"item":added}),

@@ -137,8 +137,8 @@ pub async fn catalog() -> Result<MediaModelCatalog, AppError> {
     let configured_seedance_model = (!local.seedance_model.is_empty()
         && models.iter().any(|model| model == &local.seedance_model))
     .then_some(local.seedance_model);
-    let configured_agent_id = (!local.media_generation_agent_id.is_empty())
-        .then_some(local.media_generation_agent_id);
+    let configured_agent_id =
+        (!local.media_generation_agent_id.is_empty()).then_some(local.media_generation_agent_id);
     Ok(MediaModelCatalog {
         models,
         configured_seedance_model,
@@ -220,9 +220,7 @@ pub fn sync_authorized_local_connection() -> Result<(), AppError> {
     sync_local_connection(Some(binding))?;
     let (credential_path, connection_path) = local_connection_paths()?;
     if !credential_path.is_file() || !connection_path.is_file() {
-        return Err(AppError::Engine(
-            "媒体 MCP 授权文件未完整写入本机".into(),
-        ));
+        return Err(AppError::Engine("媒体 MCP 授权文件未完整写入本机".into()));
     }
     Ok(())
 }
@@ -235,9 +233,7 @@ pub fn verify_authorized_local_connection() -> Result<(), AppError> {
     }
     let (credential_path, connection_path) = local_connection_paths()?;
     if !credential_path.is_file() || !connection_path.is_file() {
-        return Err(AppError::Engine(
-            "媒体 MCP 授权文件未完整写入本机".into(),
-        ));
+        return Err(AppError::Engine("媒体 MCP 授权文件未完整写入本机".into()));
     }
     let wrapper = usb_guard::local_data_paths()?
         .codex_home
@@ -360,7 +356,7 @@ fn protect_for_current_user(plain: &[u8]) -> Result<Vec<u8>, AppError> {
         CryptProtectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
     };
 
-    let mut input = CRYPT_INTEGER_BLOB {
+    let input = CRYPT_INTEGER_BLOB {
         cbData: plain
             .len()
             .try_into()
@@ -373,7 +369,7 @@ fn protect_for_current_user(plain: &[u8]) -> Result<Vec<u8>, AppError> {
     };
     let ok = unsafe {
         CryptProtectData(
-            &mut input,
+            &input,
             null(),
             null(),
             null(),
@@ -553,7 +549,7 @@ mod tests {
         use windows_sys::Win32::Security::Cryptography::{
             CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
         };
-        let mut input = CRYPT_INTEGER_BLOB {
+        let input = CRYPT_INTEGER_BLOB {
             cbData: protected.len() as u32,
             pbData: protected.as_ptr() as *mut u8,
         };
@@ -563,7 +559,7 @@ mod tests {
         };
         let ok = unsafe {
             CryptUnprotectData(
-                &mut input,
+                &input,
                 null_mut(),
                 null(),
                 null_mut(),

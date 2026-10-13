@@ -554,15 +554,6 @@ impl Entry {
         Ok(bytes)
     }
 
-    fn child_read_bounded(&self, name: &str, max_bytes: usize) -> Result<Option<Vec<u8>>, String> {
-        let entry = match self.child_for_read(OsStr::new(name)) {
-            Ok(entry) => entry,
-            Err(error) if error.starts_with("__REVOCATION_NOT_FOUND__") => return Ok(None),
-            Err(error) => return Err(error),
-        };
-        entry.read_bounded(max_bytes).map(Some)
-    }
-
     fn prepare_revocation_delete(self) -> Result<PreparedDeleteTree, String> {
         let mut retained = Vec::new();
         self.collect_revocation_tree_named(&mut retained, 0, String::new())?;
@@ -700,17 +691,6 @@ impl PinnedEntry {
             .as_ref()
             .ok_or_else(|| "固定条目句柄已消耗".to_string())?
             .read_bounded(max_bytes)
-    }
-
-    pub(super) fn read_child_bounded(
-        &self,
-        name: &str,
-        max_bytes: usize,
-    ) -> Result<Option<Vec<u8>>, String> {
-        self.entry
-            .as_ref()
-            .ok_or_else(|| "固定条目句柄已消耗".to_string())?
-            .child_read_bounded(name, max_bytes)
     }
 
     pub(super) fn open_child(&self, name: &str) -> Result<Option<PinnedEntry>, String> {
@@ -863,21 +843,6 @@ impl PinnedRoot {
         };
         let mut retained = Vec::new();
         root.collect_revocation_tree(&mut retained, 0, false)
-    }
-
-    pub(super) fn list_relative_names(
-        &self,
-        relative: &str,
-    ) -> Result<Option<Vec<OsString>>, String> {
-        let entry = match self.open_relative(relative, false, false) {
-            Ok(entry) => entry,
-            Err(error) if error.starts_with("__REVOCATION_NOT_FOUND__") => return Ok(None),
-            Err(error) => return Err(error),
-        };
-        if entry.info()?.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
-            return Err("固定相对路径不是目录".into());
-        }
-        entry.names().map(Some)
     }
 
     pub(super) fn open_pinned_entry(&self, relative: &str) -> Result<Option<PinnedEntry>, String> {

@@ -4337,6 +4337,7 @@ fn apply_archive(
     }
 }
 
+#[cfg_attr(not(windows), allow(unreachable_code, unused_variables))]
 pub async fn check_update(
     app: &AppHandle,
     ops: &OperationManager,
@@ -4455,6 +4456,7 @@ pub async fn check_update(
     }
 }
 
+#[cfg_attr(not(windows), allow(unreachable_code, unused_variables))]
 pub async fn apply_update(
     app: &AppHandle,
     ops: &OperationManager,
@@ -4488,6 +4490,7 @@ pub async fn apply_update(
         .map_err(|error| CommandError::from(error.with_attempts(&attempts)))
 }
 
+#[cfg_attr(not(windows), allow(unreachable_code, unused_variables))]
 pub async fn rollback(
     app: &AppHandle,
     ops: &OperationManager,
@@ -5043,9 +5046,10 @@ mod tests {
 
     #[test]
     fn skill_hub_client_uses_the_persisted_proxy_mode_without_leaking_url() {
-        let mut settings = AppSettings::default();
-
-        settings.proxy_mode = ProxyMode::System;
+        let mut settings = AppSettings {
+            proxy_mode: ProxyMode::System,
+            ..AppSettings::default()
+        };
         assert!(client(&settings).is_ok());
 
         settings.proxy_mode = ProxyMode::Direct;

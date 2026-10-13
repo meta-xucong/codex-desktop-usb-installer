@@ -1,5 +1,6 @@
 //! Native evidence orchestration and finite activation; disk state is never proof.
 use super::*;
+#[cfg(test)]
 use crate::app::codex_config_readback;
 use crate::app::model_capability::{CapabilityState, EvidenceScope, NativeRuntimeEvidence};
 use crate::app::model_native_probe::{self, NativeProbeInput, NativeProbeResult};
@@ -151,7 +152,7 @@ fn hash_runtime_reader_with_console_normalization(
     cancelled: &AtomicBool,
     deadline: Instant,
 ) -> Result<RuntimeHashes, &'static str> {
-    if expected_len < 64 || expected_len > 1024 * 1024 * 1024 {
+    if !(64..=1024 * 1024 * 1024).contains(&expected_len) {
         return Err("native-executable-unavailable");
     }
     let mut prefix = Vec::with_capacity(1024 * 1024 + 96);
@@ -453,6 +454,7 @@ fn complete_gateway(model: &ModelCapabilityReport) -> bool {
         .iter()
         .all(|state| *state == CapabilityState::Verified)
 }
+#[allow(clippy::too_many_arguments)]
 pub async fn collect(
     models: &mut [ModelCapabilityReport],
     context: &CapabilityContext,
@@ -587,12 +589,14 @@ pub async fn collect(
     }
     batch
 }
+#[cfg(test)]
 fn no_unmanaged_catalog(text: &str) -> bool {
     !text.lines().any(|line| {
         let line = line.trim_start();
         !line.starts_with('#') && line.contains("model_catalog_json")
     })
 }
+#[cfg(test)]
 fn catalog_bytes(
     batch: &NativeBatch,
     report: &NativeModelCatalogReport,
@@ -644,6 +648,7 @@ fn catalog_bytes(
     .map_err(|_| "native-catalog-invalid")
 }
 
+#[cfg(test)]
 struct PreparedPublish {
     selected_model: String,
     snapshot: SelectionReply,
@@ -652,6 +657,8 @@ struct PreparedPublish {
     catalog_bytes: Vec<u8>,
 }
 
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn prepare_publish<R, V>(
     batch: &NativeBatch,
     result: &NativeModelCatalogReport,
@@ -713,6 +720,7 @@ where
     })
 }
 
+#[cfg(test)]
 fn post_apply_snapshot_matches(
     applied: &SelectionReply,
     snapshot: &SelectionReply,
@@ -730,6 +738,7 @@ fn post_apply_snapshot_matches(
         && applied.config_sha256 == snapshot.config_sha256
 }
 
+#[cfg(test)]
 fn request_selection_snapshot<F>(request_snapshot: F) -> Result<SelectionReply, &'static str>
 where
     F: for<'request> FnOnce(SelectionRequest<'request>) -> Result<SelectionReply, &'static str>,
@@ -764,16 +773,19 @@ where
     Ok(snapshot)
 }
 
+#[cfg(test)]
 fn snapshot_confirms_model(snapshot: &SelectionReply, preferred_model_id: &str) -> bool {
     snapshot.selected_model.as_deref() == Some(preferred_model_id)
         && snapshot.revision.as_deref().is_some_and(is_sha256_hex)
         && snapshot.config_sha256.as_deref().is_some_and(is_sha256_hex)
 }
 
+#[cfg(test)]
 fn is_sha256_hex(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+#[cfg(test)]
 fn request_post_apply_snapshot<F>(
     applied: &SelectionReply,
     preferred_model_id: &str,
@@ -797,12 +809,14 @@ where
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[cfg(test)]
 enum SelectionStateFile {
     Config,
     Auth,
     Catalog,
 }
 
+#[cfg(test)]
 fn compensate_apply_failure<R, W, D>(
     candidate_catalog: &[u8],
     previous_catalog: Option<&[u8]>,
@@ -843,12 +857,14 @@ where
 }
 
 #[derive(Debug, Eq, PartialEq)]
+#[cfg(test)]
 enum SelectionApplyFailure {
     ApplyRejected(&'static str),
     CompensationFailed(&'static str),
     ReadbackFailed(&'static str),
 }
 
+#[cfg(test)]
 fn finalize_selection_apply<A, C>(
     apply_request_id: &str,
     apply_result: Result<SelectionReply, &'static str>,
@@ -890,6 +906,8 @@ where
     Ok((applied, snapshot))
 }
 
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn finalize_selection_apply_with_compensation<A, R, W, D>(
     apply_request_id: &str,
     apply_result: Result<SelectionReply, &'static str>,
@@ -928,21 +946,19 @@ where
     )
 }
 
+#[cfg(test)]
 struct ConfirmedPublish {
     selected_model: String,
     selected_owner: Option<String>,
-    proofs: Vec<NativeRuntimeEvidence>,
-    models: Vec<ModelCapabilityReport>,
-    executable: PathBuf,
-    executable_sha256: String,
-    catalog_path: PathBuf,
     catalog_sha256: String,
     config_sha256: String,
     auth_sha256: String,
 }
 
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn commit_prepared_publish<A, S, B, R>(
-    batch: &NativeBatch,
+    _batch: &NativeBatch,
     prepared: &PreparedPublish,
     result: &mut NativeModelCatalogReport,
     binding_api_key: &str,
@@ -1098,86 +1114,10 @@ where
     Ok(ConfirmedPublish {
         selected_model: prepared.selected_model.clone(),
         selected_owner,
-        proofs: batch.proofs(),
-        models: result.models.clone(),
-        executable: prepared.executable.clone(),
-        executable_sha256: prepared.expected_executable_sha256.clone(),
-        catalog_path: catalog,
         catalog_sha256: catalog_hash,
         config_sha256: observed_config_sha256,
         auth_sha256,
     })
-}
-
-/// Called inside the manager's final commit lock, never during discovery.
-/// Configuration conflicts are failures, not permission to overwrite the user.
-pub fn publish(
-    batch: NativeBatch,
-    result: &mut NativeModelCatalogReport,
-    context: &CapabilityContext,
-    preferred_model_id: &str,
-    binding: &codex_usb_license::UsbAccountBinding,
-    provider_base_url: &str,
-    home: &Path,
-    cancelled: &AtomicBool,
-    deadline: Instant,
-) -> Result<(), &'static str> {
-    let prepared = prepare_publish(
-        &batch,
-        result,
-        context,
-        preferred_model_id,
-        cancelled,
-        deadline,
-        hash_runtime,
-        |_executable, bytes, cancelled, deadline| {
-            model_native_probe::validate_final_catalog(bytes, cancelled, deadline)
-                .map_err(|error| error.code())
-        },
-    )?;
-    let confirmed = commit_prepared_publish(
-        &batch,
-        &prepared,
-        result,
-        binding.ccswitch.device_api_key.trim(),
-        binding.ccswitch.provider_id.trim(),
-        provider_base_url,
-        home,
-        cancelled,
-        deadline,
-        |request| model_selection_client::request(request, binding, cancelled, home),
-        |request| model_selection_client::request(request, binding, cancelled, home),
-        || {
-            usb_guard::authorized_account_binding()
-                .ok()
-                .flatten()
-                .as_ref()
-                == Some(binding)
-                && codex_home_dir().as_deref() == Some(home)
-        },
-        hash_runtime,
-    )?;
-    *LIVE_CATALOG.lock().unwrap_or_else(|e| e.into_inner()) = Some(LiveCatalog {
-        // The provider apply and snapshot are only the first half of commit.
-        // model_catalog promotes this proof after the final Complete sidecar
-        // checkpoint is durably written.
-        setup_complete: false,
-        binding: binding.clone(),
-        context: context.clone(),
-        selected_model: confirmed.selected_model.clone(),
-        selected_owner: confirmed.selected_owner,
-        proofs: confirmed.proofs,
-        models: confirmed.models,
-        executable: confirmed.executable,
-        executable_sha256: confirmed.executable_sha256,
-        catalog_sha256: confirmed.catalog_sha256,
-        config_sha256: confirmed.config_sha256,
-        auth_sha256: confirmed.auth_sha256,
-    });
-    result.default_model = Some(confirmed.selected_model);
-    result.catalog_path = Some(confirmed.catalog_path.to_string_lossy().into_owned());
-    mark_restart_required().map_err(|_| "selection-restart-marker-failed")?;
-    Ok(())
 }
 
 pub fn confirm_setup_complete(home: &Path) -> Result<(), &'static str> {
@@ -1190,6 +1130,7 @@ pub fn confirm_setup_complete(home: &Path) -> Result<(), &'static str> {
     Ok(())
 }
 
+#[cfg(test)]
 fn live_auth_fingerprint(bytes: &[u8], expected_key: &str) -> Result<String, &'static str> {
     let value: Value = serde_json::from_slice(bytes).map_err(|_| "selection-auth-conflict")?;
     if expected_key.is_empty()

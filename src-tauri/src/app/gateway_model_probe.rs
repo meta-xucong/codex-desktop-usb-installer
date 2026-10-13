@@ -278,6 +278,7 @@ fn revoke_request_proofs(request_id: &str) -> bool {
     before != state.tickets.len()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn issue_proof(
     request_id: &str,
     model_id: &str,
@@ -319,6 +320,7 @@ fn issue_proof(
     Ok((id, expires_at))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn consume_connectivity_proof(
     proof_id: &str,
     request_id: &str,

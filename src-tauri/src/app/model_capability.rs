@@ -230,7 +230,7 @@ pub fn select_ready_default(
         }
         let mut candidate = model.clone();
         candidate.evaluate(context, Some(proof), now);
-        (candidate.state == ModelState::Ready).then(|| candidate.model_id)
+        (candidate.state == ModelState::Ready).then_some(candidate.model_id)
     })
 }
 
@@ -350,7 +350,7 @@ mod tests {
             checks: checks(),
         };
         assert_eq!(
-            select_ready_default(&[m.clone()], &context(), &[proof.clone()], 101),
+            select_ready_default(&[m.clone()], &context(), std::slice::from_ref(&proof), 101),
             Some("arbitrary/model".into())
         );
         assert_eq!(
@@ -360,7 +360,7 @@ mod tests {
         let mut changed = context();
         changed.binding_fingerprint = "other".into();
         assert_eq!(
-            select_ready_default(&[m.clone()], &changed, &[proof.clone()], 101),
+            select_ready_default(&[m.clone()], &changed, std::slice::from_ref(&proof), 101),
             None
         );
         assert_eq!(
@@ -390,7 +390,7 @@ mod tests {
             select_ready_default(
                 &[model.clone(), other_owner],
                 &context(),
-                &[proof.clone()],
+                std::slice::from_ref(&proof),
                 101
             ),
             None
@@ -399,7 +399,7 @@ mod tests {
             select_ready_default(
                 &[model.clone(), model.clone()],
                 &context(),
-                &[proof.clone()],
+                std::slice::from_ref(&proof),
                 101
             ),
             None

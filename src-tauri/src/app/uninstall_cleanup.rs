@@ -851,22 +851,6 @@ impl PinnedRevocationEntry {
         }
     }
 
-    pub(crate) fn read_child_bounded(
-        &self,
-        name: &str,
-        max_bytes: usize,
-    ) -> Result<Option<Vec<u8>>, String> {
-        #[cfg(windows)]
-        {
-            self.inner.read_child_bounded(name, max_bytes)
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = (name, max_bytes);
-            Err("远程作废清理只允许在 Windows 受管环境中执行".into())
-        }
-    }
-
     pub(crate) fn open_child(&self, name: &str) -> Result<Option<PinnedRevocationEntry>, String> {
         #[cfg(windows)]
         {
@@ -1090,52 +1074,6 @@ impl RevocationCleanupRoot {
         Ok(())
     }
 
-    pub(crate) fn read_relative_bounded(
-        &self,
-        relative: &str,
-        max_bytes: usize,
-    ) -> Result<Option<Vec<u8>>, String> {
-        #[cfg(windows)]
-        {
-            match self.pinned.read_relative_bounded(relative, max_bytes) {
-                Ok(bytes) => Ok(Some(bytes)),
-                Err(error) if error.starts_with("__REVOCATION_NOT_FOUND__") => Ok(None),
-                Err(error) => Err(error),
-            }
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = (relative, max_bytes);
-            Err("远程作废清理只允许在 Windows 受管环境中执行".into())
-        }
-    }
-
-    pub(crate) fn list_relative_names(
-        &self,
-        relative: &str,
-    ) -> Result<Option<Vec<String>>, String> {
-        #[cfg(windows)]
-        {
-            self.pinned
-                .list_relative_names(relative)?
-                .map(|names| {
-                    names
-                        .into_iter()
-                        .map(|name| {
-                            name.into_string()
-                                .map_err(|_| "固定暂存目录包含非 UTF-8 文件名".to_string())
-                        })
-                        .collect()
-                })
-                .transpose()
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = relative;
-            Err("远程作废清理只允许在 Windows 受管环境中执行".into())
-        }
-    }
-
     pub(crate) fn open_pinned_entry(
         &self,
         relative: &str,
@@ -1151,14 +1089,6 @@ impl RevocationCleanupRoot {
             let _ = relative;
             Err("远程作废清理只允许在 Windows 受管环境中执行".into())
         }
-    }
-
-    pub(crate) fn open_entry_child(
-        &self,
-        parent: &PinnedRevocationEntry,
-        name: &str,
-    ) -> Result<Option<PinnedRevocationEntry>, String> {
-        parent.open_child(name)
     }
 
     pub(crate) fn exists_relative(&self, relative: &str) -> Result<bool, String> {
@@ -1289,7 +1219,7 @@ pub(crate) fn remove_revocation_staged_payload_if_sha256(
     #[cfg(test)]
     {
         let _ = fingerprint;
-        return remove_revocation_staged_payload_test(root, relative, expected_sha256);
+        remove_revocation_staged_payload_test(root, relative, expected_sha256)
     }
     #[cfg(not(test))]
     {
@@ -2937,6 +2867,7 @@ exit 0
 }
 
 #[cfg(windows)]
+#[cfg(test)]
 fn powershell_encoded_command(script: &str) -> String {
     use base64::Engine as _;
 
@@ -4290,7 +4221,9 @@ mod tests {
             .decode(encoded)
             .unwrap();
         let units = bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]));
         let decoded = String::from_utf16(units.collect::<Vec<_>>().as_slice()).unwrap();
         assert_eq!(decoded, script);

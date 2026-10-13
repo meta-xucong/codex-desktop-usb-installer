@@ -1493,6 +1493,31 @@ pub fn open(app: &AppHandle) -> Result<CcswitchLaunchReport, AppError> {
     launch_with_intent(app, CcswitchLaunchIntent::UserOpen)
 }
 
+/// Resolve only the signed USB product binary for a finite configuration RPC.
+/// This does not start/stop the normal GUI or touch another CCSwitch install.
+pub(crate) fn verified_usb_selection_executable() -> Result<PathBuf, AppError> {
+    crate::app::usb_guard::require_usb_content_access("ccswitch-model-selection")?;
+    let status = crate::app::usb_guard::current_status();
+    if !status.signed || !status.codex_allowed {
+        return Err(AppError::Engine(
+            "USB model selection is not authorized".into(),
+        ));
+    }
+    let bundle = status
+        .bundle_path
+        .ok_or_else(|| AppError::Engine("USB bundle is unavailable".into()))?;
+    let anchor = Path::new(&bundle).join("CodexAppManager.exe");
+    let executable = find_verified_source(&anchor, None)?
+        .ok_or_else(|| AppError::Engine("Bundled CCSwitch is unavailable".into()))?;
+    Ok(executable)
+}
+
+pub(crate) fn selection_environment(
+    binding: &codex_usb_license::UsbAccountBinding,
+) -> Vec<(&'static str, String)> {
+    ccswitch_account_environment(Some(binding))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1767,29 +1792,4 @@ mod tests {
         assert!(super::local_install_cleanup_settled(false, true));
         assert!(!super::local_install_cleanup_settled(true, true));
     }
-}
-
-/// Resolve only the signed USB product binary for a finite configuration RPC.
-/// This does not start/stop the normal GUI or touch another CCSwitch install.
-pub(crate) fn verified_usb_selection_executable() -> Result<PathBuf, AppError> {
-    crate::app::usb_guard::require_usb_content_access("ccswitch-model-selection")?;
-    let status = crate::app::usb_guard::current_status();
-    if !status.signed || !status.codex_allowed {
-        return Err(AppError::Engine(
-            "USB model selection is not authorized".into(),
-        ));
-    }
-    let bundle = status
-        .bundle_path
-        .ok_or_else(|| AppError::Engine("USB bundle is unavailable".into()))?;
-    let anchor = Path::new(&bundle).join("CodexAppManager.exe");
-    let executable = find_verified_source(&anchor, None)?
-        .ok_or_else(|| AppError::Engine("Bundled CCSwitch is unavailable".into()))?;
-    Ok(executable)
-}
-
-pub(crate) fn selection_environment(
-    binding: &codex_usb_license::UsbAccountBinding,
-) -> Vec<(&'static str, String)> {
-    ccswitch_account_environment(Some(binding))
 }

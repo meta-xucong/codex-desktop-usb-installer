@@ -450,11 +450,10 @@ fn readiness_summary(profile: &Path) -> ReadinessSummary {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
-        core_ready_from_readiness, media_install_ready, media_install_switch,
-        legacy_media_names_owned, persist_connection_ownership, readiness_summary,
-        strip_utf8_bom, validate_options, write_media_authorization_status,
-        CapabilityPackInstallOptions, ConnectionOwnershipRecord,
-        CONNECTION_OWNERSHIP_RELATIVE, PACK_ID,
+        core_ready_from_readiness, legacy_media_names_owned, media_install_ready,
+        media_install_switch, persist_connection_ownership, readiness_summary, strip_utf8_bom,
+        validate_options, write_media_authorization_status, CapabilityPackInstallOptions,
+        ConnectionOwnershipRecord, CONNECTION_OWNERSHIP_RELATIVE, PACK_ID,
     };
     use serde_json::json;
     use std::fs;
@@ -515,8 +514,16 @@ mod tests {
         fs::create_dir_all(&connections).unwrap();
         fs::write(bin.join("start-media-generation-mcp.ps1"), "wrapper").unwrap();
         fs::write(bin.join("media-generation-mcp.py"), "server").unwrap();
-        fs::write(connections.join("media-generation.connection.json"), "connection").unwrap();
-        fs::write(connections.join("media-generation.credential.dpapi"), "credential").unwrap();
+        fs::write(
+            connections.join("media-generation.connection.json"),
+            "connection",
+        )
+        .unwrap();
+        fs::write(
+            connections.join("media-generation.credential.dpapi"),
+            "credential",
+        )
+        .unwrap();
         fs::write(
             &readiness_path,
             serde_json::to_vec(&json!({
@@ -640,8 +647,10 @@ mod tests {
         };
         assert!(validate_options(&options).is_ok());
 
-        let mut license_backed_image = CapabilityPackInstallOptions::default();
-        license_backed_image.enable_media_generation = true;
+        let license_backed_image = CapabilityPackInstallOptions {
+            enable_media_generation: true,
+            ..CapabilityPackInstallOptions::default()
+        };
         assert!(validate_options(&license_backed_image).is_ok());
 
         let mut legacy_direct = options;
@@ -808,7 +817,11 @@ pub fn status(app: &AppHandle) -> Result<CapabilityPackReport, AppError> {
     } else {
         readiness.config_status.as_str()
     };
-    let status = overall_status(installed, &readiness.runtime_status, effective_config_status);
+    let status = overall_status(
+        installed,
+        &readiness.runtime_status,
+        effective_config_status,
+    );
     Ok(CapabilityPackReport {
         available: true,
         installed,
@@ -870,11 +883,13 @@ fn validate_options(options: &CapabilityPackInstallOptions) -> Result<(), AppErr
         "not-checked" | "verified" | "failed"
     ) || options.media_gateway_model_count > 100_000
         || (options.media_gateway_catalog_status == "verified"
-            && options.media_gateway_catalog_verified_at.as_deref().and_then(non_empty).is_none())
+            && options
+                .media_gateway_catalog_verified_at
+                .as_deref()
+                .and_then(non_empty)
+                .is_none())
     {
-        return Err(AppError::Engine(
-            "媒体上游模型目录检查状态无效".to_string(),
-        ));
+        return Err(AppError::Engine("媒体上游模型目录检查状态无效".to_string()));
     }
     for service in &options.enabled_api_services {
         if !matches!(service.trim(), "dashscope-web-search") {
@@ -1344,8 +1359,14 @@ pub fn install(
     // These settings are a complete manager-owned snapshot. Explicit empty
     // values prevent an inherited route from an older install being reused.
     command
-        .env("MEDIA_GENERATION_API_PROFILE", &options.media_generation_api_profile)
-        .env("MEDIA_GENERATION_AGENT_ID", &options.media_generation_agent_id)
+        .env(
+            "MEDIA_GENERATION_API_PROFILE",
+            &options.media_generation_api_profile,
+        )
+        .env(
+            "MEDIA_GENERATION_AGENT_ID",
+            &options.media_generation_agent_id,
+        )
         .env("MEDIA_IMAGE2_MODEL", &options.image2_model)
         .env("MEDIA_GROK_IMAGE_MODEL", &options.grok_image_model)
         .env("MEDIA_GROK_VIDEO_MODEL", &options.grok_video_model)
@@ -1398,10 +1419,12 @@ pub fn install(
                 log::error!("media MCP credential persistence failed: {error}");
                 AppError::Engine(format!("媒体 MCP 授权同步失败：{error}"))
             })?;
-            crate::app::media_generation::verify_authorized_local_connection().map_err(|error| {
-                log::error!("media MCP credential verification failed: {error}");
-                AppError::Engine(format!("媒体 MCP 授权自检失败：{error}"))
-            })?;
+            crate::app::media_generation::verify_authorized_local_connection().map_err(
+                |error| {
+                    log::error!("media MCP credential verification failed: {error}");
+                    AppError::Engine(format!("媒体 MCP 授权自检失败：{error}"))
+                },
+            )?;
         }
         Ok::<(), AppError>(())
     })();
@@ -1463,14 +1486,17 @@ pub fn install(
         )));
     }
     let runtime_ready = readiness.runtime_status == "ready";
-    let effective_config_status = if options.enable_media_generation
-        && readiness.media_authorization_status != "verified"
-    {
-        "partial"
-    } else {
-        readiness.config_status.as_str()
-    };
-    let status = overall_status(installed, &readiness.runtime_status, effective_config_status);
+    let effective_config_status =
+        if options.enable_media_generation && readiness.media_authorization_status != "verified" {
+            "partial"
+        } else {
+            readiness.config_status.as_str()
+        };
+    let status = overall_status(
+        installed,
+        &readiness.runtime_status,
+        effective_config_status,
+    );
     let enabled_api_services = options.enabled_api_services.clone();
     Ok(CapabilityPackReport {
         available: true,

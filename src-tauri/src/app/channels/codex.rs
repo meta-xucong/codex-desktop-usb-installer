@@ -230,6 +230,8 @@ struct RecoveryTransactionState {
     #[serde(default)]
     staged_payload_sha256: Option<String>,
     #[serde(default, skip_serializing)]
+    // Retained to deserialize pre-owner-marker recovery state written by older releases.
+    #[allow(dead_code)]
     legacy_bundle_root: Option<String>,
 }
 
@@ -749,6 +751,7 @@ fn mirror_selected_checksum_identity_sha256(package_moniker: &str, msix_sha256: 
 /// package.  Those fields must not invalidate a confirmation between check and
 /// apply.  Conversely, a version, package identity, size, selected checksum,
 /// or manifest schema change must produce a new identity.
+#[allow(clippy::too_many_arguments)]
 fn mirror_stable_identity_sha256(
     manifest_text: &str,
     architecture: &str,
@@ -2121,6 +2124,7 @@ fn validate_transaction_state_owner_markers(
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_transaction_owner_inventory(
     canonical_root: &Path,
     license: &crate::app::usb_guard::UsbLicense,
@@ -2210,36 +2214,6 @@ fn recovery_owner_matches(recovery: &RecoveryTransactionState, owner: &Transacti
             &recovery.license_signature_sha256,
             &recovery.fingerprint_sha256,
         )
-}
-
-fn read_transaction_state_pinned(
-    pinned_root: &crate::app::uninstall_cleanup::RevocationCleanupRoot,
-    _tx: &Path,
-    relative_tx: &str,
-) -> Result<TransactionState, AppError> {
-    let main_path = format!("{relative_tx}/state.json");
-    let backup_path = format!("{relative_tx}/state.json.bak");
-    let main = pinned_root
-        .read_relative_bounded(&main_path, MAX_TRANSACTION_STATE_BYTES as usize)
-        .map_err(AppError::Engine)?
-        .and_then(|bytes| serde_json::from_slice::<TransactionState>(&bytes).ok());
-    let state = match main {
-        Some(state) => Some(state),
-        None => pinned_root
-            .read_relative_bounded(&backup_path, MAX_TRANSACTION_STATE_BYTES as usize)
-            .map_err(AppError::Engine)?
-            .and_then(|bytes| serde_json::from_slice::<TransactionState>(&bytes).ok()),
-    }
-    .ok_or_else(|| {
-        AppError::Engine(format!(
-            "固定 Bundle 根句柄下事务状态缺失、损坏或超过 {} 字节上限",
-            MAX_TRANSACTION_STATE_BYTES
-        ))
-    })?;
-    if state.version != TRANSACTION_VERSION {
-        return Err(AppError::Engine("事务状态版本不受支持".to_string()));
-    }
-    Ok(state)
 }
 
 fn transaction_owner_for_authorization(
@@ -2860,7 +2834,7 @@ fn recover_pending_transactions(bundle_root: &Path) -> Result<(), AppError> {
                 fs::remove_dir_all(&tx).map_err(|error| AppError::Engine(error.to_string()))?;
                 remove_owner_sidecar_after_transaction(
                     bundle_root,
-                    &state
+                    state
                         .owner
                         .as_ref()
                         .map(|owner| owner.transaction_id.as_str())
@@ -3363,6 +3337,7 @@ fn identity_mismatch_reason(
     None
 }
 
+#[cfg(test)]
 fn same_identity(expected: &CodexPayloadIdentity, fresh: &CodexPayloadIdentity) -> bool {
     identity_mismatch_reason(expected, fresh).is_none()
 }
@@ -3467,7 +3442,7 @@ fn check_inner(
                         Some(current)
                     }
                     crate::app::usb_guard::ReinstallGateOutcome::DeferredCleanup(request) => {
-                        deferred_cleanup = Some(request);
+                        deferred_cleanup = Some(*request);
                         None
                     }
                 }
@@ -3657,7 +3632,7 @@ fn require_reinstall_authorization_while_locked(
     match crate::app::usb_guard::require_signed_codex_reinstall_bundle_deferred(phase)? {
         crate::app::usb_guard::ReinstallGateOutcome::Authorized(authorization) => Ok(authorization),
         crate::app::usb_guard::ReinstallGateOutcome::DeferredCleanup(request) => {
-            *deferred_cleanup = Some(request);
+            *deferred_cleanup = Some(*request);
             Err(AppError::Engine(
                 "usb_revocation_cleanup_deferred".to_string(),
             ))
@@ -4073,6 +4048,7 @@ fn apply_inner(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_transaction(
     root: &Path,
     tx: &Path,
@@ -4157,6 +4133,7 @@ fn production_apply_transport(network: &NetworkConfig, allow_redirects: bool) ->
     }
 }
 
+#[cfg(test)]
 fn apply_transaction_with_transport(
     root: &Path,
     tx: &Path,
@@ -4171,6 +4148,8 @@ fn apply_transaction_with_transport(
     )
 }
 
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn apply_transaction_with_transport_mode(
     root: &Path,
     tx: &Path,
@@ -4195,6 +4174,7 @@ fn apply_transaction_with_transport_mode(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_transaction_with_transport_mode_and_deferred(
     root: &Path,
     tx: &Path,
@@ -5185,7 +5165,7 @@ mod tests {
             .join(STAGING_DIR)
             .join(format!("{TRANSACTION_PREFIX}{transaction_id}"));
         fs::create_dir_all(&tx).unwrap();
-        let canonical_root = fs::canonicalize(root).unwrap();
+        let _canonical_root = fs::canonicalize(root).unwrap();
         let owner = owner_override.or_else(|| {
             Some(TransactionOwner {
                 transaction_id: transaction_id.to_string(),
@@ -5283,7 +5263,7 @@ mod tests {
         fs::write(&sentinel, b"preserve").unwrap();
         let (fingerprint, license) = revocation_fixture_identity();
         let transaction_id = uuid::Uuid::new_v4().to_string();
-        let mut mismatched = TransactionOwner {
+        let mismatched = TransactionOwner {
             transaction_id: transaction_id.clone(),
             installation_id: "other-installation".to_string(),
             license_signature_sha256: codex_usb_license::license_signature_sha256(&license)
@@ -5394,7 +5374,7 @@ mod tests {
     }
 
     fn reactivation_recovery_state(
-        root: &Path,
+        _root: &Path,
         local: &LocalBundle,
         staged_payload_sha256: Option<String>,
     ) -> RecoveryTransactionState {
@@ -5759,7 +5739,7 @@ mod tests {
         // checksum commit. The target path remains the same and is bound to
         // the transaction's original signed identity snapshot.
         let release = fake_resolved_release();
-        let (next_root, next_usb) = update_metadata(
+        let (next_root, _next_usb) = update_metadata(
             &local,
             &release.identity,
             &release.app_version,
