@@ -64,7 +64,10 @@ def build_expected(root: Path) -> tuple[dict, str, str, int]:
             raise ValueError(f"duplicate manifest path: {key}")
         listed.add(key)
         entry["sha256"] = sha256(target)
-        entry["bytes"] = target.stat().st_size
+        # Store the same canonical byte length used by the SHA calculation.
+        # .gitattributes may materialize text as CRLF on Windows while Git's
+        # blob and the pack metadata are normalized to LF.
+        entry["bytes"] = len(canonical_bytes(target))
 
     actual = {
         path.relative_to(root).as_posix()

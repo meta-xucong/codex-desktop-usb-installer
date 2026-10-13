@@ -53,24 +53,54 @@ $env:MEDIA_GENERATION_DATA_DIR = $dataRoot
 # into Codex TOML, a command line, or a plaintext connection file.
 $connectionPath = Join-Path $kitHome 'connections\media-generation.connection.json'
 $credentialPath = Join-Path $kitHome 'connections\media-generation.credential.dpapi'
-$credentialSource = if (-not [string]::IsNullOrWhiteSpace($env:MEDIA_GENERATION_API_KEY)) { 'process' } else { 'missing' }
-if (Test-Path -LiteralPath $connectionPath -PathType Leaf) {
+$hasPersistentConnection = Test-Path -LiteralPath $connectionPath -PathType Leaf
+$hasPersistentCredential = Test-Path -LiteralPath $credentialPath -PathType Leaf
+$launchTuple = @{
+    baseUrl = [string]$env:MEDIA_GENERATION_API_BASE_URL
+    profile = [string]$env:MEDIA_GENERATION_API_PROFILE
+    apiKey = [string]$env:MEDIA_GENERATION_API_KEY
+}
+$hasSignedLaunchTuple = (-not $CredentialCheck) -and ([string]$env:MEDIA_GENERATION_SIGNED_LAUNCH -ceq '1') -and
+    -not [string]::IsNullOrWhiteSpace($launchTuple.baseUrl) -and
+    -not [string]::IsNullOrWhiteSpace($launchTuple.profile) -and
+    -not [string]::IsNullOrWhiteSpace($launchTuple.apiKey)
+# Never let ambient values leak through independently. Only the complete tuple
+# explicitly marked by the USB launcher can be restored as a process credential.
+foreach ($name in @('MEDIA_GENERATION_API_BASE_URL','MEDIA_GENERATION_API_PROFILE','MEDIA_GENERATION_API_KEY')) {
+    [Environment]::SetEnvironmentVariable($name, $null, 'Process')
+}
+$credentialSource = 'missing'
+$connectionValid = $false
+if ($hasPersistentConnection) {
     try {
         $connection = Get-Content -LiteralPath $connectionPath -Raw -Encoding UTF8 | ConvertFrom-Json
-        if ([int]$connection.schemaVersion -eq 1 -and [string]::IsNullOrWhiteSpace($env:MEDIA_GENERATION_API_BASE_URL)) {
+        if ([int]$connection.schemaVersion -eq 1) {
             $base = [Uri]([string]$connection.apiBaseUrl)
-            if ($base.Scheme -eq 'https' -and -not $base.UserInfo -and -not $base.Query -and -not $base.Fragment) {
-                $env:MEDIA_GENERATION_API_BASE_URL = $base.AbsoluteUri.TrimEnd('/')
+            $profile = [string]$connection.apiProfile
+            if ($base.Scheme -eq 'https' -and -not $base.UserInfo -and -not $base.Query -and -not $base.Fragment -and $profile -in @('auto','legacy','wokey','responses')) {
+                $savedBase = $base.AbsoluteUri.TrimEnd('/')
+                $connectionValid = $true
+            } else {
+                throw 'connection_tuple_invalid'
             }
-        }
-        if ([int]$connection.schemaVersion -eq 1 -and [string]::IsNullOrWhiteSpace($env:MEDIA_GENERATION_API_PROFILE)) {
-            $env:MEDIA_GENERATION_API_PROFILE = [string]$connection.apiProfile
+        } else {
+            throw 'connection_schema_invalid'
         }
     } catch {
         [Console]::Error.WriteLine('Media MCP connection settings could not be read; API calls remain disabled.')
     }
 }
-if ([string]::IsNullOrWhiteSpace($env:MEDIA_GENERATION_API_KEY) -and (Test-Path -LiteralPath $credentialPath -PathType Leaf)) {
+if ($connectionValid) {
+    $env:MEDIA_GENERATION_API_BASE_URL = $savedBase
+    $env:MEDIA_GENERATION_API_PROFILE = $profile
+    if ($hasSignedLaunchTuple -and
+        $launchTuple.baseUrl.TrimEnd('/') -ieq $savedBase -and
+        $launchTuple.profile -ceq $profile) {
+        $env:MEDIA_GENERATION_API_KEY = $launchTuple.apiKey
+        $credentialSource = 'signed-usb-launch'
+    }
+}
+if ($connectionValid -and $hasPersistentCredential) {
     try {
         Add-Type -AssemblyName System.Security
         $blob = [IO.File]::ReadAllBytes($credentialPath)
@@ -90,6 +120,17 @@ if ([string]::IsNullOrWhiteSpace($env:MEDIA_GENERATION_API_KEY) -and (Test-Path 
         $failureCode = if ($_.Exception.InnerException) { $_.Exception.InnerException.HResult } else { $_.Exception.HResult }
         [Console]::Error.WriteLine(('Media MCP credential is unavailable for this Windows user ({0}, 0x{1:X8}); API calls remain disabled.' -f $failureType, $failureCode))
     }
+} elseif (-not $hasPersistentConnection -and $hasSignedLaunchTuple) {
+    # The USB's signed license is the portable credential source. This path is
+    # accepted only when all three values came together with the launcher marker.
+    $candidateBase = $null
+    try { $candidateBase = [Uri]$launchTuple.baseUrl } catch { }
+    if ($candidateBase -and $candidateBase.Scheme -eq 'https' -and -not $candidateBase.UserInfo -and -not $candidateBase.Query -and -not $candidateBase.Fragment -and $launchTuple.profile -in @('auto','legacy','wokey','responses')) {
+        $env:MEDIA_GENERATION_API_BASE_URL = $candidateBase.AbsoluteUri.TrimEnd('/')
+        $env:MEDIA_GENERATION_API_PROFILE = $launchTuple.profile
+        $env:MEDIA_GENERATION_API_KEY = $launchTuple.apiKey
+        $credentialSource = 'signed-usb-launch'
+    }
 }
 try {
     $userEnvironment = Get-ItemProperty -LiteralPath 'HKCU:\Environment' -ErrorAction Stop
@@ -108,6 +149,7 @@ if ($CredentialCheck) {
     [ordered]@{
         baseUrlConfigured = -not [string]::IsNullOrWhiteSpace($env:MEDIA_GENERATION_API_BASE_URL)
         apiKeyConfigured = -not [string]::IsNullOrWhiteSpace($env:MEDIA_GENERATION_API_KEY)
+        apiProfile = [string]$env:MEDIA_GENERATION_API_PROFILE
         configuredModelCount = $configuredModels
         credentialSource = $credentialSource
     } | ConvertTo-Json -Compress

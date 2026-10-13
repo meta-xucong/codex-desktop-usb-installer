@@ -105,16 +105,28 @@ if (Test-Path -LiteralPath $configPath -PathType Leaf) {
 }
 $tempPath = $configPath + '.tmp-' + [guid]::NewGuid().ToString('N')
 try {
-    Set-Content -LiteralPath $tempPath -Value $newContent -Encoding UTF8
+    $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+    [System.IO.File]::WriteAllText($tempPath, $newContent, $utf8NoBom)
+    if ([string]::IsNullOrWhiteSpace($PythonExe)) {
+        $bundledPython = Join-Path $KitHome 'runtime\python-env\Scripts\python.exe'
+        if (Test-Path -LiteralPath $bundledPython -PathType Leaf) { $PythonExe = $bundledPython }
+    }
     if ([string]::IsNullOrWhiteSpace($PythonExe)) {
         $candidate = Get-Command python -ErrorAction SilentlyContinue
         if ($candidate) { $PythonExe = $candidate.Source }
     }
-    if (-not [string]::IsNullOrWhiteSpace($PythonExe) -and (Test-Path -LiteralPath $PythonExe -PathType Leaf)) {
-        & $PythonExe -c "import pathlib,sys,tomllib; tomllib.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8-sig'))" $tempPath
-        if ($LASTEXITCODE -ne 0) { throw 'Merged Codex config failed TOML validation.' }
+    if ([string]::IsNullOrWhiteSpace($PythonExe) -or -not (Test-Path -LiteralPath $PythonExe -PathType Leaf)) {
+        throw 'Cannot safely merge Codex config without a Python TOML validator; the existing config was preserved.'
     }
-    Move-Item -LiteralPath $tempPath -Destination $configPath -Force
+    & $PythonExe -c "import pathlib,sys,tomllib; data=pathlib.Path(sys.argv[1]).read_bytes(); assert not data.startswith(bytes.fromhex('efbbbf')), 'UTF-8 BOM is not allowed'; tomllib.loads(data.decode('utf-8'))" $tempPath
+    if ($LASTEXITCODE -ne 0) { throw 'Merged Codex config failed strict UTF-8/TOML validation; the existing config was preserved.' }
+    if (Test-Path -LiteralPath $configPath -PathType Leaf) {
+        $atomicBackupPath = $configPath + '.replace-' + [guid]::NewGuid().ToString('N')
+        [System.IO.File]::Replace($tempPath, $configPath, $atomicBackupPath, $true)
+        Remove-Item -LiteralPath $atomicBackupPath -Force -ErrorAction SilentlyContinue
+    } else {
+        [System.IO.File]::Move($tempPath, $configPath)
+    }
 }
 finally {
     if (Test-Path -LiteralPath $tempPath -PathType Leaf) { Remove-Item -LiteralPath $tempPath -Force }

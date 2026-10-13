@@ -21,6 +21,8 @@ use crate::errors::AppError;
 const PACK_DIRECTORY: &str = "codex-starter-kit";
 const PACK_ID: &str = "codex-starter";
 const READINESS_RELATIVE: &str = ".codex/codex-agent-kit/readiness.json";
+const MEDIA_AUTHORIZATION_RELATIVE: &str =
+    ".codex/codex-agent-kit/connections/media-generation.authorization.json";
 const CONNECTION_OWNERSHIP_RELATIVE: &str = ".codex/codex-agent-kit/connection-ownership.json";
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -316,6 +318,8 @@ struct ReadinessSummary {
     media_runtime_status: String,
     media_protocol_status: String,
     media_registered: bool,
+    media_enabled: bool,
+    media_authorization_status: String,
     media_gateway_catalog_status: String,
     media_gateway_model_count: usize,
     media_gateway_catalog_verified_at: Option<String>,
@@ -398,6 +402,11 @@ fn readiness_summary(profile: &Path) -> ReadinessSummary {
             .pointer("/connections/mediaGeneration/registered")
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
+        media_enabled: value
+            .pointer("/connections/mediaGeneration/enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        media_authorization_status: read_media_authorization_status(profile),
         media_gateway_catalog_status: value
             .pointer("/connections/mediaGeneration/gatewayCatalog")
             .and_then(|v| v.as_str())
@@ -442,7 +451,8 @@ fn readiness_summary(profile: &Path) -> ReadinessSummary {
 mod tests {
     use super::{
         core_ready_from_readiness, media_install_ready, media_install_switch,
-        persist_connection_ownership, readiness_summary, strip_utf8_bom, validate_options,
+        legacy_media_names_owned, persist_connection_ownership, readiness_summary,
+        strip_utf8_bom, validate_options, write_media_authorization_status,
         CapabilityPackInstallOptions, ConnectionOwnershipRecord,
         CONNECTION_OWNERSHIP_RELATIVE, PACK_ID,
     };
@@ -500,24 +510,42 @@ mod tests {
         let kit = profile.join(".codex/codex-agent-kit");
         let readiness_path = kit.join("readiness.json");
         let bin = kit.join("bin");
+        let connections = kit.join("connections");
         fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&connections).unwrap();
         fs::write(bin.join("start-media-generation-mcp.ps1"), "wrapper").unwrap();
         fs::write(bin.join("media-generation-mcp.py"), "server").unwrap();
+        fs::write(connections.join("media-generation.connection.json"), "connection").unwrap();
+        fs::write(connections.join("media-generation.credential.dpapi"), "credential").unwrap();
         fs::write(
             &readiness_path,
             serde_json::to_vec(&json!({
                 "connections": {"mediaGeneration": {
                     "runtime": "passed",
                     "protocol": "passed",
-                    "registered": true
+                    "registered": true,
+                    "enabled": true
                 }}
             }))
             .unwrap(),
         )
         .unwrap();
 
+        write_media_authorization_status(&profile, "verified").unwrap();
         let readiness = readiness_summary(&profile);
         assert!(media_install_ready(&readiness, &profile));
+        let mut pending_authorization = readiness.clone();
+        pending_authorization.media_authorization_status = "pending".to_string();
+        assert!(!media_install_ready(&pending_authorization, &profile));
+        write_media_authorization_status(&profile, "pending").unwrap();
+        let refreshed = readiness_summary(&profile);
+        assert_eq!(refreshed.media_authorization_status, "pending");
+        assert!(!media_install_ready(&refreshed, &profile));
+        write_media_authorization_status(&profile, "verified").unwrap();
+        assert!(media_install_ready(&readiness_summary(&profile), &profile));
+        let mut stale_schema = readiness.clone();
+        stale_schema.media_enabled = false;
+        assert!(!media_install_ready(&stale_schema, &profile));
         let mut unregistered = readiness.clone();
         unregistered.media_registered = false;
         assert!(!media_install_ready(&unregistered, &profile));
@@ -525,6 +553,9 @@ mod tests {
         unhealthy.media_protocol_status = "failed".to_string();
         assert!(!media_install_ready(&unhealthy, &profile));
         fs::remove_file(bin.join("media-generation-mcp.py")).unwrap();
+        assert!(!media_install_ready(&readiness, &profile));
+        fs::write(bin.join("media-generation-mcp.py"), "server").unwrap();
+        fs::remove_file(connections.join("media-generation.credential.dpapi")).unwrap();
         assert!(!media_install_ready(&readiness, &profile));
         let _ = fs::remove_dir_all(profile);
     }
@@ -577,6 +608,29 @@ mod tests {
     }
 
     #[test]
+    fn legacy_media_migration_only_removes_names_owned_by_this_pack() {
+        let record = ConnectionOwnershipRecord {
+            schema_version: 1,
+            pack_id: PACK_ID.to_string(),
+            names: vec![
+                "MEDIA_GENERATION_API_KEY".to_string(),
+                "MEDIA_GENERATION_API_PROFILE".to_string(),
+                "USER_CUSTOM_VALUE".to_string(),
+            ],
+            note: String::new(),
+        };
+        assert_eq!(
+            legacy_media_names_owned(&record),
+            vec!["MEDIA_GENERATION_API_PROFILE", "MEDIA_GENERATION_API_KEY"]
+        );
+        let foreign = ConnectionOwnershipRecord {
+            pack_id: "another-pack".to_string(),
+            ..record
+        };
+        assert!(legacy_media_names_owned(&foreign).is_empty());
+    }
+
+    #[test]
     fn minimax_video_uses_the_shared_media_connection_only() {
         let options = CapabilityPackInstallOptions {
             enable_media_generation: true,
@@ -612,12 +666,78 @@ fn overall_status(core_ready: bool, runtime_status: &str, config_status: &str) -
 fn media_install_ready(readiness: &ReadinessSummary, profile: &Path) -> bool {
     let kit_home = profile.join(".codex/codex-agent-kit");
     readiness.media_registered
+        && readiness.media_enabled
+        && readiness.media_authorization_status == "verified"
         && readiness.media_runtime_status == "passed"
         && readiness.media_protocol_status == "passed"
         && kit_home
             .join("bin/start-media-generation-mcp.ps1")
             .is_file()
         && kit_home.join("bin/media-generation-mcp.py").is_file()
+        && kit_home
+            .join("connections/media-generation.connection.json")
+            .is_file()
+        && kit_home
+            .join("connections/media-generation.credential.dpapi")
+            .is_file()
+}
+
+fn write_media_authorization_status(profile: &Path, status: &str) -> Result<(), AppError> {
+    if !matches!(status, "pending" | "verified" | "failed" | "not-required") {
+        return Err(AppError::Engine("媒体授权状态无效".to_string()));
+    }
+    let path = profile.join(MEDIA_AUTHORIZATION_RELATIVE);
+    if path.exists() && is_reparse_point(&path) {
+        return Err(AppError::Engine(
+            "媒体授权状态文件不能是符号链接或重解析点".to_string(),
+        ));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| AppError::Engine("无法确定媒体授权状态目录".to_string()))?;
+    fs::create_dir_all(parent)
+        .map_err(|error| AppError::Engine(format!("创建媒体授权状态目录失败: {error}")))?;
+    if is_reparse_point(parent) {
+        return Err(AppError::Engine(
+            "媒体授权状态目录不能是符号链接或重解析点".to_string(),
+        ));
+    }
+    let value = serde_json::json!({
+        "schemaVersion": 1,
+        "packId": PACK_ID,
+        "status": status,
+    });
+    let encoded = serde_json::to_vec_pretty(&value)
+        .map_err(|error| AppError::Engine(format!("编码媒体授权状态失败: {error}")))?;
+    crate::app::atomic_file::write_atomic(&path, &encoded)
+        .map_err(|error| AppError::Engine(format!("保存媒体授权状态失败: {error}")))
+}
+
+fn read_media_authorization_status(profile: &Path) -> String {
+    let path = profile.join(MEDIA_AUTHORIZATION_RELATIVE);
+    let Ok(metadata) = fs::symlink_metadata(&path) else {
+        return "unknown".to_string();
+    };
+    if !metadata.is_file() || is_reparse_point(&path) || metadata.len() > 4096 {
+        return "unknown".to_string();
+    }
+    let Ok(bytes) = fs::read(path) else {
+        return "unknown".to_string();
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(strip_utf8_bom(&bytes)) else {
+        return "unknown".to_string();
+    };
+    if value.get("schemaVersion").and_then(|v| v.as_u64()) != Some(1)
+        || value.get("packId").and_then(|v| v.as_str()) != Some(PACK_ID)
+    {
+        return "unknown".to_string();
+    }
+    value
+        .get("status")
+        .and_then(|v| v.as_str())
+        .filter(|status| matches!(*status, "pending" | "verified" | "failed" | "not-required"))
+        .unwrap_or("unknown")
+        .to_string()
 }
 
 fn media_install_switch(enabled: bool) -> &'static str {
@@ -678,11 +798,17 @@ pub fn status(app: &AppHandle) -> Result<CapabilityPackReport, AppError> {
         && readiness.core_ready
         && readiness.pack_version.as_deref() == Some(version.as_str());
     let runtime_ready = installed && readiness.runtime_status == "ready";
-    let status = overall_status(
-        installed,
-        &readiness.runtime_status,
-        &readiness.config_status,
-    );
+    let media_needs_auth = readiness.media_enabled || readiness.media_registered;
+    let media_auth_live = !readiness.media_enabled
+        || crate::app::media_generation::verify_authorized_local_connection().is_ok();
+    let effective_config_status = if media_needs_auth
+        && (readiness.media_authorization_status != "verified" || !media_auth_live)
+    {
+        "partial"
+    } else {
+        readiness.config_status.as_str()
+    };
+    let status = overall_status(installed, &readiness.runtime_status, effective_config_status);
     Ok(CapabilityPackReport {
         available: true,
         installed,
@@ -890,6 +1016,52 @@ fn update_user_environment(_values: &[(&str, &str)]) -> Result<(), AppError> {
     Err(AppError::UnsupportedPlatform)
 }
 
+#[cfg(target_os = "windows")]
+fn remove_owned_user_environment(names: &[&str]) -> Result<(), AppError> {
+    use windows_sys::Win32::System::Registry::*;
+    struct Key(HKEY);
+    impl Drop for Key {
+        fn drop(&mut self) {
+            unsafe { RegCloseKey(self.0) };
+        }
+    }
+    let subkey: Vec<u16> = "Environment\0".encode_utf16().collect();
+    let mut handle = std::ptr::null_mut();
+    let status = unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            0,
+            KEY_SET_VALUE,
+            &mut handle,
+        )
+    };
+    if status == 2 {
+        return Ok(());
+    }
+    if status != 0 {
+        return Err(AppError::Engine(format!(
+            "读取当前用户环境变量失败（Win32 {status}）"
+        )));
+    }
+    let _key = Key(handle);
+    for name in names {
+        let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        let status = unsafe { RegDeleteValueW(handle, wide.as_ptr()) };
+        if status != 0 && status != 2 {
+            return Err(AppError::Engine(format!(
+                "清理旧媒体环境变量 {name} 失败（Win32 {status}）"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn remove_owned_user_environment(_names: &[&str]) -> Result<(), AppError> {
+    Err(AppError::UnsupportedPlatform)
+}
+
 fn persist_connection_ownership(profile: &Path, names: &[&str]) -> Result<(), AppError> {
     let ownership_path = profile.join(CONNECTION_OWNERSHIP_RELATIVE);
     let ownership_parent = ownership_path
@@ -949,6 +1121,58 @@ fn persist_connection_ownership(profile: &Path, names: &[&str]) -> Result<(), Ap
         .map_err(|error| AppError::Engine(format!("生成连接所有权记录失败: {error}")))?;
     fs::write(&ownership_path, bytes)
         .map_err(|error| AppError::Engine(format!("写入连接所有权记录失败: {error}")))
+}
+
+fn migrate_legacy_media_environment(profile: &Path) -> Result<(), AppError> {
+    let ownership_path = profile.join(CONNECTION_OWNERSHIP_RELATIVE);
+    if !ownership_path.is_file() {
+        return Ok(());
+    }
+    if is_reparse_point(&ownership_path) {
+        return Err(AppError::Engine(
+            "连接所有权记录不能是符号链接或重解析点".to_string(),
+        ));
+    }
+    let bytes = fs::read(&ownership_path)
+        .map_err(|error| AppError::Engine(format!("读取连接所有权记录失败: {error}")))?;
+    if bytes.len() > 64 * 1024 {
+        return Err(AppError::Engine("连接所有权记录超过大小限制".to_string()));
+    }
+    let value = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes);
+    let mut record: ConnectionOwnershipRecord = serde_json::from_slice(value)
+        .map_err(|error| AppError::Engine(format!("连接所有权记录 JSON 无效: {error}")))?;
+    if record.schema_version != 1 || record.pack_id != PACK_ID {
+        return Ok(());
+    }
+    let owned = legacy_media_names_owned(&record);
+    if owned.is_empty() {
+        return Ok(());
+    }
+    remove_owned_user_environment(&owned)?;
+    for name in &owned {
+        std::env::remove_var(name);
+    }
+    record
+        .names
+        .retain(|name| !owned.iter().any(|owned_name| name == owned_name));
+    let encoded = serde_json::to_vec_pretty(&record)
+        .map_err(|error| AppError::Engine(format!("编码连接所有权记录失败: {error}")))?;
+    crate::app::atomic_file::write_atomic(&ownership_path, &encoded)
+        .map_err(|error| AppError::Engine(format!("更新连接所有权记录失败: {error}")))
+}
+
+fn legacy_media_names_owned(record: &ConnectionOwnershipRecord) -> Vec<&'static str> {
+    if record.schema_version != 1 || record.pack_id != PACK_ID {
+        return Vec::new();
+    }
+    [
+        "MEDIA_GENERATION_API_BASE_URL",
+        "MEDIA_GENERATION_API_PROFILE",
+        "MEDIA_GENERATION_API_KEY",
+    ]
+    .into_iter()
+    .filter(|name| record.names.iter().any(|existing| existing == name))
+    .collect()
 }
 
 fn persist_configured_environment(
@@ -1040,6 +1264,9 @@ pub fn install(
         user_profile()?.display()
     );
     let profile = user_profile()?;
+    if options.enable_media_generation {
+        migrate_legacy_media_environment(&profile)?;
+    }
     let mut command = Command::new("powershell.exe");
     command
         .current_dir(&source)
@@ -1114,37 +1341,20 @@ pub fn install(
         &options.dashscope_base_url,
     );
     add_env(&mut command, "DASHSCOPE_MODEL", &options.dashscope_model);
-    add_env(
-        &mut command,
-        "MEDIA_GENERATION_API_PROFILE",
-        &options.media_generation_api_profile,
-    );
-    add_env(
-        &mut command,
-        "MEDIA_GENERATION_AGENT_ID",
-        &options.media_generation_agent_id,
-    );
-    add_env(&mut command, "MEDIA_IMAGE2_MODEL", &options.image2_model);
-    add_env(
-        &mut command,
-        "MEDIA_GROK_IMAGE_MODEL",
-        &options.grok_image_model,
-    );
-    add_env(
-        &mut command,
-        "MEDIA_GROK_VIDEO_MODEL",
-        &options.grok_video_model,
-    );
-    add_env(
-        &mut command,
-        "MEDIA_SEEDANCE_MODEL",
-        &options.seedance_model,
-    );
-    add_env(
-        &mut command,
-        "MEDIA_MINIMAX_VIDEO_MODEL",
-        &options.minimax_video_model,
-    );
+    // These settings are a complete manager-owned snapshot. Explicit empty
+    // values prevent an inherited route from an older install being reused.
+    command
+        .env("MEDIA_GENERATION_API_PROFILE", &options.media_generation_api_profile)
+        .env("MEDIA_GENERATION_AGENT_ID", &options.media_generation_agent_id)
+        .env("MEDIA_IMAGE2_MODEL", &options.image2_model)
+        .env("MEDIA_GROK_IMAGE_MODEL", &options.grok_image_model)
+        .env("MEDIA_GROK_VIDEO_MODEL", &options.grok_video_model)
+        .env("MEDIA_SEEDANCE_MODEL", &options.seedance_model)
+        .env("MEDIA_MINIMAX_VIDEO_MODEL", &options.minimax_video_model)
+        // Credentials and endpoint are loaded only from the protected local
+        // connection tuple after the installer exits.
+        .env_remove("MEDIA_GENERATION_API_BASE_URL")
+        .env_remove("MEDIA_GENERATION_API_KEY");
 
     let output = command.output().map_err(|error| {
         log::error!(
@@ -1181,17 +1391,32 @@ pub fn install(
         source.display(),
         pack_version
     );
-    persist_configured_environment(&options, &profile)?;
-    if options.enable_media_generation {
-        crate::app::media_generation::sync_authorized_local_connection().map_err(|error| {
-            log::error!("media MCP credential persistence failed: {error}");
-            AppError::Engine(format!("媒体 MCP 授权同步失败：{error}"))
-        })?;
-        crate::app::media_generation::verify_authorized_local_connection().map_err(|error| {
-            log::error!("media MCP credential verification failed: {error}");
-            AppError::Engine(format!("媒体 MCP 授权自检失败：{error}"))
-        })?;
+    let authorization_result = (|| {
+        persist_configured_environment(&options, &profile)?;
+        if options.enable_media_generation {
+            crate::app::media_generation::sync_authorized_local_connection().map_err(|error| {
+                log::error!("media MCP credential persistence failed: {error}");
+                AppError::Engine(format!("媒体 MCP 授权同步失败：{error}"))
+            })?;
+            crate::app::media_generation::verify_authorized_local_connection().map_err(|error| {
+                log::error!("media MCP credential verification failed: {error}");
+                AppError::Engine(format!("媒体 MCP 授权自检失败：{error}"))
+            })?;
+        }
+        Ok::<(), AppError>(())
+    })();
+    let authorization_status = if !options.enable_media_generation {
+        "not-required"
+    } else if authorization_result.is_ok() {
+        "verified"
+    } else {
+        "failed"
+    };
+    if let Err(error) = write_media_authorization_status(&profile, authorization_status) {
+        log::error!("media MCP authorization readiness update failed: {error}");
+        return Err(error);
     }
+    authorization_result?;
     let readiness = readiness_summary(&profile);
     let installed = readiness.pack_identity_valid
         && readiness.core_ready
@@ -1238,11 +1463,14 @@ pub fn install(
         )));
     }
     let runtime_ready = readiness.runtime_status == "ready";
-    let status = overall_status(
-        installed,
-        &readiness.runtime_status,
-        &readiness.config_status,
-    );
+    let effective_config_status = if options.enable_media_generation
+        && readiness.media_authorization_status != "verified"
+    {
+        "partial"
+    } else {
+        readiness.config_status.as_str()
+    };
+    let status = overall_status(installed, &readiness.runtime_status, effective_config_status);
     let enabled_api_services = options.enabled_api_services.clone();
     Ok(CapabilityPackReport {
         available: true,

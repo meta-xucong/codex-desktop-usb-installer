@@ -86,11 +86,14 @@ export function OfflineComponentsSheet({
   const [statusLoading, setStatusLoading] = useState(false);
   const [mediaCatalogLoading, setMediaCatalogLoading] = useState(false);
   const [mediaCatalogError, setMediaCatalogError] = useState<string | null>(null);
+  const [maintenanceSettingsLoading, setMaintenanceSettingsLoading] = useState(false);
+  const [maintenanceSettingsError, setMaintenanceSettingsError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [packReport, setPackReport] = useState<CapabilityPackReport | null>(null);
   const [ccswitchReport, setCcswitchReport] = useState<CcswitchLaunchReport | null>(null);
   const statusRequestRef = useRef(0);
   const mediaCatalogRequestRef = useRef(0);
+  const maintenanceSettingsRequestRef = useRef(0);
   const mediaAdvancedRef = useRef<HTMLDetailsElement>(null);
 
   useEffect(() => {
@@ -127,15 +130,37 @@ export function OfflineComponentsSheet({
     try {
       const catalog = await managerApi.mediaModelCatalog();
       if (mediaCatalogRequestRef.current !== requestId) return;
-      const selected = selectMediaModels(catalog.models);
+      // Seedance requires an account-specific route ID. Do not auto-select an
+      // un-routed model from /v1/models; only restore a route explicitly
+      // configured by the user and still present upstream.
+      const selected = selectMediaModels(catalog.models, { includeSeedance: false });
+      const configuredSeedanceModel = catalog.configuredSeedanceModel?.trim() ?? "";
+      const configuredAgentId = catalog.configuredAgentId?.trim() ?? "";
+      if (
+        configuredSeedanceModel &&
+        configuredAgentId &&
+        catalog.models.includes(configuredSeedanceModel)
+      ) {
+        selected.seedanceModel = configuredSeedanceModel;
+        selected.mediaGenerationAgentId = configuredAgentId;
+      }
       setForm((current) => ({
         ...current,
         ...selected,
         mediaGatewayCatalogStatus: "verified",
         mediaGatewayModelCount: catalog.models.length,
         mediaGatewayCatalogVerifiedAt: new Date().toISOString(),
-        mediaGenerationAgentId: selected.seedanceModel ? current.mediaGenerationAgentId : "",
+        mediaGenerationAgentId: selected.mediaGenerationAgentId,
       }));
+      const hasSupportedRoute = Boolean(
+        selected.image2Model ||
+        selected.grokImageModel ||
+        selected.grokVideoModel ||
+        (selected.seedanceModel && selected.mediaGenerationAgentId),
+      );
+      if (!hasSupportedRoute) {
+        setEnabled((current) => ({ ...current, "media-generation": false }));
+      }
     } catch (cause) {
       if (mediaCatalogRequestRef.current !== requestId) return;
       setForm((current) => ({
@@ -155,6 +180,44 @@ export function OfflineComponentsSheet({
       if (mediaCatalogRequestRef.current === requestId) setMediaCatalogLoading(false);
     }
   }, []);
+
+  useEffect(() => {
+    const requestId = maintenanceSettingsRequestRef.current + 1;
+    maintenanceSettingsRequestRef.current = requestId;
+    if (!open || view !== "maintenance") {
+      setMaintenanceSettingsLoading(false);
+      setMaintenanceSettingsError(null);
+      return;
+    }
+
+    setMaintenanceSettingsLoading(true);
+    setMaintenanceSettingsError(null);
+    void managerApi
+      .mediaModelSettings()
+      .then((settings) => {
+        if (maintenanceSettingsRequestRef.current !== requestId) return;
+        setForm((current) => ({
+          ...current,
+          mediaGenerationAgentId: settings.mediaGenerationAgentId,
+          image2Model: settings.image2Model,
+          grokImageModel: settings.grokImageModel,
+          grokVideoModel: settings.grokVideoModel,
+          seedanceModel: settings.seedanceModel,
+          minimaxVideoModel: settings.minimaxVideoModel,
+        }));
+      })
+      .catch((cause) => {
+        if (maintenanceSettingsRequestRef.current === requestId) {
+          setMaintenanceSettingsError(errorMessage(cause));
+        }
+      })
+      .finally(() => {
+        if (maintenanceSettingsRequestRef.current === requestId) setMaintenanceSettingsLoading(false);
+      });
+    return () => {
+      if (maintenanceSettingsRequestRef.current === requestId) maintenanceSettingsRequestRef.current += 1;
+    };
+  }, [open, view]);
 
   const mediaGenerationEnabled = enabled["media-generation"];
 
@@ -189,6 +252,9 @@ export function OfflineComponentsSheet({
   }, [mediaNeedsRouteId]);
 
   const validate = (): string | null => {
+    if (view === "maintenance" && maintenanceSettingsError) {
+      return t("offline.components.maintenanceSettingsUnavailable");
+    }
     if (enabled.feishu && (!form.feishuAppId.trim() || !form.feishuAppSecret.trim())) {
       return t("offline.components.validationFeishu");
     }
@@ -207,6 +273,14 @@ export function OfflineComponentsSheet({
       }
       if (mediaNeedsRouteId && !form.mediaGenerationAgentId.trim()) {
         return t("offline.components.validationMediaRoute");
+      }
+      if (
+        !form.image2Model.trim() &&
+        !form.grokImageModel.trim() &&
+        !form.grokVideoModel.trim() &&
+        !(form.seedanceModel.trim() && form.mediaGenerationAgentId.trim())
+      ) {
+        return t("offline.components.validationMedia");
       }
     }
     return null;
@@ -228,6 +302,10 @@ export function OfflineComponentsSheet({
     try {
       const report = await managerApi.installCapabilityPack({
         ...form,
+        // Maintenance repairs the pack, not user connections. Keep the saved
+        // media route fields in the request for config rendering, while
+        // explicitly preventing credential persistence/clearing.
+        persistConnections: view === "connections" && form.persistConnections,
         enableFeishu: enabled.feishu,
         enableMediaGeneration: enabled["media-generation"],
         enabledApiServices: API_SERVICE_KEYS.filter((service) => enabled[service]),
@@ -477,6 +555,12 @@ export function OfflineComponentsSheet({
         ) : (
           <div className="component-maintenance-panel">
             <p className="component-note">{t("offline.components.maintenanceBody")}</p>
+            {maintenanceSettingsLoading ? (
+              <small role="status">{t("offline.components.maintenanceSettingsLoading")}</small>
+            ) : null}
+            {maintenanceSettingsError ? (
+              <small role="alert">{t("offline.components.maintenanceSettingsUnavailable")}</small>
+            ) : null}
             <div className="component-separate-action">
               <div>
                 <strong>{t("offline.components.ccswitchTitle")}</strong>
@@ -546,7 +630,13 @@ export function OfflineComponentsSheet({
           <button
             className="btn primary"
             onClick={() => void installPack()}
-            disabled={busy !== null || statusLoading || (view === "connections" && enabled["media-generation"] && mediaCatalogLoading)}
+            disabled={
+              busy !== null ||
+              statusLoading ||
+              maintenanceSettingsLoading ||
+              (view === "maintenance" && Boolean(maintenanceSettingsError)) ||
+              (view === "connections" && enabled["media-generation"] && mediaCatalogLoading)
+            }
           >
             {busy === "pack" ? <Icon name="loader" className="spinicon" /> : <Icon name="download" />}
             {busy === "pack"

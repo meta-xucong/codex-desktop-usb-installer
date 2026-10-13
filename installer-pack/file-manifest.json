@@ -102,8 +102,8 @@
     },
     {
       "path": "configure-codex.ps1",
-      "sha256": "f675461253422de62b98b08d7af9947c94c6ee85ec7adb505cb37313d7174150",
-      "bytes": 6047,
+      "sha256": "d3286a50f694223656ae26581d5228928e5583217dc259c46a700a00004972e3",
+      "bytes": 6913,
       "owned": true
     },
     {
@@ -150,14 +150,14 @@
     },
     {
       "path": "install-all.ps1",
-      "sha256": "e6c2684293079cb125c09865ca7c72b920e79d65b6f23fc9f363929ce6b4efcf",
-      "bytes": 1955,
+      "sha256": "d363802ae55bc8034d6e7e4814affc62377648ef84dd8e5756f5d8ba9bd037de",
+      "bytes": 2717,
       "owned": true
     },
     {
       "path": "install-to-codex.ps1",
-      "sha256": "e0c85592f4e001649bad43e3d8bccc7908ac67bedfc98a8da9d920beff37950a",
-      "bytes": 57091,
+      "sha256": "1d6c5056af2b0d2dd6946e9d383442dcfe8fc6770668f1fa80334287de1a15b7",
+      "bytes": 57007,
       "owned": true
     },
     {
@@ -276,8 +276,8 @@
     },
     {
       "path": "mcp/media-generation-mcp.py",
-      "sha256": "4ac0ee6d235b4a9fdbea7cd64ac9f710fb397a4b17e3ccb1c7c869cd3327376a",
-      "bytes": 73974,
+      "sha256": "ed300e6efc978bf6a099f5a530d598a860334c17ee86ad55721af36ccbd7b969",
+      "bytes": 74045,
       "owned": true
     },
     {
@@ -294,8 +294,8 @@
     },
     {
       "path": "mcp/start-media-generation-mcp.ps1",
-      "sha256": "31d109aca37aae36efc9cf60eaa136a131b02c59921f8994098ad6c946d15762",
-      "bytes": 6822,
+      "sha256": "5c1c1c2d65c569630493905ef0183a443af251e63a9868ee48cd1d088fd1c96d",
+      "bytes": 8892,
       "owned": true
     },
     {
@@ -312,8 +312,8 @@
     },
     {
       "path": "render-codex-config.ps1",
-      "sha256": "9788e738316412ecea29fbaef3a05b622756c35196e148d64675b5d5e5fc38c6",
-      "bytes": 11110,
+      "sha256": "eeff4cffd1c2e3520c34ea8a62c8aea160eefba54ea2412aa145965199ad371c",
+      "bytes": 11994,
       "owned": true
     },
     {
@@ -1848,8 +1848,8 @@
     },
     {
       "path": "test-adapter-contracts.py",
-      "sha256": "60b15ddffe99becc111c0d360e22510e506ee84aabd86c7940e40053c4baa575",
-      "bytes": 84528,
+      "sha256": "377d60abb883080cabc7b2fd299f97452ba45c73ed31ae2b574f5cc66156e2c3",
+      "bytes": 95958,
       "owned": true
     }
   ]

@@ -439,6 +439,10 @@ def _confirmation_path(confirmation_id: str) -> Path:
     return _data_root() / "confirmations" / f"{confirmation_id}.json"
 
 
+def _uses_windows_mutex() -> bool:
+    return os.name == "nt"
+
+
 @contextlib.contextmanager
 def _confirmation_operation_lock(confirmation_id: str, operation: str):
     """Serialize submit/check/save across processes; OS releases lock on exit/crash."""
@@ -450,7 +454,7 @@ def _confirmation_operation_lock(confirmation_id: str, operation: str):
         local_lock = _CONFIRMATION_LOCKS.setdefault(lock_key, threading.Lock())
     if not local_lock.acquire(blocking=False):
         raise MediaError(f"该任务正在{operation}；请稍后重试，不要重复提交。")
-    if os.name == "nt":
+    if _uses_windows_mutex():
         import ctypes
 
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -497,7 +501,7 @@ def _confirmation_operation_lock(confirmation_id: str, operation: str):
         os.lseek(fd, 0, os.SEEK_SET)
         try:
             import fcntl
-            fcntl.flock(fd, fcntl.LOCK_EX, fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             acquired = True
         except OSError as exc:
             raise MediaError(f"该任务正在{operation}；请稍后重试，不要重复提交。") from exc

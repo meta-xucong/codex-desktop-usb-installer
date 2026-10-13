@@ -17,6 +17,7 @@ vi.mock("../../services/managerApi", async (importOriginal) => {
       installCapabilityPack: vi.fn(),
       installAndLaunchCcswitch: vi.fn(),
       mediaModelCatalog: vi.fn(),
+      mediaModelSettings: vi.fn(),
     },
   };
 });
@@ -116,6 +117,15 @@ describe("OfflineComponentsSheet", () => {
     });
     api.installAndLaunchCcswitch.mockResolvedValue(CCSWITCH_REPORT);
     api.mediaModelCatalog.mockResolvedValue({ models: ["gpt-image-2.5"] });
+    api.mediaModelSettings.mockResolvedValue({
+      licensedCredentialAvailable: true,
+      mediaGenerationAgentId: "",
+      image2Model: "gpt-image-2.5",
+      grokImageModel: "",
+      grokVideoModel: "",
+      seedanceModel: "",
+      minimaxVideoModel: "",
+    });
   });
 
   it("loads status and submits the selected Feishu configuration", async () => {
@@ -265,6 +275,95 @@ describe("OfflineComponentsSheet", () => {
     expect(submitted).not.toHaveProperty("mediaGenerationApiBaseUrl");
     expect(submitted).not.toHaveProperty("minimaxApiKey");
     expect(submitted).not.toHaveProperty("minimaxBaseUrl");
+  }, 30_000);
+
+  it("does not auto-enable an un-routed Seedance model and retains other discovered routes", async () => {
+    const user = userEvent.setup();
+    api.mediaModelCatalog.mockResolvedValueOnce({
+      models: ["gpt-image-2.5", "seedance-2.0"],
+    });
+    renderSheet();
+
+    await waitFor(() => expect(api.mediaModelCatalog).toHaveBeenCalledTimes(1));
+    await user.click(screen.getByRole("button", { name: "保存并应用连接" }));
+    await waitFor(() => expect(api.installCapabilityPack).toHaveBeenCalledTimes(1));
+    expect(api.installCapabilityPack.mock.calls[0]?.[0]).toMatchObject({
+      enableMediaGeneration: true,
+      image2Model: "gpt-image-2.5",
+      seedanceModel: "",
+      mediaGenerationAgentId: "",
+    });
+  }, 30_000);
+
+  it("restores a configured Seedance model only when its route ID is present", async () => {
+    const user = userEvent.setup();
+    api.mediaModelCatalog.mockResolvedValueOnce({
+      models: ["seedance-2.0"],
+      configuredSeedanceModel: "seedance-2.0",
+      configuredAgentId: "agent-route-42",
+    });
+    renderSheet();
+
+    await waitFor(() => expect(api.mediaModelCatalog).toHaveBeenCalledTimes(1));
+    await user.click(screen.getByRole("button", { name: "保存并应用连接" }));
+    await waitFor(() => expect(api.installCapabilityPack).toHaveBeenCalledTimes(1));
+    expect(api.installCapabilityPack.mock.calls[0]?.[0]).toMatchObject({
+      enableMediaGeneration: true,
+      seedanceModel: "seedance-2.0",
+      mediaGenerationAgentId: "agent-route-42",
+    });
+  }, 30_000);
+
+  it("does not submit media enabled when the upstream has no supported media routes", async () => {
+    const user = userEvent.setup();
+    api.mediaModelCatalog.mockResolvedValueOnce({ models: ["gpt-4o", "claude-opus-4-8"] });
+    renderSheet();
+
+    await waitFor(() => expect(api.mediaModelCatalog).toHaveBeenCalledTimes(1));
+    expect(screen.getByRole("checkbox", { name: "图片与视频生成（本地 MCP）" })).not.toBeChecked();
+    await user.click(screen.getByRole("button", { name: "保存并应用连接" }));
+    await waitFor(() => expect(api.installCapabilityPack).toHaveBeenCalledTimes(1));
+    expect(api.installCapabilityPack.mock.calls[0]?.[0]).toMatchObject({
+      enableMediaGeneration: false,
+      image2Model: "",
+      grokImageModel: "",
+      grokVideoModel: "",
+      seedanceModel: "",
+    });
+  }, 30_000);
+
+  it("restores saved media routes during maintenance and does not persist empty connections", async () => {
+    const user = userEvent.setup();
+    api.mediaModelSettings.mockResolvedValueOnce({
+      licensedCredentialAvailable: true,
+      mediaGenerationAgentId: "agent-route-42",
+      image2Model: "gpt-image-2.5",
+      grokImageModel: "grok-imagine-image",
+      grokVideoModel: "grok-video-2",
+      seedanceModel: "seedance-2.0",
+      minimaxVideoModel: "",
+    });
+    renderSheet(true, "maintenance");
+
+    await waitFor(() => expect(api.mediaModelSettings).toHaveBeenCalledTimes(1));
+    await user.click(screen.getByRole("button", { name: "安装 / 修复能力包" }));
+    await waitFor(() => expect(api.installCapabilityPack).toHaveBeenCalledTimes(1));
+    expect(api.installCapabilityPack.mock.calls[0]?.[0]).toMatchObject({
+      persistConnections: false,
+      image2Model: "gpt-image-2.5",
+      grokImageModel: "grok-imagine-image",
+      grokVideoModel: "grok-video-2",
+      seedanceModel: "seedance-2.0",
+      mediaGenerationAgentId: "agent-route-42",
+    });
+  }, 30_000);
+
+  it("blocks maintenance if saved media settings cannot be read", async () => {
+    api.mediaModelSettings.mockRejectedValueOnce(new Error("local settings unavailable"));
+    renderSheet(true, "maintenance");
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("无法读取现有媒体设置");
+    expect(screen.getByRole("button", { name: "安装 / 修复能力包" })).toBeDisabled();
   }, 30_000);
 
   it("rejects an enabled service with missing required fields before IPC", async () => {

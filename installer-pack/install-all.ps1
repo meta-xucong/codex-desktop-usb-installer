@@ -9,7 +9,10 @@ param(
     [switch]$EnableFeishu,
     [switch]$DisableFeishu,
     [switch]$EnableMediaGeneration,
-    [switch]$DisableMediaGeneration
+    [switch]$DisableMediaGeneration,
+    [ValidateSet('not-checked','verified','failed')][string]$MediaGatewayCatalogStatus = 'not-checked',
+    [ValidateRange(0,100000)][int]$MediaGatewayModelCount = 0,
+    [string]$MediaGatewayCatalogVerifiedAt = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -20,6 +23,9 @@ if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
     throw "安装器不存在: $installer"
 }
 if ($EnableMediaGeneration -and $DisableMediaGeneration) { throw '-EnableMediaGeneration and -DisableMediaGeneration are mutually exclusive.' }
+if ($MediaGatewayCatalogStatus -eq 'verified' -and [string]::IsNullOrWhiteSpace($MediaGatewayCatalogVerifiedAt)) {
+    throw 'A verified media gateway catalog must include its verification timestamp.'
+}
 
 $arguments = @(
     '-NoProfile',
@@ -39,6 +45,12 @@ if ($EnableFeishu) { $arguments += '-EnableFeishu' }
 if ($DisableFeishu) { $arguments += '-DisableFeishu' }
 if ($EnableMediaGeneration) { $arguments += '-EnableMediaGeneration' }
 if ($DisableMediaGeneration) { $arguments += '-DisableMediaGeneration' }
+if ($EnableMediaGeneration) {
+    $arguments += @('-MediaGatewayCatalogStatus', $MediaGatewayCatalogStatus, '-MediaGatewayModelCount', [string]$MediaGatewayModelCount)
+    if (-not [string]::IsNullOrWhiteSpace($MediaGatewayCatalogVerifiedAt)) {
+        $arguments += @('-MediaGatewayCatalogVerifiedAt', $MediaGatewayCatalogVerifiedAt)
+    }
+}
 $arguments += @('-FeishuAuthMode', $FeishuAuthMode, '-FeishuDomain', $FeishuDomain)
 if (@($EnableSkills).Count -gt 0) {
     $arguments += '-EnableSkills'

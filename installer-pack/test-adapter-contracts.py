@@ -135,6 +135,11 @@ class CodexConfigureContractTests(unittest.TestCase):
         )
         return json.loads(completed.stdout.lstrip("\ufeff")), config_path
 
+    def assert_config_is_utf8_toml_without_bom(self, config_path: Path):
+        data = config_path.read_bytes()
+        self.assertFalse(data.startswith(b"\xef\xbb\xbf"), "Codex config.toml must not have a UTF-8 BOM")
+        tomllib.loads(data.decode("utf-8"))
+
     def test_exact_match_legacy_feishu_block_migrates_idempotently(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -142,6 +147,7 @@ class CodexConfigureContractTests(unittest.TestCase):
             first, config_path = self.invoke(root, legacy)
             self.assertEqual(first["status"], "merged")
             self.assertTrue(first["merged"])
+            self.assert_config_is_utf8_toml_without_bom(config_path)
             first_content = config_path.read_text(encoding="utf-8-sig")
             self.assertEqual(first_content.count("# BEGIN CODEX-STARTER-KIT MANAGED CONFIG v1"), 1)
             self.assertEqual(first_content.count("[mcp_servers.feishu]"), 1)
@@ -150,6 +156,7 @@ class CodexConfigureContractTests(unittest.TestCase):
             second, _ = self.invoke(root)
             self.assertEqual(second["status"], "merged")
             self.assertEqual(config_path.read_text(encoding="utf-8-sig"), first_content)
+            self.assert_config_is_utf8_toml_without_bom(config_path)
 
     def test_modified_legacy_feishu_block_remains_conflict(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -189,6 +196,7 @@ class CodexConfigureContractTests(unittest.TestCase):
             )
             first, config_path = self.invoke(root, legacy, fragment)
             self.assertEqual(first["status"], "merged")
+            self.assert_config_is_utf8_toml_without_bom(config_path)
             first_content = config_path.read_text(encoding="utf-8-sig")
             self.assertEqual(first_content.count("# BEGIN CODEX-STARTER-KIT MANAGED CONFIG v1"), 1)
             self.assertEqual(first_content.count("[[mcp_servers.feishu.tool]]"), 1)
@@ -197,6 +205,25 @@ class CodexConfigureContractTests(unittest.TestCase):
             second, _ = self.invoke(root, fragment=fragment)
             self.assertEqual(second["status"], "merged")
             self.assertEqual(config_path.read_text(encoding="utf-8-sig"), first_content)
+
+    def test_invalid_merge_does_not_replace_the_previous_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = root / "profile"
+            config_path = profile / ".codex" / "config.toml"
+            config_path.parent.mkdir(parents=True)
+            original = b"model = 'working-model'\n"
+            config_path.write_bytes(original)
+            fragment = root / "invalid-fragment.toml"
+            fragment.write_text("[mcp_servers.feishu\nenabled = true\n", encoding="utf-8")
+            completed = subprocess.run(
+                [POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(CONFIGURE_SCRIPT),
+                 "-GeneratedFragment", str(fragment), "-TargetUserProfile", str(profile),
+                 "-KitHome", str(root / "kit"), "-PythonExe", sys.executable],
+                check=False, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            )
+            self.assertNotEqual(completed.returncode, 0, completed.stdout)
+            self.assertEqual(config_path.read_bytes(), original)
 
     def test_modified_nested_array_table_remains_conflict(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -228,6 +255,7 @@ class SkillActivationContractTests(unittest.TestCase):
             expected_total = len(audit["skills"])
             expected_enabled = expected_total - len(expected_guided)
             output = root / "generated.toml"
+            output.write_bytes(b"stale previous output")
             completed = subprocess.run(
                 [
                     POWERSHELL,
@@ -258,7 +286,9 @@ class SkillActivationContractTests(unittest.TestCase):
             self.assertEqual(status["enabledSkillCount"], expected_enabled)
             self.assertEqual(status["disabledSkillCount"], len(expected_guided))
             self.assertEqual(set(status["disabledSkills"]), expected_guided)
-            config = tomllib.loads(output.read_text(encoding="utf-8-sig"))
+            output_bytes = output.read_bytes()
+            self.assertFalse(output_bytes.startswith(b"\xef\xbb\xbf"), "Rendered TOML must not have a UTF-8 BOM")
+            config = tomllib.loads(output_bytes.decode("utf-8"))
             entries = config["skills"]["config"]
             self.assertEqual(len(entries), expected_total)
             self.assertEqual(sum(1 for entry in entries if entry["enabled"]), expected_enabled)
@@ -276,6 +306,44 @@ class SkillActivationContractTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0, completed.stdout + "\n" + completed.stderr)
         self.assertIn("pdf smoke: passed", completed.stdout)
+
+
+@unittest.skipUnless(POWERSHELL, "PowerShell is required for model catalog synchronization contract tests")
+class InstallAllMediaForwardingTests(unittest.TestCase):
+    def test_rust_media_catalog_arguments_cross_the_outer_powershell_entry(self):
+        script = ROOT / "install-all.ps1"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            outer = root / "install-all.ps1"
+            inner = root / "install-to-codex.ps1"
+            capture = root / "captured.json"
+            shutil.copy2(script, outer)
+            inner.write_text(
+                "param([switch]$EnableMediaGeneration,"
+                "[ValidateSet('not-checked','verified','failed')][string]$MediaGatewayCatalogStatus='not-checked',"
+                "[ValidateRange(0,100000)][int]$MediaGatewayModelCount=0,"
+                "[string]$MediaGatewayCatalogVerifiedAt='')\n"
+                "$result = [ordered]@{ enabled=[bool]$EnableMediaGeneration; status=$MediaGatewayCatalogStatus; count=$MediaGatewayModelCount; verifiedAt=$MediaGatewayCatalogVerifiedAt }\n"
+                "[IO.File]::WriteAllText($env:INSTALL_ALL_CAPTURE, ($result | ConvertTo-Json -Compress))\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            environment = os.environ.copy()
+            environment["INSTALL_ALL_CAPTURE"] = str(capture)
+            completed = subprocess.run(
+                [POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(outer),
+                 "-EnableMediaGeneration", "-MediaGatewayCatalogStatus", "verified",
+                 "-MediaGatewayModelCount", "3", "-MediaGatewayCatalogVerifiedAt", "2026-10-14T00:00:00Z"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", env=environment, timeout=30,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stdout + "\n" + completed.stderr)
+            forwarded = json.loads(capture.read_text(encoding="utf-8"))
+            self.assertEqual(forwarded, {
+                "enabled": True,
+                "status": "verified",
+                "count": 3,
+                "verifiedAt": "2026-10-14T00:00:00Z",
+            })
 
 
 @unittest.skipUnless(POWERSHELL, "PowerShell is required for model catalog synchronization contract tests")
@@ -476,6 +544,39 @@ class MediaGenerationMcpTests(unittest.TestCase):
             with self.assertRaises(self.module.MediaError):
                 self.module._validated_record({"confirmation_id": prepared["confirmation_id"], "confirmation_fingerprint": prepared["confirmation_fingerprint"]})
 
+    @unittest.skipUnless(POWERSHELL, "PowerShell is required for credential wrapper isolation")
+    def test_persisted_connection_is_atomic_and_never_mixes_stale_process_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            kit = Path(directory) / "kit"
+            bin_dir = kit / "bin"
+            connections = kit / "connections"
+            bin_dir.mkdir(parents=True)
+            connections.mkdir()
+            shutil.copy2(MEDIA_MCP_WRAPPER, bin_dir / "start-media-generation-mcp.ps1")
+            shutil.copy2(MEDIA_MCP_SCRIPT, bin_dir / "media-generation-mcp.py")
+            (connections / "media-generation.connection.json").write_text(
+                json.dumps({"schemaVersion": 1, "apiBaseUrl": "https://saved.example", "apiProfile": "responses"}),
+                encoding="utf-8",
+            )
+            (connections / "media-generation.credential.dpapi").write_bytes(b"invalid-dpapi")
+            env = os.environ.copy()
+            env.update({
+                "MEDIA_GENERATION_API_BASE_URL": "https://stale.example",
+                "MEDIA_GENERATION_API_PROFILE": "legacy",
+                "MEDIA_GENERATION_API_KEY": "stale-process-key",
+            })
+            completed = subprocess.run(
+                [POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                 str(bin_dir / "start-media-generation-mcp.ps1"), "-CredentialCheck", "-PythonExe", sys.executable],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", env=env, timeout=20,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stdout + "\n" + completed.stderr)
+            result = json.loads(completed.stdout)
+            self.assertTrue(result["baseUrlConfigured"])
+            self.assertFalse(result["apiKeyConfigured"])
+            self.assertEqual(result["apiProfile"], "responses")
+            self.assertEqual(result["credentialSource"], "missing")
+
     def test_submit_once_and_query_existing_async_task(self):
         calls = {"posts": 0, "gets": 0, "headers": {}, "payload": {}}
         class FakeResponse:
@@ -602,6 +703,16 @@ class MediaGenerationMcpTests(unittest.TestCase):
             with self.module._confirmation_operation_lock(confirmation_id, "检查"):
                 self.assertEqual(self.module._load_json(record_path)["state"], "prepared")
 
+    def test_posix_flock_uses_two_argument_nonblocking_contract(self):
+        fake_fcntl = SimpleNamespace(LOCK_EX=2, LOCK_NB=4, LOCK_UN=8, flock=mock.Mock())
+        with adapter_environment(self.env), mock.patch.dict(sys.modules, {"fcntl": fake_fcntl}), mock.patch.object(self.module, "_uses_windows_mutex", return_value=False):
+            prepared = self.module.media_prepare({"provider": "image-2", "prompt": "posix lock signature fixture"})
+            with self.module._confirmation_operation_lock(prepared["confirmation_id"], "提交"):
+                pass
+        self.assertEqual(fake_fcntl.flock.call_args_list[0].args[1], 2 | 4)
+        self.assertEqual(fake_fcntl.flock.call_args_list[1].args[1], 8)
+        self.assertTrue(all(len(call.args) == 2 for call in fake_fcntl.flock.call_args_list))
+
     def test_grok_reference_upload_contract_is_offline_and_dependency_closed(self):
         test_script = ROOT / "skills" / "grok-video-prompt-compiler" / "scripts" / "test_upload_reference.py"
         result = subprocess.run(
@@ -713,6 +824,9 @@ class MediaGenerationMcpTests(unittest.TestCase):
         for name in list(environment):
             if name.startswith(ADAPTER_ENV_PREFIXES): environment.pop(name, None)
         environment["MEDIA_GENERATION_API_KEY"] = "signed-launch-test-key"
+        environment["MEDIA_GENERATION_API_BASE_URL"] = gateway
+        environment["MEDIA_GENERATION_API_PROFILE"] = "responses"
+        environment["MEDIA_GENERATION_SIGNED_LAUNCH"] = "1"
         environment["MEDIA_GENERATION_DATA_DIR"] = str(kit / "data" / "media-generation")
         messages = [
             {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26"}},
@@ -737,6 +851,69 @@ class MediaGenerationMcpTests(unittest.TestCase):
         self.assertEqual(health_report["serverVersion"], "1.3.3")
         self.assertEqual(health_report["protocolStatus"], "passed")
         self.assertEqual(health_report["generationCapability"], "not_tested")
+
+    @unittest.skipUnless(POWERSHELL, "PowerShell is required for credential source isolation")
+    def test_credential_check_rejects_signed_process_key_and_keeps_dpapi_required(self):
+        kit = Path(self.temp.name) / "credential-check-kit"
+        bin_dir = kit / "bin"
+        connections = kit / "connections"
+        bin_dir.mkdir(parents=True)
+        connections.mkdir(parents=True)
+        shutil.copy2(MEDIA_MCP_WRAPPER, bin_dir / "start-media-generation-mcp.ps1")
+        shutil.copy2(MEDIA_MCP_SCRIPT, bin_dir / "media-generation-mcp.py")
+        (connections / "media-generation.connection.json").write_text(json.dumps({
+            "schemaVersion": 1, "apiBaseUrl": "https://saved.example", "apiProfile": "responses"
+        }), encoding="utf-8")
+        environment = os.environ.copy()
+        environment.update({
+            "MEDIA_GENERATION_API_BASE_URL": "https://saved.example",
+            "MEDIA_GENERATION_API_PROFILE": "responses",
+            "MEDIA_GENERATION_API_KEY": "signed-launch-key",
+            "MEDIA_GENERATION_SIGNED_LAUNCH": "1",
+        })
+        completed = subprocess.run(
+            [POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+             str(bin_dir / "start-media-generation-mcp.ps1"), "-CredentialCheck", "-PythonExe", sys.executable],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", env=environment, timeout=20,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + "\n" + completed.stderr)
+        result = json.loads(completed.stdout)
+        self.assertTrue(result["baseUrlConfigured"])
+        self.assertFalse(result["apiKeyConfigured"])
+        self.assertEqual(result["credentialSource"], "missing")
+
+    @unittest.skipUnless(POWERSHELL, "PowerShell is required for invalid signed tuple isolation")
+    def test_invalid_marked_process_tuple_without_persisted_connection_fails_closed(self):
+        kit = Path(self.temp.name) / "invalid-signed-tuple-kit"
+        bin_dir = kit / "bin"
+        bin_dir.mkdir(parents=True)
+        shutil.copy2(MEDIA_MCP_WRAPPER, bin_dir / "start-media-generation-mcp.ps1")
+        shutil.copy2(MEDIA_MCP_SCRIPT, bin_dir / "media-generation-mcp.py")
+        environment = os.environ.copy()
+        for name in list(environment):
+            if name.startswith(ADAPTER_ENV_PREFIXES): environment.pop(name, None)
+        environment.update({
+            "MEDIA_GENERATION_API_BASE_URL": "http://stale.example",
+            "MEDIA_GENERATION_API_PROFILE": "responses",
+            "MEDIA_GENERATION_API_KEY": "stale-marked-key",
+            "MEDIA_GENERATION_SIGNED_LAUNCH": "1",
+            "MEDIA_GENERATION_DATA_DIR": str(kit / "data" / "media-generation"),
+        })
+        messages = [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26"}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "media_capabilities", "arguments": {}}},
+        ]
+        raw = ("\n".join(json.dumps(item, ensure_ascii=False) for item in messages) + "\n").encode("utf-8")
+        completed = subprocess.run(
+            [POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+             str(bin_dir / "start-media-generation-mcp.ps1"), "-PythonExe", sys.executable],
+            input=raw, capture_output=True, env=environment, timeout=20,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8", errors="replace"))
+        replies = [json.loads(line.decode("utf-8", errors="strict")) for line in completed.stdout.splitlines()]
+        capabilities = json.loads(replies[1]["result"]["content"][0]["text"])
+        self.assertFalse(capabilities["api_key_configured"])
+        self.assertFalse(capabilities["base_url_configured"])
 
     def test_stale_submission_is_unknown_and_never_reposted(self):
         with adapter_environment(self.env):
@@ -1167,6 +1344,16 @@ class FinancialDataIntegrityTests(unittest.TestCase):
 
 
 class LocalFeatureContractTests(unittest.TestCase):
+    def test_capability_manifest_canonical_byte_count_ignores_checkout_newlines(self):
+        module = load_module(ROOT.parent / "tools" / "refresh-capability-pack-metadata.py")
+        with tempfile.TemporaryDirectory() as directory:
+            lf = Path(directory) / "lf.ps1"
+            crlf = Path(directory) / "crlf.ps1"
+            lf.write_bytes(b"param()\nWrite-Host 'ok'\n")
+            crlf.write_bytes(b"param()\r\nWrite-Host 'ok'\r\n")
+            self.assertEqual(module.canonical_bytes(lf), module.canonical_bytes(crlf))
+            self.assertEqual(len(module.canonical_bytes(lf)), len(module.canonical_bytes(crlf)))
+
     def test_monthly_theme_extraction_is_deterministic_and_non_placeholder(self):
         module = load_module(REFLECTION_SCRIPT)
         reflections = [

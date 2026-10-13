@@ -24,6 +24,7 @@ const DEVICE_PROVIDER_ID: &str = "404token-sub2api";
 const MEDIA_API_BASE_URL: &str = "MEDIA_GENERATION_API_BASE_URL";
 const MEDIA_API_PROFILE: &str = "MEDIA_GENERATION_API_PROFILE";
 const MEDIA_API_KEY: &str = "MEDIA_GENERATION_API_KEY";
+const MEDIA_SIGNED_LAUNCH: &str = "MEDIA_GENERATION_SIGNED_LAUNCH";
 const CREDENTIAL_FILE: &str = "media-generation.credential.dpapi";
 const CONNECTION_FILE: &str = "media-generation.connection.json";
 const CREDENTIAL_MAGIC: &[u8; 8] = b"CDXMGDP1";
@@ -165,10 +166,12 @@ pub fn launch_environment(binding: Option<&UsbAccountBinding>) -> Vec<(String, S
         }
     }
 
+    let signed_launch = if api_key.is_empty() { "" } else { "1" };
     vec![
         (MEDIA_API_BASE_URL.to_string(), base_url),
         (MEDIA_API_PROFILE.to_string(), "responses".to_string()),
         (MEDIA_API_KEY.to_string(), api_key),
+        (MEDIA_SIGNED_LAUNCH.to_string(), signed_launch.to_string()),
     ]
 }
 
@@ -258,7 +261,10 @@ pub fn verify_authorized_local_connection() -> Result<(), AppError> {
         ])
         .arg(wrapper)
         .arg("-CredentialCheck")
-        .env_remove(MEDIA_API_KEY);
+        .env_remove(MEDIA_API_BASE_URL)
+        .env_remove(MEDIA_API_PROFILE)
+        .env_remove(MEDIA_API_KEY)
+        .env_remove(MEDIA_SIGNED_LAUNCH);
     #[cfg(target_os = "windows")]
     command.creation_flags(0x0800_0000);
     let output = command
@@ -518,6 +524,7 @@ mod tests {
         assert_eq!(values[MEDIA_API_BASE_URL], "https://404token.xyz");
         assert_eq!(values[MEDIA_API_PROFILE], "responses");
         assert_eq!(values[MEDIA_API_KEY], "sk-test-license-key");
+        assert_eq!(values[MEDIA_SIGNED_LAUNCH], "1");
         assert!(!values.contains_key("MEDIA_IMAGE2_MODEL"));
     }
 
@@ -528,6 +535,7 @@ mod tests {
             assert_eq!(values[MEDIA_API_BASE_URL], "");
             assert_eq!(values[MEDIA_API_KEY], "");
             assert_eq!(values[MEDIA_API_PROFILE], "responses");
+            assert_eq!(values[MEDIA_SIGNED_LAUNCH], "");
         }
     }
 

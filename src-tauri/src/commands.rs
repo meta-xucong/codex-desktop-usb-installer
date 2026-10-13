@@ -2694,7 +2694,14 @@ pub fn set_autostart(
 fn begin_theme_restart_guard(state: &ManagerState) -> Result<OperationGuard, CommandError> {
     reject_uninstall_handoff(state)?;
     crate::app::usb_guard::require_signed_codex_bundle("codex-theme-restart")?;
-    begin_guard(state, OperationKind::Launch)
+    let operation = begin_guard(state, OperationKind::Launch)?;
+    // Theme apply/off/try-on can close and relaunch Codex without going through
+    // win_launch_codex. Validate the shared user config at this common restart
+    // boundary before any theme flow mutates it or quits the running process.
+    if matches!(state.target.os, OperatingSystem::Windows) {
+        crate::app::codex_config_guard::ensure_user_config_ready()?;
+    }
+    Ok(operation)
 }
 
 #[tauri::command]
@@ -3298,6 +3305,12 @@ pub async fn win_launch_codex(
             .into());
         }
     }
+    // Validate the user-owned Codex config before theme setup, catalog reload,
+    // process handling, compatibility patches, or the final process spawn.
+    // A valid BOM-only file is backed up and repaired; all other parse errors
+    // stay untouched and are returned to the UI instead of becoming a silent
+    // no-window startup failure.
+    crate::app::codex_config_guard::ensure_user_config_ready()?;
     let persisted = PersistedAppSettings::load();
     let settings = windows_domain_settings_for_persisted(&state);
     let codex_locale = locale

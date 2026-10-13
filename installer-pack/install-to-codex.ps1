@@ -384,9 +384,6 @@ if ($mediaGenerationEnabled) {
         $mediaProfile = 'responses'
     }
     if ($mediaProfile -notin @('auto','legacy','wokey','responses')) { throw 'Unsupported media API profile.' }
-    if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable('MEDIA_IMAGE2_MODEL', 'Process'))) {
-        [Environment]::SetEnvironmentVariable('MEDIA_IMAGE2_MODEL', 'gpt-image-2.5', 'Process')
-    }
     $mediaModelEnvNames = @('MEDIA_IMAGE2_MODEL','MEDIA_GROK_IMAGE_MODEL','MEDIA_GROK_VIDEO_MODEL','MEDIA_SEEDANCE_MODEL','MEDIA_MINIMAX_VIDEO_MODEL')
     $configuredMediaModels = @($mediaModelEnvNames | Where-Object { -not [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_, 'Process')) })
     if ($configuredMediaModels.Count -eq 0) { throw 'EnableMediaGeneration requires at least one provider model ID.' }
@@ -560,7 +557,7 @@ foreach ($runtimeOwnedPath in @($runtimeStatePath, $pdfSmokeDiagnosticPath) + $r
 
 $wrapperTarget = Join-Path $ownershipRoot 'bin\start-feishu-mcp.ps1'
 $mediaWrapperTarget = Join-Path $ownershipRoot 'bin\start-media-generation-mcp.ps1'
-$mediaHealthStatus = [ordered]@{ status = if ($mediaGenerationEnabled) { 'not-checked' } else { 'disabled' }; runtime = 'not-checked'; protocol = 'not-checked'; gatewayCatalog = if ($mediaGenerationEnabled) { $MediaGatewayCatalogStatus } else { 'not-checked' }; generationCapability = 'not-tested'; python = ''; serverVersion = ''; catalogVerifiedAt = if (-not [string]::IsNullOrWhiteSpace($MediaGatewayCatalogVerifiedAt)) { $MediaGatewayCatalogVerifiedAt } else { $null }; modelCount = if ($MediaGatewayCatalogStatus -eq 'verified') { $MediaGatewayModelCount } else { 0 } }
+$mediaHealthStatus = [ordered]@{ status = if ($mediaGenerationEnabled) { 'not-checked' } else { 'disabled' }; runtime = 'not-checked'; protocol = 'not-checked'; enabled = [bool]$mediaGenerationEnabled; gatewayCatalog = if ($mediaGenerationEnabled) { $MediaGatewayCatalogStatus } else { 'not-checked' }; generationCapability = 'not-tested'; python = ''; serverVersion = ''; catalogVerifiedAt = if (-not [string]::IsNullOrWhiteSpace($MediaGatewayCatalogVerifiedAt)) { $MediaGatewayCatalogVerifiedAt } else { $null }; modelCount = if ($MediaGatewayCatalogStatus -eq 'verified') { $MediaGatewayModelCount } else { 0 } }
 $mediaRegistrationReady = -not $mediaGenerationEnabled
 $mediaStageLog = New-Object System.Collections.Generic.List[string]
 if ($mediaGenerationEnabled) {
@@ -580,7 +577,7 @@ if ($mediaGenerationEnabled) {
         if ($LASTEXITCODE -ne 0) { throw 'The preinstalled Python media MCP health check failed.' }
         $mediaHealth = $mediaHealthOutput | ConvertFrom-Json
         if (-not $mediaHealth.ready -or [string]$mediaHealth.serverVersion -ne '1.3.3' -or [string]$mediaHealth.healthScope -ne 'local-runtime-protocol' -or [string]$mediaHealth.runtimeStatus -ne 'passed' -or [string]$mediaHealth.protocolStatus -ne 'passed' -or [int]$mediaHealth.toolCount -ne 6) { throw 'The preinstalled media MCP local runtime/protocol check failed.' }
-        $mediaHealthStatus = [ordered]@{ status = 'protocol-passed'; runtime = [string]$mediaHealth.runtimeStatus; protocol = [string]$mediaHealth.protocolStatus; gatewayCatalog = $MediaGatewayCatalogStatus; generationCapability = 'not-tested'; python = [string]$mediaHealth.python; serverVersion = [string]$mediaHealth.serverVersion; catalogVerifiedAt = if (-not [string]::IsNullOrWhiteSpace($MediaGatewayCatalogVerifiedAt)) { $MediaGatewayCatalogVerifiedAt } else { $null }; modelCount = if ($MediaGatewayCatalogStatus -eq 'verified') { $MediaGatewayModelCount } else { 0 } }
+        $mediaHealthStatus = [ordered]@{ status = 'protocol-passed'; runtime = [string]$mediaHealth.runtimeStatus; protocol = [string]$mediaHealth.protocolStatus; enabled = [bool]$mediaGenerationEnabled; gatewayCatalog = $MediaGatewayCatalogStatus; generationCapability = 'not-tested'; python = [string]$mediaHealth.python; serverVersion = [string]$mediaHealth.serverVersion; catalogVerifiedAt = if (-not [string]::IsNullOrWhiteSpace($MediaGatewayCatalogVerifiedAt)) { $MediaGatewayCatalogVerifiedAt } else { $null }; modelCount = if ($MediaGatewayCatalogStatus -eq 'verified') { $MediaGatewayModelCount } else { 0 } }
         $runtimeState.mediaGeneration.health = 'protocol-passed'
         $runtimeState.mediaGeneration.protocol = 'passed'
         $runtimeState.mediaGeneration.gatewayCatalog = $MediaGatewayCatalogStatus
@@ -731,6 +728,7 @@ $connectionStatus = [ordered]@{
     schemaVersion = 1
     feishu = if ($feishuEnabled) { 'enabled-awaiting-tenant-health' } else { 'disabled-awaiting-credentials' }
     mediaGeneration = [ordered]@{
+        enabled = [bool]$mediaGenerationEnabled
         runtime = [string]$mediaHealthStatus.runtime
         protocol = [string]$mediaHealthStatus.protocol
         registered = $mediaRegistered

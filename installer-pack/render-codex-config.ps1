@@ -148,17 +148,29 @@ $outputParent = Split-Path -Parent $outputFull
 if (-not (Test-Path -LiteralPath $outputParent)) { New-Item -ItemType Directory -Force -Path $outputParent | Out-Null }
 $tempPath = $outputFull + '.tmp-' + [guid]::NewGuid().ToString('N')
 try {
-    Set-Content -LiteralPath $tempPath -Value $content -Encoding UTF8
+    $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+    [System.IO.File]::WriteAllText($tempPath, $content, $utf8NoBom)
     $pythonPath = $PythonExe
+    if ([string]::IsNullOrWhiteSpace($pythonPath)) {
+        $bundledPython = Join-Path $userProfile '.codex\codex-agent-kit\runtime\python-env\Scripts\python.exe'
+        if (Test-Path -LiteralPath $bundledPython -PathType Leaf) { $pythonPath = $bundledPython }
+    }
     if ([string]::IsNullOrWhiteSpace($pythonPath)) {
         $python = Get-Command python -ErrorAction SilentlyContinue
         if ($python) { $pythonPath = $python.Source }
     }
-    if (-not [string]::IsNullOrWhiteSpace($pythonPath) -and (Test-Path -LiteralPath $pythonPath -PathType Leaf)) {
-        & $pythonPath -c "import pathlib,sys,tomllib; tomllib.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8-sig'))" $tempPath
-        if ($LASTEXITCODE -ne 0) { throw 'Rendered TOML failed Python tomllib validation.' }
+    if ([string]::IsNullOrWhiteSpace($pythonPath) -or -not (Test-Path -LiteralPath $pythonPath -PathType Leaf)) {
+        throw 'Cannot safely render Codex TOML without a Python TOML validator; the previous output was preserved.'
     }
-    Move-Item -LiteralPath $tempPath -Destination $outputFull -Force
+    & $pythonPath -c "import pathlib,sys,tomllib; data=pathlib.Path(sys.argv[1]).read_bytes(); assert not data.startswith(bytes.fromhex('efbbbf')), 'UTF-8 BOM is not allowed'; tomllib.loads(data.decode('utf-8'))" $tempPath
+    if ($LASTEXITCODE -ne 0) { throw 'Rendered TOML failed strict UTF-8/TOML validation; the previous output was preserved.' }
+    if (Test-Path -LiteralPath $outputFull -PathType Leaf) {
+        $atomicBackupPath = $outputFull + '.replace-' + [guid]::NewGuid().ToString('N')
+        [System.IO.File]::Replace($tempPath, $outputFull, $atomicBackupPath, $true)
+        Remove-Item -LiteralPath $atomicBackupPath -Force -ErrorAction SilentlyContinue
+    } else {
+        [System.IO.File]::Move($tempPath, $outputFull)
+    }
 } finally {
     if (Test-Path -LiteralPath $tempPath) { Remove-Item -LiteralPath $tempPath -Force }
 }
