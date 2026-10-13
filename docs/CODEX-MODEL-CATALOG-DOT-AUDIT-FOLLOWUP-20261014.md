@@ -69,5 +69,9 @@
 - 已补两类故障注入测试：配置替换失败时目录与备份不变；配置解除后目录清理失败时保留恢复标记并阻止 Add；两种场景都可由再次 Reset 收尾。
 - 已允许原生 Codex 使用的 `truncation_policy.mode` 为 `bytes` 或 `tokens`，并保留正整数 limit 校验；新增原生 `tokens` 首次 Add 保真测试及未知策略反例。
 - 机器配置隔离复核：`model_native_probe::configure_command` 先 `env_clear()`，再只提供系统启动必需环境与临时 `CODEX_HOME/HOME/USERPROFILE/APPDATA/LOCALAPPDATA/TEMP/TMP`；本地 API Key 仅在显式原生能力验证流程传入，不用于 `debug models`。因此未发现由机器级 Codex 配置污染首次目录读取的代码路径。
-- 验证收据：`rustfmt --edition 2021 --check` 对三个修改的 Rust 源文件通过；`git diff --check` 通过；模型目录定向测试 96 passed、0 failed；完整 `cargo test --lib` 708 passed、0 failed、6 ignored。第一次源码构建发现 `remove_file` 闭包生命周期编译错误，两项测试随后暴露断言/注入点问题，均已修正并在完整回归前重跑定向测试。
-- 独立只读审计第一轮发现 Add/Reset 跨进程竞态和 USB 可变路径校验后启动的 TOCTOU 窗口；已修复：Add/Reset 全程共用配置命名 mutex，实际运行验签 CLI 的临时副本并再次核对包内 SHA-256。第二轮独立审计进行中；只有第二轮通过后，代码才可视为审计闭环。未构建发行安装包或操作实体 U 盘。
+- 独立只读审计第二轮确认 Add/Reset 命名 mutex 及首次目录采集/候选校验的临时副本路径已关闭，但指出能力探测 `probe_windows` 仍直接启动原始 USB CLI，尚未绑定签名 MSIX 中的哈希。
+- 已将验签 CLI 的预期 SHA-256 从 `collect` 传入 `NativeProbeInput`。能力探测先将 USB CLI 复制到唯一临时目录，复制时逐字节核验 MSIX 中的签名哈希；哈希不符即删除副本并终止。`--version`、`debug models` 和 app-server Session 均只使用该临时副本，结束时再复核副本哈希。新增能力探测 runner 必须收到临时副本的正例和源文件哈希不符时不启动的反例。
+- 新验证收据：仅对本轮修改的两个 Rust 文件运行 `rustfmt --edition 2021 --check` 通过；`git diff --check` 通过；`model_native_probe` 定向测试 19 passed、0 failed；完整 `cargo test --lib` 715 tests，709 passed、0 failed、6 ignored。项目全量 `cargo fmt --check` 仍会报告其他既有文件 `capability_pack.rs`、`media_generation.rs` 的格式差异；本轮未触碰这些文件，避免扩展范围。
+- 第三轮独立只读复审结论 PASS：能力探测所有 `--version`、`debug models` 和 app-server Session 启动都使用同一份按签名 MSIX CLI 哈希核验的临时副本；当前代码路径未发现 USB 原始 CLI 的进程启动绕过。Add/Reset 命名 mutex、sidecar 清理、恢复标记事务和 tokens 兼容均未回退。
+- 残余边界：临时副本使用随机临时目录和独占新建，但没有显式专用 ACL；本修复抵御 USB 文件在验签后被替换，不覆盖同一 Windows 用户权限下的恶意进程在副本哈希后、进程启动前再次改写文件。若该威胁进入产品范围，需另行设计受保护临时目录/ACL。尚未通过正式发行包或实体 U 盘冷启动验证随包 Codex CLI；单测和源码审计不代表该项已验收。
+- 本轮未构建发行安装包或操作实体 U 盘；完成源码审计不等于正式 USB 包验收。

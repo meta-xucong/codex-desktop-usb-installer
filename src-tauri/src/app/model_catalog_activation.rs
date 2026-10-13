@@ -345,6 +345,7 @@ pub async fn collect(
         let model_id = model.model_id.clone();
         let input = NativeProbeInput {
             executable: executable.clone(),
+            expected_executable_sha256: expected_hash.clone(),
             context: context.clone(),
             model: model.clone(),
             gateway_base: base.into(),

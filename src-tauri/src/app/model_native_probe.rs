@@ -38,6 +38,10 @@ const MAX_EXECUTABLE_BYTES: u64 = 1024 * 1024 * 1024;
 
 pub(crate) struct NativeProbeInput {
     pub executable: std::path::PathBuf,
+    /// SHA-256 of the CLI entry extracted from the verified signed MSIX.
+    /// The source path is on removable media, so every probe executes only a
+    /// private copy whose bytes are checked against this value.
+    pub expected_executable_sha256: String,
     pub context: CapabilityContext,
     pub model: ModelCapabilityReport,
     pub gateway_base: String,
@@ -950,6 +954,7 @@ fn validate_input(input: &NativeProbeInput) -> Result<(), NativeProbeError> {
         || !valid_metadata(&input.gateway_base, 4096)
         || !valid_metadata(&input.device_key, 4096)
         || input.gateway_base.contains(input.device_key.as_str())
+        || !valid_sha256(&input.expected_executable_sha256)
         || !valid_sha256(&input.context.binding_fingerprint)
         || !input
             .context
@@ -1003,15 +1008,19 @@ fn validate_input(input: &NativeProbeInput) -> Result<(), NativeProbeError> {
 }
 
 #[cfg(windows)]
-fn hash_executable(input: &NativeProbeInput) -> Result<String, NativeProbeError> {
-    check_limits(&input.cancelled, input.deadline)?;
-    let mut file = std::fs::File::open(&input.executable)
-        .map_err(|_| NativeProbeError::ExecutableUnavailable)?;
+fn hash_executable(
+    executable: &Path,
+    cancelled: &AtomicBool,
+    deadline: std::time::Instant,
+) -> Result<String, NativeProbeError> {
+    check_limits(cancelled, deadline)?;
+    let mut file =
+        std::fs::File::open(executable).map_err(|_| NativeProbeError::ExecutableUnavailable)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     let mut total = 0_u64;
     loop {
-        check_limits(&input.cancelled, input.deadline)?;
+        check_limits(cancelled, deadline)?;
         let count = file
             .read(&mut buffer)
             .map_err(|_| NativeProbeError::ExecutableUnavailable)?;
@@ -1957,6 +1966,31 @@ fn copy_verified_executable(
     result
 }
 
+fn verified_probe_executable(
+    input: &NativeProbeInput,
+    area: &TemporaryArea,
+) -> Result<PathBuf, NativeProbeError> {
+    verified_probe_executable_path(
+        &input.executable,
+        &input.expected_executable_sha256,
+        &area.root,
+        &input.cancelled,
+        input.deadline,
+    )
+}
+
+fn verified_probe_executable_path(
+    source: &Path,
+    expected_sha256: &str,
+    temporary_root: &Path,
+    cancelled: &AtomicBool,
+    deadline: std::time::Instant,
+) -> Result<PathBuf, NativeProbeError> {
+    let copy = temporary_root.join("codex-native-probe-verified.exe");
+    copy_verified_executable(source, expected_sha256, &copy, cancelled, deadline)?;
+    Ok(copy)
+}
+
 fn run_after_runtime_verification<T>(
     verify: impl FnOnce() -> Result<PathBuf, NativeProbeError>,
     run: impl FnOnce(&Path) -> Result<T, NativeProbeError>,
@@ -2745,15 +2779,23 @@ fn matching_command_approval(params: Option<&Value>, observation: &mut TurnObser
 fn probe_windows(input: NativeProbeInput) -> Result<NativeProbeResult, NativeProbeError> {
     validate_input(&input)?;
     let area = TemporaryArea::create(&input.cancelled, input.deadline)?;
-    let hash_before = hash_executable(&input)?;
-    let runtime_version =
-        read_runtime_version(&input.executable, &area, &input.cancelled, input.deadline)?;
+    // The removable source is never passed to a process API. Copy it into the
+    // operation's private workspace and bind the copy to the signed MSIX hash
+    // captured by the verifier before any Codex process is started.
+    let verified_executable = verified_probe_executable(&input, &area)?;
+    let hash_before = input.expected_executable_sha256.clone();
+    let runtime_version = read_runtime_version(
+        &verified_executable,
+        &area,
+        &input.cancelled,
+        input.deadline,
+    )?;
     // The context is the verified desktop distribution version. The embedded
     // CLI reports a different version namespace; its identity is bound by the
     // same-executable hash and this observed version, not string equality.
     let mut prepared = prepare_probe(area, &input.model, &runtime_version, &input.gateway_base)?;
     run_catalog_gate(
-        &input.executable,
+        &verified_executable,
         &prepared.area,
         &input.model,
         &input.cancelled,
@@ -2763,7 +2805,7 @@ fn probe_windows(input: NativeProbeInput) -> Result<NativeProbeResult, NativePro
     check_limits(&input.cancelled, input.deadline)?;
 
     let mut session = win_process::Session::spawn(
-        &input.executable,
+        &verified_executable,
         &prepared.area,
         &input.device_key,
         input.cancelled.clone(),
@@ -2849,7 +2891,7 @@ fn probe_windows(input: NativeProbeInput) -> Result<NativeProbeResult, NativePro
         session.pump_turn(&mut observation)?;
     }
     session.shutdown()?;
-    let hash_after = hash_executable(&input)?;
+    let hash_after = hash_executable(&verified_executable, &input.cancelled, input.deadline)?;
     if hash_before != hash_after {
         return Err(NativeProbeError::ExecutableChanged);
     }
@@ -2929,7 +2971,6 @@ mod tests {
         ));
         std::fs::create_dir(&root).unwrap();
         let source = root.join("source.exe");
-        let destination = root.join("private-copy.exe");
         let trusted = b"trusted signed package bytes";
         let mut hash = Sha256::new();
         hash.update(trusted);
@@ -2943,14 +2984,14 @@ mod tests {
         let cancelled = AtomicBool::new(false);
         let result = run_after_runtime_verification(
             || {
-                copy_verified_executable(
+                verified_probe_executable_path(
                     &source,
                     &expected,
-                    &destination,
+                    &root,
                     &cancelled,
                     std::time::Instant::now() + std::time::Duration::from_secs(5),
                 )?;
-                Ok(destination.clone())
+                Ok(root.join("codex-native-probe-verified.exe"))
             },
             |_| {
                 launched.store(true, Ordering::Release);
@@ -2959,7 +3000,52 @@ mod tests {
         );
         assert_eq!(result, Err(NativeProbeError::ExecutableChanged));
         assert!(!launched.load(Ordering::Acquire));
-        assert!(!destination.exists());
+        assert!(!root.join("codex-native-probe-verified.exe").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn capability_probe_runner_receives_only_the_signed_hash_copy() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-native-probe-copy-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let source = root.join("usb-codex.exe");
+        let expected_bytes = b"signed MSIX CLI bytes";
+        std::fs::write(&source, expected_bytes).unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(expected_bytes);
+        let expected: String = hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let cancelled = AtomicBool::new(false);
+        let launched_from = std::sync::Mutex::new(None);
+        let result = run_after_runtime_verification(
+            || {
+                verified_probe_executable_path(
+                    &source,
+                    &expected,
+                    &root,
+                    &cancelled,
+                    std::time::Instant::now() + std::time::Duration::from_secs(5),
+                )
+            },
+            |path| {
+                *launched_from.lock().unwrap() = Some(path.to_path_buf());
+                assert_ne!(path, source.as_path());
+                assert_eq!(std::fs::read(path).unwrap(), expected_bytes);
+                Ok(())
+            },
+        );
+        assert!(result.is_ok());
+        assert_eq!(
+            *launched_from.lock().unwrap(),
+            Some(root.join("codex-native-probe-verified.exe"))
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
