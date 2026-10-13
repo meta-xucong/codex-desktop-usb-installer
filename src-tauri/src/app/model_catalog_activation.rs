@@ -6,7 +6,7 @@ use crate::app::model_native_probe::{self, NativeProbeInput, NativeProbeResult};
 use crate::app::model_selection_client::{self, SelectionReply, SelectionRequest};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
 
 pub const NATIVE_REFRESH_BUDGET: Duration = Duration::from_secs(600);
 pub const AUTO_SETUP_BUDGET: Duration = Duration::from_secs(1920);
@@ -120,63 +120,74 @@ fn hash_runtime(
     Ok(hash.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// Hash the documented USB-only Codex CLI transformation after restoring its
-/// single PE OptionalHeader.Subsystem field from GUI (2) to console (3).
-/// Every other byte remains covered by the signed MSIX member hash.
-fn hash_runtime_with_restored_console_subsystem(
+struct RuntimeHashes {
+    raw_sha256: String,
+    normalized_console_sha256: Option<String>,
+}
+
+/// Hash the original executable bytes and, when the only portable change is
+/// PE Subsystem 3→2, the console-normalized bytes during the same streaming
+/// observation. The raw digest returned here must be the same byte stream
+/// whose normalized digest is compared with the signed MSIX member.
+fn hash_runtime_with_console_normalization(
     path: &Path,
     cancelled: &AtomicBool,
     deadline: Instant,
-) -> Result<Option<String>, &'static str> {
+) -> Result<RuntimeHashes, &'static str> {
     let metadata = fs::symlink_metadata(path).map_err(|_| "native-executable-unavailable")?;
     if !metadata.is_file() || metadata.len() > 1024 * 1024 * 1024 {
         return Err("native-executable-unavailable");
     }
     let mut input = fs::File::open(path).map_err(|_| "native-executable-unavailable")?;
-    let mut dos = [0u8; 64];
-    input
-        .read_exact(&mut dos)
-        .map_err(|_| "native-executable-changed")?;
-    if &dos[..2] != b"MZ" {
-        return Ok(None);
-    }
-    let nt_offset = u32::from_le_bytes(dos[0x3c..0x40].try_into().unwrap()) as u64;
-    if nt_offset > 1024 * 1024 || nt_offset.saturating_add(94) > metadata.len() {
-        return Ok(None);
-    }
-    input
-        .seek(SeekFrom::Start(nt_offset))
-        .map_err(|_| "native-executable-unavailable")?;
-    let mut nt = [0u8; 24];
-    input
-        .read_exact(&mut nt)
-        .map_err(|_| "native-executable-changed")?;
-    if &nt[..4] != b"PE\0\0" {
-        return Ok(None);
-    }
-    let optional_size = u16::from_le_bytes([nt[20], nt[21]]) as u64;
-    let optional_offset = nt_offset + 24;
-    let subsystem_offset = optional_offset + 68;
-    if optional_size < 70 || subsystem_offset.saturating_add(2) > metadata.len() {
-        return Ok(None);
-    }
-    input
-        .seek(SeekFrom::Start(subsystem_offset))
-        .map_err(|_| "native-executable-unavailable")?;
-    let mut subsystem = [0u8; 2];
-    input
-        .read_exact(&mut subsystem)
-        .map_err(|_| "native-executable-changed")?;
-    if u16::from_le_bytes(subsystem) != 2 {
-        return Ok(None);
-    }
+    hash_runtime_reader_with_console_normalization(&mut input, metadata.len(), cancelled, deadline)
+}
 
-    input
-        .seek(SeekFrom::Start(0))
-        .map_err(|_| "native-executable-unavailable")?;
+fn hash_runtime_reader_with_console_normalization(
+    input: &mut impl Read,
+    expected_len: u64,
+    cancelled: &AtomicBool,
+    deadline: Instant,
+) -> Result<RuntimeHashes, &'static str> {
+    if expected_len < 64 || expected_len > 1024 * 1024 * 1024 {
+        return Err("native-executable-unavailable");
+    }
+    let mut prefix = Vec::with_capacity(1024 * 1024 + 96);
+    read_prefix_to(input, &mut prefix, 64, expected_len)?;
+    let normalization = if &prefix[..2] == b"MZ" {
+        let nt_offset = u32::from_le_bytes(prefix[0x3c..0x40].try_into().unwrap()) as usize;
+        if nt_offset <= 1024 * 1024 && nt_offset.saturating_add(94) <= expected_len as usize {
+            read_prefix_to(input, &mut prefix, nt_offset + 24, expected_len)?;
+            let nt = &prefix[nt_offset..nt_offset + 24];
+            let optional_size = u16::from_le_bytes([nt[20], nt[21]]) as usize;
+            let subsystem_offset = nt_offset + 24 + 68;
+            if &nt[..4] == b"PE\0\0"
+                && optional_size >= 70
+                && subsystem_offset.saturating_add(2) <= expected_len as usize
+            {
+                read_prefix_to(input, &mut prefix, subsystem_offset + 2, expected_len)?;
+                let subsystem = [prefix[subsystem_offset], prefix[subsystem_offset + 1]];
+                (u16::from_le_bytes(subsystem) == 2).then_some((subsystem_offset, subsystem))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let mut raw_hash = Sha256::new();
+    let mut normalized_hash = normalization.map(|_| Sha256::new());
+    raw_hash.update(&prefix);
+    if let (Some((subsystem_offset, _)), Some(hash)) = (normalization, normalized_hash.as_mut()) {
+        let mut restored_prefix = prefix.clone();
+        restored_prefix[subsystem_offset..subsystem_offset + 2]
+            .copy_from_slice(&3u16.to_le_bytes());
+        hash.update(&restored_prefix);
+    }
+    let mut read = prefix.len() as u64;
     let mut buffer = vec![0u8; 1024 * 1024];
-    let mut hash = Sha256::new();
-    let mut offset = 0u64;
     loop {
         check(cancelled, deadline)?;
         let size = input
@@ -185,36 +196,54 @@ fn hash_runtime_with_restored_console_subsystem(
         if size == 0 {
             break;
         }
-        let end = offset + size as u64;
-        let field_end = subsystem_offset + 2;
-        if offset < field_end && end > subsystem_offset {
-            let start_in_chunk = subsystem_offset.saturating_sub(offset) as usize;
-            let end_in_chunk = (field_end.min(end) - offset) as usize;
-            let source_field = &buffer[start_in_chunk..end_in_chunk];
-            if source_field
-                != &subsystem[(subsystem_offset.max(offset) - subsystem_offset) as usize
-                    ..(field_end.min(end) - subsystem_offset) as usize]
-            {
-                return Err("native-executable-changed");
-            }
-            let original = 3u16.to_le_bytes();
-            let original_start = (subsystem_offset.max(offset) - subsystem_offset) as usize;
-            buffer[start_in_chunk..end_in_chunk].copy_from_slice(
-                &original[original_start..original_start + end_in_chunk - start_in_chunk],
-            );
+        read = read
+            .checked_add(size as u64)
+            .filter(|count| *count <= expected_len)
+            .ok_or("native-executable-changed")?;
+        raw_hash.update(&buffer[..size]);
+        if let Some(hash) = normalized_hash.as_mut() {
+            hash.update(&buffer[..size]);
         }
-        hash.update(&buffer[..size]);
-        offset = end;
     }
-    if offset != metadata.len() {
+    if read != expected_len {
         return Err("native-executable-changed");
     }
-    Ok(Some(
-        hash.finalize()
+    Ok(RuntimeHashes {
+        raw_sha256: raw_hash
+            .finalize()
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect(),
-    ))
+        normalized_console_sha256: normalized_hash.map(|hash| {
+            hash.finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        }),
+    })
+}
+
+fn read_prefix_to(
+    input: &mut impl Read,
+    prefix: &mut Vec<u8>,
+    target: usize,
+    expected_len: u64,
+) -> Result<(), &'static str> {
+    if target as u64 > expected_len || target > 1024 * 1024 + 96 {
+        return Err("native-executable-changed");
+    }
+    while prefix.len() < target {
+        let remaining = target - prefix.len();
+        let mut chunk = vec![0u8; remaining.min(64 * 1024)];
+        let count = input
+            .read(&mut chunk)
+            .map_err(|_| "native-executable-unavailable")?;
+        if count == 0 {
+            return Err("native-executable-changed");
+        }
+        prefix.extend_from_slice(&chunk[..count]);
+    }
+    Ok(())
 }
 #[cfg(windows)]
 fn verified_runtime(
@@ -285,13 +314,18 @@ fn verified_runtime_inner(
             return Err("native-executable-unavailable");
         }
     }
-    let actual_hash = hash_runtime(&executable, cancelled, deadline)?;
+    let runtime_hashes = hash_runtime_with_console_normalization(&executable, cancelled, deadline)?;
     // Packaged internal executables need not carry an individual signature.
     // Compare their bytes with the original, signature-verified MSIX instead.
     check(cancelled, deadline)?;
     let manager = env::current_exe().map_err(|_| "native-package-unavailable")?;
-    let payload = crate::app::offline_payload::probe_offline_payload(&manager, None, None, true)
+    // Stage first: the release-manifest hash and Authenticode check are both
+    // applied to a local package snapshot. All later ZIP reads use this same
+    // staged package, never the mutable removable-drive path.
+    let staged = crate::app::offline_payload::stage_offline_payload(&manager, None, None, true)
         .map_err(|_| "native-package-unavailable")?;
+    let trusted_payload_path = PathBuf::from(&staged.staged_path);
+    let payload = staged.payload;
     if !payload.hash_verified
         || !payload
             .authenticode
@@ -300,11 +334,24 @@ fn verified_runtime_inner(
     {
         return Err("native-package-unavailable");
     }
+    let staged_identity = codex_win_engine::read_msix_identity(&trusted_payload_path)
+        .map_err(|_| "native-package-unavailable")?;
+    codex_win_engine::validate_codex_identity(
+        &staged_identity,
+        &staged_identity.version,
+        Some(payload.architecture.as_str()),
+    )
+    .map_err(|_| "native-package-unavailable")?;
+    if codex_win_engine::read_codex_app_version_from_msix(&trusted_payload_path)
+        .is_some_and(|version| version != payload.codex_desktop_version)
+    {
+        return Err("native-package-version-mismatch");
+    }
     if expected_version.is_some_and(|version| payload.codex_desktop_version != version) {
         return Err("native-package-version-mismatch");
     }
-    let entry_path = payload
-        .app_entry
+    let entry_path = crate::app::offline_payload::read_app_entry(&trusted_payload_path)
+        .map_err(|_| "native-package-unavailable")?
         .as_deref()
         .ok_or("native-package-unavailable")?
         .replace('\\', "/");
@@ -320,7 +367,7 @@ fn verified_runtime_inner(
         return Err("native-package-unavailable");
     }
     let trusted_cli_entry_path = format!("{parent}/resources/codex.exe");
-    let file = fs::File::open(&payload.payload_path).map_err(|_| "native-package-unavailable")?;
+    let file = fs::File::open(&trusted_payload_path).map_err(|_| "native-package-unavailable")?;
     let mut archive = zip::ZipArchive::new(file).map_err(|_| "native-package-unavailable")?;
     let mut entry = archive
         .by_name(&trusted_cli_entry_path)
@@ -341,18 +388,15 @@ fn verified_runtime_inner(
         hash.update(&buffer[..n]);
     }
     let packaged: String = hash.finalize().iter().map(|b| format!("{b:02x}")).collect();
-    let portable_normalized_hash = if packaged != actual_hash {
-        hash_runtime_with_restored_console_subsystem(&executable, cancelled, deadline)?
-    } else {
-        None
-    };
-    if packaged != actual_hash && portable_normalized_hash.as_deref() != Some(packaged.as_str()) {
+    if packaged != runtime_hashes.raw_sha256
+        && runtime_hashes.normalized_console_sha256.as_deref() != Some(packaged.as_str())
+    {
         return Err("native-executable-changed");
     }
     Ok(VerifiedRuntime {
         executable,
-        executable_sha256: actual_hash,
-        trusted_payload_path: PathBuf::from(payload.payload_path),
+        executable_sha256: runtime_hashes.raw_sha256,
+        trusted_payload_path,
         trusted_cli_entry_path,
         trusted_cli_sha256: packaged,
     })
@@ -1210,30 +1254,92 @@ mod tests {
         let signed_msix_member = synthetic_codex_pe(3);
         let mut portable_copy = synthetic_codex_pe(2);
         fs::write(&path, &portable_copy).unwrap();
-        let normalized = hash_runtime_with_restored_console_subsystem(
+        let hashes = hash_runtime_with_console_normalization(
             &path,
             &AtomicBool::new(false),
             Instant::now() + Duration::from_secs(5),
         )
         .unwrap();
+        assert_eq!(hashes.raw_sha256, sha256_hex(&portable_copy));
         assert_eq!(
-            normalized.as_deref(),
+            hashes.normalized_console_sha256.as_deref(),
             Some(sha256_hex(&signed_msix_member).as_str())
         );
 
         portable_copy[0x500] ^= 0x01;
         fs::write(&path, &portable_copy).unwrap();
-        let tampered = hash_runtime_with_restored_console_subsystem(
+        let tampered = hash_runtime_with_console_normalization(
             &path,
             &AtomicBool::new(false),
             Instant::now() + Duration::from_secs(5),
         )
         .unwrap();
         assert_ne!(
-            tampered.as_deref(),
+            tampered.normalized_console_sha256.as_deref(),
             Some(sha256_hex(&signed_msix_member).as_str())
         );
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn raw_and_normalized_hashes_come_from_one_streamed_observation() {
+        struct SwitchAfterPrefix {
+            first: Vec<u8>,
+            second: Vec<u8>,
+            switch_at: usize,
+            read: usize,
+        }
+        impl Read for SwitchAfterPrefix {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if self.read >= self.first.len() {
+                    return Ok(0);
+                }
+                let source = if self.read < self.switch_at {
+                    &self.first
+                } else {
+                    &self.second
+                };
+                let count = buffer.len().min(source.len() - self.read);
+                buffer[..count].copy_from_slice(&source[self.read..self.read + count]);
+                self.read += count;
+                Ok(count)
+            }
+        }
+
+        let first = synthetic_codex_pe(2);
+        let mut second = first.clone();
+        second[0x500] ^= 0x5a;
+        let switch_at = 0x80 + 24 + 70;
+        let mut stream = SwitchAfterPrefix {
+            first: first.clone(),
+            second: second.clone(),
+            switch_at,
+            read: 0,
+        };
+        let hashes = hash_runtime_reader_with_console_normalization(
+            &mut stream,
+            first.len() as u64,
+            &AtomicBool::new(false),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+
+        let mut observed = first.clone();
+        observed[switch_at..].copy_from_slice(&second[switch_at..]);
+        let mut normalized_observed = observed.clone();
+        let subsystem_offset = 0x80 + 24 + 68;
+        normalized_observed[subsystem_offset..subsystem_offset + 2]
+            .copy_from_slice(&3u16.to_le_bytes());
+        assert_eq!(hashes.raw_sha256, sha256_hex(&observed));
+        assert_eq!(
+            hashes.normalized_console_sha256.as_deref(),
+            Some(sha256_hex(&normalized_observed).as_str())
+        );
+        assert_ne!(hashes.raw_sha256, sha256_hex(&first));
+        assert_ne!(
+            hashes.normalized_console_sha256.as_deref(),
+            Some(sha256_hex(&second).as_str())
+        );
     }
 
     #[test]

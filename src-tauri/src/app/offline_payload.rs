@@ -383,7 +383,7 @@ fn discover_bundle(
     })
 }
 
-fn read_app_entry(path: &Path) -> Result<Option<String>, AppError> {
+pub(crate) fn read_app_entry(path: &Path) -> Result<Option<String>, AppError> {
     let file =
         File::open(path).map_err(|error| engine_error(format!("打开 MSIX 失败: {error}")))?;
     let mut archive = zip::ZipArchive::new(file)
@@ -795,11 +795,7 @@ pub fn stage_offline_payload(
         probe_offline_payload(executable, package_override, expected_architecture, false)?;
     let stage_root = secure_stage_directory(&payload.codex_desktop_version)?;
     let destination = copy_or_reuse_staged_payload(&payload, &stage_root, available_space)?;
-    let staged_hash = codex_win_engine::sha256_file(&destination)
-        .map_err(|error| engine_error(format!("再次计算暂存 MSIX SHA-256 失败: {error}")))?;
-    if !staged_hash.eq_ignore_ascii_case(&payload.sha256) {
-        return Err(engine_error("暂存 MSIX 二次校验失败，拒绝安装"));
-    }
+    let staged_hash = verify_staged_payload_hash(&destination, &payload.sha256)?;
     payload.authenticode = verify_staged_authenticode(&destination, enforce_authenticode)?;
     Ok(OfflineStageReport {
         source_path: payload.payload_path.clone(),
@@ -808,6 +804,15 @@ pub fn stage_offline_payload(
         sha256: staged_hash,
         payload,
     })
+}
+
+fn verify_staged_payload_hash(path: &Path, expected_sha256: &str) -> Result<String, AppError> {
+    let staged_hash = codex_win_engine::sha256_file(path)
+        .map_err(|error| engine_error(format!("再次计算暂存 MSIX SHA-256 失败: {error}")))?;
+    if !staged_hash.eq_ignore_ascii_case(expected_sha256) {
+        return Err(engine_error("暂存 MSIX 二次校验失败，拒绝安装"));
+    }
+    Ok(staged_hash)
 }
 
 fn copy_or_reuse_staged_payload(
@@ -1080,6 +1085,26 @@ mod tests {
         );
     }
 
+    fn write_fake_msix_with_cli(path: &Path, cli: &[u8]) {
+        let file = File::create(path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        writer.start_file("AppxManifest.xml", options).unwrap();
+        let manifest = format!(
+            r#"<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10">
+  <Identity Name="OpenAI.Codex" Publisher="{}" Version="26.602.3474.0" ProcessorArchitecture="x64" />
+  <Applications><Application Id="App" Executable="app/Codex.exe" EntryPoint="Windows.FullTrustApplication" /></Applications>
+</Package>"#,
+            codex_win_engine::OPENAI_MARKETPLACE_PUBLISHER_SUBJECT
+        );
+        writer.write_all(manifest.as_bytes()).unwrap();
+        writer
+            .start_file("app/resources/codex.exe", options)
+            .unwrap();
+        writer.write_all(cli).unwrap();
+        writer.finish().unwrap();
+    }
+
     fn fixture_manifest(msix: &Path) -> OfflinePayloadManifest {
         OfflinePayloadManifest {
             product_version: "0.1.0".to_string(),
@@ -1223,6 +1248,80 @@ mod tests {
         assert_eq!(staged.sha256, manifest.payload.sha256);
         assert!(staged.payload.authenticode.is_none());
         cleanup_staged_payload(Path::new(&staged.staged_path)).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn staging_rejects_usb_payload_replaced_after_preflight_hash() {
+        let root = test_root("stage-source-swap");
+        let payload_dir = root.join("payload");
+        fs::create_dir_all(&payload_dir).unwrap();
+        let source = payload_dir.join("OpenAI.Codex_x64.msix");
+        write_fake_msix(&source);
+        let manifest = fixture_manifest(&source);
+        fs::write(
+            root.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let executable = root.join("CodexDesktopSetup.exe");
+        fs::write(&executable, b"fixture").unwrap();
+
+        let preflight = probe_offline_payload(&executable, None, Some("x64"), false).unwrap();
+        let mut replaced = fs::read(&source).unwrap();
+        *replaced.last_mut().unwrap() ^= 0x01;
+        fs::write(&source, replaced).unwrap();
+        let stage_root = root.join("isolated-stage");
+        fs::create_dir(&stage_root).unwrap();
+        let stage_root = stage_root.canonicalize().unwrap();
+        let copied = copy_or_reuse_staged_payload(&preflight, &stage_root, |_| Ok(None)).unwrap();
+
+        assert!(verify_staged_payload_hash(&copied, &preflight.sha256).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn staged_snapshot_member_is_unchanged_when_usb_source_is_replaced_later() {
+        let root = test_root("stage-stable-snapshot");
+        let payload_dir = root.join("payload");
+        fs::create_dir_all(&payload_dir).unwrap();
+        let source = payload_dir.join("OpenAI.Codex_x64.msix");
+        let original_cli = b"trusted signed CLI member";
+        write_fake_msix_with_cli(&source, original_cli);
+        let manifest = fixture_manifest(&source);
+        fs::write(
+            root.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let executable = root.join("CodexDesktopSetup.exe");
+        fs::write(&executable, b"fixture").unwrap();
+
+        let preflight = probe_offline_payload(&executable, None, Some("x64"), false).unwrap();
+        let stage_root = root.join("isolated-stage");
+        fs::create_dir(&stage_root).unwrap();
+        let stage_root = stage_root.canonicalize().unwrap();
+        let snapshot = copy_or_reuse_staged_payload(&preflight, &stage_root, |_| Ok(None)).unwrap();
+        verify_staged_payload_hash(&snapshot, &preflight.sha256).unwrap();
+
+        write_fake_msix_with_cli(&source, b"replacement CLI bytes");
+        assert_eq!(
+            read_app_entry(&snapshot).unwrap().as_deref(),
+            Some("app/Codex.exe")
+        );
+        let mut archive = zip::ZipArchive::new(File::open(&snapshot).unwrap()).unwrap();
+        let mut staged_cli = Vec::new();
+        archive
+            .by_name("app/resources/codex.exe")
+            .unwrap()
+            .read_to_end(&mut staged_cli)
+            .unwrap();
+        drop(archive);
+        assert_eq!(staged_cli, original_cli);
+        assert_ne!(
+            codex_win_engine::sha256_file(&source).unwrap(),
+            preflight.sha256
+        );
         let _ = fs::remove_dir_all(root);
     }
 

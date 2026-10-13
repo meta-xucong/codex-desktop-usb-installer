@@ -86,3 +86,11 @@
 - 本机工具链为 `x86_64-pc-windows-msvc`；实际 Windows 编译和测试已运行。未运行非 Windows 目标交叉编译；`TemporaryArea` 引用函数已明确限定为 Windows。未取得随包 MSIX/最终发行包，未做正式 USB 冷启动，因此发行包验收仍待做。
 - 同用户权限下恶意进程可能改写哈希后临时副本的威胁不纳入本次修复范围；此限制已披露。
 - 第四轮独立只读复审结论 PASS：确认上述四项均闭环，并复核 Add/Reset 锁、sidecar 与 tokens 兼容没有回退。审计方未编辑文件、未重跑测试；其源码结论与本地测试收据相符。
+
+## 7ed42cd 后续复审补充（2026-10-14）
+
+- 新发现 P1：不再在 Authenticode 通过后重新从可变 U 盘 MSIX 路径派生 CLI 摘要。能力验证复用 `stage_offline_payload`：复制时将暂存内容与发行 manifest 的整包 SHA-256 比对，并在同一暂存路径做 Authenticode 校验；入口元数据、CLI 成员摘要和最终提取都只读取暂存快照。源包在预检后被替换时，暂存整包摘要不匹配会拒绝；源包在快照建立后替换，不影响后续 ZIP 成员读取。
+- 新发现 P2：安装目录 CLI 的 raw SHA-256 和 PE Subsystem 3→2 归一化 SHA-256 现在由同一打开文件的一次顺序字节流产生。实现先缓存并解析有界 PE 头前缀，然后对同一前缀与后续流同时计算 raw/normalized 摘要；验收只返回这次被归一化摘要认证的 raw 摘要，不再混用两轮路径读取。
+- 新增可控回归：源包在预检 hash 后替换会导致暂存摘要校验失败；已暂存快照不受之后 USB 源包替换影响；MSIX 成员提取仍只接受快照摘要；分段变化输入验证 raw/normalized 两个结果都来自同一实际读取流。所有用例使用合成字节/ZIP fixture，不运行测试二进制。
+- 验证收据：4 条新增替换/摘要回归分别通过；完整 `src-tauri --lib` **717 passed、0 failed、6 ignored**；`codex-win-engine --lib` **236 passed、0 failed、2 ignored**；三个变更 Rust 文件的 `rustfmt --check` 与 `git diff --check` 通过。测试使用合成 ZIP/PE fixture，不执行 Codex 或其他不可信二进制。
+- 独立 A2 只读审计待在固定提交上完成。当前只安装 `x86_64-pc-windows-msvc` target，非 Windows 交叉编译未运行；最终发行包、随包 MSIX 和实体 U 盘冷启动仍是独立验收项。

@@ -3104,6 +3104,53 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn extraction_uses_verified_snapshot_after_usb_source_path_is_replaced() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-native-probe-snapshot-swap-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let source = root.join("usb-source.msix");
+        let snapshot = root.join("verified-snapshot.msix");
+        let entry = "app/resources/codex.exe";
+        let trusted_cli = b"CLI bytes from validated package snapshot";
+        write_test_msix_cli(&source, entry, trusted_cli);
+        std::fs::copy(&source, &snapshot).unwrap();
+
+        let mut digest = Sha256::new();
+        digest.update(trusted_cli);
+        let expected: String = digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        write_test_msix_cli(&source, entry, b"replacement package after validation");
+
+        let output = root.join("codex-verified.exe");
+        extract_verified_cli_from_msix(
+            &snapshot,
+            entry,
+            &expected,
+            &output,
+            &AtomicBool::new(false),
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&output).unwrap(), trusted_cli);
+        assert!(extract_verified_cli_from_msix(
+            &source,
+            entry,
+            &expected,
+            &root.join("must-not-exist.exe"),
+            &AtomicBool::new(false),
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     fn write_test_msix_cli(path: &Path, entry: &str, bytes: &[u8]) {
         let file = std::fs::File::create(path).unwrap();
         let mut writer = zip::ZipWriter::new(file);
