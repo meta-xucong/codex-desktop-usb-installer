@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
     [string]$Target = "x86_64-pc-windows-msvc",
     [string]$CcswitchArtifactDir = "",
@@ -28,6 +28,8 @@ if ($defaultSetupDir) {
     }
 }
 $previousUsbPolicy = $env:CODEX_USB_GUARD_POLICY
+$previousRevocationUrl = $env:CODEX_USB_REVOCATION_URL
+$previousRevocationKeyring = $env:CODEX_USB_REVOCATION_KEYRING_JSON
 Push-Location $repo
 try {
     . (Join-Path $repo "tools\usb-signing-profile.ps1")
@@ -45,6 +47,16 @@ try {
         $signingProfile = Get-CodexUsbSigningProfile -RepoRoot $repo -ProfilePath $UsbSigningProfilePath -RequireExplicitPath
         Assert-CodexUsbSigningProfileVersion -Profile $signingProfile -ExpectedVersion $packageVersion
         Initialize-CodexUsbSigningEnvironment -Profile $signingProfile
+        # These are public production pins already enforced by src-tauri/build.rs.
+        # Seed them for reproducible release builds when the invoking shell has
+        # no release environment; an explicit override still goes through the
+        # same pinned-host and key-fingerprint validation.
+        if ([string]::IsNullOrWhiteSpace($env:CODEX_USB_REVOCATION_URL)) {
+            $env:CODEX_USB_REVOCATION_URL = "https://license.404token.xyz/"
+        }
+        if ([string]::IsNullOrWhiteSpace($env:CODEX_USB_REVOCATION_KEYRING_JSON)) {
+            $env:CODEX_USB_REVOCATION_KEYRING_JSON = '{"keys":{"revocation-20261010":"9BOdJLfX3HDjXnw+stH+TB44YNwV/RDsmyPiGbmJl8c="}}'
+        }
         $publicKeyId = [string]$env:CODEX_USB_GUARD_PUBLIC_KEY_ID
         $publicKeyB64 = [string]$env:CODEX_USB_GUARD_PUBLIC_KEY_B64
         if ([string]::IsNullOrWhiteSpace($publicKeyId) -or
@@ -374,7 +386,14 @@ try {
     if (-not (Test-Path -LiteralPath $baseSourcePath -PathType Leaf)) {
         throw "缺少基础 Skill 源清单，无法验证资源身份：$baseSourcePath"
     }
-    $baseSourceHash = (Get-FileHash -LiteralPath $baseSourcePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $baseSourceBytes = [System.IO.File]::ReadAllBytes($baseSourcePath)
+    $baseSourceText = [System.Text.Encoding]::UTF8.GetString($baseSourceBytes).Replace("`r`n", "`n").Replace("`r", "`n")
+    $baseSourceHasher = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $baseSourceHash = ([BitConverter]::ToString($baseSourceHasher.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($baseSourceText)))).Replace("-", "").ToLowerInvariant()
+    } finally {
+        $baseSourceHasher.Dispose()
+    }
     $baseSkills = @($baseManifest.skills)
     $sourceManifest = Get-Content -LiteralPath $baseSourcePath -Raw -Encoding UTF8 | ConvertFrom-Json
     $sourceSkills = @($sourceManifest.skills)
@@ -400,6 +419,16 @@ finally {
         Remove-Item Env:CODEX_USB_GUARD_POLICY -ErrorAction SilentlyContinue
     } else {
         $env:CODEX_USB_GUARD_POLICY = $previousUsbPolicy
+    }
+    if ($null -eq $previousRevocationUrl) {
+        Remove-Item Env:CODEX_USB_REVOCATION_URL -ErrorAction SilentlyContinue
+    } else {
+        $env:CODEX_USB_REVOCATION_URL = $previousRevocationUrl
+    }
+    if ($null -eq $previousRevocationKeyring) {
+        Remove-Item Env:CODEX_USB_REVOCATION_KEYRING_JSON -ErrorAction SilentlyContinue
+    } else {
+        $env:CODEX_USB_REVOCATION_KEYRING_JSON = $previousRevocationKeyring
     }
     Pop-Location
 }

@@ -62,10 +62,10 @@ pub use portable::{
     codex_running_for_root, inject_portable_fault, install_portable_from_msix,
     install_portable_from_msix_with_observer, install_portable_from_msix_with_observer_options,
     install_portable_from_msix_with_observer_options_and_progress, installed_app_exe,
-    installed_codex_launch_exe, installed_usb_codex_launch_exe,
-    purge_codex_user_data, remove_directory_all_with_retry, rename_directory_with_retry,
-    uninstall_portable, validate_cleanup_path, PortableBoundary, PortableExtractionProgress,
-    PortableFault, PortableInstallOptions, PortableInstallReport, PortableUninstallReport,
+    installed_codex_launch_exe, installed_usb_codex_launch_exe, purge_codex_user_data,
+    remove_directory_all_with_retry, rename_directory_with_retry, uninstall_portable,
+    validate_cleanup_path, PortableBoundary, PortableExtractionProgress, PortableFault,
+    PortableInstallOptions, PortableInstallReport, PortableUninstallReport,
 };
 pub use sys::{
     close_msix_codex_processes, detect_installed_codex, detect_portable_install, fetch_text,
@@ -86,8 +86,9 @@ pub use sys::{
 /// termination is exposed to callers.
 pub use windows_process::{
     close_processes_for_root, hide_console_windows_for_root, hide_windows_for_root,
-    processes_running_for_root, processes_running_for_root_strict, show_windows_for_root,
-    wait_for_usable_window_for_root, UsableWindowReport,
+    processes_running_for_executable_under_root_strict, processes_running_for_root,
+    processes_running_for_root_strict, show_windows_for_root, wait_for_usable_window_for_root,
+    UsableWindowReport,
 };
 // Failure-kind constants for structured MSIX health outcomes.
 pub use sys::msix_failure;

@@ -75,11 +75,12 @@
     {
       "id": "media-generation",
       "name": "统一媒体生成 MCP",
-      "status": "guided-config",
+      "version": "1.3.3",
+      "status": "auto-installable-runtime",
       "available": true,
-      "recommended": false,
+      "recommended": true,
       "transport": "stdio",
-      "purpose": "同一 MCP 使用一组共享端点与 API Key 提供 Image-2、Grok、Seedance，以及未来由统一上游开放后的 MiniMax 图片/视频任务准备、用户确认、提交、查询和结果保存。MiniMax 模型槽位默认留空，不会回退到其他模型。",
+      "purpose": "统一图片/视频 MCP。Image-2 自动使用签名 U 盘授权中的 404token Key，经 Responses API 生成并保存图片；Grok、Seedance，以及未来由统一上游开放后的 MiniMax 仍共用这条授权与 MCP。MiniMax 模型槽位默认留空，不会回退到其他模型。",
       "implementation": {
         "publisher": "Codex Starter Kit",
         "runtime": "bundled Python 3.12 standard library",
@@ -89,6 +90,7 @@
       "toolContract": {
         "manifest": "manifest/media-generation-tools.json",
         "tools": [
+          "media_refresh_models",
           "media_capabilities",
           "media_prepare",
           "media_submit",
@@ -100,9 +102,6 @@
       },
       "configFragment": "config-fragments/media-generation-stdio.template.toml",
       "connectionFields": [
-        "media-generation.api-base-url",
-        "media-generation.api-profile",
-        "media-generation.api-key",
         "media-generation.agent-id",
         "media-generation.image2-model",
         "media-generation.grok-image-model",
@@ -111,17 +110,15 @@
         "media-generation.minimax-video-model"
       ],
       "enableWhen": [
-        "user-selected-in-setup-wizard",
-        "MEDIA_GENERATION_API_BASE_URL",
-        "MEDIA_GENERATION_API_PROFILE",
-        "MEDIA_GENERATION_API_KEY",
+        "signed-usb-license.device-api-key",
         "runtime.python312.healthy"
       ],
+      "defaultEnabled": true,
       "healthCheck": {
-        "offlineCommand": "scripts/start-media-generation-mcp.ps1 -DryRun",
+        "offlineCommand": "scripts/start-media-generation-mcp.ps1 -HealthCheck",
         "codexCommand": "codex mcp get media_generation --json",
-        "expected": "Bundled Python and MCP server exist; tools/list exposes the five declared tools without making provider API calls. MiniMax remains unavailable until its shared-upstream model ID is configured.",
-        "failure": "缺少端点、凭据或模型时，对应 provider 显示未配置；不声称生成成功。"
+          "expected": "Version 1.3.3: local runtime/protocol health includes initialize, tools/list, and media_capabilities over UTF-8 raw bytes under a simulated non-UTF-8 Python environment. This does not validate gateway catalog or real generation. media_refresh_models separately authenticates GET /v1/models and records time/model count without generation. The wrapper reads the signed USB credential from its launch environment or current-user DPAPI; it never places the key in Codex config or logs. After installation, restart Codex to reload the stdio server.",
+        "failure": "本地 Python 或 MCP 未通过检查时安装失败；缺少有效 U 盘授权时，不访问上游。"
       },
       "pricing": "The MCP does not assume prices or refund policy; user must check the selected provider and approve each paid submit.",
       "disableRule": "Set [mcp_servers.media_generation].enabled=false; keep unrelated MCP blocks.",

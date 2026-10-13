@@ -9,13 +9,13 @@ description: 通过统一媒体生成 MCP 调用已配置的 Seedance 视频模�
 
 ## 启用条件
 
-先调用 `media_capabilities` 查看 `seedance-video` 是否已配置。需要用户提供的媒体 API Base URL、媒体 API Key、Seedance 实际模型名，以及当前网关要求的 `MEDIA_GENERATION_AGENT_ID`。不要猜测模型、价格、预扣积分、退款条款或链接有效期。
+先调用 `media_capabilities` 查看 `seedance-video` 是否已配置。签名 U 盘授权会自动提供共享设备 Key；Seedance 实际模型名和当前网关要求的 `MEDIA_GENERATION_AGENT_ID` 仍须来自上游配置。不要猜测模型、价格、预扣积分、退款条款或链接有效期。
 
 Seedance 参考素材当前必须是模型服务端可访问的公网 HTTPS URL；MCP 不会代替用户上传本地媒体。通过 `media_prepare` 的 `reference_media` 数组按原顺序传入 `kind` 为 `image`、`video` 或 `audio` 的 URL 项。相同 URL 重复出现时也保留，不排序、不去重。
 
 ## 执行步骤
 
-1. 调用 `media_capabilities`，确认 API Base URL、Key 和 Seedance 模型已配置。该工具不联网、不计费。
+1. 调用 `media_capabilities`，确认签名授权、Seedance 模型和路由 ID 已配置。该工具不联网、不计费。
 2. 调用 `media_prepare`，使用 `provider="seedance-video"`，传入完整 prompt、素材数组，以及实际支持的 `duration`、`ratio` 和 `watermark` 参数。纯文本生成传空数组。当前兼容契约会启用音频生成并返回最后一帧；不要传 `generate_audio=false`。
 3. 展示完整 prompt、模型、视频参数、所有参考素材 URL/类型/数量/顺序，并明确价格估算未知，要求用户先核对服务方当前计费规则。等待用户明确回复“确认”或“就按这份生成”。确认 ID 与指纹是 MCP 内部执行数据，不向用户展示。
 4. 用户确认后，以同一确认 ID 和指纹调用 `media_submit`。提交不得改变任何已确认的输入。

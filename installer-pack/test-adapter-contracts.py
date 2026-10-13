@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import http.server
+import base64
 import json
 import os
 import shutil
@@ -13,10 +14,14 @@ import tempfile
 import threading
 import tomllib
 import unittest
+import urllib.error
 import uuid
+import struct
+import zlib
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 
 sys.dont_write_bytecode = True
@@ -25,6 +30,7 @@ _SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 ROOT = _SCRIPT_DIRECTORY if (_SCRIPT_DIRECTORY / "skills").is_dir() else _SCRIPT_DIRECTORY.parent
 SCRIPT_ROOT = _SCRIPT_DIRECTORY if (_SCRIPT_DIRECTORY / "configure-codex.ps1").is_file() else ROOT / "scripts"
 MEDIA_MCP_SCRIPT = (ROOT / "mcp" / "media-generation-mcp.py") if (ROOT / "mcp" / "media-generation-mcp.py").is_file() else (SCRIPT_ROOT / "media-generation-mcp.py")
+MEDIA_MCP_WRAPPER = (ROOT / "mcp" / "start-media-generation-mcp.ps1") if (ROOT / "mcp" / "start-media-generation-mcp.ps1").is_file() else (SCRIPT_ROOT / "start-media-generation-mcp.ps1")
 WEB_SCRIPT = ROOT / "skills" / "web-search-extraction" / "scripts" / "web_search.py"
 TECHNICAL_SCRIPT = ROOT / "skills" / "china-stock-analysis" / "scripts" / "technical_analysis.py"
 A_SHARE_VALUATION_SCRIPT = ROOT / "skills" / "china-stock-analysis" / "scripts" / "valuation_calculator.py"
@@ -471,36 +477,138 @@ class MediaGenerationMcpTests(unittest.TestCase):
                 self.module._validated_record({"confirmation_id": prepared["confirmation_id"], "confirmation_fingerprint": prepared["confirmation_fingerprint"]})
 
     def test_submit_once_and_query_existing_async_task(self):
-        class Handler(http.server.BaseHTTPRequestHandler):
-            def log_message(self, *_args):
-                pass
-            def do_POST(self):
-                self.server.posts += 1
-                self.server.last_headers = dict(self.headers)
-                self.server.last_payload = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
-                body = json.dumps({"task_id": "fixture-task-1", "status": "queued"}).encode()
-                self.send_response(200); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
-            def do_GET(self):
-                self.server.gets += 1
-                body = json.dumps({"status": "completed", "data": [{"url": "https://assets.example.invalid/result.png"}]}).encode()
-                self.send_response(200); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
-        self.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
-        self.server.posts = 0; self.server.gets = 0; self.server.last_headers = {}; self.server.last_payload = {}
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-        self.thread.start()
-        env = dict(self.env, MEDIA_GENERATION_API_BASE_URL=f"http://127.0.0.1:{self.server.server_port}")
+        calls = {"posts": 0, "gets": 0, "headers": {}, "payload": {}}
+        class FakeResponse:
+            def __init__(self, body): self.body = body
+            def __enter__(self): return self
+            def __exit__(self, *_args): return False
+            def read(self, _limit): return self.body
+        class FakeOpener:
+            def open(self, request, timeout):
+                self_timeout = timeout
+                self.asserted = self_timeout
+                if request.get_method() == "POST":
+                    calls["posts"] += 1
+                    calls["headers"] = dict(request.header_items())
+                    calls["payload"] = json.loads(request.data)
+                    return FakeResponse(json.dumps({"task_id": "fixture-task-1", "status": "queued"}).encode())
+                calls["gets"] += 1
+                return FakeResponse(json.dumps({"status": "completed", "data": [{"url": "https://assets.example.invalid/result.png"}]}).encode())
+        env = dict(self.env)
         with adapter_environment(env):
-            prepared = self.module.media_prepare({"provider": "image-2", "prompt": "A billable call"})
-            submitted = self.module.media_submit({"confirmation_id": prepared["confirmation_id"], "confirmation_fingerprint": prepared["confirmation_fingerprint"], "user_confirmation": "确认"})
-            self.assertEqual(submitted["task_id"], "fixture-task-1")
-            self.assertEqual(self.server.posts, 1)
-            self.assertEqual(self.server.last_payload["model"], "test-image-model")
-            self.assertTrue(self.server.last_headers.get("Idempotency-Key"))
-            with self.assertRaises(self.module.MediaError):
-                self.module.media_submit({"confirmation_id": prepared["confirmation_id"], "confirmation_fingerprint": prepared["confirmation_fingerprint"], "user_confirmation": "确认"})
-            checked = self.module.media_check({"confirmation_id": prepared["confirmation_id"], "confirmation_fingerprint": prepared["confirmation_fingerprint"]})
+            with mock.patch.object(self.module.urllib.request, "build_opener", side_effect=lambda *_args: FakeOpener()):
+                prepared = self.module.media_prepare({"provider": "image-2", "prompt": "A billable call"})
+                submitted = self.module.media_submit({"confirmation_id": prepared["confirmation_id"], "confirmation_fingerprint": prepared["confirmation_fingerprint"], "user_confirmation": "确认"})
+                self.assertEqual(submitted["task_id"], "fixture-task-1")
+                self.assertEqual(calls["posts"], 1)
+                self.assertEqual(calls["payload"]["model"], "test-image-model")
+                self.assertIn("idempotency-key", {key.lower() for key in calls["headers"]})
+                with self.assertRaises(self.module.MediaError):
+                    self.module.media_submit({"confirmation_id": prepared["confirmation_id"], "confirmation_fingerprint": prepared["confirmation_fingerprint"], "user_confirmation": "确认"})
+                checked = self.module.media_check({"confirmation_id": prepared["confirmation_id"], "confirmation_fingerprint": prepared["confirmation_fingerprint"]})
+                self.assertEqual(checked["state"], "completed")
+                self.assertEqual(calls["gets"], 1)
+                record = self.module._load_json(self.module._confirmation_path(prepared["confirmation_id"]))
+                self.assertTrue(record["api_request_sent"])
+                self.assertEqual(record["response_summary"]["status"], "completed")
+                self.assertNotIn("response", record)
+
+    def test_check_during_submit_does_not_mark_live_request_unknown(self):
+        post_started = threading.Event()
+        release_post = threading.Event()
+        outcomes = {}
+
+        class FakeResponse:
+            def __init__(self, body): self.body = body
+            def __enter__(self): return self
+            def __exit__(self, *_args): return False
+            def read(self, _limit): return self.body
+
+        class FakeOpener:
+            def open(inner, request, timeout):
+                if request.get_method() == "POST":
+                    post_started.set()
+                    if not release_post.wait(5):
+                        raise TimeoutError("test fixture timed out")
+                    return FakeResponse(json.dumps({"task_id": "race-task-1", "status": "queued"}).encode())
+                return FakeResponse(json.dumps({"status": "completed", "data": [{"url": "https://assets.example.invalid/race.png"}]}).encode())
+
+        with adapter_environment(self.env), mock.patch.object(self.module.urllib.request, "build_opener", side_effect=lambda *_args: FakeOpener()):
+            prepared = self.module.media_prepare({"provider": "seedance-video", "prompt": "submission race fixture"})
+            args = {"confirmation_id": prepared["confirmation_id"], "confirmation_fingerprint": prepared["confirmation_fingerprint"], "user_confirmation": "确认"}
+
+            def submit():
+                try:
+                    outcomes["submit"] = self.module.media_submit(args)
+                except Exception as exc:
+                    outcomes["submit_error"] = exc
+
+            worker = threading.Thread(target=submit)
+            worker.start()
+            self.assertTrue(post_started.wait(3), "submit did not reach its fake network request")
+            path = self.module._confirmation_path(prepared["confirmation_id"])
+            self.assertEqual(self.module._load_json(path)["state"], "submitting")
+            with self.assertRaisesRegex(self.module.MediaError, "正在检查"):
+                self.module.media_check(args)
+            self.assertEqual(self.module._load_json(path)["state"], "submitting")
+
+            release_post.set()
+            worker.join(timeout=5)
+            self.assertFalse(worker.is_alive(), "submit worker did not finish")
+            self.assertNotIn("submit_error", outcomes)
+            self.assertEqual(outcomes["submit"]["task_id"], "race-task-1")
+            record = self.module._load_json(path)
+            self.assertEqual(record["state"], "task_created")
+            self.assertEqual(record["task_id"], "race-task-1")
+            checked = self.module.media_check(args)
             self.assertEqual(checked["state"], "completed")
-            self.assertEqual(self.server.gets, 1)
+
+    @unittest.skipUnless(os.name == "nt", "Windows file-lock semantics are the release target")
+    def test_confirmation_operation_lock_blocks_another_process(self):
+        with adapter_environment(self.env):
+            prepared = self.module.media_prepare({"provider": "seedance-video", "prompt": "cross-process lock fixture"})
+            confirmation_id = prepared["confirmation_id"]
+            record_path = self.module._confirmation_path(confirmation_id)
+            child_code = (
+                "import importlib.util,os,sys\n"
+                "spec=importlib.util.spec_from_file_location('media_lock_child',os.environ['MEDIA_TEST_SCRIPT'])\n"
+                "module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)\n"
+                "with module._confirmation_operation_lock(os.environ['MEDIA_TEST_CONFIRMATION'], '提交'):\n"
+                "    print('LOCKED',flush=True)\n"
+                "    sys.stdin.readline()\n"
+            )
+            child_env = os.environ.copy()
+            child_env.update(self.env)
+            child_env["MEDIA_TEST_SCRIPT"] = str(MEDIA_MCP_SCRIPT)
+            child_env["MEDIA_TEST_CONFIRMATION"] = confirmation_id
+            child = subprocess.Popen(
+                [sys.executable, "-c", child_code], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, encoding="utf-8", env=child_env, bufsize=1,
+            )
+            try:
+                self.assertEqual(child.stdout.readline().strip(), "LOCKED", child.stderr.read() if child.poll() is not None and child.stderr else "")
+                args = {"confirmation_id": confirmation_id, "confirmation_fingerprint": prepared["confirmation_fingerprint"]}
+                with self.assertRaisesRegex(self.module.MediaError, "正在检查"):
+                    self.module.media_check(args)
+                self.assertEqual(self.module._load_json(record_path)["state"], "prepared")
+            finally:
+                if child.poll() is None:
+                    child.terminate()
+                child.wait(timeout=5)
+                for stream in (child.stdin, child.stdout, child.stderr):
+                    if stream:
+                        stream.close()
+            self.assertNotEqual(child.returncode, 0, "fixture must terminate while holding the OS lock")
+            with self.module._confirmation_operation_lock(confirmation_id, "检查"):
+                self.assertEqual(self.module._load_json(record_path)["state"], "prepared")
+
+    def test_grok_reference_upload_contract_is_offline_and_dependency_closed(self):
+        test_script = ROOT / "skills" / "grok-video-prompt-compiler" / "scripts" / "test_upload_reference.py"
+        result = subprocess.run(
+            [sys.executable, str(test_script)], capture_output=True, text=True, encoding="utf-8", timeout=20
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + "\n" + result.stderr)
+        self.assertIn("5 tests passed", result.stdout)
 
     def test_minimax_is_reserved_for_the_shared_wokey_media_slot(self):
         with adapter_environment(self.env):
@@ -550,10 +658,174 @@ class MediaGenerationMcpTests(unittest.TestCase):
             {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "contract-test", "version": "1"}}},
             {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
         ]
-        result = subprocess.run([sys.executable, str(MEDIA_MCP_SCRIPT)], input="\n".join(json.dumps(item) for item in messages) + "\n", text=True, capture_output=True, env=environment, timeout=10, check=True)
-        responses = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+        protocol_input = ("\n".join(json.dumps(item, ensure_ascii=False) for item in messages) + "\n").encode("utf-8")
+        result = subprocess.run([sys.executable, str(MEDIA_MCP_SCRIPT)], input=protocol_input, capture_output=True, env=environment, timeout=10, check=True)
+        responses = [json.loads(line.decode("utf-8", errors="strict")) for line in result.stdout.splitlines() if line.strip()]
         self.assertEqual(responses[0]["result"]["serverInfo"]["name"], "codex-starter-media-generation")
-        self.assertEqual([item["name"] for item in responses[1]["result"]["tools"]], ["media_capabilities", "media_prepare", "media_submit", "media_check", "media_save"])
+        self.assertEqual([item["name"] for item in responses[1]["result"]["tools"]], ["media_refresh_models", "media_capabilities", "media_prepare", "media_submit", "media_check", "media_save"])
+
+    def test_stdio_utf8_protocol_errors_notifications_and_eof(self):
+        environment = os.environ.copy()
+        for name in list(environment):
+            if name.startswith(ADAPTER_ENV_PREFIXES):
+                environment.pop(name, None)
+        environment["PYTHONIOENCODING"] = "gbk"
+        environment["PYTHONUTF8"] = "0"
+        environment["MEDIA_GENERATION_DATA_DIR"] = str(self.data_dir / "stdio-data")
+        messages = [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26", "clientInfo": {"name": "中文测试", "version": "1"}}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "media_capabilities", "arguments": {}}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
+            {"jsonrpc": "2.0", "id": 4},
+            [],
+        ]
+        raw = b"\n".join(json.dumps(item, ensure_ascii=False).encode("utf-8") for item in messages)
+        raw += b"\nnot-json\n" + (b" " * (self.module.MAX_JSON_BYTES + 5)) + b"\n"
+        result = subprocess.run([sys.executable, str(MEDIA_MCP_SCRIPT)], input=raw, capture_output=True, env=environment, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", errors="replace"))
+        self.assertEqual(result.stderr, b"")
+        lines = result.stdout.splitlines()
+        self.assertTrue(all(line.startswith(b"{") for line in lines))
+        replies = [json.loads(line.decode("utf-8", errors="strict")) for line in lines]
+        self.assertEqual([reply.get("id") for reply in replies], [1, 2, 3, 4, None, None, None])
+        self.assertEqual(replies[3]["error"]["code"], -32600)
+        self.assertEqual(replies[4]["error"]["code"], -32600)
+        self.assertEqual(replies[5]["error"]["code"], -32700)
+        self.assertEqual(replies[6]["error"]["code"], -32600)
+        self.assertIn("统一网关", lines[1].decode("utf-8"))
+        caps = json.loads(replies[2]["result"]["content"][0]["text"])
+        self.assertEqual(caps["generation_capability"], "not_tested")
+
+    @unittest.skipUnless(POWERSHELL, "PowerShell is required for the installed wrapper integration test")
+    def test_normal_wrapper_config_path_uses_signed_launch_key_and_preserves_raw_jsonrpc(self):
+        kit = Path(self.temp.name) / "unpacked-kit"
+        bin_dir = kit / "bin"
+        connections = kit / "connections"
+        bin_dir.mkdir(parents=True)
+        connections.mkdir(parents=True)
+        shutil.copy2(MEDIA_MCP_SCRIPT, bin_dir / "media-generation-mcp.py")
+        shutil.copy2(MEDIA_MCP_WRAPPER, bin_dir / "start-media-generation-mcp.ps1")
+        gateway = "https://media.example.invalid"
+        (connections / "media-generation.connection.json").write_text(json.dumps({"schemaVersion": 1, "apiBaseUrl": gateway, "apiProfile": "responses"}), encoding="utf-8")
+        (connections / "media-generation.json").write_text(json.dumps({"schemaVersion": 1, "gateway": gateway, "models": {"image-2": "gpt-image-2.5", "grok-image": "", "grok-video": "", "seedance-video": "", "minimax-video": ""}}), encoding="utf-8")
+        environment = os.environ.copy()
+        for name in list(environment):
+            if name.startswith(ADAPTER_ENV_PREFIXES): environment.pop(name, None)
+        environment["MEDIA_GENERATION_API_KEY"] = "signed-launch-test-key"
+        environment["MEDIA_GENERATION_DATA_DIR"] = str(kit / "data" / "media-generation")
+        messages = [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26"}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "media_capabilities", "arguments": {}}},
+        ]
+        raw = ("\n".join(json.dumps(item, ensure_ascii=False) for item in messages) + "\n").encode("utf-8")
+        completed = subprocess.run([POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(bin_dir / "start-media-generation-mcp.ps1"), "-PythonExe", sys.executable], input=raw, capture_output=True, env=environment, timeout=20)
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8", errors="replace"))
+        self.assertEqual(completed.stderr, b"", completed.stderr.decode("utf-8", errors="replace"))
+        replies = [json.loads(line.decode("utf-8", errors="strict")) for line in completed.stdout.splitlines()]
+        self.assertEqual([item.get("id") for item in replies], [1, 2, 3], completed.stdout.decode("utf-8", errors="replace"))
+        capabilities = json.loads(replies[2]["result"]["content"][0]["text"])
+        self.assertTrue(capabilities["api_key_configured"])
+        self.assertTrue(capabilities["base_url_configured"])
+        self.assertTrue(capabilities["providers"]["image-2"]["configured"])
+        # The signed-launch credential is used by the child but never appears on MCP stdout.
+        self.assertNotIn(b"signed-launch-test-key", completed.stdout)
+        health = subprocess.run([POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(bin_dir / "start-media-generation-mcp.ps1"), "-HealthCheck", "-PythonExe", sys.executable], capture_output=True, env=environment, timeout=20)
+        self.assertEqual(health.returncode, 0, health.stderr.decode("utf-8", errors="replace"))
+        health_report = json.loads(health.stdout.decode("utf-8", errors="strict"))
+        self.assertEqual(health_report["serverVersion"], "1.3.3")
+        self.assertEqual(health_report["protocolStatus"], "passed")
+        self.assertEqual(health_report["generationCapability"], "not_tested")
+
+    def test_stale_submission_is_unknown_and_never_reposted(self):
+        with adapter_environment(self.env):
+            prepared = self.module.media_prepare({"provider": "seedance-video", "prompt": "A recovery fixture"})
+            path = self.module._confirmation_path(prepared["confirmation_id"])
+            record = self.module._load_json(path)
+            record["state"] = "submitting"
+            record["api_request_sent"] = True
+            path.write_text(json.dumps(record), encoding="utf-8")
+            args = {"confirmation_id": prepared["confirmation_id"], "confirmation_fingerprint": prepared["confirmation_fingerprint"], "user_confirmation": "确认"}
+            with self.assertRaisesRegex(self.module.MediaError, "submission_unknown"):
+                self.module.media_submit(args)
+            recovered = self.module._load_json(path)
+            self.assertEqual(recovered["state"], "submission_unknown")
+            self.assertTrue(recovered["api_request_sent"])
+            with self.assertRaisesRegex(self.module.MediaError, "没有可查询的 task_id"):
+                self.module.media_check(args)
+
+    def test_submit_timeout_persists_unknown_and_never_reposts(self):
+        calls = {"count": 0}
+        class FakeOpener:
+            def open(inner, request, timeout):
+                calls["count"] += 1
+                current = self.module._load_json(self.module._confirmation_path(prepared["confirmation_id"]))
+                self.assertEqual(current["state"], "submitting")
+                self.assertTrue(current["api_request_sent"])
+                raise urllib.error.URLError("fixture timeout")
+        with adapter_environment(self.env):
+            with mock.patch.object(self.module.urllib.request, "build_opener", side_effect=lambda *_args: FakeOpener()):
+                prepared = self.module.media_prepare({"provider": "seedance-video", "prompt": "timeout fixture"})
+                args = {"confirmation_id": prepared["confirmation_id"], "confirmation_fingerprint": prepared["confirmation_fingerprint"], "user_confirmation": "确认"}
+                with self.assertRaisesRegex(self.module.MediaError, "提交状态未知"):
+                    self.module.media_submit(args)
+                path = self.module._confirmation_path(prepared["confirmation_id"])
+                record = self.module._load_json(path)
+                self.assertEqual(record["state"], "submission_unknown")
+                self.assertTrue(record["api_request_sent"])
+                with self.assertRaises(self.module.MediaError):
+                    self.module.media_submit(args)
+                self.assertEqual(calls["count"], 1)
+
+    def test_relative_content_url_and_bearer_origin_boundary(self):
+        env = dict(self.env, MEDIA_GENERATION_API_PROFILE="wokey", MEDIA_GENERATION_API_BASE_URL="https://gateway.example")
+        with adapter_environment(env):
+            artifact = self.module._artifacts({"status": "completed", "content_url": "/v1/videos/video-7/content"}, "seedance-video")
+            self.assertEqual(artifact[0]["url"], "https://gateway.example/v1/videos/video-7/content")
+            requests = []
+            class FakeResponse:
+                headers = {"Content-Length": "5"}
+                def __init__(self): self.stream = __import__("io").BytesIO(b"video")
+                def __enter__(self): return self
+                def __exit__(self, *_args): return False
+                def read(self, size): return self.stream.read(size)
+            class FakeOpener:
+                def open(inner, request, timeout):
+                    requests.append(request)
+                    return FakeResponse()
+            with mock.patch.object(self.module.urllib.request, "build_opener", side_effect=lambda *_args: FakeOpener()), \
+                 mock.patch.object(self.module, "_validate_public_url", side_effect=lambda value, resolve=False: value), \
+                 mock.patch.object(self.module, "_base", return_value="https://gateway.example"):
+                self.data_dir.mkdir(parents=True, exist_ok=True)
+                for index, url in enumerate((artifact[0]["url"], "https://assets.example/result.mp4", "https://gateway.example:8443/result.mp4")):
+                    destination = self.data_dir / f"download-{index}.mp4"
+                    self.module._safe_download(url, destination)
+                    self.assertEqual(destination.read_bytes(), b"video")
+            self.assertEqual(requests[0].get_header("Authorization"), "Bearer contract-test-key")
+            self.assertIsNone(requests[1].get_header("Authorization"))
+            self.assertIsNone(requests[2].get_header("Authorization"))
+
+    def test_completed_task_can_be_saved_after_local_reference_is_deleted(self):
+        source = self.data_dir / "reference.png"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(b"test-image-bytes")
+        with adapter_environment(self.env):
+            prepared = self.module.media_prepare({"provider": "image-2", "prompt": "reference recovery", "reference_media": [{"kind": "image", "local_path": str(source)}]})
+            path = self.module._confirmation_path(prepared["confirmation_id"])
+            record = self.module._load_json(path)
+            record["state"] = "completed"
+            record["api_request_sent"] = True
+            record["artifacts"] = [{"kind": "image", "url": "https://assets.example.invalid/result.png"}]
+            self.module._atomic_json(path, record)
+            source.unlink()
+            def fake_download(_url, destination):
+                destination.write_bytes(b"saved-image")
+                return len(b"saved-image")
+            with mock.patch.object(self.module, "_safe_download", side_effect=fake_download):
+                result = self.module.media_save({"confirmation_id": prepared["confirmation_id"], "confirmation_fingerprint": prepared["confirmation_fingerprint"]})
+            self.assertTrue(result["success"])
+            self.assertEqual(Path(result["saved"][0]["path"]).read_bytes(), b"saved-image")
 
     def test_wokey_profile_uses_wokey_image_and_video_contracts(self):
         env = dict(self.env, MEDIA_GENERATION_API_PROFILE="wokey", MEDIA_GENERATION_API_BASE_URL="https://api.wokey.ai")
@@ -590,6 +862,113 @@ class MediaGenerationMcpTests(unittest.TestCase):
             self.assertTrue(configured["providers"]["image-2"]["configured"])
             self.assertTrue(configured["providers"]["seedance-video"]["configured"])
 
+
+
+    def test_responses_image_uses_gpt_image_25_and_saves_valid_png_in_same_submit(self):
+        def chunk(name, body):
+            return struct.pack(">I", len(body)) + name + body + struct.pack(">I", zlib.crc32(name + body) & 0xFFFFFFFF)
+
+        png = (
+            b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(b"\x00\xff\x00\x00"))
+            + chunk(b"IEND", b"")
+        )
+
+        calls = {"posts": 0, "url": "", "payload": {}, "timeout": None}
+        class FakeResponse:
+            def __enter__(self): return self
+            def __exit__(self, *_args): return False
+            def read(self, _limit): return json.dumps({"output": [{"type": "image_generation_call", "result": base64.b64encode(png).decode("ascii")}] }).encode()
+        class FakeOpener:
+            def open(self, request, timeout):
+                calls["posts"] += 1
+                calls["url"] = request.full_url
+                calls["timeout"] = timeout
+                calls["payload"] = json.loads(request.data)
+                return FakeResponse()
+        env = dict(
+            self.env,
+            MEDIA_GENERATION_API_PROFILE="responses",
+            MEDIA_GENERATION_API_BASE_URL="https://media.example.invalid",
+            MEDIA_IMAGE2_MODEL="gpt-image-2.5",
+        )
+        env.pop("MEDIA_GENERATION_AGENT_ID", None)
+        with adapter_environment(env):
+            with mock.patch.object(self.module.urllib.request, "build_opener", side_effect=lambda *_args: FakeOpener()):
+                prepared = self.module.media_prepare({"provider": "image-2", "prompt": "A small test image"})
+                submitted = self.module.media_submit({
+                    "confirmation_id": prepared["confirmation_id"],
+                    "confirmation_fingerprint": prepared["confirmation_fingerprint"],
+                    "user_confirmation": "确认",
+                })
+                self.assertEqual(calls["posts"], 1)
+                self.assertEqual(calls["url"], "https://media.example.invalid/v1/responses")
+                self.assertEqual(calls["timeout"], 60)
+                self.assertEqual(calls["payload"]["model"], "gpt-image-2.5")
+                self.assertEqual(calls["payload"]["tool_choice"], {"type": "image_generation"})
+                self.assertEqual(submitted["state"], "completed")
+                self.assertEqual(len(submitted["saved"]), 1)
+                saved_path = Path(submitted["saved"][0]["path"])
+                self.assertEqual(saved_path.suffix, ".png")
+                self.assertEqual(saved_path.read_bytes(), png)
+                self.module._validate_png(saved_path.read_bytes())
+            invalid_png = (
+                b"\x89PNG\r\n\x1a\n"
+                + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+                + chunk(b"IDAT", b"not-a-zlib-stream")
+                + chunk(b"IEND", b"")
+            )
+            with self.assertRaisesRegex(self.module.MediaError, "压缩数据无法解码"):
+                self.module._validate_png(invalid_png)
+
+    def test_bundled_python_healthcheck_needs_no_openai_package_or_provider_key(self):
+        environment = os.environ.copy()
+        for key in list(environment):
+            if key.startswith(ADAPTER_ENV_PREFIXES) or key == "OPENAI_API_KEY":
+                environment.pop(key, None)
+        completed = subprocess.run(
+            [sys.executable, str(MEDIA_MCP_SCRIPT), "--healthcheck"],
+            text=True,
+            capture_output=True,
+            env=environment,
+            timeout=10,
+            check=True,
+        )
+        health = json.loads(completed.stdout)
+        self.assertTrue(health["ready"])
+        self.assertEqual(health["implementation"], "cpython")
+        self.assertGreaterEqual(tuple(map(int, health["python"].split("."))), (3, 12))
+        self.assertEqual(health["dependencies"], "python-standard-library")
+        self.assertEqual(health["healthScope"], "local-runtime-protocol")
+        self.assertEqual(health["gatewayCatalogStatus"], "not_checked")
+        self.assertEqual(health["generationCapability"], "not_tested")
+        self.assertEqual(health["serverVersion"], "1.3.3")
+
+    def test_wrapper_healthcheck_does_not_merge_stderr_into_json_stdout(self):
+        self.assertTrue(POWERSHELL, "Windows PowerShell is required for this wrapper contract test")
+        fake_python = Path(self.temp.name) / "python-health-fixture.cmd"
+        health_json = json.dumps({
+            "ready": True,
+            "serverVersion": "1.3.3",
+            "healthScope": "local-runtime-protocol",
+            "runtimeStatus": "passed",
+            "protocolStatus": "passed",
+            "gatewayCatalogStatus": "not_checked",
+            "generationCapability": "not_tested",
+            "toolCount": 6,
+        }, separators=(",", ":"))
+        fake_python.write_text(f"@echo off\r\necho {health_json}\r\necho diagnostic-only 1>&2\r\n", encoding="ascii")
+        completed = subprocess.run(
+            [POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(MEDIA_MCP_WRAPPER), "-HealthCheck", "-PythonExe", str(fake_python)],
+            capture_output=True,
+            timeout=20,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8", errors="replace"))
+        self.assertEqual(completed.stderr, b"")
+        health = json.loads(completed.stdout.decode("utf-8", errors="strict"))
+        self.assertTrue(health["ready"])
+        self.assertEqual(health["protocolStatus"], "passed")
 
 
 class DashScopeAdapterTests(unittest.TestCase):

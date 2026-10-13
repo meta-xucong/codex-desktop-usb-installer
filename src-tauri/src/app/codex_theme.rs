@@ -36,6 +36,19 @@ const CONFIG_SETTLE: Duration = Duration::from_secs(2);
 const QUIT_TIMEOUT_SECS: u64 = 30;
 const CDP_WAIT: Duration = Duration::from_secs(45);
 
+async fn run_after_usb_target_gate<T, Gate, Action, Fut>(
+    gate: Gate,
+    action: Action,
+) -> Result<T, AppError>
+where
+    Gate: FnOnce() -> Result<(), AppError>,
+    Action: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T, AppError>>,
+{
+    gate()?;
+    action().await
+}
+
 /// How a restart-based flow syncs the native layer: try-on requires a verified
 /// hot sync so the UI never reports a full theme while only CSS was applied;
 /// a full apply may fall back to the stopped-Codex transactional file write.
@@ -944,29 +957,32 @@ impl ThemeService {
     /// injects. Does not touch the manager's persisted selection — the caller
     /// decides whether to keep it.
     pub async fn try_on(&self, settings: &AppSettings, theme_ref: &str) -> Result<(), AppError> {
-        if !theme_supported() {
-            return Err(AppError::UnsupportedPlatform);
-        }
-        ensure_no_pending_tx()?;
-        let dir = resolve_theme(settings, theme_ref)?;
-        // Validate eagerly so a broken package fails the command, not the
-        // daemon's next tick.
-        let theme = load_theme(&dir).map_err(|e| AppError::Engine(e.to_string()))?;
-        if !codex_theme_engine::cdp::cdp_http_ready(THEME_CDP_PORT).await {
-            return Err(AppError::Engine(
-                "codex-not-debuggable: Codex 未以调试模式运行".to_string(),
-            ));
-        }
-        if let Some(native) = lenient_native(&theme) {
-            // A codex-theme-v1 package promises native appearance values. Do
-            // not silently claim success when only its CSS layer could apply.
-            self.hot_apply_native(&theme.config.id, &native, true)
-                .await?;
-        }
-        let handle = self.directive_handle().await;
-        handle
-            .send(Some(dir))
-            .map_err(|_| AppError::Internal("主题守护未运行".to_string()))
+        run_after_usb_target_gate(authorize_theme_codex_target, || async {
+            if !theme_supported() {
+                return Err(AppError::UnsupportedPlatform);
+            }
+            ensure_no_pending_tx()?;
+            let dir = resolve_theme(settings, theme_ref)?;
+            // Validate eagerly so a broken package fails the command, not the
+            // daemon's next tick.
+            let theme = load_theme(&dir).map_err(|e| AppError::Engine(e.to_string()))?;
+            if !codex_theme_engine::cdp::cdp_http_ready(THEME_CDP_PORT).await {
+                return Err(AppError::Engine(
+                    "codex-not-debuggable: Codex 未以调试模式运行".to_string(),
+                ));
+            }
+            if let Some(native) = lenient_native(&theme) {
+                // A codex-theme-v1 package promises native appearance values.
+                // Do not silently claim success when only its CSS layer could apply.
+                self.hot_apply_native(&theme.config.id, &native, true)
+                    .await?;
+            }
+            let handle = self.directive_handle().await;
+            handle
+                .send(Some(dir))
+                .map_err(|_| AppError::Internal("主题守护未运行".to_string()))
+        })
+        .await
     }
 
     /// Hot-write a theme's native settings over CDP (running Codex, official
@@ -981,6 +997,7 @@ impl ThemeService {
         native: &CodexTheme,
         stash_first: bool,
     ) -> Result<(), AppError> {
+        authorize_theme_codex_target()?;
         let paths = native_paths()?;
         codex_theme_engine::native::backup_native_theme(&paths)
             .map_err(|e| AppError::Engine(e.to_string()))?;
@@ -1054,48 +1071,58 @@ impl ThemeService {
     /// pre-try-on native settings back. With Codex stopped the snapshot is
     /// written straight into config.toml (transactionally) instead.
     pub async fn cancel_try_on(&self) -> Result<(), AppError> {
-        self.turn_off_live().await?;
-        let Some(stash) = read_stash() else {
-            return Ok(());
-        };
-        if codex_theme_engine::cdp::cdp_http_ready(THEME_CDP_PORT).await {
-            let mut targets = codex_theme_engine::cdp::connect_codex_targets(
-                THEME_CDP_PORT,
-                Duration::from_secs(8),
-            )
-            .await
-            .map_err(|e| AppError::Engine(e.to_string()))?;
-            let session = targets.remove(0).session;
-            for extra in targets {
-                extra.session.close();
+        run_after_usb_target_gate(authorize_theme_codex_target, || async {
+            self.turn_off_live_unchecked().await?;
+            let Some(stash) = read_stash() else {
+                return Ok(());
+            };
+            if codex_theme_engine::cdp::cdp_http_ready(THEME_CDP_PORT).await {
+                let mut targets = codex_theme_engine::cdp::connect_codex_targets(
+                    THEME_CDP_PORT,
+                    Duration::from_secs(8),
+                )
+                .await
+                .map_err(|e| AppError::Engine(e.to_string()))?;
+                let session = targets.remove(0).session;
+                for extra in targets {
+                    extra.session.close();
+                }
+                let version_hint = codex_version_hint();
+                let entries = native_hot::snapshot_write_entries(&stash.settings);
+                let outcome =
+                    native_hot::write_values(&session, &entries, version_hint.as_deref()).await;
+                session.close();
+                outcome.map_err(|e| AppError::Engine(e.to_string()))?;
+                remove_stash();
+                Ok(())
+            } else if !codex_running() {
+                let snapshot = stash.settings.clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    write_snapshot_with_tx(&snapshot, "snapshot_restore")
+                })
+                .await
+                .map_err(|e| AppError::Internal(format!("试穿撤销任务失败: {e}")))??;
+                remove_stash();
+                Ok(())
+            } else {
+                Err(AppError::Engine(
+                    "Codex 正在运行但没有调试端口，暂时无法撤销原生试穿——退出 Codex 后重试，或使用完全恢复".to_string(),
+                ))
             }
-            let version_hint = codex_version_hint();
-            let entries = native_hot::snapshot_write_entries(&stash.settings);
-            let outcome =
-                native_hot::write_values(&session, &entries, version_hint.as_deref()).await;
-            session.close();
-            outcome.map_err(|e| AppError::Engine(e.to_string()))?;
-            remove_stash();
-            Ok(())
-        } else if !codex_running() {
-            let snapshot = stash.settings.clone();
-            tauri::async_runtime::spawn_blocking(move || {
-                write_snapshot_with_tx(&snapshot, "snapshot_restore")
-            })
-            .await
-            .map_err(|e| AppError::Internal(format!("试穿撤销任务失败: {e}")))??;
-            remove_stash();
-            Ok(())
-        } else {
-            Err(AppError::Engine(
-                "Codex 正在运行但没有调试端口，暂时无法撤销原生试穿——退出 Codex 后重试，或使用完全恢复".to_string(),
-            ))
-        }
+        })
+        .await
     }
 
     /// Live removal (renderers back to stock). Persisted selection is cleared
     /// by the command layer; config.toml is only touched by `off_full`.
     pub async fn turn_off_live(&self) -> Result<(), AppError> {
+        run_after_usb_target_gate(authorize_theme_codex_target, || async {
+            self.turn_off_live_unchecked().await
+        })
+        .await
+    }
+
+    async fn turn_off_live_unchecked(&self) -> Result<(), AppError> {
         let inner = self.inner.lock().await;
         if let Some(tx) = &inner.directive_tx {
             let _ = tx.send(None);
@@ -1159,45 +1186,48 @@ impl ThemeService {
         theme_ref: &str,
         codex_locale: Option<&str>,
     ) -> Result<(), AppError> {
-        if !theme_supported() {
-            return Err(AppError::UnsupportedPlatform);
-        }
-        ensure_no_pending_tx()?;
-        let dir = resolve_theme(settings, theme_ref)?;
-        let theme = load_theme(&dir).map_err(|e| AppError::Engine(e.to_string()))?;
-        let native = strict_native(&theme)?;
-        // §4 contract gate: both official share strings must derive and
-        // round-trip before anything is written anywhere.
-        codex_theme_engine::codex_theme::verified_share_strings(&native)
-            .map_err(|e| AppError::Engine(e.to_string()))?;
-        let theme_id = theme.config.id.clone();
+        run_after_usb_target_gate(authorize_theme_codex_target, || async {
+            if !theme_supported() {
+                return Err(AppError::UnsupportedPlatform);
+            }
+            ensure_no_pending_tx()?;
+            let dir = resolve_theme(settings, theme_ref)?;
+            let theme = load_theme(&dir).map_err(|e| AppError::Engine(e.to_string()))?;
+            let native = strict_native(&theme)?;
+            // §4 contract gate: both official share strings must derive and
+            // round-trip before anything is written anywhere.
+            codex_theme_engine::codex_theme::verified_share_strings(&native)
+                .map_err(|e| AppError::Engine(e.to_string()))?;
+            let theme_id = theme.config.id.clone();
 
-        if codex_theme_engine::cdp::cdp_http_ready(THEME_CDP_PORT).await {
-            match self.hot_apply_native(&theme_id, &native, false).await {
-                Ok(()) => {
-                    let handle = self.directive_handle().await;
-                    handle
-                        .send(Some(dir.clone()))
-                        .map_err(|_| AppError::Internal("主题守护未运行".to_string()))?;
-                    self.wait_daemon_theme(&theme_id, Duration::from_secs(30))
-                        .await?;
-                    remove_stash(); // applied == kept: the try-on stash is consumed
-                    return Ok(());
-                }
-                Err(error) => {
-                    log::warn!("热应用失败，降级为停机写 config.toml: {error}");
-                    return self
-                        .file_apply_flow(settings, &dir, &theme_id, &native, codex_locale)
-                        .await;
+            if codex_theme_engine::cdp::cdp_http_ready(THEME_CDP_PORT).await {
+                match self.hot_apply_native(&theme_id, &native, false).await {
+                    Ok(()) => {
+                        let handle = self.directive_handle().await;
+                        handle
+                            .send(Some(dir.clone()))
+                            .map_err(|_| AppError::Internal("主题守护未运行".to_string()))?;
+                        self.wait_daemon_theme(&theme_id, Duration::from_secs(30))
+                            .await?;
+                        remove_stash(); // applied == kept: the try-on stash is consumed
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        log::warn!("热应用失败，降级为停机写 config.toml: {error}");
+                        return self
+                            .file_apply_flow(settings, &dir, &theme_id, &native, codex_locale)
+                            .await;
+                    }
                 }
             }
-        }
-        self.restart_debuggable_and_inject(
-            settings,
-            theme_ref,
-            NativeSync::HotThenFile,
-            codex_locale,
-        )
+            self.restart_debuggable_and_inject(
+                settings,
+                theme_ref,
+                NativeSync::HotThenFile,
+                codex_locale,
+            )
+            .await
+        })
         .await
     }
 
@@ -1232,6 +1262,7 @@ impl ThemeService {
         let launch_locale = codex_locale.clone();
         tauri::async_runtime::spawn_blocking(move || -> Result<(), AppError> {
             let installed = installed_codex_path()?;
+            authorize_theme_codex_path(&installed)?;
             quit_codex(&installed)?;
             launch_codex_with_cdp(
                 &installed,
@@ -1300,6 +1331,7 @@ impl ThemeService {
         let mut tx =
             tauri::async_runtime::spawn_blocking(move || -> Result<NativeTransaction, AppError> {
                 let installed = installed_codex_path()?;
+                authorize_theme_codex_path(&installed)?;
                 let was_running = codex_running();
                 quit_codex(&installed)?;
                 std::thread::sleep(CONFIG_SETTLE);
@@ -1431,6 +1463,7 @@ impl ThemeService {
         self.turn_off_live().await?;
         tauri::async_runtime::spawn_blocking(move || -> Result<(), AppError> {
             let installed = installed_codex_path()?;
+            authorize_theme_codex_path(&installed)?;
             let was_running = codex_running();
             quit_codex(&installed)?;
             std::thread::sleep(CONFIG_SETTLE);
@@ -1559,9 +1592,51 @@ fn launch_codex_plain() -> Result<(), AppError> {
 #[cfg(target_os = "windows")]
 fn windows_domain_settings() -> crate::domain::settings::AppSettings {
     let saved = AppSettings::load();
-    let mut settings = crate::domain::settings::AppSettings::new(String::new(), saved.install_root);
+    // USB drive letters can change, and a persisted machine-local portable
+    // path must not win detection when the manager is running from a signed
+    // removable bundle.
+    let install_root = crate::app::usb_guard::current_usb_codex_root()
+        .filter(|_| crate::app::usb_guard::guard_required())
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or(saved.install_root);
+    let mut settings = crate::domain::settings::AppSettings::new(String::new(), install_root);
     settings.disable_codex_self_updates = saved.disable_codex_self_updates;
     settings
+}
+
+#[cfg(target_os = "windows")]
+fn authorize_theme_codex_target() -> Result<(), AppError> {
+    if !crate::app::usb_guard::guard_required() {
+        return Ok(());
+    }
+    let installed = installed_windows_codex()?;
+    crate::app::win_update::authorize_usb_codex_launch(&installed, "codex-theme-operation-target")?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn authorize_theme_codex_target() -> Result<(), AppError> {
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn authorize_theme_codex_path(installed_path: &Path) -> Result<(), AppError> {
+    if !crate::app::usb_guard::guard_required() {
+        return Ok(());
+    }
+    let installed = installed_windows_codex()?;
+    if !codex_win_engine::same_windows_path(Path::new(&installed.path), installed_path) {
+        return Err(AppError::Engine(
+            "Codex 安装位置在主题操作前发生变化，请重新打开管理器后重试。".to_string(),
+        ));
+    }
+    crate::app::win_update::authorize_usb_codex_launch(&installed, "codex-theme-operation-path")?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn authorize_theme_codex_path(_installed_path: &Path) -> Result<(), AppError> {
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
@@ -1600,9 +1675,6 @@ fn launch_codex_with_cdp(
     codex_locale: Option<&str>,
 ) -> Result<(), AppError> {
     run_gated_theme_relaunch(require_theme_relaunch_authorization, || {
-        if disable_self_updates {
-            crate::app::codex_self_update::sync_setting(true)?;
-        }
         let detected = installed_windows_codex()?;
         if !codex_win_engine::same_windows_path(Path::new(&detected.path), installed) {
             return Err(AppError::Engine(format!(
@@ -1611,11 +1683,22 @@ fn launch_codex_with_cdp(
                 detected.path
             )));
         }
+        // A fixed USB manager can otherwise fall back to a previously
+        // registered local portable install when its own payload is missing.
+        // Validate the detected target against the signed USB root before
+        // changing settings or running the USB startup transaction.
+        let usb_authorization = crate::app::win_update::authorize_usb_codex_launch(
+            &detected,
+            "codex-theme-launch-target",
+        )?;
+        let usb_mode = usb_authorization.is_some();
+        if disable_self_updates {
+            crate::app::codex_self_update::sync_setting(true)?;
+        }
         log::info!(
             "launching Windows Codex with CDP port={port} path={}",
             installed.display()
         );
-        let usb_mode = crate::app::usb_guard::guard_required();
         let launch_policy = if usb_mode {
             if crate::app::win_update::usb_no_sandbox_compatibility_known(&detected.version) {
                 codex_win_engine::PortableLaunchPolicy::UsbCompatibleNoSandbox
@@ -1625,17 +1708,20 @@ fn launch_codex_with_cdp(
         } else {
             codex_win_engine::PortableLaunchPolicy::Standard
         };
-        let direct_entry_required = if usb_mode {
-            crate::app::usb_guard::require_signed_codex_bundle("codex-theme-direct-entry-policy")?
-                .map(|authorization| authorization.direct_entry_required)
-                .unwrap_or(false)
+        let direct_entry_required = usb_authorization
+            .as_ref()
+            .is_some_and(|authorization| authorization.direct_entry_required);
+        let media_environment = if usb_mode {
+            crate::app::media_generation::usb_launch_environment()
         } else {
-            false
+            Vec::new()
         };
         let report = codex_win_engine::launch_codex_with_options(
             &detected,
             codex_win_engine::LaunchOptions {
                 disable_codex_self_updates: disable_self_updates || usb_mode,
+                environment: media_environment,
+                usb_integrity_transaction: usb_mode,
                 require_usb_entry_overlay: direct_entry_required,
                 remote_debugging_port: Some(port),
                 codex_home: if usb_mode {
@@ -1770,7 +1856,7 @@ mod catalog_network_tests {
 
 #[cfg(test)]
 mod usb_theme_launch_gate_tests {
-    use super::run_gated_theme_relaunch;
+    use super::{run_after_usb_target_gate, run_gated_theme_relaunch};
     use crate::errors::AppError;
     use std::cell::Cell;
 
@@ -1796,6 +1882,28 @@ mod usb_theme_launch_gate_tests {
             assert!(result.is_err(), "route={route}");
             assert!(!launched.get(), "route={route} must not spawn Codex");
         }
+    }
+
+    #[tokio::test]
+    async fn usb_target_mismatch_blocks_theme_side_effect_before_action() {
+        let changed = Cell::new(false);
+        let result = run_after_usb_target_gate(
+            || {
+                Err(AppError::Engine(
+                    "selected Codex is outside signed USB root".into(),
+                ))
+            },
+            || async {
+                changed.set(true);
+                Ok(())
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(
+            !changed.get(),
+            "theme side effect must not run before target gate"
+        );
     }
 }
 

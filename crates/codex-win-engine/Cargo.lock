@@ -34,6 +34,7 @@ name = "codex-win-engine"
 version = "0.1.0"
 dependencies = [
  "log",
+ "memchr",
  "roxmltree",
  "serde",
  "serde_json",

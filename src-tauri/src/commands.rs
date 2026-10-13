@@ -483,13 +483,21 @@ pub async fn manager_check_update(
     let updater = manager_updater_builder(&app)?
         .build()
         .map_err(|e| AppError::Engine(format!("build manager updater: {e}")))?;
-    let update = match updater.check().await {
-        Ok(update) => update,
-        Err(error) => {
-            log::warn!("manager update check failed stage=metadata error={error}");
-            return Err(AppError::Engine(format!("check manager update: {error}")).into());
-        }
-    };
+    let update =
+        match tokio::time::timeout(std::time::Duration::from_secs(30), updater.check()).await {
+            Ok(Ok(update)) => update,
+            Ok(Err(error)) => {
+                log::warn!("manager update check failed stage=metadata error={error}");
+                return Err(AppError::Engine(format!("check manager update: {error}")).into());
+            }
+            Err(_) => {
+                log::warn!("manager update check failed stage=metadata reason=timeout");
+                return Err(AppError::Engine(
+                    "manager update check timed out after 30 seconds".to_string(),
+                )
+                .into());
+            }
+        };
     log::info!(
         "manager update check completed available={}",
         update.is_some()
@@ -2681,16 +2689,12 @@ pub fn set_autostart(
 // needs a debuggable Codex; the apply path restarts Codex with the loopback
 // debug port and writes the native config.toml appearance sections.
 
-/// Refuse theme operations that restart Codex while an install/update holds
-/// the operation lock — a themed relaunch racing an updater's quit/swap would
-/// interleave two owners of the Codex process lifecycle.
-fn ensure_theme_may_restart_codex(state: &ManagerState) -> Result<(), CommandError> {
+/// Gate theme restarts with the same backend lease as ordinary Codex launch.
+/// The lease closes the snapshot-check race and stays held through the relaunch.
+fn begin_theme_restart_guard(state: &ManagerState) -> Result<OperationGuard, CommandError> {
     reject_uninstall_handoff(state)?;
     crate::app::usb_guard::require_signed_codex_bundle("codex-theme-restart")?;
-    if state.operations.snapshot().is_some() {
-        return Err(AppError::Engine("有正在进行的操作，请稍后再试".to_string()).into());
-    }
-    Ok(())
+    begin_guard(state, OperationKind::Launch)
 }
 
 #[tauri::command]
@@ -2727,7 +2731,7 @@ pub async fn codex_theme_try_on_restart(
     state: State<'_, ManagerState>,
     theme_ref: String,
 ) -> Result<crate::app::codex_theme::ThemeStatusReport, CommandError> {
-    ensure_theme_may_restart_codex(&state)?;
+    let _op = begin_theme_restart_guard(&state)?;
     let settings = PersistedAppSettings::load();
     state
         .codex_theme
@@ -2780,7 +2784,7 @@ pub async fn codex_theme_apply(
     state: State<'_, ManagerState>,
     theme_ref: String,
 ) -> Result<crate::app::codex_theme::ThemeStatusReport, CommandError> {
-    ensure_theme_may_restart_codex(&state)?;
+    let _op = begin_theme_restart_guard(&state)?;
     let settings = PersistedAppSettings::load();
     state
         .codex_theme
@@ -2971,7 +2975,7 @@ pub async fn codex_theme_off(
 ) -> Result<crate::app::codex_theme::ThemeStatusReport, CommandError> {
     reject_uninstall_handoff(&state)?;
     if full {
-        ensure_theme_may_restart_codex(&state)?;
+        let _op = begin_theme_restart_guard(&state)?;
         state.codex_theme.off_full().await?;
         // Only the full restore clears the selection — off_live is a
         // session-scoped pause (SPEC §11): the native palette stays enabled
@@ -3272,6 +3276,10 @@ pub async fn win_launch_codex(
     if !matches!(state.target.os, OperatingSystem::Windows) {
         return Err(AppError::UnsupportedPlatform.into());
     }
+    // Acquire the shared backend operation lock before resolving the USB core
+    // or applying startup compatibility changes. The guard remains live until
+    // the selected launch path returns.
+    let _op = begin_guard(&state, OperationKind::Launch)?;
     if crate::app::usb_guard::guard_required() {
         // Manager startup already performs the online revocation decision and
         // starts the USB watchdog. Re-running start_for_manager here tears
@@ -3291,17 +3299,31 @@ pub async fn win_launch_codex(
         }
     }
     let persisted = PersistedAppSettings::load();
+    let settings = windows_domain_settings_for_persisted(&state);
     let codex_locale = locale
         .as_deref()
         .map(str::trim)
         .filter(|locale| matches!(*locale, "zh-CN" | "zh-TW"))
         .map(str::to_owned);
+    let catalog_reload_marker = if persisted.codex_theme.is_some() {
+        crate::app::win_update::prepare_usb_model_catalog_for_theme_launch(&settings)?
+    } else {
+        None
+    };
     let mut before_codex = crate::app::usb_guard::snapshot_processes("Codex.exe");
     if crate::app::usb_guard::guard_required() {
         before_codex.extend(crate::app::usb_guard::snapshot_usb_codex_entry_processes());
     }
     let before_chatgpt = crate::app::usb_guard::snapshot_processes("ChatGPT.exe");
-    if persisted.codex_theme.is_some() && state.operations.snapshot().is_none() {
+    // A pending catalog reload must use the normal USB launch transaction.
+    // The theme route can treat any listener on its fixed CDP port as success,
+    // even when that listener belongs to an unrelated local Codex instance.
+    // The normal route guarantees the authorized USB executable is launched;
+    // the saved theme resumes on the next launch.
+    if should_attempt_theme_codex_launch(
+        persisted.codex_theme.is_some(),
+        catalog_reload_marker.is_some(),
+    ) {
         let themed = crate::app::codex_theme::launch_with_active_theme(
             &state.codex_theme,
             &persisted,
@@ -3309,6 +3331,9 @@ pub async fn win_launch_codex(
         )
         .await?;
         if themed {
+            crate::app::win_update::complete_usb_model_catalog_launch(
+                catalog_reload_marker.as_deref(),
+            );
             tauri::async_runtime::spawn_blocking(move || {
                 std::thread::sleep(std::time::Duration::from_millis(500));
                 crate::app::usb_guard::register_new_codex_processes(&before_codex, &before_chatgpt);
@@ -3316,7 +3341,6 @@ pub async fn win_launch_codex(
             return Ok(());
         }
     }
-    let settings = windows_domain_settings_for_persisted(&state);
     tauri::async_runtime::spawn_blocking(move || {
         let result = crate::app::win_update::launch_codex(&settings, codex_locale.as_deref());
         if result.is_ok() {
@@ -3328,6 +3352,10 @@ pub async fn win_launch_codex(
     .await
     .map_err(|e| AppError::Internal(format!("join: {e}")))?
     .map_err(Into::into)
+}
+
+fn should_attempt_theme_codex_launch(has_theme: bool, catalog_reload_pending: bool) -> bool {
+    has_theme && !catalog_reload_pending
 }
 
 /// Return the latest local USB guard snapshot.  The command is read-only and
@@ -3351,6 +3379,22 @@ pub async fn gateway_model_probe(
 #[tauri::command]
 pub fn cancel_gateway_model_probe(request_id: String) -> bool {
     crate::app::gateway_model_probe::cancel(&request_id)
+}
+
+/// Read the currently authorized upstream model directory for automatic
+/// media-model selection. The backend issues only GET /v1/models.
+#[tauri::command]
+pub async fn media_model_catalog(
+) -> Result<crate::app::media_generation::MediaModelCatalog, CommandError> {
+    crate::app::media_generation::catalog()
+        .await
+        .map_err(Into::into)
+}
+
+/// Read this user's saved, non-secret media model routing values.
+#[tauri::command]
+pub fn media_model_settings() -> crate::app::media_generation::LocalMediaModelSettings {
+    crate::app::media_generation::local_model_settings()
 }
 
 /// Read, selectively extend, or reset the manager-owned native model catalog.
@@ -4632,10 +4676,17 @@ mod tests {
         install_root_from_picked_dir, invalidate_retained_pause_if_stale,
         manager_update_matches_confirmation, normalize_windows_source_base,
         record_macos_policy_install_state, record_windows_policy_install_state,
-        validate_historical_architecture_with_compatibility, validate_install_root_path,
-        validated_custom_proxy_for_settings, HistoricalPolicyInstallState,
-        INSTALL_LOCATION_PROBE_PREFIX,
+        should_attempt_theme_codex_launch, validate_historical_architecture_with_compatibility,
+        validate_install_root_path, validated_custom_proxy_for_settings,
+        HistoricalPolicyInstallState, INSTALL_LOCATION_PROBE_PREFIX,
     };
+
+    #[test]
+    fn catalog_reload_uses_normal_usb_launch_instead_of_fixed_port_theme_hot_attach() {
+        assert!(!should_attempt_theme_codex_launch(true, true));
+        assert!(should_attempt_theme_codex_launch(true, false));
+        assert!(!should_attempt_theme_codex_launch(false, false));
+    }
     use crate::app::mac_update::HistoricalMacEvidence;
     use crate::app::op_phase::OperationPhase;
     use crate::app::oplock::{OperationKind, OperationManager};

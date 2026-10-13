@@ -292,6 +292,7 @@ fn find_bytes_in_file(path: &Path, needle: &[u8]) -> io::Result<Option<u64>> {
     if needle.is_empty() {
         return Ok(Some(0));
     }
+    let finder = memchr::memmem::Finder::new(needle);
     let file = fs::File::open(path)?;
     let mut reader = BufReader::with_capacity(EXTRACTION_COPY_BUFFER_BYTES, file);
     let mut carry = Vec::with_capacity(needle.len().saturating_sub(1));
@@ -306,10 +307,7 @@ fn find_bytes_in_file(path: &Path, needle: &[u8]) -> io::Result<Option<u64>> {
         let mut haystack = Vec::with_capacity(carry_len + read);
         haystack.extend_from_slice(&carry);
         haystack.extend_from_slice(&chunk[..read]);
-        if let Some(index) = haystack
-            .windows(needle.len())
-            .position(|window| window == needle)
-        {
+        if let Some(index) = finder.find(&haystack) {
             return Ok(Some(
                 file_offset.saturating_sub(carry_len as u64) + index as u64,
             ));
@@ -603,7 +601,6 @@ fn json_array_string_spans(bytes: &[u8], array: Range<usize>) -> Option<Vec<Rang
     }
 }
 
-#[cfg(test)]
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -1056,10 +1053,7 @@ fn electron_asar_integrity_value_spans(bytes: &[u8]) -> Result<Vec<Range<usize>>
         let is_app_asar = record
             .get("file")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|path| {
-                path.replace('/', "\\")
-                    .eq_ignore_ascii_case("resources\\app.asar")
-            });
+            .is_some_and(|path| path.eq_ignore_ascii_case("resources\\app.asar"));
         let uses_sha256 = record
             .get("alg")
             .and_then(serde_json::Value::as_str)
@@ -1321,13 +1315,546 @@ fn app_asar_header_sha256(app_asar: &Path) -> Result<String, EngineError> {
     Ok(hash.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-fn refresh_embedded_asar_integrity(install_root: &Path) -> Result<bool, EngineError> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IntegrityReplaceStage {
+    CommitCore,
+    CommitOverlay,
+    RestoreCore,
+    RestoreOverlay,
+}
+
+fn integrity_file_path(install_root: &Path, name: &str) -> PathBuf {
+    install_root.join(name)
+}
+
+fn validate_sha256_hex(value: &str, label: &str) -> Result<(), EngineError> {
+    if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err(EngineError::Msix(format!(
+            "USB integrity recovery {label} is not a SHA256"
+        )))
+    }
+}
+
+fn require_regular_recovery_file(path: &Path, label: &str) -> Result<(), EngineError> {
+    if is_regular_non_reparse_file(path)? {
+        Ok(())
+    } else {
+        Err(EngineError::Msix(format!(
+            "USB integrity recovery {label} is missing or is not a regular non-reparse file"
+        )))
+    }
+}
+
+fn write_new_synced_file(path: &Path, bytes: &[u8], label: &str) -> Result<(), EngineError> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| io_err(&format!("create USB integrity recovery {label}"), error))?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| io_err(&format!("write USB integrity recovery {label}"), error))
+}
+
+fn remove_regular_recovery_file(path: &Path, label: &str) -> Result<(), EngineError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            require_regular_recovery_file(path, label)?;
+            fs::remove_file(path)
+                .map_err(|error| io_err(&format!("remove USB integrity recovery {label}"), error))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io_err(
+            &format!("inspect USB integrity recovery {label}"),
+            error,
+        )),
+    }
+}
+
+fn cleanup_usb_integrity_recovery_files(install_root: &Path) -> Result<(), EngineError> {
+    // Remove the journal first. A crash after this point leaves only inert,
+    // product-owned backups and cannot trigger recovery on the next launch.
+    remove_regular_recovery_file(
+        &integrity_file_path(install_root, USB_INTEGRITY_RECOVERY_JOURNAL),
+        "journal",
+    )?;
+    remove_regular_recovery_file(
+        &integrity_file_path(install_root, USB_INTEGRITY_CORE_BACKUP),
+        "core backup",
+    )?;
+    remove_regular_recovery_file(
+        &integrity_file_path(install_root, USB_INTEGRITY_OVERLAY_BACKUP),
+        "overlay backup",
+    )
+}
+
+fn cleanup_orphan_usb_integrity_backups(install_root: &Path) -> Result<(), EngineError> {
+    let journal_path = integrity_file_path(install_root, USB_INTEGRITY_RECOVERY_JOURNAL);
+    match fs::symlink_metadata(&journal_path) {
+        Ok(_) => {
+            return Err(EngineError::Msix(
+                "USB integrity recovery journal must be processed before another update"
+                    .to_string(),
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io_err("inspect USB integrity recovery journal", error)),
+    }
+    remove_regular_recovery_file(
+        &integrity_file_path(install_root, USB_INTEGRITY_CORE_BACKUP),
+        "orphan core backup",
+    )?;
+    remove_regular_recovery_file(
+        &integrity_file_path(install_root, USB_INTEGRITY_OVERLAY_BACKUP),
+        "orphan overlay backup",
+    )
+}
+
+/// Locate one unique top-level overlay value while preserving all source bytes.
+/// serde_json accepts duplicate object keys, so recovery rejects duplicates
+/// rather than risking a disagreement between the edited and parsed value.
+fn unique_overlay_original_sha_span(bytes: &[u8]) -> Result<Range<usize>, EngineError> {
+    let _object_end = matching_json_object_end(bytes, 0)
+        .ok_or_else(|| EngineError::Msix("USB entry overlay root object is invalid".to_string()))?;
+    let mut cursor = 1usize;
+    let mut found = None;
+    loop {
+        cursor = skip_json_whitespace(bytes, cursor);
+        if bytes.get(cursor) == Some(&b'}') {
+            break;
+        }
+        let (key, key_end, _) = parse_json_string_at(bytes, cursor)
+            .ok_or_else(|| EngineError::Msix("USB entry overlay key is invalid".to_string()))?;
+        cursor = skip_json_whitespace(bytes, key_end);
+        if bytes.get(cursor) != Some(&b':') {
+            return Err(EngineError::Msix(
+                "USB entry overlay member is invalid".to_string(),
+            ));
+        }
+        let value_start = skip_json_whitespace(bytes, cursor + 1);
+        let value_end = json_value_end(bytes, value_start)
+            .ok_or_else(|| EngineError::Msix("USB entry overlay value is invalid".to_string()))?;
+        if key == "originalSha256" {
+            if found.replace(value_start..value_end).is_some() {
+                return Err(EngineError::Msix(
+                    "USB entry overlay has duplicate originalSha256 fields".to_string(),
+                ));
+            }
+        }
+        cursor = skip_json_whitespace(bytes, value_end);
+        match bytes.get(cursor) {
+            Some(b',') => cursor += 1,
+            Some(b'}') => break,
+            _ => {
+                return Err(EngineError::Msix(
+                    "USB entry overlay object is malformed".to_string(),
+                ));
+            }
+        }
+    }
+    let value = found.ok_or_else(|| {
+        EngineError::Msix("USB entry overlay originalSha256 is missing".to_string())
+    })?;
+    let (_, end, contents) = parse_json_string_at(bytes, value.start)
+        .filter(|(_, end, _)| *end == value.end)
+        .ok_or_else(|| {
+            EngineError::Msix("USB entry overlay originalSha256 is invalid".to_string())
+        })?;
+    if end != value.end
+        || contents.len() != 64
+        || !bytes[contents.clone()].iter().all(u8::is_ascii_hexdigit)
+    {
+        return Err(EngineError::Msix(
+            "USB entry overlay originalSha256 is not a SHA256".to_string(),
+        ));
+    }
+    Ok(contents)
+}
+
+fn derive_usb_overlay_with_core_hash(
+    old_overlay_bytes: &[u8],
+    old_core_sha256: &str,
+    new_core_sha256: &str,
+) -> Result<Vec<u8>, EngineError> {
+    validate_sha256_hex(old_core_sha256, "old core hash")?;
+    validate_sha256_hex(new_core_sha256, "new core hash")?;
+    let metadata: UsbEntryOverlay = serde_json::from_slice(old_overlay_bytes).map_err(|error| {
+        EngineError::Msix(format!(
+            "USB direct-entry overlay metadata is invalid: {error}"
+        ))
+    })?;
+    if metadata.schema_version != USB_ENTRY_OVERLAY_SCHEMA
+        || metadata.original_executable != USB_ENTRY_ORIGINAL_EXE
+        || !metadata
+            .original_sha256
+            .eq_ignore_ascii_case(old_core_sha256)
+    {
+        return Err(EngineError::Msix(
+            "USB direct-entry overlay does not bind the recovery backup core".to_string(),
+        ));
+    }
+    let span = unique_overlay_original_sha_span(old_overlay_bytes)?;
+    let mut new_overlay = Vec::with_capacity(old_overlay_bytes.len());
+    new_overlay.extend_from_slice(&old_overlay_bytes[..span.start]);
+    new_overlay.extend_from_slice(new_core_sha256.as_bytes());
+    new_overlay.extend_from_slice(&old_overlay_bytes[span.end..]);
+    let parsed: UsbEntryOverlay = serde_json::from_slice(&new_overlay).map_err(|error| {
+        EngineError::Msix(format!("derived USB entry overlay is invalid: {error}"))
+    })?;
+    if !parsed.original_sha256.eq_ignore_ascii_case(new_core_sha256)
+        || parsed.schema_version != metadata.schema_version
+        || parsed.entry_executable != metadata.entry_executable
+        || parsed.original_executable != metadata.original_executable
+        || parsed.shim_sha256 != metadata.shim_sha256
+        || parsed.aliases.len() != metadata.aliases.len()
+    {
+        return Err(EngineError::Msix(
+            "derived USB entry overlay changed fields outside the core hash".to_string(),
+        ));
+    }
+    for (derived, original) in parsed.aliases.iter().zip(metadata.aliases.iter()) {
+        if derived.executable != original.executable
+            || derived.original_executable != original.original_executable
+            || derived.original_sha256 != original.original_sha256
+            || derived.shim_sha256 != original.shim_sha256
+        {
+            return Err(EngineError::Msix(
+                "derived USB entry overlay changed an alias record".to_string(),
+            ));
+        }
+    }
+    Ok(new_overlay)
+}
+
+fn replace_integrity_file<F>(
+    path: &Path,
+    bytes: &[u8],
+    stage: IntegrityReplaceStage,
+    before_replace: &mut F,
+) -> Result<(), EngineError>
+where
+    F: FnMut(IntegrityReplaceStage) -> Result<(), EngineError>,
+{
+    before_replace(stage)?;
+    replace_file_atomically(path, bytes)
+}
+
+fn recover_usb_integrity_transaction_with<F>(
+    install_root: &Path,
+    before_replace: &mut F,
+) -> Result<(), EngineError>
+where
+    F: FnMut(IntegrityReplaceStage) -> Result<(), EngineError>,
+{
+    let journal_path = integrity_file_path(install_root, USB_INTEGRITY_RECOVERY_JOURNAL);
+    match fs::symlink_metadata(&journal_path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return cleanup_orphan_usb_integrity_backups(install_root);
+        }
+        Err(error) => return Err(io_err("inspect USB integrity recovery journal", error)),
+        Ok(_) => {}
+    }
+    require_regular_recovery_file(&journal_path, "journal")?;
+    let journal_bytes = fs::read(&journal_path)
+        .map_err(|error| io_err("read USB integrity recovery journal", error))?;
+    let journal: UsbIntegrityRecoveryJournal =
+        serde_json::from_slice(&journal_bytes).map_err(|error| {
+            EngineError::Msix(format!(
+                "USB integrity recovery journal is invalid: {error}"
+            ))
+        })?;
+    if journal.schema_version != USB_INTEGRITY_RECOVERY_SCHEMA {
+        return Err(EngineError::Msix(
+            "USB integrity recovery journal schema is unsupported".to_string(),
+        ));
+    }
+    for (hash, label) in [
+        (&journal.old_core_sha256, "old core hash"),
+        (&journal.new_core_sha256, "new core hash"),
+        (&journal.old_overlay_sha256, "old overlay hash"),
+        (&journal.new_overlay_sha256, "new overlay hash"),
+        (&journal.asar_header_sha256, "ASAR header hash"),
+    ] {
+        validate_sha256_hex(hash, label)?;
+    }
+
+    let core_path = install_root.join(USB_ENTRY_ORIGINAL_EXE);
+    let overlay_path = install_root.join(USB_ENTRY_OVERLAY_FILE);
+    let core_backup_path = integrity_file_path(install_root, USB_INTEGRITY_CORE_BACKUP);
+    let overlay_backup_path = integrity_file_path(install_root, USB_INTEGRITY_OVERLAY_BACKUP);
+    require_regular_recovery_file(&core_path, "CodexCore.dat")?;
+    require_regular_recovery_file(&overlay_path, "overlay")?;
+    require_regular_recovery_file(&core_backup_path, "core backup")?;
+    require_regular_recovery_file(&overlay_backup_path, "overlay backup")?;
+
+    let old_core = fs::read(&core_backup_path)
+        .map_err(|error| io_err("read USB integrity core backup", error))?;
+    let old_overlay = fs::read(&overlay_backup_path)
+        .map_err(|error| io_err("read USB integrity overlay backup", error))?;
+    if !sha256_hex(&old_core).eq_ignore_ascii_case(&journal.old_core_sha256)
+        || !sha256_hex(&old_overlay).eq_ignore_ascii_case(&journal.old_overlay_sha256)
+    {
+        return Err(EngineError::Msix(
+            "USB integrity recovery backup hash does not match its journal".to_string(),
+        ));
+    }
+    let old_metadata: UsbEntryOverlay = serde_json::from_slice(&old_overlay)
+        .map_err(|error| EngineError::Msix(format!("USB overlay backup is invalid: {error}")))?;
+    if old_metadata.schema_version != USB_ENTRY_OVERLAY_SCHEMA
+        || old_metadata.original_executable != USB_ENTRY_ORIGINAL_EXE
+        || !old_metadata
+            .original_sha256
+            .eq_ignore_ascii_case(&journal.old_core_sha256)
+    {
+        return Err(EngineError::Msix(
+            "USB overlay backup does not bind the old core".to_string(),
+        ));
+    }
+    let mut new_core = old_core.clone();
+    if patch_pe_electron_asar_integrity(&mut new_core, &journal.asar_header_sha256)?.is_none() {
+        return Err(EngineError::Msix(
+            "USB recovery backup has no supported app.asar PE integrity record".to_string(),
+        ));
+    }
+    let derived_new_core_sha256 = sha256_hex(&new_core);
+    if !derived_new_core_sha256.eq_ignore_ascii_case(&journal.new_core_sha256) {
+        return Err(EngineError::Msix(
+            "USB integrity journal new core cannot be derived from its backup".to_string(),
+        ));
+    }
+    let new_overlay = derive_usb_overlay_with_core_hash(
+        &old_overlay,
+        &journal.old_core_sha256,
+        &derived_new_core_sha256,
+    )?;
+    if !sha256_hex(&new_overlay).eq_ignore_ascii_case(&journal.new_overlay_sha256) {
+        return Err(EngineError::Msix(
+            "USB integrity journal new overlay cannot be derived from its backup".to_string(),
+        ));
+    }
+
+    let current_core_sha256 = crate::download::sha256_file(&core_path)?;
+    let current_overlay_sha256 = crate::download::sha256_file(&overlay_path)?;
+    let core_is_old = current_core_sha256.eq_ignore_ascii_case(&journal.old_core_sha256);
+    let core_is_new = current_core_sha256.eq_ignore_ascii_case(&journal.new_core_sha256);
+    let overlay_is_old = current_overlay_sha256.eq_ignore_ascii_case(&journal.old_overlay_sha256);
+    let overlay_is_new = current_overlay_sha256.eq_ignore_ascii_case(&journal.new_overlay_sha256);
+
+    match (core_is_old, core_is_new, overlay_is_old, overlay_is_new) {
+        (true, false, true, false) | (false, true, false, true) => {
+            cleanup_usb_integrity_recovery_files(install_root)
+        }
+        (false, true, true, false) => {
+            replace_integrity_file(
+                &core_path,
+                &old_core,
+                IntegrityReplaceStage::RestoreCore,
+                before_replace,
+            )?;
+            if !crate::download::sha256_file(&core_path)?
+                .eq_ignore_ascii_case(&journal.old_core_sha256)
+            {
+                return Err(EngineError::Msix(
+                    "USB core rollback did not restore the verified backup".to_string(),
+                ));
+            }
+            cleanup_usb_integrity_recovery_files(install_root)
+        }
+        (true, false, false, true) => {
+            replace_integrity_file(
+                &overlay_path,
+                &old_overlay,
+                IntegrityReplaceStage::RestoreOverlay,
+                before_replace,
+            )?;
+            if !crate::download::sha256_file(&overlay_path)?
+                .eq_ignore_ascii_case(&journal.old_overlay_sha256)
+            {
+                return Err(EngineError::Msix(
+                    "USB overlay rollback did not restore the verified backup".to_string(),
+                ));
+            }
+            cleanup_usb_integrity_recovery_files(install_root)
+        }
+        _ => Err(EngineError::Msix(
+            "USB Codex core and overlay do not match a recognized recovery state; launch refused"
+                .to_string(),
+        )),
+    }
+}
+
+/// Resolve a prepared USB PE/overlay transaction before executable selection.
+/// The caller must have validated USB mode; requiring a direct-entry overlay
+/// is a separate policy decision used by newer bundle schemas.
+/// This function is called while the manager's Launch operation lock is held;
+/// it never turns an unjournaled hash mismatch into a success.
+pub(crate) fn recover_usb_codex_integrity_before_launch(
+    install_root: &Path,
+    usb_integrity_transaction: bool,
+) -> Result<(), EngineError> {
+    if !usb_integrity_transaction {
+        return Ok(());
+    }
+    let journal = integrity_file_path(install_root, USB_INTEGRITY_RECOVERY_JOURNAL);
+    let overlay = install_root.join(USB_ENTRY_OVERLAY_FILE);
+    let journal_exists = match fs::symlink_metadata(&journal) {
+        Ok(_) => true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(io_err("inspect USB integrity recovery journal", error)),
+    };
+    let overlay_exists = match fs::symlink_metadata(&overlay) {
+        Ok(_) => true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(io_err("inspect USB entry overlay", error)),
+    };
+    if !journal_exists && !overlay_exists {
+        return Ok(());
+    }
+    recover_usb_integrity_transaction_with(install_root, &mut |_| Ok(()))
+}
+
+fn commit_usb_integrity_transaction_with<F>(
+    install_root: &Path,
+    old_core: &[u8],
+    new_core: &[u8],
+    old_overlay: &[u8],
+    new_overlay: &[u8],
+    asar_header_sha256: &str,
+    before_replace: &mut F,
+) -> Result<(), EngineError>
+where
+    F: FnMut(IntegrityReplaceStage) -> Result<(), EngineError>,
+{
+    cleanup_orphan_usb_integrity_backups(install_root)?;
+    validate_sha256_hex(asar_header_sha256, "ASAR header hash")?;
+    let core_path = install_root.join(USB_ENTRY_ORIGINAL_EXE);
+    let overlay_path = install_root.join(USB_ENTRY_OVERLAY_FILE);
+    require_regular_recovery_file(&core_path, "CodexCore.dat")?;
+    require_regular_recovery_file(&overlay_path, "overlay")?;
+    let journal_path = integrity_file_path(install_root, USB_INTEGRITY_RECOVERY_JOURNAL);
+    let core_backup_path = integrity_file_path(install_root, USB_INTEGRITY_CORE_BACKUP);
+    let overlay_backup_path = integrity_file_path(install_root, USB_INTEGRITY_OVERLAY_BACKUP);
+    let old_core_sha256 = sha256_hex(old_core);
+    let new_core_sha256 = sha256_hex(new_core);
+    let old_overlay_sha256 = sha256_hex(old_overlay);
+    let new_overlay_sha256 = sha256_hex(new_overlay);
+    if !crate::download::sha256_file(&core_path)?.eq_ignore_ascii_case(&old_core_sha256)
+        || !crate::download::sha256_file(&overlay_path)?.eq_ignore_ascii_case(&old_overlay_sha256)
+    {
+        return Err(EngineError::Msix(
+            "USB Codex core or overlay changed before integrity transaction".to_string(),
+        ));
+    }
+
+    let journal = UsbIntegrityRecoveryJournal {
+        schema_version: USB_INTEGRITY_RECOVERY_SCHEMA,
+        old_core_sha256,
+        new_core_sha256,
+        old_overlay_sha256,
+        new_overlay_sha256,
+        asar_header_sha256: asar_header_sha256.to_ascii_lowercase(),
+    };
+    let journal_bytes = serde_json::to_vec_pretty(&journal)
+        .map_err(|error| EngineError::Msix(format!("encode USB integrity journal: {error}")))?;
+
+    if let Err(error) = write_new_synced_file(&core_backup_path, old_core, "core backup") {
+        let _ = remove_regular_recovery_file(&core_backup_path, "partial core backup");
+        return Err(error);
+    }
+    if let Err(error) = write_new_synced_file(&overlay_backup_path, old_overlay, "overlay backup") {
+        let _ = remove_regular_recovery_file(&core_backup_path, "core backup");
+        let _ = remove_regular_recovery_file(&overlay_backup_path, "partial overlay backup");
+        return Err(error);
+    }
+    for (path, expected, label) in [
+        (&core_backup_path, &journal.old_core_sha256, "core backup"),
+        (
+            &overlay_backup_path,
+            &journal.old_overlay_sha256,
+            "overlay backup",
+        ),
+    ] {
+        if !crate::download::sha256_file(path)?.eq_ignore_ascii_case(expected) {
+            let _ = remove_regular_recovery_file(&core_backup_path, "core backup");
+            let _ = remove_regular_recovery_file(&overlay_backup_path, "overlay backup");
+            return Err(EngineError::Msix(format!(
+                "USB integrity {label} failed its write verification"
+            )));
+        }
+    }
+    if let Err(error) = replace_file_atomically(&journal_path, &journal_bytes) {
+        let _ = remove_regular_recovery_file(&core_backup_path, "core backup");
+        let _ = remove_regular_recovery_file(&overlay_backup_path, "overlay backup");
+        return Err(error);
+    }
+    require_regular_recovery_file(&journal_path, "journal")?;
+    if !crate::download::sha256_file(&journal_path)?
+        .eq_ignore_ascii_case(&sha256_hex(&journal_bytes))
+    {
+        return Err(EngineError::Msix(
+            "USB integrity recovery journal failed its write verification".to_string(),
+        ));
+    }
+
+    let commit_result = (|| {
+        replace_integrity_file(
+            &core_path,
+            new_core,
+            IntegrityReplaceStage::CommitCore,
+            before_replace,
+        )?;
+        replace_integrity_file(
+            &overlay_path,
+            new_overlay,
+            IntegrityReplaceStage::CommitOverlay,
+            before_replace,
+        )?;
+        if !crate::download::sha256_file(&core_path)?.eq_ignore_ascii_case(&journal.new_core_sha256)
+            || !crate::download::sha256_file(&overlay_path)?
+                .eq_ignore_ascii_case(&journal.new_overlay_sha256)
+        {
+            return Err(EngineError::Msix(
+                "USB integrity transaction did not commit both files".to_string(),
+            ));
+        }
+        cleanup_usb_integrity_recovery_files(install_root)
+    })();
+    match commit_result {
+        Ok(()) => Ok(()),
+        Err(commit_error) => {
+            match recover_usb_integrity_transaction_with(install_root, before_replace) {
+                Ok(()) => Err(commit_error),
+                Err(recovery_error) => Err(EngineError::Msix(format!(
+                    "{commit_error}; USB integrity recovery remains pending: {recovery_error}"
+                ))),
+            }
+        }
+    }
+}
+
+fn refresh_embedded_asar_integrity(
+    install_root: &Path,
+    usb_integrity_transaction: bool,
+) -> Result<bool, EngineError> {
     let app_asar = install_root.join("resources").join("app.asar");
     if !app_asar.is_file() {
         return Ok(false);
     }
     let overlay_path = install_root.join(USB_ENTRY_OVERLAY_FILE);
-    let is_usb_overlay = overlay_path.is_file();
+    let is_usb_overlay = match fs::symlink_metadata(&overlay_path) {
+        Ok(_) if usb_integrity_transaction => {
+            require_regular_recovery_file(&overlay_path, "overlay")?;
+            true
+        }
+        // An overlay filename is not proof that this process is authorized to
+        // update USB core/overlay state. Leave the entire USB integrity set
+        // untouched in ordinary portable mode.
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(io_err("inspect USB direct-entry overlay metadata", error)),
+    };
     let executable = if is_usb_overlay {
         install_root.join(USB_ENTRY_ORIGINAL_EXE)
     } else if let Some(executable) = installed_app_exe(install_root) {
@@ -1345,72 +1872,63 @@ fn refresh_embedded_asar_integrity(install_root: &Path) -> Result<bool, EngineEr
     let mut executable_bytes = fs::read(&executable)
         .map_err(|error| io_err("read Codex executable for ASAR integrity", error))?;
     let original_executable_bytes = executable_bytes.clone();
+    let old_core_sha256 = sha256_hex(&original_executable_bytes);
+    let old_overlay_bytes = if is_usb_overlay {
+        let bytes = fs::read(&overlay_path)
+            .map_err(|error| io_err("read USB direct-entry overlay metadata", error))?;
+        let metadata: UsbEntryOverlay = serde_json::from_slice(&bytes).map_err(|error| {
+            EngineError::Msix(format!(
+                "USB direct-entry overlay metadata is invalid: {error}"
+            ))
+        })?;
+        if metadata.schema_version != USB_ENTRY_OVERLAY_SCHEMA
+            || metadata.original_executable != USB_ENTRY_ORIGINAL_EXE
+            || !metadata
+                .original_sha256
+                .eq_ignore_ascii_case(&old_core_sha256)
+        {
+            return Err(EngineError::Msix(
+                "USB direct-entry overlay does not match CodexCore.dat before integrity refresh"
+                    .to_string(),
+            ));
+        }
+        // Also reject duplicate binding keys before either file is changed.
+        let _ = unique_overlay_original_sha_span(&bytes)?;
+        Some(bytes)
+    } else {
+        None
+    };
     let Some(executable_patched) =
         patch_pe_electron_asar_integrity(&mut executable_bytes, &header_hash)?
     else {
         return Ok(false);
     };
-    if executable_patched {
+    if !executable_patched {
+        return Ok(false);
+    }
+    let new_core_sha256 = sha256_hex(&executable_bytes);
+    if let Some(old_overlay) = old_overlay_bytes {
+        let new_overlay =
+            derive_usb_overlay_with_core_hash(&old_overlay, &old_core_sha256, &new_core_sha256)?;
+        let mut no_fault = |_| Ok(());
+        commit_usb_integrity_transaction_with(
+            install_root,
+            &original_executable_bytes,
+            &executable_bytes,
+            &old_overlay,
+            &new_overlay,
+            &header_hash,
+            &mut no_fault,
+        )?;
+    } else {
         replace_file_atomically(&executable, &executable_bytes)?;
-        log::info!(
-            "refreshed Codex ElectronAsar PE resource path={} header_sha256={}",
-            executable.display(),
-            header_hash
-        );
     }
-
-    let mut changed = executable_patched;
-    if is_usb_overlay {
-        let overlay_result = (|| {
-            let mut overlay = fs::read(&overlay_path)
-                .map_err(|error| io_err("read USB direct-entry overlay metadata", error))?;
-            let mut metadata: UsbEntryOverlay =
-                serde_json::from_slice(&overlay).map_err(|error| {
-                    EngineError::Msix(format!(
-                        "USB direct-entry overlay metadata is invalid: {error}"
-                    ))
-                })?;
-            if metadata.schema_version != USB_ENTRY_OVERLAY_SCHEMA
-                || metadata.original_executable != USB_ENTRY_ORIGINAL_EXE
-            {
-                return Err(EngineError::Msix(
-                    "USB direct-entry overlay metadata does not identify CodexCore.dat".to_string(),
-                ));
-            }
-            let executable_hash = crate::download::sha256_file(&executable)?;
-            if !metadata
-                .original_sha256
-                .eq_ignore_ascii_case(&executable_hash)
-            {
-                metadata.original_sha256 = executable_hash;
-                overlay = serde_json::to_vec_pretty(&metadata).map_err(|error| {
-                    EngineError::Msix(format!(
-                        "serialize USB direct-entry overlay metadata: {error}"
-                    ))
-                })?;
-                overlay.push(b'\n');
-                replace_file_atomically(&overlay_path, &overlay)?;
-                return Ok(true);
-            }
-            Ok(false)
-        })();
-        match overlay_result {
-            Ok(overlay_changed) => changed |= overlay_changed,
-            Err(error) => {
-                if executable_patched {
-                    replace_file_atomically(&executable, &original_executable_bytes).map_err(
-                        |rollback_error| {
-                            EngineError::Msix(format!(
-                                "{error}; failed to roll back CodexCore.dat after USB overlay update failed: {rollback_error}"
-                            ))
-                        },
-                    )?;
-                }
-                return Err(error);
-            }
-        }
-    }
-    Ok(changed)
+    log::info!(
+        "refreshed Codex ElectronAsar PE resource path={} header_sha256={} usb_transaction={is_usb_overlay}",
+        executable.display(),
+        header_hash
+    );
+    Ok(true)
 }
 
 fn patch_asar_bytes_in_place(
@@ -1511,8 +2029,7 @@ fn patch_all_fixed_width_calls(
 }
 
 fn patch_codex_console_spawn(app_asar: &Path) -> Result<bool, EngineError> {
-    // Scan the archive once.  Reopening and rescanning a 300+ MB ASAR for
-    // every known shape made a slow removable-drive launch needlessly costly;
+    // Read the archive once, use fast substring searches for each known shape,
     // collect fixed-width edits from the original bytes, then apply only the
     // small offsets that matched.
     let bytes = fs::read(app_asar)
@@ -1532,11 +2049,9 @@ fn patch_codex_console_spawn(app_asar: &Path) -> Result<bool, EngineError> {
                 ));
             }
             let mut search_from = 0_usize;
+            let finder = memchr::memmem::Finder::new(call);
             while search_from.saturating_add(call.len()) <= bytes.len() {
-                let Some(relative) = bytes[search_from..]
-                    .windows(call.len())
-                    .position(|window| window == *call)
-                else {
+                let Some(relative) = finder.find(&bytes[search_from..]) else {
                     break;
                 };
                 let offset = search_from + relative;
@@ -1580,11 +2095,9 @@ fn patch_codex_console_spawn(app_asar: &Path) -> Result<bool, EngineError> {
     let mut has_known_patch = false;
     for needle in known_patches {
         let mut search_from = 0usize;
+        let finder = memchr::memmem::Finder::new(needle);
         while search_from.saturating_add(needle.len()) <= bytes.len() {
-            let Some(relative) = bytes[search_from..]
-                .windows(needle.len())
-                .position(|window| window == needle)
-            else {
+            let Some(relative) = finder.find(&bytes[search_from..]) else {
                 break;
             };
             let offset = search_from + relative;
@@ -1630,11 +2143,16 @@ fn is_regular_non_reparse_file(path: &Path) -> Result<bool, EngineError> {
         // FILE_ATTRIBUTE_REPARSE_POINT.  symlink_metadata() does not follow a
         // junction, but Windows still reports a reparse-point file as a
         // regular file in some filesystem configurations.
-        if metadata.file_attributes() & 0x400 != 0 {
+        if has_windows_reparse_attribute(metadata.file_attributes()) {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+#[cfg(windows)]
+fn has_windows_reparse_attribute(attributes: u32) -> bool {
+    attributes & 0x400 != 0 // FILE_ATTRIBUTE_REPARSE_POINT
 }
 
 /// Change one known extracted Codex sidecar from Windows CUI (3) to GUI (2).
@@ -1932,8 +2450,16 @@ fn patch_codex_app_tools_mcp_config(
 pub fn ensure_portable_codex_startup_compatibility(
     install_root: &Path,
 ) -> Result<bool, EngineError> {
+    ensure_portable_codex_startup_compatibility_with_usb_integrity_mode(install_root, false)
+}
+
+pub(crate) fn ensure_portable_codex_startup_compatibility_with_usb_integrity_mode(
+    install_root: &Path,
+    usb_integrity_transaction: bool,
+) -> Result<bool, EngineError> {
     let patched = ensure_portable_codex_startup_compatibility_inner(install_root)?;
-    let integrity_patched = refresh_embedded_asar_integrity(install_root)?;
+    let integrity_patched =
+        refresh_embedded_asar_integrity(install_root, usb_integrity_transaction)?;
     Ok(patched || integrity_patched)
 }
 
@@ -2092,12 +2618,14 @@ fn ensure_portable_codex_startup_compatibility_inner(
 pub fn ensure_portable_codex_locale_compatibility(
     install_root: &Path,
     locale: Option<&str>,
+    usb_integrity_transaction: bool,
 ) -> Result<bool, EngineError> {
     if !requests_chinese_codex_locale(locale) {
         return Ok(false);
     }
     let patched = ensure_portable_codex_locale_compatibility_inner(install_root, locale)?;
-    let integrity_patched = refresh_embedded_asar_integrity(install_root)?;
+    let integrity_patched =
+        refresh_embedded_asar_integrity(install_root, usb_integrity_transaction)?;
     Ok(patched || integrity_patched)
 }
 
@@ -2630,19 +3158,28 @@ pub fn installed_app_exe(install_root: &Path) -> Option<PathBuf> {
 /// the manifest-declared path; when that overlay exists, verify its fixed
 /// filenames and recorded hashes before returning the preserved executable.
 pub fn installed_codex_launch_exe(install_root: &Path) -> Result<PathBuf, EngineError> {
-    installed_codex_launch_exe_with_usb_gate(install_root, false)
+    installed_codex_launch_exe_with_usb_gate(install_root, false, false)
 }
 
 /// Resolve a USB Codex executable only when the direct-entry shim overlay is
 /// present and its recorded hashes match. Older USB installs without the
 /// overlay must be repaired before the manager can launch Codex.
 pub fn installed_usb_codex_launch_exe(install_root: &Path) -> Result<PathBuf, EngineError> {
-    installed_codex_launch_exe_with_usb_gate(install_root, true)
+    installed_codex_launch_exe_with_usb_gate(install_root, true, true)
+}
+
+/// Resolve a portable entry from a validated USB context without making the
+/// direct-entry overlay mandatory. Legacy schema 2 bundles use this path.
+pub(crate) fn installed_codex_launch_exe_for_usb_mode(
+    install_root: &Path,
+) -> Result<PathBuf, EngineError> {
+    installed_codex_launch_exe_with_usb_gate(install_root, false, true)
 }
 
 fn installed_codex_launch_exe_with_usb_gate(
     install_root: &Path,
     require_usb_overlay: bool,
+    allow_usb_overlay: bool,
 ) -> Result<PathBuf, EngineError> {
     let entry = installed_app_exe(install_root).ok_or_else(|| {
         EngineError::Msix(format!(
@@ -2650,6 +3187,9 @@ fn installed_codex_launch_exe_with_usb_gate(
             install_root.display()
         ))
     })?;
+    if !allow_usb_overlay {
+        return Ok(entry);
+    }
     let metadata_path = install_root.join(USB_ENTRY_OVERLAY_FILE);
     if !metadata_path.exists() {
         if require_usb_overlay {
@@ -2742,6 +3282,10 @@ const USB_ENTRY_OVERLAY_SCHEMA: u32 = 2;
 const USB_ENTRY_OVERLAY_FILE: &str = "codex-usb-entry-overlay.json";
 const USB_ENTRY_ORIGINAL_EXE: &str = "CodexCore.dat";
 const USB_ENTRY_ALIAS_ORIGINAL_EXE: &str = "CodexAliasCore.dat";
+const USB_INTEGRITY_RECOVERY_SCHEMA: u32 = 1;
+const USB_INTEGRITY_RECOVERY_JOURNAL: &str = "codex-usb-integrity-recovery.json";
+const USB_INTEGRITY_CORE_BACKUP: &str = "CodexCore.dat.codex-usb-recovery.bak";
+const USB_INTEGRITY_OVERLAY_BACKUP: &str = "codex-usb-entry-overlay.json.codex-usb-recovery.bak";
 
 fn same_entry_basename(left: &Path, right: &Path) -> bool {
     left.file_name()
@@ -2758,6 +3302,20 @@ struct UsbEntryOverlay {
     original_sha256: String,
     shim_sha256: String,
     aliases: Vec<UsbEntryAliasOverlay>,
+}
+
+/// Durable description of the only two PE/overlay states accepted during USB
+/// startup recovery. The fixed backup filenames live beside this journal; the
+/// journal never contains a drive letter or caller-controlled path.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UsbIntegrityRecoveryJournal {
+    schema_version: u32,
+    old_core_sha256: String,
+    new_core_sha256: String,
+    old_overlay_sha256: String,
+    new_overlay_sha256: String,
+    asar_header_sha256: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -3080,7 +3638,10 @@ fn prepare_portable_payload(
     // payload is moved into place.  The operation is idempotent and is also
     // repeated lazily at launch so an already-installed tree upgraded by an
     // older manager is repaired without requiring a second reinstall.
-    if let Err(error) = ensure_portable_codex_startup_compatibility(&payload) {
+    if let Err(error) = ensure_portable_codex_startup_compatibility_with_usb_integrity_mode(
+        &payload,
+        usb_entry_shim.is_some(),
+    ) {
         // Windows Defender/indexers can briefly hold a freshly extracted
         // 200–300 MB ASAR.  Do not roll back an otherwise verified install for
         // that transient lock; launch performs the same bounded repair before
@@ -3688,6 +4249,7 @@ fn health_check_portable_install(
     install_root: &Path,
     launch: bool,
     keep_running: bool,
+    usb_integrity_transaction: bool,
 ) -> Result<bool, EngineError> {
     let exe = installed_app_exe(install_root).ok_or_else(|| {
         EngineError::Install(format!(
@@ -3698,7 +4260,10 @@ fn health_check_portable_install(
     if !launch {
         return Ok(false);
     }
-    ensure_portable_codex_startup_compatibility(install_root)?;
+    ensure_portable_codex_startup_compatibility_with_usb_integrity_mode(
+        install_root,
+        usb_integrity_transaction,
+    )?;
     // Spawn alone is not enough: a broken payload can exit immediately after
     // CreateProcess succeeds. Require a short liveness window, then leave the
     // process running (this path is the post-install relaunch).
@@ -4046,6 +4611,7 @@ pub fn install_portable_from_msix_with_observer_options_and_progress(
         install_root,
         options.launch_health_check,
         options.launch_health_check && options.relaunch,
+        options.usb_entry_shim.is_some(),
     ) {
         Ok(relaunched) => relaunched,
         Err(err) => {
@@ -4426,6 +4992,22 @@ mod tests {
         dir
     }
 
+    #[test]
+    fn byte_search_finds_matches_crossing_the_read_buffer_boundary() {
+        let root = temp_test_dir("byte-search-boundary");
+        let path = root.join("archive.bin");
+        let mut bytes = vec![b'x'; EXTRACTION_COPY_BUFFER_BYTES - 3];
+        bytes.extend_from_slice(b"boundary-marker");
+        fs::write(&path, bytes).unwrap();
+
+        assert_eq!(
+            find_bytes_in_file(&path, b"boundary-marker").unwrap(),
+            Some((EXTRACTION_COPY_BUFFER_BYTES - 3) as u64)
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn fake_pe_image(subsystem: u16) -> Vec<u8> {
         let mut bytes = vec![0_u8; 0x300];
         bytes[..2].copy_from_slice(b"MZ");
@@ -4528,6 +5110,113 @@ mod tests {
         archive.resize(16 + padded_json_len, 0);
         archive.extend_from_slice(member);
         archive
+    }
+
+    struct UsbIntegrityFixture {
+        bundle_root: PathBuf,
+        install_root: PathBuf,
+        old_core: Vec<u8>,
+        new_core: Vec<u8>,
+        old_overlay: Vec<u8>,
+        new_overlay: Vec<u8>,
+        asar_header_sha256: String,
+    }
+
+    fn usb_integrity_fixture(name: &str) -> UsbIntegrityFixture {
+        let bundle_root = temp_test_dir(name);
+        let install_root = bundle_root.join("apps").join("Codex");
+        fs::create_dir_all(install_root.join("resources")).unwrap();
+        let shim = b"trusted USB entry shim";
+        fs::write(bundle_root.join("CodexEntryShim.exe"), shim).unwrap();
+        fs::write(install_root.join("ChatGPT.exe"), shim).unwrap();
+        fs::write(
+            install_root.join("AppxManifest.xml"),
+            r#"<Package><Applications><Application Executable="ChatGPT.exe" /></Applications></Package>"#,
+        )
+        .unwrap();
+        let app_asar = install_root.join("resources").join("app.asar");
+        fs::write(
+            &app_asar,
+            fake_asar_archive_with_member(b"USB fixture payload"),
+        )
+        .unwrap();
+        let asar_header_sha256 = app_asar_header_sha256(&app_asar).unwrap();
+        let old_core = fake_pe_image_with_electron_asar_hash(&"a".repeat(64));
+        let old_core_sha256 = sha256_hex(&old_core);
+        let shim_sha256 = sha256_hex(shim);
+        let old_overlay = serde_json::to_vec_pretty(&UsbEntryOverlay {
+            schema_version: USB_ENTRY_OVERLAY_SCHEMA,
+            entry_executable: "ChatGPT.exe".to_string(),
+            original_executable: USB_ENTRY_ORIGINAL_EXE.to_string(),
+            original_sha256: old_core_sha256.clone(),
+            shim_sha256,
+            aliases: Vec::new(),
+        })
+        .unwrap();
+        fs::write(install_root.join(USB_ENTRY_ORIGINAL_EXE), &old_core).unwrap();
+        fs::write(install_root.join(USB_ENTRY_OVERLAY_FILE), &old_overlay).unwrap();
+
+        let mut new_core = old_core.clone();
+        assert_eq!(
+            patch_pe_electron_asar_integrity(&mut new_core, &asar_header_sha256).unwrap(),
+            Some(true)
+        );
+        let new_core_sha256 = sha256_hex(&new_core);
+        let new_overlay =
+            derive_usb_overlay_with_core_hash(&old_overlay, &old_core_sha256, &new_core_sha256)
+                .unwrap();
+        UsbIntegrityFixture {
+            bundle_root,
+            install_root,
+            old_core,
+            new_core,
+            old_overlay,
+            new_overlay,
+            asar_header_sha256,
+        }
+    }
+
+    fn prepare_usb_integrity_recovery(fixture: &UsbIntegrityFixture) {
+        let core_backup = integrity_file_path(&fixture.install_root, USB_INTEGRITY_CORE_BACKUP);
+        let overlay_backup =
+            integrity_file_path(&fixture.install_root, USB_INTEGRITY_OVERLAY_BACKUP);
+        write_new_synced_file(&core_backup, &fixture.old_core, "test core backup").unwrap();
+        write_new_synced_file(&overlay_backup, &fixture.old_overlay, "test overlay backup")
+            .unwrap();
+        let journal = UsbIntegrityRecoveryJournal {
+            schema_version: USB_INTEGRITY_RECOVERY_SCHEMA,
+            old_core_sha256: sha256_hex(&fixture.old_core),
+            new_core_sha256: sha256_hex(&fixture.new_core),
+            old_overlay_sha256: sha256_hex(&fixture.old_overlay),
+            new_overlay_sha256: sha256_hex(&fixture.new_overlay),
+            asar_header_sha256: fixture.asar_header_sha256.clone(),
+        };
+        let journal_bytes = serde_json::to_vec_pretty(&journal).unwrap();
+        replace_file_atomically(
+            &integrity_file_path(&fixture.install_root, USB_INTEGRITY_RECOVERY_JOURNAL),
+            &journal_bytes,
+        )
+        .unwrap();
+    }
+
+    fn assert_usb_fixture_state(fixture: &UsbIntegrityFixture, new: bool) {
+        let (core, overlay) = if new {
+            (&fixture.new_core, &fixture.new_overlay)
+        } else {
+            (&fixture.old_core, &fixture.old_overlay)
+        };
+        assert_eq!(
+            fs::read(fixture.install_root.join(USB_ENTRY_ORIGINAL_EXE))
+                .unwrap()
+                .as_slice(),
+            core.as_slice()
+        );
+        assert_eq!(
+            fs::read(fixture.install_root.join(USB_ENTRY_OVERLAY_FILE))
+                .unwrap()
+                .as_slice(),
+            overlay.as_slice()
+        );
     }
 
     fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -4647,6 +5336,543 @@ mod tests {
         assert_eq!(value_span.len(), 1);
         assert_eq!(&resource[value_span[0].clone()], expected.as_bytes());
         assert_eq!(executable.len(), 0x1200);
+    }
+
+    #[test]
+    fn electron_asar_resource_key_matches_windows_runtime_path_rules() {
+        let record = |path: &str| {
+            serde_json::to_vec(&serde_json::json!([{
+                "file": path,
+                "alg": "SHA256",
+                "value": "a".repeat(64),
+            }]))
+            .unwrap()
+        };
+
+        assert!(electron_asar_integrity_value_spans(&record("resources\\app.asar")).is_ok());
+        assert!(electron_asar_integrity_value_spans(&record("RESOURCES\\APP.ASAR")).is_ok());
+        assert!(electron_asar_integrity_value_spans(&record("resources/app.asar")).is_err());
+        assert!(electron_asar_integrity_value_spans(&record("resources/app.asar\\")).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn recovery_file_classifier_rejects_windows_reparse_attribute() {
+        assert!(!has_windows_reparse_attribute(0));
+        assert!(has_windows_reparse_attribute(0x400));
+        assert!(has_windows_reparse_attribute(0x400 | 0x20));
+    }
+
+    #[test]
+    fn usb_integrity_transaction_commits_pair_and_is_idempotent() {
+        let fixture = usb_integrity_fixture("integrity-commit");
+        let mut no_fault = |_| Ok(());
+        commit_usb_integrity_transaction_with(
+            &fixture.install_root,
+            &fixture.old_core,
+            &fixture.new_core,
+            &fixture.old_overlay,
+            &fixture.new_overlay,
+            &fixture.asar_header_sha256,
+            &mut no_fault,
+        )
+        .unwrap();
+        assert_usb_fixture_state(&fixture, true);
+        assert!(
+            !integrity_file_path(&fixture.install_root, USB_INTEGRITY_RECOVERY_JOURNAL).exists()
+        );
+        assert!(!integrity_file_path(&fixture.install_root, USB_INTEGRITY_CORE_BACKUP).exists());
+        assert!(!integrity_file_path(&fixture.install_root, USB_INTEGRITY_OVERLAY_BACKUP).exists());
+
+        let core_modified = fs::metadata(fixture.install_root.join(USB_ENTRY_ORIGINAL_EXE))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let overlay_modified = fs::metadata(fixture.install_root.join(USB_ENTRY_OVERLAY_FILE))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert!(!refresh_embedded_asar_integrity(&fixture.install_root, true).unwrap());
+        assert_eq!(
+            fs::metadata(fixture.install_root.join(USB_ENTRY_ORIGINAL_EXE))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            core_modified
+        );
+        assert_eq!(
+            fs::metadata(fixture.install_root.join(USB_ENTRY_OVERLAY_FILE))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            overlay_modified
+        );
+        fs::remove_dir_all(fixture.bundle_root).unwrap();
+    }
+
+    #[test]
+    fn usb_integrity_recovery_rolls_back_interrupted_core_replace_then_retries() {
+        let fixture = usb_integrity_fixture("integrity-crash-after-core");
+        prepare_usb_integrity_recovery(&fixture);
+        replace_file_atomically(
+            &fixture.install_root.join(USB_ENTRY_ORIGINAL_EXE),
+            &fixture.new_core,
+        )
+        .unwrap();
+
+        recover_usb_codex_integrity_before_launch(&fixture.install_root, true).unwrap();
+        assert_usb_fixture_state(&fixture, false);
+        assert!(installed_usb_codex_launch_exe(&fixture.install_root).is_ok());
+
+        assert!(refresh_embedded_asar_integrity(&fixture.install_root, true).unwrap());
+        assert_usb_fixture_state(&fixture, true);
+        assert!(installed_usb_codex_launch_exe(&fixture.install_root).is_ok());
+        fs::remove_dir_all(fixture.bundle_root).unwrap();
+    }
+
+    #[test]
+    fn usb_integrity_recovery_restores_overlay_from_old_new_state() {
+        let fixture = usb_integrity_fixture("integrity-old-new");
+        prepare_usb_integrity_recovery(&fixture);
+        replace_file_atomically(
+            &fixture.install_root.join(USB_ENTRY_OVERLAY_FILE),
+            &fixture.new_overlay,
+        )
+        .unwrap();
+
+        recover_usb_codex_integrity_before_launch(&fixture.install_root, true).unwrap();
+        assert_usb_fixture_state(&fixture, false);
+        assert!(installed_usb_codex_launch_exe(&fixture.install_root).is_ok());
+        fs::remove_dir_all(fixture.bundle_root).unwrap();
+    }
+
+    #[test]
+    fn usb_integrity_overlay_write_failure_rolls_back_core_and_keeps_error_visible() {
+        let fixture = usb_integrity_fixture("integrity-overlay-fail");
+        let mut failed_overlay_once = false;
+        let mut inject = |stage| {
+            if stage == IntegrityReplaceStage::CommitOverlay && !failed_overlay_once {
+                failed_overlay_once = true;
+                Err(EngineError::Io(
+                    "injected overlay replace failure".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
+        };
+        let result = commit_usb_integrity_transaction_with(
+            &fixture.install_root,
+            &fixture.old_core,
+            &fixture.new_core,
+            &fixture.old_overlay,
+            &fixture.new_overlay,
+            &fixture.asar_header_sha256,
+            &mut inject,
+        );
+        assert!(result.is_err());
+        assert_usb_fixture_state(&fixture, false);
+        assert!(
+            !integrity_file_path(&fixture.install_root, USB_INTEGRITY_RECOVERY_JOURNAL).exists()
+        );
+        assert!(refresh_embedded_asar_integrity(&fixture.install_root, true).unwrap());
+        assert_usb_fixture_state(&fixture, true);
+        fs::remove_dir_all(fixture.bundle_root).unwrap();
+    }
+
+    #[test]
+    fn usb_integrity_failed_rollback_preserves_journal_for_next_start() {
+        let fixture = usb_integrity_fixture("integrity-rollback-fail");
+        let mut inject = |stage| match stage {
+            IntegrityReplaceStage::CommitOverlay | IntegrityReplaceStage::RestoreCore => {
+                Err(EngineError::Io(format!("injected {stage:?} failure")))
+            }
+            _ => Ok(()),
+        };
+        assert!(commit_usb_integrity_transaction_with(
+            &fixture.install_root,
+            &fixture.old_core,
+            &fixture.new_core,
+            &fixture.old_overlay,
+            &fixture.new_overlay,
+            &fixture.asar_header_sha256,
+            &mut inject,
+        )
+        .is_err());
+        assert!(
+            integrity_file_path(&fixture.install_root, USB_INTEGRITY_RECOVERY_JOURNAL).is_file()
+        );
+        assert_eq!(
+            fs::read(fixture.install_root.join(USB_ENTRY_ORIGINAL_EXE)).unwrap(),
+            fixture.new_core
+        );
+        assert_eq!(
+            fs::read(fixture.install_root.join(USB_ENTRY_OVERLAY_FILE)).unwrap(),
+            fixture.old_overlay
+        );
+
+        recover_usb_codex_integrity_before_launch(&fixture.install_root, true).unwrap();
+        assert_usb_fixture_state(&fixture, false);
+        assert!(installed_usb_codex_launch_exe(&fixture.install_root).is_ok());
+        fs::remove_dir_all(fixture.bundle_root).unwrap();
+    }
+
+    #[test]
+    fn usb_integrity_recovery_rejects_corrupt_journal_without_touching_core() {
+        let fixture = usb_integrity_fixture("integrity-corrupt-journal");
+        prepare_usb_integrity_recovery(&fixture);
+        fs::write(
+            integrity_file_path(&fixture.install_root, USB_INTEGRITY_RECOVERY_JOURNAL),
+            b"{not json",
+        )
+        .unwrap();
+
+        assert!(recover_usb_codex_integrity_before_launch(&fixture.install_root, true).is_err());
+        assert_usb_fixture_state(&fixture, false);
+        assert!(
+            integrity_file_path(&fixture.install_root, USB_INTEGRITY_RECOVERY_JOURNAL).exists()
+        );
+        fs::remove_dir_all(fixture.bundle_root).unwrap();
+    }
+
+    #[test]
+    fn usb_integrity_recovery_rejects_malformed_hash_and_preserves_evidence() {
+        let fixture = usb_integrity_fixture("integrity-malformed-hash");
+        prepare_usb_integrity_recovery(&fixture);
+        let journal_path =
+            integrity_file_path(&fixture.install_root, USB_INTEGRITY_RECOVERY_JOURNAL);
+        let mut journal: serde_json::Value =
+            serde_json::from_slice(&fs::read(&journal_path).unwrap()).unwrap();
+        journal["oldCoreSha256"] = serde_json::Value::String("not-a-sha256".to_string());
+        fs::write(&journal_path, serde_json::to_vec(&journal).unwrap()).unwrap();
+
+        assert!(recover_usb_codex_integrity_before_launch(&fixture.install_root, true).is_err());
+        assert_usb_fixture_state(&fixture, false);
+        assert!(journal_path.exists());
+        assert!(integrity_file_path(&fixture.install_root, USB_INTEGRITY_CORE_BACKUP).exists());
+        assert!(integrity_file_path(&fixture.install_root, USB_INTEGRITY_OVERLAY_BACKUP).exists());
+        fs::remove_dir_all(fixture.bundle_root).unwrap();
+    }
+
+    #[test]
+    fn usb_integrity_recovery_rejects_unknown_live_core_or_overlay_hashes() {
+        for (name, unknown_file, bytes) in [
+            (
+                "integrity-unknown-core",
+                USB_ENTRY_ORIGINAL_EXE,
+                b"unrecognized core bytes".as_slice(),
+            ),
+            (
+                "integrity-unknown-overlay",
+                USB_ENTRY_OVERLAY_FILE,
+                b"unrecognized overlay bytes".as_slice(),
+            ),
+        ] {
+            let fixture = usb_integrity_fixture(name);
+            prepare_usb_integrity_recovery(&fixture);
+            let unknown_path = fixture.install_root.join(unknown_file);
+            fs::write(&unknown_path, bytes).unwrap();
+
+            assert!(
+                recover_usb_codex_integrity_before_launch(&fixture.install_root, true).is_err()
+            );
+            assert_eq!(fs::read(&unknown_path).unwrap(), bytes);
+            assert!(
+                integrity_file_path(&fixture.install_root, USB_INTEGRITY_RECOVERY_JOURNAL).exists()
+            );
+            assert!(integrity_file_path(&fixture.install_root, USB_INTEGRITY_CORE_BACKUP).exists());
+            assert!(
+                integrity_file_path(&fixture.install_root, USB_INTEGRITY_OVERLAY_BACKUP).exists()
+            );
+            fs::remove_dir_all(fixture.bundle_root).unwrap();
+        }
+    }
+
+    #[test]
+    fn usb_launch_gate_rejects_unjournaled_core_mismatch_without_repair() {
+        let fixture = usb_integrity_fixture("integrity-unjournaled-core-mismatch");
+        let tampered_core = b"untrusted core without a recovery journal";
+        fs::write(
+            fixture.install_root.join(USB_ENTRY_ORIGINAL_EXE),
+            tampered_core,
+        )
+        .unwrap();
+        assert!(
+            !integrity_file_path(&fixture.install_root, USB_INTEGRITY_RECOVERY_JOURNAL).exists()
+        );
+
+        // Match launch order: recovery handles only a valid journal or inert
+        // orphan backups; the strict USB overlay gate remains authoritative.
+        recover_usb_codex_integrity_before_launch(&fixture.install_root, true).unwrap();
+        assert!(installed_usb_codex_launch_exe(&fixture.install_root).is_err());
+        assert_eq!(
+            fs::read(fixture.install_root.join(USB_ENTRY_ORIGINAL_EXE)).unwrap(),
+            tampered_core
+        );
+        assert_eq!(
+            fs::read(fixture.install_root.join(USB_ENTRY_OVERLAY_FILE)).unwrap(),
+            fixture.old_overlay
+        );
+        assert!(
+            !integrity_file_path(&fixture.install_root, USB_INTEGRITY_RECOVERY_JOURNAL).exists()
+        );
+        fs::remove_dir_all(fixture.bundle_root).unwrap();
+    }
+
+    #[test]
+    fn non_usb_portable_does_not_process_usb_recovery_marker_or_journal() {
+        let fixture = usb_integrity_fixture("integrity-non-usb-marker");
+        prepare_usb_integrity_recovery(&fixture);
+        let core_path = fixture.install_root.join(USB_ENTRY_ORIGINAL_EXE);
+        let overlay_path = fixture.install_root.join(USB_ENTRY_OVERLAY_FILE);
+        replace_file_atomically(&core_path, &fixture.new_core).unwrap();
+        fs::write(
+            &overlay_path,
+            b"not-json; ordinary portable must ignore this",
+        )
+        .unwrap();
+        let journal_path =
+            integrity_file_path(&fixture.install_root, USB_INTEGRITY_RECOVERY_JOURNAL);
+        let journal_before = fs::read(&journal_path).unwrap();
+        let overlay_before = fs::read(&overlay_path).unwrap();
+        let core_backup_path =
+            integrity_file_path(&fixture.install_root, USB_INTEGRITY_CORE_BACKUP);
+        let overlay_backup_path =
+            integrity_file_path(&fixture.install_root, USB_INTEGRITY_OVERLAY_BACKUP);
+        let core_backup_before = fs::read(&core_backup_path).unwrap();
+        let overlay_backup_before = fs::read(&overlay_backup_path).unwrap();
+
+        // A same-named marker in an ordinary portable tree is not enough to
+        // authorize recovery, compatibility refresh, or executable selection.
+        recover_usb_codex_integrity_before_launch(&fixture.install_root, false).unwrap();
+        ensure_portable_codex_startup_compatibility_with_usb_integrity_mode(
+            &fixture.install_root,
+            false,
+        )
+        .unwrap();
+        let entry = installed_codex_launch_exe(&fixture.install_root).unwrap();
+
+        assert_eq!(fs::read(&core_path).unwrap(), fixture.new_core);
+        assert_eq!(fs::read(&overlay_path).unwrap(), overlay_before);
+        assert_eq!(fs::read(&journal_path).unwrap(), journal_before);
+        assert_eq!(fs::read(&core_backup_path).unwrap(), core_backup_before);
+        assert_eq!(
+            fs::read(&overlay_backup_path).unwrap(),
+            overlay_backup_before
+        );
+        assert_eq!(entry, fixture.install_root.join("ChatGPT.exe"));
+        fs::remove_dir_all(fixture.bundle_root).unwrap();
+    }
+
+    #[test]
+    fn legacy_usb_integrity_recovers_without_requiring_direct_entry_overlay() {
+        let fixture = usb_integrity_fixture("integrity-legacy-usb-mode");
+        prepare_usb_integrity_recovery(&fixture);
+        replace_file_atomically(
+            &fixture.install_root.join(USB_ENTRY_ORIGINAL_EXE),
+            &fixture.new_core,
+        )
+        .unwrap();
+
+        // Schema 2 USB bundles set require_usb_entry_overlay=false but still
+        // have a validated USB context that authorizes transaction recovery.
+        recover_usb_codex_integrity_before_launch(&fixture.install_root, true).unwrap();
+        assert_usb_fixture_state(&fixture, false);
+        assert!(installed_codex_launch_exe_for_usb_mode(&fixture.install_root).is_ok());
+        fs::remove_dir_all(fixture.bundle_root).unwrap();
+    }
+
+    #[test]
+    fn usb_integrity_recovery_rejects_missing_or_modified_backups_without_mutating_live_pair() {
+        for (name, backup_name, remove_backup) in [
+            (
+                "integrity-missing-core-backup",
+                USB_INTEGRITY_CORE_BACKUP,
+                true,
+            ),
+            (
+                "integrity-modified-overlay-backup",
+                USB_INTEGRITY_OVERLAY_BACKUP,
+                false,
+            ),
+        ] {
+            let fixture = usb_integrity_fixture(name);
+            prepare_usb_integrity_recovery(&fixture);
+            let backup_path = integrity_file_path(&fixture.install_root, backup_name);
+            if remove_backup {
+                fs::remove_file(&backup_path).unwrap();
+            } else {
+                fs::write(&backup_path, b"tampered backup").unwrap();
+            }
+
+            assert!(
+                recover_usb_codex_integrity_before_launch(&fixture.install_root, true).is_err()
+            );
+            assert_usb_fixture_state(&fixture, false);
+            assert!(
+                integrity_file_path(&fixture.install_root, USB_INTEGRITY_RECOVERY_JOURNAL).exists()
+            );
+            assert_eq!(backup_path.exists(), !remove_backup);
+            fs::remove_dir_all(fixture.bundle_root).unwrap();
+        }
+    }
+
+    #[test]
+    fn usb_integrity_recovery_rejects_non_regular_journal_and_backup_paths() {
+        for (name, non_regular_name) in [
+            (
+                "integrity-non-regular-journal",
+                USB_INTEGRITY_RECOVERY_JOURNAL,
+            ),
+            ("integrity-non-regular-backup", USB_INTEGRITY_CORE_BACKUP),
+        ] {
+            let fixture = usb_integrity_fixture(name);
+            prepare_usb_integrity_recovery(&fixture);
+            let path = integrity_file_path(&fixture.install_root, non_regular_name);
+            fs::remove_file(&path).unwrap();
+            fs::create_dir(&path).unwrap();
+
+            assert!(
+                recover_usb_codex_integrity_before_launch(&fixture.install_root, true).is_err()
+            );
+            assert_usb_fixture_state(&fixture, false);
+            assert!(path.is_dir());
+            fs::remove_dir_all(fixture.bundle_root).unwrap();
+        }
+    }
+
+    #[test]
+    fn usb_integrity_cleanup_resumes_after_journal_was_removed() {
+        let fixture = usb_integrity_fixture("integrity-cleanup-interrupted");
+        let core_backup = integrity_file_path(&fixture.install_root, USB_INTEGRITY_CORE_BACKUP);
+        let overlay_backup =
+            integrity_file_path(&fixture.install_root, USB_INTEGRITY_OVERLAY_BACKUP);
+        fs::write(&core_backup, b"orphan core backup").unwrap();
+        fs::create_dir(&overlay_backup).unwrap();
+
+        assert!(recover_usb_codex_integrity_before_launch(&fixture.install_root, true).is_err());
+        assert!(!core_backup.exists());
+        assert!(overlay_backup.is_dir());
+        assert_usb_fixture_state(&fixture, false);
+
+        fs::remove_dir(&overlay_backup).unwrap();
+        recover_usb_codex_integrity_before_launch(&fixture.install_root, true).unwrap();
+        assert_usb_fixture_state(&fixture, false);
+        assert!(!core_backup.exists());
+        assert!(!overlay_backup.exists());
+        fs::remove_dir_all(fixture.bundle_root).unwrap();
+    }
+
+    #[test]
+    fn usb_integrity_backup_preparation_failure_does_not_mutate_live_files() {
+        let fixture = usb_integrity_fixture("integrity-backup-fail");
+        let overlay_backup =
+            integrity_file_path(&fixture.install_root, USB_INTEGRITY_OVERLAY_BACKUP);
+        fs::create_dir(&overlay_backup).unwrap();
+        let mut no_fault = |_| Ok(());
+        assert!(commit_usb_integrity_transaction_with(
+            &fixture.install_root,
+            &fixture.old_core,
+            &fixture.new_core,
+            &fixture.old_overlay,
+            &fixture.new_overlay,
+            &fixture.asar_header_sha256,
+            &mut no_fault,
+        )
+        .is_err());
+        assert_usb_fixture_state(&fixture, false);
+        assert!(
+            !integrity_file_path(&fixture.install_root, USB_INTEGRITY_RECOVERY_JOURNAL).exists()
+        );
+        assert!(!integrity_file_path(&fixture.install_root, USB_INTEGRITY_CORE_BACKUP).exists());
+        fs::remove_dir_all(fixture.bundle_root).unwrap();
+    }
+
+    #[test]
+    fn usb_integrity_recovery_cleans_orphan_backups_without_rewriting_committed_pair() {
+        let fixture = usb_integrity_fixture("integrity-orphan-backups");
+        fs::write(
+            integrity_file_path(&fixture.install_root, USB_INTEGRITY_CORE_BACKUP),
+            b"orphan core backup",
+        )
+        .unwrap();
+        fs::write(
+            integrity_file_path(&fixture.install_root, USB_INTEGRITY_OVERLAY_BACKUP),
+            b"orphan overlay backup",
+        )
+        .unwrap();
+        let original_core_modified =
+            fs::metadata(fixture.install_root.join(USB_ENTRY_ORIGINAL_EXE))
+                .unwrap()
+                .modified()
+                .unwrap();
+
+        recover_usb_codex_integrity_before_launch(&fixture.install_root, true).unwrap();
+        assert_usb_fixture_state(&fixture, false);
+        assert_eq!(
+            fs::metadata(fixture.install_root.join(USB_ENTRY_ORIGINAL_EXE))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            original_core_modified
+        );
+        assert!(!integrity_file_path(&fixture.install_root, USB_INTEGRITY_CORE_BACKUP).exists());
+        assert!(!integrity_file_path(&fixture.install_root, USB_INTEGRITY_OVERLAY_BACKUP).exists());
+        fs::remove_dir_all(fixture.bundle_root).unwrap();
+    }
+
+    #[test]
+    fn usb_integrity_new_new_recovery_only_cleans_transaction_files() {
+        let fixture = usb_integrity_fixture("integrity-new-new-recovery");
+        prepare_usb_integrity_recovery(&fixture);
+        replace_file_atomically(
+            &fixture.install_root.join(USB_ENTRY_ORIGINAL_EXE),
+            &fixture.new_core,
+        )
+        .unwrap();
+        replace_file_atomically(
+            &fixture.install_root.join(USB_ENTRY_OVERLAY_FILE),
+            &fixture.new_overlay,
+        )
+        .unwrap();
+        let core_modified = fs::metadata(fixture.install_root.join(USB_ENTRY_ORIGINAL_EXE))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let overlay_modified = fs::metadata(fixture.install_root.join(USB_ENTRY_OVERLAY_FILE))
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        recover_usb_codex_integrity_before_launch(&fixture.install_root, true).unwrap();
+        assert_usb_fixture_state(&fixture, true);
+        assert_eq!(
+            fs::metadata(fixture.install_root.join(USB_ENTRY_ORIGINAL_EXE))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            core_modified
+        );
+        assert_eq!(
+            fs::metadata(fixture.install_root.join(USB_ENTRY_OVERLAY_FILE))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            overlay_modified
+        );
+        assert!(
+            !integrity_file_path(&fixture.install_root, USB_INTEGRITY_RECOVERY_JOURNAL).exists()
+        );
+        fs::remove_dir_all(fixture.bundle_root).unwrap();
+    }
+
+    #[test]
+    fn usb_overlay_rejects_duplicate_original_hash_keys() {
+        let hash = "a".repeat(64);
+        let bytes = format!(
+            r#"{{"schemaVersion":2,"entryExecutable":"ChatGPT.exe","originalExecutable":"CodexCore.dat","originalSha256":"{hash}","originalSha256":"{hash}","shimSha256":"{}","aliases":[]}}"#,
+            "b".repeat(64)
+        );
+        assert!(unique_overlay_original_sha_span(bytes.as_bytes()).is_err());
     }
 
     #[test]
@@ -5048,7 +6274,7 @@ mod tests {
             b"other get(`enable_i18n`,!0) webview zh-CN get(`enable_i18n`,!1) locale bundle";
         fs::write(&app_asar, original).unwrap();
 
-        assert!(ensure_portable_codex_locale_compatibility(&root, Some("zh-CN")).unwrap());
+        assert!(ensure_portable_codex_locale_compatibility(&root, Some("zh-CN"), false).unwrap());
         let patched = fs::read(&app_asar).unwrap();
         assert_eq!(patched.len(), original.len());
         assert!(!patched
@@ -5061,8 +6287,8 @@ mod tests {
                 .count()
                 >= 2
         );
-        assert!(!ensure_portable_codex_locale_compatibility(&root, Some("zh-CN")).unwrap());
-        assert!(!ensure_portable_codex_locale_compatibility(&root, Some("en")).unwrap());
+        assert!(!ensure_portable_codex_locale_compatibility(&root, Some("zh-CN"), false).unwrap());
+        assert!(!ensure_portable_codex_locale_compatibility(&root, Some("en"), false).unwrap());
 
         let _ = fs::remove_dir_all(root);
     }
@@ -5088,14 +6314,14 @@ mod tests {
         )
         .unwrap();
 
-        assert!(ensure_portable_codex_locale_compatibility(&root, Some("zh-CN")).unwrap());
+        assert!(ensure_portable_codex_locale_compatibility(&root, Some("zh-CN"), false).unwrap());
         let header_hash = app_asar_header_sha256(&app_asar).unwrap();
         let mut executable = fs::read(&executable).unwrap();
         assert_eq!(
             patch_pe_electron_asar_integrity(&mut executable, &header_hash).unwrap(),
             Some(false)
         );
-        assert!(!ensure_portable_codex_locale_compatibility(&root, Some("zh-CN")).unwrap());
+        assert!(!ensure_portable_codex_locale_compatibility(&root, Some("zh-CN"), false).unwrap());
 
         let _ = fs::remove_dir_all(root);
     }
@@ -5130,7 +6356,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(ensure_portable_codex_locale_compatibility(&root, Some("zh-CN")).unwrap());
+        assert!(ensure_portable_codex_locale_compatibility(&root, Some("zh-CN"), true).unwrap());
         let header_hash = app_asar_header_sha256(&app_asar).unwrap();
         let mut executable_bytes = fs::read(&executable).unwrap();
         assert_eq!(
@@ -5143,7 +6369,7 @@ mod tests {
             overlay.original_sha256,
             crate::download::sha256_file(&executable).unwrap()
         );
-        assert!(!ensure_portable_codex_locale_compatibility(&root, Some("zh-CN")).unwrap());
+        assert!(!ensure_portable_codex_locale_compatibility(&root, Some("zh-CN"), true).unwrap());
 
         let _ = fs::remove_dir_all(root);
     }
@@ -5279,18 +6505,18 @@ mod tests {
             "the package entry remains the shim"
         );
         assert_eq!(
-            installed_codex_launch_exe(&payload).unwrap(),
+            installed_codex_launch_exe_for_usb_mode(&payload).unwrap(),
             payload.join("CodexCore.dat")
         );
 
         fs::write(payload.join("Codex.exe"), b"tampered alias").unwrap();
-        assert!(installed_codex_launch_exe(&payload).is_err());
+        assert!(installed_codex_launch_exe_for_usb_mode(&payload).is_err());
         fs::write(payload.join("Codex.exe"), b"trusted test shim bytes").unwrap();
         fs::write(payload.join("ChatGPT.exe"), b"tampered shim").unwrap();
-        assert!(installed_codex_launch_exe(&payload).is_err());
+        assert!(installed_codex_launch_exe_for_usb_mode(&payload).is_err());
         fs::write(payload.join("ChatGPT.exe"), b"trusted test shim bytes").unwrap();
         fs::write(root.join("CodexEntryShim.exe"), b"tampered trusted shim").unwrap();
-        assert!(installed_codex_launch_exe(&payload).is_err());
+        assert!(installed_codex_launch_exe_for_usb_mode(&payload).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -5336,17 +6562,23 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    #[ignore = "requires CODEX_REAL_MSIX_SMOKE_PATH pointing to a locally verified Codex MSIX"]
+    #[ignore = "requires a verified Codex MSIX or prepared USB payload and CodexEntryShim.exe in the CODEX_REAL_MSIX_SMOKE_* variables"]
     fn real_msix_codex_core_opens_from_portable_tree() {
         let package_or_payload = std::env::var_os("CODEX_REAL_MSIX_SMOKE_PATH")
             .map(PathBuf::from)
-            .expect(
-                "CODEX_REAL_MSIX_SMOKE_PATH must name a verified MSIX or extracted test payload",
-            );
+            .expect("CODEX_REAL_MSIX_SMOKE_PATH must name a verified Codex MSIX or prepared USB payload");
+        let entry_shim = std::env::var_os("CODEX_REAL_MSIX_SMOKE_SHIM_PATH")
+            .map(PathBuf::from)
+            .expect("CODEX_REAL_MSIX_SMOKE_SHIM_PATH must name CodexEntryShim.exe");
         assert!(
             package_or_payload.is_file() || package_or_payload.is_dir(),
-            "test MSIX or payload is missing: {}",
+            "test MSIX or prepared payload is missing: {}",
             package_or_payload.display()
+        );
+        assert!(
+            entry_shim.is_file(),
+            "test USB entry shim is missing: {}",
+            entry_shim.display()
         );
 
         let _env_lock = test_env_lock();
@@ -5354,25 +6586,40 @@ mod tests {
         let work = root.join("work");
         fs::create_dir_all(&work).unwrap();
         let result = (|| {
-            let (payload, version, arch) = if package_or_payload.is_dir() {
+            let bundle_entry_shim = root.join("CodexEntryShim.exe");
+            fs::copy(&entry_shim, &bundle_entry_shim)
+                .map_err(|error| format!("copy real USB entry shim: {error}"))?;
+            let (payload, version, processor_architecture) = if package_or_payload.is_dir() {
+                let manifest = fs::read_to_string(package_or_payload.join("AppxManifest.xml"))
+                    .map_err(|error| format!("read prepared USB payload manifest: {error}"))?;
+                let identity = parse_appx_manifest_xml(&manifest)
+                    .map_err(|error| format!("parse prepared USB payload manifest: {error}"))?;
+                if !package_or_payload.join("CodexCore.dat").is_file() {
+                    return Err("prepared USB payload has no CodexCore.dat".to_string());
+                }
                 (
                     package_or_payload.clone(),
-                    "existing-test-payload".to_string(),
-                    None,
+                    identity.version,
+                    identity.processor_architecture,
                 )
             } else {
-                let prepared = prepare_portable_payload(&package_or_payload, &work, None, None)
-                    .map_err(|error| format!("extract and patch real Codex MSIX: {error}"))?;
+                let prepared = prepare_portable_payload(
+                    &package_or_payload,
+                    &work,
+                    Some(&bundle_entry_shim),
+                    None,
+                )
+                .map_err(|error| format!("extract and prepare real USB Codex MSIX: {error}"))?;
                 (
                     prepared.payload_dir,
                     prepared.identity.version,
-                    Some(prepared.identity.processor_architecture),
+                    prepared.identity.processor_architecture,
                 )
             };
             let installed = crate::InstalledWindowsCodex {
                 path: payload.to_string_lossy().into_owned(),
-                version,
-                arch,
+                version: version.clone(),
+                arch: Some(processor_architecture),
                 source: "portable".to_string(),
                 package_family_name: None,
                 package_volume: None,
@@ -5380,6 +6627,9 @@ mod tests {
             };
             let options = crate::LaunchOptions {
                 disable_codex_self_updates: true,
+                environment: Vec::new(),
+                usb_integrity_transaction: true,
+                require_usb_entry_overlay: true,
                 codex_home: Some(root.join("isolated-codex-home")),
                 locale_override: Some("zh-CN".to_string()),
                 portable_launch_policy: crate::PortableLaunchPolicy::UsbCompatible,
@@ -5396,16 +6646,29 @@ mod tests {
             let previous_local_appdata = std::env::var_os("LOCALAPPDATA");
             let previous_userprofile = std::env::var_os("USERPROFILE");
             let previous_home = std::env::var_os("HOME");
+            let previous_codex_cli_path = std::env::var_os("CODEX_CLI_PATH");
+            let previous_codex_node = std::env::var_os("CODEX_NODE");
+            let previous_codex_mcp_node_path = std::env::var_os("CODEX_MCP_NODE_PATH");
             std::env::set_var("APPDATA", &appdata);
             std::env::set_var("LOCALAPPDATA", &local_appdata);
             std::env::set_var("USERPROFILE", &userprofile);
             std::env::set_var("HOME", &userprofile);
+            // The desktop runner sets these overrides for Codex-launched tasks.
+            // They would make this packaged-payload smoke borrow the caller's
+            // installed CLI/Node binaries, defeating root-scoped cleanup and
+            // testing a different runtime than a USB installation uses.
+            std::env::remove_var("CODEX_CLI_PATH");
+            std::env::remove_var("CODEX_NODE");
+            std::env::remove_var("CODEX_MCP_NODE_PATH");
             let report = crate::launch_codex_with_options(&installed, options)
                 .map_err(|error| format!("real Codex core did not start: {error}"));
             restore_test_env("APPDATA", previous_appdata);
             restore_test_env("LOCALAPPDATA", previous_local_appdata);
             restore_test_env("USERPROFILE", previous_userprofile);
             restore_test_env("HOME", previous_home);
+            restore_test_env("CODEX_CLI_PATH", previous_codex_cli_path);
+            restore_test_env("CODEX_NODE", previous_codex_node);
+            restore_test_env("CODEX_MCP_NODE_PATH", previous_codex_mcp_node_path);
             let report = report?;
             if !report.usable_window_confirmed {
                 return Err(format!(
@@ -5414,7 +6677,7 @@ mod tests {
             }
             println!(
                 "real Codex smoke passed version={} launch_mode={} usable_window_confirmed={}",
-                installed.version, report.launch_mode, report.usable_window_confirmed
+                version, report.launch_mode, report.usable_window_confirmed
             );
             Ok(())
         })();
@@ -6058,7 +7321,7 @@ if ($null -ne (Get-OwnedPortableEntry)) {{ 'owned' }} else {{ 'missing' }}
         )
         .unwrap();
 
-        let err = health_check_portable_install(&root, true, true).unwrap_err();
+        let err = health_check_portable_install(&root, true, true, false).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("exited immediately"),

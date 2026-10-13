@@ -61,13 +61,13 @@ App ID/Secret、飞书侧应用权限和可访问租户。
 
 ### 统一媒体生成 MCP：Image-2、Grok、Seedance
 
-本地 STDIO MCP 统一提供 Image-2 图片、Grok 图片/视频、Seedance 视频，以及待上游开放后使用的 MiniMax 视频模型槽位的准备、确认、提交、查询与结果保存工具。它使用随包 Python 3.12 标准库，需用户自行提供一组媒体 API Base URL、共享 Key 和实际模型名；Image-2/Seedance 的部分网关路由需要用户配置 agent-id。MiniMax 当前模型槽位为空，仅接受统一上游的 Wokey 兼容模式；不会访问官方 MiniMax API 或回退其他模型。网关 API 路径必须符合随包 provider adapter 的路由契约。
+本地 STDIO MCP 统一提供 Image-2 图片、Grok 图片/视频、Seedance 视频，以及待上游支持后使用的 MiniMax 视频模型槽位的准备、确认、提交、查询与结果保存工具。U 盘版从签名 License 自动读取设备 Key 和 404token 地址，用户无需填写媒体 API Base URL 或 Key；安装器会从随包介质离线安装 CPython 3.12，并在写入 Codex 配置前运行 MCP 健康检查。MCP 使用 Python 标准库，不需要 `openai` 包。连接页面读取认证后的上游 `/v1/models` 目录，按模型 ID 中的版本号选择最新匹配项；未发现时留空，不使用固定默认 ID，也不发起生成请求。Image-2 使用当前匹配模型走 `/v1/responses`，同一次提交会校验并保存 PNG。MiniMax 当前不支持 404token 路由，不会访问官方 MiniMax API 或回退其他模型。
 
 每次可能计费的任务都要求离线准备、展示完整输入并等待用户确认；MCP 写入 HMAC 校验的单次确认记录，已有或未知提交不会自动重发。它不查询或猜测价格、余额、退款规则。Image-2 图生图接受本地参考图；Grok 图片/视频接受其当前适配的参考素材；Seedance 参考媒体目前要求服务端可访问的公网 HTTPS URL。第三方 API 兼容性和任务状态仍须用用户自己的端点与账号验证，本轮只做离线协议与本地模拟服务验收，不发真实计费请求。
 
 ### MiniMax 视频：预留模型槽位
 
-`minimax-video-gen` 保留为工作流 Skill，实际调用只经过统一媒体 MCP，并共用其 Base URL/API Key。当前统一上游未配置 MiniMax 视频模型，因此该 provider 会显示未配置并在任何网络请求前停止。不得改走 MiniMax 官方 API，也不得自动回退 Grok 或 Seedance。
+`minimax-video-gen` 保留为工作流 Skill，实际调用只经过统一媒体 MCP，并共用签名 License 提供的设备 Key。当前统一上游未配置 MiniMax 视频模型，因此该 provider 会显示未配置并在任何网络请求前停止。不得改走 MiniMax 官方 API，也不得自动回退 Grok 或 Seedance。
 
 全部连接字段及启用条件见 [`manifest/connection-fields.json`](../manifest/connection-fields.json) 和
 [`manifest/api-services.json`](../manifest/api-services.json)。

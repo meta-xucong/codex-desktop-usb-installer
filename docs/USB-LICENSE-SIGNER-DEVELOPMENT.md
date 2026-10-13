@@ -595,7 +595,7 @@ pwsh ./tools/build-oneclick-usb-layout.ps1 -InstallerPath $installer -ManagerPat
 7. 日常始终从 CodexDesktopSetup.exe 启动；
 8. Payload 更新前后均由后端重新验证签名和 Bundle。
 
-日常启动请使用 CodexDesktopSetup.exe。直接运行 apps/Codex 中由 MSIX manifest 声明的官方入口，可能绕过管理器的远程状态检查和 U 盘租约；这是已接受的边界，不得宣称直接入口受控。
+日常建议使用 CodexDesktopSetup.exe。apps/Codex 中由 MSIX manifest 声明的入口必须替换为受清单保护的 CodexEntryShim.exe；shim 通过同一用户会话的命名管道把启动请求交给 USB 管理器，统一校验本地签名、租约和在线可获得的远程作废状态。缺少 shim、管理器或校验失败时必须拒绝启动，不得回退到直接启动 Codex.exe。发行包必须包含并校验 CodexEntryShim.exe；该保证不覆盖用户自行复制、改写或替换掉受清单保护的入口文件。
 
 ### 7.6 正式发布顺序
 

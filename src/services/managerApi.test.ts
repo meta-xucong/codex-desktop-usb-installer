@@ -31,9 +31,47 @@ const CODEX_PAYLOAD_INFO: UpdateInfo = {
 
 beforeEach(() => {
   invokeMock.mockReset();
-  vi.stubGlobal("window", { open: vi.fn(), __TAURI_INTERNALS__: undefined });
+  vi.stubGlobal("window", {
+    open: vi.fn(),
+    __TAURI_INTERNALS__: undefined,
+    setTimeout: (...args: Parameters<typeof setTimeout>) => setTimeout(...args),
+    clearTimeout: (handle: ReturnType<typeof setTimeout>) => clearTimeout(handle),
+  });
   localStorage.clear();
 });
+
+describe("update check watchdog", () => {
+  it("returns unavailable when the manager update bridge never settles", async () => {
+    window.__TAURI_INTERNALS__ = {};
+    invokeMock.mockReturnValue(new Promise<never>(() => {}));
+    vi.useFakeTimers();
+    try {
+      const pending = managerApi.checkManagerUpdate();
+      await vi.advanceTimersByTimeAsync(35_000);
+      await expect(pending).resolves.toEqual({ kind: "unavailable" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("rejects the Windows update plan when the native bridge never settles", async () => {
+    window.__TAURI_INTERNALS__ = {};
+    invokeMock.mockReturnValue(new Promise<never>(() => {}));
+    vi.useFakeTimers();
+    try {
+      const pending = managerApi.winPlanUpdate();
+      const rejected = expect(pending).rejects.toMatchObject({
+        code: "timeout",
+        detail: "stage=ui-check-watchdog; timeout_ms=150000",
+      });
+      await vi.advanceTimersByTimeAsync(150_000);
+      await rejected;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe("isNetworkError", () => {
   it("classifies transport and TLS failures as connectivity errors", () => {
     expect(

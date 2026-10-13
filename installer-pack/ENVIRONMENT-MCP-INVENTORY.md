@@ -76,16 +76,16 @@ Codex 只按 `env_vars` 转发进程环境变量名，本机 wrapper 读取值�
 
 | 服务 | 用途 | 状态 | 必需连接字段 |
 |---|---|---|---|
-| `mcp.media-generation` | Image-2 / Grok 图片与视频 / Seedance 统一准备、确认、提交、查询、保存 | guided-config | 统一媒体 API Key、根级 HTTPS Base URL；按实际 provider 填模型名，Image-2/Seedance 还需要网关路由 ID |
+| `mcp.media-generation` | Image-2 / Grok 图片与视频 / Seedance 统一准备、确认、提交、查询、保存 | auto-installable-runtime | U 盘签名授权自动提供设备 Key；安装器从上游模型目录自动选择最新匹配项，没有匹配项时留空 |
 
-统一媒体服务以随包 Python 3.12 标准库程序运行，不安装额外 Python 包。它是本地 STDIO MCP，不是供应商官方 SDK，也不内置任何模型或价格。每笔可能计费的生成都先落一份有时效、带 HMAC 的确认清单；未知提交结果不会重试。Seedance 参考素材目前要求公网 HTTPS URL；MCP 不代替用户上传。详情见 `manifest/media-generation-tools.json`。
+统一媒体服务以安装器预装的 CPython 3.12 标准库程序运行，不需要系统 Python、`openai` 包或其他额外 Python 依赖；安装器会检查 Python、MCP 版本及含中文工具清单的严格 UTF-8 协议。签名 U 盘授权中的设备 Key 会以当前 Windows 用户 DPAPI 加密副本保存在 `connections/media-generation.credential.dpapi`；MCP 启动包装脚本优先使用 USB 启动器注入的短时进程环境，缺失时读取 DPAPI 副本，并把 Key 只放入 MCP 子进程环境。明文不会写入 Codex TOML、普通连接文件、用户环境变量、命令行或日志；普通连接信息与模型目录缓存不含密钥，授权缺失或卸载时会清理受管文件。首次使用或缺少默认模型时，`media_refresh_models` 仅调用认证后的 `/v1/models` 读取目录并缓存可识别的图片/Grok 默认模型，不创建生图/视频任务；匹配不到的模型槽位保持为空。Image-2 使用已配置模型走 `/v1/responses`，同一次提交会校验并保存 PNG。异步视频任务只在上游明确完成且解析到输出地址后标记完成；相对 `content_url` 会补成当前网关地址，`media_save` 随后下载并保存。下载只对与网关协议、主机、端口完全相同的地址带授权；外部主机、不同端口和重定向不会收到 Key。每笔可能计费的生成都先落一份有时效、带 HMAC 的确认清单；未知提交结果不会重试。Seedance 参考素材目前要求公网 HTTPS URL；MCP 不代替用户上传。详情见 `manifest/media-generation-tools.json`。
 
 ### 直连 API
 
 | 服务 | 用途 | 状态 | 必需连接字段 |
 |---|---|---|---|
 | `api.dashscope-web-search` | 网页搜索摘要适配 | guided-config | 专用 API Key、`compatible-mode/v1` 根级 HTTPS Base URL、实际联网搜索模型 |
-DashScope 是当前唯一单独的直连 API。Image-2、Grok、Seedance，以及未来由统一媒体上游开放后的 MiniMax 视频模型，都使用一个媒体 MCP、一组 Base URL 和一把共享 API Key。MiniMax 模型槽位 `MEDIA_MINIMAX_VIDEO_MODEL` 当前留空；不设置 MiniMax 官方 API Key 或官方 API Base URL。
+DashScope 是当前唯一单独的直连 API。Image-2、Grok、Seedance，以及未来由统一媒体上游开放后的 MiniMax 视频模型，都使用一个媒体 MCP 和签名 U 盘授权中的共享设备 Key。MiniMax 模型槽位 `MEDIA_MINIMAX_VIDEO_MODEL` 当前留空；不设置 MiniMax 官方 API Key 或官方 API Base URL。
 
 DashScope 脚本只接受 `compatible-mode/v1` 根地址并自行拼接 `/chat/completions`；模型必须通过
 `DASHSCOPE_MODEL` 或命令参数显式提供，不再沿用仓库中的示例模型名。未配置 Key 或模型时会在网络 I/O 前失败。

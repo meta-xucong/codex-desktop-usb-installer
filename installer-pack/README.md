@@ -124,10 +124,8 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 双击 `Install-Codex-Starter.cmd` 会打开 Windows 图形向导。向导根据
 [`manifest/connection-fields.json`](manifest/connection-fields.json)、[`manifest/mcp-servers.json`](manifest/mcp-servers.json)
-和 [`manifest/api-services.json`](manifest/api-services.json) 动态列出 6 个 MCP 与 1 个直连 API 的配置项，共 17 个连接字段
-连接字段。每个外部连接默认不勾选；不填写或点击“跳过配置，直接安装”不会启用连接，但仍会把全部 Skill、Agent、运行时、
-离线依赖和 MCP 包安装到本机。需要启用某项服务时，勾选它并填写该组必填字段；密钥输入框会遮罩，非空值只写入当前 Windows
-用户环境变量，Codex 配置只保存环境变量名。留空的密钥会沿用已有的本机用户环境变量（若存在），不会在界面或日志中显示。
+和 [`manifest/api-services.json`](manifest/api-services.json) 动态列出 6 个 MCP 与 1 个直连 API 的配置项，共 14 个连接字段。
+飞书、DashScope 和远程服务默认等待用户连接；U 盘版统一媒体 MCP 默认启用，设备 Key 和 404token 端点由签名 License 在 Codex 启动时提供，不要求用户输入或写入 Windows 用户环境变量。启用其他服务时，填写其必需字段；密钥输入框会遮罩，Codex 配置只保存环境变量名。留空的密钥会沿用已有的本机用户环境变量（若存在），不会在界面或日志中显示。
 向导中的“清理本机已有环境变量”默认关闭；即使明确勾选，也只会清理本安装器此前记录为自己写入的变量名，不会碰其他程序或用户手工配置。
 
 无界面部署或自动化测试仍可直接调用 `install-all.ps1`；设置 `CODEX_STARTER_NONINTERACTIVE=1`，或给 `.cmd` 传入参数，
@@ -163,7 +161,7 @@ Skill 或全局 `AGENTS.md`。它会校验 `file-manifest.json` 与 `checksums.s
 - 连接字段：统一的密钥、端点、认证方式、校验和能力映射，见 [`manifest/connection-fields.json`](manifest/connection-fields.json)。
   图形向导按这些清单生成表单，不在脚本中另维护一套凭据字段；所有外部连接都是显式选择后才启用。
 
-统一媒体 MCP 包含 Image-2、Grok 图片/视频、Seedance 视频，以及待上游开放后使用的 MiniMax 视频 provider。安装时只配置一组媒体 API Base URL/Key，可按需填写各 provider 模型名；MiniMax 模型槽位当前留空，并仅接受统一上游的 Wokey 兼容路由，不访问 MiniMax 官方 API，也不会回退到其他模型。Image-2/Seedance 的部分旧网关还需路由 ID。MCP 使用本地 Python 3.12 标准库，无额外第三方运行时。它不会猜价格、退款、账户余额或模型名；计费调用必须走准备清单、明确确认、单次提交和原任务查询，未知提交状态不会重试。Seedance 参考媒体目前使用服务端可访问的 HTTPS URL。
+统一媒体 MCP 包含 Image-2、Grok 图片/视频、Seedance 视频，以及待上游开放后使用的 MiniMax 视频 provider。U 盘版从签名 License 自动读取设备 Key，并在 Codex 启动时传给 MCP；用户无需再次填写媒体 API 地址或 Key。Image-2 默认使用 `gpt-image-2.5` `/v1/responses` 路径，同一次提交会校验并保存 PNG。MiniMax 模型槽位当前留空，并仅接受统一上游的 Wokey 兼容路由，不访问 MiniMax 官方 API，也不会回退到其他模型。Seedance 按需填写上游要求的模型名和路由 ID。MCP 使用安装器预装的 CPython 3.12 标准库，不需要安装 `openai` 包或其他 MCP 专用依赖；安装时会执行离线健康检查。它不会猜价格、退款、账户余额或模型名；计费调用必须走准备清单、明确确认、单次提交和原任务查询，未知提交状态不会重试。Seedance 参考媒体目前使用服务端可访问的 HTTPS URL。
 模板在 `config-fragments/` 中，默认保持禁用。可先生成待人工合并的无密钥片段：
 
 ```powershell
@@ -209,4 +207,4 @@ Python，还会自动运行完整兼容性审计。安装器只消费已通过�
 
 ### 预留 MiniMax 模型槽位与可选远程 MCP
 
-能力包保留 MiniMax 视频工作流 Skill，但请求只经统一媒体 MCP，并与 Image-2、Grok、Seedance 共用端点和 API Key。当前没有配置 MiniMax 模型；只有统一上游开放模型并由用户填写模型名后才会启用，不存在官方 API 直连。远程 MCP 需相应服务账号/工作区权限并由 Codex 完成 OAuth。
+能力包保留 MiniMax 视频工作流 Skill，但请求只经统一媒体 MCP，并使用签名 U 盘授权提供的共享设备 Key。当前没有配置 MiniMax 模型；只有统一上游开放模型并配置模型名后才会启用，不存在官方 API 直连。远程 MCP 需相应服务账号/工作区权限并由 Codex 完成 OAuth。

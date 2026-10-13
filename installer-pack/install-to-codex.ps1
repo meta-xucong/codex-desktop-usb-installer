@@ -12,12 +12,20 @@ param(
     [string[]]$EnabledRemoteMcps = @(),
     [switch]$EnableFeishu,
     [switch]$DisableFeishu,
-    [switch]$EnableMediaGeneration
+    [switch]$EnableMediaGeneration,
+    [switch]$DisableMediaGeneration,
+    [ValidateSet('not-checked','verified','failed')][string]$MediaGatewayCatalogStatus = 'not-checked',
+    [ValidateRange(0,100000)][int]$MediaGatewayModelCount = 0,
+    [string]$MediaGatewayCatalogVerifiedAt = ''
 )
 
 $ErrorActionPreference = 'Stop'
 if ($IncludeUnsupported -and -not $IncludeNonDefault) { throw '-IncludeUnsupported requires -IncludeNonDefault.' }
 if ($EnableFeishu -and $DisableFeishu) { throw '-EnableFeishu and -DisableFeishu are mutually exclusive.' }
+if ($EnableMediaGeneration -and $DisableMediaGeneration) { throw '-EnableMediaGeneration and -DisableMediaGeneration are mutually exclusive.' }
+if ($MediaGatewayCatalogStatus -eq 'verified' -and [string]::IsNullOrWhiteSpace($MediaGatewayCatalogVerifiedAt)) {
+    throw 'A verified media gateway catalog must include its verification timestamp.'
+}
 $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 
 function Write-JsonNoBom([string]$Path, [object]$Value, [int]$Depth = 8) {
@@ -100,7 +108,7 @@ foreach ($entry in $manifest.files) {
     if ($hash -ne ([string]$entry.sha256).ToLowerInvariant()) { throw "Pack hash mismatch: $($entry.path)" }
 }
 $checksumPaths = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-foreach ($line in Get-Content -LiteralPath $checksumFile -Encoding UTF8) {
+foreach ($line in Get-Content -LiteralPath $checksumFile) {
     if ([string]::IsNullOrWhiteSpace($line)) { continue }
     $match = [regex]::Match($line, '^(?<hash>[0-9a-fA-F]{64}) \*(?<path>.+)$')
     if (-not $match.Success) { throw "Invalid pack checksum line: $line" }
@@ -348,8 +356,8 @@ $supportFiles = @(
     @{ source = 'manifest/mcp-servers.json'; destination = (Join-Path $ownershipRoot 'manifest\mcp-servers.json'); kind = 'mcp-catalog' },
     @{ source = 'manifest/skill-audit.json'; destination = (Join-Path $ownershipRoot 'manifest\skill-audit.json'); kind = 'audit-contract' },
     @{ source = 'config-fragments/feishu-official-stdio.template.toml'; destination = (Join-Path $ownershipRoot 'config-fragments\feishu-official-stdio.template.toml'); kind = 'config-template' },
-    @{ source = 'mcp/dashscope-web-search.template.env'; destination = (Join-Path $ownershipRoot 'connections\dashscope-web-search.template.env'); kind = 'connection-template' },
     @{ source = 'config-fragments/media-generation-stdio.template.toml'; destination = (Join-Path $ownershipRoot 'config-fragments\media-generation-stdio.template.toml'); kind = 'config-template' },
+    @{ source = 'mcp/dashscope-web-search.template.env'; destination = (Join-Path $ownershipRoot 'connections\dashscope-web-search.template.env'); kind = 'connection-template' },
     @{ source = 'mcp/media-generation.template.env'; destination = (Join-Path $ownershipRoot 'connections\media-generation.template.env'); kind = 'connection-template' }
 )
 foreach ($supportFile in $supportFiles) {
@@ -368,25 +376,26 @@ function Test-CurrentOwnership([string]$Path, [string]$Kind) {
 $feishuAppId = [Environment]::GetEnvironmentVariable('FEISHU_APP_ID', 'Process')
 $feishuAppSecret = [Environment]::GetEnvironmentVariable('FEISHU_APP_SECRET', 'Process')
 $feishuEnabled = if ($DisableFeishu) { $false } elseif ($EnableFeishu) { $true } else { (-not [string]::IsNullOrWhiteSpace($feishuAppId) -and $feishuAppId -match '^cli_[A-Za-z0-9_-]+$' -and -not [string]::IsNullOrWhiteSpace($feishuAppSecret) -and $feishuAppSecret.Length -ge 8) }
-$mediaApiBaseUrl = [Environment]::GetEnvironmentVariable('MEDIA_GENERATION_API_BASE_URL', 'Process')
-$mediaApiKey = [Environment]::GetEnvironmentVariable('MEDIA_GENERATION_API_KEY', 'Process')
-$mediaGenerationEnabled = [bool]$EnableMediaGeneration
-if ($mediaGenerationEnabled -and ([string]::IsNullOrWhiteSpace($mediaApiBaseUrl) -or [string]::IsNullOrWhiteSpace($mediaApiKey))) {
-    throw 'EnableMediaGeneration requires MEDIA_GENERATION_API_BASE_URL and MEDIA_GENERATION_API_KEY in the installer process.'
-}
+$mediaGenerationEnabled = -not [bool]$DisableMediaGeneration
 if ($mediaGenerationEnabled) {
+    $mediaProfile = [Environment]::GetEnvironmentVariable('MEDIA_GENERATION_API_PROFILE', 'Process')
+    if ([string]::IsNullOrWhiteSpace($mediaProfile)) {
+        [Environment]::SetEnvironmentVariable('MEDIA_GENERATION_API_PROFILE', 'responses', 'Process')
+        $mediaProfile = 'responses'
+    }
+    if ($mediaProfile -notin @('auto','legacy','wokey','responses')) { throw 'Unsupported media API profile.' }
+    if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable('MEDIA_IMAGE2_MODEL', 'Process'))) {
+        [Environment]::SetEnvironmentVariable('MEDIA_IMAGE2_MODEL', 'gpt-image-2.5', 'Process')
+    }
     $mediaModelEnvNames = @('MEDIA_IMAGE2_MODEL','MEDIA_GROK_IMAGE_MODEL','MEDIA_GROK_VIDEO_MODEL','MEDIA_SEEDANCE_MODEL','MEDIA_MINIMAX_VIDEO_MODEL')
     $configuredMediaModels = @($mediaModelEnvNames | Where-Object { -not [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_, 'Process')) })
     if ($configuredMediaModels.Count -eq 0) { throw 'EnableMediaGeneration requires at least one provider model ID.' }
-    if ((-not [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable('MEDIA_IMAGE2_MODEL', 'Process')) -or -not [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable('MEDIA_SEEDANCE_MODEL', 'Process'))) -and [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable('MEDIA_GENERATION_AGENT_ID', 'Process'))) {
-        throw 'EnableMediaGeneration requires MEDIA_GENERATION_AGENT_ID for Image-2 or Seedance.'
+    if (-not [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable('MEDIA_SEEDANCE_MODEL', 'Process')) -and [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable('MEDIA_GENERATION_AGENT_ID', 'Process'))) {
+        throw 'EnableMediaGeneration requires MEDIA_GENERATION_AGENT_ID for the configured Seedance route.'
     }
     $minimaxVideoModel = [Environment]::GetEnvironmentVariable('MEDIA_MINIMAX_VIDEO_MODEL', 'Process')
     if (-not [string]::IsNullOrWhiteSpace($minimaxVideoModel)) {
-        $mediaProfile = [Environment]::GetEnvironmentVariable('MEDIA_GENERATION_API_PROFILE', 'Process')
-        $mediaUri = $null
-        $baseIsWokey = [Uri]::TryCreate($mediaApiBaseUrl, [UriKind]::Absolute, [ref]$mediaUri) -and $mediaUri.Host.Equals('api.wokey.ai', [StringComparison]::OrdinalIgnoreCase)
-        if ($mediaProfile -eq 'legacy' -or ($mediaProfile -ne 'wokey' -and -not ($mediaProfile -eq 'auto' -and $baseIsWokey))) {
+        if ($mediaProfile -ne 'wokey') {
             throw 'MiniMax video model is supported only through the shared upstream Wokey-compatible profile; the official MiniMax API is not used.'
         }
     }
@@ -444,23 +453,50 @@ $runtimeState = [ordered]@{
     status = 'failed'
     targetUserProfile = $userProfile
     python = [ordered]@{ executable = ''; baseInterpreter = ''; version = ''; wheelCount = 0; health = 'unknown' }
-    manim = [ordered]@{ executable = ''; version = ''; health = 'unknown'; latex = 'optional-not-installed' }
-    node = [ordered]@{ executable = ''; version = ''; health = 'unknown' }
-    ffmpeg = [ordered]@{ executable = ''; ffprobe = ''; version = ''; health = 'unknown' }
-    hyperframes = [ordered]@{ executable = ''; command = ''; version = ''; cliHealth = 'unknown'; browserHealth = 'unknown'; health = 'unknown'; error = '' }
+    node = [ordered]@{ executable = ''; version = ''; health = 'disabled' }
     feishu = [ordered]@{ packageRoot = ''; package = '@larksuiteoapi/lark-mcp@0.5.1'; health = if ($feishuEnabled) { 'unknown' } else { 'disabled' } }
-    mediaGeneration = [ordered]@{ health = if ($mediaGenerationEnabled) { 'unknown' } else { 'disabled' }; server = 'media-generation-mcp.py' }
+    mediaGeneration = [ordered]@{
+        health = if ($mediaGenerationEnabled) { 'unknown' } else { 'disabled' }
+        server = 'media-generation-mcp.py'
+        serverVersion = ''
+        protocol = 'not-checked'
+        gatewayCatalog = if ($mediaGenerationEnabled) { $MediaGatewayCatalogStatus } else { 'not-checked' }
+        gatewayCatalogVerifiedAt = $null
+        gatewayModelCount = 0
+        generationCapability = 'not-tested'
+    }
     paths = [ordered]@{ kitHome = $ownershipRoot; runtimeRoot = (Join-Path $ownershipRoot 'runtime'); binRoot = (Join-Path $ownershipRoot 'bin') }
     secretsStored = $false
 }
 try {
     $runtimeArguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', $runtimeScript, '-PackRoot', $PackRoot, '-TargetUserProfile', $userProfile)
-    if ($feishuEnabled) { $runtimeArguments += '-EnableFeishu' }
+if ($feishuEnabled) { $runtimeArguments += '-EnableFeishu' }
     $runtimeOutput = (& $powershellCommand.Source @runtimeArguments 2>&1 | Out-String)
     $runtimeExitCode = $LASTEXITCODE
     $runtimeState = $runtimeOutput | ConvertFrom-Json
     if ($runtimeExitCode -ne 0) { throw "Bundled runtime provisioning failed with exit code $runtimeExitCode." }
     if (-not (Test-RuntimeReady $runtimeState)) { throw 'Bundled runtime provisioning returned a partial or unhealthy state.' }
+    $initialMediaHealth = if ($mediaGenerationEnabled) { 'unknown' } else { 'disabled' }
+    $mediaRuntimeDefaults = [ordered]@{
+        health = $initialMediaHealth
+        server = 'media-generation-mcp.py'
+        serverVersion = ''
+        protocol = 'not-checked'
+        gatewayCatalog = if ($mediaGenerationEnabled) { $MediaGatewayCatalogStatus } else { 'not-checked' }
+        gatewayCatalogVerifiedAt = $null
+        gatewayModelCount = 0
+        generationCapability = 'not-tested'
+    }
+    if (-not $runtimeState.PSObject.Properties['mediaGeneration']) {
+        $runtimeState | Add-Member -NotePropertyName mediaGeneration -NotePropertyValue ([pscustomobject]$mediaRuntimeDefaults)
+    } else {
+        foreach ($property in $mediaRuntimeDefaults.GetEnumerator()) {
+            if (-not $runtimeState.mediaGeneration.PSObject.Properties[$property.Key]) {
+                $runtimeState.mediaGeneration | Add-Member -NotePropertyName $property.Key -NotePropertyValue $property.Value
+            }
+        }
+    }
+    if (-not $runtimeState.PSObject.Properties['error']) { $runtimeState | Add-Member -NotePropertyName error -NotePropertyValue '' }
 } catch {
     $runtimeState.error = Redact-Diagnostic (($runtimeOutput + "`n" + $_.Exception.Message).Trim())
 }
@@ -524,6 +560,44 @@ foreach ($runtimeOwnedPath in @($runtimeStatePath, $pdfSmokeDiagnosticPath) + $r
 
 $wrapperTarget = Join-Path $ownershipRoot 'bin\start-feishu-mcp.ps1'
 $mediaWrapperTarget = Join-Path $ownershipRoot 'bin\start-media-generation-mcp.ps1'
+$mediaHealthStatus = [ordered]@{ status = if ($mediaGenerationEnabled) { 'not-checked' } else { 'disabled' }; runtime = 'not-checked'; protocol = 'not-checked'; gatewayCatalog = if ($mediaGenerationEnabled) { $MediaGatewayCatalogStatus } else { 'not-checked' }; generationCapability = 'not-tested'; python = ''; serverVersion = ''; catalogVerifiedAt = if (-not [string]::IsNullOrWhiteSpace($MediaGatewayCatalogVerifiedAt)) { $MediaGatewayCatalogVerifiedAt } else { $null }; modelCount = if ($MediaGatewayCatalogStatus -eq 'verified') { $MediaGatewayModelCount } else { 0 } }
+$mediaRegistrationReady = -not $mediaGenerationEnabled
+$mediaStageLog = New-Object System.Collections.Generic.List[string]
+if ($mediaGenerationEnabled) {
+    $mediaServerTarget = Join-Path $ownershipRoot 'bin\media-generation-mcp.py'
+    if (-not (Test-Path -LiteralPath $mediaWrapperTarget -PathType Leaf) -or -not (Test-Path -LiteralPath $mediaServerTarget -PathType Leaf)) {
+        $mediaStageLog.Add('deploy=failed;reason=wrapper-or-server-missing')
+        throw '媒体 MCP 部署失败：本机 bin 缺少启动脚本或服务文件。'
+    }
+    $mediaStageLog.Add('deploy=passed')
+}
+if ($mediaGenerationEnabled) {
+    $mediaHealthOutput = ''
+    try {
+        # Parse only stdout: the wrapper's healthcheck emits one JSON document
+        # there, while diagnostics belong on stderr and must never corrupt it.
+        $mediaHealthOutput = & $powershellCommand.Source -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File $mediaWrapperTarget -HealthCheck | Out-String
+        if ($LASTEXITCODE -ne 0) { throw 'The preinstalled Python media MCP health check failed.' }
+        $mediaHealth = $mediaHealthOutput | ConvertFrom-Json
+        if (-not $mediaHealth.ready -or [string]$mediaHealth.serverVersion -ne '1.3.3' -or [string]$mediaHealth.healthScope -ne 'local-runtime-protocol' -or [string]$mediaHealth.runtimeStatus -ne 'passed' -or [string]$mediaHealth.protocolStatus -ne 'passed' -or [int]$mediaHealth.toolCount -ne 6) { throw 'The preinstalled media MCP local runtime/protocol check failed.' }
+        $mediaHealthStatus = [ordered]@{ status = 'protocol-passed'; runtime = [string]$mediaHealth.runtimeStatus; protocol = [string]$mediaHealth.protocolStatus; gatewayCatalog = $MediaGatewayCatalogStatus; generationCapability = 'not-tested'; python = [string]$mediaHealth.python; serverVersion = [string]$mediaHealth.serverVersion; catalogVerifiedAt = if (-not [string]::IsNullOrWhiteSpace($MediaGatewayCatalogVerifiedAt)) { $MediaGatewayCatalogVerifiedAt } else { $null }; modelCount = if ($MediaGatewayCatalogStatus -eq 'verified') { $MediaGatewayModelCount } else { 0 } }
+        $runtimeState.mediaGeneration.health = 'protocol-passed'
+        $runtimeState.mediaGeneration.protocol = 'passed'
+        $runtimeState.mediaGeneration.gatewayCatalog = $MediaGatewayCatalogStatus
+        $runtimeState.mediaGeneration.gatewayCatalogVerifiedAt = $mediaHealthStatus.catalogVerifiedAt
+        $runtimeState.mediaGeneration.gatewayModelCount = $mediaHealthStatus.modelCount
+        $runtimeState.mediaGeneration.generationCapability = 'not-tested'
+        $runtimeState.mediaGeneration.serverVersion = [string]$mediaHealth.serverVersion
+        $mediaStageLog.Add('protocol_health=passed')
+        Write-JsonNoBom $runtimeStatePath $runtimeState 8
+    } catch {
+        $mediaHealthStatus.status = 'failed'
+        $mediaHealthOutput = Redact-Diagnostic (($mediaHealthOutput + "`n" + $_.Exception.Message).Trim())
+        $mediaHealthDiagnosticPath = Join-Path $diagnosticsRoot 'media-generation-health.log'
+        [void](Write-Diagnostic $mediaHealthDiagnosticPath ($mediaHealthOutput + "`nstatus=failed"))
+        throw "Bundled Python media MCP is not ready: $mediaHealthOutput"
+    }
+}
 $rendererTarget = Join-Path $ownershipRoot 'bin\render-codex-config.ps1'
 $generatedConfig = Join-Path $ownershipRoot 'config\codex-starter.generated.toml'
 $feishuPackageCacheForRender = [string]$runtimeState.feishu.packageRoot
@@ -581,12 +655,32 @@ try {
     $configOutput = & $powershellCommand.Source @configArguments 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) { throw "Codex configuration merge failed." }
     $configStatus = $configOutput | ConvertFrom-Json
+    if ($mediaGenerationEnabled) {
+        if ([string]$configStatus.status -ne 'merged') { throw "媒体 MCP 配置未合并：$([string]$configStatus.status)" }
+        $codexConfigPath = Join-Path $userProfile '.codex\config.toml'
+        if (-not (Test-Path -LiteralPath $codexConfigPath -PathType Leaf)) { throw 'Codex config.toml 不存在。' }
+        $configText = Get-Content -LiteralPath $codexConfigPath -Raw -Encoding UTF8
+        $mediaTable = [regex]::Match($configText, '(?ms)^\[mcp_servers\.media_generation\][ \t]*\r?\n(?<body>.*?)(?=^\[[^\[]|\z)')
+        $expectedWrapperPath = [IO.Path]::GetFullPath($mediaWrapperTarget)
+        $expectedWrapperToml = '"' + $expectedWrapperPath.Replace('\', '\\').Replace('"', '\"') + '"'
+        if (-not $mediaTable.Success -or
+            $mediaTable.Groups['body'].Value -notmatch '(?m)^enabled\s*=\s*true\s*$' -or
+            -not $mediaTable.Groups['body'].Value.Contains($expectedWrapperToml)) {
+            throw 'Codex config.toml 中未找到启用状态正确且指向本机包装器的 media_generation 配置。'
+        }
+        $mediaRegistrationReady = $true
+        $mediaStageLog.Add('codex_registration=passed')
+    }
 } catch {
     if ([string]$renderStatus.status -eq 'not-run') {
         $renderStatus.status = 'failed'
         $renderStatus.reason = Redact-Diagnostic (($configOutput + "`n" + $_.Exception.Message).Trim())
     }
     $configStatus.reason = Redact-Diagnostic (($configOutput + "`n" + $_.Exception.Message).Trim())
+    if ($mediaGenerationEnabled) {
+        $mediaRegistrationReady = $false
+        $mediaStageLog.Add(('codex_registration=failed;reason=' + (Redact-Diagnostic $_.Exception.Message)))
+    }
 }
 $configDiagnostic = Write-Diagnostic $configDiagnosticPath ($configOutput + "`nstatus=" + [string]$configStatus.status + "`nreason=" + [string]$configStatus.reason)
 if (Test-Path -LiteralPath $generatedConfig -PathType Leaf) {
@@ -626,12 +720,27 @@ foreach ($modelOwnedPath in @((Join-Path $ownershipRoot 'model-catalog.json'), (
     }
 }
 $connectionStatusPath = Join-Path $ownershipRoot 'connection-status.json'
+$mediaReady = -not $mediaGenerationEnabled -or ($mediaRegistrationReady -and [string]$mediaHealthStatus.runtime -eq 'passed' -and [string]$mediaHealthStatus.protocol -eq 'passed' -and (Test-Path -LiteralPath $mediaWrapperTarget -PathType Leaf) -and (Test-Path -LiteralPath (Join-Path $ownershipRoot 'bin\media-generation-mcp.py') -PathType Leaf))
+$mediaRegistered = [bool]($mediaGenerationEnabled -and $mediaReady)
+if ($mediaGenerationEnabled -and -not $mediaReady) { $mediaStageLog.Add('acceptance=failed') }
+$codexRunning = @(Get-Process -Name 'Codex','codex' -ErrorAction SilentlyContinue).Count -gt 0
 $localMcpsEnabled = @()
 if ($feishuEnabled) { $localMcpsEnabled += 'feishu' }
 if ($mediaGenerationEnabled) { $localMcpsEnabled += 'media-generation' }
 $connectionStatus = [ordered]@{
     schemaVersion = 1
     feishu = if ($feishuEnabled) { 'enabled-awaiting-tenant-health' } else { 'disabled-awaiting-credentials' }
+    mediaGeneration = [ordered]@{
+        runtime = [string]$mediaHealthStatus.runtime
+        protocol = [string]$mediaHealthStatus.protocol
+        registered = $mediaRegistered
+        gatewayCatalog = [string]$mediaHealthStatus.gatewayCatalog
+        generationCapability = [string]$mediaHealthStatus.generationCapability
+        serverVersion = [string]$mediaHealthStatus.serverVersion
+        gatewayCatalogVerifiedAt = $mediaHealthStatus.catalogVerifiedAt
+        gatewayModelCount = [int]$mediaHealthStatus.modelCount
+    }
+    codex = [ordered]@{ restartRequired = [bool]$mediaGenerationEnabled; running = [bool]$codexRunning }
     codexConfig = [string]$configStatus.status
     apiServices = [ordered]@{
         templatesInstalled = $true
@@ -641,7 +750,7 @@ $connectionStatus = [ordered]@{
         credentialsStored = $false
         remoteMcpsEnabled = @($EnabledRemoteMcps)
         localMcpsEnabled = $localMcpsEnabled
-        note = 'API credentials remain user-provided environment variables; remote MCP OAuth authorization is handled by Codex.'
+        note = 'The media MCP receives the signed USB license credential only in the Codex launch environment; media credentials are not written to user environment variables or Codex config. Remote MCP OAuth authorization is handled by Codex.'
     }
     secretsStored = $false
 }
@@ -667,7 +776,7 @@ $runtimeReady = Test-RuntimeReady $runtimeState
 $pdfReady = [string]$pdfSmokeStatus.status -eq 'passed'
 $configReady = [string]$configStatus.status -notin @('failed', 'partial', 'conflict')
 $modelReady = [string]$modelSyncStatus.status -eq 'ready'
-$overallStatus = if (-not $coreReady) { 'failed' } elseif ($runtimeReady -and [string]$runtimeState.status -eq 'ready' -and $pdfReady -and $configReady -and $modelReady) { 'ready' } else { 'partial' }
+$overallStatus = if (-not $coreReady -or ($mediaGenerationEnabled -and -not $mediaReady)) { 'failed' } elseif ($runtimeReady -and [string]$runtimeState.status -eq 'ready' -and $pdfReady -and $configReady -and $modelReady) { 'ready' } else { 'partial' }
 $diagnostics = [ordered]@{
     path = (Join-Path $diagnosticsRoot 'capability-pack.log')
     runtime = $runtimeDiagnosticPath
@@ -682,7 +791,9 @@ $diagnosticText = @(
     "config status=$([string]$configStatus.status)",
     "model sync status=$([string]$modelSyncStatus.status) preferred=$([string]$modelSyncStatus.preferredModel) migration=$([string]$modelSyncStatus.migration)",
     "runtime log=$runtimeDiagnosticPath",
-    "config log=$configDiagnosticPath"
+    "config log=$configDiagnosticPath",
+    "media registration=$mediaRegistrationReady",
+    "media stages=$($mediaStageLog -join ',')"
 ) -join [Environment]::NewLine
 $diagnosticPath = Write-Diagnostic ([string]$diagnostics.path) $diagnosticText
 foreach ($diagnosticFile in @($runtimeDiagnosticPath, $pdfSmokeDiagnosticPath, $configDiagnosticPath, $modelSyncDiagnosticPath, [string]$diagnostics.path)) {
@@ -714,7 +825,6 @@ $readiness = [ordered]@{
         skills = $installedSkillCount
         agents = $installedAgentCount
         feishuWrapper = Test-CurrentOwnership $wrapperTarget 'mcp-wrapper'
-        mediaGenerationMcp = Test-CurrentOwnership $mediaWrapperTarget 'mcp-wrapper'
         configRenderer = Test-CurrentOwnership $rendererTarget 'config-renderer'
         modelCatalog = Test-CurrentOwnership (Join-Path $ownershipRoot 'model-catalog.json') 'model-catalog'
         modelSync = Test-CurrentOwnership (Join-Path $ownershipRoot 'bin\sync-model-catalog.ps1') 'model-sync'
@@ -727,6 +837,7 @@ $readiness = [ordered]@{
     overallStatus = $overallStatus
     diagnostics = $diagnostics
     connections = $connectionStatus
+    codex = [ordered]@{ restartRequired = [bool]$mediaGenerationEnabled; running = [bool]$codexRunning }
     secretsStored = $false
 }
 $readinessTemp = Join-Path ([IO.Path]::GetTempPath()) ('codex-starter-readiness-' + [guid]::NewGuid().ToString('N') + '.json')
@@ -752,4 +863,7 @@ $record = [ordered]@{
 }
 Write-JsonNoBom $ownershipFile $record 8
 Write-Host "Ownership record: $ownershipFile"
+if ($mediaGenerationEnabled -and -not $mediaReady) {
+    throw "媒体 MCP 预装未通过验收；安装已标记失败。诊断文件：$($diagnostics.path)"
+}
 Write-Host 'Done. Restart Codex or open a new task so the new agents and skills are reloaded.' -ForegroundColor Green

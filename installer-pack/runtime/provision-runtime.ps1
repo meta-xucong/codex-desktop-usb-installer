@@ -164,7 +164,7 @@ if (-not $venvHealthy) {
 
 $pythonInstall = Invoke-NativeCapture -Executable $venvPython -Arguments @('-m','pip','install','--disable-pip-version-check','--no-input','--no-index','--find-links',$wheelDir,'--require-hashes','-r',$lockPath)
 if ($pythonInstall.ExitCode -ne 0) { throw "Offline Python dependency installation failed: $($pythonInstall.Output)" }
-$pythonHealthProbe = 'import akshare,pandas,numpy,matplotlib,openpyxl,docx,pptx,pypdf,pdfplumber,reportlab,PIL,scrapling,html2text,jsonpath'
+$pythonHealthProbe = 'import akshare,pandas,numpy,matplotlib,openpyxl,docx,pptx,pypdf,pdfplumber,reportlab,PIL,scrapling,html2text,jsonpath,requests'
 $pythonHealthResult = Invoke-NativeCapture -Executable $venvPython -Arguments @('-c',$pythonHealthProbe)
 if ($pythonHealthResult.ExitCode -ne 0) { throw "Python runtime health check failed: $($pythonHealthResult.Output)" }
 

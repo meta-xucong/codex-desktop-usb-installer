@@ -87,12 +87,13 @@ pub struct CapabilityPackInstallOptions {
     pub enabled_api_services: Vec<String>,
     pub enabled_remote_mcps: Vec<String>,
     pub enable_media_generation: bool,
+    pub media_gateway_catalog_status: String,
+    pub media_gateway_model_count: usize,
+    pub media_gateway_catalog_verified_at: Option<String>,
     pub dashscope_api_key: String,
     pub dashscope_base_url: String,
     pub dashscope_model: String,
-    pub media_generation_api_base_url: String,
     pub media_generation_api_profile: String,
-    pub media_generation_api_key: String,
     pub media_generation_agent_id: String,
     pub image2_model: String,
     pub grok_image_model: String,
@@ -113,13 +114,14 @@ impl Default for CapabilityPackInstallOptions {
             feishu_auth_mode: "tenant".to_string(),
             enabled_api_services: Vec::new(),
             enabled_remote_mcps: Vec::new(),
-            enable_media_generation: false,
+            enable_media_generation: true,
+            media_gateway_catalog_status: "not-checked".to_string(),
+            media_gateway_model_count: 0,
+            media_gateway_catalog_verified_at: None,
             dashscope_api_key: String::new(),
             dashscope_base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1".to_string(),
             dashscope_model: String::new(),
-            media_generation_api_base_url: String::new(),
-            media_generation_api_profile: "auto".to_string(),
-            media_generation_api_key: String::new(),
+            media_generation_api_profile: "responses".to_string(),
             media_generation_agent_id: String::new(),
             image2_model: String::new(),
             grok_image_model: String::new(),
@@ -148,6 +150,14 @@ pub struct CapabilityPackReport {
     pub diagnostics_path: Option<String>,
     pub feishu_enabled: bool,
     pub enabled_api_services: Vec<String>,
+    pub media_runtime_status: String,
+    pub media_protocol_status: String,
+    pub media_gateway_catalog_status: String,
+    pub media_gateway_model_count: usize,
+    pub media_gateway_catalog_verified_at: Option<String>,
+    pub media_generation_capability: String,
+    pub codex_restart_required: bool,
+    pub codex_running: bool,
     pub message: String,
 }
 
@@ -168,6 +178,14 @@ fn report_missing(message: impl Into<String>) -> CapabilityPackReport {
         diagnostics_path: None,
         feishu_enabled: false,
         enabled_api_services: Vec::new(),
+        media_runtime_status: "unknown".to_string(),
+        media_protocol_status: "unknown".to_string(),
+        media_gateway_catalog_status: "not-checked".to_string(),
+        media_gateway_model_count: 0,
+        media_gateway_catalog_verified_at: None,
+        media_generation_capability: "not-tested".to_string(),
+        codex_restart_required: false,
+        codex_running: false,
         message: message.into(),
     }
 }
@@ -295,6 +313,15 @@ struct ReadinessSummary {
     agents: usize,
     runtime_status: String,
     config_status: String,
+    media_runtime_status: String,
+    media_protocol_status: String,
+    media_registered: bool,
+    media_gateway_catalog_status: String,
+    media_gateway_model_count: usize,
+    media_gateway_catalog_verified_at: Option<String>,
+    media_generation_capability: String,
+    codex_restart_required: bool,
+    codex_running: bool,
     diagnostics_path: Option<String>,
 }
 
@@ -357,6 +384,46 @@ fn readiness_summary(profile: &Path) -> ReadinessSummary {
             .and_then(|v| v.as_str())
             .unwrap_or("unknown")
             .to_string(),
+        media_runtime_status: value
+            .pointer("/connections/mediaGeneration/runtime")
+            .and_then(|v| v.as_str())
+            .unwrap_or("not-checked")
+            .to_string(),
+        media_protocol_status: value
+            .pointer("/connections/mediaGeneration/protocol")
+            .and_then(|v| v.as_str())
+            .unwrap_or("not-checked")
+            .to_string(),
+        media_registered: value
+            .pointer("/connections/mediaGeneration/registered")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        media_gateway_catalog_status: value
+            .pointer("/connections/mediaGeneration/gatewayCatalog")
+            .and_then(|v| v.as_str())
+            .unwrap_or("not-checked")
+            .to_string(),
+        media_gateway_model_count: value
+            .pointer("/connections/mediaGeneration/gatewayModelCount")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize,
+        media_gateway_catalog_verified_at: value
+            .pointer("/connections/mediaGeneration/gatewayCatalogVerifiedAt")
+            .and_then(|v| v.as_str())
+            .map(ToOwned::to_owned),
+        media_generation_capability: value
+            .pointer("/connections/mediaGeneration/generationCapability")
+            .and_then(|v| v.as_str())
+            .unwrap_or("not-tested")
+            .to_string(),
+        codex_restart_required: value
+            .pointer("/codex/restartRequired")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        codex_running: value
+            .pointer("/codex/running")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
         config_status: value
             .pointer("/config/status")
             .or_else(|| value.pointer("/connections/codexConfig"))
@@ -374,8 +441,9 @@ fn readiness_summary(profile: &Path) -> ReadinessSummary {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
-        core_ready_from_readiness, persist_connection_ownership, readiness_summary, strip_utf8_bom,
-        validate_options, CapabilityPackInstallOptions, ConnectionOwnershipRecord,
+        core_ready_from_readiness, media_install_ready, media_install_switch,
+        persist_connection_ownership, readiness_summary, strip_utf8_bom, validate_options,
+        CapabilityPackInstallOptions, ConnectionOwnershipRecord,
         CONNECTION_OWNERSHIP_RELATIVE, PACK_ID,
     };
     use serde_json::json;
@@ -424,6 +492,50 @@ mod tests {
     }
 
     #[test]
+    fn media_mcp_requires_registered_protocol_and_both_local_files() {
+        let profile = std::env::temp_dir().join(format!(
+            "codex-media-readiness-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let kit = profile.join(".codex/codex-agent-kit");
+        let readiness_path = kit.join("readiness.json");
+        let bin = kit.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(bin.join("start-media-generation-mcp.ps1"), "wrapper").unwrap();
+        fs::write(bin.join("media-generation-mcp.py"), "server").unwrap();
+        fs::write(
+            &readiness_path,
+            serde_json::to_vec(&json!({
+                "connections": {"mediaGeneration": {
+                    "runtime": "passed",
+                    "protocol": "passed",
+                    "registered": true
+                }}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let readiness = readiness_summary(&profile);
+        assert!(media_install_ready(&readiness, &profile));
+        let mut unregistered = readiness.clone();
+        unregistered.media_registered = false;
+        assert!(!media_install_ready(&unregistered, &profile));
+        let mut unhealthy = readiness.clone();
+        unhealthy.media_protocol_status = "failed".to_string();
+        assert!(!media_install_ready(&unhealthy, &profile));
+        fs::remove_file(bin.join("media-generation-mcp.py")).unwrap();
+        assert!(!media_install_ready(&readiness, &profile));
+        let _ = fs::remove_dir_all(profile);
+    }
+
+    #[test]
+    fn media_disabled_is_explicitly_forwarded_to_the_powershell_installer() {
+        assert_eq!(media_install_switch(true), "-EnableMediaGeneration");
+        assert_eq!(media_install_switch(false), "-DisableMediaGeneration");
+    }
+
+    #[test]
     fn strip_utf8_bom_preserves_bomless_json() {
         let bytes = br#"{"ready":true}"#;
         assert_eq!(strip_utf8_bom(bytes), bytes);
@@ -468,13 +580,15 @@ mod tests {
     fn minimax_video_uses_the_shared_media_connection_only() {
         let options = CapabilityPackInstallOptions {
             enable_media_generation: true,
-            media_generation_api_base_url: "https://api.wokey.ai".to_string(),
-            media_generation_api_profile: "auto".to_string(),
-            media_generation_api_key: "shared-test-key".to_string(),
+            media_generation_api_profile: "wokey".to_string(),
             minimax_video_model: "upstream-minimax-video-model".to_string(),
             ..CapabilityPackInstallOptions::default()
         };
         assert!(validate_options(&options).is_ok());
+
+        let mut license_backed_image = CapabilityPackInstallOptions::default();
+        license_backed_image.enable_media_generation = true;
+        assert!(validate_options(&license_backed_image).is_ok());
 
         let mut legacy_direct = options;
         legacy_direct
@@ -495,6 +609,25 @@ fn overall_status(core_ready: bool, runtime_status: &str, config_status: &str) -
     }
 }
 
+fn media_install_ready(readiness: &ReadinessSummary, profile: &Path) -> bool {
+    let kit_home = profile.join(".codex/codex-agent-kit");
+    readiness.media_registered
+        && readiness.media_runtime_status == "passed"
+        && readiness.media_protocol_status == "passed"
+        && kit_home
+            .join("bin/start-media-generation-mcp.ps1")
+            .is_file()
+        && kit_home.join("bin/media-generation-mcp.py").is_file()
+}
+
+fn media_install_switch(enabled: bool) -> &'static str {
+    if enabled {
+        "-EnableMediaGeneration"
+    } else {
+        "-DisableMediaGeneration"
+    }
+}
+
 fn sanitized_child_output(output: &Output, options: &CapabilityPackInstallOptions) -> String {
     let mut text = format!(
         "{}\n{}",
@@ -505,7 +638,6 @@ fn sanitized_child_output(output: &Output, options: &CapabilityPackInstallOption
         &options.feishu_app_secret,
         &options.feishu_user_access_token,
         &options.dashscope_api_key,
-        &options.media_generation_api_key,
     ] {
         if !secret.trim().is_empty() {
             text = text.replace(secret, "<redacted>");
@@ -567,6 +699,14 @@ pub fn status(app: &AppHandle) -> Result<CapabilityPackReport, AppError> {
         diagnostics_path: readiness.diagnostics_path,
         feishu_enabled: false,
         enabled_api_services: Vec::new(),
+        media_runtime_status: readiness.media_runtime_status.clone(),
+        media_protocol_status: readiness.media_protocol_status.clone(),
+        media_gateway_catalog_status: readiness.media_gateway_catalog_status.clone(),
+        media_gateway_model_count: readiness.media_gateway_model_count,
+        media_gateway_catalog_verified_at: readiness.media_gateway_catalog_verified_at.clone(),
+        media_generation_capability: readiness.media_generation_capability.clone(),
+        codex_restart_required: readiness.codex_restart_required,
+        codex_running: readiness.codex_running,
         message: if status == "ready" {
             "能力包已安装；外部连接状态按本机配置决定".to_string()
         } else if installed {
@@ -599,6 +739,17 @@ fn selected_service(options: &CapabilityPackInstallOptions, id: &str) -> bool {
 }
 
 fn validate_options(options: &CapabilityPackInstallOptions) -> Result<(), AppError> {
+    if !matches!(
+        options.media_gateway_catalog_status.as_str(),
+        "not-checked" | "verified" | "failed"
+    ) || options.media_gateway_model_count > 100_000
+        || (options.media_gateway_catalog_status == "verified"
+            && options.media_gateway_catalog_verified_at.as_deref().and_then(non_empty).is_none())
+    {
+        return Err(AppError::Engine(
+            "媒体上游模型目录检查状态无效".to_string(),
+        ));
+    }
     for service in &options.enabled_api_services {
         if !matches!(service.trim(), "dashscope-web-search") {
             return Err(AppError::Engine(format!(
@@ -637,45 +788,26 @@ fn validate_options(options: &CapabilityPackInstallOptions) -> Result<(), AppErr
         ));
     }
     if options.enable_media_generation {
-        if non_empty(&options.media_generation_api_base_url).is_none()
-            || non_empty(&options.media_generation_api_key).is_none()
-        {
-            return Err(AppError::Engine(
-                "启用统一媒体 MCP 时必须填写媒体 Base URL 和共享 API Key".to_string(),
-            ));
-        }
         if !matches!(
             options.media_generation_api_profile.trim(),
-            "auto" | "legacy" | "wokey"
+            "auto" | "legacy" | "wokey" | "responses"
         ) {
-            return Err(AppError::Engine(
-                "媒体 API 兼容模式只允许 auto、legacy 或 wokey".to_string(),
-            ));
+            return Err(AppError::Engine("媒体 API 兼容模式无效".to_string()));
         }
         let has_image2 = non_empty(&options.image2_model).is_some();
-        let has_grok_image = non_empty(&options.grok_image_model).is_some();
-        let has_grok_video = non_empty(&options.grok_video_model).is_some();
         let has_seedance = non_empty(&options.seedance_model).is_some();
         let has_minimax = non_empty(&options.minimax_video_model).is_some();
-        if !(has_image2 || has_grok_image || has_grok_video || has_seedance || has_minimax) {
-            return Err(AppError::Engine(
-                "统一媒体 MCP 至少需要填写一个上游实际支持的模型名".to_string(),
-            ));
-        }
-        let base_is_wokey = non_empty(&options.media_generation_api_base_url)
-            .map(|value| {
-                value
-                    .trim_end_matches('/')
-                    .eq_ignore_ascii_case("https://api.wokey.ai")
-            })
-            .unwrap_or(false);
-        let uses_wokey = options.media_generation_api_profile == "wokey"
-            || (options.media_generation_api_profile == "auto" && base_is_wokey);
+        let uses_wokey = options.media_generation_api_profile == "wokey";
         if has_minimax && !uses_wokey {
             return Err(AppError::Engine("MiniMax 视频模型槽位仅可用于统一上游的 Wokey 兼容模式；当前不得配置官方 MiniMax API".to_string()));
         }
-        if !uses_wokey
-            && (has_image2 || has_seedance)
+        let needs_image_route_id = has_image2
+            && matches!(
+                options.media_generation_api_profile.as_str(),
+                "auto" | "legacy"
+            );
+        let needs_seedance_route_id = has_seedance && !uses_wokey;
+        if (needs_image_route_id || needs_seedance_route_id)
             && non_empty(&options.media_generation_agent_id).is_none()
         {
             return Err(AppError::Engine(
@@ -846,37 +978,32 @@ fn persist_configured_environment(
             ("DASHSCOPE_MODEL", options.dashscope_model.as_str()),
         ]);
     }
-    if options.enable_media_generation {
-        values.extend([
-            (
-                "MEDIA_GENERATION_API_BASE_URL",
-                options.media_generation_api_base_url.as_str(),
-            ),
-            (
-                "MEDIA_GENERATION_API_PROFILE",
-                options.media_generation_api_profile.as_str(),
-            ),
-            (
-                "MEDIA_GENERATION_API_KEY",
-                options.media_generation_api_key.as_str(),
-            ),
-            (
-                "MEDIA_GENERATION_AGENT_ID",
-                options.media_generation_agent_id.as_str(),
-            ),
-            ("MEDIA_IMAGE2_MODEL", options.image2_model.as_str()),
-            ("MEDIA_GROK_IMAGE_MODEL", options.grok_image_model.as_str()),
-            ("MEDIA_GROK_VIDEO_MODEL", options.grok_video_model.as_str()),
-            ("MEDIA_SEEDANCE_MODEL", options.seedance_model.as_str()),
-            (
-                "MEDIA_MINIMAX_VIDEO_MODEL",
-                options.minimax_video_model.as_str(),
-            ),
-        ]);
-    }
+    // The manager owns these model slots. Persist empty values too so a model
+    // that disappeared from the live upstream catalog cannot survive from an
+    // earlier install as a stale fallback.
+    let media_values = if options.enable_media_generation {
+        [
+            options.media_generation_agent_id.as_str(),
+            options.image2_model.as_str(),
+            options.grok_image_model.as_str(),
+            options.grok_video_model.as_str(),
+            options.seedance_model.as_str(),
+            options.minimax_video_model.as_str(),
+        ]
+    } else {
+        ["", "", "", "", "", ""]
+    };
+    values.extend([
+        ("MEDIA_GENERATION_AGENT_ID", media_values[0]),
+        ("MEDIA_IMAGE2_MODEL", media_values[1]),
+        ("MEDIA_GROK_IMAGE_MODEL", media_values[2]),
+        ("MEDIA_GROK_VIDEO_MODEL", media_values[3]),
+        ("MEDIA_SEEDANCE_MODEL", media_values[4]),
+        ("MEDIA_MINIMAX_VIDEO_MODEL", media_values[5]),
+    ]);
     let values = values
         .into_iter()
-        .filter(|(_, value)| non_empty(value).is_some())
+        .filter(|(name, value)| name.starts_with("MEDIA_") || non_empty(value).is_some())
         .collect::<Vec<_>>();
     if values.is_empty() {
         return Ok(());
@@ -946,8 +1073,22 @@ pub fn install(
             command.arg(server);
         }
     }
+    command.arg(media_install_switch(options.enable_media_generation));
     if options.enable_media_generation {
-        command.arg("-EnableMediaGeneration");
+        command
+            .arg("-MediaGatewayCatalogStatus")
+            .arg(&options.media_gateway_catalog_status)
+            .arg("-MediaGatewayModelCount")
+            .arg(options.media_gateway_model_count.to_string());
+        if let Some(verified_at) = options
+            .media_gateway_catalog_verified_at
+            .as_deref()
+            .and_then(non_empty)
+        {
+            command
+                .arg("-MediaGatewayCatalogVerifiedAt")
+                .arg(verified_at);
+        }
     }
     add_env(&mut command, "FEISHU_APP_ID", &options.feishu_app_id);
     add_env(
@@ -975,18 +1116,8 @@ pub fn install(
     add_env(&mut command, "DASHSCOPE_MODEL", &options.dashscope_model);
     add_env(
         &mut command,
-        "MEDIA_GENERATION_API_BASE_URL",
-        &options.media_generation_api_base_url,
-    );
-    add_env(
-        &mut command,
         "MEDIA_GENERATION_API_PROFILE",
         &options.media_generation_api_profile,
-    );
-    add_env(
-        &mut command,
-        "MEDIA_GENERATION_API_KEY",
-        &options.media_generation_api_key,
     );
     add_env(
         &mut command,
@@ -1051,6 +1182,16 @@ pub fn install(
         pack_version
     );
     persist_configured_environment(&options, &profile)?;
+    if options.enable_media_generation {
+        crate::app::media_generation::sync_authorized_local_connection().map_err(|error| {
+            log::error!("media MCP credential persistence failed: {error}");
+            AppError::Engine(format!("媒体 MCP 授权同步失败：{error}"))
+        })?;
+        crate::app::media_generation::verify_authorized_local_connection().map_err(|error| {
+            log::error!("media MCP credential verification failed: {error}");
+            AppError::Engine(format!("媒体 MCP 授权自检失败：{error}"))
+        })?;
+    }
     let readiness = readiness_summary(&profile);
     let installed = readiness.pack_identity_valid
         && readiness.core_ready
@@ -1078,6 +1219,24 @@ pub fn install(
             ),
         ));
     }
+    if options.enable_media_generation && !media_install_ready(&readiness, &profile) {
+        log::error!(
+            "media MCP readiness failed source={} version={} runtime={} protocol={} registered={} kit_home={}",
+            source.display(),
+            pack_version,
+            readiness.media_runtime_status,
+            readiness.media_protocol_status,
+            readiness.media_registered,
+            profile.join(".codex/codex-agent-kit").display()
+        );
+        return Err(AppError::Engine(format!(
+            "统一媒体 MCP 未完成安装：部署文件、Codex 注册或协议自检未通过；请查看 {} 并从组件修复入口重试",
+            readiness
+                .diagnostics_path
+                .as_deref()
+                .unwrap_or(".codex/codex-agent-kit/diagnostics/capability-pack.log")
+        )));
+    }
     let runtime_ready = readiness.runtime_status == "ready";
     let status = overall_status(
         installed,
@@ -1101,6 +1260,14 @@ pub fn install(
         diagnostics_path: readiness.diagnostics_path,
         feishu_enabled: options.enable_feishu,
         enabled_api_services,
+        media_runtime_status: readiness.media_runtime_status.clone(),
+        media_protocol_status: readiness.media_protocol_status.clone(),
+        media_gateway_catalog_status: readiness.media_gateway_catalog_status.clone(),
+        media_gateway_model_count: readiness.media_gateway_model_count,
+        media_gateway_catalog_verified_at: readiness.media_gateway_catalog_verified_at.clone(),
+        media_generation_capability: readiness.media_generation_capability.clone(),
+        codex_restart_required: readiness.codex_restart_required,
+        codex_running: readiness.codex_running,
         message: if status == "ready" {
             format!(
                 "能力包安装完成：{} 个 Skills、{} 个 Agents，运行时已就绪",

@@ -2675,10 +2675,11 @@ button.row.danger:hover {
 .upstream-model-manager {
   display: flex;
   flex-direction: column;
-  gap: 12px;
-  min-width: min(560px, 82vw);
-  max-width: min(720px, 88vw);
+  gap: 7px;
+  min-width: min(500px, 82vw);
+  max-width: min(620px, 88vw);
   padding: 2px;
+  text-align: left;
 }
 .upstream-model-manager-topbar {
   display: flex;
@@ -2687,7 +2688,8 @@ button.row.danger:hover {
   gap: 12px;
 }
 .upstream-model-manager-back {
-  min-height: 38px;
+  min-height: 30px;
+  padding: 5px 8px;
 }
 .upstream-model-manager-heading {
   display: flex;
@@ -2695,46 +2697,42 @@ button.row.danger:hover {
   justify-content: space-between;
   gap: 12px;
 }
-.upstream-model-manager-heading h3,
-.upstream-model-manager-heading p,
-.upstream-model-manager-warning,
-.upstream-model-manager-reset p {
+.upstream-model-manager-heading h3 {
   margin: 0;
 }
-.upstream-model-manager-heading p,
-.upstream-model-manager-warning,
-.upstream-model-manager-reset p {
+.upstream-model-manager-heading p {
   color: var(--text-soft);
-  line-height: 1.45;
-}
-.upstream-model-manager-steps {
-  margin: 0;
-  padding: 9px 11px;
-  border-radius: var(--r-md);
-  background: color-mix(in oklch, var(--accent) 8%, var(--surface-2));
-  color: var(--text);
+  max-width: min(560px, 78vw);
+  margin: 3px 0 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  line-height: 1.3;
   font-size: var(--fs-label);
-  line-height: 1.45;
-  overflow-wrap: anywhere;
 }
-.upstream-model-manager-warning {
-  padding: 10px 12px;
-  border: 1px solid color-mix(in srgb, var(--warning, #d9911a) 35%, var(--line));
-  border-radius: var(--r-md);
-  background: color-mix(in srgb, var(--warning, #d9911a) 8%, var(--surface));
+.upstream-model-manager-heading {
+  text-align: center;
 }
 .upstream-model-manager-toolbar {
   display: flex;
   align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
 }
-.upstream-model-manager-summary {
-  color: var(--text-soft);
-  font-size: var(--fs-label);
+.upstream-model-manager-compact-action {
+  width: auto;
+  min-width: 0;
+  min-height: 32px;
+  padding: 5px 9px;
+  font-size: 12px;
+  line-height: 1.15;
+  white-space: nowrap;
 }
 .upstream-model-manager-list {
   display: grid;
-  gap: 8px;
-  max-height: min(42vh, 420px);
+  gap: 0;
+  max-height: min(52vh, 420px);
+  min-height: 0;
   margin: 0;
   padding: 0 2px 0 0;
   overflow-y: auto;
@@ -2742,17 +2740,19 @@ button.row.danger:hover {
 }
 .upstream-model-manager-list > li {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(126px, 148px);
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
-  gap: 8px 12px;
-  padding: 10px 12px;
-  border: 1px solid var(--line);
-  border-radius: var(--r-md);
-  background: color-mix(in oklch, var(--surface-2) 55%, transparent);
+  gap: 8px;
+  min-height: 44px;
+  padding: 5px 6px;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  border-radius: 0;
+  background: transparent;
 }
 .upstream-model-manager-model {
   display: grid;
-  gap: 3px;
+  gap: 2px;
   min-width: 0;
 }
 .upstream-model-manager-model-id {
@@ -2761,36 +2761,27 @@ button.row.danger:hover {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  font-size: 13px;
 }
-.upstream-model-manager-model span,
 .upstream-model-manager-model small {
   color: var(--text-faint);
 }
 .upstream-model-manager-row-status {
+  max-width: 100%;
   overflow-wrap: anywhere;
+  font-size: 11px;
+  line-height: 1.2;
+  text-align: left;
 }
 .upstream-model-manager-row-actions {
   display: flex;
   min-width: 0;
-  flex-direction: column;
-  align-items: stretch;
-  gap: 5px;
-}
-.upstream-model-manager-row-actions .btn {
-  width: 100%;
-  min-height: 38px;
-  padding: 8px 10px;
-  font-size: var(--fs-label);
-  line-height: 1.25;
-}
-.upstream-model-manager-action-reason {
-  color: var(--text-faint);
-  font-size: var(--fs-label);
-  line-height: 1.35;
-  overflow-wrap: anywhere;
+  align-items: center;
+  justify-content: flex-end;
 }
 .upstream-model-manager-row-status-spacer {
-  min-height: 38px;
+  min-width: 1px;
+  min-height: 32px;
 }
 .upstream-model-manager-error {
   color: var(--danger, #c43c35);
@@ -2799,19 +2790,37 @@ button.row.danger:hover {
 .upstream-model-manager-reset {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding-top: 10px;
+  justify-content: flex-end;
+  gap: 8px;
+  padding-top: 7px;
   border-top: 1px solid var(--line);
+}
+.upstream-model-manager-cache {
+  display: block;
+  max-width: 100%;
+  overflow: hidden;
+  color: var(--text-faint);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  line-height: 1.25;
+  text-align: left;
+}
+/* Model manager is a focused task surface: keep the application behind it
+   quiet and prevent glass layers from letting the underlying controls compete. */
+.scrim:has(.upstream-model-manager) {
+  background: color-mix(in oklch, var(--bg) 78%, transparent);
+  backdrop-filter: blur(10px) saturate(1.04);
+  -webkit-backdrop-filter: blur(10px) saturate(1.04);
+}
+.sheet-frame:has(.upstream-model-manager) {
+  background: var(--surface);
+  background-image: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
 }
 @media (max-width: 520px) {
   .upstream-model-manager { min-width: 0; max-width: 100%; }
-  .upstream-model-manager-list > li { grid-template-columns: minmax(0, 1fr); }
-  .upstream-model-manager-toolbar,
-  .upstream-model-manager-reset { align-items: stretch; flex-direction: column; }
-  .upstream-model-manager-row-actions .btn,
-  .upstream-model-manager-toolbar .btn,
-  .upstream-model-manager-reset .btn { width: 100%; }
+  .upstream-model-manager-heading p { max-width: 78vw; }
 }
 
 .install-root-row {

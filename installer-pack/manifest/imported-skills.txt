@@ -16,6 +16,7 @@ feishu-perm
 feishu-wiki
 fitness-coach
 fund-portfolio
+grok-video-prompt-compiler
 growth-analyst
 healthcheck
 hyperframes-video

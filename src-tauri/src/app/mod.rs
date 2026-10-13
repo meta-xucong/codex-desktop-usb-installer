@@ -17,6 +17,7 @@ pub mod gateway_model_probe;
 pub mod install_tx;
 pub mod logging;
 pub mod mac_update;
+pub mod media_generation;
 pub mod model_capability;
 pub mod model_catalog;
 pub mod model_diagnostics;

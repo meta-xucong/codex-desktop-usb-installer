@@ -125,19 +125,23 @@ pub(crate) fn probe(input: NativeProbeInput) -> Result<NativeProbeResult, Native
 /// gateway model does not hide the client's existing native models.
 #[cfg(windows)]
 pub(crate) fn native_default_catalog(
-    executable: &Path,
     cancelled: &AtomicBool,
     deadline: std::time::Instant,
 ) -> Result<Value, NativeProbeError> {
     check_limits(cancelled, deadline)?;
     let mut area = TemporaryArea::create(cancelled, deadline)?;
-    let result = win_process::capture(
-        executable,
-        &["debug", "models"],
-        &area,
-        None,
-        cancelled,
-        deadline,
+    let result = run_after_runtime_verification(
+        || verified_catalog_runtime(&area, cancelled, deadline),
+        |executable| {
+            win_process::capture(
+                executable,
+                &["debug", "models"],
+                &area,
+                None,
+                cancelled,
+                deadline,
+            )
+        },
     )?;
     if !result.status.success() {
         return Err(NativeProbeError::CatalogUnsupported);
@@ -160,7 +164,6 @@ pub(crate) fn native_default_catalog(
 
 #[cfg(not(windows))]
 pub(crate) fn native_default_catalog(
-    _: &Path,
     _: &AtomicBool,
     _: std::time::Instant,
 ) -> Result<Value, NativeProbeError> {
@@ -1827,7 +1830,6 @@ fn run_catalog_gate(
 /// spawning a second Codex process on every launch.
 #[cfg(windows)]
 pub(crate) fn validate_final_catalog(
-    executable: &Path,
     catalog: &[u8],
     cancelled: &AtomicBool,
     deadline: std::time::Instant,
@@ -1853,13 +1855,18 @@ pub(crate) fn validate_final_catalog(
         toml_string(&TemporaryArea::text(&path)?)
     );
     write_owned_file(&area.home.join("config.toml"), config.as_bytes())?;
-    let parsed = win_process::capture(
-        executable,
-        &["debug", "models"],
-        &area,
-        None,
-        cancelled,
-        deadline,
+    let parsed = run_after_runtime_verification(
+        || verified_catalog_runtime(&area, cancelled, deadline),
+        |executable| {
+            win_process::capture(
+                executable,
+                &["debug", "models"],
+                &area,
+                None,
+                cancelled,
+                deadline,
+            )
+        },
     )?;
     if !parsed.status.success() || !catalog_output_matches(&parsed.stdout, &value) {
         return Err(NativeProbeError::CatalogUnsupported);
@@ -1867,9 +1874,98 @@ pub(crate) fn validate_final_catalog(
     area.cleanup()?;
     Ok(())
 }
+
+#[cfg(windows)]
+fn verified_catalog_runtime(
+    area: &TemporaryArea,
+    cancelled: &AtomicBool,
+    deadline: std::time::Instant,
+) -> Result<PathBuf, NativeProbeError> {
+    let (source, expected_sha256) =
+        crate::app::model_catalog::verified_codex_runtime_for_catalog(cancelled, deadline)
+            .map_err(|code| match code {
+                "native-executable-changed" => NativeProbeError::ExecutableChanged,
+                "native-probe-cancelled" => NativeProbeError::Cancelled,
+                "native-probe-timeout" => NativeProbeError::DeadlineExceeded,
+                _ => NativeProbeError::ExecutableUnavailable,
+            })?;
+    let copy = area.root.join("codex-verified.exe");
+    copy_verified_executable(&source, &expected_sha256, &copy, cancelled, deadline)?;
+    Ok(copy)
+}
+
+fn copy_verified_executable(
+    source: &Path,
+    expected_sha256: &str,
+    destination: &Path,
+    cancelled: &AtomicBool,
+    deadline: std::time::Instant,
+) -> Result<(), NativeProbeError> {
+    let result = (|| {
+        let metadata = std::fs::symlink_metadata(source)
+            .map_err(|_| NativeProbeError::ExecutableUnavailable)?;
+        if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_EXECUTABLE_BYTES {
+            return Err(NativeProbeError::ExecutableUnavailable);
+        }
+        let mut input =
+            std::fs::File::open(source).map_err(|_| NativeProbeError::ExecutableUnavailable)?;
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(destination)
+            .map_err(|_| NativeProbeError::TemporaryStorage)?;
+        let mut buffer = vec![0u8; 1024 * 1024];
+        let mut hasher = Sha256::new();
+        let mut copied = 0u64;
+        loop {
+            check_limits(cancelled, deadline)?;
+            let count = input
+                .read(&mut buffer)
+                .map_err(|_| NativeProbeError::ExecutableUnavailable)?;
+            if count == 0 {
+                break;
+            }
+            copied = copied
+                .checked_add(count as u64)
+                .filter(|size| *size <= MAX_EXECUTABLE_BYTES)
+                .ok_or(NativeProbeError::OutputLimit)?;
+            hasher.update(&buffer[..count]);
+            output
+                .write_all(&buffer[..count])
+                .map_err(|_| NativeProbeError::TemporaryStorage)?;
+        }
+        output
+            .flush()
+            .and_then(|_| output.sync_all())
+            .map_err(|_| NativeProbeError::TemporaryStorage)?;
+        if copied != metadata.len() {
+            return Err(NativeProbeError::ExecutableChanged);
+        }
+        let copied_sha256: String = hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        if copied_sha256 != expected_sha256 {
+            return Err(NativeProbeError::ExecutableChanged);
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(destination);
+    }
+    result
+}
+
+fn run_after_runtime_verification<T>(
+    verify: impl FnOnce() -> Result<PathBuf, NativeProbeError>,
+    run: impl FnOnce(&Path) -> Result<T, NativeProbeError>,
+) -> Result<T, NativeProbeError> {
+    let executable = verify()?;
+    run(&executable)
+}
 #[cfg(not(windows))]
 pub(crate) fn validate_final_catalog(
-    _: &Path,
     _: &[u8],
     _: &AtomicBool,
     _: std::time::Instant,
@@ -2794,6 +2890,78 @@ fn probe_windows(input: NativeProbeInput) -> Result<NativeProbeResult, NativePro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unverified_runtime_is_never_passed_to_codex_process_runner() {
+        let launched = std::sync::atomic::AtomicBool::new(false);
+        let result = run_after_runtime_verification::<()>(
+            || Err(NativeProbeError::ExecutableChanged),
+            |_| {
+                launched.store(true, Ordering::Release);
+                Ok(())
+            },
+        );
+        assert_eq!(result, Err(NativeProbeError::ExecutableChanged));
+        assert!(!launched.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn verified_runtime_path_is_the_only_path_passed_to_codex_process_runner() {
+        let expected = PathBuf::from("verified-codex.exe");
+        let observed = std::sync::Mutex::new(None);
+        let result = run_after_runtime_verification(
+            || Ok(expected.clone()),
+            |path| {
+                *observed.lock().unwrap() = Some(path.to_path_buf());
+                Ok(())
+            },
+        );
+        assert!(result.is_ok());
+        assert_eq!(*observed.lock().unwrap(), Some(expected));
+    }
+
+    #[test]
+    fn executable_copy_must_match_signed_runtime_hash_before_runner_is_called() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-verified-copy-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let source = root.join("source.exe");
+        let destination = root.join("private-copy.exe");
+        let trusted = b"trusted signed package bytes";
+        let mut hash = Sha256::new();
+        hash.update(trusted);
+        let expected: String = hash
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        std::fs::write(&source, b"changed after source verification").unwrap();
+        let launched = std::sync::atomic::AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+        let result = run_after_runtime_verification(
+            || {
+                copy_verified_executable(
+                    &source,
+                    &expected,
+                    &destination,
+                    &cancelled,
+                    std::time::Instant::now() + std::time::Duration::from_secs(5),
+                )?;
+                Ok(destination.clone())
+            },
+            |_| {
+                launched.store(true, Ordering::Release);
+                Ok(())
+            },
+        );
+        assert_eq!(result, Err(NativeProbeError::ExecutableChanged));
+        assert!(!launched.load(Ordering::Acquire));
+        assert!(!destination.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn generated_neutral_catalog_entry_uses_codex_required_fields() {

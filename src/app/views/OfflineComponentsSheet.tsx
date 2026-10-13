@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 
 import { errorMessage, managerApi } from "../../services/managerApi";
 import type {
@@ -6,6 +6,7 @@ import type {
   CapabilityPackReport,
   CcswitchLaunchReport,
 } from "../../shared/types";
+import { selectMediaModels } from "../mediaModelSelection";
 import { Icon } from "../icons";
 import { useI18n } from "../i18n";
 import { Sheet } from "../Sheet";
@@ -28,15 +29,15 @@ const EMPTY_FORM: FormValues = {
   dashscopeApiKey: "",
   dashscopeBaseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
   dashscopeModel: "",
-  mediaGenerationApiBaseUrl: "",
-  mediaGenerationApiProfile: "auto",
-  mediaGenerationApiKey: "",
   mediaGenerationAgentId: "",
   image2Model: "",
   grokImageModel: "",
   grokVideoModel: "",
   seedanceModel: "",
   minimaxVideoModel: "",
+  mediaGatewayCatalogStatus: "not-checked",
+  mediaGatewayModelCount: 0,
+  mediaGatewayCatalogVerifiedAt: null,
 };
 
 const API_SERVICE_KEYS: ApiServiceId[] = ["dashscope-web-search"];
@@ -59,16 +60,6 @@ function configNeedsAttention(report: CapabilityPackReport): boolean {
   );
 }
 
-function mediaUsesLegacyProfile(profile: string, baseUrl: string): boolean {
-  if (profile === "legacy") return true;
-  if (profile === "wokey") return false;
-  try {
-    return new URL(baseUrl.trim()).hostname.toLowerCase() !== "api.wokey.ai";
-  } catch {
-    return true;
-  }
-}
-
 export function OfflineComponentsSheet({
   open,
   onDismiss,
@@ -84,7 +75,7 @@ export function OfflineComponentsSheet({
   const [form, setForm] = useState<FormValues>(EMPTY_FORM);
   const [enabled, setEnabled] = useState<Record<ServiceId, boolean>>({
     feishu: false,
-    "media-generation": false,
+    "media-generation": true,
     "dashscope-web-search": false,
     cloudflare: false,
     figma: false,
@@ -93,10 +84,13 @@ export function OfflineComponentsSheet({
   });
   const [busy, setBusy] = useState<"pack" | "ccswitch" | null>(null);
   const [statusLoading, setStatusLoading] = useState(false);
+  const [mediaCatalogLoading, setMediaCatalogLoading] = useState(false);
+  const [mediaCatalogError, setMediaCatalogError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [packReport, setPackReport] = useState<CapabilityPackReport | null>(null);
   const [ccswitchReport, setCcswitchReport] = useState<CcswitchLaunchReport | null>(null);
   const statusRequestRef = useRef(0);
+  const mediaCatalogRequestRef = useRef(0);
   const mediaAdvancedRef = useRef<HTMLDetailsElement>(null);
 
   useEffect(() => {
@@ -125,6 +119,57 @@ export function OfflineComponentsSheet({
     };
   }, [open]);
 
+  const refreshMediaModels = useCallback(async () => {
+    const requestId = mediaCatalogRequestRef.current + 1;
+    mediaCatalogRequestRef.current = requestId;
+    setMediaCatalogLoading(true);
+    setMediaCatalogError(null);
+    try {
+      const catalog = await managerApi.mediaModelCatalog();
+      if (mediaCatalogRequestRef.current !== requestId) return;
+      const selected = selectMediaModels(catalog.models);
+      setForm((current) => ({
+        ...current,
+        ...selected,
+        mediaGatewayCatalogStatus: "verified",
+        mediaGatewayModelCount: catalog.models.length,
+        mediaGatewayCatalogVerifiedAt: new Date().toISOString(),
+        mediaGenerationAgentId: selected.seedanceModel ? current.mediaGenerationAgentId : "",
+      }));
+    } catch (cause) {
+      if (mediaCatalogRequestRef.current !== requestId) return;
+      setForm((current) => ({
+        ...current,
+        image2Model: "",
+        grokImageModel: "",
+        grokVideoModel: "",
+        seedanceModel: "",
+        minimaxVideoModel: "",
+        mediaGenerationAgentId: "",
+        mediaGatewayCatalogStatus: "failed",
+        mediaGatewayModelCount: 0,
+        mediaGatewayCatalogVerifiedAt: null,
+      }));
+      setMediaCatalogError(errorMessage(cause));
+    } finally {
+      if (mediaCatalogRequestRef.current === requestId) setMediaCatalogLoading(false);
+    }
+  }, []);
+
+  const mediaGenerationEnabled = enabled["media-generation"];
+
+  useEffect(() => {
+    if (!open || view !== "connections" || !mediaGenerationEnabled) {
+      mediaCatalogRequestRef.current += 1;
+      setMediaCatalogLoading(false);
+      return;
+    }
+    void refreshMediaModels();
+    return () => {
+      mediaCatalogRequestRef.current += 1;
+    };
+  }, [open, view, mediaGenerationEnabled, refreshMediaModels]);
+
   const update = <K extends keyof FormValues>(key: K, value: FormValues[K]) => {
     setForm((current) => ({ ...current, [key]: value }));
     setError(null);
@@ -135,9 +180,7 @@ export function OfflineComponentsSheet({
     setError(null);
   };
 
-  const mediaNeedsRouteId =
-    mediaUsesLegacyProfile(form.mediaGenerationApiProfile, form.mediaGenerationApiBaseUrl) &&
-    Boolean(form.image2Model.trim() || form.seedanceModel.trim());
+  const mediaNeedsRouteId = Boolean(form.seedanceModel.trim());
 
   useEffect(() => {
     if (mediaNeedsRouteId && mediaAdvancedRef.current) {
@@ -159,9 +202,8 @@ export function OfflineComponentsSheet({
       return t("offline.components.validationDashscope");
     }
     if (enabled["media-generation"]) {
-      const mediaModels = [form.image2Model, form.grokImageModel, form.grokVideoModel, form.seedanceModel, form.minimaxVideoModel];
-      if (!form.mediaGenerationApiBaseUrl.trim() || !form.mediaGenerationApiKey.trim() || mediaModels.every((model) => !model.trim())) {
-        return t("offline.components.validationMedia");
+      if (mediaCatalogError) {
+        return t("offline.components.mediaModelsRetryBeforeSave");
       }
       if (mediaNeedsRouteId && !form.mediaGenerationAgentId.trim()) {
         return t("offline.components.validationMediaRoute");
@@ -171,7 +213,7 @@ export function OfflineComponentsSheet({
   };
 
   const installPack = async () => {
-    if (busy !== null || statusLoading) return;
+    if (busy !== null || statusLoading || mediaCatalogLoading) return;
     const validation = validate();
     if (validation) {
       setError(validation);
@@ -220,6 +262,7 @@ export function OfflineComponentsSheet({
     label: string,
     secret = false,
     placeholder?: string,
+    readOnly = false,
   ) => (
     <label className="component-field" key={String(key)}>
       <span>{label}</span>
@@ -229,6 +272,7 @@ export function OfflineComponentsSheet({
         autoComplete={secret ? "new-password" : "off"}
         value={String(form[key])}
         placeholder={placeholder}
+        readOnly={readOnly}
         onChange={(event) => update(key, event.target.value)}
         disabled={busy !== null}
       />
@@ -338,46 +382,32 @@ export function OfflineComponentsSheet({
                   {t("offline.components.mediaGenerationIntro")}
                 </p>
                 <div className="component-fields">
-                  {field("mediaGenerationApiBaseUrl", t("offline.components.mediaBaseUrl"))}
-                  {field("mediaGenerationApiKey", t("offline.components.mediaApiKey"), true)}
-
                   <div className="component-field-group">
                     <strong>{t("offline.components.mediaModelsTitle")}</strong>
                     <small>{t("offline.components.mediaModelsHint")}</small>
-                    {field("image2Model", t("offline.components.image2Model"), false, t("offline.components.modelIdPlaceholder"))}
-                    {field("grokImageModel", t("offline.components.grokImageModel"), false, t("offline.components.modelIdPlaceholder"))}
-                    {field("grokVideoModel", t("offline.components.grokVideoModel"), false, t("offline.components.modelIdPlaceholder"))}
-                    {field("seedanceModel", t("offline.components.seedanceModel"), false, t("offline.components.modelIdPlaceholder"))}
+                    <button className="btn ghost" type="button" onClick={() => void refreshMediaModels()} disabled={busy !== null || mediaCatalogLoading}>
+                      {mediaCatalogLoading ? t("offline.components.mediaModelsLoading") : t("offline.components.refreshMediaModels")}
+                    </button>
+                    {mediaCatalogError ? <small role="status">{t("offline.components.mediaModelsError", { error: mediaCatalogError })}</small> : null}
+                    {field("image2Model", t("offline.components.image2Model"), false, t("offline.components.modelNotFound"), true)}
+                    {field("grokImageModel", t("offline.components.grokImageModel"), false, t("offline.components.modelNotFound"), true)}
+                    {field("grokVideoModel", t("offline.components.grokVideoModel"), false, t("offline.components.modelNotFound"), true)}
+                    {field("seedanceModel", t("offline.components.seedanceModel"), false, t("offline.components.modelNotFound"), true)}
                     <div className="component-provider-status" role="status">
                       <strong>{t("offline.components.minimaxUnavailableTitle")}</strong>
                       <span>{t("offline.components.minimaxUnavailableBody")}</span>
                     </div>
                   </div>
 
-                  <details className="component-advanced" ref={mediaAdvancedRef}>
-                    <summary>{t("offline.components.mediaAdvanced")}</summary>
-                    <div className="component-advanced-fields">
-                      <label className="component-field">
-                        <span>{t("offline.components.apiProfile")}</span>
-                        <select
-                          className="input"
-                          value={form.mediaGenerationApiProfile}
-                          onChange={(event) => update("mediaGenerationApiProfile", event.target.value)}
-                          disabled={busy !== null}
-                        >
-                          <option value="auto">{t("offline.components.profileAuto")}</option>
-                          <option value="legacy">{t("offline.components.profileLegacy")}</option>
-                          <option value="wokey">{t("offline.components.profileWokey")}</option>
-                        </select>
-                      </label>
-                      {mediaNeedsRouteId ? (
-                        <>
-                          {field("mediaGenerationAgentId", t("offline.components.routeId"))}
-                          <small>{t("offline.components.mediaRouteHint")}</small>
-                        </>
-                      ) : null}
-                    </div>
-                  </details>
+                  {mediaNeedsRouteId ? (
+                    <details className="component-advanced" ref={mediaAdvancedRef} open>
+                      <summary>{t("offline.components.mediaAdvanced")}</summary>
+                      <div className="component-advanced-fields">
+                        {field("mediaGenerationAgentId", t("offline.components.routeId"))}
+                        <small>{t("offline.components.mediaRouteHint")}</small>
+                      </div>
+                    </details>
+                  ) : null}
                 </div>
               </>
             ) : null}
@@ -476,6 +506,17 @@ export function OfflineComponentsSheet({
                 : t("offline.components.notReady")}
             </strong>
             <span>{packReport.message}</span>
+            {packReport.codexRestartRequired ? (
+              <small role="status">
+                {t("offline.components.mediaReadiness", {
+                  protocol: t(packReport.mediaProtocolStatus === "passed" ? "offline.components.statusPassed" : "offline.components.statusNotChecked"),
+                  catalog: t(packReport.mediaGatewayCatalogStatus === "verified" ? "offline.components.statusPassed" : packReport.mediaGatewayCatalogStatus === "failed" ? "offline.components.statusFailed" : "offline.components.statusNotChecked"),
+                  restart: packReport.codexRunning
+                    ? t("offline.components.restartRunning")
+                    : t("offline.components.restartRequired"),
+                })}
+              </small>
+            ) : null}
             {packReport.skills > 0 ? (
               <small>
                 {t("offline.components.counts", {
@@ -505,7 +546,7 @@ export function OfflineComponentsSheet({
           <button
             className="btn primary"
             onClick={() => void installPack()}
-            disabled={busy !== null || statusLoading}
+            disabled={busy !== null || statusLoading || (view === "connections" && enabled["media-generation"] && mediaCatalogLoading)}
           >
             {busy === "pack" ? <Icon name="loader" className="spinicon" /> : <Icon name="download" />}
             {busy === "pack"

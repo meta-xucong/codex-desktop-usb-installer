@@ -141,9 +141,18 @@ try {
         $candidate = Join-Path $outputDir ($relativePath.Replace('/', '\'))
         Assert-Condition (Test-Path -LiteralPath $candidate -PathType Leaf) "U 盘目录缺少 $relativePath"
     }
+    $usbReadme = Get-Content -LiteralPath (Join-Path $repoRoot "docs\USB-INSTALL-USER-GUIDE.txt") -Raw -Encoding UTF8
+    Assert-Condition (
+        $usbReadme.Contains("CodexEntryShim.exe") -and
+        -not $usbReadme.Contains("可能绕过管理器的联网授权检查")
+    ) "U 盘说明必须描述 CodexEntryShim 授权门禁，不能保留直接入口可绕过的旧说明"
     $capabilityRoot = Join-Path $outputDir "content\codex-starter-kit"
     $capabilityPack = Get-Content -LiteralPath (Join-Path $capabilityRoot "pack.json") -Raw | ConvertFrom-Json
-    Assert-Condition ($capabilityPack.version -eq "1.5.0") "U 盘能力包版本不是 1.5.0"
+    $sourceCapabilityPack = Get-Content -LiteralPath (Join-Path $repoRoot "installer-pack\pack.json") -Raw | ConvertFrom-Json
+    Assert-Condition (
+        -not [string]::IsNullOrWhiteSpace([string]$sourceCapabilityPack.version) -and
+        $capabilityPack.version -eq $sourceCapabilityPack.version
+    ) "U 盘能力包版本与仓库源清单不一致：bundle=$($capabilityPack.version)，source=$($sourceCapabilityPack.version)"
     foreach ($retiredPath in @(
         "skills\image-2\scripts\image_2_gen.py",
         "skills\seedance2-0-video-gen\scripts\seedance_video_gen.py",

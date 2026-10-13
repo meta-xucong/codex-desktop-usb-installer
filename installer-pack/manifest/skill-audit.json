@@ -751,6 +751,49 @@
       "notes": "筛选器只暴露 AkShare 排行接口实际读取的基金类型及 1/3 年收益字段，接口失败非零退出。配置构建器要求带来源的用户审阅模型，只换算金额并保留 fund_type_notes 原标签；定投只比较显式收益场景。风险评估器删除硬编码波动率、风险评级、适配人群和调仓/止损建议，要求完整来源、时点与场景参数。"
     },
     {
+      "id": "grok-video-prompt-compiler",
+      "status": "requires-runtime",
+      "defaultEnabled": true,
+      "dependencies": [
+        {
+          "id": "runtime.python",
+          "kind": "runtime",
+          "required": true,
+          "autoInstallable": true,
+          "minVersion": "3.12",
+          "lockedVersion": "3.12.10",
+          "abi": "cp312",
+          "platform": "win_amd64",
+          "healthCheck": "bundled CPython 3.12; scripts/compile_prompt.py --help",
+          "failureMessage": "需要随 U 盘安装的 Python 3.12 运行时。",
+          "pythonPackages": [
+            {
+              "name": "requests",
+              "version": "2.34.2",
+              "importName": "requests"
+            }
+          ]
+        }
+      ],
+      "capabilities": [
+        "Grok 视频提示词编译",
+        "视频能力风险审计",
+        "生成结果验收清单"
+      ],
+      "installByDefault": true,
+      "afterRemediationStatus": "auto-installable-runtime",
+      "enableWhen": [
+        "skill-installed",
+        "runtime-healthy"
+      ],
+      "verification": {
+        "skillFile": "skills/grok-video-prompt-compiler/SKILL.md",
+        "windowsEntry": "scripts/compile_prompt.py --help",
+        "smoke": "frontmatter, package closure, compiler help, and prompt safety/contract tests"
+      },
+      "notes": "随包预装的离线提示词编译工作流；参考图上传依赖随包 Python 运行时中的 requests 2.34.2（已列入依赖并锁定到离线 wheelhouse）；媒体 MCP 和 API 凭据只在实际生成时需要，付费任务仍须逐次获得用户明确确认。"
+    },
+    {
       "id": "growth-analyst",
       "status": "ready",
       "defaultEnabled": true,
@@ -860,7 +903,7 @@
     {
       "id": "image-2",
       "status": "requires-credential",
-      "defaultEnabled": false,
+      "defaultEnabled": true,
       "dependencies": [
         {
           "id": "runtime.python312",
@@ -880,17 +923,17 @@
           "required": true,
           "autoInstallable": true,
           "transport": "stdio",
-          "healthCheck": "media_generation tools/list includes media_prepare, media_submit, media_check and media_save",
+          "healthCheck": "media_generation strict UTF-8 tools/list includes media_refresh_models, media_capabilities, media_prepare, media_submit, media_check and media_save",
           "failureMessage": "统一媒体 MCP 未安装、未启用或不可用时，不提交外部计费请求。"
         },
         {
-          "id": "credential.media-generation-api-key",
+          "id": "credential.usb-license-404token",
           "kind": "credential",
           "required": true,
-          "autoInstallable": false,
+          "autoInstallable": true,
           "secret": true,
-          "healthCheck": "MEDIA_GENERATION_API_KEY and MEDIA_GENERATION_API_BASE_URL are configured",
-          "failureMessage": "缺少媒体 API 配置时不访问网络。"
+          "healthCheck": "USB launcher supplies the signed device key in the Codex launch environment for the media MCP env_vars pass-through",
+          "failureMessage": "没有有效签名 U 盘授权时不向媒体上游发送请求。"
         }
       ],
       "capabilities": [
@@ -898,20 +941,20 @@
         "图生图",
         "统一 MCP 两阶段确认"
       ],
-      "installByDefault": false,
-      "afterRemediationStatus": "guided-config",
+      "installByDefault": true,
+      "afterRemediationStatus": "auto-installable-runtime",
       "enableWhen": [
         "skill-installed",
         "runtime.python312",
         "mcp.media-generation",
-        "credential.media-generation-api-key"
+        "signed-usb-license.device-api-key"
       ],
       "verification": {
         "skillFile": "skills/image-2/SKILL.md",
-        "windowsEntry": "media_generation MCP tools/list; offline media_prepare; missing credentials fail before API network I/O",
+        "windowsEntry": "media_generation MCP tools/list; signed device key from USB launch environment or current-user DPAPI fallback; read-only model refresh; offline media_prepare",
         "smoke": "frontmatter, pack-copy, and dependency health-check path"
       },
-      "notes": "通过统一 media_generation MCP 调用 Image-2 路由；确认清单、本地文件 SHA-256、单次幂等提交和异步任务查询都在 MCP 中处理。图生图参考图仅接受本地图片。"
+      "notes": "通过统一 media_generation MCP 调用已验证的 gpt-image-2.5 Responses 路由；USB 启动器从签名 License 读取该设备的 404token Key，并放入 Codex 启动环境供 MCP env_vars 传入，不写入用户环境或 Codex 配置。确认清单、单次提交、PNG 校验和自动保存均由 MCP 处理。"
     },
     {
       "id": "image-prompt-generator",
@@ -1206,15 +1249,15 @@
           "required": true,
           "autoInstallable": false,
           "healthCheck": "media_generation exposes media_prepare/media_submit and the unified upstream reports minimax-video configured",
-          "failureMessage": "需要统一媒体 MCP、共享媒体 API Key，以及由上游实际开放后填写的 MiniMax 视频模型名。"
+          "failureMessage": "需要统一媒体 MCP、签名 U 盘授权中的设备 Key，以及由上游实际开放后填写的 MiniMax 视频模型名。"
         },
         {
-          "id": "credential.media-generation-api-key",
+          "id": "credential.usb-license-404token",
           "kind": "credential",
           "required": true,
-          "autoInstallable": false,
-          "healthCheck": "MEDIA_GENERATION_API_KEY is available to the configured MCP process",
-          "failureMessage": "请在统一媒体 MCP 中配置共享 API Key；不使用 MiniMax 官方 API Key。"
+          "autoInstallable": true,
+          "healthCheck": "Signed USB device key is available in the Codex launch environment for the media MCP env_vars pass-through",
+          "failureMessage": "媒体 MCP 会从签名 U 盘授权读取共享 Key；不使用 MiniMax 官方 API Key。"
         },
         {
           "id": "config.MEDIA_MINIMAX_VIDEO_MODEL",
@@ -1234,7 +1277,7 @@
       "enableWhen": [
         "skill-installed",
         "mcp.media-generation.ready",
-        "MEDIA_GENERATION_API_KEY",
+        "signed-usb-license.device-api-key",
         "MEDIA_MINIMAX_VIDEO_MODEL",
         "user-approved-paid-task"
       ],
@@ -1243,7 +1286,7 @@
         "windowsEntry": "Codex workflow / frontmatter",
         "smoke": "MCP reports the MiniMax slot unavailable when the model is blank and prepares a single-use request only when configured"
       },
-      "notes": "保留 MiniMax 专用创作流程 Skill，但所有请求只经统一媒体 MCP，并共用媒体 API Key/Base URL。当前模型槽位留空；只有统一上游实际开放 MiniMax 视频模型后才可启用。无官方 MiniMax API 直连，也不回退到其他视频模型。"
+      "notes": "保留 MiniMax 专用创作流程 Skill，但所有请求只经统一媒体 MCP，并共用签名 U 盘授权中的设备 Key。当前模型槽位留空；只有统一上游实际开放 MiniMax 视频模型后才可启用。无官方 MiniMax API 直连，也不回退到其他视频模型。"
     },
     {
       "id": "multi-search-engine",
@@ -1565,17 +1608,17 @@
           "required": true,
           "autoInstallable": true,
           "transport": "stdio",
-          "healthCheck": "media_generation tools/list includes media_prepare, media_submit, media_check and media_save",
+          "healthCheck": "media_generation strict UTF-8 tools/list includes media_refresh_models, media_capabilities, media_prepare, media_submit, media_check and media_save",
           "failureMessage": "统一媒体 MCP 未安装、未启用或不可用时，不提交外部计费请求。"
         },
         {
-          "id": "credential.media-generation-api-key",
+          "id": "credential.usb-license-404token",
           "kind": "credential",
           "required": true,
-          "autoInstallable": false,
+          "autoInstallable": true,
           "secret": true,
-          "healthCheck": "MEDIA_GENERATION_API_KEY and MEDIA_GENERATION_API_BASE_URL are configured",
-          "failureMessage": "缺少媒体 API 配置时不访问网络。"
+          "healthCheck": "USB launcher supplies the signed device key in the Codex launch environment for the media MCP env_vars pass-through",
+          "failureMessage": "没有有效签名 U 盘授权时不向媒体上游发送请求。"
         }
       ],
       "capabilities": [
@@ -1589,14 +1632,14 @@
         "skill-installed",
         "runtime.python312",
         "mcp.media-generation",
-        "credential.media-generation-api-key"
+        "signed-usb-license.device-api-key"
       ],
       "verification": {
         "skillFile": "skills/seedance2-0-video-gen/SKILL.md",
-        "windowsEntry": "media_generation MCP tools/list; offline media_prepare; missing credentials fail before API network I/O",
+        "windowsEntry": "media_generation MCP tools/list; signed device key from USB launch environment or current-user DPAPI fallback; missing credentials fail before generation requests",
         "smoke": "frontmatter, pack-copy, and dependency health-check path"
       },
-      "notes": "通过统一 media_generation MCP 调用 Seedance 路由；当前参考媒体需为服务方可访问的 HTTPS URL，按输入顺序保留。不猜测价格、预扣积分、退款规则或链接期限。"
+      "notes": "通过统一 media_generation MCP 调用 Seedance 路由；共享设备 Key 来自签名 U 盘授权，Seedance 模型和路由 ID 仍按服务方实际配置。当前参考媒体需为服务方可访问的 HTTPS URL，按输入顺序保留。不猜测价格、预扣积分、退款规则或链接期限。"
     },
     {
       "id": "self-improvement-agent",

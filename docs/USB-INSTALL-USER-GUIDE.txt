@@ -7,8 +7,9 @@ Codex U 盘版 v0.5.24 — 使用说明
 请双击 U 盘根目录的：CodexDesktopSetup.exe
 
 看到 Windows 用户账户控制（UAC）时点击“是”。
-日常请从 CodexDesktopSetup.exe 启动。直接运行 apps\Codex 中 MSIX manifest 声明的官方程序入口，
-可能绕过管理器的联网授权检查和 U 盘看门狗；产品接受这一限制，不会声称直接入口也受门禁保护。
+日常建议从 CodexDesktopSetup.exe 启动。apps\Codex 中 MSIX manifest 声明的程序入口
+也会先经过 U 盘内的 CodexEntryShim.exe，再交给管理器检查签名、授权和远程作废状态；
+校验失败或缺少 shim 时会拒绝启动。请勿单独复制或移动 Codex 程序文件。
 
 
 二、这一版把什么放在哪里
@@ -165,8 +166,10 @@ usb-license.json 是管理器为当前物理 U 盘生成的可变身份文件，
   Windows 用户目录后再装；安装器不会在这种状态下继续。
 
 “安装成功但找不到开始菜单 Codex”
-  这是当前设计，不会自动创建 Codex 快捷方式。请从 CodexDesktopSetup.exe 启动，
-  让管理器在启动 Codex 前重新检查授权。直接运行 apps\Codex 中的官方入口可能绕过此检查。
+  这是当前设计，不会自动创建 Codex 快捷方式。请从 CodexDesktopSetup.exe 启动。
+  如果直接从 apps\Codex 启动，CodexEntryShim.exe 仍会将请求交给管理器进行授权检查；
+  若启动失败，请确认发行包中的 CodexEntryShim.exe、CodexAppManager.exe 和清单文件齐全，
+  再从 CodexDesktopSetup.exe 重试。
 
 “点启动后短暂等待”
   管理器正在确认 Codex 是否出现稳定、可操作的窗口；只有进程但没有窗口不会被误报

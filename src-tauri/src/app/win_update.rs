@@ -743,6 +743,136 @@ fn is_current_usb_portable(installed: &InstalledWindowsCodex) -> bool {
     })
 }
 
+fn validate_usb_launch_target(
+    installed: &InstalledWindowsCodex,
+    authorized_codex_root: &Path,
+) -> Result<(), AppError> {
+    if installed.source == "portable"
+        && codex_win_engine::same_windows_path(Path::new(&installed.path), authorized_codex_root)
+    {
+        return Ok(());
+    }
+    Err(AppError::Engine(
+        "当前 U 盘中的 Codex 程序不存在或未通过路径校验，请先修复 U 盘程序再启动。".to_string(),
+    ))
+}
+
+/// Resolve USB launch authority and bind the selected Codex tree to the
+/// signed bundle. Detection may fall back to another manager-registered
+/// portable install when the USB payload is missing; that fallback is useful
+/// for ordinary status/planning but must never enter a USB launch transaction.
+pub(crate) fn authorize_usb_codex_launch(
+    installed: &InstalledWindowsCodex,
+    phase: &str,
+) -> Result<Option<usb_guard::SignedUsbAuthorization>, AppError> {
+    if !usb_guard::guard_required() {
+        return Ok(None);
+    }
+    let authorization = usb_guard::require_signed_codex_bundle(phase)?
+        .ok_or_else(|| AppError::Engine("U 盘 Codex 启动缺少有效的签名授权".to_string()))?;
+    if let Err(error) = validate_usb_launch_target(installed, &authorization.codex_root) {
+        log::error!(
+            "USB Codex launch target rejected phase={phase} source={} selected={} authorized_root={}",
+            installed.source,
+            installed.path,
+            authorization.codex_root.display()
+        );
+        return Err(error);
+    }
+    Ok(Some(authorization))
+}
+
+fn restart_codex_for_catalog_reload<F, C>(
+    root: &Path,
+    reload_pending: bool,
+    is_running: F,
+    close: C,
+) -> Result<(), AppError>
+where
+    F: FnMut(&Path) -> Result<bool, String>,
+    C: FnOnce(&Path) -> Result<(), String>,
+{
+    if !reload_pending {
+        return Ok(());
+    }
+    let mut is_running = is_running;
+    match is_running(root) {
+        Ok(false) => Ok(()),
+        Ok(true) => {
+            close(root).map_err(|error| {
+                AppError::Engine(format!("关闭正在运行的 Codex 以加载新模型失败：{error}"))
+            })?;
+            match is_running(root) {
+                Ok(false) => Ok(()),
+                Ok(true) => Err(AppError::Engine(
+                    "关闭 Codex 后仍检测到旧进程，未启动以避免继续使用旧模型目录".into(),
+                )),
+                Err(error) => Err(AppError::Engine(format!(
+                    "关闭 Codex 后无法确认旧进程是否退出，未启动以避免继续使用旧模型目录：{error}"
+                ))),
+            }
+        }
+        Err(error) => Err(AppError::Engine(format!(
+            "无法确认 Codex 是否仍在运行，未尝试加载新模型；请手动关闭 Codex 后重试：{error}"
+        ))),
+    }
+}
+
+fn prepare_model_catalog_launch(
+    installed: &InstalledWindowsCodex,
+    usb_mode: bool,
+) -> Result<Option<Vec<u8>>, AppError> {
+    if !usb_mode {
+        return Ok(None);
+    }
+    crate::app::model_catalog::preflight_usb_catalog()?;
+    let reload_marker = crate::app::model_catalog::restart_marker_snapshot_checked()?;
+    let root = Path::new(&installed.path);
+    if reload_marker.is_some() {
+        log::info!(
+            "model catalog reload pending before Codex launch; checking managed root={}",
+            root.display()
+        );
+    }
+    restart_codex_for_catalog_reload(
+        root,
+        reload_marker.is_some(),
+        |root| {
+            codex_win_engine::processes_running_for_executable_under_root_strict(
+                root,
+                std::ffi::OsStr::new("Codex.exe"),
+            )
+            .map_err(|error| error.to_string())
+        },
+        |root| close_codex_gracefully_for_root(30, root).map_err(|error| error.to_string()),
+    )?;
+    Ok(reload_marker)
+}
+
+/// Prepare the same catalog reload boundary for the persisted-theme launch
+/// path, which otherwise bypasses `launch_codex` and may hot-apply onto an old
+/// single-instance Codex process.
+pub(crate) fn prepare_usb_model_catalog_for_theme_launch(
+    settings: &AppSettings,
+) -> Result<Option<Vec<u8>>, AppError> {
+    if !usb_guard::guard_required() {
+        return Ok(None);
+    }
+    let store = ProvenanceStore::load();
+    let installed = detect_managed_codex(settings, &store)
+        .ok_or_else(|| AppError::Engine("没有可打开的 Codex".to_string()))?;
+    let authorization = authorize_usb_codex_launch(&installed, "win-launch-theme-target")?;
+    prepare_model_catalog_launch(&installed, authorization.is_some())
+}
+
+pub(crate) fn complete_usb_model_catalog_launch(reload_marker: Option<&[u8]>) {
+    if let Some(marker) = reload_marker {
+        if let Err(error) = crate::app::model_catalog::clear_restart_marker_if_matches(marker) {
+            log::warn!("could not clear applied model catalog reload marker: {error}");
+        }
+    }
+}
+
 pub fn plan_windows_update(
     endpoints: &MirrorEndpoints,
     settings: &AppSettings,
@@ -3016,7 +3146,18 @@ pub fn launch_codex(settings: &AppSettings, codex_locale: Option<&str>) -> Resul
     let store = ProvenanceStore::load();
     let installed = detect_managed_codex(settings, &store)
         .ok_or_else(|| AppError::Engine("没有可打开的 Codex".to_string()))?;
-    let usb_mode = usb_guard::guard_required();
+    // Bind the selected tree to the signed USB root before applying any
+    // startup compatibility changes. The detection fallback may otherwise
+    // select a previously registered portable install on the local disk.
+    let usb_authorization = authorize_usb_codex_launch(&installed, "win-launch-target")?;
+    let usb_mode = usb_authorization.is_some();
+    let catalog_reload_marker = if usb_mode {
+        // Validate/recover the manager-owned model catalog before either launch
+        // path can close an existing window or run a Codex compatibility patch.
+        prepare_model_catalog_launch(&installed, true)?
+    } else {
+        None
+    };
     if usb_mode {
         if let Err(error) = crate::app::codex_agents_hint::ensure_portable_usb_hint() {
             log::warn!(
@@ -3029,29 +3170,6 @@ pub fn launch_codex(settings: &AppSettings, codex_locale: Option<&str>) -> Resul
     }
     let path = &installed.path;
     log::info!("Windows launch Codex path={path}");
-    // Codex loads `model_catalog_json` when its app-server starts and keeps the
-    // resulting list in memory.  If the manager refreshed the catalog while a
-    // managed Codex process was already open, launching again would otherwise
-    // signal that old single-instance process and leave the stale model menu
-    // visible.  Consume the explicit reload marker by restarting only this
-    // manager-owned portable tree; unrelated Codex installations are never
-    // touched.
-    if crate::app::model_catalog::restart_required() {
-        match codex_win_engine::processes_running_for_root(Path::new(path)) {
-            Ok(true) => {
-                log::info!(
-                    "restarting managed Codex before applying refreshed native model catalog root={}"
-                    , path
-                );
-                close_codex_gracefully_for_root(30, Path::new(path)).map_err(engine_err)?;
-            }
-            Ok(false) => {}
-            Err(error) => log::warn!(
-                "could not inspect managed Codex before model catalog reload root={} error={error}",
-                path
-            ),
-        }
-    }
     let codex_home = if usb_mode {
         Some(usb_guard::local_data_paths()?.codex_home)
     } else {
@@ -3066,12 +3184,13 @@ pub fn launch_codex(settings: &AppSettings, codex_locale: Option<&str>) -> Resul
     } else {
         codex_win_engine::PortableLaunchPolicy::Standard
     };
-    let direct_entry_required = if usb_mode {
-        usb_guard::require_signed_codex_bundle("win-launch-direct-entry-policy")?
-            .map(|authorization| authorization.direct_entry_required)
-            .unwrap_or(false)
+    let direct_entry_required = usb_authorization
+        .as_ref()
+        .is_some_and(|authorization| authorization.direct_entry_required);
+    let media_environment = if usb_mode {
+        crate::app::media_generation::usb_launch_environment()
     } else {
-        false
+        Vec::new()
     };
     let report = codex_win_engine::launch_codex_with_options(
         &installed,
@@ -3080,6 +3199,8 @@ pub fn launch_codex(settings: &AppSettings, codex_locale: Option<&str>) -> Resul
             // place. Scope this to the launched child instead of changing the
             // user's global setting for an unrelated official installation.
             disable_codex_self_updates: settings.disable_codex_self_updates || usb_mode,
+            environment: media_environment,
+            usb_integrity_transaction: usb_mode,
             require_usb_entry_overlay: direct_entry_required,
             remote_debugging_port: None,
             codex_home,
@@ -3088,9 +3209,7 @@ pub fn launch_codex(settings: &AppSettings, codex_locale: Option<&str>) -> Resul
         },
     )
     .map_err(|e| AppError::Engine(e.to_string()))?;
-    if crate::app::model_catalog::restart_required() {
-        crate::app::model_catalog::clear_restart_required();
-    }
+    complete_usb_model_catalog_launch(catalog_reload_marker.as_deref());
     if usb_mode && report.no_sandbox {
         remember_usb_no_sandbox_compatibility(&installed.version);
     }
@@ -3886,6 +4005,128 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn model_catalog_reload_skips_process_inspection_when_no_marker_is_pending() {
+        let inspected = std::cell::Cell::new(false);
+        let closed = std::cell::Cell::new(false);
+        super::restart_codex_for_catalog_reload(
+            std::path::Path::new(r"X:\Codex"),
+            false,
+            |_| {
+                inspected.set(true);
+                Ok(true)
+            },
+            |_| {
+                closed.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(!inspected.get());
+        assert!(!closed.get());
+    }
+
+    #[test]
+    fn model_catalog_reload_closes_only_a_running_managed_root() {
+        let closed_roots = std::cell::RefCell::new(Vec::new());
+        let checks = std::cell::Cell::new(0);
+        super::restart_codex_for_catalog_reload(
+            std::path::Path::new(r"X:\Codex"),
+            true,
+            |_| {
+                let count = checks.get();
+                checks.set(count + 1);
+                Ok(count == 0)
+            },
+            |root| {
+                closed_roots
+                    .borrow_mut()
+                    .push(root.to_string_lossy().into_owned());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(&*closed_roots.borrow(), &[r"X:\Codex"]);
+
+        let closed = std::cell::Cell::new(false);
+        super::restart_codex_for_catalog_reload(
+            std::path::Path::new(r"X:\Codex"),
+            true,
+            |_| Ok(false),
+            |_| {
+                closed.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(!closed.get());
+    }
+
+    #[test]
+    fn model_catalog_reload_fails_closed_when_process_state_or_close_is_unknown() {
+        let inspect_error = super::restart_codex_for_catalog_reload(
+            std::path::Path::new(r"X:\Codex"),
+            true,
+            |_| Err("process query failed".to_string()),
+            |_| Ok(()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(inspect_error.contains("无法确认 Codex 是否仍在运行"));
+        assert!(inspect_error.contains("process query failed"));
+
+        let close_error = super::restart_codex_for_catalog_reload(
+            std::path::Path::new(r"X:\Codex"),
+            true,
+            |_| Ok(true),
+            |_| Err("graceful close timed out".to_string()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(close_error.contains("关闭正在运行的 Codex 以加载新模型失败"));
+        assert!(close_error.contains("graceful close timed out"));
+    }
+
+    #[test]
+    fn model_catalog_reload_keeps_pending_marker_when_close_does_not_complete() {
+        let marker_pending = std::cell::Cell::new(true);
+        let result = super::restart_codex_for_catalog_reload(
+            std::path::Path::new(r"X:\Codex"),
+            marker_pending.get(),
+            |_| Ok(true),
+            |_| Err("graceful close failed".to_string()),
+        );
+        if result.is_ok() {
+            super::complete_usb_model_catalog_launch(Some(b"pending"));
+            marker_pending.set(false);
+        }
+        assert!(result.is_err());
+        assert!(marker_pending.get());
+    }
+
+    #[test]
+    fn model_catalog_reload_requires_old_process_to_be_confirmed_exited() {
+        let checks = std::cell::Cell::new(0);
+        let error = super::restart_codex_for_catalog_reload(
+            std::path::Path::new(r"X:\Codex"),
+            true,
+            |_| {
+                let count = checks.get();
+                checks.set(count + 1);
+                if count == 0 {
+                    Ok(true)
+                } else {
+                    Ok(true)
+                }
+            },
+            |_| Ok(()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("仍检测到旧进程"));
+        assert_eq!(checks.get(), 2);
+    }
+
     fn policy_msix_fixture(drive: &str, full_name: &str) -> InstalledWindowsCodex {
         InstalledWindowsCodex {
             path: format!(r"{drive}\WindowsApps\{full_name}"),
@@ -4222,8 +4463,9 @@ mod tests {
         portable_fallback_needs_msix_cleanup, portable_install_result_message,
         retry_windows_ancillary_with_detector, should_retry_usb_volume_registration,
         usb_install_blocks_existing_install, validate_historical_windows_app_version,
-        WinAbortGuard, WinInstallStatus, WinPerformAction, FIXED_MSIX_INSTALL_MODE,
-        USB_APPX_INSTALL_MODE, USB_PORTABLE_INSTALL_MODE, WIN_UPDATE_ABORT,
+        validate_usb_launch_target, WinAbortGuard, WinInstallStatus, WinPerformAction,
+        FIXED_MSIX_INSTALL_MODE, USB_APPX_INSTALL_MODE, USB_PORTABLE_INSTALL_MODE,
+        WIN_UPDATE_ABORT,
     };
     use crate::app::operation_outcome::{recovery, OperationOutcome, StepOutcome};
     use crate::app::provenance::ProvenanceStore;
@@ -4634,6 +4876,52 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&old_dir);
         let _ = std::fs::remove_dir_all(&new_dir);
+    }
+
+    #[test]
+    fn usb_launch_rejects_registered_external_portable_when_usb_payload_is_missing() {
+        let external = temp_test_dir("usb-launch-external-portable");
+        let missing_usb_root = temp_test_dir("usb-launch-missing-usb-root").join("Codex");
+        write_fake_portable_install(&external, "26.1002.52244.0");
+
+        let protected_files = [
+            "Codex.exe",
+            "CodexCore.dat",
+            "codex-usb-entry-overlay.json",
+            "codex-usb-integrity-recovery.json",
+            "CodexCore.dat.codex-usb-recovery.bak",
+            "codex-usb-entry-overlay.json.codex-usb-recovery.bak",
+        ];
+        for name in protected_files {
+            std::fs::write(external.join(name), format!("protected:{name}")).unwrap();
+        }
+        let before = protected_files
+            .iter()
+            .map(|name| (*name, std::fs::read(external.join(name)).unwrap()))
+            .collect::<Vec<_>>();
+
+        let mut store = ProvenanceStore::default();
+        store.record(
+            external.to_string_lossy().into_owned(),
+            codex_win_engine::version_key("26.1002.52244.0"),
+            "adopted-external",
+        );
+        let settings = AppSettings::new(
+            "https://codexapp.agentsmirror.com".to_string(),
+            missing_usb_root.to_string_lossy().into_owned(),
+        );
+        let selected = detect_managed_codex(&settings, &store)
+            .expect("manager detection reproduces the external-portable fallback");
+        assert_eq!(selected.path, external.to_string_lossy());
+
+        let rejected = validate_usb_launch_target(&selected, &missing_usb_root);
+        assert!(rejected.is_err());
+        for (name, expected) in before {
+            assert_eq!(std::fs::read(external.join(name)).unwrap(), expected);
+        }
+
+        let _ = std::fs::remove_dir_all(&external);
+        let _ = std::fs::remove_dir_all(missing_usb_root.parent().unwrap());
     }
 
     fn release() -> WindowsRelease {

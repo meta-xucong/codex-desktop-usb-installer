@@ -32,6 +32,8 @@ vi.mock("../../services/managerApi", async (importOriginal) => {
       accountRefresh: vi.fn(),
       accountRedeem: vi.fn(),
       capabilityPackStatus: vi.fn(),
+      mediaModelCatalog: vi.fn(),
+      mediaModelSettings: vi.fn(),
       installCapabilityPack: vi.fn(),
       usbGuardStatus: vi.fn(),
       openLogsDir: vi.fn(),
@@ -138,6 +140,8 @@ describe("OfflineHome", () => {
       sourcePath: "F:\\ccswitch\\CodexSwitch.exe",
       installedPath: "C:\\Users\\test\\AppData\\Local\\Programs\\CodexSwitch\\CodexSwitch.exe",
       copiedFiles: 5,
+      accountInjected: true,
+      accountInjectionStatus: "verified",
       message: "launched",
     });
     api.cancelGatewayModelProbe.mockResolvedValue(true);
@@ -172,6 +176,14 @@ describe("OfflineHome", () => {
       diagnosticsPath: null,
       feishuEnabled: false,
       enabledApiServices: [],
+      mediaRuntimeStatus: "unknown",
+      mediaProtocolStatus: "unknown",
+      mediaGatewayCatalogStatus: "not-checked",
+      mediaGatewayModelCount: 0,
+      mediaGatewayCatalogVerifiedAt: null,
+      mediaGenerationCapability: "unknown",
+      codexRestartRequired: false,
+      codexRunning: false,
       message: "ready",
     });
     api.installCapabilityPack.mockResolvedValue({
@@ -190,7 +202,29 @@ describe("OfflineHome", () => {
       diagnosticsPath: null,
       feishuEnabled: false,
       enabledApiServices: [],
+      mediaRuntimeStatus: "ready",
+      mediaProtocolStatus: "ready",
+      mediaGatewayCatalogStatus: "verified",
+      mediaGatewayModelCount: 3,
+      mediaGatewayCatalogVerifiedAt: "2026-10-13T00:00:00Z",
+      mediaGenerationCapability: "available",
+      codexRestartRequired: false,
+      codexRunning: false,
       message: "installed",
+    });
+    api.mediaModelCatalog.mockResolvedValue({
+      models: ["gpt-image-2", "gpt-image-2.5", "grok-imagine-image", "grok-video-2", "seedance-2.0"],
+      configuredSeedanceModel: null,
+      configuredAgentId: null,
+    });
+    api.mediaModelSettings.mockResolvedValue({
+      licensedCredentialAvailable: false,
+      mediaGenerationAgentId: "",
+      image2Model: "",
+      grokImageModel: "",
+      grokVideoModel: "",
+      seedanceModel: "",
+      minimaxVideoModel: "",
     });
     api.openLogsDir.mockResolvedValue();
     api.usbGuardStatus.mockResolvedValue(USB_GUARD);
@@ -323,7 +357,7 @@ describe("OfflineHome", () => {
     expect(api.gatewayModelProbe).not.toHaveBeenCalled();
     expect(api.manageNativeModelCatalog).not.toHaveBeenCalled();
 
-    await user.click(screen.getByRole("button", { name: "添加模型" }));
+    await user.click(screen.getByRole("button", { name: "管理模型" }));
     await screen.findByRole("heading", { name: "管理模型" });
     await waitFor(() => expect(api.gatewayModelProbe).toHaveBeenCalledTimes(1));
     expect(api.gatewayModelProbe.mock.calls[0]?.[0].selectedModelIds).toEqual([]);
@@ -555,6 +589,14 @@ describe("OfflineHome", () => {
     expect(api.installCapabilityPack).toHaveBeenCalledTimes(1);
     expect(api.installCapabilityPack.mock.calls[0]?.[0]).toMatchObject({
       enableFeishu: false,
+      enableMediaGeneration: true,
+      persistConnections: true,
+      image2Model: "gpt-image-2.5",
+      grokImageModel: "grok-imagine-image",
+      grokVideoModel: "grok-video-2",
+      seedanceModel: "",
+      mediaGatewayCatalogStatus: "verified",
+      mediaGatewayModelCount: 5,
       enabledApiServices: [],
     });
     await waitFor(() => expect(api.installAndLaunchCcswitch).toHaveBeenCalledTimes(1));
@@ -563,6 +605,118 @@ describe("OfflineHome", () => {
     expect(screen.queryByText(/404token API Key 自动/)).not.toBeInTheDocument();
     expect(localStorage.getItem("codex-usb-ccswitch-injection-issue-v1")).toBeNull();
     expect(await screen.findByRole("button", { name: "启动 Codex" })).toBeEnabled();
+  });
+
+  it("keeps the capability pack installable when the media model catalog has no supported routes", async () => {
+    api.winStatus
+      .mockResolvedValueOnce({ installed: null, status: "none" })
+      .mockResolvedValueOnce({ installed: null, status: "none" })
+      .mockResolvedValue({ status: "managed", installed: USB_PORTABLE_CODEX });
+    api.mediaModelCatalog.mockResolvedValueOnce({ models: ["gpt-4o", "claude-opus-4-8"] });
+    renderView();
+    api.offlinePayloadStage.mockResolvedValue({
+      ...STAGE,
+      payload: { ...STAGE.payload, releaseTag: "upstream-26.602.40724" },
+    });
+    await waitFor(() => expect(screen.getByRole("button", { name: "一键安装" })).toBeEnabled());
+    await userEvent.setup().click(screen.getByRole("button", { name: "一键安装" }));
+
+    await waitFor(() => expect(api.installCapabilityPack).toHaveBeenCalledTimes(1));
+    expect(api.installCapabilityPack.mock.calls[0]?.[0]).toMatchObject({
+      persistConnections: true,
+      enableMediaGeneration: false,
+      mediaGatewayCatalogStatus: "verified",
+      mediaGatewayModelCount: 2,
+      image2Model: "",
+      grokImageModel: "",
+      grokVideoModel: "",
+      seedanceModel: "",
+    });
+    expect(await screen.findByText(/媒体生成暂未启用/)).toBeInTheDocument();
+  });
+
+  it("preserves saved media selections when the catalog request fails", async () => {
+    api.winStatus
+      .mockResolvedValueOnce({ installed: null, status: "none" })
+      .mockResolvedValueOnce({ installed: null, status: "none" })
+      .mockResolvedValue({ status: "managed", installed: USB_PORTABLE_CODEX });
+    api.mediaModelCatalog.mockRejectedValueOnce(new Error("offline"));
+    renderView();
+    api.offlinePayloadStage.mockResolvedValue({
+      ...STAGE,
+      payload: { ...STAGE.payload, releaseTag: "upstream-26.602.40724" },
+    });
+    await waitFor(() => expect(screen.getByRole("button", { name: "一键安装" })).toBeEnabled());
+    await userEvent.setup().click(screen.getByRole("button", { name: "一键安装" }));
+
+    await waitFor(() => expect(api.installCapabilityPack).toHaveBeenCalledTimes(1));
+    expect(api.installCapabilityPack.mock.calls[0]?.[0]).toMatchObject({
+      persistConnections: false,
+      enableMediaGeneration: false,
+      mediaGatewayCatalogStatus: "failed",
+      image2Model: "",
+    });
+    expect(await screen.findByText(/媒体生成暂未启用/)).toBeInTheDocument();
+  });
+
+  it("keeps an existing media MCP enabled when the catalog is unavailable but local routes are configured", async () => {
+    api.winStatus
+      .mockResolvedValueOnce({ installed: null, status: "none" })
+      .mockResolvedValueOnce({ installed: null, status: "none" })
+      .mockResolvedValue({ status: "managed", installed: USB_PORTABLE_CODEX });
+    api.mediaModelCatalog.mockRejectedValueOnce(new Error("offline"));
+    api.mediaModelSettings.mockResolvedValueOnce({
+      licensedCredentialAvailable: true,
+      mediaGenerationAgentId: "",
+      image2Model: "gpt-image-2.5",
+      grokImageModel: "",
+      grokVideoModel: "",
+      seedanceModel: "",
+      minimaxVideoModel: "",
+    });
+    renderView();
+    api.offlinePayloadStage.mockResolvedValue({
+      ...STAGE,
+      payload: { ...STAGE.payload, releaseTag: "upstream-26.602.40724" },
+    });
+    await waitFor(() => expect(screen.getByRole("button", { name: "一键安装" })).toBeEnabled());
+    await userEvent.setup().click(screen.getByRole("button", { name: "一键安装" }));
+
+    await waitFor(() => expect(api.installCapabilityPack).toHaveBeenCalledTimes(1));
+    expect(api.installCapabilityPack.mock.calls[0]?.[0]).toMatchObject({
+      persistConnections: false,
+      enableMediaGeneration: true,
+      mediaGatewayCatalogStatus: "failed",
+      image2Model: "gpt-image-2.5",
+    });
+    expect(await screen.findByText(/继续使用已有媒体模型设置/)).toBeInTheDocument();
+  });
+
+  it("keeps a still-listed Seedance route already configured by the user", async () => {
+    api.winStatus
+      .mockResolvedValueOnce({ installed: null, status: "none" })
+      .mockResolvedValueOnce({ installed: null, status: "none" })
+      .mockResolvedValue({ status: "managed", installed: USB_PORTABLE_CODEX });
+    api.mediaModelCatalog.mockResolvedValueOnce({
+      models: ["seedance-2.0"],
+      configuredSeedanceModel: "seedance-2.0",
+      configuredAgentId: "agent-route-42",
+    });
+    renderView();
+    api.offlinePayloadStage.mockResolvedValue({
+      ...STAGE,
+      payload: { ...STAGE.payload, releaseTag: "upstream-26.602.40724" },
+    });
+    await waitFor(() => expect(screen.getByRole("button", { name: "一键安装" })).toBeEnabled());
+    await userEvent.setup().click(screen.getByRole("button", { name: "一键安装" }));
+
+    await waitFor(() => expect(api.installCapabilityPack).toHaveBeenCalledTimes(1));
+    expect(api.installCapabilityPack.mock.calls[0]?.[0]).toMatchObject({
+      persistConnections: true,
+      enableMediaGeneration: true,
+      mediaGenerationAgentId: "agent-route-42",
+      seedanceModel: "seedance-2.0",
+    });
   });
 
   it("keeps a warning when CCSwitch receives a key but does not confirm activation", async () => {
@@ -716,6 +870,14 @@ describe("OfflineHome", () => {
       diagnosticsPath: null,
       feishuEnabled: false,
       enabledApiServices: [],
+      mediaRuntimeStatus: "ready",
+      mediaProtocolStatus: "ready",
+      mediaGatewayCatalogStatus: "verified",
+      mediaGatewayModelCount: 3,
+      mediaGatewayCatalogVerifiedAt: "2026-10-13T00:00:00Z",
+      mediaGenerationCapability: "available",
+      codexRestartRequired: false,
+      codexRunning: false,
       message: "Codex 配置冲突",
     });
 
@@ -754,6 +916,14 @@ describe("OfflineHome", () => {
       diagnosticsPath: null,
       feishuEnabled: false,
       enabledApiServices: [],
+      mediaRuntimeStatus: "failed",
+      mediaProtocolStatus: "unknown",
+      mediaGatewayCatalogStatus: "verified",
+      mediaGatewayModelCount: 3,
+      mediaGatewayCatalogVerifiedAt: "2026-10-13T00:00:00Z",
+      mediaGenerationCapability: "unavailable",
+      codexRestartRequired: false,
+      codexRunning: false,
       message: "运行时和 Codex 配置均需处理",
     });
 

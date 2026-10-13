@@ -37,6 +37,8 @@ import type {
   MacUpdateReport,
   GatewayModelProbeReport,
   GatewayModelProbeRequest,
+  LocalMediaModelSettings,
+  MediaModelCatalog,
   NativeModelCatalogActionReport,
   NativeModelCatalogActionRequest,
   OfflinePayloadReport,
@@ -64,6 +66,10 @@ export const SETTINGS_CHANGED_EVENT = "cam:settings-changed";
 const DEFAULT_PERIODIC_CHECK_INTERVAL_SECONDS = 15 * 60;
 const MIN_PERIODIC_CHECK_INTERVAL_SECONDS = 60;
 const MAX_PERIODIC_CHECK_INTERVAL_SECONDS = 7 * 24 * 60 * 60;
+const WINDOWS_UPDATE_PLAN_UI_TIMEOUT_MS = 150_000;
+const MAC_UPDATE_PLAN_UI_TIMEOUT_MS = 90_000;
+const MANAGER_UPDATE_CHECK_UI_TIMEOUT_MS = 35_000;
+const CODEX_PAYLOAD_CHECK_UI_TIMEOUT_MS = 180_000;
 const BROWSER_SKILL_REPO_ERROR = {
   code: "unsupported_platform",
   message: "Skill Hub update is unavailable in browser preview",
@@ -71,6 +77,32 @@ const BROWSER_SKILL_REPO_ERROR = {
 
 function browserSkillRepoUnavailable(): Promise<never> {
   return Promise.reject({ ...BROWSER_SKILL_REPO_ERROR });
+}
+
+/**
+ * A broken native bridge must not leave an update screen in its checking state
+ * forever. This watchdog only stops waiting in the renderer; native commands
+ * keep their own bounded network/process timeouts and may finish in the
+ * background. The generation guards in the calling views ignore late results.
+ */
+function withUpdateCheckWatchdog<T>(
+  request: Promise<T>,
+  timeoutMs: number,
+  checkName: string,
+): Promise<T> {
+  let timer: number | undefined;
+  const watchdog = new Promise<never>((_resolve, reject) => {
+    timer = window.setTimeout(() => {
+      reject({
+        code: "timeout",
+        message: `${checkName} UI watchdog expired`,
+        detail: `stage=ui-check-watchdog; timeout_ms=${timeoutMs}`,
+      } satisfies CommandError);
+    }, timeoutMs);
+  });
+  return Promise.race([request, watchdog]).finally(() => {
+    if (timer !== undefined) window.clearTimeout(timer);
+  });
 }
 
 export type ManagerUpdateCheck =
@@ -1171,9 +1203,13 @@ export const managerApi = {
         simulatedBuild: simulatedBuild ?? null,
       });
     }
-    return invoke<MacUpdateReport>("mac_plan_update", {
-      simulatedBuild: simulatedBuild ?? null,
-    }).then(guardMacReport);
+    return withUpdateCheckWatchdog(
+      invoke<MacUpdateReport>("mac_plan_update", {
+        simulatedBuild: simulatedBuild ?? null,
+      }).then(guardMacReport),
+      MAC_UPDATE_PLAN_UI_TIMEOUT_MS,
+      "mac-update-plan",
+    );
   },
   // Destructive: reconstruct + codesign-gate + atomic swap + relaunch (or
   // rollback). `confirm` must be true; the backend rejects it otherwise. Guarded
@@ -1217,8 +1253,10 @@ export const managerApi = {
     }
     // A routine check shouldn't surface a scary error when the release feed
     // isn't published yet or is unreachable.
-    const update = await invoke<ManagerUpdateMetadata | null>(
-      "manager_check_update",
+    const update = await withUpdateCheckWatchdog(
+      invoke<ManagerUpdateMetadata | null>("manager_check_update"),
+      MANAGER_UPDATE_CHECK_UI_TIMEOUT_MS,
+      "manager-update-check",
     ).catch(() => undefined);
     if (update === undefined) {
       return { kind: "unavailable" };
@@ -1235,12 +1273,14 @@ export const managerApi = {
     if (!hasTauriRuntime()) {
       return { kind: "development" };
     }
-    const update = await invoke<UpdateInfo | null>("payload_check_codex").catch(
-      (cause: unknown) => {
-        lastCodexPayloadError = errorMessage(cause);
-        return undefined;
-      },
-    );
+    const update = await withUpdateCheckWatchdog(
+      invoke<UpdateInfo | null>("payload_check_codex"),
+      CODEX_PAYLOAD_CHECK_UI_TIMEOUT_MS,
+      "codex-payload-check",
+    ).catch((cause: unknown) => {
+      lastCodexPayloadError = errorMessage(cause);
+      return undefined;
+    });
     if (update === undefined) {
       return { kind: "unavailable", message: lastCodexPayloadError ?? "" };
     }
@@ -1745,7 +1785,11 @@ export const managerApi = {
     if (!hasTauriRuntime()) {
       return Promise.resolve(WIN_FALLBACK_PLAN);
     }
-    return invoke<WinUpdateReport>("win_plan_update").then(guardWinReport);
+    return withUpdateCheckWatchdog(
+      invoke<WinUpdateReport>("win_plan_update").then(guardWinReport),
+      WINDOWS_UPDATE_PLAN_UI_TIMEOUT_MS,
+      "windows-update-plan",
+    );
   },
   winPauseDownload(operationId: string): Promise<boolean> {
     if (!hasTauriRuntime()) {
@@ -1970,6 +2014,26 @@ export const managerApi = {
     if (!hasTauriRuntime()) return Promise.resolve(false);
     return invoke<boolean>("cancel_gateway_model_probe", { requestId });
   },
+  /** Read the licensed upstream model directory for automatic media setup. */
+  mediaModelCatalog(): Promise<MediaModelCatalog> {
+    if (!hasTauriRuntime()) return Promise.resolve({ models: [] });
+    return invoke<MediaModelCatalog>("media_model_catalog");
+  },
+  /** Read local non-secret media model settings without contacting the upstream. */
+  mediaModelSettings(): Promise<LocalMediaModelSettings> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({
+        licensedCredentialAvailable: false,
+        mediaGenerationAgentId: "",
+        image2Model: "",
+        grokImageModel: "",
+        grokVideoModel: "",
+        seedanceModel: "",
+        minimaxVideoModel: "",
+      });
+    }
+    return invoke<LocalMediaModelSettings>("media_model_settings");
+  },
   accountStatus(): Promise<AccountStatus> {
     if (!hasTauriRuntime()) {
       return Promise.resolve({
@@ -2014,6 +2078,14 @@ export const managerApi = {
         diagnosticsPath: null,
         feishuEnabled: false,
         enabledApiServices: [],
+        mediaRuntimeStatus: "unknown",
+        mediaProtocolStatus: "unknown",
+        mediaGatewayCatalogStatus: "not-checked",
+        mediaGatewayModelCount: 0,
+        mediaGatewayCatalogVerifiedAt: null,
+        mediaGenerationCapability: "unknown",
+        codexRestartRequired: false,
+        codexRunning: false,
         message: "browser preview: capability pack status is unavailable",
       });
     }
@@ -2040,6 +2112,14 @@ export const managerApi = {
         diagnosticsPath: null,
         feishuEnabled: false,
         enabledApiServices: [],
+        mediaRuntimeStatus: "unknown",
+        mediaProtocolStatus: "unknown",
+        mediaGatewayCatalogStatus: "not-checked",
+        mediaGatewayModelCount: 0,
+        mediaGatewayCatalogVerifiedAt: null,
+        mediaGenerationCapability: "unknown",
+        codexRestartRequired: false,
+        codexRunning: false,
         message: "browser preview: capability pack installation is unavailable",
       });
     }

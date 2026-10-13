@@ -1233,7 +1233,10 @@ mod imp {
 
     /// Strict cleanup probe. Unlike the ordinary process query, it does not
     /// silently skip live processes whose executable path cannot be queried.
-    pub fn processes_running_for_root_strict(root: &Path) -> Result<bool, EngineError> {
+    fn processes_running_for_root_strict_matching(
+        root: &Path,
+        executable_name: Option<&std::ffi::OsStr>,
+    ) -> Result<bool, EngineError> {
         let snapshot = OwnedHandle::new(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) })
             .ok_or_else(|| last_error("create strict process snapshot"))?;
         let mut entry = PROCESSENTRY32W {
@@ -1262,6 +1265,22 @@ mod imp {
                     .unwrap_or(entry.szExeFile.len());
                 let snapshot_image_name =
                     OsString::from_wide(&entry.szExeFile[..image_name_length]);
+                if executable_name.is_some_and(|expected| {
+                    !snapshot_image_name
+                        .to_string_lossy()
+                        .eq_ignore_ascii_case(&expected.to_string_lossy())
+                }) {
+                    if unsafe { Process32NextW(snapshot.raw(), &mut entry) } == 0 {
+                        let error = std::io::Error::last_os_error();
+                        if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
+                            break;
+                        }
+                        return Err(EngineError::Install(format!(
+                            "read next strict process snapshot entry: {error}"
+                        )));
+                    }
+                    continue;
+                }
                 match strict_probe_process(
                     pid,
                     &snapshot_image_name,
@@ -1288,6 +1307,21 @@ mod imp {
             return Err(error);
         }
         Ok(false)
+    }
+
+    /// Strictly inspect only processes whose snapshot image name matches the
+    /// expected executable. This avoids failing a Codex launch because an
+    /// unrelated protected process cannot be queried, while still refusing to
+    /// guess when a Codex.exe candidate cannot be resolved to an image path.
+    pub fn processes_running_for_executable_under_root_strict(
+        root: &Path,
+        executable_name: &std::ffi::OsStr,
+    ) -> Result<bool, EngineError> {
+        processes_running_for_root_strict_matching(root, Some(executable_name))
+    }
+
+    pub fn processes_running_for_root_strict(root: &Path) -> Result<bool, EngineError> {
+        processes_running_for_root_strict_matching(root, None)
     }
 
     pub(crate) fn codex_processes_running_for_root(root: &Path) -> Result<bool, EngineError> {
@@ -1557,6 +1591,48 @@ mod imp {
         }
 
         #[test]
+        fn executable_filtered_strict_probe_finds_codex_and_ignores_other_names() {
+            if std::env::var_os(STRICT_HELPER_ENV).is_some() {
+                return;
+            }
+            let root = std::env::temp_dir().join(format!(
+                "codex-filtered-process-probe-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let helper = root.join("Codex.exe");
+            std::fs::copy(std::env::current_exe().unwrap(), &helper).unwrap();
+            let mut child = Command::new(&helper)
+                .args([
+                    "--exact",
+                    "windows_process::imp::windows_tests::strict_probe_helper_child",
+                    "--nocapture",
+                ])
+                .env(STRICT_HELPER_ENV, "1")
+                .spawn()
+                .unwrap();
+
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let found = loop {
+                match processes_running_for_executable_under_root_strict(
+                    &root,
+                    std::ffi::OsStr::new("Codex.exe"),
+                ) {
+                    Ok(true) => break true,
+                    Ok(false) | Err(_) if Instant::now() < deadline => {
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                    Ok(false) | Err(_) => break false,
+                }
+            };
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_dir_all(&root);
+            assert!(found, "executable-filtered strict probe missed Codex.exe");
+        }
+
+        #[test]
         fn closes_unlisted_helper_process_without_powershell() {
             if std::env::var_os(HELPER_ENV).is_some() {
                 thread::sleep(Duration::from_secs(30));
@@ -1611,8 +1687,9 @@ mod imp {
 #[cfg(windows)]
 pub use imp::{
     close_processes_for_root, hide_codex_auxiliary_windows_for_root, hide_console_windows_for_root,
-    hide_windows_for_root, processes_running_for_root, processes_running_for_root_strict,
-    show_windows_for_root, start_console_window_watcher, wait_for_usable_window_for_root,
+    hide_windows_for_root, processes_running_for_executable_under_root_strict,
+    processes_running_for_root, processes_running_for_root_strict, show_windows_for_root,
+    start_console_window_watcher, wait_for_usable_window_for_root,
 };
 
 #[cfg(windows)]
@@ -1668,6 +1745,16 @@ pub fn processes_running_for_root(_root: &Path) -> Result<bool, EngineError> {
 
 #[cfg(not(windows))]
 pub fn processes_running_for_root_strict(_root: &Path) -> Result<bool, EngineError> {
+    Err(EngineError::Install(
+        "strict process image query is supported only on Windows".to_string(),
+    ))
+}
+
+#[cfg(not(windows))]
+pub fn processes_running_for_executable_under_root_strict(
+    _root: &Path,
+    _executable_name: &std::ffi::OsStr,
+) -> Result<bool, EngineError> {
     Err(EngineError::Install(
         "strict process image query is supported only on Windows".to_string(),
     ))

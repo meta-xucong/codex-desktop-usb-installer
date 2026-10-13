@@ -90,26 +90,11 @@ if ($EnableFeishu) {
 
 $mediaTemplate = Get-Content -LiteralPath $mediaTemplatePath -Raw -Encoding UTF8
 if ($EnableMediaGeneration) {
-    $mediaKey = [Environment]::GetEnvironmentVariable('MEDIA_GENERATION_API_KEY', 'Process')
-    $mediaBaseUrl = [Environment]::GetEnvironmentVariable('MEDIA_GENERATION_API_BASE_URL', 'Process')
-    if ([string]::IsNullOrWhiteSpace($mediaKey) -or [string]::IsNullOrWhiteSpace($mediaBaseUrl)) {
-        throw 'MEDIA_GENERATION_API_KEY and MEDIA_GENERATION_API_BASE_URL are required before enabling the unified media MCP.'
-    }
-    $modelNames = @('MEDIA_IMAGE2_MODEL','MEDIA_GROK_IMAGE_MODEL','MEDIA_GROK_VIDEO_MODEL','MEDIA_SEEDANCE_MODEL','MEDIA_MINIMAX_VIDEO_MODEL')
-    $configuredModels = @($modelNames | Where-Object { -not [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_, 'Process')) })
-    if ($configuredModels.Count -eq 0) { throw 'Configure at least one actual provider model before enabling the unified media MCP.' }
-    if ((-not [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable('MEDIA_IMAGE2_MODEL', 'Process')) -or -not [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable('MEDIA_SEEDANCE_MODEL', 'Process'))) -and [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable('MEDIA_GENERATION_AGENT_ID', 'Process'))) {
-        throw 'MEDIA_GENERATION_AGENT_ID is required when enabling Image-2 or Seedance routes.'
-    }
-    $mediaUri = $null
-    if (-not [Uri]::TryCreate($mediaBaseUrl, [UriKind]::Absolute, [ref]$mediaUri) -or $mediaUri.Scheme -ne 'https' -or $mediaUri.AbsolutePath.TrimEnd('/') -ne '' -or -not [string]::IsNullOrWhiteSpace($mediaUri.Query) -or -not [string]::IsNullOrWhiteSpace($mediaUri.Fragment) -or -not [string]::IsNullOrWhiteSpace($mediaUri.UserInfo)) {
-        throw 'MEDIA_GENERATION_API_BASE_URL must be a root HTTPS URL without credentials, path, query, or fragment.'
-    }
     if (-not (Test-Path -LiteralPath $MediaMcpWrapperPath -PathType Leaf)) { throw "Media MCP wrapper not found: $MediaMcpWrapperPath" }
-    $mediaDryRunText = & $MediaMcpWrapperPath -DryRun | Out-String
-    if ($LASTEXITCODE -ne 0) { throw 'Media MCP wrapper dry-run failed.' }
-    $mediaDryRun = $mediaDryRunText | ConvertFrom-Json
-    if (-not [bool]$mediaDryRun.pythonReady -or -not [bool]$mediaDryRun.serverReady) { throw 'Bundled Python or unified media MCP server is missing.' }
+    $mediaHealthText = & $MediaMcpWrapperPath -HealthCheck | Out-String
+    if ($LASTEXITCODE -ne 0) { throw 'Bundled Python media MCP health check failed.' }
+    $mediaHealth = $mediaHealthText | ConvertFrom-Json
+    if (-not [bool]$mediaHealth.ready -or [string]$mediaHealth.serverVersion -ne '1.3.3' -or [string]$mediaHealth.healthScope -ne 'local-runtime-protocol' -or [string]$mediaHealth.protocolStatus -ne 'passed' -or [int]$mediaHealth.toolCount -ne 6) { throw 'Bundled Python media MCP local runtime/protocol check is unhealthy.' }
 }
 
 $mcpManifestPath = Join-Path $kitRoot 'manifest\mcp-servers.json'

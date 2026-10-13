@@ -114,6 +114,33 @@ fn verified_runtime(
     cancelled: &AtomicBool,
     deadline: Instant,
 ) -> Result<(PathBuf, String), &'static str> {
+    verified_runtime_inner(
+        &target.installation_root,
+        Some(&target.desktop_version),
+        cancelled,
+        deadline,
+    )
+}
+
+#[cfg(windows)]
+pub(crate) fn verified_catalog_runtime(
+    cancelled: &AtomicBool,
+    deadline: Instant,
+) -> Result<(PathBuf, String), &'static str> {
+    if !usb_guard::guard_required() {
+        return Err("native-usb-required");
+    }
+    let root = usb_guard::authorized_usb_codex_root().map_err(|_| "native-binding-unavailable")?;
+    verified_runtime_inner(&root, None, cancelled, deadline)
+}
+
+#[cfg(windows)]
+fn verified_runtime_inner(
+    installation_root: &Path,
+    expected_version: Option<&str>,
+    cancelled: &AtomicBool,
+    deadline: Instant,
+) -> Result<(PathBuf, String), &'static str> {
     use std::os::windows::fs::MetadataExt;
     if !usb_guard::guard_required() {
         return Err("native-usb-required");
@@ -127,10 +154,7 @@ fn verified_runtime(
         .as_deref()
         .map(PathBuf::from)
         .ok_or("native-usb-required")?;
-    for raw in [
-        &target.installation_root,
-        &bundle.join("apps").join("Codex"),
-    ] {
+    for raw in [installation_root, &bundle.join("apps").join("Codex")] {
         for ancestor in raw.ancestors() {
             let meta =
                 fs::symlink_metadata(ancestor).map_err(|_| "native-installation-unavailable")?;
@@ -141,8 +165,8 @@ fn verified_runtime(
     }
     let expected_root = fs::canonicalize(bundle.join("apps").join("Codex"))
         .map_err(|_| "native-installation-unavailable")?;
-    let actual_root = fs::canonicalize(&target.installation_root)
-        .map_err(|_| "native-installation-unavailable")?;
+    let actual_root =
+        fs::canonicalize(installation_root).map_err(|_| "native-installation-unavailable")?;
     if actual_root != expected_root {
         return Err("native-installation-mismatch");
     }
@@ -168,7 +192,7 @@ fn verified_runtime(
     {
         return Err("native-package-unavailable");
     }
-    if payload.codex_desktop_version != target.desktop_version {
+    if expected_version.is_some_and(|version| payload.codex_desktop_version != version) {
         return Err("native-package-version-mismatch");
     }
     let entry_path = payload
@@ -209,6 +233,14 @@ fn verified_runtime(
 #[cfg(not(windows))]
 fn verified_runtime(
     _: &NativeRuntimeTarget,
+    _: &AtomicBool,
+    _: Instant,
+) -> Result<(PathBuf, String), &'static str> {
+    Err("native-platform-unsupported")
+}
+
+#[cfg(not(windows))]
+pub(crate) fn verified_catalog_runtime(
     _: &AtomicBool,
     _: Instant,
 ) -> Result<(PathBuf, String), &'static str> {
@@ -893,8 +925,8 @@ pub fn publish(
         cancelled,
         deadline,
         hash_runtime,
-        |executable, bytes, cancelled, deadline| {
-            model_native_probe::validate_final_catalog(executable, bytes, cancelled, deadline)
+        |_executable, bytes, cancelled, deadline| {
+            model_native_probe::validate_final_catalog(bytes, cancelled, deadline)
                 .map_err(|error| error.code())
         },
     )?;

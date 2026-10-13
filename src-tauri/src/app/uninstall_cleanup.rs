@@ -551,6 +551,15 @@ impl CleanupRoots {
             self.local.join("wangnov").join("codexappmanager"),
             self.local.join("CodexUsbGuard"),
             self.local.join("CodexUsbAppx"),
+            // The media MCP credential is DPAPI-protected for the current
+            // Windows user and is owned by this installer. Remove only these
+            // three exact files on every product uninstall/revocation path.
+            self.home
+                .join(".codex/codex-agent-kit/connections/media-generation.credential.dpapi"),
+            self.home
+                .join(".codex/codex-agent-kit/connections/media-generation.connection.json"),
+            self.home
+                .join(".codex/codex-agent-kit/connections/media-generation.json"),
         ];
         targets.extend(self.install_staging_targets());
         targets.extend(self.legacy_desktop_report_targets()?);

@@ -1033,6 +1033,8 @@ pub fn run() {
             commands::usb_guard_status,
             commands::gateway_model_probe,
             commands::cancel_gateway_model_probe,
+            commands::media_model_catalog,
+            commands::media_model_settings,
             commands::manage_native_model_catalog,
             commands::install_and_launch_ccswitch,
             commands::open_ccswitch,

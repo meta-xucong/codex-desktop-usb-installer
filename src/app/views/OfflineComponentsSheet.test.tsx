@@ -16,6 +16,7 @@ vi.mock("../../services/managerApi", async (importOriginal) => {
       capabilityPackStatus: vi.fn(),
       installCapabilityPack: vi.fn(),
       installAndLaunchCcswitch: vi.fn(),
+      mediaModelCatalog: vi.fn(),
     },
   };
 });
@@ -38,6 +39,14 @@ const PACK_REPORT: CapabilityPackReport = {
   diagnosticsPath: null,
   feishuEnabled: false,
   enabledApiServices: [],
+  mediaGatewayModelCount: 0,
+  mediaGatewayCatalogVerifiedAt: null,
+  mediaRuntimeStatus: "not-checked",
+  mediaProtocolStatus: "not-checked",
+  mediaGatewayCatalogStatus: "not-checked",
+  mediaGenerationCapability: "not-tested",
+  codexRestartRequired: false,
+  codexRunning: false,
   message: "能力包可用",
 };
 
@@ -106,6 +115,7 @@ describe("OfflineComponentsSheet", () => {
       message: "能力包安装完成",
     });
     api.installAndLaunchCcswitch.mockResolvedValue(CCSWITCH_REPORT);
+    api.mediaModelCatalog.mockResolvedValue({ models: ["gpt-image-2.5"] });
   });
 
   it("loads status and submits the selected Feishu configuration", async () => {
@@ -206,9 +216,11 @@ describe("OfflineComponentsSheet", () => {
     expect(screen.queryByText("核心能力已就绪，Codex 配置存在冲突/需确认")).not.toBeInTheDocument();
   }, 30_000);
 
-  it("installs core capabilities without credentials when every optional service is unchecked", async () => {
+  it("installs core capabilities without optional connections when they are unchecked", async () => {
     const user = userEvent.setup();
     renderSheet();
+
+    await user.click(screen.getByRole("checkbox", { name: "图片与视频生成（本地 MCP）" }));
 
     await user.click(screen.getByRole("button", { name: "保存并应用连接" }));
 
@@ -222,23 +234,19 @@ describe("OfflineComponentsSheet", () => {
         feishuAppSecret: "",
         dashscopeApiKey: "",
         enableMediaGeneration: false,
-        mediaGenerationApiKey: "",
+        image2Model: "gpt-image-2.5",
         minimaxVideoModel: "",
       }),
     );
     expect(screen.queryByText("DashScope 的 Key、Base URL 和模型必须填写完整。")).not.toBeInTheDocument();
   }, 30_000);
 
-  it("configures MiniMax as a blank future model in the same shared media MCP", async () => {
+  it("enables license-backed Image-2 by default without asking for a separate media key", async () => {
     const user = userEvent.setup();
     renderSheet();
 
-    await user.click(screen.getByRole("checkbox", { name: "图片与视频生成（本地 MCP）" }));
+    expect(screen.getByRole("checkbox", { name: "图片与视频生成（本地 MCP）" })).toBeChecked();
     expect(screen.getByText("MiniMax 视频：暂未开放")).toBeInTheDocument();
-    await user.type(screen.getByLabelText("媒体上游 API 地址"), "https://api.wokey.ai");
-    await user.type(screen.getByLabelText("媒体上游 API Key（共用）"), "shared-media-test-key");
-    await user.click(screen.getByText("高级设置"));
-    await user.selectOptions(screen.getByLabelText("上游兼容模式"), "wokey");
     await user.type(screen.getByLabelText("Grok 图片模型 ID"), "grok-imagine-test");
     await user.click(screen.getByRole("button", { name: "保存并应用连接" }));
 
@@ -246,10 +254,15 @@ describe("OfflineComponentsSheet", () => {
     const submitted = api.installCapabilityPack.mock.calls[0][0];
     expect(submitted).toEqual(expect.objectContaining({
       enableMediaGeneration: true,
-      mediaGenerationApiKey: "shared-media-test-key",
+      image2Model: "gpt-image-2.5",
       minimaxVideoModel: "",
+      mediaGatewayCatalogStatus: "verified",
+      mediaGatewayModelCount: 1,
+      mediaGatewayCatalogVerifiedAt: expect.any(String),
       enabledApiServices: [],
     }));
+    expect(submitted).not.toHaveProperty("mediaGenerationApiKey");
+    expect(submitted).not.toHaveProperty("mediaGenerationApiBaseUrl");
     expect(submitted).not.toHaveProperty("minimaxApiKey");
     expect(submitted).not.toHaveProperty("minimaxBaseUrl");
   }, 30_000);

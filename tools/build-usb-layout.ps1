@@ -17,6 +17,17 @@ if ([string]::IsNullOrWhiteSpace($OutputPath)) { $OutputPath = Join-Path $repo "
 if ([string]::IsNullOrWhiteSpace($CapabilityPackSource)) {
     $CapabilityPackSource = Join-Path $repo "installer-pack"
 }
+$capabilityPackSourceFull = (Resolve-Path -LiteralPath $CapabilityPackSource -ErrorAction Stop).Path
+$packMetadataChecker = Join-Path $PSScriptRoot "refresh-capability-pack-metadata.py"
+if (-not (Test-Path -LiteralPath $packMetadataChecker -PathType Leaf)) {
+    throw "缺少能力包完整性检查器：$packMetadataChecker"
+}
+$python = Get-Command python -ErrorAction Stop
+$packCheckOutput = & $python.Source $packMetadataChecker --check $capabilityPackSourceFull 2>&1 | Out-String
+if ($LASTEXITCODE -ne 0) {
+    throw "能力包完整性检查失败，拒绝生成 U 盘包：$($packCheckOutput.Trim())"
+}
+Write-Output "能力包文件清单与哈希校验通过：$($packCheckOutput.Trim())"
 $bundle = (Resolve-Path -LiteralPath $BundlePath).Path
 $installer = (Resolve-Path -LiteralPath $InstallerPath).Path
 
@@ -222,7 +233,6 @@ foreach ($directory in @("apps", "content", "content\skills", "content\mcp")) {
 # Ship the complete capability pack in the generated USB layout. The manager
 # installs this local tree after Codex verification, so the USB workflow does
 # not depend on GitHub, npm, PyPI, or a second installer window.
-$capabilityPackSourceFull = (Resolve-Path -LiteralPath $CapabilityPackSource -ErrorAction Stop).Path
 if (-not (Test-Path -LiteralPath $capabilityPackSourceFull -PathType Container)) {
     throw "能力包源目录不存在：$CapabilityPackSource"
 }

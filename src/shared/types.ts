@@ -1,7 +1,7 @@
 export type OperatingSystem = "windows" | "macos" | "linux" | "unknown";
 export type Architecture = "x64" | "arm64" | "unknown";
 export type OperationKind =
-  "install" | "update" | "uninstall" | "set-install-root" | "adopt";
+  "install" | "update" | "uninstall" | "set-install-root" | "adopt" | "launch";
 export type OperationToken = string;
 /** Lifecycle phase of a backend operation lease (mirrors Rust `OperationPhase`). */
 export type OperationPhase =
@@ -278,6 +278,22 @@ export interface GatewayModelProbeReport {
   connectivityProofExpiresAt?: number;
 }
 
+export interface MediaModelCatalog {
+  models: string[];
+  configuredSeedanceModel?: string | null;
+  configuredAgentId?: string | null;
+}
+
+export interface LocalMediaModelSettings {
+  licensedCredentialAvailable: boolean;
+  mediaGenerationAgentId: string;
+  image2Model: string;
+  grokImageModel: string;
+  grokVideoModel: string;
+  seedanceModel: string;
+  minimaxVideoModel: string;
+}
+
 export interface NativeModelCatalogActionRequest {
   operation: "state" | "add" | "reset";
   requestId?: string;
@@ -308,12 +324,12 @@ export interface CapabilityPackInstallOptions {
   enabledApiServices: string[];
   enabledRemoteMcps: string[];
   enableMediaGeneration: boolean;
+  mediaGatewayCatalogStatus: "not-checked" | "verified" | "failed" | string;
+  mediaGatewayModelCount: number;
+  mediaGatewayCatalogVerifiedAt: string | null;
   dashscopeApiKey: string;
   dashscopeBaseUrl: string;
   dashscopeModel: string;
-  mediaGenerationApiBaseUrl: string;
-  mediaGenerationApiProfile: string;
-  mediaGenerationApiKey: string;
   mediaGenerationAgentId: string;
   image2Model: string;
   grokImageModel: string;
@@ -338,6 +354,14 @@ export interface CapabilityPackReport {
   diagnosticsPath: string | null;
   feishuEnabled: boolean;
   enabledApiServices: string[];
+  mediaRuntimeStatus: string;
+  mediaProtocolStatus: string;
+  mediaGatewayCatalogStatus: string;
+  mediaGatewayModelCount: number;
+  mediaGatewayCatalogVerifiedAt: string | null;
+  mediaGenerationCapability: string;
+  codexRestartRequired: boolean;
+  codexRunning: boolean;
   message: string;
 }
 

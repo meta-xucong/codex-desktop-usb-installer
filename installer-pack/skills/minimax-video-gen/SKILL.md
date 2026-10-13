@@ -5,7 +5,7 @@ description: Prepare a MiniMax video-generation request and, only when the unifi
 
 # MiniMax 视频工作流
 
-所有媒体生成统一使用本地 `media_generation` MCP 和同一组媒体 Base URL/API Key。此 Skill 不调用 MiniMax 官方 API，不读取或要求单独的 MiniMax Key，也不自行猜测上游端点。
+所有媒体生成统一使用本地 `media_generation` MCP 和签名 U 盘授权提供的共享设备 Key。此 Skill 不调用 MiniMax 官方 API，不读取或要求单独的 MiniMax Key，也不自行猜测上游端点。
 
 ## 前置检查
 
@@ -23,6 +23,6 @@ description: Prepare a MiniMax video-generation request and, only when the unifi
 ## 安全与可用性边界
 
 - 当前没有预置 MiniMax 模型名。MiniMax 视频能力只有在统一媒体上游实际开放模型、并在 `MEDIA_MINIMAX_VIDEO_MODEL` 中配置后才可用。
-- API Key、Base URL、Profile 与其他媒体 provider 共用 `MEDIA_GENERATION_*` 配置；不设置 `MINIMAX_API_KEY` 或 `MINIMAX_API_BASE_URL`。
+- 设备 Key 由签名 U 盘授权提供；不设置 `MINIMAX_API_KEY` 或 `MINIMAX_API_BASE_URL`。
 - 不宣称模型价格、余额、额度或任务成功。每次可能计费的提交都必须先获得用户对完整请求的明确同意。
 - 当前 MCP 的 MiniMax 视频仅支持统一上游的 Wokey 兼容路由和文生视频参数；若请求需要未实现的参考素材或其他模式，说明限制并停止，不要猜测接口格式。

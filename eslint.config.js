@@ -31,6 +31,9 @@ export default tseslint.config(
       // Historical source snapshots and audit transcripts are evidence, not
       // live app sources. Lint the checked-out product tree, not those copies.
       ".codex-audit/",
+      // Temporary installer/MCP/model-catalog validation trees can contain
+      // extracted third-party runtimes; they are evidence, not app sources.
+      ".tmp-*/**",
       // Local release/capability simulations contain bundled third-party
       // runtimes and extracted vendor JavaScript. They are test evidence, not
       // renderer sources, and must not make the product lint gate depend on a

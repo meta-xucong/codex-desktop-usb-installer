@@ -23,6 +23,7 @@ pub enum OperationKind {
     Uninstall,
     SetInstallRoot,
     Adopt,
+    Launch,
 }
 
 impl OperationKind {
@@ -33,6 +34,7 @@ impl OperationKind {
             Self::Uninstall => "uninstall",
             Self::SetInstallRoot => "set-install-root",
             Self::Adopt => "adopt",
+            Self::Launch => "launch",
         }
     }
 }
@@ -750,11 +752,11 @@ impl OperationManager {
         let Ok(mut inner) = self.inner.lock() else {
             return false;
         };
-        if !inner
-            .active
-            .as_ref()
-            .is_some_and(|active| active.token == token.0 && active.phase.interruptible())
-        {
+        if !inner.active.as_ref().is_some_and(|active| {
+            active.token == token.0
+                && active.phase.interruptible()
+                && matches!(active.kind, OperationKind::Install | OperationKind::Update)
+        }) {
             return false;
         }
         let requested = request();
@@ -779,7 +781,10 @@ impl OperationManager {
         let Some(active) = inner.active.as_mut() else {
             return false;
         };
-        if active.token != token.0 || !active.phase.interruptible() {
+        if active.token != token.0
+            || !active.phase.interruptible()
+            || !matches!(active.kind, OperationKind::Install | OperationKind::Update)
+        {
             return false;
         }
         let requested = request();
@@ -1170,7 +1175,7 @@ mod tests {
     };
     use crate::app::release_install::{ReleaseArchitecture, ReleasePackageFormat};
     use std::fs;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -1369,7 +1374,7 @@ mod tests {
     fn second_manager_hits_cross_process_lock() {
         let path = lock_path("cross-process");
         let first = OperationManager::new(path.clone());
-        let _guard = first.begin(OperationKind::Update).unwrap();
+        let _guard = first.begin(OperationKind::Launch).unwrap();
         let second = OperationManager::new(path.clone());
 
         assert!(second.is_busy());
@@ -1377,7 +1382,40 @@ mod tests {
             second.begin(OperationKind::Install),
             Err(OperationError::BusyOtherProcess)
         ));
+        assert!(matches!(
+            second.begin(OperationKind::Update),
+            Err(OperationError::BusyOtherProcess)
+        ));
 
+        drop(_guard);
+        let _update = second.begin(OperationKind::Update).unwrap();
+        let third = OperationManager::new(path.clone());
+        assert!(matches!(
+            third.begin(OperationKind::Launch),
+            Err(OperationError::BusyOtherProcess)
+        ));
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn launch_operation_rejects_download_pause_and_cancel_requests() {
+        let path = lock_path("launch-control");
+        let manager = OperationManager::new(path.clone());
+        let guard = manager.begin(OperationKind::Launch).unwrap();
+        let callback_ran = AtomicBool::new(false);
+
+        assert!(!manager.request_cancellation(guard.token(), || {
+            callback_ran.store(true, Ordering::SeqCst);
+            true
+        }));
+        assert!(!manager.request_pause(guard.token(), || {
+            callback_ran.store(true, Ordering::SeqCst);
+            true
+        }));
+        assert!(!callback_ran.load(Ordering::SeqCst));
+
+        drop(guard);
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 

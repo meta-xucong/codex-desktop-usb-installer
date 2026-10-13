@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import argparse
 import json
-import sys
 from pathlib import Path
 
 
@@ -30,8 +30,20 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(canonical_bytes(path)).hexdigest()
 
 
-def refresh(root: Path) -> dict[str, int]:
-    root = root.resolve(strict=True)
+def sha256_bytes(path: Path, data: bytes) -> str:
+    if path.suffix.lower() in TEXT_EXTENSIONS:
+        data = data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return hashlib.sha256(data).hexdigest()
+
+
+def build_expected(root: Path) -> tuple[dict, str, str, int]:
+    # `resolve(strict=True)` can fail with WinError 5 in restricted Windows
+    # sandboxes even when the current process can enumerate and write the pack.
+    # An absolute lexical path is sufficient here; file existence and complete
+    # manifest scope are validated immediately below.
+    root = root.absolute()
+    if not root.is_dir():
+        raise NotADirectoryError(root)
     manifest_path = root / "file-manifest.json"
     checksum_path = root / "checksums.sha256"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -67,22 +79,54 @@ def refresh(root: Path) -> dict[str, int]:
             f"missing={sorted(listed - actual)}"
         )
 
-    manifest_path.write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-        newline="\n",
-    )
+    manifest_text = json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"
+    manifest_bytes = manifest_text.encode("utf-8")
+    manifest_hash = sha256_bytes(manifest_path, manifest_bytes)
     files = [("file-manifest.json", manifest_path)] + [
         (relative, root / relative) for relative in sorted(listed)
     ]
-    checksum_path.write_text(
-        "".join(f"{sha256(path)} *{relative}\n" for relative, path in files),
-        encoding="utf-8",
-        newline="\n",
+    checksum_text = "".join(
+        f"{manifest_hash if relative == 'file-manifest.json' else sha256(path)} *{relative}\n"
+        for relative, path in files
     )
-    return {"manifestFiles": len(listed), "checksumFiles": len(files)}
+    return manifest, manifest_text, checksum_text, len(listed)
+
+
+def refresh(root: Path) -> dict[str, int]:
+    manifest, manifest_text, checksum_text, manifest_count = build_expected(root)
+    root = root.absolute()
+    (root / "file-manifest.json").write_text(
+        manifest_text, encoding="utf-8", newline="\n"
+    )
+    (root / "checksums.sha256").write_text(
+        checksum_text, encoding="utf-8", newline="\n"
+    )
+    return {"manifestFiles": manifest_count, "checksumFiles": manifest_count + 1}
+
+
+def check(root: Path) -> dict[str, int]:
+    _, expected_manifest, expected_checksums, manifest_count = build_expected(root)
+    root = root.absolute()
+    manifest_path = root / "file-manifest.json"
+    checksum_path = root / "checksums.sha256"
+    mismatches = []
+    if manifest_path.read_text(encoding="utf-8") != expected_manifest:
+        mismatches.append("file-manifest.json")
+    if checksum_path.read_text(encoding="utf-8") != expected_checksums:
+        mismatches.append("checksums.sha256")
+    if mismatches:
+        raise ValueError(
+            "capability-pack integrity metadata is stale: " + ", ".join(mismatches)
+        )
+    return {"manifestFiles": manifest_count, "checksumFiles": manifest_count + 1}
 
 
 if __name__ == "__main__":
-    pack_root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parents[1] / "installer-pack"
-    print(json.dumps(refresh(pack_root), ensure_ascii=False))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("pack_root", nargs="?", type=Path,
+                        default=Path(__file__).resolve().parents[1] / "installer-pack")
+    parser.add_argument("--check", action="store_true",
+                        help="validate metadata without changing any files")
+    args = parser.parse_args()
+    result = check(args.pack_root) if args.check else refresh(args.pack_root)
+    print(json.dumps(result, ensure_ascii=False))

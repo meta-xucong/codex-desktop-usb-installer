@@ -34,6 +34,7 @@ import { SkillRepoUpdateCard } from "./SkillRepoUpdateCard";
 import { UpstreamModelManagerSheet } from "./UpstreamModelManagerSheet";
 import { ProgressScreen } from "./ProgressScreen";
 import { useDownloadProgress } from "./useDownloadProgress";
+import { selectMediaModels } from "../mediaModelSelection";
 
 type OfflinePhase = "loading" | "ready" | "installed" | "staging" | "installing" | "error";
 
@@ -49,7 +50,9 @@ const USB_GUARD_NORMAL_POLL_MS = 1_000;
 
 const DEFAULT_CAPABILITY_PACK_OPTIONS: CapabilityPackInstallOptions = {
   enableFeishu: false,
-  persistConnections: false,
+  // Persist only the non-secret model selections below. The signed USB key
+  // stays in the DPAPI credential store and is never written to the registry.
+  persistConnections: true,
   feishuAppId: "",
   feishuAppSecret: "",
   feishuUserAccessToken: "",
@@ -57,13 +60,13 @@ const DEFAULT_CAPABILITY_PACK_OPTIONS: CapabilityPackInstallOptions = {
   feishuAuthMode: "tenant",
   enabledApiServices: [],
   enabledRemoteMcps: [],
-  enableMediaGeneration: false,
+  enableMediaGeneration: true,
+  mediaGatewayCatalogStatus: "not-checked",
+  mediaGatewayModelCount: 0,
+  mediaGatewayCatalogVerifiedAt: null,
   dashscopeApiKey: "",
   dashscopeBaseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
   dashscopeModel: "",
-  mediaGenerationApiBaseUrl: "",
-  mediaGenerationApiProfile: "auto",
-  mediaGenerationApiKey: "",
   mediaGenerationAgentId: "",
   image2Model: "",
   grokImageModel: "",
@@ -756,9 +759,69 @@ export function OfflineHome({
       // and remains retryable from the quiet Components entry below.
       let capabilityPackReport: CapabilityPackReport | null = null;
       let capabilityPackErrorDetail: string | null = null;
+      let mediaModelsAvailable = false;
+      let mediaCatalogStatus: CapabilityPackInstallOptions["mediaGatewayCatalogStatus"] = "failed";
       try {
+        let mediaGatewayModelCount = 0;
+        let mediaGatewayCatalogVerifiedAt: string | null = null;
+        let mediaModels = {
+          mediaGenerationAgentId: "",
+          image2Model: "",
+          grokImageModel: "",
+          grokVideoModel: "",
+          seedanceModel: "",
+          minimaxVideoModel: "",
+        };
+        try {
+          // This is an authenticated GET /v1/models lookup only; it does not
+          // submit a paid image or video generation request.
+          const catalog = await managerApi.mediaModelCatalog();
+          mediaModels = selectMediaModels(catalog.models, { includeSeedance: false });
+          const existingSeedanceModel = catalog.configuredSeedanceModel?.trim() ?? "";
+          const existingAgentId = catalog.configuredAgentId?.trim() ?? "";
+          if (existingSeedanceModel && existingAgentId && catalog.models.includes(existingSeedanceModel)) {
+            mediaModels.seedanceModel = existingSeedanceModel;
+            mediaModels.mediaGenerationAgentId = existingAgentId;
+          }
+          mediaGatewayModelCount = catalog.models.length;
+          mediaGatewayCatalogVerifiedAt = new Date().toISOString();
+          mediaCatalogStatus = "verified";
+          mediaModelsAvailable = Object.entries(mediaModels).some(
+            ([name, model]) => name !== "mediaGenerationAgentId" && Boolean(model),
+          );
+        } catch {
+          console.warn("[media-mcp] model catalog lookup failed; media MCP will remain disabled");
+          try {
+            const saved = await managerApi.mediaModelSettings();
+            mediaModels = {
+              mediaGenerationAgentId: saved.mediaGenerationAgentId,
+              image2Model: saved.image2Model,
+              grokImageModel: saved.grokImageModel,
+              grokVideoModel: saved.grokVideoModel,
+              seedanceModel: saved.seedanceModel,
+              minimaxVideoModel: "",
+            };
+            mediaModelsAvailable = saved.licensedCredentialAvailable && Boolean(
+              mediaModels.image2Model ||
+              mediaModels.grokImageModel ||
+              mediaModels.grokVideoModel ||
+              (mediaModels.seedanceModel && mediaModels.mediaGenerationAgentId),
+            );
+          } catch {
+            // Without either a live catalog or readable local selections, the
+            // safe behavior is to leave only this MCP disabled.
+          }
+        }
         capabilityPackReport = await managerApi.installCapabilityPack({
           ...DEFAULT_CAPABILITY_PACK_OPTIONS,
+          // A failed catalog lookup is not evidence that previously saved
+          // media models are stale. Preserve those user slots for retry.
+          persistConnections: mediaCatalogStatus === "verified",
+          ...mediaModels,
+          enableMediaGeneration: mediaModelsAvailable,
+          mediaGatewayCatalogStatus: mediaCatalogStatus,
+          mediaGatewayModelCount,
+          mediaGatewayCatalogVerifiedAt,
         });
       } catch (capabilityError) {
         capabilityPackErrorDetail =
@@ -783,6 +846,17 @@ export function OfflineHome({
       if (capabilityPackErrorDetail) {
         setInstallationDetail(
           `${result.message}\n能力包自动安装失败：${capabilityPackErrorDetail}\n可在“高级功能 > 组件修复”中重试。`,
+        );
+      } else if (!mediaModelsAvailable) {
+        const mediaMessage = mediaCatalogStatus === "failed"
+          ? "无法读取上游模型目录"
+          : "上游暂未返回可用的图片或视频模型";
+        setInstallationDetail(
+          `${result.message}\n${mediaMessage}，媒体 MCP 未启用；其余能力包已继续安装。可在“连接与扩展”重新检测后启用。`,
+        );
+      } else if (mediaCatalogStatus === "failed") {
+        setInstallationDetail(
+          `${result.message}\n上游模型目录暂不可读，已保留本机现有媒体模型与 MCP 设置；本次没有刷新模型列表。`,
         );
       }
       setStatus(installed);
@@ -811,6 +885,15 @@ export function OfflineHome({
         );
       } else {
         notices.push(t("offline.capabilityFailed"));
+      }
+      if (!mediaModelsAvailable) {
+        notices.push(
+          mediaCatalogStatus === "failed"
+            ? "媒体生成暂未启用：无法读取上游模型目录，可在“连接与扩展”重试。"
+            : "媒体生成暂未启用：未发现可用模型，可在“连接与扩展”重新检测。",
+        );
+      } else if (mediaCatalogStatus === "failed") {
+        notices.push("上游模型目录暂不可读，本次继续使用已有媒体模型设置。");
       }
       if (!injectionIssue && ccswitchReport?.launched) {
         notices.push(ccswitchUserMessage(ccswitchReport.message, t("offline.ccswitchLaunched")));

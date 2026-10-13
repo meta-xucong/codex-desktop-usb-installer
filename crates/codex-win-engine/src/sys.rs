@@ -73,6 +73,15 @@ pub struct CodexLaunchReport {
 #[derive(Debug, Clone, Default)]
 pub struct LaunchOptions {
     pub disable_codex_self_updates: bool,
+    /// Extra environment variables for the launched Codex process. USB callers
+    /// use this only for license-backed MCP credentials and their trusted
+    /// endpoint; the values are never persisted by this engine.
+    pub environment: Vec<(String, String)>,
+    /// The caller has already validated that this launch is in USB mode.
+    /// Enables the USB-only recovery transaction and overlay-aware executable
+    /// selection, independently of whether a legacy bundle requires the
+    /// direct-entry overlay as a launch gate.
+    pub usb_integrity_transaction: bool,
     /// Signed schema 3 USB bundles require the direct-entry shim overlay.
     /// Legacy schema 2 and standard portable installs retain their manifest
     /// entry behavior.
@@ -5003,6 +5012,9 @@ fn configure_portable_launch_command(
     for (name, value) in portable_launch_environment_overrides(options) {
         command.env(name, value);
     }
+    for (name, value) in &options.environment {
+        command.env(name, value);
+    }
     command.args(portable_launch_arguments(
         options,
         software_rendering,
@@ -5230,21 +5242,34 @@ pub fn launch_codex_with_options(
 ) -> Result<CodexLaunchReport, EngineError> {
     if installed.source == "portable" {
         let root = Path::new(&installed.path);
+        // A prior USB launch may have stopped between replacing the core PE
+        // resource and updating its overlay hash. USB mode is an explicit,
+        // validated caller decision; the direct-entry requirement is separate.
+        crate::portable::recover_usb_codex_integrity_before_launch(
+            root,
+            options.usb_integrity_transaction,
+        )?;
         let exe = if options.require_usb_entry_overlay {
             crate::portable::installed_usb_codex_launch_exe(root)?
+        } else if options.usb_integrity_transaction {
+            crate::portable::installed_codex_launch_exe_for_usb_mode(root)?
         } else {
             crate::portable::installed_codex_launch_exe(root)?
         };
         // Keep older non-USB/standard portable roots safe as well.  The patch
         // is no-op for a package whose bootstrap does not use the MSIX
         // updater, and is applied before either launch strategy below.
-        crate::portable::ensure_portable_codex_startup_compatibility(root)?;
+        crate::portable::ensure_portable_codex_startup_compatibility_with_usb_integrity_mode(
+            root,
+            options.usb_integrity_transaction,
+        )?;
         // The locale patch is deliberately launch-time: the manager's
         // language can change without reinstalling the payload, and the
         // fixed-width edit is idempotent for existing USB installs.
         let _ = crate::portable::ensure_portable_codex_locale_compatibility(
             root,
             options.locale_override.as_deref(),
+            options.usb_integrity_transaction,
         )?;
         #[cfg(windows)]
         if options.portable_launch_policy != PortableLaunchPolicy::Standard {
@@ -5282,6 +5307,9 @@ pub fn launch_codex_with_options(
         // CREATE_NO_WINDOW only suppresses a console flash; the GUI still shows.
         // The ordinary non-USB manager retains its historical liveness check.
         let mut command = hidden_command(exe);
+        for (name, value) in &options.environment {
+            command.env(name, value);
+        }
         if options.disable_codex_self_updates {
             command.env(CODEX_SELF_UPDATE_ENV_KEY, CODEX_SELF_UPDATE_ENV_DISABLED);
         }

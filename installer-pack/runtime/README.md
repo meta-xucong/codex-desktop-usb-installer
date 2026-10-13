@@ -17,6 +17,6 @@ HyperFrames CLI 固定为 `hyperframes@0.8.134`，通过随包 Node/npm 安装�
 
 ## 可选组件和账号
 
-MiKTeX/LaTeX 仅在 Manim 需要 `Tex`/`MathTex` 公式时安装。Feishu 需用户自己的 App ID、App Secret 和租户授权；远程 OAuth MCP 需各自的账号/工作区授权；统一媒体 MCP（Image-2/Grok/Seedance，以及未来由同一上游开放的 MiniMax 模型）需用户自己的统一服务 Key/额度。包不含任何凭据，也不会因预装运行时而自动开通第三方服务。
+MiKTeX/LaTeX 仅在 Manim 需要 `Tex`/`MathTex` 公式时安装。Feishu 需用户自己的 App ID、App Secret 和租户授权；远程 OAuth MCP 需各自的账号/工作区授权。U 盘版的统一媒体 MCP 使用签名 License 中自动配置的设备 Key，不要求用户再填写媒体 Base URL 或 Key；具体模型可用性和调用额度仍由对应的 404token 上游配置决定。公开能力包不包含用户凭据。Python 3.12 安装器与依赖 wheelhouse 随包携带，初始化时离线安装并验证。
 
 逐项介质、来源、许可证和完整性见 `bundled/media-manifest.json`、`wheelhouse-manifest.json` 和 `THIRD-PARTY-NOTICES.md`。

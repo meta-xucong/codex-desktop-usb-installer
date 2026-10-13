@@ -96,11 +96,11 @@
 
 `image-prompt-generator` 的职责是产生提示词，不依赖任何生成服务即可完成。只有用户明确要求生成图片时才进入第二阶段：
 
-1. 优先使用当前 Codex 提供的原生图像生成能力。
-2. 用户明确选择并已配置外部 Image-2 时，才显式调用 `$image-2`。
-3. 没有生成能力时交付提示词文件，不声称图片已生成。
+1. 提示词任务只交付提示词，不触发生成。
+2. U 盘版收到实际生图请求时调用 `$image-2`，默认使用签名授权连接的 `gpt-image-2.5` Responses API。
+3. MCP 在同一提交中提取图片、校验 PNG 并保存到本机；未获用户对本次请求的明确确认时不提交。
 
-验收：仓库文本中不存在作为工具名使用的 `image2`；`image-2` 仍保持 `guided-config` 和禁止隐式调用。
+验收：仓库文本中不存在作为工具名使用的 `image2`；U 盘版默认安装 `image-2` 和统一 MCP，外部请求仍走两阶段确认。
 
 ### 4.3 飞书 MCP 契约
 
@@ -156,13 +156,15 @@ Skill 中的脚本均以当前 Skill 目录为基准。说明文本必须要求 
 
 Image-2、Grok 图片/视频和 Seedance 由同一个本地 STDIO `media_generation` MCP 提供，不再各自安装直连 HTTP 脚本。Codex 原生图片能力仍是普通图片请求的默认入口；只有用户明确选择外部 provider 时，才使用对应 Skill 和配置模型。
 
-1. `media_capabilities` 只检查本机配置；`media_prepare` 离线校验请求并写入 30 分钟有效的确认记录；只有用户明确确认后才能调用 `media_submit`。
-2. 用户共用一个媒体 Base URL 与 Key；模型名按 provider 分别配置。Image-2 和 Seedance 网关还要求服务方提供 `agent-id`。所有值均由用户输入，不从其他 API Key 回退，也不猜模型、价格或退款规则。
-3. MCP 将 provider 请求映射到已约定的兼容路径：Image-2 `/api/llm/openai/v1/images/*`、Grok `/v1/images/*` 与 `/v1/videos/*`、Seedance `/api/llm/doubao/contents/generations/tasks*`。这些是本项目的网关适配契约；安装器不会验证某个账户或中转服务是否开通这些路由。
+1. `media_capabilities` 检查本机配置；默认模型缺失时可调用 `media_refresh_models`，只读查询网关目录并保存非敏感模型 ID。`media_prepare` 离线校验请求并写入 30 分钟有效的确认记录；只有用户明确确认后才能调用 `media_submit`。
+2. U 盘版的 Base URL 和 Key 由启动器从已签名 License 运行时提供，不写入用户环境或 Codex 配置。Image-2 默认模型为 `gpt-image-2.5`，走 `/v1/responses`；Seedance 可能仍要求服务方提供 `agent-id`。不猜模型、价格或退款规则。
+3. MCP 将 provider 请求映射到已约定的兼容路径：Image-2 `/v1/responses`、Grok `/v1/images/*` 与 `/v1/videos/*`、Seedance `/api/llm/doubao/contents/generations/tasks*`。这些是本项目的网关适配契约；安装器不会验证某个账户或中转服务是否开通这些路由。
 4. 图片任务的本地参考图会锁定字节数与 SHA-256；Seedance 参考素材须为服务方可访问的 HTTPS URL，并按输入顺序保留，不排序或去重。MCP 不扫描 Codex 会话或从附件名称推断远程素材地址。
 5. Seedance 延续旧适配器约定：显式传入视频时长/比例，默认不加水印，启用音频并要求返回最后一帧。费用、积分预扣、退款规则、模型能力与任务链接有效期以用户的服务方为准，MCP 不自行补值。
 6. `media_submit` 在网络请求前持久化单次提交状态；超时、5xx、限流或响应无法解析时视为结果未知，不自动再次 POST。已有任务只允许经 `media_check` 查询，结果由 `media_save` 保存到本机数据目录。
 7. 确认记录、任务响应和输出保存在 Codex Kit 数据目录，不写入安装后的 Skill 树；Base URL 限定为无凭据、路径、查询参数的根级 HTTPS 地址。
+
+U 盘安装闭环：安装器预装 CPython 3.12 并对媒体 MCP 执行离线健康检查；MCP 仅使用 Python 标准库，无需 `openai` SDK 或系统 Python。USB launcher 从签名 License 读取设备 Key，并在 Codex 启动环境中提供给 MCP 的 `env_vars`；不写入用户环境变量或 Codex `config.toml`。Image-2 在同一次 `/v1/responses` 提交中保存并校验 PNG。健康检查不访问上游；每次真实生成仍须用户确认。
 
 ### 4.7 数据、假设与决策边界
 

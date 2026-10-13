@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
   "id": "codex-starter",
-  "version": "1.5.2",
+  "version": "1.5.3",
   "policy": "No secrets, caches, history, databases, drafts or user content.",
   "system": [
     {
@@ -162,13 +162,13 @@
       ]
     },
     {
-      "id": "credential.media-generation-api-key",
+      "id": "credential.usb-license-404token",
       "kind": "credential",
       "required": true,
-      "autoInstallable": false,
+      "autoInstallable": true,
       "secret": true,
-      "healthCheck": "MEDIA_GENERATION_API_KEY and MEDIA_GENERATION_API_BASE_URL are configured",
-      "failureMessage": "缺少媒体 API 配置时不访问网络。",
+      "healthCheck": "USB launcher supplies the signed device key in the Codex launch environment for the media MCP env_vars pass-through",
+      "failureMessage": "没有有效签名 U 盘授权时不向媒体上游发送请求。",
       "dependentCapabilities": [
         "异步文生图",
         "图生图",
@@ -245,7 +245,7 @@
       "required": true,
       "autoInstallable": true,
       "transport": "stdio",
-      "healthCheck": "media_generation tools/list includes media_prepare, media_submit, media_check and media_save",
+      "healthCheck": "media_generation returns strict UTF-8 tools/list with media_refresh_models, media_capabilities, media_prepare, media_submit, media_check and media_save",
       "failureMessage": "统一媒体 MCP 未安装、未启用或不可用时，不提交外部计费请求。",
       "dependentCapabilities": [
         "异步文生图",
@@ -1726,13 +1726,13 @@
       "id": "image-2",
       "path": "skills/image-2",
       "status": "requires-credential",
-      "afterRemediationStatus": "guided-config",
-      "installByDefault": false,
+      "afterRemediationStatus": "auto-installable-runtime",
+      "installByDefault": true,
       "enableWhen": [
         "skill-installed",
         "runtime.python312",
         "mcp.media-generation",
-        "credential.media-generation-api-key"
+        "signed-usb-license.device-api-key"
       ],
       "dependencyTypes": [
         "credential",
@@ -1742,7 +1742,7 @@
       "dependencies": [
         "runtime.python312",
         "mcp.media-generation",
-        "credential.media-generation-api-key"
+        "credential.usb-license-404token"
       ],
       "dependentCapabilities": [
         "异步文生图",
@@ -1750,7 +1750,7 @@
         "统一 MCP 两阶段确认"
       ],
       "healthCheck": "frontmatter, pack-copy, and dependency health-check path",
-      "notes": "通过统一 media_generation MCP 调用 Image-2 路由；确认清单、本地文件 SHA-256、单次幂等提交和异步任务查询都在 MCP 中处理。图生图参考图仅接受本地图片。"
+      "notes": "通过统一 media_generation MCP 调用已验证的 gpt-image-2.5 Responses 路由；USB 启动器从签名 License 读取该设备的 404token Key，并放入 Codex 启动环境供 MCP env_vars 传入，不写入用户环境或 Codex 配置。确认清单、单次提交、PNG 校验和自动保存均由 MCP 处理。"
     },
     {
       "id": "image-prompt-generator",
@@ -1945,7 +1945,7 @@
       "enableWhen": [
         "skill-installed",
         "mcp.media-generation.ready",
-        "MEDIA_GENERATION_API_KEY",
+        "signed-usb-license.device-api-key",
         "MEDIA_MINIMAX_VIDEO_MODEL",
         "user-approved-paid-task"
       ],
@@ -1956,7 +1956,7 @@
       ],
       "dependencies": [
         "mcp.media-generation",
-        "credential.media-generation-api-key",
+        "credential.usb-license-404token",
         "config.MEDIA_MINIMAX_VIDEO_MODEL"
       ],
       "dependentCapabilities": [
@@ -1964,7 +1964,7 @@
         "异步任务查询"
       ],
       "healthCheck": "MCP reports the MiniMax slot unavailable when the model is blank and prepares a single-use request only when configured",
-      "notes": "保留 MiniMax 专用创作流程 Skill，但所有请求只经统一媒体 MCP，并共用媒体 API Key/Base URL。当前模型槽位留空；只有统一上游实际开放 MiniMax 视频模型后才可启用。无官方 MiniMax API 直连，也不回退到其他视频模型。"
+      "notes": "保留 MiniMax 专用创作流程 Skill，但所有请求只经统一媒体 MCP，并共用签名 U 盘授权中的设备 Key。当前模型槽位留空；只有统一上游实际开放 MiniMax 视频模型后才可启用。无官方 MiniMax API 直连，也不回退到其他视频模型。"
     },
     {
       "id": "multi-search-engine",
@@ -2164,7 +2164,7 @@
         "skill-installed",
         "runtime.python312",
         "mcp.media-generation",
-        "credential.media-generation-api-key"
+        "signed-usb-license.device-api-key"
       ],
       "dependencyTypes": [
         "credential",
@@ -2174,7 +2174,7 @@
       "dependencies": [
         "runtime.python312",
         "mcp.media-generation",
-        "credential.media-generation-api-key"
+        "credential.usb-license-404token"
       ],
       "dependentCapabilities": [
         "视频生成",
@@ -2182,7 +2182,7 @@
         "统一 MCP 确认与任务查询"
       ],
       "healthCheck": "frontmatter, pack-copy, and dependency health-check path",
-      "notes": "通过统一 media_generation MCP 调用 Seedance 路由；当前参考媒体需为服务方可访问的 HTTPS URL，按输入顺序保留。不猜测价格、预扣积分、退款规则或链接期限。"
+      "notes": "通过统一 media_generation MCP 调用 Seedance 路由；共享设备 Key 来自签名 U 盘授权，Seedance 模型和路由 ID 仍按服务方实际配置。当前参考媒体需为服务方可访问的 HTTPS URL，按输入顺序保留。不猜测价格、预扣积分、退款规则或链接期限。"
     },
     {
       "id": "self-improvement-agent",

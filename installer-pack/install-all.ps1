@@ -8,7 +8,8 @@ param(
     [string[]]$EnabledRemoteMcps = @(),
     [switch]$EnableFeishu,
     [switch]$DisableFeishu,
-    [switch]$EnableMediaGeneration
+    [switch]$EnableMediaGeneration,
+    [switch]$DisableMediaGeneration
 )
 
 $ErrorActionPreference = 'Stop'
@@ -18,6 +19,7 @@ $installer = Join-Path $packRoot 'install-to-codex.ps1'
 if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
     throw "安装器不存在: $installer"
 }
+if ($EnableMediaGeneration -and $DisableMediaGeneration) { throw '-EnableMediaGeneration and -DisableMediaGeneration are mutually exclusive.' }
 
 $arguments = @(
     '-NoProfile',
@@ -36,6 +38,7 @@ if (-not [string]::IsNullOrWhiteSpace($TargetUserProfile)) {
 if ($EnableFeishu) { $arguments += '-EnableFeishu' }
 if ($DisableFeishu) { $arguments += '-DisableFeishu' }
 if ($EnableMediaGeneration) { $arguments += '-EnableMediaGeneration' }
+if ($DisableMediaGeneration) { $arguments += '-DisableMediaGeneration' }
 $arguments += @('-FeishuAuthMode', $FeishuAuthMode, '-FeishuDomain', $FeishuDomain)
 if (@($EnableSkills).Count -gt 0) {
     $arguments += '-EnableSkills'

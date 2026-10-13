@@ -151,61 +151,6 @@
       ]
     },
     {
-      "id": "media-generation.api-base-url",
-      "serviceId": "media-generation",
-      "label": "统一媒体 API Base URL",
-      "type": "url",
-      "required": true,
-      "secret": false,
-      "envVar": "MEDIA_GENERATION_API_BASE_URL",
-      "defaultUrl": "",
-      "validation": {
-        "scheme": "https"
-      },
-      "help": "只填 HTTPS 域名根地址，不含 API 路径。媒体 API 兼容模式控制不同网关的路由与任务格式。",
-      "capabilities": [
-        "mcp.media-generation"
-      ]
-    },
-    {
-      "id": "media-generation.api-profile",
-      "serviceId": "media-generation",
-      "label": "媒体 API 兼容模式",
-      "type": "select",
-      "required": false,
-      "secret": false,
-      "envVar": "MEDIA_GENERATION_API_PROFILE",
-      "defaultUrl": "auto",
-      "validation": {
-        "choices": [
-          "auto",
-          "legacy",
-          "wokey"
-        ]
-      },
-      "help": "auto 会识别 api.wokey.ai；其他地址默认使用现有 404Token/Sub2API 路由。Sub2API 若透传 Wokey 标准图/视频端点，请选 wokey。",
-      "capabilities": [
-        "mcp.media-generation"
-      ]
-    },
-    {
-      "id": "media-generation.api-key",
-      "serviceId": "media-generation",
-      "label": "统一媒体 API Key",
-      "type": "secret",
-      "required": true,
-      "secret": true,
-      "envVar": "MEDIA_GENERATION_API_KEY",
-      "defaultUrl": "",
-      "validation": {
-        "minLength": 8
-      },
-      "help": "媒体网关专用 Key。只保存在当前 Windows 用户环境变量；生成请求可能产生费用，每次必须单独确认。",
-      "capabilities": [
-        "mcp.media-generation"
-      ]
-    },
-    {
       "id": "media-generation.agent-id",
       "serviceId": "media-generation",
       "label": "媒体网关路由 ID",
@@ -218,7 +163,7 @@
         "minLength": 1,
         "maxLength": 256
       },
-      "help": "Image-2 和当前 Seedance 网关配置需要；请填写服务方提供的路由 ID，不要用 Codex thread/task ID 替代。Grok 直连风格端点不需要。",
+      "help": "仅在服务方要求时填写路由 ID，例如 Seedance 路由；不要用 Codex thread/task ID 替代。",
       "capabilities": [
         "mcp.media-generation"
       ]
@@ -235,7 +180,7 @@
       "validation": {
         "maxLength": 256
       },
-      "help": "按服务方给出的实际模型名填写；不设默认猜测值。",
+      "help": "由安装器从当前上游模型目录自动选择；未发现时保持空白。",
       "capabilities": [
         "mcp.media-generation"
       ]
@@ -303,7 +248,7 @@
       "validation": {
         "maxLength": 256
       },
-      "help": "当前留空；仅当同一媒体上游实际开放 MiniMax 模型后填写。共用媒体 API Base URL 和 API Key，不连接 MiniMax 官方 API。",
+      "help": "当前留空；仅当同一媒体上游实际开放 MiniMax 模型后填写。自动共用签名 U 盘授权提供的设备 Key，不需另填 Base URL 或 MiniMax 官方 API Key。",
       "capabilities": [
         "mcp.media-generation"
       ]

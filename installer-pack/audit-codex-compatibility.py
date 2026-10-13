@@ -332,8 +332,9 @@ def check_openai_metadata(audit: Audit) -> None:
         prompt = fields.get("default_prompt", "")
         if prompt and f"${skill_id}" not in prompt:
             audit.error(f"{skill_id} default_prompt must explicitly mention ${skill_id}.")
-        if not re.search(r"^\s{2}allow_implicit_invocation:\s*false\s*$", text, re.MULTILINE):
-            audit.error(f"Non-core Skill must disable implicit invocation: {skill_id}")
+        expected_implicit = skill_id == "image-2"
+        if not re.search(rf"^\s{{2}}allow_implicit_invocation:\s*{str(expected_implicit).lower()}\s*$", text, re.MULTILINE):
+            audit.error(f"Unexpected implicit invocation policy for non-core Skill: {skill_id}")
         if skill_id.startswith("feishu-"):
             if not re.search(r'^\s{6}value:\s*"feishu"\s*$', text, re.MULTILINE):
                 audit.error(f"{skill_id} UI metadata lacks the feishu MCP dependency.")
@@ -498,6 +499,36 @@ def check_audit_statuses(audit: Audit) -> None:
         audit.passed("Compatibility statuses, one-step Skill activation, safe unsupported fallbacks, and PDF license/runtime contract")
 
 
+def check_grok_reference_upload_dependency(audit: Audit) -> None:
+    errors_before = len(audit.errors)
+    manifest = load_json(audit.root / "manifest" / "skill-audit.json")
+    skill = next((item for item in manifest.get("skills", []) if item.get("id") == "grok-video-prompt-compiler"), None)
+    if skill is None:
+        audit.error("Grok video prompt compiler is missing from the Skill manifest.")
+        return
+    runtime = next((item for item in skill.get("dependencies", []) if item.get("id") == "runtime.python"), None)
+    declared = runtime.get("pythonPackages", []) if runtime else []
+    requests = next((item for item in declared if item.get("name") == "requests"), None)
+    lock_path = audit.root / "runtime" / "bundled" / "python-requirements.lock"
+    wheel_manifest_path = audit.root / "runtime" / "bundled" / "python-wheelhouse-manifest.json"
+    provisioner_path = audit.root / "runtime" / "provision-runtime.ps1"
+    if not requests or requests.get("version") != "2.34.2" or requests.get("importName") != "requests":
+        audit.error("Grok reference upload must declare locked requests 2.34.2 as a Python runtime package.")
+    if not lock_path.is_file() or not re.search(r"(?m)^requests==2\.34\.2\s+--hash=sha256:[0-9a-f]{64}$", lock_path.read_text(encoding="utf-8")):
+        audit.error("Python runtime requirements lock is missing the hashed requests 2.34.2 pin.")
+    else:
+        wheel_manifest = load_json(wheel_manifest_path)
+        if not any(item.get("normalizedPackage") == "requests" and item.get("version") == "2.34.2" for item in wheel_manifest.get("wheels", [])):
+            audit.error("Python wheelhouse does not contain the locked requests 2.34.2 wheel.")
+    if not provisioner_path.is_file() or not re.search(r"(?m)^\$pythonHealthProbe\s*=.*\brequests\b", provisioner_path.read_text(encoding="utf-8")):
+        audit.error("Installed Python health probe does not import the Skill's requests dependency.")
+    upload_script = audit.root / "skills" / "grok-video-prompt-compiler" / "scripts" / "upload_reference.py"
+    if not upload_script.is_file() or "import requests" not in upload_script.read_text(encoding="utf-8"):
+        audit.error("Grok reference uploader does not use the declared requests package.")
+    if len(audit.errors) == errors_before:
+        audit.passed("Grok reference upload dependency is declared, wheelhouse-locked, and checked in the installed Python runtime")
+
+
 def check_external_adapters(audit: Audit) -> None:
     errors_before = len(audit.errors)
     media_script = audit.root / "scripts" / "media-generation-mcp.py"
@@ -526,6 +557,7 @@ def check_external_adapters(audit: Audit) -> None:
         "hmac.compare_digest", "CONFIRMATION_TTL_SECONDS", 'record["state"] = "submitting"',
         '"Idempotency-Key"', "submission_unknown", "MAX_REFERENCE_BYTES", "MAX_DOWNLOAD_BYTES",
         '"media_prepare"', '"media_submit"', '"media_check"', '"media_save"',
+        '"responses"', '"/v1/responses"', 'image_generation_call',
         '"/v1/images/generations"', '"/v1/videos/generations"',
         '"/api/llm/openai/v1/images/generations"',
         '"/api/llm/doubao/contents/generations/tasks"',
@@ -542,6 +574,12 @@ def check_external_adapters(audit: Audit) -> None:
         audit.error("Retired direct Seedance adapter script remains in the Skill bundle.")
     if "media_prepare" not in image_skill.read_text(encoding="utf-8") or "media_submit" not in image_skill.read_text(encoding="utf-8"):
         audit.error("Image Skill does not route through the unified MCP confirmation contract.")
+    image_meta = (audit.root / "skills" / "image-2" / "agents" / "openai.yaml").read_text(encoding="utf-8")
+    image_entry = next((item for item in load_json(audit.root / "manifest" / "skill-audit.json").get("skills", []) if item.get("id") == "image-2"), {})
+    if image_entry.get("afterRemediationStatus") != "auto-installable-runtime" or image_entry.get("installByDefault") is not True:
+        audit.error("Image-2 Skill must be auto-installed with the bundled runtime on the USB edition.")
+    if not re.search(r"^\s{2}allow_implicit_invocation:\s*true\s*$", image_meta, re.MULTILINE):
+        audit.error("Image-2 Skill must be implicitly available for direct image requests on the USB edition.")
     if "media_prepare" not in seedance_skill.read_text(encoding="utf-8") or "media_check" not in seedance_skill.read_text(encoding="utf-8"):
         audit.error("Seedance Skill does not route through the unified MCP task contract.")
 
@@ -551,20 +589,20 @@ def check_external_adapters(audit: Audit) -> None:
     fields = load_json(fields_path).get("fields", [])
     field_ids = [str(item.get("id", "")) for item in fields]
     expected_fields = {
-        "dashscope.model", "media-generation.api-base-url", "media-generation.api-key",
+        "dashscope.model",
         "media-generation.agent-id", "media-generation.image2-model",
         "media-generation.grok-image-model", "media-generation.grok-video-model",
         "media-generation.seedance-model", "media-generation.minimax-video-model",
     }
-    if len(field_ids) != 17 or len(field_ids) != len(set(field_ids)):
-        audit.error(f"Expected 17 unique guided connection fields after consolidation, found {len(field_ids)}/{len(set(field_ids))}.")
+    if len(field_ids) != 14 or len(field_ids) != len(set(field_ids)):
+        audit.error(f"Expected 14 unique guided connection fields after using the signed USB credential, found {len(field_ids)}/{len(set(field_ids))}.")
     if not expected_fields.issubset(field_ids):
         audit.error(f"Unified media connection fields are incomplete: {sorted(expected_fields - set(field_ids))}")
     if any(field_id.startswith(("image-2.", "seedance.")) for field_id in field_ids):
         audit.error("Retired duplicate Image-2/Seedance configuration fields remain in the installer form.")
     secret_fields = {str(item.get("id")) for item in fields if item.get("secret")}
-    if not {"dashscope.api-key", "media-generation.api-key"}.issubset(secret_fields):
-        audit.error("Unified media/API keys are not marked secret in the connection schema.")
+    if secret_fields != {"feishu.app-secret", "feishu.user-access-token", "dashscope.api-key"}:
+        audit.error("Only Feishu and the separately configured DashScope credentials should appear as secret connection fields.")
 
     services = {str(item.get("id")): item for item in load_json(services_path).get("services", [])}
     dashscope_service = services.get("dashscope-web-search", {})
@@ -578,10 +616,17 @@ def check_external_adapters(audit: Audit) -> None:
     mcp = {str(item.get("id")): item for item in load_json(mcp_path).get("servers", [])}.get("media-generation", {})
     if mcp.get("transport") != "stdio" or mcp.get("configFragment") != "config-fragments/media-generation-stdio.template.toml":
         audit.error("Unified media MCP must be a local STDIO server using its checked-in config template.")
+    if mcp.get("status") != "auto-installable-runtime" or mcp.get("defaultEnabled") is not True:
+        audit.error("Unified media MCP must be enabled by default after its offline runtime check.")
     if set(mcp.get("connectionFields", [])) != {item for item in field_ids if item.startswith("media-generation.")}:
         audit.error("Media MCP connection field closure differs from the installer form.")
+    declared_media_skills = set(mcp.get("relatedSkills", []))
+    audit_skills = {str(item.get("id")) for item in load_json(audit.root / "manifest" / "skill-audit.json").get("skills", [])}
+    missing_media_skills = sorted(skill_id for skill_id in declared_media_skills if skill_id not in audit_skills or not (audit.root / "skills" / skill_id / "SKILL.md").is_file())
+    if missing_media_skills:
+        audit.error(f"Media MCP related Skills are not closed by the package: {missing_media_skills}")
     tool_names = [str(item.get("name", "")) for item in load_json(media_manifest).get("tools", [])]
-    if tool_names != ["media_capabilities", "media_prepare", "media_submit", "media_check", "media_save"]:
+    if tool_names != ["media_refresh_models", "media_capabilities", "media_prepare", "media_submit", "media_check", "media_save"]:
         audit.error(f"Unified media tool contract is incomplete or out of order: {tool_names}")
     for stale_template in (audit.root / "manifest" / "image-2.template.env", audit.root / "manifest" / "seedance.template.env"):
         if stale_template.exists():
@@ -1154,6 +1199,7 @@ def main() -> int:
         check_openai_metadata(audit)
         check_feishu(audit)
         check_audit_statuses(audit)
+        check_grok_reference_upload_dependency(audit)
         check_external_adapters(audit)
         check_local_write_boundaries(audit)
         check_financial_data_truthfulness(audit)

@@ -64,6 +64,7 @@ describe("UpstreamModelManagerSheet", () => {
   beforeEach(() => {
     vi.resetAllMocks();
     localStorage.setItem("cam.lang", "zh-CN");
+    localStorage.removeItem("codex-manager.upstream-model-probe.v1");
     api.manageNativeModelCatalog.mockResolvedValue(catalogState);
     api.gatewayModelProbe.mockResolvedValue(listing);
     api.cancelGatewayModelProbe.mockResolvedValue(true);
@@ -85,6 +86,63 @@ describe("UpstreamModelManagerSheet", () => {
 
     await user.click(screen.getByRole("button", { name: "返回首页" }));
     expect(onDismiss).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps full-probe results across leaving and reopening, and replaces them only after manual refresh", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    api.gatewayModelProbe
+      .mockResolvedValueOnce(listing)
+      .mockResolvedValueOnce({
+        ...listing,
+        status: "passed",
+        generatedRequests: 1,
+        connectivityModelId: "vendor/model-latest",
+        results: [{
+          modelId: "vendor/model-latest", passed: true, generatedRequests: 1,
+          checks: [{ name: "text", passed: true }], errorCode: null,
+        }],
+      })
+      .mockResolvedValueOnce(listing);
+
+    const view = renderSheet();
+    await screen.findByText("vendor/model-latest");
+    await user.click(screen.getByRole("button", { name: "测所有模型可用性" }));
+    expect(await screen.findByText("文字测试可用")).toBeInTheDocument();
+    await waitFor(() => expect(api.gatewayModelProbe).toHaveBeenCalledTimes(2));
+
+    const cached = JSON.parse(localStorage.getItem("codex-manager.upstream-model-probe.v1") ?? "null");
+    cached.updatedAtMs = Date.now() - 49 * 60 * 60 * 1000;
+    localStorage.setItem("codex-manager.upstream-model-probe.v1", JSON.stringify(cached));
+    view.unmount();
+
+    renderSheet();
+    expect(await screen.findByText("文字测试可用")).toBeInTheDocument();
+    expect(screen.getByTestId("upstream-model-cache-notice")).toHaveTextContent("保留 48 小时");
+    expect(api.gatewayModelProbe).toHaveBeenCalledTimes(2);
+
+    await user.click(screen.getByRole("button", { name: "刷新模型列表" }));
+    await waitFor(() => expect(api.gatewayModelProbe).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(screen.getByText("还没测试")).toBeInTheDocument());
+  });
+
+  it("keeps locally configured models missing from the current directory in a collapsed section", async () => {
+    const localOnlyModel = "legacy/claude-3-5-haiku";
+    api.manageNativeModelCatalog.mockResolvedValue({ ...catalogState, modelIds: [localOnlyModel] });
+
+    renderSheet();
+    await screen.findByText("vendor/model-latest");
+
+    const candidates = screen.getByTestId("upstream-model-candidate-list");
+    expect(within(candidates).getByText("vendor/model-latest")).toBeInTheDocument();
+    expect(within(candidates).queryByText(localOnlyModel)).not.toBeInTheDocument();
+
+    const sectionTitle = screen.getByText("本机已配置，但本次上游目录未返回");
+    const section = sectionTitle.closest("details");
+    expect(section).not.toHaveAttribute("open");
+    expect(within(section!).getByText(localOnlyModel)).toBeInTheDocument();
+    expect(within(section!).getByText(/本机记录不代表上游当前支持/)).toBeInTheDocument();
+    expect(within(section!).queryByRole("button")).not.toBeInTheDocument();
   });
 
   it("discovers read-only and only offers Add after the exact model passes a quick test", async () => {
@@ -121,7 +179,7 @@ describe("UpstreamModelManagerSheet", () => {
 
     await user.click(screen.getByRole("button", { name: "测试是否可用" }));
     await screen.findByRole("button", { name: "添加到 Codex" });
-    expect(screen.getByText("测试通过")).toBeInTheDocument();
+    expect(screen.getByText("文字测试可用")).toBeInTheDocument();
     expect(api.gatewayModelProbe.mock.calls[1]?.[0]).toMatchObject({
       selectedModelIds: [], connectivityModelId: "vendor/model-latest", costConsent: false,
     });
@@ -134,6 +192,90 @@ describe("UpstreamModelManagerSheet", () => {
     expect(api.manageNativeModelCatalog.mock.calls[2]?.[0].requestId)
       .not.toBe(api.gatewayModelProbe.mock.calls[1]?.[0].requestId);
     expect(await screen.findByText("已添加到 Codex。重启 Codex 后即可使用。")).toBeInTheDocument();
+    expect(within(screen.getByTestId("upstream-model-vendor/model-latest"))
+      .getByText("已添加到 Codex")).toBeInTheDocument();
+    expect(within(screen.getByTestId("upstream-model-vendor/model-latest"))
+      .queryByText("文字测试可用")).not.toBeInTheDocument();
+    expect(within(screen.getByTestId("upstream-model-vendor/model-latest"))
+      .queryByRole("button", { name: "添加到 Codex" })).not.toBeInTheDocument();
+  });
+
+  it("does not report Add as successful when the post-write catalog reread omits the model", async () => {
+    const user = userEvent.setup();
+    api.gatewayModelProbe
+      .mockResolvedValueOnce(listing)
+      .mockResolvedValueOnce({
+        ...listing,
+        status: "passed",
+        generatedRequests: 1,
+        connectivityModelId: "vendor/model-latest",
+        connectivityProofId: "proof-reread-mismatch",
+        checkedAt: Math.floor(Date.now() / 1000),
+        connectivityProofExpiresAt: Math.floor(Date.now() / 1000) + 300,
+        results: [{ modelId: "vendor/model-latest", passed: true, generatedRequests: 1,
+          checks: [{ name: "text", passed: true }], errorCode: null }],
+      });
+    api.manageNativeModelCatalog
+      .mockResolvedValueOnce(catalogState)
+      .mockResolvedValueOnce(catalogState)
+      .mockResolvedValueOnce({
+        status: "applied_restart_pending", modelIds: ["vendor/model-latest"],
+        restartRequired: true, message: "added",
+      })
+      .mockResolvedValueOnce(catalogState);
+
+    renderSheet();
+    await screen.findByText("vendor/model-latest");
+    await user.click(screen.getByRole("button", { name: "测试是否可用" }));
+    await user.click(await screen.findByRole("button", { name: "添加到 Codex" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("还不能确认这个模型是否添加成功。请刷新列表查看状态。");
+    expect(screen.queryByText("已添加到 Codex。重启 Codex 后即可使用。")).not.toBeInTheDocument();
+    const row = screen.getByTestId("upstream-model-vendor/model-latest");
+    expect(within(row).queryByText("已添加到 Codex")).not.toBeInTheDocument();
+    expect(within(row).queryByText("文字测试可用")).not.toBeInTheDocument();
+    expect(within(row).getByRole("button", { name: "测试是否可用" })).toBeInTheDocument();
+  });
+
+  it("clears the old availability badge when Add outcome is unconfirmed and state reread fails", async () => {
+    const user = userEvent.setup();
+    api.gatewayModelProbe
+      .mockResolvedValueOnce(listing)
+      .mockResolvedValueOnce({
+        ...listing,
+        status: "passed",
+        generatedRequests: 1,
+        connectivityModelId: "vendor/model-latest",
+        connectivityProofId: "proof-state-read-fails",
+        checkedAt: Math.floor(Date.now() / 1000),
+        connectivityProofExpiresAt: Math.floor(Date.now() / 1000) + 300,
+        results: [{ modelId: "vendor/model-latest", passed: true, generatedRequests: 1,
+          checks: [{ name: "text", passed: true }], errorCode: null }],
+      });
+    let addStarted = false;
+    api.manageNativeModelCatalog.mockImplementation(({ operation }) => {
+      if (operation === "add") {
+        addStarted = true;
+        return Promise.resolve({
+          status: "outcome_unconfirmed", modelIds: [], restartRequired: true,
+          message: "unconfirmed",
+        });
+      }
+      if (addStarted) return Promise.reject(new Error("state read failed"));
+      return Promise.resolve(catalogState);
+    });
+
+    renderSheet();
+    await screen.findByText("vendor/model-latest");
+    await user.click(screen.getByRole("button", { name: "测试是否可用" }));
+    await user.click(await screen.findByRole("button", { name: "添加到 Codex" }));
+
+    expect(await screen.findByText("模型设置暂不可用。请刷新列表，或恢复 Codex 默认模型后再试。"))
+      .toBeInTheDocument();
+    const row = screen.getByTestId("upstream-model-vendor/model-latest");
+    expect(within(row).getByText("还没测试")).toBeInTheDocument();
+    expect(within(row).queryByText("文字测试可用")).not.toBeInTheDocument();
+    expect(within(row).queryByText("已添加到 Codex")).not.toBeInTheDocument();
   });
 
   it("never offers Add after a failed quick test and revokes a passed ticket on close", async () => {
@@ -264,6 +406,11 @@ describe("UpstreamModelManagerSheet", () => {
       restartRequired: true,
       message: "added",
     });
+    api.manageNativeModelCatalog.mockResolvedValueOnce({
+      ...catalogState,
+      modelIds: ["vendor/model-latest"],
+      restartRequired: true,
+    });
     expect(await screen.findByText("已添加到 Codex。重启 Codex 后即可使用。")).toBeInTheDocument();
   });
 
@@ -324,8 +471,8 @@ describe("UpstreamModelManagerSheet", () => {
       message: "added",
     });
 
-    expect(await screen.findByText("已添加到 Codex")).toBeInTheDocument();
-    expect(screen.getByText("共找到 1 个模型，已添加 1 个")).toBeInTheDocument();
+    expect(await screen.findByText("已添加到 Codex。重启 Codex 后即可使用。")).toBeInTheDocument();
+    expect(screen.queryByText("共找到 1 个模型，已添加 1 个")).not.toBeInTheDocument();
     await waitFor(() => {
       expect(refresh).toBeEnabled();
       expect(reset).toBeEnabled();
@@ -460,6 +607,9 @@ describe("UpstreamModelManagerSheet", () => {
     expect(api.manageNativeModelCatalog.mock.calls[3]?.[0]).toEqual({ operation: "state" });
     expect(screen.getByRole("button", { name: "测试是否可用" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "恢复 Codex 默认模型" })).toBeInTheDocument();
+    const row = screen.getByTestId("upstream-model-vendor/model-latest");
+    expect(within(row).getByText("还没测试")).toBeInTheDocument();
+    expect(within(row).queryByText("文字测试可用")).not.toBeInTheDocument();
   });
 
   it("keeps Test and Add disabled when a partial Reset rereads as orphaned", async () => {
@@ -482,6 +632,9 @@ describe("UpstreamModelManagerSheet", () => {
     expect(screen.getByRole("button", { name: "测试是否可用" })).toBeDisabled();
     expect(screen.queryByRole("button", { name: "添加到 Codex" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "恢复 Codex 默认模型" })).toBeInTheDocument();
+    const row = screen.getByTestId("upstream-model-vendor/model-latest");
+    expect(within(row).getByText("还没测试")).toBeInTheDocument();
+    expect(within(row).queryByText("文字测试可用")).not.toBeInTheDocument();
   });
 
   it("keeps only Reset when a partial Add rereads as orphaned", async () => {
@@ -519,5 +672,8 @@ describe("UpstreamModelManagerSheet", () => {
     expect(screen.getByRole("button", { name: "测试是否可用" })).toBeDisabled();
     expect(screen.queryByRole("button", { name: "添加到 Codex" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "恢复 Codex 默认模型" })).toBeInTheDocument();
+    const row = screen.getByTestId("upstream-model-vendor/model-latest");
+    expect(within(row).getByText("还没测试")).toBeInTheDocument();
+    expect(within(row).queryByText("文字测试可用")).not.toBeInTheDocument();
   });
 });
