@@ -17,8 +17,6 @@
 
 // The public non-Windows stubs keep cross-platform manager builds possible;
 // the lease helper, process matching and removable-media scanner run on Windows.
-#![cfg_attr(not(target_os = "windows"), allow(dead_code))]
-
 #[cfg(target_os = "windows")]
 use std::fs::OpenOptions;
 use std::fs::{self, File};
