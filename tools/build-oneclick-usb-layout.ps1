@@ -14,6 +14,11 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$windowsPowerShell = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
+if (-not (Test-Path -LiteralPath $windowsPowerShell -PathType Leaf)) {
+    $windowsPowerShellCommand = Get-Command powershell.exe -ErrorAction Stop
+    $windowsPowerShell = $windowsPowerShellCommand.Source
+}
 . (Join-Path $repo "tools\usb-signing-profile.ps1")
 $signingProfile = $null
 $releaseVersion = [string]((Get-Content -LiteralPath (Join-Path $repo "package.json") -Raw | ConvertFrom-Json).version)
@@ -366,6 +371,7 @@ Copy-Item -LiteralPath (Join-Path $PSScriptRoot "verify-usb-launcher.ps1") -Dest
 $verificationOutput = Join-Path $output "verification"
 New-Item -ItemType Directory -Force -Path $verificationOutput | Out-Null
 Copy-Item -LiteralPath (Join-Path $repo "tools\usb-signing-profile.ps1") -Destination (Join-Path $verificationOutput "usb-signing-profile.ps1") -Force
+Copy-Item -LiteralPath (Join-Path $repo "tools\verify-capability-pack-powershell.ps1") -Destination (Join-Path $verificationOutput "verify-capability-pack-powershell.ps1") -Force
 if ($null -ne $signingProfile) {
     # Only emit the public verification fields. Never copy the source profile
     # verbatim: a future local signing profile may contain private or
@@ -386,11 +392,11 @@ if ($null -ne $signingProfile) {
     )
 }
 $launcherVerifier = Join-Path $output "verify-usb-launcher.ps1"
-& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $launcherVerifier -Path (Join-Path $output "CodexAppManager.exe") -ExpectedLevel requireAdministrator
+& $windowsPowerShell -NoProfile -ExecutionPolicy Bypass -File $launcherVerifier -Path (Join-Path $output "CodexAppManager.exe") -ExpectedLevel requireAdministrator
 if ($LASTEXITCODE -ne 0) {
     throw "CodexAppManager.exe 未通过 USB requireAdministrator 清单验证"
 }
-& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $launcherVerifier -Path (Join-Path $output "CodexEntryShim.exe") -ExpectedLevel asInvoker
+& $windowsPowerShell -NoProfile -ExecutionPolicy Bypass -File $launcherVerifier -Path (Join-Path $output "CodexEntryShim.exe") -ExpectedLevel asInvoker
 if ($LASTEXITCODE -ne 0) {
     throw "CodexEntryShim.exe 未通过 asInvoker 清单验证"
 }
@@ -709,8 +715,15 @@ if ($UsbPolicy -eq "SignedRequired") {
 } elseif ($SkipSignature) {
     $standaloneVerifyArgs += "-SkipSignature"
 }
-$standaloneVerification = & powershell.exe @standaloneVerifyArgs 2>&1 | Out-String
-if ($LASTEXITCODE -ne 0) {
+$previousErrorActionPreference = $ErrorActionPreference
+try {
+    $ErrorActionPreference = 'Continue'
+    $standaloneVerification = & $windowsPowerShell @standaloneVerifyArgs 2>&1 | Out-String
+    $standaloneVerificationExitCode = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $previousErrorActionPreference
+}
+if ($standaloneVerificationExitCode -ne 0) {
     throw "生成后的随盘 verify-usb.ps1 自检失败：$standaloneVerification"
 }
 

@@ -1,4 +1,4 @@
-# CCSwitch 源码克隆与构建脚本
+﻿# CCSwitch 源码克隆与构建脚本
 # 用途: 从 GitHub 克隆指定 commit 的 CCSwitch 源码,应用环境变量补丁,并构建新版本
 
 param(

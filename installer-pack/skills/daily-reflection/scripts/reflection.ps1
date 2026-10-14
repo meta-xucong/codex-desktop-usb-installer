@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [Parameter(Position = 0)][ValidateSet('health','template','log','summary')][string]$Command = 'health',
     [string]$Date = ([DateTime]::Now.ToString('yyyy-MM-dd')),

@@ -510,6 +510,31 @@ Assert-Condition (Test-Path -LiteralPath $contentReadme -PathType Leaf) "缺少 
 Assert-Condition (Test-Path -LiteralPath $skillsReadme -PathType Leaf) "缺少 content/skills 目录契约"
 Assert-Condition (Test-Path -LiteralPath $mcpReadme -PathType Leaf) "缺少 content/mcp 目录契约"
 Assert-Condition (Test-Path -LiteralPath $capabilityPack -PathType Container) "缺少完整能力包目录 content/codex-starter-kit"
+$capabilityPowerShellVerifier = Join-Path $PSScriptRoot "verify-capability-pack-powershell.ps1"
+if (-not (Test-Path -LiteralPath $capabilityPowerShellVerifier -PathType Leaf)) {
+    $capabilityPowerShellVerifier = Join-Path $PSScriptRoot "verification\verify-capability-pack-powershell.ps1"
+}
+Assert-Condition (Test-Path -LiteralPath $capabilityPowerShellVerifier -PathType Leaf) "缺少 Windows PowerShell 能力包编码/语法验证器"
+$windowsPowerShell = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
+if (-not (Test-Path -LiteralPath $windowsPowerShell -PathType Leaf)) {
+    $windowsPowerShellCommand = Get-Command powershell.exe -ErrorAction Stop
+    $windowsPowerShell = $windowsPowerShellCommand.Source
+}
+$previousErrorActionPreference = $ErrorActionPreference
+try {
+    # Ignore stderr as a success/failure signal: stock Windows hosts may emit
+    # provider initialization warnings before the verifier starts. The verifier
+    # is fail-closed and its process exit code is authoritative.
+    $ErrorActionPreference = 'Continue'
+    $capabilityPowerShellCheck = & $windowsPowerShell -NoProfile -ExecutionPolicy Bypass -File $capabilityPowerShellVerifier -Root $root 2>&1 | Out-String
+    $capabilityPowerShellExitCode = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $previousErrorActionPreference
+}
+if ($capabilityPowerShellExitCode -ne 0) {
+    throw "能力包 PowerShell 编码或 Windows PowerShell 5.1 语法检查失败：$($capabilityPowerShellCheck.Trim())"
+}
+Write-Output $capabilityPowerShellCheck.Trim()
 Assert-CompiledUsbManagerPolicy $manager $signingPolicy
 if ($signingPolicy -eq "SignedRequired") {
     Assert-CompiledUsbManagerBinding $manager $signingKeyId $configuredPublicKey $signingDigest
@@ -527,16 +552,37 @@ Assert-Condition ($usbManifest.webView2Runtime.file -eq "resources/prerequisites
 Assert-Condition ($usbManifest.webView2Runtime.sha256 -ieq $expectedWebView2Hash) "联合清单中的 WebView2 哈希不正确"
 Assert-Condition ((Get-JsonInteger $usbManifest.webView2Runtime "size") -eq (Get-Item -LiteralPath $webView2).Length) "联合清单中的 WebView2 大小不正确"
 Assert-Condition ($usbManifest.webView2Runtime.beforeUi -eq $true) "WebView2 必须在创建安装界面前预检"
-$launcherVerification = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $launcherVerifierPath -Path $installer 2>&1 | Out-String
-if ($LASTEXITCODE -ne 0) {
+$previousErrorActionPreference = $ErrorActionPreference
+try {
+    $ErrorActionPreference = 'Continue'
+    $launcherVerification = & $windowsPowerShell -NoProfile -ExecutionPolicy Bypass -File $launcherVerifierPath -Path $installer 2>&1 | Out-String
+    $launcherVerificationExitCode = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $previousErrorActionPreference
+}
+if ($launcherVerificationExitCode -ne 0) {
     throw "USB 入口清单验证失败：$launcherVerification"
 }
-$managerVerification = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $launcherVerifierPath -Path $manager -ExpectedLevel requireAdministrator 2>&1 | Out-String
-if ($LASTEXITCODE -ne 0) {
+$previousErrorActionPreference = $ErrorActionPreference
+try {
+    $ErrorActionPreference = 'Continue'
+    $managerVerification = & $windowsPowerShell -NoProfile -ExecutionPolicy Bypass -File $launcherVerifierPath -Path $manager -ExpectedLevel requireAdministrator 2>&1 | Out-String
+    $managerVerificationExitCode = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $previousErrorActionPreference
+}
+if ($managerVerificationExitCode -ne 0) {
     throw "USB 管理器清单验证失败：$managerVerification"
 }
-$entryShimVerification = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $launcherVerifierPath -Path $entryShim -ExpectedLevel asInvoker 2>&1 | Out-String
-if ($LASTEXITCODE -ne 0) {
+$previousErrorActionPreference = $ErrorActionPreference
+try {
+    $ErrorActionPreference = 'Continue'
+    $entryShimVerification = & $windowsPowerShell -NoProfile -ExecutionPolicy Bypass -File $launcherVerifierPath -Path $entryShim -ExpectedLevel asInvoker 2>&1 | Out-String
+    $entryShimVerificationExitCode = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $previousErrorActionPreference
+}
+if ($entryShimVerificationExitCode -ne 0) {
     throw "USB Codex direct-entry shim 清单验证失败：$entryShimVerification"
 }
 $actualVcRedistHash = (Get-FileHash -LiteralPath $vcRedist -Algorithm SHA256).Hash

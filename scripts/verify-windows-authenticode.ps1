@@ -1,4 +1,4 @@
-# Verify Authenticode signatures on Windows PE files (installer, app, uninstaller).
+﻿# Verify Authenticode signatures on Windows PE files (installer, app, uninstaller).
 #
 # Modes:
 #   optional  — report status; unsigned/NotSigned exits 0 (current milestone while

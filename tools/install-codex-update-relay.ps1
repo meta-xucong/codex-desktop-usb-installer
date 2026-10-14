@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param([switch]$RunSync,[switch]$VerifyPublic)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"

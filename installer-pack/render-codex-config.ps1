@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$OutputPath,
     [string]$SkillRoot,
@@ -94,7 +94,7 @@ if ($EnableMediaGeneration) {
     $mediaHealthText = & $MediaMcpWrapperPath -HealthCheck | Out-String
     if ($LASTEXITCODE -ne 0) { throw 'Bundled Python media MCP health check failed.' }
     $mediaHealth = $mediaHealthText | ConvertFrom-Json
-    if (-not [bool]$mediaHealth.ready -or [string]$mediaHealth.serverVersion -ne '1.3.3' -or [string]$mediaHealth.healthScope -ne 'local-runtime-protocol' -or [string]$mediaHealth.protocolStatus -ne 'passed' -or [int]$mediaHealth.toolCount -ne 6) { throw 'Bundled Python media MCP local runtime/protocol check is unhealthy.' }
+    if (-not [bool]$mediaHealth.ready -or [string]$mediaHealth.serverVersion -ne '1.3.4' -or [string]$mediaHealth.healthScope -ne 'local-runtime-protocol' -or [string]$mediaHealth.protocolStatus -ne 'passed' -or [int]$mediaHealth.toolCount -ne 6) { throw 'Bundled Python media MCP local runtime/protocol check is unhealthy.' }
 }
 
 $mcpManifestPath = Join-Path $kitRoot 'manifest\mcp-servers.json'

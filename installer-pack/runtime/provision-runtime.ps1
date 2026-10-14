@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$PackRoot,
     [Parameter(Mandatory = $true)][string]$TargetUserProfile,

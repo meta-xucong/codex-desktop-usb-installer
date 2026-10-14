@@ -51,3 +51,27 @@ The source-level remediation and listed local suites pass, but this is **not rel
 4. Verify media MCP `initialize`, `tools/list`, and `media_capabilities` using the packaged wrapper and ordinary Codex launch environment; keep live billable generation as an explicitly authorized separate acceptance step.
 
 Until these artifact-level checks pass, do not mark the USB release as fully accepted or ready to publish.
+
+## Follow-up: media MCP installer entrypoint failure — 2026-10-14
+
+The field report that media MCP still did not install exposed a gap not caught by the prior server health check: `install-all.ps1` and `install-to-codex.ps1` contain non-ASCII text but were BOM-less UTF-8. Windows PowerShell 5.1 decoded the entrypoint with the active ANSI code page and produced parser errors before the install logic ran. Adding UTF-8 BOMs made both scripts parse successfully in Windows PowerShell 5.1. A regression test now parses both files with the Windows PowerShell parser.
+
+The installation path also treated route availability as a component-install prerequisite: it rejected an empty media model catalog, Seedance without an agent route, or MiniMax under another profile. That contradicted the intended behavior where the MCP can be installed while individual generation routes remain unavailable. These checks no longer abort component installation; the MCP's `media_capabilities` response reports missing route requirements. Runtime protocol validation remains required.
+
+Verification after this follow-up:
+
+- Windows PowerShell 5.1 parsed both media-install entrypoints successfully.
+- Adapter contract suite: **61 passed, 0 failed**.
+- Isolated install into a temporary profile with all media model IDs empty completed. Readiness reported `registered=true`, runtime/protocol `passed`, gateway catalog `not-checked`, and generation `not-tested`; the packaged wrapper health check returned `ready=true` and six tools. No API key or billable generation request was used.
+- Full installer build: TypeScript check, ESLint, **415 frontend tests**, **724 Rust tests** passed (6 ignored), Vite production build, and release PE manifest checks passed.
+- One-click USB package rebuilt and `verify-oneclick-usb.ps1 -InternalSigned -SkipNetwork` passed with the g48 release profile.
+
+The build proves installation and local MCP protocol registration, not gateway credentials, live image generation, or physical USB cold-start acceptance.
+
+## Follow-up: Windows PowerShell encoding release gate — 2026-10-14
+
+The field failure was caused by a BOM-less UTF-8 copy of the capability package, not an actual unmatched quote. Windows PowerShell 5.1 decoded Chinese source bytes through the machine's legacy ANSI code page; PowerShell 7's UTF-8 default masked that defect during some developer checks. See [`WINDOWS-POWERSHELL-ENCODING-GATE-20261014.md`](WINDOWS-POWERSHELL-ENCODING-GATE-20261014.md) for the encoding contract and references.
+
+The package now applies UTF-8 BOM consistently to all `.ps1`, `.psm1`, and `.psd1` files. The release gate strictly decodes UTF-8 and parses every packaged PowerShell file using Windows PowerShell 5.1 against both the source tree and copied USB payload. The standalone USB verifier repeats the same check using its bundled helper. Regression fixtures confirm acceptance of BOM-marked Chinese text and rejection of BOM-less scripts, invalid UTF-8, and parser errors.
+
+This follow-up changes only PowerShell file encoding, build/verification gates, package checksums, and tests. It does not change the Codex startup, model catalog, model merge semantics, MCP protocol, or media route behavior.

@@ -96,14 +96,14 @@
     },
     {
       "path": "config-fragments/media-generation-stdio.template.toml",
-      "sha256": "27f832a198985716ef9c7e824a8d64c59a57fbea2cc4fe9bd13d57d4b52483bf",
-      "bytes": 753,
+      "sha256": "e256d4d513304885a00f4496d994068edbb1c531ff82c8f506e61f8f9ff0622a",
+      "bytes": 754,
       "owned": true
     },
     {
       "path": "configure-codex.ps1",
-      "sha256": "d3286a50f694223656ae26581d5228928e5583217dc259c46a700a00004972e3",
-      "bytes": 6913,
+      "sha256": "dc67a71394ba431dd1eba5450c4af03d202f1b19185bbb36d1608a258f9deab1",
+      "bytes": 6916,
       "owned": true
     },
     {
@@ -150,14 +150,14 @@
     },
     {
       "path": "install-all.ps1",
-      "sha256": "d363802ae55bc8034d6e7e4814affc62377648ef84dd8e5756f5d8ba9bd037de",
-      "bytes": 2717,
+      "sha256": "ee5c7b0de4269571e6e1c06209f1994d3dab7fe92da04454eb66ffa85063c3b5",
+      "bytes": 2720,
       "owned": true
     },
     {
       "path": "install-to-codex.ps1",
-      "sha256": "1d6c5056af2b0d2dd6946e9d383442dcfe8fc6770668f1fa80334287de1a15b7",
-      "bytes": 57007,
+      "sha256": "67860f3e95c6d2e9fa150d17798f077c37082da95d78984fd180df0ad3a935ef",
+      "bytes": 56176,
       "owned": true
     },
     {
@@ -216,14 +216,14 @@
     },
     {
       "path": "manifest/mcp-servers.json",
-      "sha256": "49d09c9b147d276f8abcc68a81d01a2829dcaefea26a91b0f674daa9dbb2ce1d",
-      "bytes": 9590,
+      "sha256": "733c0f265ba5303040c4e9c64c181a28a22365220873d28659ceb8c01a209968",
+      "bytes": 9744,
       "owned": true
     },
     {
       "path": "manifest/media-generation-tools.json",
-      "sha256": "66150525ada50e405f74c0cdd125a7cc0f093350fedef385dfd4f8152cb99dc3",
-      "bytes": 2263,
+      "sha256": "b62debedf94d940c73b50016969dbe6d2bf6ee137588847b327cea442aac7fdf",
+      "bytes": 2342,
       "owned": true
     },
     {
@@ -270,14 +270,14 @@
     },
     {
       "path": "mcp/mcp-servers.json",
-      "sha256": "f00c5cfc839526564855512be8c856d38e40d0a0150fb35cdeca039f2213b731",
-      "bytes": 9588,
+      "sha256": "a34fe825b72ed07e72c287d528f87a687719ea8b565d7f08063bb1a011a02000",
+      "bytes": 9742,
       "owned": true
     },
     {
       "path": "mcp/media-generation-mcp.py",
-      "sha256": "ed300e6efc978bf6a099f5a530d598a860334c17ee86ad55721af36ccbd7b969",
-      "bytes": 74045,
+      "sha256": "98cf9c7960ad2b4843d9209399c57d957958fca94cf363e96ca51adaa7109c8b",
+      "bytes": 74118,
       "owned": true
     },
     {
@@ -288,14 +288,14 @@
     },
     {
       "path": "mcp/start-feishu-mcp.ps1",
-      "sha256": "1d7af0beda1b6d8cc859dca3c478eb900812df6517e4284296edfd6ad54cbfc8",
-      "bytes": 6094,
+      "sha256": "6d9cb34ebc0f37b4b71d92f9de330750033bad90a2c34b70afee08b0f92e2d87",
+      "bytes": 6097,
       "owned": true
     },
     {
       "path": "mcp/start-media-generation-mcp.ps1",
-      "sha256": "5c1c1c2d65c569630493905ef0183a443af251e63a9868ee48cd1d088fd1c96d",
-      "bytes": 8892,
+      "sha256": "af1532340d08ae57980f4c40169047d34e60ab14fd7be160fcdee0d1c4962a1d",
+      "bytes": 8895,
       "owned": true
     },
     {
@@ -312,8 +312,8 @@
     },
     {
       "path": "render-codex-config.ps1",
-      "sha256": "eeff4cffd1c2e3520c34ea8a62c8aea160eefba54ea2412aa145965199ad371c",
-      "bytes": 11994,
+      "sha256": "1ed30e65b6251602f2cef5586a17bf25465ff0cbbb5755679b466f2dccf26d1c",
+      "bytes": 11997,
       "owned": true
     },
     {
@@ -852,8 +852,8 @@
     },
     {
       "path": "runtime/materialize-python-wheelhouse.ps1",
-      "sha256": "5b91c25931bd58469752a620c2e3bb210722e68502987f7d816fdd44ddd7ed17",
-      "bytes": 1825,
+      "sha256": "a7eef0d4dd3bea2019188c403a4fb5577916ebbfd15dc1b3a433cd7f2143d67f",
+      "bytes": 1828,
       "owned": true
     },
     {
@@ -864,8 +864,8 @@
     },
     {
       "path": "runtime/provision-runtime.ps1",
-      "sha256": "2edd6b0bbbb8d8afbdb656a2abb0a5b79a9f3ea5ee71def3cbd428afa674dd46",
-      "bytes": 24566,
+      "sha256": "7c4cef7b2c016d502fdd38508e57b5d1d50b826180704c140808a0af685eee75",
+      "bytes": 24569,
       "owned": true
     },
     {
@@ -996,8 +996,8 @@
     },
     {
       "path": "skills/daily-reflection/scripts/reflection.ps1",
-      "sha256": "fa0a36fed45e0e61d4050a5db66837d1cf64ce137a72f5352d776f40b8a26d56",
-      "bytes": 1893,
+      "sha256": "2d78bec6f6de84384a6b612a0ea01830d7944929694fadcecae5c81bfa93ad76",
+      "bytes": 1896,
       "owned": true
     },
     {
@@ -1548,8 +1548,8 @@
     },
     {
       "path": "skills/python-env-setup/scripts/check_python_env.ps1",
-      "sha256": "d9a004995ca89de868c7e415ed9734b19e3894f65d9b4c85828b3cc6bdc99c63",
-      "bytes": 2501,
+      "sha256": "7753dab79d4df6db5279aacae68089995bd74096641b9d5e81884b661408906f",
+      "bytes": 2504,
       "owned": true
     },
     {
@@ -1602,8 +1602,8 @@
     },
     {
       "path": "skills/skills-search/scripts/skills_search.ps1",
-      "sha256": "846b146b96ca16523a860b82ef8efaac2caf131b2e2e6402c3d69131c2f76341",
-      "bytes": 3352,
+      "sha256": "fae12033d1e40f05cbe2bef11757d250407b4c2a656e7812c9051c06f57cc709",
+      "bytes": 3355,
       "owned": true
     },
     {
@@ -1740,8 +1740,8 @@
     },
     {
       "path": "skills/weather-forecast/scripts/weather_db.ps1",
-      "sha256": "c4721ad0b145c3ba96b6ac27b6ee35dda5d0f5eeccb424d02b0228c998748312",
-      "bytes": 1741,
+      "sha256": "aac008ae6fac35985932b3e481c422ec53bab2e8d4c4f698e2ac5ddf7a196f22",
+      "bytes": 1744,
       "owned": true
     },
     {
@@ -1842,14 +1842,14 @@
     },
     {
       "path": "sync-model-catalog.ps1",
-      "sha256": "84e571960dfaabec6223546ffd428f24a34e835933e75904cf4fe6b611786ab9",
-      "bytes": 13030,
+      "sha256": "fffa4f6ae689467409982434fb3356a7377742165914d9f2872602fc081eae69",
+      "bytes": 13033,
       "owned": true
     },
     {
       "path": "test-adapter-contracts.py",
-      "sha256": "377d60abb883080cabc7b2fd299f97452ba45c73ed31ae2b574f5cc66156e2c3",
-      "bytes": 95958,
+      "sha256": "98a64c6481fdde003806d92b9d4a535b6a5f2dedbfef6e0b3550583795002277",
+      "bytes": 101063,
       "owned": true
     }
   ]

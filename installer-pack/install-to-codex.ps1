@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [switch]$IncludeNonDefault,
     [switch]$IncludeUnsupported,
@@ -384,18 +384,10 @@ if ($mediaGenerationEnabled) {
         $mediaProfile = 'responses'
     }
     if ($mediaProfile -notin @('auto','legacy','wokey','responses')) { throw 'Unsupported media API profile.' }
-    $mediaModelEnvNames = @('MEDIA_IMAGE2_MODEL','MEDIA_GROK_IMAGE_MODEL','MEDIA_GROK_VIDEO_MODEL','MEDIA_SEEDANCE_MODEL','MEDIA_MINIMAX_VIDEO_MODEL')
-    $configuredMediaModels = @($mediaModelEnvNames | Where-Object { -not [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_, 'Process')) })
-    if ($configuredMediaModels.Count -eq 0) { throw 'EnableMediaGeneration requires at least one provider model ID.' }
-    if (-not [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable('MEDIA_SEEDANCE_MODEL', 'Process')) -and [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable('MEDIA_GENERATION_AGENT_ID', 'Process'))) {
-        throw 'EnableMediaGeneration requires MEDIA_GENERATION_AGENT_ID for the configured Seedance route.'
-    }
-    $minimaxVideoModel = [Environment]::GetEnvironmentVariable('MEDIA_MINIMAX_VIDEO_MODEL', 'Process')
-    if (-not [string]::IsNullOrWhiteSpace($minimaxVideoModel)) {
-        if ($mediaProfile -ne 'wokey') {
-            throw 'MiniMax video model is supported only through the shared upstream Wokey-compatible profile; the official MiniMax API is not used.'
-        }
-    }
+    # Installing the MCP server is independent from whether this upstream has
+    # usable media routes today. Missing models / route metadata are reported by
+    # media_capabilities at runtime; they must not block registration, because
+    # the model catalog is allowed to be empty when the gateway has no match.
 }
 
 function Redact-Diagnostic([string]$Text) {
@@ -576,7 +568,7 @@ if ($mediaGenerationEnabled) {
         $mediaHealthOutput = & $powershellCommand.Source -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File $mediaWrapperTarget -HealthCheck | Out-String
         if ($LASTEXITCODE -ne 0) { throw 'The preinstalled Python media MCP health check failed.' }
         $mediaHealth = $mediaHealthOutput | ConvertFrom-Json
-        if (-not $mediaHealth.ready -or [string]$mediaHealth.serverVersion -ne '1.3.3' -or [string]$mediaHealth.healthScope -ne 'local-runtime-protocol' -or [string]$mediaHealth.runtimeStatus -ne 'passed' -or [string]$mediaHealth.protocolStatus -ne 'passed' -or [int]$mediaHealth.toolCount -ne 6) { throw 'The preinstalled media MCP local runtime/protocol check failed.' }
+        if (-not $mediaHealth.ready -or [string]$mediaHealth.serverVersion -ne '1.3.4' -or [string]$mediaHealth.healthScope -ne 'local-runtime-protocol' -or [string]$mediaHealth.runtimeStatus -ne 'passed' -or [string]$mediaHealth.protocolStatus -ne 'passed' -or [int]$mediaHealth.toolCount -ne 6) { throw 'The preinstalled media MCP local runtime/protocol check failed.' }
         $mediaHealthStatus = [ordered]@{ status = 'protocol-passed'; runtime = [string]$mediaHealth.runtimeStatus; protocol = [string]$mediaHealth.protocolStatus; enabled = [bool]$mediaGenerationEnabled; gatewayCatalog = $MediaGatewayCatalogStatus; generationCapability = 'not-tested'; python = [string]$mediaHealth.python; serverVersion = [string]$mediaHealth.serverVersion; catalogVerifiedAt = if (-not [string]::IsNullOrWhiteSpace($MediaGatewayCatalogVerifiedAt)) { $MediaGatewayCatalogVerifiedAt } else { $null }; modelCount = if ($MediaGatewayCatalogStatus -eq 'verified') { $MediaGatewayModelCount } else { 0 } }
         $runtimeState.mediaGeneration.health = 'protocol-passed'
         $runtimeState.mediaGeneration.protocol = 'passed'

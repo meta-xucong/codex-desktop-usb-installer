@@ -28,6 +28,33 @@ if ($LASTEXITCODE -ne 0) {
     throw "能力包完整性检查失败，拒绝生成 U 盘包：$($packCheckOutput.Trim())"
 }
 Write-Output "能力包文件清单与哈希校验通过：$($packCheckOutput.Trim())"
+$windowsPowerShell = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
+if (-not (Test-Path -LiteralPath $windowsPowerShell -PathType Leaf)) {
+    $windowsPowerShellCommand = Get-Command powershell.exe -ErrorAction Stop
+    $windowsPowerShell = $windowsPowerShellCommand.Source
+}
+$powerShellEncodingVerifier = Join-Path $PSScriptRoot "verify-capability-pack-powershell.ps1"
+if (-not (Test-Path -LiteralPath $powerShellEncodingVerifier -PathType Leaf)) {
+    throw "缺少 Windows PowerShell 能力包编码/语法验证器：$powerShellEncodingVerifier"
+}
+function Assert-CapabilityPackPowerShellCompatibility([string]$RootPath, [string]$Stage) {
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        # Windows PowerShell can emit a host-only FileSystem provider warning
+        # on stderr during startup. Capture it as diagnostic text, then trust
+        # the child process exit code rather than treating stderr as failure.
+        $ErrorActionPreference = 'Continue'
+        $validationOutput = & $windowsPowerShell -NoProfile -ExecutionPolicy Bypass -File $powerShellEncodingVerifier -Root $RootPath 2>&1 | Out-String
+        $validationExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    if ($validationExitCode -ne 0) {
+        throw "能力包 PowerShell 编码或 Windows PowerShell 5.1 语法检查失败（$Stage）：$($validationOutput.Trim())"
+    }
+    Write-Output $validationOutput.Trim()
+}
+Assert-CapabilityPackPowerShellCompatibility $capabilityPackSourceFull "source"
 $bundle = (Resolve-Path -LiteralPath $BundlePath).Path
 $installer = (Resolve-Path -LiteralPath $InstallerPath).Path
 
@@ -181,8 +208,15 @@ if ($installerItem.Name -ieq "CodexUsbLauncher.exe" -or $installerItem.Name -ieq
     if (-not (Test-Path -LiteralPath $launcherVerifier -PathType Leaf)) {
         throw "缺少 USB 入口清单验证脚本：$launcherVerifier"
     }
-    $launcherCheck = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $launcherVerifier -Path $installer 2>&1 | Out-String
-    if ($LASTEXITCODE -eq 0) {
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $launcherCheck = & $windowsPowerShell -NoProfile -ExecutionPolicy Bypass -File $launcherVerifier -Path $installer 2>&1 | Out-String
+        $launcherCheckExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    if ($launcherCheckExitCode -eq 0) {
         $isUsbLauncher = $true
         Write-Output $launcherCheck.Trim()
     } elseif ($installerItem.Name -ieq "CodexUsbLauncher.exe") {
@@ -269,6 +303,7 @@ foreach ($packFile in Get-ChildItem -LiteralPath $capabilityPackSourceFull -Recu
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $packDestination) | Out-Null
     Copy-Item -LiteralPath $packFile.FullName -Destination $packDestination -Force
 }
+Assert-CapabilityPackPowerShellCompatibility $capabilityPackOutput "copied USB payload"
 [System.IO.File]::WriteAllText(
     (Join-Path $output "apps\README.txt"),
     "此目录由安装器管理。Codex 程序将解包到 apps\Codex；账号、会话、缓存和配置不写入这里。`r`n",
@@ -294,7 +329,7 @@ if ($isUsbLauncher) {
     Copy-Item -LiteralPath $managerSource -Destination (Join-Path $output "CodexAppManager.exe") -Force
     Copy-Item -LiteralPath $entryShimSource -Destination (Join-Path $output "CodexEntryShim.exe") -Force
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot "verify-usb-launcher.ps1") -Destination (Join-Path $output "verify-usb-launcher.ps1") -Force
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "verify-usb-launcher.ps1") -Path (Join-Path $output "CodexEntryShim.exe") -ExpectedLevel asInvoker
+    & $windowsPowerShell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "verify-usb-launcher.ps1") -Path (Join-Path $output "CodexEntryShim.exe") -ExpectedLevel asInvoker
     if ($LASTEXITCODE -ne 0) { throw "USB Codex direct-entry shim 未通过 asInvoker 清单验证" }
 }
 $resourceSource = Join-Path $installerItem.DirectoryName "resources"

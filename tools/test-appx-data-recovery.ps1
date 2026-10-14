@@ -1,4 +1,4 @@
-# Executes real journal/manifest/hash/restore code against disposable fixtures.
+﻿# Executes real journal/manifest/hash/restore code against disposable fixtures.
 # All deployment/context callbacks are replaced before the recovery entry runs.
 param([string]$ScriptPath = (Join-Path $PSScriptRoot '..\crates\codex-win-engine\src\appx_data_recovery.ps1'))
 $ErrorActionPreference = 'Stop'

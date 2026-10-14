@@ -32,10 +32,10 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-SERVER_VERSION = "1.3.3"
+SERVER_VERSION = "1.3.4"
 PROTOCOL_VERSION = "2025-03-26"
 MAX_JSON_BYTES = 32 * 1024 * 1024
-HTTP_TIMEOUT_SECONDS = 60
+HTTP_TIMEOUT_SECONDS = 600
 MAX_REFERENCE_BYTES = 25 * 1024 * 1024
 MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024
 MAX_PNG_PIXELS = 100_000_000
@@ -971,7 +971,7 @@ def _safe_download(url: str, destination: Path) -> int:
     temporary = destination.with_suffix(destination.suffix + ".part")
     total = 0
     try:
-        with opener.open(request, timeout=60) as response, temporary.open("wb") as stream:
+        with opener.open(request, timeout=HTTP_TIMEOUT_SECONDS) as response, temporary.open("wb") as stream:
             declared = int(response.headers.get("Content-Length") or 0)
             if declared > MAX_DOWNLOAD_BYTES:
                 raise MediaError("结果文件超过本地下载上限。")
@@ -1190,6 +1190,7 @@ def _configured() -> dict[str, Any]:
         "api_key_configured": key_ok,
         "base_url_configured": base_ok,
         "api_profile": _api_profile(),
+        "http_timeout_seconds": HTTP_TIMEOUT_SECONDS,
         "gateway_catalog": {"status": "previously_verified" if catalog_at else "not_checked", "verified_at": catalog_at, "model_count": catalog_count},
         "generation_capability": "not_tested",
         "providers": providers,

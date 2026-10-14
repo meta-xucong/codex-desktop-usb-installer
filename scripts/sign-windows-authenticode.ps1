@@ -1,4 +1,4 @@
-# Authenticode-sign Windows PE files when a code-signing certificate is available.
+﻿# Authenticode-sign Windows PE files when a code-signing certificate is available.
 #
 # Non-blocking milestone: if WINDOWS_CERTIFICATE (base64 PFX) is unset/empty,
 # the script prints a clear skip message and exits 0. Wire secrets into the

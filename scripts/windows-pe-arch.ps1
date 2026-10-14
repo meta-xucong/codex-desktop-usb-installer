@@ -1,4 +1,4 @@
-# Print PE machine type for Windows binaries (build diagnostics).
+﻿# Print PE machine type for Windows binaries (build diagnostics).
 #
 # Used in release CI for ARM64 cross-builds: confirms the produced PE is
 # IMAGE_FILE_MACHINE_ARM64 without claiming that it was *run* on ARM64 hardware.

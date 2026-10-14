@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$PackageCache,
     [ValidateSet('tenant','oauth','user')][string]$AuthMode = 'tenant',

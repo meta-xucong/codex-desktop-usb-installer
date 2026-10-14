@@ -19,6 +19,15 @@ use sha2::{Digest, Sha256};
 const HELPER_ARG: &str = "--codex-uninstall-cleanup";
 const HELPER_PREFIX: &str = "codex-uninstall-helper-";
 const HELPER_EXE: &str = "CodexUninstallCleanup.exe";
+const HELPER_ERROR_FILE: &str = "helper-error.json";
+const HELPER_ERROR_PENDING_FILE: &str = "helper-error.pending";
+const HELPER_PHASE_FILE: &str = "helper-phase.json";
+const HELPER_PHASE_PENDING_FILE: &str = "helper-phase.pending";
+#[cfg(windows)]
+const HELPER_READY_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(windows)]
+const HELPER_TERMINATE_TIMEOUT: Duration = Duration::from_secs(3);
+const HELPER_ERROR_MAX_BYTES: u64 = 16 * 1024;
 const RETRIES: usize = 8;
 const RETRY_DELAY: Duration = Duration::from_millis(500);
 const HELPER_FILES: &[&str] = &[
@@ -33,6 +42,10 @@ const HELPER_FILES: &[&str] = &[
     "commit.json",
     "commit.pending",
     "lifetime.lock",
+    HELPER_ERROR_FILE,
+    HELPER_ERROR_PENDING_FILE,
+    HELPER_PHASE_FILE,
+    HELPER_PHASE_PENDING_FILE,
 ];
 
 const FINALIZER_ERROR_MAX_BYTES: u64 = 16 * 1024;
@@ -85,6 +98,127 @@ struct UnstartedHelper {
     directory: PathBuf,
     armed: bool,
 }
+
+#[cfg(windows)]
+struct SpawnedCleanupHelper {
+    child: std::process::Child,
+    terminate_on_drop: bool,
+}
+
+#[cfg(windows)]
+impl SpawnedCleanupHelper {
+    fn new(child: std::process::Child) -> Self {
+        Self {
+            child,
+            terminate_on_drop: true,
+        }
+    }
+
+    fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    fn terminate(&mut self) -> Result<(), String> {
+        if !self.terminate_on_drop {
+            return Ok(());
+        }
+        if self
+            .child
+            .try_wait()
+            .map_err(|error| format!("检查清理助手退出状态失败：{error}"))?
+            .is_some()
+        {
+            self.terminate_on_drop = false;
+            return Ok(());
+        }
+        let kill_error = self.child.kill().err();
+        let deadline = Instant::now() + HELPER_TERMINATE_TIMEOUT;
+        loop {
+            if self
+                .child
+                .try_wait()
+                .map_err(|error| format!("等待清理助手退出失败：{error}"))?
+                .is_some()
+            {
+                self.terminate_on_drop = false;
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(kill_error
+                    .map(|error| format!("终止清理助手失败：{error}"))
+                    .unwrap_or_else(|| "终止清理助手后仍未确认进程退出".into()));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn release(&mut self) {
+        self.terminate_on_drop = false;
+    }
+}
+
+#[cfg(windows)]
+impl Drop for SpawnedCleanupHelper {
+    fn drop(&mut self) {
+        let _ = self.terminate();
+    }
+}
+
+#[cfg(windows)]
+fn terminate_helper_with_detail(child: &mut SpawnedCleanupHelper, detail: &str) -> String {
+    match child.terminate() {
+        Ok(()) => detail.to_string(),
+        Err(error) => format!("{detail}；未能确认临时助手已退出：{error}"),
+    }
+}
+
+#[cfg(windows)]
+fn abort_helper_with_detail(
+    child: &mut SpawnedCleanupHelper,
+    unstarted: &mut UnstartedHelper,
+    detail: &str,
+) -> String {
+    let detail = terminate_helper_with_detail(child, detail);
+    if child.terminate_on_drop {
+        // Keep the exact helper tree if termination could not be confirmed;
+        // deleting files while the child may still be running is unsafe.
+        unstarted.armed = false;
+    }
+    detail
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct HelperStartupError {
+    schema_version: u32,
+    nonce: String,
+    helper_pid: u32,
+    stage: String,
+    error: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct HelperStartupPhase {
+    schema_version: u32,
+    nonce: String,
+    helper_pid: u32,
+    phase: String,
+}
+
+#[cfg(windows)]
+const HELPER_PHASES: &[&str] = &[
+    "discoveringRoots",
+    "validatingPlan",
+    "validatingParent",
+    "acquiringMutex",
+    "preparingReport",
+    "publishingReady",
+];
 impl Drop for UnstartedHelper {
     fn drop(&mut self) {
         if self.armed && check_ancestors(&self.directory).is_ok() {
@@ -2026,6 +2160,268 @@ fn read_finalizer_error(helper_dir: &Path) -> Result<Option<String>, String> {
     Ok((!text.is_empty()).then(|| text.to_string()))
 }
 
+#[cfg(windows)]
+fn helper_dir_for_nonce(nonce: &str) -> Result<PathBuf, String> {
+    let parsed = uuid::Uuid::parse_str(nonce).map_err(|_| "无效清理批次")?;
+    if parsed.to_string() != nonce {
+        return Err("无效清理批次格式".into());
+    }
+    let executable = fs::canonicalize(std::env::current_exe().map_err(|error| error.to_string())?)
+        .map_err(|error| error.to_string())?;
+    if executable.file_name().and_then(|value| value.to_str()) != Some(HELPER_EXE) {
+        return Err("清理助手映像名称不匹配".into());
+    }
+    let helper_dir = executable.parent().ok_or("清理目录不存在")?;
+    let temp = fs::canonicalize(std::env::temp_dir()).map_err(|error| error.to_string())?;
+    let expected = temp.join(format!("{HELPER_PREFIX}{nonce}"));
+    if helper_dir != expected {
+        return Err("清理助手不在本次卸载生成的临时目录".into());
+    }
+    check_ancestors(helper_dir)?;
+    Ok(helper_dir.to_path_buf())
+}
+
+#[cfg(windows)]
+fn publish_helper_startup_error(nonce: &str, error: &str) -> Result<bool, String> {
+    let helper_dir = helper_dir_for_nonce(nonce)?;
+    let ready = helper_dir.join("ready.json");
+    if let Some(metadata) = metadata_optional(&ready)? {
+        if is_reparse(&metadata) {
+            return Err("清理握手文件被替换为链接".into());
+        }
+        // After the parent has accepted readiness, the regular finalization
+        // report owns failures. Never add a bootstrap marker during cleanup.
+        return Ok(false);
+    }
+    let message = error.chars().take(2048).collect::<String>();
+    let value = HelperStartupError {
+        schema_version: 1,
+        nonce: nonce.to_string(),
+        helper_pid: std::process::id(),
+        stage: read_helper_phase(&helper_dir, nonce, std::process::id())?
+            .unwrap_or_else(|| "unknown".into()),
+        error: message,
+    };
+    let pending = helper_dir.join(HELPER_ERROR_PENDING_FILE);
+    let target = helper_dir.join(HELPER_ERROR_FILE);
+    check_ancestors(&pending)?;
+    check_ancestors(&target)?;
+    let bytes = serde_json::to_vec(&value).map_err(|serialize| serialize.to_string())?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&pending)
+        .map_err(|write| write.to_string())?;
+    if let Err(write) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
+        let _ = fs::remove_file(&pending);
+        return Err(write.to_string());
+    }
+    drop(file);
+    fs::rename(&pending, &target).map_err(|rename| rename.to_string())?;
+    Ok(true)
+}
+
+#[cfg(windows)]
+fn publish_helper_phase(helper_dir: &Path, nonce: &str, phase: &str) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    if !HELPER_PHASES.contains(&phase) {
+        return Err("清理助手启动阶段无效".into());
+    }
+    let pending = helper_dir.join(HELPER_PHASE_PENDING_FILE);
+    let target = helper_dir.join(HELPER_PHASE_FILE);
+    check_ancestors(&pending)?;
+    check_ancestors(&target)?;
+    let value = HelperStartupPhase {
+        schema_version: 1,
+        nonce: nonce.to_string(),
+        helper_pid: std::process::id(),
+        phase: phase.to_string(),
+    };
+    let bytes = serde_json::to_vec(&value).map_err(|error| error.to_string())?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&pending)
+        .map_err(|error| error.to_string())?;
+    if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
+        let _ = fs::remove_file(&pending);
+        return Err(error.to_string());
+    }
+    drop(file);
+    let from = pending
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let to = target
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let result = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        let error = io::Error::last_os_error();
+        let _ = fs::remove_file(&pending);
+        return Err(format!("发布清理助手启动阶段失败：{error}"));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn read_helper_phase(
+    helper_dir: &Path,
+    nonce: &str,
+    helper_pid: u32,
+) -> Result<Option<String>, String> {
+    let path = helper_dir.join(HELPER_PHASE_FILE);
+    check_ancestors(&path)?;
+    let Some(metadata) = metadata_optional(&path)? else {
+        return Ok(None);
+    };
+    if !metadata.is_file() || is_reparse(&metadata) || metadata.len() > 4096 {
+        return Err("清理助手启动阶段文件无效".into());
+    }
+    let value: HelperStartupPhase =
+        serde_json::from_slice(&fs::read(&path).map_err(|error| error.to_string())?)
+            .map_err(|error| format!("读取清理助手启动阶段失败：{error}"))?;
+    if value.schema_version != 1
+        || value.nonce != nonce
+        || value.helper_pid != helper_pid
+        || !HELPER_PHASES.contains(&value.phase.as_str())
+    {
+        return Err("清理助手启动阶段身份不匹配".into());
+    }
+    Ok(Some(value.phase))
+}
+
+#[cfg(windows)]
+fn read_helper_startup_error(
+    helper_dir: &Path,
+    nonce: &str,
+    helper_pid: u32,
+) -> Result<Option<String>, String> {
+    let path = helper_dir.join(HELPER_ERROR_FILE);
+    check_ancestors(&path)?;
+    let Some(metadata) = metadata_optional(&path)? else {
+        return Ok(None);
+    };
+    if !metadata.is_file() || is_reparse(&metadata) {
+        return Err("清理助手启动错误通道不是普通文件".into());
+    }
+    if metadata.len() > HELPER_ERROR_MAX_BYTES {
+        return Err("清理助手启动错误通道超过大小限制".into());
+    }
+    let value: HelperStartupError =
+        serde_json::from_slice(&fs::read(&path).map_err(|error| error.to_string())?)
+            .map_err(|error| format!("读取清理助手启动错误失败：{error}"))?;
+    if value.schema_version != 1
+        || value.nonce != nonce
+        || value.helper_pid != helper_pid
+        || !HELPER_PHASES.contains(&value.stage.as_str()) && value.stage != "unknown"
+    {
+        return Err("清理助手启动错误身份不匹配".into());
+    }
+    Ok(Some(format!("阶段 {}：{}", value.stage, value.error)))
+}
+
+#[cfg(windows)]
+fn validate_helper_commit(
+    helper_dir: &Path,
+    nonce: &str,
+    parent_pid: u32,
+    helper_pid: u32,
+) -> Result<(), String> {
+    let commit = helper_dir.join("commit.json");
+    check_ancestors(&commit)?;
+    if metadata_optional(&commit)?
+        .ok_or("安装器未确认二阶段清理；未执行删除")?
+        .len()
+        > 4096
+    {
+        return Err("二阶段确认文件过大".into());
+    }
+    let confirmation: serde_json::Value =
+        serde_json::from_slice(&fs::read(&commit).map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
+    if confirmation["nonce"] != nonce
+        || confirmation["parentPid"] != parent_pid
+        || confirmation["helperPid"] != helper_pid
+    {
+        return Err("二阶段确认身份不匹配；未执行删除".into());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn show_summary(message: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK};
+    let body = message.to_owned();
+    let (completed, wait) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let body = body.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+        let title = "Codex 卸载清理结果"
+            .encode_utf16()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        unsafe {
+            MessageBoxW(
+                std::ptr::null_mut(),
+                body.as_ptr(),
+                title.as_ptr(),
+                MB_OK | MB_ICONINFORMATION,
+            );
+        }
+        let _ = completed.send(());
+    });
+    let _ = wait.recv_timeout(Duration::from_secs(60));
+}
+
+#[cfg(windows)]
+fn record_handoff_failure(
+    report_path: &Path,
+    helper_dir: &Path,
+    detail: &str,
+) -> Result<(), String> {
+    check_ancestors(report_path)?;
+    let bytes = fs::read(report_path).map_err(|error| format!("读取卸载报告失败：{error}"))?;
+    let mut report: CleanupReport =
+        serde_json::from_slice(&bytes).map_err(|error| format!("解析卸载报告失败：{error}"))?;
+    apply_handoff_failure(&mut report, &helper_dir.display().to_string(), detail);
+    write_report_atomically(report_path, &report)
+}
+
+fn apply_handoff_failure(report: &mut CleanupReport, helper_path: &str, detail: &str) {
+    report.status = "partialFailure".into();
+    report.phase = "helperHandoffFailed".into();
+    report.exit_code = Some(2);
+    report.helper_finalization = format!("failed: {detail}");
+    report.retry_suggestion =
+        "Codex 与 CCSwitch 主卸载已完成；无需重复卸载。保留此报告并修复收尾助手后再清理临时残留。"
+            .into();
+    report.note = "主卸载结果已记录；收尾助手未完成交接，未提交二阶段清理。".into();
+    if !report
+        .items
+        .iter()
+        .any(|item| item.path == helper_path && item.status == "failed" && item.detail == detail)
+    {
+        report.items.push(CleanupItem {
+            path: helper_path.to_string(),
+            status: "failed".into(),
+            detail: detail.to_string(),
+        });
+    }
+}
+
 /// Read only the installer-owned environment-variable names before `.codex`
 /// is removed.  The record never contains values, and an invalid/mismatched
 /// record is rejected so an arbitrary file cannot turn this into a generic
@@ -2616,9 +3012,9 @@ pub fn launch_deferred_cleanup(
             &CleanupReport {
                 schema_version: 1,
                 status: "awaitingManagerExit".into(),
-                phase: "prepare".into(),
+                phase: "helperStarting".into(),
                 exit_code: None,
-                retry_suggestion: "等待安装器退出后自动继续清理；失败时可根据报告重试卸载".into(),
+                retry_suggestion: "正在启动收尾助手；主卸载已完成，不要重复卸载".into(),
                 items: plan
                     .prior_notes
                     .iter()
@@ -2629,10 +3025,11 @@ pub fn launch_deferred_cleanup(
                     })
                     .collect(),
                 helper_finalization: "pending".into(),
-                note: "此报告按卸载确认保留在所示位置；应用数据尚未开始二阶段清理。".into(),
+                note: "主卸载及已选择的数据清理步骤已记录；当前等待独立收尾助手完成安全交接。"
+                    .into(),
             },
         )?;
-        let mut child = Command::new(&helper_exe)
+        let child = match Command::new(&helper_exe)
             .current_dir(&helper_dir)
             .arg(HELPER_ARG)
             .arg(&nonce)
@@ -2641,84 +3038,178 @@ pub fn launch_deferred_cleanup(
             .stderr(Stdio::null())
             .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
             .spawn()
-            .map_err(|error| format!("启动清理组件失败：{error}；报告：{}", report.display()))?;
-        unstarted.armed = false;
+        {
+            Ok(child) => child,
+            Err(error) => {
+                let detail = format!("启动清理助手失败：{error}");
+                record_handoff_failure(&report, &helper_dir, &detail)?;
+                return Err(format!("{detail}；报告：{}", report.display()));
+            }
+        };
+        let mut child = SpawnedCleanupHelper::new(child);
         let ready = helper_dir.join("ready.json");
         let start = Instant::now();
-        while start.elapsed() < Duration::from_secs(15) {
-            if let Some(metadata) = metadata_optional(&ready)? {
-                if is_reparse(&metadata) {
-                    return Err("清理握手文件被替换为链接".into());
+        while start.elapsed() < HELPER_READY_TIMEOUT {
+            let startup_error = match read_helper_startup_error(&helper_dir, &nonce, child.id()) {
+                Ok(value) => value,
+                Err(error) => {
+                    let detail = abort_helper_with_detail(
+                        &mut child,
+                        &mut unstarted,
+                        &format!("清理助手启动错误通道校验失败：{error}"),
+                    );
+                    record_handoff_failure(&report, &helper_dir, &detail)?;
+                    return Err(format!("{detail}；报告：{}", report.display()));
                 }
-                let value: serde_json::Value =
-                    serde_json::from_slice(&fs::read(&ready).map_err(|error| error.to_string())?)
-                        .map_err(|error| error.to_string())?;
+            };
+            if let Some(error) = startup_error {
+                let detail = abort_helper_with_detail(
+                    &mut child,
+                    &mut unstarted,
+                    &format!("收尾助手在就绪前失败：{error}"),
+                );
+                record_handoff_failure(&report, &helper_dir, &detail)?;
+                return Err(format!("{detail}；报告：{}", report.display()));
+            }
+            let ready_metadata = match metadata_optional(&ready) {
+                Ok(value) => value,
+                Err(error) => {
+                    let detail = abort_helper_with_detail(
+                        &mut child,
+                        &mut unstarted,
+                        &format!("清理握手状态读取失败：{error}"),
+                    );
+                    record_handoff_failure(&report, &helper_dir, &detail)?;
+                    return Err(format!("{detail}；报告：{}", report.display()));
+                }
+            };
+            if let Some(metadata) = ready_metadata {
+                if is_reparse(&metadata) {
+                    let detail = abort_helper_with_detail(
+                        &mut child,
+                        &mut unstarted,
+                        "清理握手文件被替换为链接",
+                    );
+                    record_handoff_failure(&report, &helper_dir, &detail)?;
+                    return Err(format!("{detail}；报告：{}", report.display()));
+                }
+                let value: serde_json::Value = match fs::read(&ready)
+                    .map_err(|error| error.to_string())
+                    .and_then(|bytes| {
+                        serde_json::from_slice(&bytes).map_err(|error| error.to_string())
+                    }) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let detail = abort_helper_with_detail(
+                            &mut child,
+                            &mut unstarted,
+                            &format!("清理握手内容无效：{error}"),
+                        );
+                        record_handoff_failure(&report, &helper_dir, &detail)?;
+                        return Err(format!("{detail}；报告：{}", report.display()));
+                    }
+                };
                 if value["nonce"] == nonce
                     && value["parentPid"] == plan.parent_pid
                     && value["helperPid"] == child.id()
                 {
                     // A late helper must not begin deletion merely because the
                     // manager eventually exits after a failed ready handshake.
-                    let commit = helper_dir.join("commit.pending");
-                    let mut file = OpenOptions::new()
-                        .create_new(true)
-                        .write(true)
-                        .open(&commit)
-                        .map_err(|error| format!("确认二阶段清理失败：{error}"))?;
-                    file.write_all(&serde_json::to_vec(&serde_json::json!({"nonce":nonce,"parentPid":plan.parent_pid,"helperPid":child.id()})).map_err(|error| error.to_string())?).and_then(|_| file.sync_all()).map_err(|error| error.to_string())?;
-                    drop(file);
-                    fs::rename(&commit, helper_dir.join("commit.json"))
+                    let commit_result = (|| {
+                        let commit = helper_dir.join("commit.pending");
+                        let mut file = OpenOptions::new()
+                            .create_new(true)
+                            .write(true)
+                            .open(&commit)
+                            .map_err(|error| error.to_string())?;
+                        file.write_all(
+                            &serde_json::to_vec(&serde_json::json!({
+                                "nonce": nonce,
+                                "parentPid": plan.parent_pid,
+                                "helperPid": child.id()
+                            }))
+                            .map_err(|error| error.to_string())?,
+                        )
+                        .and_then(|_| file.sync_all())
                         .map_err(|error| error.to_string())?;
+                        drop(file);
+                        fs::rename(&commit, helper_dir.join("commit.json"))
+                            .map_err(|error| error.to_string())
+                    })();
+                    if let Err(error) = commit_result {
+                        let detail = abort_helper_with_detail(
+                            &mut child,
+                            &mut unstarted,
+                            &format!("提交二阶段清理失败：{error}"),
+                        );
+                        record_handoff_failure(&report, &helper_dir, &detail)?;
+                        return Err(format!("{detail}；报告：{}", report.display()));
+                    }
+                    // The parent has now authenticated the handoff and
+                    // atomically committed it. Only here may the helper outlive
+                    // this scope and perform stage two after manager exit.
+                    unstarted.armed = false;
+                    child.release();
                     return Ok(CleanupHandoff {
                         handoff_id: nonce.clone(),
                         report_path: report.display().to_string(),
                         message: "系统卸载已完成，清理组件已就绪。关闭安装器后清理日志、缓存、锁文件和暂存；最终结果保留在所示路径的报告。".into(),
                     });
                 }
-                return Err("清理组件握手身份不匹配".into());
+                let detail =
+                    abort_helper_with_detail(&mut child, &mut unstarted, "清理组件握手身份不匹配");
+                record_handoff_failure(&report, &helper_dir, &detail)?;
+                return Err(format!("{detail}；报告：{}", report.display()));
             }
-            if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
-                return Err(format!(
-                    "清理组件就绪前退出（{status}）；报告：{}",
-                    report.display()
-                ));
+            let child_status = match child.try_wait() {
+                Ok(status) => status,
+                Err(error) => {
+                    let detail = abort_helper_with_detail(
+                        &mut child,
+                        &mut unstarted,
+                        &format!("检查清理助手进程状态失败：{error}"),
+                    );
+                    record_handoff_failure(&report, &helper_dir, &detail)?;
+                    return Err(format!("{detail}；报告：{}", report.display()));
+                }
+            };
+            if let Some(status) = child_status {
+                let phase = read_helper_phase(&helper_dir, &nonce, child.id())
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| "unknown".into());
+                let detail = match read_helper_startup_error(&helper_dir, &nonce, child.id()) {
+                    Ok(Some(error)) => format!("收尾助手在就绪前失败：{error}（{status}）"),
+                    Ok(None) => format!("收尾助手在阶段 {phase} 就绪前退出（{status}）"),
+                    Err(error) => {
+                        format!("收尾助手在就绪前退出（{status}）；错误通道无效：{error}")
+                    }
+                };
+                record_handoff_failure(&report, &helper_dir, &detail)?;
+                return Err(format!("{detail}；报告：{}", report.display()));
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        // No deletion occurs until the manager exits. Do not kill by name or
-        // force-close the app if preparation failed; helper wait is bounded.
-        Err(format!(
-            "清理组件就绪超时；安装器未退出，数据保留。报告：{}",
-            report.display()
-        ))
+        // The helper has no deletion authority without commit.json. Terminate
+        // only the exact process handle created above so a late readiness
+        // marker cannot leave an orphan waiting for a parent that never
+        // committed its handoff.
+        let phase = read_helper_phase(&helper_dir, &nonce, child.id())
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "unknown".into());
+        let detail = abort_helper_with_detail(
+            &mut child,
+            &mut unstarted,
+            &format!(
+                "收尾助手在阶段 {} 等待 {} 秒后仍未完成就绪握手；未提交二阶段清理",
+                phase,
+                HELPER_READY_TIMEOUT.as_secs(),
+            ),
+        );
+        record_handoff_failure(&report, &helper_dir, &detail)?;
+        Err(format!("{detail}；报告：{}", report.display()))
     }
-}
-
-#[cfg(windows)]
-fn show_summary(message: &str) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK};
-    let body = message.to_owned();
-    let (completed, wait) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let body = body.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
-        let title = "Codex 卸载清理结果"
-            .encode_utf16()
-            .chain(Some(0))
-            .collect::<Vec<_>>();
-        unsafe {
-            MessageBoxW(
-                std::ptr::null_mut(),
-                body.as_ptr(),
-                title.as_ptr(),
-                MB_OK | MB_ICONINFORMATION,
-            );
-        }
-        let _ = completed.send(());
-    });
-    // A helper must never keep its own 20 MB image mapped forever merely
-    // because nobody is present to dismiss an error dialog. The durable report
-    // remains after this bounded notification closes with the process.
-    let _ = wait.recv_timeout(Duration::from_secs(60));
 }
 
 #[cfg(windows)]
@@ -2761,7 +3252,7 @@ function Assert-SafeAncestors([string]$path) {{
   }}
 }}
 function Assert-KnownHelperEntries {{
-  $allowed=@('CodexUninstallCleanup.exe','plan.json','ready.json','ready.pending','finalizer.ready','finalizer.ready.pending','finalizer.error.txt','finalizer.error.pending','commit.json','commit.pending','lifetime.lock')
+  $allowed=@('CodexUninstallCleanup.exe','plan.json','ready.json','ready.pending','finalizer.ready','finalizer.ready.pending','finalizer.error.txt','finalizer.error.pending','commit.json','commit.pending','lifetime.lock','helper-error.json','helper-error.pending','helper-phase.json','helper-phase.pending')
   foreach($entry in @(Get-ChildItem -LiteralPath $helper -Force -ErrorAction Stop)) {{
     if($allowed -notcontains $entry.Name) {{ throw ('Unexpected cleanup helper file: '+$entry.Name) }}
     if($entry.PSIsContainer) {{ throw ('Unexpected cleanup helper directory: '+$entry.Name) }}
@@ -2839,7 +3330,7 @@ function Register-HelperRebootCleanup {{
   # the directory out of the reboot queue so user data cannot be swept.
   Assert-KnownHelperEntries
   $scheduled=@()
-  foreach($name in @('CodexUninstallCleanup.exe','plan.json','ready.json','ready.pending','finalizer.ready','finalizer.ready.pending','finalizer.error.txt','finalizer.error.pending','commit.json','commit.pending','lifetime.lock')) {{
+  foreach($name in @('CodexUninstallCleanup.exe','plan.json','ready.json','ready.pending','finalizer.ready','finalizer.ready.pending','finalizer.error.txt','finalizer.error.pending','commit.json','commit.pending','lifetime.lock','helper-error.json','helper-error.pending','helper-phase.json','helper-phase.pending')) {{
     $f=Join-Path $helper $name
     if(Test-Path -LiteralPath $f) {{ Register-RebootDelete $f; $scheduled += $f }}
   }}
@@ -2871,7 +3362,7 @@ try {{
       Assert-SafeAncestors $helper
       Assert-SafeAncestors $report
       Assert-KnownHelperEntries
-      foreach($name in @('CodexUninstallCleanup.exe','ready.json','ready.pending','finalizer.ready','finalizer.ready.pending','finalizer.error.txt','finalizer.error.pending','commit.json','commit.pending','lifetime.lock')) {{
+      foreach($name in @('CodexUninstallCleanup.exe','ready.json','ready.pending','finalizer.ready','finalizer.ready.pending','finalizer.error.txt','finalizer.error.pending','commit.json','commit.pending','lifetime.lock','helper-error.json','helper-error.pending','helper-phase.json','helper-phase.pending')) {{
         $f=Join-Path $helper $name
         if(Test-Path -LiteralPath $f) {{ if(((Get-Item -LiteralPath $f -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {{ throw 'Refusing helper reparse point' }}; Remove-Item -LiteralPath $f -Force -ErrorAction Stop }}
       }}
@@ -3087,19 +3578,21 @@ fn run_helper(nonce_arg: &str) -> Result<(), String> {
     use windows_sys::Win32::System::Threading::WaitForSingleObject;
     let current_exe = fs::canonicalize(std::env::current_exe().map_err(|error| error.to_string())?)
         .map_err(|error| error.to_string())?;
-    let helper_dir = current_exe.parent().ok_or("清理目录不存在")?;
-    let roots = CleanupRoots::discover()?;
-    // Reject manual invocation outside the exact temporary helper layout BEFORE
-    // opening an attacker-selected plan, showing UI, or creating files.
+    let helper_dir = helper_dir_for_nonce(nonce_arg)?;
     let nonce = uuid::Uuid::parse_str(nonce_arg)
         .map_err(|_| "无效清理批次")?
         .to_string();
+    publish_helper_phase(&helper_dir, &nonce, "discoveringRoots")?;
+    let roots = CleanupRoots::discover()?;
+    // Reject manual invocation outside the exact temporary helper layout BEFORE
+    // opening an attacker-selected plan, showing UI, or creating files.
     if nonce != nonce_arg
         || helper_dir != roots.temp.join(format!("{HELPER_PREFIX}{nonce}"))
         || current_exe.file_name().and_then(|name| name.to_str()) != Some(HELPER_EXE)
     {
         return Err("二阶段清理只能由安装器生成并启动".into());
     }
+    publish_helper_phase(&helper_dir, &nonce, "validatingPlan")?;
     check_ancestors(&helper_dir.join("plan.json"))?;
     if metadata_optional(&helper_dir.join("plan.json"))?
         .ok_or("清理计划不存在")?
@@ -3113,18 +3606,22 @@ fn run_helper(nonce_arg: &str) -> Result<(), String> {
         return Err("清理计划过大".into());
     }
     let plan: CleanupPlan = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
-    validate_plan(&plan, helper_dir, &current_exe, &roots)?;
+    validate_plan(&plan, &helper_dir, &current_exe, &roots)?;
     if plan.nonce != nonce {
         return Err("清理计划批次不匹配".into());
     }
+    publish_helper_phase(&helper_dir, &nonce, "validatingParent")?;
     let parent = open_parent(&plan)?;
+    publish_helper_phase(&helper_dir, &nonce, "acquiringMutex")?;
     let _mutex = acquire_cleanup_mutex()?;
-    let lifetime_lock = create_lifetime_lock(helper_dir, &nonce)?;
+    let lifetime_lock = create_lifetime_lock(&helper_dir, &nonce)?;
     let report_file = report_path(&roots, &nonce);
     let mut report = CleanupReport { schema_version: 1, status: "awaitingManagerExit".into(), phase: "prepare".into(), exit_code: None, retry_suggestion: "等待安装器退出后自动继续清理；失败时可根据报告重试卸载".into(), items: plan.prior_notes.iter().map(|note| CleanupItem { path: "systemUninstall".into(), status: "note".into(), detail: note.clone() }).collect(), helper_finalization: "pending".into(),
         note: "本报告是卸载确认中声明保留的唯一诊断输出。共享 VC++/WebView2、非本产品文件及未知系统状态不强制删除。".into() };
+    publish_helper_phase(&helper_dir, &nonce, "preparingReport")?;
     write_report(&report_file, &report)?;
     // Atomic ready publication avoids a partial JSON handshake read.
+    publish_helper_phase(&helper_dir, &nonce, "publishingReady")?;
     let ready_bytes = serde_json::to_vec(&serde_json::json!({"nonce":nonce,"parentPid":plan.parent_pid,"helperPid":std::process::id()})).map_err(|error| error.to_string())?;
     let pending = helper_dir.join("ready.pending");
     OpenOptions::new()
@@ -3145,24 +3642,12 @@ fn run_helper(nonce_arg: &str) -> Result<(), String> {
         if unsafe { WaitForSingleObject(parent.0, u32::MAX) } != WAIT_OBJECT_0 {
             return Err("无法等待安装器进程退出，未执行任何数据删除".to_string());
         }
-        let commit = helper_dir.join("commit.json");
-        check_ancestors(&commit)?;
-        if metadata_optional(&commit)?
-            .ok_or("安装器未确认二阶段清理；未执行删除")?
-            .len()
-            > 4096
-        {
-            return Err("二阶段确认文件过大".into());
-        }
-        let confirmation: serde_json::Value =
-            serde_json::from_slice(&fs::read(&commit).map_err(|error| error.to_string())?)
-                .map_err(|error| error.to_string())?;
-        if confirmation["nonce"] != plan.nonce
-            || confirmation["parentPid"] != plan.parent_pid
-            || confirmation["helperPid"] != std::process::id()
-        {
-            return Err("二阶段确认身份不匹配；未执行删除".into());
-        }
+        validate_helper_commit(
+            &helper_dir,
+            &plan.nonce,
+            plan.parent_pid,
+            std::process::id(),
+        )?;
         if !plan.force_shared_cleanup {
             ensure_journals_recovered(&roots)?;
         }
@@ -3210,7 +3695,7 @@ fn run_helper(nonce_arg: &str) -> Result<(), String> {
         }
         report
             .items
-            .extend(clean_stale_helpers(&roots, helper_dir)?);
+            .extend(clean_stale_helpers(&roots, &helper_dir)?);
         for target in &selected_targets {
             if let Err(error) = verify_absent(target) {
                 report.items.push(CleanupItem {
@@ -3301,7 +3786,7 @@ fn run_helper(nonce_arg: &str) -> Result<(), String> {
         "等待收尾组件完成自清理".into()
     };
     write_report(&report_file, &report)?;
-    let finalizer_error = schedule_self_cleanup(helper_dir, &report_file, &roots, &nonce).err();
+    let finalizer_error = schedule_self_cleanup(&helper_dir, &report_file, &roots, &nonce).err();
     // `finalizer.ready` means that the detached PowerShell process has taken
     // ownership of the handoff and is waiting for this exact lifetime lock.
     // Once it is ready, this helper must release the lock and exit immediately:
@@ -3310,7 +3795,7 @@ fn run_helper(nonce_arg: &str) -> Result<(), String> {
     // user notification, and any reboot fallback after that point.
     drop(lifetime_lock);
     if let Some(error) = finalizer_error {
-        let fallback = schedule_helper_cleanup_on_reboot(helper_dir, &roots);
+        let fallback = schedule_helper_cleanup_on_reboot(&helper_dir, &roots);
         let fallback_detail = match fallback {
             Ok(detail) => {
                 report.items.push(CleanupItem {
@@ -3356,15 +3841,22 @@ pub fn maybe_run_cleanup_helper() -> Option<i32> {
     }
     #[cfg(windows)]
     {
-        let result = if args.len() == 3 && args[1] == HELPER_ARG {
-            run_helper(&args[2])
+        let (result, nonce) = if args.len() == 3 && args[1] == HELPER_ARG {
+            (run_helper(&args[2]), Some(args[2].as_str()))
         } else {
-            Err("无效的卸载清理参数".into())
+            (Err("无效的卸载清理参数".into()), None)
         };
         if let Err(error) = result {
-            show_summary(&format!(
-                "二阶段清理未完成：{error}\n错误已写入卸载报告；窗口最迟 60 秒自动关闭，不会继续占用清理组件。"
-            ));
+            let diagnostic =
+                nonce.and_then(|nonce| publish_helper_startup_error(nonce, &error).ok());
+            if diagnostic == Some(false) {
+                // Post-ready cleanup errors already have a durable report and
+                // retain the previous user notification. Pre-ready failures
+                // must never block this detached process on a modal dialog.
+                show_summary(&format!("二阶段清理未完成：{error}"));
+            }
+            // For bootstrap failures, the parent receives the nonce/PID-bound
+            // marker or this process exit code and owns the user-visible report.
             return Some(2);
         }
         Some(0)
@@ -4116,6 +4608,190 @@ mod tests {
         assert_eq!(fs::read(directory.join("unrelated")).unwrap(), b"keep");
     }
 
+    #[test]
+    fn pre_ready_handoff_failure_is_recorded_in_terminal_report() {
+        let helper_path = "C:\\Temp\\codex-uninstall-helper-test";
+        let original_note = CleanupItem {
+            path: "systemUninstall".into(),
+            status: "note".into(),
+            detail: "Codex 主卸载已完成".into(),
+        };
+        let mut report = CleanupReport {
+            schema_version: 1,
+            status: "awaitingManagerExit".into(),
+            phase: "helperStarting".into(),
+            exit_code: None,
+            retry_suggestion: "启动中".into(),
+            items: vec![original_note.clone()],
+            helper_finalization: "pending".into(),
+            note: "等待清理助手".into(),
+        };
+
+        let detail = "收尾助手在就绪前失败：清理计划身份/用户目录不匹配";
+        apply_handoff_failure(&mut report, helper_path, detail);
+        let report: CleanupReport =
+            serde_json::from_slice(&serde_json::to_vec(&report).unwrap()).unwrap();
+
+        assert_eq!(report.status, "partialFailure");
+        assert_eq!(report.phase, "helperHandoffFailed");
+        assert_eq!(report.exit_code, Some(2));
+        assert_eq!(report.helper_finalization, format!("failed: {detail}"));
+        assert!(report.items.iter().any(|item| {
+            item.path == original_note.path
+                && item.status == original_note.status
+                && item.detail == original_note.detail
+        }));
+        assert!(report.items.iter().any(|item| {
+            item.path == helper_path && item.status == "failed" && item.detail == detail
+        }));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn spawned_cleanup_helper_guard_terminates_only_its_child() {
+        use std::os::windows::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        let shell = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        let child = Command::new(shell)
+            .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 60"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(0x08000000)
+            .spawn()
+            .unwrap();
+        let mut helper = SpawnedCleanupHelper::new(child);
+        helper.terminate().unwrap();
+        assert!(helper.try_wait().unwrap().is_some());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn helper_startup_error_requires_matching_nonce_and_process_identity() {
+        let root = TempRoot::new();
+        let helper_dir = root.0.join("helper");
+        fs::create_dir(&helper_dir).unwrap();
+        let nonce = uuid::Uuid::new_v4().to_string();
+        let value = HelperStartupError {
+            schema_version: 1,
+            nonce: nonce.clone(),
+            helper_pid: std::process::id(),
+            stage: "validatingPlan".into(),
+            error: "清理计划无效".into(),
+        };
+        fs::write(
+            helper_dir.join(HELPER_ERROR_FILE),
+            serde_json::to_vec(&value).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_helper_startup_error(&helper_dir, &nonce, std::process::id()).unwrap(),
+            Some("阶段 validatingPlan：清理计划无效".into())
+        );
+        assert!(read_helper_startup_error(
+            &helper_dir,
+            &uuid::Uuid::new_v4().to_string(),
+            std::process::id()
+        )
+        .is_err());
+        assert!(read_helper_startup_error(
+            &helper_dir,
+            &nonce,
+            std::process::id().saturating_add(1)
+        )
+        .is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn helper_phase_is_bound_to_nonce_and_process_identity() {
+        let root = TempRoot::new();
+        let helper_dir = root.0.join("helper");
+        fs::create_dir(&helper_dir).unwrap();
+        let nonce = uuid::Uuid::new_v4().to_string();
+        let phase = HelperStartupPhase {
+            schema_version: 1,
+            nonce: nonce.clone(),
+            helper_pid: std::process::id(),
+            phase: "acquiringMutex".into(),
+        };
+        fs::write(
+            helper_dir.join(HELPER_PHASE_FILE),
+            serde_json::to_vec(&phase).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_helper_phase(&helper_dir, &nonce, std::process::id()).unwrap(),
+            Some("acquiringMutex".into())
+        );
+        assert!(read_helper_phase(
+            &helper_dir,
+            &uuid::Uuid::new_v4().to_string(),
+            std::process::id()
+        )
+        .is_err());
+        assert!(
+            read_helper_phase(&helper_dir, &nonce, std::process::id().saturating_add(1)).is_err()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn helper_refuses_cleanup_without_matching_parent_commit() {
+        let root = TempRoot::new();
+        let helper_dir = root.0.join("helper");
+        fs::create_dir(&helper_dir).unwrap();
+        let protected_target = root.0.join("protected-target.txt");
+        fs::write(&protected_target, b"keep until committed").unwrap();
+        let nonce = uuid::Uuid::new_v4().to_string();
+        let parent_pid = std::process::id();
+        let helper_pid = parent_pid.saturating_add(1);
+
+        let missing =
+            validate_helper_commit(&helper_dir, &nonce, parent_pid, helper_pid).unwrap_err();
+        assert!(missing.contains("未执行删除"));
+        assert_eq!(
+            fs::read(&protected_target).unwrap(),
+            b"keep until committed"
+        );
+
+        fs::write(
+            helper_dir.join("commit.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "nonce": uuid::Uuid::new_v4().to_string(),
+                "parentPid": parent_pid,
+                "helperPid": helper_pid,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(validate_helper_commit(&helper_dir, &nonce, parent_pid, helper_pid).is_err());
+        assert_eq!(
+            fs::read(&protected_target).unwrap(),
+            b"keep until committed"
+        );
+
+        fs::write(
+            helper_dir.join("commit.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "nonce": nonce,
+                "parentPid": parent_pid,
+                "helperPid": helper_pid,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(validate_helper_commit(&helper_dir, &nonce, parent_pid, helper_pid).is_ok());
+        assert_eq!(
+            fs::read(&protected_target).unwrap(),
+            b"keep until committed"
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn readonly_owned_file_is_removed_without_acl_changes() {
@@ -4204,6 +4880,10 @@ mod tests {
         assert!(script.contains("Staged finalizer report did not confirm helper removal"));
         assert!(script.contains("finalizer.ready"));
         assert!(script.contains("finalizer.error.txt"));
+        assert!(script.contains("helper-error.json"));
+        assert!(script.contains("helper-error.pending"));
+        assert!(script.contains("helper-phase.json"));
+        assert!(script.contains("helper-phase.pending"));
         assert!(script.contains("exit 2"));
         let shell = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
             .join("System32/WindowsPowerShell/v1.0/powershell.exe");

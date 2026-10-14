@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [Parameter(Position = 0, Mandatory = $true)][ValidateSet('has_city','get_city','set_city','get_config')][string]$Command,
     [Parameter(Position = 1)][string]$City

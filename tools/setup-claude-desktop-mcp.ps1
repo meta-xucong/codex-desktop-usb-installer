@@ -1,4 +1,4 @@
-# Claude Desktop MCP Configuration Script
+﻿# Claude Desktop MCP Configuration Script
 # Purpose: Configure Filesystem + Shell MCP to enable Windows native environment access
 
 [CmdletBinding()]

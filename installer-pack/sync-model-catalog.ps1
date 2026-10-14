@@ -1,4 +1,4 @@
-[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
+﻿[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
 param(
     [Parameter(Mandatory = $true)][string]$PackRoot,
     [Parameter(Mandatory = $true)][string]$TargetUserProfile,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import http.server
 import base64
+import functools
 import json
 import os
 import shutil
@@ -44,6 +45,13 @@ RENDER_SCRIPT = SCRIPT_ROOT / "render-codex-config.ps1"
 PDF_TOOL_SCRIPT = ROOT / "skills" / "pdf-processing-toolkit" / "scripts" / "pdf_tool.py"
 MODEL_SYNC_SCRIPT = SCRIPT_ROOT / "sync-model-catalog.ps1"
 POWERSHELL = shutil.which("powershell.exe") or shutil.which("pwsh.exe") or shutil.which("pwsh")
+WINDOWS_POWERSHELL = shutil.which("powershell.exe")
+if not WINDOWS_POWERSHELL:
+    _windows_dir = os.environ.get("WINDIR") or os.environ.get("SystemRoot")
+    if _windows_dir:
+        _windows_powershell_candidate = Path(_windows_dir) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+        if _windows_powershell_candidate.is_file():
+            WINDOWS_POWERSHELL = str(_windows_powershell_candidate)
 MACRO_CYCLE_SCRIPT = ROOT / "skills" / "macro-research" / "scripts" / "cycle_analyzer.py"
 POLICY_SCRIPT = ROOT / "skills" / "macro-research" / "scripts" / "policy_analyzer.py"
 SENTIMENT_SCRIPT = ROOT / "skills" / "macro-research" / "scripts" / "sentiment_monitor.py"
@@ -74,6 +82,27 @@ def adapter_environment(values=None):
     finally:
         os.environ.clear()
         os.environ.update(original)
+
+
+@functools.lru_cache(maxsize=1)
+def powershell_host_startup_stderr():
+    if not POWERSHELL:
+        return b""
+    completed = subprocess.run(
+        [POWERSHELL, "-NoProfile", "-Command", "exit 0"],
+        check=False,
+        capture_output=True,
+        timeout=15,
+    )
+    return completed.stderr
+
+
+def remove_powershell_host_startup_stderr(stderr):
+    """Exclude only bytes emitted by a clean PowerShell host in this environment."""
+    startup = powershell_host_startup_stderr()
+    if startup and stderr.startswith(startup):
+        return stderr[len(startup):]
+    return stderr
 
 
 def load_module(path: Path, environment=None):
@@ -344,6 +373,67 @@ class InstallAllMediaForwardingTests(unittest.TestCase):
                 "count": 3,
                 "verifiedAt": "2026-10-14T00:00:00Z",
             })
+
+
+class MediaMcpInstallAvailabilityPolicyTests(unittest.TestCase):
+    def test_missing_provider_routes_do_not_block_mcp_installation(self):
+        script = (ROOT / "install-to-codex.ps1").read_text(encoding="utf-8-sig")
+        self.assertIn("if ($mediaGenerationEnabled)", script)
+        self.assertIn("protocol-passed", script)
+        self.assertIn("-EnableMediaGeneration", script)
+        self.assertNotIn("EnableMediaGeneration requires at least one provider model ID.", script)
+        self.assertNotIn("EnableMediaGeneration requires MEDIA_GENERATION_AGENT_ID", script)
+        self.assertNotIn("MiniMax video model is supported only through", script)
+
+    @unittest.skipUnless(WINDOWS_POWERSHELL, "Windows PowerShell 5.1 is required for capability pack parse tests")
+    def test_media_install_entrypoints_have_utf8_bom_and_parse_in_powershell(self):
+        verifier = ROOT.parent / "tools" / "verify-capability-pack-powershell.ps1"
+        completed = subprocess.run(
+            [WINDOWS_POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(verifier), "-Root", str(ROOT)],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + "\n" + completed.stderr)
+
+    @unittest.skipUnless(WINDOWS_POWERSHELL, "Windows PowerShell 5.1 is required for encoding rejection tests")
+    def test_windows_powershell_encoding_gate_rejects_bomless_invalid_or_malformed_scripts(self):
+        verifier = ROOT.parent / "tools" / "verify-capability-pack-powershell.ps1"
+
+        def run_gate(root):
+            return subprocess.run(
+                [WINDOWS_POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(verifier), "-Root", str(root)],
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+            )
+
+        with tempfile.TemporaryDirectory(prefix="pwsh-encoding-gate-") as temporary:
+            root = Path(temporary)
+            script = root / "sample.ps1"
+            script.write_bytes(b"\xef\xbb\xbfWrite-Output '\xe4\xb8\xad\xe6\x96\x87'\r\n")
+            self.assertEqual(run_gate(root).returncode, 0, "BOM-marked UTF-8 PowerShell should parse")
+
+            script.write_bytes("Write-Output '中文'\r\n".encode("utf-8"))
+            result = run_gate(root)
+            self.assertNotEqual(result.returncode, 0, "BOM-less non-ASCII PowerShell must be rejected")
+            self.assertIn("missing UTF-8 BOM", " ".join(result.stderr.split()))
+
+            script.write_bytes(b"\xef\xbb\xbf\xff\xfe")
+            result = run_gate(root)
+            self.assertNotEqual(result.returncode, 0, "Invalid UTF-8 PowerShell must be rejected")
+            self.assertIn("sample.ps1", result.stderr)
+            self.assertIn("invalid UTF-8", result.stderr)
+
+            script.write_bytes(b"\xef\xbb\xbfif (\r\n")
+            result = run_gate(root)
+            self.assertNotEqual(result.returncode, 0, "Malformed PowerShell must be rejected by the 5.1 parser")
 
 
 @unittest.skipUnless(POWERSHELL, "PowerShell is required for model catalog synchronization contract tests")
@@ -807,6 +897,13 @@ class MediaGenerationMcpTests(unittest.TestCase):
         self.assertIn("统一网关", lines[1].decode("utf-8"))
         caps = json.loads(replies[2]["result"]["content"][0]["text"])
         self.assertEqual(caps["generation_capability"], "not_tested")
+        self.assertEqual(caps["http_timeout_seconds"], 600)
+        media_template = ROOT / "config-fragments" / "media-generation-stdio.template.toml"
+        media_template_text = media_template.read_text(encoding="utf-8")
+        media_template_text = media_template_text.replace("__MEDIA_GENERATION_ENABLED__", "true").replace("__MEDIA_GENERATION_WRAPPER__", '"media-wrapper.ps1"')
+        media_config = tomllib.loads(media_template_text)
+        self.assertEqual(media_config["mcp_servers"]["media_generation"]["startup_timeout_sec"], 20)
+        self.assertEqual(media_config["mcp_servers"]["media_generation"]["tool_timeout_sec"], 1500)
 
     @unittest.skipUnless(POWERSHELL, "PowerShell is required for the installed wrapper integration test")
     def test_normal_wrapper_config_path_uses_signed_launch_key_and_preserves_raw_jsonrpc(self):
@@ -836,7 +933,7 @@ class MediaGenerationMcpTests(unittest.TestCase):
         raw = ("\n".join(json.dumps(item, ensure_ascii=False) for item in messages) + "\n").encode("utf-8")
         completed = subprocess.run([POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(bin_dir / "start-media-generation-mcp.ps1"), "-PythonExe", sys.executable], input=raw, capture_output=True, env=environment, timeout=20)
         self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8", errors="replace"))
-        self.assertEqual(completed.stderr, b"", completed.stderr.decode("utf-8", errors="replace"))
+        self.assertEqual(remove_powershell_host_startup_stderr(completed.stderr), b"", completed.stderr.decode("utf-8", errors="replace"))
         replies = [json.loads(line.decode("utf-8", errors="strict")) for line in completed.stdout.splitlines()]
         self.assertEqual([item.get("id") for item in replies], [1, 2, 3], completed.stdout.decode("utf-8", errors="replace"))
         capabilities = json.loads(replies[2]["result"]["content"][0]["text"])
@@ -848,7 +945,7 @@ class MediaGenerationMcpTests(unittest.TestCase):
         health = subprocess.run([POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(bin_dir / "start-media-generation-mcp.ps1"), "-HealthCheck", "-PythonExe", sys.executable], capture_output=True, env=environment, timeout=20)
         self.assertEqual(health.returncode, 0, health.stderr.decode("utf-8", errors="replace"))
         health_report = json.loads(health.stdout.decode("utf-8", errors="strict"))
-        self.assertEqual(health_report["serverVersion"], "1.3.3")
+        self.assertEqual(health_report["serverVersion"], "1.3.4")
         self.assertEqual(health_report["protocolStatus"], "passed")
         self.assertEqual(health_report["generationCapability"], "not_tested")
 
@@ -961,6 +1058,7 @@ class MediaGenerationMcpTests(unittest.TestCase):
             artifact = self.module._artifacts({"status": "completed", "content_url": "/v1/videos/video-7/content"}, "seedance-video")
             self.assertEqual(artifact[0]["url"], "https://gateway.example/v1/videos/video-7/content")
             requests = []
+            timeouts = []
             class FakeResponse:
                 headers = {"Content-Length": "5"}
                 def __init__(self): self.stream = __import__("io").BytesIO(b"video")
@@ -970,6 +1068,7 @@ class MediaGenerationMcpTests(unittest.TestCase):
             class FakeOpener:
                 def open(inner, request, timeout):
                     requests.append(request)
+                    timeouts.append(timeout)
                     return FakeResponse()
             with mock.patch.object(self.module.urllib.request, "build_opener", side_effect=lambda *_args: FakeOpener()), \
                  mock.patch.object(self.module, "_validate_public_url", side_effect=lambda value, resolve=False: value), \
@@ -982,6 +1081,7 @@ class MediaGenerationMcpTests(unittest.TestCase):
             self.assertEqual(requests[0].get_header("Authorization"), "Bearer contract-test-key")
             self.assertIsNone(requests[1].get_header("Authorization"))
             self.assertIsNone(requests[2].get_header("Authorization"))
+            self.assertEqual(timeouts, [600, 600, 600])
 
     def test_completed_task_can_be_saved_after_local_reference_is_deleted(self):
         source = self.data_dir / "reference.png"
@@ -1081,7 +1181,7 @@ class MediaGenerationMcpTests(unittest.TestCase):
                 })
                 self.assertEqual(calls["posts"], 1)
                 self.assertEqual(calls["url"], "https://media.example.invalid/v1/responses")
-                self.assertEqual(calls["timeout"], 60)
+                self.assertEqual(calls["timeout"], 600)
                 self.assertEqual(calls["payload"]["model"], "gpt-image-2.5")
                 self.assertEqual(calls["payload"]["tool_choice"], {"type": "image_generation"})
                 self.assertEqual(submitted["state"], "completed")
@@ -1120,14 +1220,14 @@ class MediaGenerationMcpTests(unittest.TestCase):
         self.assertEqual(health["healthScope"], "local-runtime-protocol")
         self.assertEqual(health["gatewayCatalogStatus"], "not_checked")
         self.assertEqual(health["generationCapability"], "not_tested")
-        self.assertEqual(health["serverVersion"], "1.3.3")
+        self.assertEqual(health["serverVersion"], "1.3.4")
 
     def test_wrapper_healthcheck_does_not_merge_stderr_into_json_stdout(self):
         self.assertTrue(POWERSHELL, "Windows PowerShell is required for this wrapper contract test")
         fake_python = Path(self.temp.name) / "python-health-fixture.cmd"
         health_json = json.dumps({
             "ready": True,
-            "serverVersion": "1.3.3",
+            "serverVersion": "1.3.4",
             "healthScope": "local-runtime-protocol",
             "runtimeStatus": "passed",
             "protocolStatus": "passed",
@@ -1142,7 +1242,7 @@ class MediaGenerationMcpTests(unittest.TestCase):
             timeout=20,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8", errors="replace"))
-        self.assertEqual(completed.stderr, b"")
+        self.assertEqual(remove_powershell_host_startup_stderr(completed.stderr), b"")
         health = json.loads(completed.stdout.decode("utf-8", errors="strict"))
         self.assertTrue(health["ready"])
         self.assertEqual(health["protocolStatus"], "passed")

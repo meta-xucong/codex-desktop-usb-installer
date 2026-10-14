@@ -1,4 +1,4 @@
-# Windows x64 packaged lifecycle smoke test.
+﻿# Windows x64 packaged lifecycle smoke test.
 #
 # Stages (each failure message is prefixed so CI logs pin the phase):
 #   build     — caller already built; this script only consumes the installer

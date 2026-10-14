@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$TargetUserProfile,
     [ValidateSet('tenant','oauth','user')][string]$FeishuAuthMode = 'tenant',

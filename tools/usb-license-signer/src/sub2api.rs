@@ -193,8 +193,18 @@ struct PendingProvisionRecord {
     sub2api_user_id: u64,
     group_id: u64,
     password: String,
+    /// Per-registration idempotency key for the admin create-user POST.
+    /// Persisted before the request so retries are stable, while a fresh
+    /// registration that reuses a USB number cannot replay a prior account.
+    #[serde(default)]
+    provision_idempotency_key: Option<String>,
     #[serde(default)]
     device_api_key: Option<String>,
+    /// Per-registration idempotency key for the user API-key POST. This must
+    /// be persisted before the request so retries of one registration reuse
+    /// it, while a fresh registration that reuses a USB number gets a new key.
+    #[serde(default)]
+    user_api_key_idempotency_key: Option<String>,
     created_at_unix_ms: u128,
 }
 
@@ -317,6 +327,20 @@ fn validate_pending_provision(
     {
         return Err(Sub2ApiError::Recovery("恢复记录参数无效".to_string()));
     }
+    if let Some(key) = pending.user_api_key_idempotency_key.as_deref() {
+        if !valid_user_api_key_idempotency_key(&pending.usb_asset_id, key) {
+            return Err(Sub2ApiError::Recovery(
+                "恢复记录中的 API Key 请求标识无效".to_string(),
+            ));
+        }
+    }
+    if let Some(key) = pending.provision_idempotency_key.as_deref() {
+        if !valid_provision_idempotency_key(&pending.usb_asset_id, key) {
+            return Err(Sub2ApiError::Recovery(
+                "恢复记录中的账号创建请求标识无效".to_string(),
+            ));
+        }
+    }
     validate_initial_password(&pending.password)
         .map_err(|_| Sub2ApiError::Recovery("恢复记录中的密码无效".to_string()))?;
     if let Some(api_key) = pending.device_api_key.as_deref() {
@@ -358,24 +382,48 @@ fn save_pending_provision(
     validate_pending_provision(pending, recovery_key)?;
     let path = pending_provision_path(recovery_key)?;
     if let Some(existing) = load_pending_provision(recovery_key)? {
-        let candidate_changed = existing.usb_asset_id != pending.usb_asset_id
-            || existing.login_email != pending.login_email;
         let identity_changed = existing.recovery_key_digest != pending.recovery_key_digest
             || existing.group_id != pending.group_id
             || existing.password != pending.password
             || existing.created_at_unix_ms != pending.created_at_unix_ms;
-        let user_id_changed_unsafely =
-            existing.sub2api_user_id != 0 && existing.sub2api_user_id != pending.sub2api_user_id;
+        let candidate_changed = existing.usb_asset_id != pending.usb_asset_id
+            || existing.login_email != pending.login_email;
+        // A login-401 reconciliation may replace a stale remote user ID only
+        // after the exact USB username+email lookup proves the stored ID is
+        // obsolete. Such a repair is allowed only before a user API key has
+        // been saved and without changing the local registration identity.
+        let remote_identity_repair = existing.sub2api_user_id != pending.sub2api_user_id
+            && existing.device_api_key.is_none()
+            && pending.device_api_key.is_none()
+            && !candidate_changed
+            && !identity_changed;
+        let user_id_changed_unsafely = existing.sub2api_user_id != 0
+            && existing.sub2api_user_id != pending.sub2api_user_id
+            && !remote_identity_repair;
         let candidate_changed_after_creation =
             candidate_changed && (existing.sub2api_user_id != 0 || pending.sub2api_user_id != 0);
         let key_changed = existing
             .device_api_key
             .as_deref()
             .is_some_and(|key| pending.device_api_key.as_deref() != Some(key));
+        let api_key_idempotency_changed_unsafely = existing.sub2api_user_id != 0
+            && !remote_identity_repair
+            && existing
+                .user_api_key_idempotency_key
+                .as_deref()
+                .is_some_and(|key| pending.user_api_key_idempotency_key.as_deref() != Some(key));
+        let provision_idempotency_changed_unsafely = existing.sub2api_user_id != 0
+            && !remote_identity_repair
+            && existing
+                .provision_idempotency_key
+                .as_deref()
+                .is_some_and(|key| pending.provision_idempotency_key.as_deref() != Some(key));
         if identity_changed
             || user_id_changed_unsafely
             || candidate_changed_after_creation
             || key_changed
+            || api_key_idempotency_changed_unsafely
+            || provision_idempotency_changed_unsafely
         {
             return Err(Sub2ApiError::Recovery(
                 "已有不同账号占用当前 Bundle 的恢复记录".to_string(),
@@ -644,33 +692,35 @@ pub fn make_idempotency_key(asset_id: &str, license_digest: &str) -> String {
     )
 }
 
-/// Stable key for the account-creation transaction.  It contains only the
-/// public USB identity; the password and administrator credential never enter
-/// the key or any request log.
+/// Create a fresh idempotency key for one registration's account-creation
+/// transaction. The random suffix avoids replaying a deleted account's server
+/// idempotency record if USB numbering is later reset.
 pub fn make_provision_idempotency_key(asset_id: &str) -> String {
-    let digest = Sha256::digest(asset_id.as_bytes());
-    format!(
-        "usb-provision-{asset_id}-{}",
-        digest
-            .iter()
-            .take(16)
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()
-    )
+    format!("usb-provision-{asset_id}-{}", Uuid::new_v4().simple())
 }
 
-/// Stable key for creating the per-USB user API key. A retry after an
-/// ambiguous response must refer to the same key-creation operation.
-pub fn make_user_api_key_idempotency_key(asset_id: &str) -> String {
-    let digest = Sha256::digest(asset_id.as_bytes());
-    format!(
-        "usb-user-key-{asset_id}-{}",
-        digest
-            .iter()
-            .take(16)
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()
-    )
+fn valid_provision_idempotency_key(asset_id: &str, key: &str) -> bool {
+    valid_registration_idempotency_key("usb-provision", asset_id, key)
+}
+
+/// Create a fresh key for one registration's user API-key operation. The
+/// random suffix prevents a deleted/re-numbered test account from reusing a
+/// server idempotency record; callers persist the result before the POST.
+fn make_user_api_key_idempotency_key(asset_id: &str) -> String {
+    format!("usb-user-key-{asset_id}-{}", Uuid::new_v4().simple())
+}
+
+fn valid_user_api_key_idempotency_key(asset_id: &str, key: &str) -> bool {
+    valid_registration_idempotency_key("usb-user-key", asset_id, key)
+}
+
+fn valid_registration_idempotency_key(prefix: &str, asset_id: &str, key: &str) -> bool {
+    let Some(suffix) = key.strip_prefix(&format!("{prefix}-{asset_id}-")) else {
+        return false;
+    };
+    suffix.len() == 32
+        && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && Uuid::parse_str(suffix).is_ok()
 }
 
 pub fn generate_initial_password() -> Result<Zeroizing<String>, Sub2ApiError> {
@@ -807,12 +857,14 @@ impl Sub2ApiClient {
                 .map(recovery_key_digest)
                 .transpose()?
                 .unwrap_or_default(),
-            usb_asset_id: asset_id,
+            usb_asset_id: asset_id.clone(),
             login_email: email,
             sub2api_user_id: 0,
             group_id,
             password: password.to_string(),
+            provision_idempotency_key: Some(make_provision_idempotency_key(&asset_id)),
             device_api_key: None,
+            user_api_key_idempotency_key: Some(make_user_api_key_idempotency_key(&asset_id)),
             created_at_unix_ms: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_err(|_| Sub2ApiError::Recovery("系统时间无效".to_string()))?
@@ -854,8 +906,17 @@ impl Sub2ApiClient {
                 number = next_usb_number(users).max(number.saturating_add(1));
                 continue;
             }
+            let candidate_changed = pending.usb_asset_id != asset_id;
             pending.usb_asset_id = asset_id.clone();
             pending.login_email = email.clone();
+            if candidate_changed {
+                pending.provision_idempotency_key = Some(make_provision_idempotency_key(&asset_id));
+                pending.user_api_key_idempotency_key =
+                    Some(make_user_api_key_idempotency_key(&asset_id));
+            }
+            if pending.provision_idempotency_key.is_none() {
+                pending.provision_idempotency_key = Some(make_provision_idempotency_key(&asset_id));
+            }
             if let Some(recovery_key) = recovery_key {
                 save_pending_provision(recovery_key, pending)?;
             }
@@ -864,6 +925,10 @@ impl Sub2ApiClient {
                 &email,
                 &pending.password,
                 pending.group_id,
+                pending
+                    .provision_idempotency_key
+                    .as_deref()
+                    .expect("provision idempotency key created before request"),
                 users,
             ) {
                 Ok(user_id) => {
@@ -909,9 +974,34 @@ impl Sub2ApiClient {
                         ));
                     }
                 }
-                let user_token = self.login(&pending.login_email, &pending.password)?;
-                let api_key =
-                    self.create_user_api_key(&user_token, &pending.usb_asset_id, pending.group_id)?;
+                // Older encrypted recovery records predate this field. Give
+                // them one fresh operation key and persist it before login or
+                // POST, so a restart cannot generate a different key.
+                if pending.user_api_key_idempotency_key.is_none() {
+                    pending.user_api_key_idempotency_key =
+                        Some(make_user_api_key_idempotency_key(&pending.usb_asset_id));
+                    if let Some(recovery_key) = recovery_key {
+                        save_pending_provision(recovery_key, &pending)?;
+                    }
+                }
+                let user_token = match self.login(&pending.login_email, &pending.password) {
+                    Ok(token) => token,
+                    Err(error) if error.is_unauthorized() => {
+                        self.reconcile_after_login_unauthorized(&mut pending, recovery_key)?;
+                        self.login(&pending.login_email, &pending.password)?
+                    }
+                    Err(error) => return Err(error),
+                };
+                let idempotency_key = pending
+                    .user_api_key_idempotency_key
+                    .as_deref()
+                    .expect("API key operation key persisted before login");
+                let api_key = self.create_user_api_key(
+                    &user_token,
+                    &pending.usb_asset_id,
+                    pending.group_id,
+                    &idempotency_key,
+                )?;
                 pending.device_api_key = Some(api_key.clone());
                 if let Some(recovery_key) = recovery_key {
                     save_pending_provision(recovery_key, &pending)?;
@@ -941,6 +1031,66 @@ impl Sub2ApiClient {
             reused: false,
             recovered,
         })
+    }
+
+    /// A deleted account may leave the server's idempotency cache intact. If
+    /// an older signer persisted the stale user ID returned by that cache,
+    /// login can fail even though the current registration is otherwise
+    /// recoverable. Reconcile only against the exact USB username+email pair.
+    fn reconcile_after_login_unauthorized(
+        &self,
+        pending: &mut PendingProvisionRecord,
+        recovery_key: Option<&str>,
+    ) -> Result<(), Sub2ApiError> {
+        let mut users = self.list_usb_users()?;
+        if let Some(user) = find_user_identity(&users, &pending.usb_asset_id, &pending.login_email)
+        {
+            if user.id == pending.sub2api_user_id {
+                return Err(Sub2ApiError::ExistingAccount(
+                    "U 盘编号与邮箱对应的账号存在，但登录密码未通过；为避免覆盖账号，未自动重置密码"
+                        .to_string(),
+                ));
+            }
+            if pending.device_api_key.is_some() {
+                return Err(Sub2ApiError::Recovery(
+                    "账号 ID 与本地已保存的 API Key 不一致，已停止自动修复".to_string(),
+                ));
+            }
+            pending.sub2api_user_id = user.id;
+            pending.user_api_key_idempotency_key =
+                Some(make_user_api_key_idempotency_key(&pending.usb_asset_id));
+            if let Some(recovery_key) = recovery_key {
+                save_pending_provision(recovery_key, pending)?;
+            }
+            return Ok(());
+        }
+
+        if users
+            .iter()
+            .any(|user| user.username == pending.usb_asset_id || user.email == pending.login_email)
+        {
+            return Err(Sub2ApiError::ExistingAccount(
+                "远端存在相同 U 盘编号或邮箱，但两者不匹配；已停止自动创建以避免串号".to_string(),
+            ));
+        }
+        if pending.device_api_key.is_some() {
+            return Err(Sub2ApiError::Recovery(
+                "远端账号不存在，但恢复记录已有 API Key；已停止自动重建".to_string(),
+            ));
+        }
+
+        // The stored ID no longer names a visible account. Reset the remote
+        // link and rotate both operation keys before safely creating the exact
+        // persisted identity again. A later retry can find and resume it.
+        pending.sub2api_user_id = 0;
+        pending.provision_idempotency_key =
+            Some(make_provision_idempotency_key(&pending.usb_asset_id));
+        pending.user_api_key_idempotency_key =
+            Some(make_user_api_key_idempotency_key(&pending.usb_asset_id));
+        if let Some(recovery_key) = recovery_key {
+            save_pending_provision(recovery_key, pending)?;
+        }
+        self.create_pending_user(pending, &mut users, recovery_key)
     }
 
     /// Remove the encrypted registration recovery record after the same
@@ -1090,12 +1240,12 @@ impl Sub2ApiClient {
         email: &str,
         password: &str,
         group_id: u64,
+        idempotency_key: &str,
         users: &mut Vec<UserRecord>,
     ) -> Result<u64, Sub2ApiError> {
-        let idempotency_key = make_provision_idempotency_key(asset_id);
         let mut last_error = None;
         for attempt in 1..=MAX_TRANSIENT_ATTEMPTS {
-            match self.create_user(asset_id, email, password, group_id, &idempotency_key) {
+            match self.create_user(asset_id, email, password, group_id, idempotency_key) {
                 Ok(id) => return Ok(id),
                 Err(error) if error.is_conflict() => {
                     let refreshed = self.list_usb_users()?;
@@ -1179,8 +1329,8 @@ impl Sub2ApiClient {
         token: &str,
         asset_id: &str,
         group_id: u64,
+        idempotency_key: &str,
     ) -> Result<String, Sub2ApiError> {
-        let idempotency_key = make_user_api_key_idempotency_key(asset_id);
         let value = self.user_request(
             "create-api-key",
             Method::POST,
@@ -1190,7 +1340,7 @@ impl Sub2ApiClient {
                 "group_id": group_id,
             })),
             Some(token),
-            Some(&idempotency_key),
+            Some(idempotency_key),
         )?;
         find_string(&value, &["key", "api_key", "apiKey", "token"]).ok_or(Sub2ApiError::Response {
             operation: "create-api-key",
@@ -1306,7 +1456,7 @@ impl Sub2ApiClient {
             return Err(Sub2ApiError::Http {
                 operation,
                 status: status.as_u16(),
-                kind: http_error_kind(status),
+                kind: http_error_kind(status, operation),
             });
         }
         if bytes.is_empty() {
@@ -1349,17 +1499,22 @@ impl Sub2ApiError {
             }
         )
     }
+
+    fn is_unauthorized(&self) -> bool {
+        matches!(self, Self::Http { status: 401, .. })
+    }
 }
 
 fn retry_delay(attempt: u32) -> Duration {
     Duration::from_millis(RETRY_BASE_DELAY_MS.saturating_mul(1_u64 << attempt.saturating_sub(1)))
 }
 
-fn http_error_kind(status: StatusCode) -> &'static str {
+fn http_error_kind(status: StatusCode, operation: &'static str) -> &'static str {
     match status {
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => "授权失败",
         StatusCode::NOT_FOUND => "接口不存在",
-        StatusCode::CONFLICT => "编号冲突",
+        StatusCode::CONFLICT if operation == "create-api-key" => "API Key 创建冲突",
+        StatusCode::CONFLICT => "资源冲突",
         StatusCode::UNPROCESSABLE_ENTITY => "参数被拒绝",
         status if status.is_server_error() => "服务端错误",
         _ => "请求被拒绝",
@@ -1801,9 +1956,24 @@ mod tests {
             sub2api_user_id: 0,
             group_id: 7,
             password: "Test-only-USB-password-42".to_string(),
+            provision_idempotency_key: Some(make_provision_idempotency_key("USB-0042")),
             device_api_key: None,
+            user_api_key_idempotency_key: Some(make_user_api_key_idempotency_key("USB-0042")),
             created_at_unix_ms: 1,
         };
+        let mut legacy_json = serde_json::to_value(&pending).expect("serialize current record");
+        legacy_json
+            .as_object_mut()
+            .expect("record is an object")
+            .remove("provisionIdempotencyKey");
+        legacy_json
+            .as_object_mut()
+            .expect("record is an object")
+            .remove("userApiKeyIdempotencyKey");
+        let legacy: PendingProvisionRecord =
+            serde_json::from_value(legacy_json).expect("read legacy recovery record");
+        assert!(legacy.provision_idempotency_key.is_none());
+        assert!(legacy.user_api_key_idempotency_key.is_none());
         save_pending_provision(&recovery_key, &pending).expect("save recovery record");
         let path = pending_provision_path(&recovery_key).unwrap();
         let raw = fs::read(&path).expect("read encrypted recovery record");
@@ -1816,12 +1986,11 @@ mod tests {
         let raw = fs::read(&path).expect("read encrypted completed recovery record");
         assert!(!String::from_utf8_lossy(&raw).contains("sk-device-key"));
         assert!(!String::from_utf8_lossy(&raw).contains("Test-only-USB-password-42"));
+        let restored = load_pending_provision(&recovery_key).unwrap().unwrap();
+        assert_eq!(restored.sub2api_user_id, 23);
         assert_eq!(
-            load_pending_provision(&recovery_key)
-                .unwrap()
-                .unwrap()
-                .sub2api_user_id,
-            23
+            restored.user_api_key_idempotency_key,
+            linked.user_api_key_idempotency_key
         );
         clear_pending_provision(&recovery_key).expect("clear recovery record");
         assert!(!path.exists());
@@ -1893,21 +2062,37 @@ mod tests {
     }
 
     #[test]
-    fn idempotency_key_is_stable_without_containing_credentials() {
+    fn idempotency_keys_keep_scope_and_registration_keys_are_unique() {
         let first = make_idempotency_key("USB-0002", &"a".repeat(64));
         assert_eq!(first, make_idempotency_key("USB-0002", &"a".repeat(64)));
         assert!(first.starts_with("usb-preload-USB-0002-"));
         assert!(!first.contains("sk-"));
 
         let provision = make_provision_idempotency_key("USB-0002");
-        assert_eq!(provision, make_provision_idempotency_key("USB-0002"));
+        let provision_retry = provision.clone();
+        let next_provision = make_provision_idempotency_key("USB-0002");
         assert!(provision.starts_with("usb-provision-USB-0002-"));
         assert!(!provision.contains("password"));
+        assert!(valid_provision_idempotency_key("USB-0002", &provision));
+        assert_eq!(provision_retry, provision);
+        assert_ne!(provision, next_provision);
+        assert!(!valid_provision_idempotency_key("USB-0003", &provision));
 
         let user_key = make_user_api_key_idempotency_key("USB-0002");
-        assert_eq!(user_key, make_user_api_key_idempotency_key("USB-0002"));
+        let retry_key = user_key.clone();
+        let fresh_registration_key = make_user_api_key_idempotency_key("USB-0002");
         assert!(user_key.starts_with("usb-user-key-USB-0002-"));
         assert!(!user_key.contains("password"));
+        assert!(valid_user_api_key_idempotency_key("USB-0002", &user_key));
+        assert_eq!(
+            retry_key, user_key,
+            "a retry reuses the persisted operation key"
+        );
+        assert_ne!(
+            user_key, fresh_registration_key,
+            "a fresh registration must not reuse a prior server idempotency record"
+        );
+        assert!(!valid_user_api_key_idempotency_key("USB-0003", &user_key));
     }
 
     #[test]
@@ -2195,6 +2380,20 @@ mod tests {
                         assert_eq!(persisted.login_email, "u1@u.404token.xyz");
                         assert_eq!(persisted.sub2api_user_id, 0);
                         assert!(persisted.device_api_key.is_none());
+                        let request_idempotency = request_lower
+                            .lines()
+                            .find_map(|line| line.strip_prefix("idempotency-key:"))
+                            .expect("create-user idempotency header")
+                            .trim();
+                        assert_eq!(
+                            persisted
+                                .provision_idempotency_key
+                                .as_deref()
+                                .map(str::to_ascii_lowercase)
+                                .as_deref(),
+                            Some(request_idempotency),
+                            "the exact account-create key is durably recorded before POST"
+                        );
                         send_json(&mut stream, r#"{"id":23}"#);
                     }
                     3 | 6 => {
@@ -2210,6 +2409,18 @@ mod tests {
                             .trim()
                             .to_string();
                         first_key_idempotency = Some(key);
+                        let pending = load_pending_provision(&fixture_recovery_key)
+                            .expect("read pending API key operation")
+                            .expect("pending record retained before API key POST");
+                        assert_eq!(
+                            pending
+                                .user_api_key_idempotency_key
+                                .as_deref()
+                                .map(str::to_ascii_lowercase)
+                                .as_deref(),
+                            first_key_idempotency.as_deref(),
+                            "the exact key sent to the provider is durably recorded first"
+                        );
                         send_error(&mut stream, "503 Service Unavailable");
                     }
                     7 => {
@@ -2249,6 +2460,112 @@ mod tests {
         assert_eq!(provisioned.binding.sub2api_user_id, 23);
         assert_eq!(provisioned.binding.ccswitch.device_api_key, "sk-device-key");
         handle.join().expect("key recovery fixture thread");
+        match previous {
+            Some(value) => std::env::set_var("LOCALAPPDATA", value),
+            None => std::env::remove_var("LOCALAPPDATA"),
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn login_401_recovers_stale_deleted_account_idempotency_result() {
+        let _guard = CONFIG_TEST_LOCK.lock().unwrap();
+        let root =
+            std::env::temp_dir().join(format!("usb-signer-login-recovery-{}", Uuid::new_v4()));
+        let previous = std::env::var_os("LOCALAPPDATA");
+        std::env::set_var("LOCALAPPDATA", &root);
+        let recovery_key = make_provision_recovery_key(123, &"b".repeat(64), "CodexUsb");
+        let stale_provision_key = format!("usb-provision-USB-0001-{}", "a".repeat(32));
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stale account fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let fixture_recovery_key = recovery_key.clone();
+        let fixture_stale_provision_key = stale_provision_key.clone();
+        let handle = thread::spawn(move || {
+            for step in 0..6 {
+                let (mut stream, _) = listener.accept().expect("accept stale account request");
+                let request = read_http_request(&mut stream);
+                let request_lower = request.to_ascii_lowercase();
+                match step {
+                    0 => {
+                        assert!(request.starts_with("GET /api/v1/admin/groups/all "));
+                        send_json(
+                            &mut stream,
+                            r#"{"data":[{"id":7,"name":"unified-api-internal","status":"active"}]}"#,
+                        );
+                    }
+                    1 => {
+                        assert!(request.starts_with("POST /api/v1/auth/login "));
+                        send_error(&mut stream, "401 Unauthorized");
+                    }
+                    2 => {
+                        assert!(request.starts_with("GET /api/v1/admin/users?search=USB-"));
+                        send_json(&mut stream, r#"{"data":[]}"#);
+                    }
+                    3 => {
+                        assert!(request.starts_with("POST /api/v1/admin/users "));
+                        let key = request_lower
+                            .lines()
+                            .find_map(|line| line.strip_prefix("idempotency-key:"))
+                            .expect("replacement create-user idempotency key")
+                            .trim();
+                        assert!(key.starts_with("usb-provision-usb-0001-"));
+                        assert_ne!(key, fixture_stale_provision_key);
+                        let pending = load_pending_provision(&fixture_recovery_key)
+                            .expect("load repaired recovery record")
+                            .expect("recovery record remains available");
+                        assert_eq!(pending.sub2api_user_id, 0);
+                        assert_ne!(
+                            pending.provision_idempotency_key.as_deref(),
+                            Some(fixture_stale_provision_key.as_str())
+                        );
+                        send_json(&mut stream, r#"{"id":24}"#);
+                    }
+                    4 => {
+                        assert!(request.starts_with("POST /api/v1/auth/login "));
+                        send_json(&mut stream, r#"{"access_token":"recovered-user-token"}"#);
+                    }
+                    5 => {
+                        assert!(request.starts_with("POST /api/v1/keys "));
+                        assert!(
+                            request_lower.contains("authorization: bearer recovered-user-token")
+                        );
+                        send_json(&mut stream, r#"{"key":"sk-recovered-device-key"}"#);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        });
+
+        let stale_pending = PendingProvisionRecord {
+            schema_version: PROVISION_RECOVERY_SCHEMA_VERSION,
+            recovery_key_digest: recovery_key_digest(&recovery_key).unwrap(),
+            usb_asset_id: "USB-0001".to_string(),
+            login_email: "u1@u.404token.xyz".to_string(),
+            sub2api_user_id: 23,
+            group_id: 7,
+            password: DEFAULT_INITIAL_PASSWORD.to_string(),
+            provision_idempotency_key: Some(stale_provision_key),
+            device_api_key: None,
+            user_api_key_idempotency_key: Some(format!("usb-user-key-USB-0001-{}", "b".repeat(32))),
+            created_at_unix_ms: 1,
+        };
+        save_pending_provision(&recovery_key, &stale_pending)
+            .expect("save old-format pending state");
+        let client = Sub2ApiClient::new(Sub2ApiConfig {
+            base_url: format!("http://{address}"),
+            admin_api_key: "admin-test-key".to_string(),
+            fake_email_domain: DEFAULT_EMAIL_DOMAIN.to_string(),
+        })
+        .expect("fixture client");
+        let provisioned = client
+            .provision_account_with_recovery(None, None, Some(&recovery_key))
+            .expect("recreate account after stale deleted-user id");
+        assert_eq!(provisioned.binding.sub2api_user_id, 24);
+        assert_eq!(
+            provisioned.binding.ccswitch.device_api_key,
+            "sk-recovered-device-key"
+        );
+        handle.join().expect("stale account fixture thread");
         match previous {
             Some(value) => std::env::set_var("LOCALAPPDATA", value),
             None => std::env::remove_var("LOCALAPPDATA"),
