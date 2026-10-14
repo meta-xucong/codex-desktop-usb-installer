@@ -2,7 +2,10 @@
 //! Native readiness stays in the manager; this transport never accepts proof.
 use crate::app::model_diagnostics::safe_identifier;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+#[cfg(windows)]
+use std::sync::atomic::Ordering;
+#[cfg(windows)]
 use std::time::{Duration, Instant};
 
 #[derive(Serialize)]
@@ -316,6 +319,69 @@ pub(crate) fn request(
     Ok(reply)
 }
 
+/// Same finite, thread-affine lock as the CCSwitch Codex writer. It protects
+/// the final compare-and-write of our catalog reference, never model proof.
+#[cfg(windows)]
+pub(crate) struct ConfigurationLock {
+    handle: *mut std::ffi::c_void,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn CreateMutexW(
+        attributes: *const std::ffi::c_void,
+        initial_owner: i32,
+        name: *const u16,
+    ) -> *mut std::ffi::c_void;
+    fn WaitForSingleObject(handle: *mut std::ffi::c_void, milliseconds: u32) -> u32;
+    fn ReleaseMutex(handle: *mut std::ffi::c_void) -> i32;
+    fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+}
+#[cfg(windows)]
+impl Drop for ConfigurationLock {
+    fn drop(&mut self) {
+        unsafe {
+            ReleaseMutex(self.handle);
+            CloseHandle(self.handle);
+        }
+    }
+}
+#[cfg(windows)]
+pub(crate) fn lock_configuration() -> Result<ConfigurationLock, &'static str> {
+    let name: Vec<u16> = "Local\\CodexUsbModelSelection"
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+    if handle.is_null() {
+        return Err("selection-lock-unavailable");
+    }
+    let status = unsafe { WaitForSingleObject(handle, 10_000) };
+    if status != 0 {
+        if status == 0x80 {
+            unsafe {
+                ReleaseMutex(handle);
+            }
+        }
+        unsafe {
+            CloseHandle(handle);
+        }
+        return Err("selection-lock-unavailable");
+    }
+    Ok(ConfigurationLock {
+        handle,
+        _thread: std::marker::PhantomData,
+    })
+}
+
+#[cfg(not(windows))]
+pub(crate) struct ConfigurationLock;
+#[cfg(not(windows))]
+pub(crate) fn lock_configuration() -> Result<ConfigurationLock, &'static str> {
+    Ok(ConfigurationLock)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -530,66 +596,4 @@ mod tests {
         );
         assert!(matches!(oversized, Err("selection-read-failed")));
     }
-}
-
-/// Same finite, thread-affine lock as the CCSwitch Codex writer. It protects
-/// the final compare-and-write of our catalog reference, never model proof.
-#[cfg(windows)]
-pub(crate) struct ConfigurationLock {
-    handle: *mut std::ffi::c_void,
-    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
-}
-#[cfg(windows)]
-#[link(name = "kernel32")]
-extern "system" {
-    fn CreateMutexW(
-        attributes: *const std::ffi::c_void,
-        initial_owner: i32,
-        name: *const u16,
-    ) -> *mut std::ffi::c_void;
-    fn WaitForSingleObject(handle: *mut std::ffi::c_void, milliseconds: u32) -> u32;
-    fn ReleaseMutex(handle: *mut std::ffi::c_void) -> i32;
-    fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
-}
-#[cfg(windows)]
-impl Drop for ConfigurationLock {
-    fn drop(&mut self) {
-        unsafe {
-            ReleaseMutex(self.handle);
-            CloseHandle(self.handle);
-        }
-    }
-}
-#[cfg(windows)]
-pub(crate) fn lock_configuration() -> Result<ConfigurationLock, &'static str> {
-    let name: Vec<u16> = "Local\\CodexUsbModelSelection"
-        .encode_utf16()
-        .chain(Some(0))
-        .collect();
-    let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
-    if handle.is_null() {
-        return Err("selection-lock-unavailable");
-    }
-    let status = unsafe { WaitForSingleObject(handle, 10_000) };
-    if status != 0 {
-        if status == 0x80 {
-            unsafe {
-                ReleaseMutex(handle);
-            }
-        }
-        unsafe {
-            CloseHandle(handle);
-        }
-        return Err("selection-lock-unavailable");
-    }
-    Ok(ConfigurationLock {
-        handle,
-        _thread: std::marker::PhantomData,
-    })
-}
-#[cfg(not(windows))]
-pub(crate) struct ConfigurationLock;
-#[cfg(not(windows))]
-pub(crate) fn lock_configuration() -> Result<ConfigurationLock, &'static str> {
-    Ok(ConfigurationLock)
 }

@@ -4,9 +4,12 @@
 //! constructed only after the current gateway, the current native catalog
 //! parser, and one isolated app-server turn have all been observed by this
 //! process.
+#![cfg_attr(not(windows), allow(dead_code))]
 
+#[cfg(windows)]
+use crate::app::model_capability::CapabilityState;
 use crate::app::model_capability::{
-    CapabilityContext, CapabilityState, ModelCapabilityReport, NativeRuntimeEvidence,
+    CapabilityContext, ModelCapabilityReport, NativeRuntimeEvidence,
 };
 use crate::app::model_catalog::MODEL_BASE_INSTRUCTIONS;
 use crate::app::model_diagnostics::safe_identifier;
@@ -60,6 +63,7 @@ pub(crate) struct NativeProbeInput {
 
 pub(crate) struct NativeProbeResult {
     pub proof: NativeRuntimeEvidence,
+    #[cfg(test)]
     pub catalog_entry: serde_json::Value,
     pub runtime_version: String,
     pub executable_sha256: String,
@@ -67,6 +71,7 @@ pub(crate) struct NativeProbeResult {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeProbeError {
+    #[cfg_attr(windows, allow(dead_code))]
     UnsupportedPlatform,
     Cancelled,
     DeadlineExceeded,
@@ -123,7 +128,7 @@ impl NativeProbeError {
 pub(crate) fn probe(input: NativeProbeInput) -> Result<NativeProbeResult, NativeProbeError> {
     #[cfg(windows)]
     {
-        return probe_windows(input);
+        probe_windows(input)
     }
     #[cfg(not(windows))]
     {
@@ -848,6 +853,7 @@ struct PreparedProbe {
     command: String,
     skill_name: String,
     skill_root: PathBuf,
+    #[cfg(test)]
     catalog_entry: Value,
     cwd_text: String,
 }
@@ -946,6 +952,7 @@ fn prepare_probe(
         command,
         skill_name,
         skill_root,
+        #[cfg(test)]
         catalog_entry,
         cwd_text,
     })
@@ -1320,11 +1327,9 @@ mod win_process {
                         break;
                     }
                 }
-                if status.is_some() {
-                    if job.take().map(Job::close).transpose().is_err() {
-                        failure = Some(NativeProbeError::CleanupFailed);
-                        break;
-                    }
+                if status.is_some() && job.take().map(Job::close).transpose().is_err() {
+                    failure = Some(NativeProbeError::CleanupFailed);
+                    break;
                 }
             }
             if stdout_bytes.is_some() && stderr_done && status.is_some() {
@@ -2946,6 +2951,7 @@ fn probe_windows(input: NativeProbeInput) -> Result<NativeProbeResult, NativePro
     if hash_before != hash_after {
         return Err(NativeProbeError::ExecutableChanged);
     }
+    #[cfg(test)]
     let catalog_entry = prepared.catalog_entry.clone();
     prepared.area.cleanup()?;
     check_limits(&input.cancelled, input.deadline)?;
@@ -2974,6 +2980,7 @@ fn probe_windows(input: NativeProbeInput) -> Result<NativeProbeResult, NativePro
     };
     Ok(NativeProbeResult {
         proof,
+        #[cfg(test)]
         catalog_entry,
         runtime_version,
         // Evidence and later activation remain tied to the USB executable
@@ -3409,7 +3416,7 @@ mod tests {
     #[test]
     fn native_catalog_and_cli_capture_limits_cover_the_supported_catalog_size() {
         assert_eq!(MAX_CATALOG_BYTES, crate::app::model_probe::BODY_LIMIT);
-        assert!(MAX_CAPTURE_BYTES >= MAX_CATALOG_BYTES * 2);
+        const { assert!(MAX_CAPTURE_BYTES >= MAX_CATALOG_BYTES * 2) };
         assert_eq!(MAX_CAPTURE_BYTES, 2 * 1024 * 1024);
         for (limit, allows) in [
             (MAX_CATALOG_BYTES - 1, true),

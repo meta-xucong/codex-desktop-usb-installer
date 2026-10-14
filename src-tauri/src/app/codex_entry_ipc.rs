@@ -478,7 +478,7 @@ fn create_named_pipe(
             unsafe { GetLastError() }
         ));
     }
-    let mut security_attributes = SECURITY_ATTRIBUTES {
+    let security_attributes = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: security_descriptor,
         bInheritHandle: 0,
@@ -492,7 +492,7 @@ fn create_named_pipe(
             MAX_FRAME_BYTES as u32,
             MAX_FRAME_BYTES as u32,
             0,
-            &mut security_attributes,
+            &security_attributes,
         )
     };
     let last_error = if handle == INVALID_HANDLE_VALUE {

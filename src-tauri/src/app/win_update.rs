@@ -4115,13 +4115,8 @@ mod tests {
             std::path::Path::new(r"X:\Codex"),
             true,
             |_| {
-                let count = checks.get();
-                checks.set(count + 1);
-                if count == 0 {
-                    Ok(true)
-                } else {
-                    Ok(true)
-                }
+                checks.set(checks.get() + 1);
+                Ok(true)
             },
             |_| Ok(()),
         )

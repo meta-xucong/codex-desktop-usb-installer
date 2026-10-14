@@ -31,7 +31,7 @@ pub fn ensure_portable_usb_hint() -> io::Result<bool> {
         return Ok(false);
     }
     let paths = crate::app::usb_guard::local_data_paths()
-        .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+        .map_err(|error| io::Error::other(error.to_string()))?;
     ensure_hint_at(&paths.codex_home)
 }
 

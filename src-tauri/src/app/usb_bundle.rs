@@ -291,6 +291,7 @@ fn sha256_file(path: &Path) -> Result<String, AppError> {
     Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
+#[cfg(test)]
 fn read_json(root: &Path, name: &str) -> Result<serde_json::Value, AppError> {
     read_json_snapshot(root, name).map(|(value, _)| value)
 }
@@ -317,6 +318,7 @@ fn read_bounded_file(path: &Path, max_bytes: usize, label: &str) -> Result<Vec<u
     Ok(bytes)
 }
 
+#[cfg(test)]
 fn read_sums_text(root: &Path) -> Result<String, AppError> {
     let bytes = read_bounded_file(&root.join(SUMS_FILE), MAX_SHA_SUMS_BYTES, SUMS_FILE)?;
     String::from_utf8(bytes)
@@ -424,6 +426,7 @@ pub fn validate_backup_layout(
     Ok(())
 }
 
+#[cfg(test)]
 fn verify_sums(
     root: &Path,
     payload_relative: &str,
@@ -646,6 +649,7 @@ fn is_mutable_revocation_sidecar(relative: &str) -> bool {
         || relative.eq_ignore_ascii_case(REVOCATION_STATE_FILE)
 }
 
+#[allow(clippy::type_complexity)]
 fn verify_manifest_contract(
     root: &Path,
     allow_missing_payload: bool,
@@ -989,6 +993,7 @@ fn verify_file_metadata(
 /// Both must agree: otherwise an attacker could rewrite SHA256SUMS together
 /// with a replaced launcher or manager without changing the signed USB
 /// identity.
+#[allow(clippy::too_many_arguments)]
 fn verify_cross_file_metadata(
     root: &Path,
     manifest: &serde_json::Value,

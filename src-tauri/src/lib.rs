@@ -799,6 +799,7 @@ pub fn run() {
     // This read-only gate must precede WebView2/VC probing, logging, recovery,
     // lease creation and any automatic launch. A formal USB binary therefore
     // cannot perform prerequisite or recovery writes on an unlicensed medium.
+    #[allow(unused_mut)]
     let mut usb_startup = match crate::app::usb_guard::startup_preflight() {
         Ok(result) => result,
         Err(error) => {
@@ -824,6 +825,7 @@ pub fn run() {
             }
         };
     }
+    #[cfg(target_os = "windows")]
     let usb_authorization_blocked = usb_startup.is_authorization_blocked();
     if let Some(reason) = usb_startup.reason() {
         if usb_startup.is_integrity_pending() {

@@ -485,7 +485,10 @@ fn windows_volume_key(raw: &str) -> Option<String> {
     }
     let lower = value.to_ascii_lowercase();
     if lower.starts_with(r"\\") {
-        let mut parts = lower[2..].split('\\').filter(|part| !part.is_empty());
+        let mut parts = lower
+            .strip_prefix(r"\\")?
+            .split('\\')
+            .filter(|part| !part.is_empty());
         let server = parts.next()?;
         let share = parts.next()?;
         return Some(format!(r"\\{server}\{share}"));
@@ -920,10 +923,7 @@ mod uninstall_cleanup_tests {
         // exists and no filesystem rename is performed.  The actual directory
         // scanner also validates the journal filename against the production
         // data root, so this test stays at the pure decision boundary.
-        assert_eq!(
-            transaction_matches_scope(&tx, Some(&root.join("install"))),
-            false
-        );
+        assert!(!transaction_matches_scope(&tx, Some(&root.join("install"))));
         assert!(transaction_matches_scope(&tx, None));
         assert!(can_reconcile_new_installed_for_uninstall(&tx));
         assert!(other.join("install").is_dir());

@@ -679,17 +679,16 @@ fn post_apply_snapshot_protocol_uses_a_fresh_metadata_only_request_and_fails_clo
 
 #[test]
 fn failed_apply_compensation_restores_only_when_config_auth_and_candidate_are_unchanged() {
+    type StateSnapshot = std::collections::BTreeMap<SelectionStateFile, Option<Vec<u8>>>;
+
     fn run(
         previous_catalog: Option<Vec<u8>>,
         previous_config: Vec<u8>,
         previous_auth: Vec<u8>,
-        current: std::collections::BTreeMap<SelectionStateFile, Option<Vec<u8>>>,
+        current: StateSnapshot,
         fail_write: bool,
         fail_remove: bool,
-    ) -> (
-        Result<(), &'static str>,
-        std::collections::BTreeMap<SelectionStateFile, Option<Vec<u8>>>,
-    ) {
+    ) -> (Result<(), &'static str>, StateSnapshot) {
         let state = std::cell::RefCell::new(current);
         let outcome = compensate_apply_failure(
             b"candidate-catalog",

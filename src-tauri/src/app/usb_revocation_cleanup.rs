@@ -4,6 +4,7 @@
 use std::fs;
 use std::path::Path;
 
+#[cfg(test)]
 use serde_json::Value;
 
 use crate::app::usb_guard::{UsbFingerprint, UsbLicense};
@@ -342,6 +343,7 @@ fn validate_fingerprint_binding(
     Ok(())
 }
 
+#[cfg(test)]
 fn required_relative(value: &Value, pointer: &str) -> Result<String, AppError> {
     let raw = value
         .pointer(pointer)
@@ -694,9 +696,8 @@ mod tests {
 
         let mut target_deleted = false;
         let attempt = ensure_no_codex_process(|| Err("live PID image path is unknown".to_string()))
-            .and_then(|()| {
+            .map(|()| {
                 target_deleted = true;
-                Ok(())
             });
         assert!(attempt.is_err());
         assert!(

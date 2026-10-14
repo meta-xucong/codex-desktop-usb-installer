@@ -103,7 +103,8 @@ jobs:
             crates/codex-win-engine/Cargo.lock \
             crates/codex-theme-engine/Cargo.lock
           do
-            cargo audit --file "$lockfile"
+            # Match deny.toml's exception for Tauri's transitive unic-common advisory.
+            cargo audit --ignore RUSTSEC-2025-0080 --file "$lockfile"
           done
       - name: Enforce Rust dependency policy
         run: cargo deny --manifest-path src-tauri/Cargo.toml check

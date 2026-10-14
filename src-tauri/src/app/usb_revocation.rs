@@ -354,7 +354,7 @@ const STATUS_KEYRING_JSON: Option<&str> = option_env!("CODEX_USB_REVOCATION_KEYR
 
 #[cfg(test)]
 thread_local! {
-    static TEST_STATUS_PUBLIC_KEYS: RefCell<BTreeMap<String, String>> = RefCell::new(BTreeMap::new());
+    static TEST_STATUS_PUBLIC_KEYS: RefCell<BTreeMap<String, String>> = const { RefCell::new(BTreeMap::new()) };
 }
 
 #[cfg(test)]
@@ -839,14 +839,14 @@ fn check_startup_with_url_timeout(
     let registration = match load_registration(root, license, fingerprint) {
         Ok(value) => value,
         Err(_) => {
-            return Ok(if pending.is_some() {
+            return Ok(if let Some(pending) = pending.as_ref() {
                 persist_pending_local_state(
                     root,
                     &usb_state,
                     &local_state,
                     previous,
                     &state_lock,
-                    pending.as_ref().expect("pending checked"),
+                    pending,
                     true,
                     license,
                     fingerprint,
@@ -991,6 +991,7 @@ fn service_url_is_allowed(url: &url::Url) -> bool {
     false
 }
 
+#[allow(clippy::too_many_arguments)]
 fn persist_pending_local_state(
     root: &Path,
     usb_state: &Path,
@@ -1028,32 +1029,8 @@ fn persist_pending_local_state(
     }
 }
 
-fn retry_pending_revocation_locked(
-    root: &Path,
-    usb_state: &Path,
-    local_state: &Path,
-    local_base: &Path,
-    license: &UsbLicense,
-    fingerprint: &UsbFingerprint,
-    signature_digest: &str,
-    fingerprint_sha: &str,
-    state_lock: &RevocationStateLock,
-    pending: &PendingRevoked,
-) -> Decision {
-    retry_pending_revocation_locked_with_local_base(
-        root,
-        usb_state,
-        local_state,
-        local_base,
-        license,
-        fingerprint,
-        signature_digest,
-        fingerprint_sha,
-        state_lock,
-        pending,
-    )
-}
-
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn retry_pending_revocation_locked_with_local_base(
     root: &Path,
     usb_state: &Path,
@@ -2465,7 +2442,7 @@ mod tests {
         let license = test_license(&installation_id);
         let fingerprint = license.fingerprint.clone();
         let signature_digest = license_signature_sha256(&license).unwrap();
-        let fingerprint_sha = fingerprint_digest(&fingerprint).unwrap();
+        let _fingerprint_sha = fingerprint_digest(&fingerprint).unwrap();
         let registration_key = SigningKey::from_bytes(&[0x71; 32]);
         let status_key = SigningKey::from_bytes(&[0x72; 32]);
         write_registered_schema3_fixture(&root, &license, &registration_key);

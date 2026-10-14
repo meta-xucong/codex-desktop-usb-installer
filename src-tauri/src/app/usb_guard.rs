@@ -17,8 +17,6 @@
 
 // The public non-Windows stubs keep cross-platform manager builds possible;
 // the lease helper, process matching and removable-media scanner run on Windows.
-#![cfg_attr(not(target_os = "windows"), allow(dead_code))]
-
 #[cfg(target_os = "windows")]
 use std::fs::OpenOptions;
 use std::fs::{self, File};
@@ -208,7 +206,7 @@ pub(crate) struct DeferredRevocationCleanup {
 #[derive(Debug, Clone)]
 pub(crate) enum ReinstallGateOutcome {
     Authorized(SignedUsbAuthorization),
-    DeferredCleanup(DeferredRevocationCleanup),
+    DeferredCleanup(Box<DeferredRevocationCleanup>),
 }
 
 impl DeferredRevocationCleanup {
@@ -329,7 +327,7 @@ const COMPILETIME_PUBLIC_KEY_ID: Option<&str> = option_env!("CODEX_USB_GUARD_PUB
 #[cfg(test)]
 thread_local! {
     static TEST_LICENSE_PUBLIC_KEYS: std::cell::RefCell<Vec<(String, String)>> =
-        std::cell::RefCell::new(Vec::new());
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
@@ -1073,12 +1071,14 @@ fn lock_path() -> Result<PathBuf, AppError> {
 
 pub fn current_status() -> UsbGuardStatus {
     if STARTUP_INTEGRITY_PENDING.load(Ordering::SeqCst) && guard_required() {
+        #[allow(unused_mut)]
         let mut status = base_status("starting", "not-running");
         status.removable = true;
         status.codex_block_reason = Some("U 盘能力包正在进行启动完整性校验".to_string());
         status.message = "正在校验 U 盘能力包，完成后才会开放 Codex 操作".to_string();
         return status;
     }
+    #[allow(unused_mut)]
     let mut status = status_path()
         .ok()
         .and_then(|path| read_json::<UsbGuardStatus>(&path))
@@ -1330,7 +1330,7 @@ pub fn require_signed_codex_reinstall_bundle(
 ) -> Result<SignedUsbAuthorization, AppError> {
     match require_signed_codex_reinstall_bundle_deferred(phase)? {
         ReinstallGateOutcome::Authorized(authorization) => Ok(authorization),
-        ReinstallGateOutcome::DeferredCleanup(request) => request.cleanup_and_reject(),
+        ReinstallGateOutcome::DeferredCleanup(request) => (*request).cleanup_and_reject(),
     }
 }
 
@@ -1430,7 +1430,7 @@ fn validate_signed_codex_reinstall_state(phase: &str) -> Result<ReinstallGateOut
             .highest_verified_revoked_version
             .is_some_and(|revoked| state_version > revoked) => {}
         crate::app::usb_revocation::Decision::Revoked { state_version } => {
-            return Ok(ReinstallGateOutcome::DeferredCleanup(
+            return Ok(ReinstallGateOutcome::DeferredCleanup(Box::new(
                 DeferredRevocationCleanup {
                     observation,
                     bundle_root,
@@ -1440,10 +1440,10 @@ fn validate_signed_codex_reinstall_state(phase: &str) -> Result<ReinstallGateOut
                     conflict: false,
                     phase: phase.to_string(),
                 },
-            ));
+            )));
         }
         crate::app::usb_revocation::Decision::StatusConflict { state_version } => {
-            return Ok(ReinstallGateOutcome::DeferredCleanup(
+            return Ok(ReinstallGateOutcome::DeferredCleanup(Box::new(
                 DeferredRevocationCleanup {
                     observation,
                     bundle_root,
@@ -1453,7 +1453,7 @@ fn validate_signed_codex_reinstall_state(phase: &str) -> Result<ReinstallGateOut
                     conflict: true,
                     phase: phase.to_string(),
                 },
-            ));
+            )));
         }
         _ => {
             return Err(engine(format!(
@@ -3030,6 +3030,7 @@ fn revoke_and_cleanup(
 }
 
 #[cfg(target_os = "windows")]
+#[allow(clippy::too_many_arguments)]
 fn revoke_and_cleanup_with(
     observation: &UsbObservation,
     bundle: &Path,
@@ -3430,7 +3431,7 @@ fn run_cleanup_retry_loop_with(
             CleanupRetryOutcome::Complete | CleanupRetryOutcome::Stop { .. } => break,
             CleanupRetryOutcome::Retry { phase, detail } => {
                 retries = retries.saturating_add(1);
-                if retries == 1 || retries % 5 == 0 {
+                if retries == 1 || retries.is_multiple_of(5) {
                     report_retry(phase, &detail, retries);
                 }
                 delay = delay.saturating_mul(2).min(Duration::from_secs(30));
