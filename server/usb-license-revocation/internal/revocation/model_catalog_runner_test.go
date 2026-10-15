@@ -311,6 +311,15 @@ func TestModelCatalogAdminAssetsRenderSummaryAsText(t *testing.T) {
 	}
 }
 
+func TestAdminLicenseListUsesTwentyItemsPerPage(t *testing.T) {
+	script, err := adminWebFiles.ReadFile("adminweb/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(script), `limit: 20`) {
+		t.Fatal("admin USB registration list must request at most 20 items per page")
+	}
+}
 func TestModelCatalogServiceUnitHasScopedCredentialAndStopSemantics(t *testing.T) {
 	unit, err := os.ReadFile(filepath.Join("..", "..", "deploy", "codex-usb-license-revocation.service"))
 	if err != nil {

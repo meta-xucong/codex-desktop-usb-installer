@@ -1,6 +1,6 @@
 (() => {
   const $ = (id) => document.getElementById(id);
-  const state = { csrf: "", offset: 0, limit: 50, total: 0, selected: null, items: [], modelCatalogTimer: null };
+  const state = { csrf: "", offset: 0, limit: 20, total: 0, selected: null, items: [], modelCatalogTimer: null };
 
   async function request(path, options = {}) {
     const headers = new Headers(options.headers || {});
