@@ -63,6 +63,11 @@ tr:last-child td { border-bottom: 0; }
 .pagination { margin-top: 14px; }
 .pagination > div { display: flex; gap: 8px; }
 .footnote { margin: 14px 2px 0; color: #8290a5; font-size: 12px; }
+.model-catalog-status { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin: 18px 0 8px; }
+.model-catalog-status > div { min-width: 0; padding: 12px; border: 1px solid #e1e8f1; border-radius: 10px; background: #f7f9fb; }
+.model-catalog-status dt { color: #73829a; font-size: 12px; }
+.model-catalog-status dd { margin: 6px 0 0; overflow-wrap: anywhere; font-weight: 700; }
+.model-catalog-summary { max-height: 420px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; padding: 14px; border-radius: 10px; background: #f4f6f8; color: #253044; font: 12px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; }
 .confirm-dialog { width: min(520px, calc(100% - 28px)); padding: 28px; border: 1px solid #dfe5ee; border-radius: 14px; box-shadow: 0 24px 100px #13213b40; }
 .confirm-dialog::backdrop { background: #101d32a8; }
 .confirm-dialog h2 { font-size: 23px; }

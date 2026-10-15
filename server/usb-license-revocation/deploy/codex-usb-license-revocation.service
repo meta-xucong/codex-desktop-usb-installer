@@ -8,9 +8,13 @@ User=codex-license-revocation
 Group=codex-license-revocation
 UMask=0027
 EnvironmentFile=/etc/codex-usb-license-revocation/service.env
+Environment=XDG_CACHE_HOME=/var/lib/codex-usb-license-revocation/model-catalog/cache
+LoadCredential=admin-api-key:/etc/codex-usb-license-revocation/model-catalog/admin-api-key.json
 ExecStart=/opt/codex-usb-license-revocation/revocationd
 Restart=on-failure
 RestartSec=3
+KillMode=control-group
+TimeoutStopSec=15s
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

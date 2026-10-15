@@ -25,6 +25,7 @@ type HTTPConfig struct {
 	AdminTOTPSecret    string
 	AdminOrigin        string
 	AdminCookieSecure  bool
+	modelCatalog       *modelCatalogRunnerConfig
 }
 
 type tokenBucket struct {
@@ -140,6 +141,14 @@ func NewHTTPServer(store *Store, keyring map[string]ed25519.PublicKey, cfg HTTPC
 		admin, err := newAdminConsole(store, cfg, logger)
 		if err != nil {
 			return nil, err
+		}
+		if cfg.modelCatalog != nil {
+			runner, runnerErr := newModelCatalogRunner(*cfg.modelCatalog)
+			if runnerErr != nil {
+				logger.Error("model catalog admin feature unavailable")
+			} else {
+				admin.modelCatalog = runner
+			}
 		}
 		admin.Register(mux)
 	}

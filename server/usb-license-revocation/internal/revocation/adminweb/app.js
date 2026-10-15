@@ -1,6 +1,6 @@
 (() => {
   const $ = (id) => document.getElementById(id);
-  const state = { csrf: "", offset: 0, limit: 50, total: 0, selected: null, items: [] };
+  const state = { csrf: "", offset: 0, limit: 50, total: 0, selected: null, items: [], modelCatalogTimer: null };
 
   async function request(path, options = {}) {
     const headers = new Headers(options.headers || {});
@@ -20,6 +20,8 @@
 
   function showLogin(message = "") {
     state.csrf = "";
+    if (state.modelCatalogTimer) clearTimeout(state.modelCatalogTimer);
+    state.modelCatalogTimer = null;
     if ($("password-dialog").open) $("password-dialog").close();
     $("app-panel").hidden = true;
     $("first-setup-panel").hidden = true;
@@ -126,6 +128,102 @@
     }
   }
 
+  const modelCatalogStatusNames = {
+    idle: "尚未运行", running: "运行中", succeeded: "完成", no_plan: "没有可应用计划",
+    partial: "部分完成", blocked: "已阻断", failed: "失败", interrupted: "已中断",
+  };
+  const modelCatalogReasonNames = {
+    completed: "已完成", no_applicable_plan: "没有可应用计划", account_scan_partial: "账号目录扫描不完整",
+    native_refresh_running: "原生模型刷新仍在运行", native_refresh_status_unavailable: "原生刷新状态暂不可用",
+    native_refresh_status_unknown: "原生刷新状态未知", manager_lock_requires_review: "管理器遗留锁需要人工核验",
+    configuration_invalid: "固定配置或程序不可用", credential_unavailable: "管理员 API 凭据不可用",
+    discovery_failed: "目录发现失败", approved_rules_blocked: "批准规则校验未通过",
+    apply_partial: "映射写入部分完成", apply_failed: "映射写入失败", process_timeout: "任务超时，结果未知",
+    manager_result_invalid: "任务结果无效，映射结果未知", service_interrupted: "服务重启前任务未完成",
+  };
+
+  function formatModelCatalogTime(value) {
+    if (!value) return "—";
+    const parsed = new Date(value);
+    return Number.isNaN(parsed.getTime()) ? "—" : parsed.toLocaleString("zh-CN", { hour12: false });
+  }
+
+  function renderModelCatalog(data) {
+    $("model-catalog-status").textContent = modelCatalogStatusNames[data.status] || "状态未知";
+    $("model-catalog-started").textContent = formatModelCatalogTime(data.started_at);
+    $("model-catalog-finished").textContent = formatModelCatalogTime(data.finished_at);
+    $("model-catalog-reason").textContent = modelCatalogReasonNames[data.reason_code] || (data.reason_code ? "原因未知" : "—");
+    const count = (value) => Number.isInteger(value) && value >= 0 ? String(value) : "未知/不可用";
+    $("model-catalog-planned").textContent = count(data.planned_count);
+    $("model-catalog-applied").textContent = count(data.applied_count);
+    $("model-catalog-noop").textContent = count(data.noop_count);
+    $("model-catalog-failed").textContent = count(data.failed_count);
+    $("model-catalog-not-attempted").textContent = count(data.not_attempted_count);
+    const note = $("model-catalog-note");
+    note.className = "message";
+    const failedWriteUnverified = Number.isInteger(data.failed_count) && data.failed_count > 0;
+    note.textContent = data.status === "interrupted"
+      ? "任务结果无法核实，映射副作用可能未知。检查摘要和备份前不要重试。"
+      : failedWriteUnverified
+        ? "有账号的映射写入结果未核实；这不代表请求一定到达服务端。先核对摘要和备份，再决定是否重试。系统不会自动重试。"
+        : data.status === "partial"
+          ? "本轮只完成了部分工作。核对摘要和备份后再决定是否重试。"
+          : data.status === "blocked" || data.status === "failed"
+            ? "任务未成功完成；不会自动重试。请根据原因和摘要检查。"
+            : data.status === "running" ? "任务运行中；完成前计数显示为未知。" : "";
+    if (["partial", "blocked", "failed", "interrupted"].includes(data.status)) note.classList.add("error");
+    const summary = $("model-catalog-summary");
+    summary.textContent = typeof data.summary === "string" ? data.summary : "";
+    summary.hidden = !summary.textContent;
+    if (data.summary_unavailable) {
+      note.textContent = `${note.textContent}${note.textContent ? " " : ""}安全摘要当前不可用。`;
+    }
+    const running = data.status === "running";
+    $("model-catalog-run-button").disabled = running;
+    $("model-catalog-run-button").textContent = running ? "任务运行中…" : "刷新并整理模型";
+    if (state.modelCatalogTimer) clearTimeout(state.modelCatalogTimer);
+    state.modelCatalogTimer = running ? setTimeout(() => {
+      state.modelCatalogTimer = null;
+      loadModelCatalog();
+    }, 2500) : null;
+  }
+
+  function renderModelCatalogUnavailable(message) {
+    const unknown = "未知/不可用";
+    $("model-catalog-status").textContent = "暂不可用";
+    $("model-catalog-started").textContent = "—";
+    $("model-catalog-finished").textContent = "—";
+    $("model-catalog-reason").textContent = "—";
+    $("model-catalog-planned").textContent = unknown;
+    $("model-catalog-applied").textContent = unknown;
+    $("model-catalog-noop").textContent = unknown;
+    $("model-catalog-failed").textContent = unknown;
+    $("model-catalog-not-attempted").textContent = unknown;
+    $("model-catalog-note").textContent = message || "任务状态无法读取；刷新页面后再确认当前状态。";
+    $("model-catalog-note").className = "message error";
+    const summary = $("model-catalog-summary");
+    summary.textContent = "";
+    summary.hidden = true;
+    const button = $("model-catalog-run-button");
+    button.disabled = true;
+    button.textContent = "状态暂不可用";
+    if (state.modelCatalogTimer) clearTimeout(state.modelCatalogTimer);
+    state.modelCatalogTimer = setTimeout(() => {
+      state.modelCatalogTimer = null;
+      loadModelCatalog();
+    }, 10000);
+  }
+
+  async function loadModelCatalog() {
+    try {
+      const data = await request("/admin/api/model-catalog/runs/current");
+      renderModelCatalog(data);
+    } catch (error) {
+      if (error.status === 401) return showLogin("登录已过期，请重新登录。");
+      renderModelCatalogUnavailable(error.message);
+    }
+  }
+
   function openRevokeDialog(item) {
     state.selected = item;
     $("revoke-installation-id").textContent = item.installationId;
@@ -192,6 +290,7 @@
       }
       showApp(data.username);
       await loadLicenses();
+      await loadModelCatalog();
     } catch (error) {
       $("login-error").textContent = error.message;
     } finally {
@@ -281,6 +380,19 @@
   });
 
   $("refresh-button").addEventListener("click", () => loadLicenses());
+  $("model-catalog-run-button").addEventListener("click", async () => {
+    if (!window.confirm("这会刷新所有符合条件的 404token 账号上游目录，并按已批准规则更新账号映射。不会发送模型生成请求。确定开始吗？")) return;
+    const button = $("model-catalog-run-button");
+    button.disabled = true;
+    try {
+      const data = await request("/admin/api/model-catalog/runs", { method: "POST" });
+      renderModelCatalog(data);
+      if (data.status === "running") await loadModelCatalog();
+    } catch (error) {
+      if (error.status === 401) return showLogin("登录已过期，请重新登录。");
+      renderModelCatalogUnavailable(error.message);
+    }
+  });
   $("registration-file").addEventListener("change", (event) => importRegistration(event.target.files[0]));
   $("previous-page").addEventListener("click", () => { state.offset = Math.max(0, state.offset - state.limit); loadLicenses(); });
   $("next-page").addEventListener("click", () => { state.offset += state.limit; loadLicenses(); });
@@ -325,6 +437,7 @@
       }
       showApp(data.username);
       await loadLicenses();
+      await loadModelCatalog();
     } catch (_) {
       showLogin();
     }

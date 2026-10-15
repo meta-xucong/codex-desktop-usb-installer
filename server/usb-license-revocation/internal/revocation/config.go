@@ -56,6 +56,9 @@ func ConfigFromEnv() (Config, HTTPConfig, error) {
 		AdminOrigin:        get("USB_REVOCATION_ADMIN_ORIGIN", ""),
 		AdminCookieSecure:  adminCookieSecure,
 	}
+	if httpCfg.AdminUsername != "" {
+		httpCfg.modelCatalog = defaultModelCatalogRunnerConfig()
+	}
 	if (httpCfg.AdminUsername == "") != (httpCfg.AdminPassword == "") {
 		return Config{}, HTTPConfig{}, fmt.Errorf("USB_REVOCATION_ADMIN_USERNAME and USB_REVOCATION_ADMIN_PASSWORD must be configured together")
 	}

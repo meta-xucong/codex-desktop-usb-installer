@@ -83,6 +83,25 @@
           <div><button id="previous-page" class="quiet" type="button">上一页</button><button id="next-page" class="quiet" type="button">下一页</button></div>
         </footer>
       </section>
+      <section class="panel model-catalog-panel" aria-labelledby="model-catalog-heading">
+        <div class="panel-heading">
+          <div><h2 id="model-catalog-heading">上游模型目录</h2><p class="muted">刷新符合条件的 404token 账号目录，并按已批准规则整理映射。目录出现不代表模型生成已验证；本功能不发送模型生成请求。</p></div>
+          <button id="model-catalog-run-button" class="primary" type="button">刷新并整理模型</button>
+        </div>
+        <dl class="model-catalog-status">
+          <div><dt>状态</dt><dd id="model-catalog-status">正在读取…</dd></div>
+          <div><dt>开始时间</dt><dd id="model-catalog-started">—</dd></div>
+          <div><dt>结束时间</dt><dd id="model-catalog-finished">—</dd></div>
+          <div><dt>原因</dt><dd id="model-catalog-reason">—</dd></div>
+          <div><dt>计划账号</dt><dd id="model-catalog-planned">未知/不可用</dd></div>
+          <div><dt>已应用</dt><dd id="model-catalog-applied">未知/不可用</dd></div>
+          <div><dt>无需变更</dt><dd id="model-catalog-noop">未知/不可用</dd></div>
+          <div><dt>失败</dt><dd id="model-catalog-failed">未知/不可用</dd></div>
+          <div><dt>未执行</dt><dd id="model-catalog-not-attempted">未知/不可用</dd></div>
+        </dl>
+        <p id="model-catalog-note" class="message" role="status"></p>
+        <pre id="model-catalog-summary" class="model-catalog-summary" hidden></pre>
+      </section>
       <p class="footnote">撤销记录会进入服务端审计日志。USB 指纹和许可证摘要只显示部分字符。</p>
     </section>
   </main>

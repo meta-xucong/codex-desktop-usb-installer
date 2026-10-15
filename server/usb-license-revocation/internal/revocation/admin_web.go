@@ -56,6 +56,7 @@ type adminConsole struct {
 	logger          *slog.Logger
 	loginLimit      *tokenBucket
 	changeLimit     *tokenBucket
+	modelCatalog    *modelCatalogRunner
 	authMu          sync.Mutex
 	authUnavailable bool
 	mu              sync.Mutex
@@ -158,11 +159,15 @@ func (a *adminConsole) Register(mux *http.ServeMux) {
 	if err != nil {
 		panic("embedded admin web assets are invalid")
 	}
+	staticHandler := http.StripPrefix("/admin/static/", http.FileServer(http.FS(static)))
 	mux.HandleFunc("GET /admin", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/admin/", http.StatusPermanentRedirect)
 	})
 	mux.HandleFunc("GET /admin/", a.serveIndex)
-	mux.Handle("GET /admin/static/", http.StripPrefix("/admin/static/", http.FileServer(http.FS(static))))
+	mux.Handle("GET /admin/static/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		a.setSecurityHeaders(w)
+		staticHandler.ServeHTTP(w, r)
+	}))
 	mux.HandleFunc("POST /admin/api/login", a.login)
 	mux.HandleFunc("GET /admin/api/initial-setup", a.initialSetupInfo)
 	mux.HandleFunc("POST /admin/api/initial-setup", a.completeInitialSetup)
@@ -172,6 +177,60 @@ func (a *adminConsole) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /admin/api/licenses", a.listLicenses)
 	mux.HandleFunc("POST /admin/api/licenses", a.importLicense)
 	mux.HandleFunc("POST /admin/api/licenses/{installationID}/revoke", a.revokeLicense)
+	mux.HandleFunc("GET /admin/api/model-catalog/runs/current", a.getModelCatalogRun)
+	mux.HandleFunc("POST /admin/api/model-catalog/runs", a.startModelCatalogRun)
+}
+
+func (a *adminConsole) getModelCatalogRun(w http.ResponseWriter, r *http.Request) {
+	a.setSecurityHeaders(w)
+	session, _, ok := a.readSession(r)
+	if !ok {
+		writeAdminError(w, http.StatusUnauthorized, "请先登录")
+		return
+	}
+	if session.setupPending {
+		writeAdminError(w, http.StatusForbidden, "请先完成首次安全设置")
+		return
+	}
+	if a.modelCatalog == nil {
+		writeAdminError(w, http.StatusServiceUnavailable, "模型目录功能暂不可用")
+		return
+	}
+	writeAdminJSON(w, http.StatusOK, a.modelCatalog.response())
+}
+
+func (a *adminConsole) startModelCatalogRun(w http.ResponseWriter, r *http.Request) {
+	a.setSecurityHeaders(w)
+	session, _, ok := a.readSession(r)
+	if !ok || !a.validMutation(r, session) {
+		writeAdminError(w, http.StatusForbidden, "登录状态或请求校验无效")
+		return
+	}
+	if session.setupPending {
+		writeAdminError(w, http.StatusForbidden, "请先完成首次安全设置")
+		return
+	}
+	if a.modelCatalog == nil {
+		writeAdminError(w, http.StatusServiceUnavailable, "模型目录功能暂不可用")
+		return
+	}
+	if r.Body != nil {
+		extra, readErr := io.ReadAll(io.LimitReader(r.Body, 1))
+		if readErr != nil || len(extra) != 0 {
+			writeAdminError(w, http.StatusBadRequest, "此操作不接受请求参数")
+			return
+		}
+	}
+	state, started, err := a.modelCatalog.start()
+	if err != nil {
+		writeAdminError(w, http.StatusServiceUnavailable, "模型整理任务暂不可用")
+		return
+	}
+	status := http.StatusOK
+	if started {
+		status = http.StatusAccepted
+	}
+	writeAdminJSON(w, status, modelCatalogRunResponse{modelCatalogRunState: state})
 }
 
 func (a *adminConsole) serveIndex(w http.ResponseWriter, r *http.Request) {
