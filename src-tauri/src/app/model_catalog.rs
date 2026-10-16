@@ -1588,6 +1588,7 @@ where
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn add_tested_model_files_with_validator<F, I, V, C, M>(
     home: &Path,
