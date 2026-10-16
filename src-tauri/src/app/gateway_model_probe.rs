@@ -20,6 +20,7 @@ const MODEL_MATRIX_BUDGET: Duration = Duration::from_secs(10 * 60);
 const PROOF_TTL: Duration = Duration::from_secs(5 * 60);
 const PROOF_LIMIT: usize = 128;
 const RUN_HISTORY_LIMIT: usize = 256;
+const CODEX_EFFORTS: [&str; 7] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -31,6 +32,12 @@ pub struct GatewayModelProbeRequest {
     pub cost_consent: bool,
     #[serde(default)]
     pub connectivity_model_id: Option<String>,
+    #[serde(default)]
+    pub reasoning_model_id: Option<String>,
+    #[serde(default)]
+    pub reasoning_efforts: Vec<String>,
+    #[serde(default)]
+    pub reasoning_cost_consent: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -48,6 +55,15 @@ pub struct GatewayProbeModelResult {
     pub passed: bool,
     pub generated_requests: usize,
     pub checks: Vec<GatewayProbeCheck>,
+    pub error_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayReasoningEffortResult {
+    pub effort: String,
+    /// accepted_by_route, rejected_by_route, or unknown
+    pub status: String,
     pub error_code: Option<String>,
 }
 
@@ -79,6 +95,12 @@ pub struct GatewayModelProbeReport {
     pub connectivity_proof_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connectivity_proof_expires_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_model_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_results: Option<Vec<GatewayReasoningEffortResult>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_proof_id: Option<String>,
 }
 
 #[derive(Default)]
@@ -200,6 +222,13 @@ struct ConnectivityProof {
     catalog_digest: String,
     epoch: u64,
     expires_at: u64,
+    reasoning: Option<ReasoningEvidence>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ReasoningEvidence {
+    pub efforts: Vec<String>,
+    pub default_effort: String,
 }
 
 #[derive(Default)]
@@ -289,6 +318,7 @@ fn issue_proof(
     catalog_digest: String,
     expected_epoch: u64,
     cancelled: &AtomicBool,
+    reasoning: Option<ReasoningEvidence>,
 ) -> Result<(String, u64), AppError> {
     let mut state = proofs().lock().unwrap_or_else(|error| error.into_inner());
     state
@@ -315,6 +345,7 @@ fn issue_proof(
             catalog_digest,
             epoch: expected_epoch,
             expires_at,
+            reasoning,
         },
     );
     Ok((id, expires_at))
@@ -330,7 +361,7 @@ pub(crate) fn consume_connectivity_proof(
     binding: &codex_usb_license::UsbAccountBinding,
     api_key: &str,
     catalog_digest: &str,
-) -> Result<(), AppError> {
+) -> Result<Option<ReasoningEvidence>, AppError> {
     let mut state = proofs().lock().unwrap_or_else(|error| error.into_inner());
     let Some(ticket) = state.tickets.remove(proof_id) else {
         return Err(engine("测试凭证已失效、已使用或需要重新测试"));
@@ -348,7 +379,7 @@ pub(crate) fn consume_connectivity_proof(
     if !valid {
         return Err(engine("上游目录、账户或测试状态已变化；请重新测试"));
     }
-    Ok(())
+    Ok(ticket.reasoning)
 }
 
 pub fn cancel(request_id: &str) -> bool {
@@ -414,6 +445,42 @@ fn validate_request(request: &GatewayModelProbeRequest) -> Result<(), AppError> 
     if request.connectivity_model_id.is_some() && request.cost_consent {
         return Err(engine("单模型连通性测试不能与完整协议矩阵费用授权混用"));
     }
+    let reasoning_mode =
+        request.reasoning_model_id.is_some() || !request.reasoning_efforts.is_empty();
+    if reasoning_mode {
+        let id = request
+            .reasoning_model_id
+            .as_deref()
+            .ok_or_else(|| engine("思考档位测试缺少模型"))?;
+        if !safe_identifier(id)
+            || request.connectivity_model_id.is_some()
+            || !request.selected_model_ids.is_empty()
+        {
+            return Err(engine("思考档位测试请求无效"));
+        }
+        if !request.reasoning_cost_consent {
+            return Err(engine("思考档位测试需要单独确认可能产生的费用"));
+        }
+        if request.cost_consent {
+            return Err(engine("思考档位测试费用确认不能与完整协议矩阵授权混用"));
+        }
+        if request.reasoning_efforts.is_empty()
+            || request.reasoning_efforts.len() > CODEX_EFFORTS.len()
+        {
+            return Err(engine("请明确选择要检测的思考档位"));
+        }
+        let allowed = reasoning_candidates(id);
+        let mut unique = BTreeSet::new();
+        if request
+            .reasoning_efforts
+            .iter()
+            .any(|effort| !allowed.contains(&effort.as_str()) || !unique.insert(effort))
+        {
+            return Err(engine("思考档位无效、重复或不适用于该精确型号"));
+        }
+    } else if request.reasoning_cost_consent {
+        return Err(engine("没有思考档位测试时不能提交费用确认"));
+    }
     let mut selected = BTreeSet::new();
     for model_id in &request.selected_model_ids {
         if !safe_identifier(model_id) || !selected.insert(model_id) {
@@ -424,6 +491,25 @@ fn validate_request(request: &GatewayModelProbeRequest) -> Result<(), AppError> 
         return Err(engine("完整网关探测需要本次单独费用确认"));
     }
     Ok(())
+}
+
+fn reasoning_candidates(model_id: &str) -> Vec<&'static str> {
+    let normalized = model_id.to_ascii_lowercase();
+    let omit_none = normalized == "claude-opus-5-5" || normalized.ends_with("/claude-opus-5-5");
+    CODEX_EFFORTS
+        .iter()
+        .copied()
+        .filter(|effort| !omit_none || *effort != "none")
+        .collect()
+}
+
+pub(crate) fn canonical_reasoning_efforts(model_id: &str, selected: &[String]) -> Vec<String> {
+    let selected = selected.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    reasoning_candidates(model_id)
+        .into_iter()
+        .filter(|effort| selected.contains(effort))
+        .map(str::to_owned)
+        .collect()
 }
 
 fn parse_model_catalog(
@@ -516,11 +602,12 @@ fn gateway_checks(model: &ModelCapabilityReport) -> Vec<GatewayProbeCheck> {
 pub async fn run(request: GatewayModelProbeRequest) -> Result<GatewayModelProbeReport, AppError> {
     validate_request(&request)?;
     let active = begin_management_run(&request.request_id)?;
-    let proof_epoch = if request.connectivity_model_id.is_some() {
-        Some(proof_epoch_snapshot()?)
-    } else {
-        None
-    };
+    let proof_epoch =
+        if request.connectivity_model_id.is_some() || request.reasoning_model_id.is_some() {
+            Some(proof_epoch_snapshot()?)
+        } else {
+            None
+        };
     let binding = usb_guard::authorized_account_binding()?
         .ok_or_else(|| engine("未取得有效的签名 U 盘账号绑定"))?;
     if binding.ccswitch.provider_id != TARGET_PROVIDER_ID {
@@ -561,6 +648,9 @@ pub async fn run(request: GatewayModelProbeRequest) -> Result<GatewayModelProbeR
         connectivity_model_id: None,
         connectivity_proof_id: None,
         connectivity_proof_expires_at: None,
+        reasoning_model_id: None,
+        reasoning_results: None,
+        reasoning_proof_id: None,
     };
 
     if let Some(model_id) = request.connectivity_model_id.as_deref() {
@@ -615,10 +705,91 @@ pub async fn run(request: GatewayModelProbeRequest) -> Result<GatewayModelProbeR
             catalog_digest(&report.models),
             proof_epoch.expect("quick test captured a proof epoch"),
             &active.cancelled,
+            None,
         )?;
         report.status = "passed".into();
         report.connectivity_proof_id = Some(proof_id);
         report.connectivity_proof_expires_at = Some(proof_expires_at);
+        return Ok(report);
+    }
+
+    if let Some(model_id) = request.reasoning_model_id.as_deref() {
+        resolve_selected_models(&report.models, &[model_id.to_owned()])?;
+        let client = ProbeClient::new(
+            &base,
+            api_key,
+            active.cancellation_flag(),
+            Instant::now() + MODEL_MATRIX_BUDGET,
+        )
+        .map_err(|_| engine("无法初始化安全的 404token 探测客户端"))?
+        .with_run_id(&request.request_id);
+        let efforts = canonical_reasoning_efforts(model_id, &request.reasoning_efforts);
+        let mut results = Vec::with_capacity(efforts.len());
+        let mut accepted = Vec::new();
+        for effort in &efforts {
+            if active.is_cancelled() {
+                report.status = "cancelled".into();
+                report.error_code = Some(ProbeError::Cancelled.code().into());
+                break;
+            }
+            let token = format!("codexeffort{}", uuid::Uuid::new_v4().simple());
+            match client
+                .quick_text_with_effort(model_id, &token, effort)
+                .await
+            {
+                Ok(()) => {
+                    accepted.push(effort.clone());
+                    results.push(GatewayReasoningEffortResult {
+                        effort: effort.clone(),
+                        status: "accepted_by_route".into(),
+                        error_code: None,
+                    });
+                }
+                Err(error) => results.push(GatewayReasoningEffortResult {
+                    effort: effort.clone(),
+                    status: if error == ProbeError::UnsupportedEffort {
+                        "rejected_by_route"
+                    } else {
+                        "unknown"
+                    }
+                    .into(),
+                    error_code: Some(error.code().into()),
+                }),
+            }
+        }
+        report.generated_requests = client.requests_started();
+        report.reasoning_model_id = Some(model_id.to_owned());
+        report.reasoning_results = Some(results);
+        if !accepted.is_empty() && !active.is_cancelled() {
+            let default_effort = accepted
+                .iter()
+                .find(|value| value.as_str() == "medium")
+                .cloned()
+                .unwrap_or_else(|| accepted[0].clone());
+            let (proof_id, proof_expires_at) = issue_proof(
+                &request.request_id,
+                model_id,
+                &binding.ccswitch.provider_id,
+                &base,
+                &binding,
+                api_key,
+                catalog_digest(&report.models),
+                proof_epoch.expect("reasoning probe captured proof epoch"),
+                &active.cancelled,
+                Some(ReasoningEvidence {
+                    efforts: accepted,
+                    default_effort,
+                }),
+            )?;
+            report.status = "passed".into();
+            report.connectivity_model_id = Some(model_id.to_owned());
+            report.connectivity_proof_id = Some(proof_id.clone());
+            report.connectivity_proof_expires_at = Some(proof_expires_at);
+            report.reasoning_proof_id = Some(proof_id);
+        } else if report.status != "cancelled" {
+            report.status = "failed".into();
+            report.error_code = Some("no-effort-accepted".into());
+        }
         return Ok(report);
     }
 
@@ -711,7 +882,7 @@ pub(crate) async fn add_tested_model(
     if active.is_cancelled() {
         return Err(engine("模型添加已取消；未修改 Codex 目录"));
     }
-    consume_connectivity_proof(
+    let evidence = consume_connectivity_proof(
         proof_id,
         request_id,
         model_id,
@@ -720,7 +891,8 @@ pub(crate) async fn add_tested_model(
         &binding,
         api_key,
         &catalog_digest(&models),
-    )?;
+    )?
+    .ok_or_else(|| engine("思考档位尚未通过当前路由测试；请先检测思考档位"))?;
     crate::app::model_catalog::add_tested_model_to_catalog(
         request_id,
         model_id,
@@ -730,6 +902,7 @@ pub(crate) async fn add_tested_model(
             .and_then(|candidate| candidate.owned_by.as_deref()),
         &binding,
         &active.cancelled,
+        &evidence,
     )
 }
 
@@ -761,6 +934,9 @@ mod tests {
             selected_model_ids,
             cost_consent,
             connectivity_model_id: None,
+            reasoning_model_id: None,
+            reasoning_efforts: Vec::new(),
+            reasoning_cost_consent: false,
         }
     }
 
@@ -816,6 +992,42 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_effort_probe_requires_explicit_cost_consent_and_exact_model_candidates() {
+        let mut request = request(Vec::new(), false);
+        request.reasoning_model_id = Some("claude-opus-5-5".into());
+        request.reasoning_efforts = vec!["medium".into(), "high".into()];
+        assert!(validate_request(&request).is_err());
+        request.reasoning_cost_consent = true;
+        assert!(validate_request(&request).is_ok());
+        request.reasoning_efforts.push("none".into());
+        assert!(validate_request(&request).is_err());
+        request.reasoning_efforts = vec!["medium".into(), "medium".into()];
+        assert!(validate_request(&request).is_err());
+        request.reasoning_efforts = vec!["arbitrary".into()];
+        assert!(validate_request(&request).is_err());
+        assert!(!reasoning_candidates("claude-opus-5-5")
+            .iter()
+            .any(|effort| *effort == "none"));
+        assert!(reasoning_candidates("vendor/model-latest")
+            .iter()
+            .any(|effort| *effort == "none"));
+    }
+
+    #[test]
+    fn reasoning_efforts_are_canonicalized_independently_of_request_order() {
+        let reversed = vec!["high".into(), "medium".into(), "low".into()];
+        assert_eq!(
+            canonical_reasoning_efforts("vendor/model", &reversed),
+            vec!["low", "medium", "high"]
+        );
+        let claude = vec!["high".into(), "low".into(), "medium".into()];
+        assert_eq!(
+            canonical_reasoning_efforts("claude-opus-5-5", &claude),
+            vec!["low", "medium", "high"]
+        );
+    }
+
+    #[test]
     fn proof_is_bound_to_model_provider_account_credential_catalog_and_single_use() {
         let _serial = PROOF_TEST_LOCK
             .lock()
@@ -845,6 +1057,7 @@ mod tests {
             catalog.clone(),
             epoch,
             &cancelled,
+            None,
         )
         .unwrap();
         assert!(expires_at > unix_seconds());
@@ -896,6 +1109,7 @@ mod tests {
             "fixture-catalog-digest".into(),
             old_epoch,
             &cancelled,
+            None,
         );
         finish_catalog_reset();
         assert!(result.is_err());
@@ -932,6 +1146,7 @@ mod tests {
             catalog.clone(),
             epoch,
             &cancelled,
+            None,
         )
         .unwrap();
 
