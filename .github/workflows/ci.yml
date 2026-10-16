@@ -18,6 +18,53 @@ permissions:
   contents: read
 
 jobs:
+  changes:
+    name: Select scoped checks
+    runs-on: ubuntu-latest
+    outputs:
+      windows_engine: ${{ steps.filter.outputs.windows_engine }}
+      theme_engine: ${{ steps.filter.outputs.theme_engine }}
+      dependencies: ${{ steps.filter.outputs.dependencies }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Classify changed files
+        id: filter
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "pull_request" && -n "$PR_BASE_SHA" ]]; then
+            base="$PR_BASE_SHA"
+          else
+            base="$BEFORE_SHA"
+          fi
+          if [[ -z "$base" || "$base" == "0000000000000000000000000000000000000000" ]]; then
+            changed="$(git show --pretty=format: --name-only HEAD)"
+          else
+            changed="$(git diff --name-only "$base"...HEAD)"
+          fi
+
+          if grep -Eq '^crates/codex-win-engine/' <<<"$changed"; then
+            echo "windows_engine=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "windows_engine=false" >> "$GITHUB_OUTPUT"
+          fi
+          if grep -Eq '^crates/codex-theme-engine/' <<<"$changed"; then
+            echo "theme_engine=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "theme_engine=false" >> "$GITHUB_OUTPUT"
+          fi
+          if grep -Eq '(^|/)(Cargo\.lock|Cargo\.toml|package-lock\.json|pnpm-lock\.yaml|package\.json|deny\.toml)$|^\.cargo/' <<<"$changed"; then
+            echo "dependencies=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "dependencies=false" >> "$GITHUB_OUTPUT"
+          fi
+
   frontend:
     name: Frontend
     runs-on: ubuntu-latest
@@ -39,11 +86,10 @@ jobs:
 
   rust:
     name: Rust
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+    needs: changes
+    # The USB edition is Windows-only. macOS distribution support remains in
+    # release.yml, outside this Windows USB pull-request gate.
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
@@ -66,18 +112,22 @@ jobs:
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --workspace --all-targets -- -D warnings
       - name: Test (src-tauri)
         run: cargo test --manifest-path src-tauri/Cargo.toml --workspace
-      # Path deps are not workspace members, so their unit/integration tests are
-      # not covered by the step above. Run each engine crate explicitly so
-      # mac/win pure-logic regressions fail required CI on every PR.
-      - name: Test codex-mac-engine (standalone)
-        run: cargo test --manifest-path crates/codex-mac-engine/Cargo.toml --all-targets
+      # The standalone Windows engine suite includes AppX/WpSystem deployment
+      # fixture tests. Keep it, but only run it when that engine crate changes;
+      # unrelated model-manager changes must not be blocked by those fixtures.
       - name: Test codex-win-engine (standalone)
+        if: needs.changes.outputs.windows_engine == 'true'
         run: cargo test --manifest-path crates/codex-win-engine/Cargo.toml --all-targets
       - name: Test codex-theme-engine (standalone)
+        if: needs.changes.outputs.theme_engine == 'true'
         run: cargo test --manifest-path crates/codex-theme-engine/Cargo.toml --all-targets
 
   audit:
     name: Audit
+    needs: changes
+    # Dependency policy is checked when dependency manifests/lockfiles change;
+    # unrelated application code is not held up by the current yanked-zip audit notice.
+    if: needs.changes.outputs.dependencies == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1

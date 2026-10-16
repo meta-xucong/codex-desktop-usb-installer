@@ -34,6 +34,9 @@ export default tseslint.config(
       // Temporary installer/MCP/model-catalog validation trees can contain
       // extracted third-party runtimes; they are evidence, not app sources.
       ".tmp-*/**",
+      // Retained local test evidence is likewise outside the product source
+      // tree; copied third-party scripts here must not fail the renderer lint.
+      ".test-tmp/**",
       // Local release/capability simulations contain bundled third-party
       // runtimes and extracted vendor JavaScript. They are test evidence, not
       // renderer sources, and must not make the product lint gate depend on a
