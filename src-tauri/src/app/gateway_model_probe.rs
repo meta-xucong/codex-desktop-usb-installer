@@ -1005,12 +1005,8 @@ mod tests {
         assert!(validate_request(&request).is_err());
         request.reasoning_efforts = vec!["arbitrary".into()];
         assert!(validate_request(&request).is_err());
-        assert!(!reasoning_candidates("claude-opus-5-5")
-            .iter()
-            .any(|effort| *effort == "none"));
-        assert!(reasoning_candidates("vendor/model-latest")
-            .iter()
-            .any(|effort| *effort == "none"));
+        assert!(!reasoning_candidates("claude-opus-5-5").contains(&"none"));
+        assert!(reasoning_candidates("vendor/model-latest").contains(&"none"));
     }
 
     #[test]
