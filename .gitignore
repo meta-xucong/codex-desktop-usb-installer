@@ -61,5 +61,6 @@ release/usb-oneclick-v*/
 # Local validation snapshots and third-party offline prerequisite binaries are
 # reproducible inputs, not source. Their expected hashes/signers are release
 # gates in tools/build-installer.ps1.
+.test-tmp/
 .codex-audit/
 src-tauri/resources/prerequisites/*.exe
