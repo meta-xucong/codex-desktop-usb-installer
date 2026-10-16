@@ -10,6 +10,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 pub const BODY_LIMIT: usize = 1024 * 1024;
+const REASONING_ERROR_BODY_LIMIT: usize = 16 * 1024;
 pub const REFRESH_BUDGET: Duration = Duration::from_secs(180);
 /// Upper bound for lightweight gateway requests such as `/health`, `/models`,
 /// and the compatibility directory.  This is deliberately shorter than the
@@ -85,13 +86,18 @@ impl<'a> ProbeClient<'a> {
             return Err(ProbeError::InvalidResponse);
         }
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let client = reqwest::Client::builder()
+        let mut client_builder = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(8))
             .timeout(timeouts.request)
             .redirect(reqwest::redirect::Policy::none())
-            .user_agent("Codex-App-Manager/local-capability-probe")
-            .build()
-            .map_err(|_| ProbeError::Network)?;
+            .user_agent("Codex-App-Manager/local-capability-probe");
+        if loopback_fixture {
+            // Unit tests bind their own 127.0.0.1 mock server. Ignore inherited
+            // desktop proxy settings for this loopback-only fixture; production
+            // gateway requests retain the configured proxy behavior.
+            client_builder = client_builder.no_proxy();
+        }
+        let client = client_builder.build().map_err(|_| ProbeError::Network)?;
         Ok(Self {
             client,
             base,
@@ -158,6 +164,26 @@ impl<'a> ProbeClient<'a> {
                     return Err(ProbeError::Unauthorized);
                 }
                 if !response.status().is_success() {
+                    if status == 400 {
+                        if response
+                            .content_length()
+                            .is_some_and(|length| length > REASONING_ERROR_BODY_LIMIT as u64)
+                        {
+                            return Err(ProbeError::Http);
+                        }
+                        let mut body = Vec::new();
+                        while let Some(chunk) =
+                            response.chunk().await.map_err(|_| ProbeError::Http)?
+                        {
+                            if body.len().saturating_add(chunk.len()) > REASONING_ERROR_BODY_LIMIT {
+                                return Err(ProbeError::Http);
+                            }
+                            body.extend_from_slice(&chunk);
+                        }
+                        if is_unsupported_reasoning_effort(status, &body) {
+                            return Err(ProbeError::UnsupportedEffort);
+                        }
+                    }
                     return Err(ProbeError::Http);
                 }
                 if let Some(expected) = expected_content_type {
@@ -287,7 +313,11 @@ impl<'a> ProbeClient<'a> {
             .and_then(|value| {
                 // Preserve only the opaque correlation ID when validation fails.
                 diag.response(value.get("id").and_then(Value::as_str));
-                validate_response(&value, model)?;
+                if stage == "reasoning-effort" {
+                    validate_effort_probe_response(&value, model)?;
+                } else {
+                    validate_response(&value, model)?;
+                }
                 Ok(value)
             });
         match &result {
@@ -326,6 +356,18 @@ impl<'a> ProbeClient<'a> {
     /// only generation request used by the selective catalog quick test.
     pub async fn quick_text(&self, model: &str, token: &str) -> Result<(), ProbeError> {
         self.text(model, token, None).await.map(|_| ())
+    }
+    /// Send one bounded text challenge with an explicit Codex reasoning effort.
+    /// HTTP 400 is classified as a route rejection; all other failures remain unknown.
+    pub async fn quick_text_with_effort(
+        &self,
+        model: &str,
+        token: &str,
+        effort: &str,
+    ) -> Result<(), ProbeError> {
+        let body = reasoning_effort_request_body(model, token, effort);
+        let response = self.response(model, body, "reasoning-effort").await?;
+        require_text(&response, token)
     }
     async fn tool_start(
         &self,
@@ -519,6 +561,60 @@ impl<'a> ProbeClient<'a> {
     }
 }
 
+fn reasoning_effort_request_body(model: &str, token: &str, effort: &str) -> Value {
+    json!({
+        "model": model,
+        "input": format!("Reply exactly {token} and nothing else."),
+        "stream": false,
+        "store": false,
+        "max_output_tokens": 1024,
+        "reasoning": {"effort": effort}
+    })
+}
+
+fn is_unsupported_reasoning_effort(status: u16, body: &[u8]) -> bool {
+    if status != 400 || body.len() > REASONING_ERROR_BODY_LIMIT {
+        return false;
+    }
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return false;
+    };
+    let error = value.get("error").unwrap_or(&value);
+    let code = error
+        .get("code")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let kind = error
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let param = error
+        .get("param")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let effort_reference = param == "reasoning.effort"
+        || [code.as_str(), kind.as_str(), message.as_str()]
+            .iter()
+            .any(|text| text.contains("reasoning.effort") || text.contains("reasoning effort"));
+    let explicitly_unsupported =
+        [code.as_str(), kind.as_str(), message.as_str()]
+            .iter()
+            .any(|text| {
+                text.contains("unsupported")
+                    || text.contains("not supported")
+                    || text.contains("does not support")
+            });
+    effort_reference && explicitly_unsupported
+}
+
 fn finish_error(
     model: &mut ModelCapabilityReport,
     stage: &'static str,
@@ -568,6 +664,20 @@ fn validate_response(value: &Value, model: &str) -> Result<(), ProbeError> {
         return Err(ProbeError::InvalidResponse);
     }
     Ok(())
+}
+fn validate_effort_probe_response(value: &Value, model: &str) -> Result<(), ProbeError> {
+    response_id(value)?;
+    if value.get("model").and_then(Value::as_str) != Some(model)
+        || value.get("error").is_some_and(|v| !v.is_null())
+        || !value.get("output").is_some_and(Value::is_array)
+    {
+        return Err(ProbeError::InvalidResponse);
+    }
+    match value.get("status").and_then(Value::as_str) {
+        Some("completed") => Ok(()),
+        Some("incomplete") => Err(ProbeError::Incomplete),
+        _ => Err(ProbeError::InvalidResponse),
+    }
 }
 fn require_text(value: &Value, expected: &str) -> Result<(), ProbeError> {
     let mut texts = Vec::new();
@@ -953,6 +1063,140 @@ fn validate_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reasoning_effort_request_is_explicit_and_output_bounded() {
+        let body = reasoning_effort_request_body("vendor/model", "challenge", "high");
+        assert_eq!(body["model"], "vendor/model");
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["max_output_tokens"], 1024);
+        assert_eq!(body["store"], false);
+        assert_eq!(body["stream"], false);
+        assert!(body["input"].as_str().unwrap().contains("challenge"));
+    }
+
+    #[test]
+    fn only_explicit_reasoning_effort_bad_requests_are_classified_as_route_rejections() {
+        assert!(is_unsupported_reasoning_effort(400, br#"{"error":{"code":"unsupported_value","param":"reasoning.effort","message":"model does not support reasoning effort high"}}"#));
+        assert!(is_unsupported_reasoning_effort(400, br#"{"error":{"code":"unsupported_parameter","param":"reasoning.effort","message":"unsupported parameter"}}"#));
+        assert!(!is_unsupported_reasoning_effort(
+            400,
+            br#"{"error":{"message":"reasoning.effort is required"}}"#
+        ));
+        assert!(!is_unsupported_reasoning_effort(
+            400,
+            br#"{"error":{"message":"reasoning effort invalid in combination with this request"}}"#
+        ));
+        assert!(!is_unsupported_reasoning_effort(400, b"unsupported effort"));
+        assert!(!is_unsupported_reasoning_effort(400, b"invalid API key"));
+        assert!(!is_unsupported_reasoning_effort(
+            401,
+            b"reasoning effort unsupported"
+        ));
+        assert!(!is_unsupported_reasoning_effort(
+            429,
+            b"reasoning effort unsupported"
+        ));
+        assert!(!is_unsupported_reasoning_effort(
+            400,
+            &vec![b'x'; REASONING_ERROR_BODY_LIMIT + 1]
+        ));
+    }
+
+    #[test]
+    fn incomplete_reasoning_effort_responses_remain_unknown_instead_of_becoming_rejections() {
+        let response = json!({
+            "id":"resp-fixture",
+            "model":"vendor/model",
+            "status":"incomplete",
+            "incomplete_details":{"reason":"max_output_tokens"},
+            "output":[]
+        });
+        assert_eq!(
+            validate_effort_probe_response(&response, "vendor/model"),
+            Err(ProbeError::Incomplete)
+        );
+    }
+
+    #[tokio::test]
+    async fn reasoning_effort_probe_sends_one_bounded_request_to_the_responses_route() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 2048];
+            loop {
+                let read = stream.read(&mut chunk).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                let header_end = request.windows(4).position(|window| window == b"\r\n\r\n");
+                if let Some(header_end) = header_end {
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= header_end + 4 + content_length {
+                        break;
+                    }
+                }
+            }
+            let body_start = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .unwrap()
+                + 4;
+            let headers = String::from_utf8_lossy(&request[..body_start]);
+            let response_body = serde_json::to_vec(&json!({
+                "id":"resp-fixture",
+                "model":"vendor/model",
+                "status":"completed",
+                "output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"challenge"}]}]
+            })).unwrap();
+            write!(stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response_body.len()
+            ).unwrap();
+            stream.write_all(&response_body).unwrap();
+            (
+                headers.into_owned(),
+                serde_json::from_slice::<Value>(&request[body_start..]).unwrap(),
+            )
+        });
+
+        let client = ProbeClient::new(
+            &format!("http://{address}/v1/"),
+            "fixture-key",
+            Arc::new(AtomicBool::new(false)),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+        client
+            .quick_text_with_effort("vendor/model", "challenge", "high")
+            .await
+            .unwrap();
+        assert_eq!(client.requests_started(), 1);
+        let (headers, body) = server.join().unwrap();
+        assert!(headers.starts_with("POST /v1/responses HTTP/1.1"));
+        assert!(headers
+            .to_ascii_lowercase()
+            .contains("authorization: bearer fixture-key"));
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["max_output_tokens"], 1024);
+        assert_eq!(body["store"], false);
+    }
+
     fn tool_response() -> Value {
         json!({"id":"resp-fixture","model":"fixture-model","status":"completed","output":[
             {"type":"function_call","id":"item-fixture","call_id":"call-fixture",

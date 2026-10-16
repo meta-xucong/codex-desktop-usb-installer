@@ -246,11 +246,19 @@ export interface GatewayModelProbeRequest {
   selectedModelIds: string[];
   costConsent: boolean;
   connectivityModelId?: string | null;
+  reasoningModelId?: string | null;
+  reasoningEfforts?: string[];
+  reasoningCostConsent?: boolean;
 }
 export interface GatewayProbeModel {
   id: string;
   ownedBy: string | null;
   selectable: boolean;
+}
+export interface GatewayReasoningEffortResult {
+  effort: string;
+  status: "accepted_by_route" | "rejected_by_route" | "unknown";
+  errorCode: string | null;
 }
 export interface GatewayProbeCheck {
   name: string;
@@ -276,6 +284,9 @@ export interface GatewayModelProbeReport {
   connectivityModelId?: string;
   connectivityProofId?: string;
   connectivityProofExpiresAt?: number;
+  reasoningModelId?: string;
+  reasoningResults?: GatewayReasoningEffortResult[];
+  reasoningProofId?: string;
 }
 
 export interface MediaModelCatalog {

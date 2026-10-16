@@ -1499,13 +1499,15 @@ pub(crate) fn add_tested_model_to_catalog(
     owner: Option<&str>,
     expected_binding: &codex_usb_license::UsbAccountBinding,
     cancelled: &AtomicBool,
+    reasoning: &crate::app::gateway_model_probe::ReasoningEvidence,
 ) -> Result<NativeModelCatalogActionReport, AppError> {
     let home = codex_home_dir().ok_or_else(|| engine("无法确定 Codex 用户目录"))?;
     let expected_home = home.clone();
-    add_tested_model_files_with_validator(
+    add_tested_model_files_with_reasoning(
         &home,
         model_id,
         owner,
+        reasoning,
         cancelled,
         || {
             Ok(
@@ -1586,6 +1588,7 @@ where
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn add_tested_model_files_with_validator<F, I, V, C, M>(
     home: &Path,
@@ -1605,8 +1608,53 @@ where
     C: Fn(),
     M: Fn() -> Result<(), AppError>,
 {
+    add_tested_model_files_with_reasoning(
+        home,
+        model_id,
+        owner,
+        &crate::app::gateway_model_probe::ReasoningEvidence {
+            efforts: vec!["medium".into()],
+            default_effort: "medium".into(),
+        },
+        cancelled,
+        is_current,
+        initial_catalog,
+        validate_catalog,
+        mark_commit,
+        mark_restart,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_tested_model_files_with_reasoning<F, I, V, C, M>(
+    home: &Path,
+    model_id: &str,
+    owner: Option<&str>,
+    reasoning: &crate::app::gateway_model_probe::ReasoningEvidence,
+    cancelled: &AtomicBool,
+    is_current: F,
+    initial_catalog: I,
+    validate_catalog: V,
+    mark_commit: C,
+    mark_restart: M,
+) -> Result<NativeModelCatalogActionReport, AppError>
+where
+    F: Fn() -> Result<bool, AppError>,
+    I: FnOnce() -> Result<Value, AppError>,
+    V: Fn(&[u8]) -> Result<(), AppError>,
+    C: Fn(),
+    M: Fn() -> Result<(), AppError>,
+{
     if !safe_identifier(model_id) || owner.is_some_and(|value| !safe_identifier(value)) {
         return Err(engine("已测试模型的标识无效，未写入目录"));
+    }
+    let canonical_efforts =
+        crate::app::gateway_model_probe::canonical_reasoning_efforts(model_id, &reasoning.efforts);
+    if reasoning.efforts.is_empty()
+        || canonical_efforts != reasoning.efforts
+        || !reasoning.efforts.contains(&reasoning.default_effort)
+    {
+        return Err(engine("思考档位证据无效；未写入目录"));
     }
     let _files = FILE_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let _process_lock = model_selection_client::lock_configuration()
@@ -1639,6 +1687,26 @@ where
         .transpose()
         .map_err(|_| engine("Codex 配置不是 UTF-8，模型未添加"))?
         .unwrap_or("");
+    let parsed_config: toml::Value = toml::from_str(config_text)
+        .map_err(|_| engine("Codex 配置无法安全读取；保留原配置，未写入模型"))?;
+    if let Some(global_effort) = parsed_config
+        .get("model_reasoning_effort")
+        .and_then(toml::Value::as_str)
+    {
+        if !reasoning
+            .efforts
+            .iter()
+            .any(|effort| effort == global_effort)
+        {
+            return Err(engine(format!(
+                "全局思考档位“{global_effort}”不在此模型当前路由接受的档位中。安装器保留了全局设置；请在 Codex 设置中调整后重新测试。"
+            )));
+        }
+    } else if parsed_config.get("model_reasoning_effort").is_some() {
+        return Err(engine(
+            "全局思考档位设置格式无法识别；保留原配置，未写入模型",
+        ));
+    }
     let (cleaned_config, managed) = cleaned_config_without_external_catalog(config_text, &config)?;
     let catalog_snapshot = read_optional(&catalog)?;
     let mut catalog_value = match catalog_snapshot.as_deref() {
@@ -1680,22 +1748,41 @@ where
     };
     normalize_legacy_model_entries(&mut catalog_value)?;
     let existing_ids = catalog_model_ids(&catalog_value)?;
-    if existing_ids.iter().any(|id| id == model_id) {
-        return Ok(action_report(
-            "already_added",
-            existing_ids,
-            "该模型已在 Codex 目录中，无需重复添加",
-        ));
-    }
     let models = catalog_value
         .get_mut("models")
         .and_then(Value::as_array_mut)
         .ok_or_else(|| engine("本地模型目录格式无效；请先复位模型目录"))?;
-    models.push(conservative_tested_model_entry(
+    let supported = crate::app::gateway_model_probe::canonical_reasoning_efforts(
         model_id,
-        owner,
-        models.len() + 1,
-    ));
+        &reasoning.efforts,
+    )
+    .iter()
+    .map(|effort| json!({"effort":effort,"description":format!("{effort} reasoning effort")}))
+    .collect::<Vec<_>>();
+    if let Some(existing) = models
+        .iter_mut()
+        .find(|entry| entry.get("slug").and_then(Value::as_str) == Some(model_id))
+    {
+        if existing
+            .get("default_reasoning_level")
+            .and_then(Value::as_str)
+            == Some(reasoning.default_effort.as_str())
+            && existing.get("supported_reasoning_levels") == Some(&json!(supported))
+        {
+            return Ok(action_report(
+                "already_added",
+                existing_ids,
+                "该模型已在 Codex 目录中",
+            ));
+        }
+        existing["default_reasoning_level"] = json!(reasoning.default_effort);
+        existing["supported_reasoning_levels"] = json!(supported);
+    } else {
+        let mut entry = conservative_tested_model_entry(model_id, owner, models.len() + 1);
+        entry["default_reasoning_level"] = json!(reasoning.default_effort);
+        entry["supported_reasoning_levels"] = json!(supported);
+        models.push(entry);
+    }
     let resulting_ids = catalog_model_ids(&catalog_value)?;
     let catalog_bytes =
         serde_json::to_vec_pretty(&catalog_value).map_err(|_| engine("模型目录序列化失败"))?;
@@ -1724,8 +1811,16 @@ where
         return Err(engine("模型添加已取消；未修改 Codex 目录"));
     }
     mark_commit();
-    atomic_file::write_atomic(&catalog, &catalog_bytes)
-        .map_err(|_| engine("模型目录写入未完成；请重新读取状态后再试"))?;
+    atomic_file::write_atomic(&catalog, &catalog_bytes).map_err(|error| {
+        log::warn!("model catalog atomic write failed: {error}");
+        if cfg!(test) {
+            engine(format!(
+                "模型目录写入未完成；请重新读取状态后再试（{error}）"
+            ))
+        } else {
+            engine("模型目录写入未完成；请重新读取状态后再试")
+        }
+    })?;
     if let Some(merged) = merged {
         if atomic_file::write_atomic_preserving_backup(&config, merged.as_bytes()).is_err() {
             let current = read_optional(&catalog).ok().flatten();
@@ -3437,6 +3532,191 @@ mod tests {
                 conservative_tested_model_entry(id, None, index + 1)
             }).collect::<Vec<_>>()
         })
+    }
+
+    #[test]
+    fn reasoning_recheck_updates_only_owned_entry_and_preserves_other_fields_and_order() {
+        let home = CatalogTempHome::new();
+        let config = config_path_for(home.path());
+        let catalog = catalog_path_for(home.path());
+        std::fs::write(&config, managed_catalog_config(home.path())).unwrap();
+        let mut custom = conservative_tested_model_entry("vendor/existing", None, 1);
+        custom["description"] = json!("keep this user-visible description");
+        let second = conservative_tested_model_entry("vendor/other", None, 2);
+        std::fs::write(
+            &catalog,
+            serde_json::to_vec_pretty(&json!({
+                "identity": CATALOG_IDENTITY,
+                "models": [custom, second]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let reasoning = crate::app::gateway_model_probe::ReasoningEvidence {
+            efforts: vec!["low".into(), "high".into()],
+            default_effort: "high".into(),
+        };
+
+        let result = add_tested_model_files_with_reasoning(
+            home.path(),
+            "vendor/existing",
+            None,
+            &reasoning,
+            &AtomicBool::new(false),
+            || Ok(true),
+            || Ok(empty_native_catalog()),
+            |_| Ok(()),
+            || {},
+            || Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(result.status, "applied_restart_pending");
+        let saved: Value = serde_json::from_slice(&std::fs::read(&catalog).unwrap()).unwrap();
+        assert_eq!(saved["models"][0]["slug"], "vendor/existing");
+        assert_eq!(
+            saved["models"][0]["description"],
+            "keep this user-visible description"
+        );
+        assert_eq!(saved["models"][0]["default_reasoning_level"], "high");
+        assert_eq!(
+            saved["models"][0]["supported_reasoning_levels"][0]["effort"],
+            "low"
+        );
+        assert_eq!(
+            saved["models"][0]["supported_reasoning_levels"][1]["effort"],
+            "high"
+        );
+        assert_eq!(saved["models"][1]["slug"], "vendor/other");
+    }
+
+    #[test]
+    fn incompatible_global_reasoning_effort_blocks_add_without_rewriting_config() {
+        let home = CatalogTempHome::new();
+        let config = config_path_for(home.path());
+        let original = b"model_reasoning_effort = \"none\"\n";
+        std::fs::write(&config, original).unwrap();
+        let reasoning = crate::app::gateway_model_probe::ReasoningEvidence {
+            efforts: vec!["medium".into()],
+            default_effort: "medium".into(),
+        };
+
+        let result = add_tested_model_files_with_reasoning(
+            home.path(),
+            "vendor/model",
+            None,
+            &reasoning,
+            &AtomicBool::new(false),
+            || Ok(true),
+            || Ok(empty_native_catalog()),
+            |_| Ok(()),
+            || {},
+            || Ok(()),
+        );
+
+        assert!(result.unwrap_err().to_string().contains("全局思考档位"));
+        assert_eq!(std::fs::read(&config).unwrap(), original);
+        assert!(!catalog_path_for(home.path()).exists());
+    }
+
+    #[test]
+    fn compatible_global_reasoning_effort_is_preserved_when_adding_model() {
+        let home = CatalogTempHome::new();
+        let config = config_path_for(home.path());
+        let original = format!(
+            "model_reasoning_effort = \"medium\"\n{}",
+            String::from_utf8(managed_catalog_config(home.path())).unwrap()
+        );
+        std::fs::write(&config, original.as_bytes()).unwrap();
+        std::fs::write(
+            catalog_path_for(home.path()),
+            serde_json::to_vec_pretty(&fixture_native_catalog(&["gpt-5", "vendor/legacy"]))
+                .unwrap(),
+        )
+        .unwrap();
+        let reasoning = crate::app::gateway_model_probe::ReasoningEvidence {
+            efforts: vec!["medium".into(), "high".into()],
+            default_effort: "medium".into(),
+        };
+
+        let result = add_tested_model_files_with_reasoning(
+            home.path(),
+            "vendor/model",
+            None,
+            &reasoning,
+            &AtomicBool::new(false),
+            || Ok(true),
+            || Ok(empty_native_catalog()),
+            |_| Ok(()),
+            || {},
+            || Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(result.status, "applied_restart_pending");
+        assert_eq!(std::fs::read(&config).unwrap(), original.as_bytes());
+        let saved: Value =
+            serde_json::from_slice(&std::fs::read(catalog_path_for(home.path())).unwrap()).unwrap();
+        let models = saved["models"].as_array().unwrap();
+        assert_eq!(models.len(), 3);
+        assert_eq!(models[0]["slug"], "gpt-5");
+        assert_eq!(models[1]["slug"], "vendor/legacy");
+        assert_eq!(models[2]["slug"], "vendor/model");
+        assert_eq!(models[2]["default_reasoning_level"], "medium");
+    }
+
+    #[test]
+    fn malformed_global_reasoning_effort_blocks_add_without_rewriting_config() {
+        let home = CatalogTempHome::new();
+        let config = config_path_for(home.path());
+        let original = b"model_reasoning_effort = 3\n";
+        std::fs::write(&config, original).unwrap();
+        let reasoning = crate::app::gateway_model_probe::ReasoningEvidence {
+            efforts: vec!["medium".into()],
+            default_effort: "medium".into(),
+        };
+
+        let result = add_tested_model_files_with_reasoning(
+            home.path(),
+            "vendor/model",
+            None,
+            &reasoning,
+            &AtomicBool::new(false),
+            || Ok(true),
+            || Ok(empty_native_catalog()),
+            |_| Ok(()),
+            || {},
+            || Ok(()),
+        );
+
+        assert!(result.unwrap_err().to_string().contains("格式无法识别"));
+        assert_eq!(std::fs::read(&config).unwrap(), original);
+        assert!(!catalog_path_for(home.path()).exists());
+    }
+
+    #[test]
+    fn model_specific_unsupported_effort_cannot_be_injected_into_catalog_evidence() {
+        let home = CatalogTempHome::new();
+        let reasoning = crate::app::gateway_model_probe::ReasoningEvidence {
+            efforts: vec!["none".into()],
+            default_effort: "none".into(),
+        };
+
+        let result = add_tested_model_files_with_reasoning(
+            home.path(),
+            "claude-opus-5-5",
+            None,
+            &reasoning,
+            &AtomicBool::new(false),
+            || Ok(true),
+            || Ok(empty_native_catalog()),
+            |_| Ok(()),
+            || {},
+            || Ok(()),
+        );
+
+        assert!(result.unwrap_err().to_string().contains("思考档位证据无效"));
+        assert!(!catalog_path_for(home.path()).exists());
     }
 
     #[test]

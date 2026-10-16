@@ -60,6 +60,13 @@ function renderSheet(onDismiss?: () => void) {
   );
 }
 
+async function runReasoningProbe(user: ReturnType<typeof userEvent.setup>, efforts = ["medium"]) {
+  vi.spyOn(window, "confirm").mockReturnValue(true);
+  await user.click(screen.getByRole("button", { name: "检测思考档位（可能产生多次调用费用）" }));
+  for (const effort of efforts) await user.click(screen.getByRole("checkbox", { name: effort }));
+  await user.click(screen.getByRole("button", { name: `开始检测（${efforts.length} 次）` }));
+}
+
 describe("UpstreamModelManagerSheet", () => {
   beforeEach(() => {
     vi.resetAllMocks();
@@ -145,7 +152,7 @@ describe("UpstreamModelManagerSheet", () => {
     expect(within(section!).queryByRole("button")).not.toBeInTheDocument();
   });
 
-  it("discovers read-only and only offers Add after the exact model passes a quick test", async () => {
+  it("discovers read-only and only offers Add after the exact model's reasoning efforts pass", async () => {
     const user = userEvent.setup();
     api.gatewayModelProbe
       .mockResolvedValueOnce(listing)
@@ -155,6 +162,9 @@ describe("UpstreamModelManagerSheet", () => {
         generatedRequests: 1,
         connectivityModelId: "vendor/model-latest",
         connectivityProofId: "proof-fixture",
+        reasoningModelId: "vendor/model-latest",
+        reasoningProofId: "proof-fixture",
+        reasoningResults: [{ effort: "medium", status: "accepted_by_route", errorCode: null }],
         checkedAt: Math.floor(Date.now() / 1000),
         connectivityProofExpiresAt: Math.floor(Date.now() / 1000) + 300,
         results: [{
@@ -177,11 +187,14 @@ describe("UpstreamModelManagerSheet", () => {
       selectedModelIds: [], costConsent: false,
     });
 
-    await user.click(screen.getByRole("button", { name: "测试是否可用" }));
+    await runReasoningProbe(user);
     await screen.findByRole("button", { name: "添加到 Codex" });
-    expect(screen.getByText("文字测试可用")).toBeInTheDocument();
+    expect(screen.getByText("档位检测完成：当前路由接受 1 个档位请求。")).toBeInTheDocument();
+    const modelRow = screen.getByTestId("upstream-model-vendor/model-latest");
+    expect(within(modelRow).getByText("路由接受")).toBeInTheDocument();
+    expect(within(modelRow).getByRole("list", { name: "各思考档位检测结果" })).toBeInTheDocument();
     expect(api.gatewayModelProbe.mock.calls[1]?.[0]).toMatchObject({
-      selectedModelIds: [], connectivityModelId: "vendor/model-latest", costConsent: false,
+      selectedModelIds: [], reasoningModelId: "vendor/model-latest", reasoningEfforts: ["medium"], reasoningCostConsent: true,
     });
 
     await user.click(screen.getByRole("button", { name: "添加到 Codex" }));
@@ -195,9 +208,39 @@ describe("UpstreamModelManagerSheet", () => {
     expect(within(screen.getByTestId("upstream-model-vendor/model-latest"))
       .getByText("已添加到 Codex")).toBeInTheDocument();
     expect(within(screen.getByTestId("upstream-model-vendor/model-latest"))
-      .queryByText("文字测试可用")).not.toBeInTheDocument();
-    expect(within(screen.getByTestId("upstream-model-vendor/model-latest"))
       .queryByRole("button", { name: "添加到 Codex" })).not.toBeInTheDocument();
+  });
+
+  it("shows accepted, rejected, and unknown reasoning effort results per candidate", async () => {
+    const user = userEvent.setup();
+    api.gatewayModelProbe
+      .mockResolvedValueOnce(listing)
+      .mockResolvedValueOnce({
+        ...listing,
+        status: "passed",
+        reasoningModelId: "vendor/model-latest",
+        reasoningProofId: "proof-efforts",
+        connectivityProofId: "proof-efforts",
+        reasoningResults: [
+          { effort: "low", status: "accepted_by_route", errorCode: null },
+          { effort: "medium", status: "rejected_by_route", errorCode: "unsupported_effort" },
+          { effort: "high", status: "unknown", errorCode: "network_error" },
+          { effort: "xhigh", status: "unknown", errorCode: "effort-probe-incomplete" },
+        ],
+        checkedAt: Math.floor(Date.now() / 1000),
+        connectivityProofExpiresAt: Math.floor(Date.now() / 1000) + 300,
+      });
+
+    renderSheet();
+    await screen.findByText("vendor/model-latest");
+    await runReasoningProbe(user, ["low", "medium", "high", "xhigh"]);
+    const row = screen.getByTestId("upstream-model-vendor/model-latest");
+    expect(within(row).getByText("路由接受")).toBeInTheDocument();
+    expect(within(row).getByText("路由拒绝")).toBeInTheDocument();
+    expect(within(row).getAllByText("结果未知")).toHaveLength(2);
+    expect(within(row).getAllByText("结果未知").some((node) =>
+      node.closest("span")?.getAttribute("title") === "在输出上限内未完成，不能判断该档位是否受支持。",
+    )).toBe(true);
   });
 
   it("does not report Add as successful when the post-write catalog reread omits the model", async () => {
@@ -210,6 +253,8 @@ describe("UpstreamModelManagerSheet", () => {
         generatedRequests: 1,
         connectivityModelId: "vendor/model-latest",
         connectivityProofId: "proof-reread-mismatch",
+        reasoningProofId: "proof-reread-mismatch",
+        reasoningResults: [{ effort: "medium", status: "accepted_by_route", errorCode: null }],
         checkedAt: Math.floor(Date.now() / 1000),
         connectivityProofExpiresAt: Math.floor(Date.now() / 1000) + 300,
         results: [{ modelId: "vendor/model-latest", passed: true, generatedRequests: 1,
@@ -226,7 +271,7 @@ describe("UpstreamModelManagerSheet", () => {
 
     renderSheet();
     await screen.findByText("vendor/model-latest");
-    await user.click(screen.getByRole("button", { name: "测试是否可用" }));
+    await runReasoningProbe(user);
     await user.click(await screen.findByRole("button", { name: "添加到 Codex" }));
 
     expect(await screen.findByRole("alert")).toHaveTextContent("还不能确认这个模型是否添加成功。请刷新列表查看状态。");
@@ -247,6 +292,8 @@ describe("UpstreamModelManagerSheet", () => {
         generatedRequests: 1,
         connectivityModelId: "vendor/model-latest",
         connectivityProofId: "proof-state-read-fails",
+        reasoningProofId: "proof-state-read-fails",
+        reasoningResults: [{ effort: "medium", status: "accepted_by_route", errorCode: null }],
         checkedAt: Math.floor(Date.now() / 1000),
         connectivityProofExpiresAt: Math.floor(Date.now() / 1000) + 300,
         results: [{ modelId: "vendor/model-latest", passed: true, generatedRequests: 1,
@@ -267,7 +314,7 @@ describe("UpstreamModelManagerSheet", () => {
 
     renderSheet();
     await screen.findByText("vendor/model-latest");
-    await user.click(screen.getByRole("button", { name: "测试是否可用" }));
+    await runReasoningProbe(user);
     await user.click(await screen.findByRole("button", { name: "添加到 Codex" }));
 
     expect(await screen.findByText("模型设置暂不可用。请刷新列表，或恢复 Codex 默认模型后再试。"))
@@ -299,6 +346,8 @@ describe("UpstreamModelManagerSheet", () => {
         generatedRequests: 1,
         connectivityModelId: "vendor/model-latest",
         connectivityProofId: "proof-close",
+        reasoningProofId: "proof-close",
+        reasoningResults: [{ effort: "medium", status: "accepted_by_route", errorCode: null }],
         checkedAt: Math.floor(Date.now() / 1000),
         connectivityProofExpiresAt: Math.floor(Date.now() / 1000) + 300,
         results: [{
@@ -312,7 +361,7 @@ describe("UpstreamModelManagerSheet", () => {
     await screen.findByRole("alert");
     expect(screen.queryByRole("button", { name: "添加到 Codex" })).not.toBeInTheDocument();
 
-    await user.click(screen.getByRole("button", { name: "测试是否可用" }));
+    await runReasoningProbe(user);
     await screen.findByRole("button", { name: "添加到 Codex" });
     const successfulRequestId = api.gatewayModelProbe.mock.calls[2]?.[0].requestId;
     await user.click(screen.getByRole("button", { name: "关闭" }));
@@ -329,6 +378,8 @@ describe("UpstreamModelManagerSheet", () => {
         generatedRequests: 1,
         connectivityModelId: "vendor/model-latest",
         connectivityProofId: "proof-reset",
+        reasoningProofId: "proof-reset",
+        reasoningResults: [{ effort: "medium", status: "accepted_by_route", errorCode: null }],
         checkedAt: Math.floor(Date.now() / 1000),
         connectivityProofExpiresAt: Math.floor(Date.now() / 1000) + 300,
         results: [{
@@ -344,7 +395,7 @@ describe("UpstreamModelManagerSheet", () => {
 
     renderSheet();
     await screen.findByText("vendor/model-latest");
-    await user.click(screen.getByRole("button", { name: "测试是否可用" }));
+    await runReasoningProbe(user);
     await screen.findByRole("button", { name: "添加到 Codex" });
     const testedRequestId = api.gatewayModelProbe.mock.calls[1]?.[0].requestId;
     await user.click(screen.getByRole("button", { name: "恢复 Codex 默认模型" }));
@@ -369,6 +420,8 @@ describe("UpstreamModelManagerSheet", () => {
         generatedRequests: 1,
         connectivityModelId: "vendor/model-latest",
         connectivityProofId: "proof-pending-add",
+        reasoningProofId: "proof-pending-add",
+        reasoningResults: [{ effort: "medium", status: "accepted_by_route", errorCode: null }],
         checkedAt: Math.floor(Date.now() / 1000),
         connectivityProofExpiresAt: Math.floor(Date.now() / 1000) + 300,
         results: [{ modelId: "vendor/model-latest", passed: true, generatedRequests: 1,
@@ -380,7 +433,7 @@ describe("UpstreamModelManagerSheet", () => {
 
     renderSheet();
     await screen.findByText("vendor/model-latest");
-    await user.click(screen.getByRole("button", { name: "测试是否可用" }));
+    await runReasoningProbe(user);
     await screen.findByRole("button", { name: "添加到 Codex" });
 
     const reset = screen.getByRole("button", { name: "恢复 Codex 默认模型" });
@@ -429,6 +482,8 @@ describe("UpstreamModelManagerSheet", () => {
         generatedRequests: 1,
         connectivityModelId: "vendor/model-latest",
         connectivityProofId: "proof-close-pending-add",
+        reasoningProofId: "proof-close-pending-add",
+        reasoningResults: [{ effort: "medium", status: "accepted_by_route", errorCode: null }],
         checkedAt: Math.floor(Date.now() / 1000),
         connectivityProofExpiresAt: Math.floor(Date.now() / 1000) + 300,
         results: [{ modelId: "vendor/model-latest", passed: true, generatedRequests: 1,
@@ -441,7 +496,7 @@ describe("UpstreamModelManagerSheet", () => {
 
     renderSheet();
     await screen.findByText("vendor/model-latest");
-    await user.click(screen.getByRole("button", { name: "测试是否可用" }));
+    await runReasoningProbe(user);
     await screen.findByRole("button", { name: "添加到 Codex" });
     await user.click(screen.getByRole("button", { name: "添加到 Codex" }));
     await waitFor(() => expect(api.manageNativeModelCatalog).toHaveBeenCalledWith(
@@ -490,6 +545,8 @@ describe("UpstreamModelManagerSheet", () => {
         generatedRequests: 1,
         connectivityModelId: "vendor/model-latest",
         connectivityProofId: "proof-stale-binding",
+        reasoningProofId: "proof-stale-binding",
+        reasoningResults: [{ effort: "medium", status: "accepted_by_route", errorCode: null }],
         checkedAt: Math.floor(Date.now() / 1000),
         connectivityProofExpiresAt: Math.floor(Date.now() / 1000) + 300,
         results: [{ modelId: "vendor/model-latest", passed: true, generatedRequests: 1,
@@ -501,7 +558,7 @@ describe("UpstreamModelManagerSheet", () => {
 
     renderSheet();
     await screen.findByText("vendor/model-latest");
-    await user.click(screen.getByRole("button", { name: "测试是否可用" }));
+    await runReasoningProbe(user);
     await waitFor(() => expect(screen.queryByRole("button", { name: "添加到 Codex" })).not.toBeInTheDocument());
     expect(await screen.findByText(/账号或服务设置已变化/)).toBeInTheDocument();
   });
@@ -516,6 +573,8 @@ describe("UpstreamModelManagerSheet", () => {
         generatedRequests: 1,
         connectivityModelId: "vendor/model-latest",
         connectivityProofId: "proof-expiring",
+        reasoningProofId: "proof-expiring",
+        reasoningResults: [{ effort: "medium", status: "accepted_by_route", errorCode: null }],
         checkedAt: Math.floor(Date.now() / 1000),
         connectivityProofExpiresAt: Math.floor(Date.now() / 1000) + 1,
         results: [{ modelId: "vendor/model-latest", passed: true, generatedRequests: 1,
@@ -524,7 +583,7 @@ describe("UpstreamModelManagerSheet", () => {
 
     renderSheet();
     await screen.findByText("vendor/model-latest");
-    await user.click(screen.getByRole("button", { name: "测试是否可用" }));
+    await runReasoningProbe(user);
     await screen.findByRole("button", { name: "添加到 Codex" }, { timeout: 800 });
     await waitFor(() => expect(screen.queryByRole("button", { name: "添加到 Codex" })).not.toBeInTheDocument(), { timeout: 2500 });
   });
@@ -586,6 +645,8 @@ describe("UpstreamModelManagerSheet", () => {
         generatedRequests: 1,
         connectivityModelId: "vendor/model-latest",
         connectivityProofId: "proof-failed-add",
+        reasoningProofId: "proof-failed-add",
+        reasoningResults: [{ effort: "medium", status: "accepted_by_route", errorCode: null }],
         checkedAt: Math.floor(Date.now() / 1000),
         connectivityProofExpiresAt: Math.floor(Date.now() / 1000) + 300,
         results: [{ modelId: "vendor/model-latest", passed: true, generatedRequests: 1,
@@ -599,7 +660,7 @@ describe("UpstreamModelManagerSheet", () => {
 
     renderSheet();
     await screen.findByText("vendor/model-latest");
-    await user.click(screen.getByRole("button", { name: "测试是否可用" }));
+    await runReasoningProbe(user);
     await user.click(await screen.findByRole("button", { name: "添加到 Codex" }));
 
     const testedRequestId = api.gatewayModelProbe.mock.calls[1]?.[0].requestId;
@@ -647,6 +708,8 @@ describe("UpstreamModelManagerSheet", () => {
         generatedRequests: 1,
         connectivityModelId: "vendor/model-latest",
         connectivityProofId: "proof-add-cleanup-pending",
+        reasoningProofId: "proof-add-cleanup-pending",
+        reasoningResults: [{ effort: "medium", status: "accepted_by_route", errorCode: null }],
         checkedAt: Math.floor(Date.now() / 1000),
         connectivityProofExpiresAt: Math.floor(Date.now() / 1000) + 300,
         results: [{ modelId: "vendor/model-latest", passed: true, generatedRequests: 1,
@@ -665,7 +728,7 @@ describe("UpstreamModelManagerSheet", () => {
 
     renderSheet();
     await screen.findByText("vendor/model-latest");
-    await user.click(screen.getByRole("button", { name: "测试是否可用" }));
+    await runReasoningProbe(user);
     await user.click(await screen.findByRole("button", { name: "添加到 Codex" }));
 
     await screen.findByRole("alert");

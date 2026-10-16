@@ -2779,6 +2779,46 @@ button.row.danger:hover {
   align-items: center;
   justify-content: flex-end;
 }
+.upstream-model-manager-reasoning-picker {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0 7px;
+}
+.upstream-model-manager-reasoning-picker fieldset {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  min-width: 0;
+  margin: 0;
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.upstream-model-manager-reasoning-picker label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.upstream-model-manager-reasoning-results {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px 12px;
+  margin: 0;
+  padding: 2px 0 6px;
+  list-style: none;
+  color: var(--text-faint);
+  font-size: 11px;
+}
+.upstream-model-manager-reasoning-results li {
+  display: inline-flex;
+  gap: 4px;
+}
+.reasoning-result-accepted_by_route { color: var(--success, #27814c); }
+.reasoning-result-rejected_by_route { color: var(--danger, #c43c35); }
 .upstream-model-manager-row-status-spacer {
   min-width: 1px;
   min-height: 32px;

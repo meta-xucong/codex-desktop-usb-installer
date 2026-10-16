@@ -42,6 +42,8 @@ pub enum ProbeError {
     TooLarge,
     BudgetExhausted,
     ContextChanged,
+    UnsupportedEffort,
+    Incomplete,
 }
 impl ProbeError {
     pub fn code(self) -> &'static str {
@@ -57,6 +59,8 @@ impl ProbeError {
             Self::TooLarge => "response-too-large",
             Self::BudgetExhausted => "probe-budget-exhausted",
             Self::ContextChanged => "binding-changed",
+            Self::UnsupportedEffort => "effort-rejected",
+            Self::Incomplete => "effort-probe-incomplete",
         }
     }
     pub fn retryable(self) -> bool {
