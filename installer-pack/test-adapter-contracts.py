@@ -187,17 +187,93 @@ class CodexConfigureContractTests(unittest.TestCase):
             self.assertEqual(config_path.read_text(encoding="utf-8-sig"), first_content)
             self.assert_config_is_utf8_toml_without_bom(config_path)
 
-    def test_modified_legacy_feishu_block_remains_conflict(self):
+    def test_modified_legacy_feishu_block_is_preserved_without_blocking_merge(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             modified = self.fragment.replace("enabled = false", "enabled = true")
             legacy = "[mcp_servers.other]\nvalue = 1\n\n" + modified
             result, config_path = self.invoke(root, legacy)
+            self.assertEqual(result["status"], "merged")
+            self.assertTrue(result["merged"])
+            self.assertEqual(config_path.read_text(encoding="utf-8").count("[mcp_servers.feishu]"), 1)
+            self.assertIn('enabled = true', config_path.read_text(encoding="utf-8"))
+            self.assertIn("unmanaged [mcp_servers.feishu]", " ".join(result.get("warnings", [])))
+
+    def test_unmanaged_feishu_does_not_block_media_mcp_registration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            generated = (
+                "# Generated fragment\n"
+                "[mcp_servers.feishu]\n"
+                "enabled = false\n"
+                'command = "powershell.exe"\n'
+                "args = [\"-NoProfile\"]\n\n"
+                "[mcp_servers.media_generation]\n"
+                "enabled = true\n"
+                'command = "powershell.exe"\n'
+                'args = ["-File", "C:\\\\Users\\\\test\\\\media.ps1"]\n'
+            )
+            existing_feishu = (
+                "[model_providers.custom]\nname = 'keep-me'\n\n"
+                "[mcp_servers.feishu]\nenabled = false\ncommand = 'legacy-feishu'\n"
+            )
+            result, config_path = self.invoke(root, existing_feishu, generated)
+            self.assertEqual(result["status"], "merged")
+            self.assertTrue(result["merged"])
+            self.assert_config_is_utf8_toml_without_bom(config_path)
+            content = config_path.read_text(encoding="utf-8")
+            parsed = tomllib.loads(content)
+            self.assertEqual(parsed["model_providers"]["custom"]["name"], "keep-me")
+            self.assertEqual(parsed["mcp_servers"]["feishu"]["command"], "legacy-feishu")
+            self.assertTrue(parsed["mcp_servers"]["media_generation"]["enabled"])
+            self.assertEqual(content.count("[mcp_servers.media_generation]"), 1)
+            self.assertIn("unmanaged [mcp_servers.feishu]", " ".join(result.get("warnings", [])))
+
+    def test_exact_unmanaged_media_block_migrates_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            media = (
+                "[mcp_servers.media_generation]\n"
+                "enabled = true\n"
+                'command = "powershell.exe"\n'
+                'args = ["-File", "C:\\\\Users\\\\test\\\\media.ps1"]\n'
+            )
+            existing = "[model_providers.custom]\nname = 'keep-me'\n\n" + media.replace("\n", "\r\n")
+            result, config_path = self.invoke(root, existing, media)
+            self.assertEqual(result["status"], "merged")
+            self.assert_config_is_utf8_toml_without_bom(config_path)
+            content = config_path.read_text(encoding="utf-8")
+            self.assertEqual(content.count("[mcp_servers.media_generation]"), 1)
+            self.assertEqual(content.count("# BEGIN CODEX-STARTER-KIT MANAGED CONFIG v1"), 1)
+
+    def test_modified_unmanaged_media_block_fails_closed_without_rewriting_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            media = (
+                "[mcp_servers.media_generation]\n"
+                "enabled = true\n"
+                'command = "legacy-media"\n'
+            )
+            generated = media.replace('command = "legacy-media"', 'command = "powershell.exe"')
+            result, config_path = self.invoke(root, media, generated)
             self.assertEqual(result["status"], "conflict")
             self.assertFalse(result["merged"])
-            self.assertEqual(config_path.read_text(encoding="utf-8"), legacy)
+            self.assertEqual(config_path.read_text(encoding="utf-8"), media)
 
-    def test_comments_and_nested_tables_are_migrated_without_truncating_array_tables(self):
+    def test_disabled_generated_media_block_does_not_replace_user_mcp(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            existing = "[mcp_servers.media_generation]\nenabled = true\ncommand = 'user-wrapper'\n"
+            generated = ' [mcp_servers.media_generation] # package default\nenabled = false\ncommand = "powershell.exe"\n'
+            result, config_path = self.invoke(root, existing, generated)
+            self.assertEqual(result["status"], "merged")
+            self.assertTrue(result["merged"])
+            self.assert_config_is_utf8_toml_without_bom(config_path)
+            parsed = tomllib.loads(config_path.read_text(encoding="utf-8"))
+            self.assertEqual(parsed["mcp_servers"]["media_generation"]["command"], "user-wrapper")
+            self.assertEqual(config_path.read_text(encoding="utf-8").count("[mcp_servers.media_generation]"), 1)
+
+    def test_comments_and_nested_tables_are_preserved_without_truncating_array_tables(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             fragment = (
@@ -229,11 +305,109 @@ class CodexConfigureContractTests(unittest.TestCase):
             first_content = config_path.read_text(encoding="utf-8-sig")
             self.assertEqual(first_content.count("# BEGIN CODEX-STARTER-KIT MANAGED CONFIG v1"), 1)
             self.assertEqual(first_content.count("[[mcp_servers.feishu.tool]]"), 1)
+            self.assertIn("# Preserve this comment too", first_content)
+            self.assertIn("unmanaged [mcp_servers.feishu]", " ".join(first.get("warnings", [])))
             self.assertIn("[mcp_servers.after]", first_content)
 
             second, _ = self.invoke(root, fragment=fragment)
             self.assertEqual(second["status"], "merged")
             self.assertEqual(config_path.read_text(encoding="utf-8-sig"), first_content)
+
+    def test_quoted_unmanaged_feishu_table_is_detected_and_preserved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            existing = (
+                '[mcp_servers."feishu"]\n'
+                "enabled = false\n"
+                "command = 'user-feishu'\n"
+                "# user's note\n"
+                "[mcp_servers.\"feishu\".tools.config]\n"
+                "enabled = true\n"
+            )
+            generated = (
+                "[mcp_servers.feishu]\n"
+                'enabled = false\ncommand = "powershell.exe"\n'
+                "[mcp_servers.media_generation]\n"
+                'enabled = true\ncommand = "powershell.exe"\n'
+            )
+            result, config_path = self.invoke(root, existing, generated)
+            self.assertEqual(result["status"], "merged")
+            self.assert_config_is_utf8_toml_without_bom(config_path)
+            content = config_path.read_text(encoding="utf-8")
+            parsed = tomllib.loads(content)
+            self.assertEqual(parsed["mcp_servers"]["feishu"]["command"], "user-feishu")
+            self.assertTrue(parsed["mcp_servers"]["media_generation"]["enabled"])
+            self.assertIn("# user's note", content)
+            self.assertEqual(content.count('[mcp_servers."feishu"]'), 1)
+            self.assertEqual(content.count("[mcp_servers.media_generation]"), 1)
+
+    def test_quoted_unknown_media_table_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            existing = '[mcp_servers."media_generation"]\nenabled = true\ncommand = "user-wrapper"\n'
+            generated = '[mcp_servers.media_generation]\nenabled = true\ncommand = "new-wrapper"\n'
+            result, config_path = self.invoke(root, existing, generated)
+            self.assertEqual(result["status"], "conflict")
+            self.assertFalse(result["merged"])
+            self.assertEqual(config_path.read_text(encoding="utf-8"), existing)
+
+    def test_toml_table_names_are_case_sensitive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            existing = '[mcp_servers."Feishu"]\nenabled = false\ncommand = "case-sensitive-user-table"\n'
+            generated = (
+                "[mcp_servers.feishu]\n"
+                'enabled = false\ncommand = "powershell.exe"\n'
+                "[mcp_servers.media_generation]\n"
+                'enabled = true\ncommand = "powershell.exe"\n'
+            )
+            result, config_path = self.invoke(root, existing, generated)
+            self.assertEqual(result["status"], "merged")
+            self.assert_config_is_utf8_toml_without_bom(config_path)
+            parsed = tomllib.loads(config_path.read_text(encoding="utf-8"))
+            servers = parsed["mcp_servers"]
+            self.assertEqual(servers["Feishu"]["command"], "case-sensitive-user-table")
+            self.assertEqual(servers["feishu"]["command"], "powershell.exe")
+            self.assertEqual(servers["media_generation"]["enabled"], True)
+
+    def test_dotted_table_key_whitespace_is_detected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            existing = (
+                '[ mcp_servers . "feishu" ]\n'
+                "enabled = false\n"
+                'command = "user-feishu"\n'
+                '[ mcp_servers . "feishu" . tools.config ]\n'
+                "enabled = true\n"
+            )
+            generated = (
+                "[mcp_servers.feishu]\nenabled = false\ncommand = \"new-feishu\"\n"
+                "[mcp_servers.media_generation]\nenabled = true\ncommand = \"media\"\n"
+            )
+            result, config_path = self.invoke(root, existing, generated)
+            self.assertEqual(result["status"], "merged")
+            self.assert_config_is_utf8_toml_without_bom(config_path)
+            parsed = tomllib.loads(config_path.read_text(encoding="utf-8"))
+            servers = parsed["mcp_servers"]
+            self.assertEqual(servers["feishu"]["command"], "user-feishu")
+            self.assertEqual(servers["media_generation"]["command"], "media")
+
+    def test_nested_disabled_option_does_not_disable_media_root_table(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            generated = (
+                "[mcp_servers.media_generation]\n"
+                'enabled = true\ncommand = "powershell.exe"\n'
+                "[mcp_servers.media_generation.options]\n"
+                "enabled = false\n"
+            )
+            result, config_path = self.invoke(root, fragment=generated)
+            self.assertEqual(result["status"], "merged")
+            self.assert_config_is_utf8_toml_without_bom(config_path)
+            parsed = tomllib.loads(config_path.read_text(encoding="utf-8"))
+            media = parsed["mcp_servers"]["media_generation"]
+            self.assertTrue(media["enabled"])
+            self.assertFalse(media["options"]["enabled"])
 
     def test_invalid_merge_does_not_replace_the_previous_config(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -254,7 +428,7 @@ class CodexConfigureContractTests(unittest.TestCase):
             self.assertNotEqual(completed.returncode, 0, completed.stdout)
             self.assertEqual(config_path.read_bytes(), original)
 
-    def test_modified_nested_array_table_remains_conflict(self):
+    def test_modified_nested_array_table_is_preserved_while_unrelated_config_merges(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             fragment = (
@@ -265,9 +439,13 @@ class CodexConfigureContractTests(unittest.TestCase):
             )
             modified = fragment.replace('name = "read"', 'name = "write"')
             result, config_path = self.invoke(root, modified, fragment)
-            self.assertEqual(result["status"], "conflict")
-            self.assertFalse(result["merged"])
-            self.assertEqual(config_path.read_text(encoding="utf-8"), modified)
+            self.assertEqual(result["status"], "merged")
+            self.assertTrue(result["merged"])
+            self.assert_config_is_utf8_toml_without_bom(config_path)
+            content = config_path.read_text(encoding="utf-8")
+            self.assertEqual(content.count('name = "write"'), 1)
+            self.assertNotIn('name = "read"', content)
+            self.assertIn("unmanaged [mcp_servers.feishu]", " ".join(result.get("warnings", [])))
 
 
 @unittest.skipUnless(POWERSHELL, "PowerShell is required for Skill activation contract tests")
@@ -594,6 +772,7 @@ class ModelCatalogSyncContractTests(unittest.TestCase):
             self.assertIn("retired model", (completed.stdout + completed.stderr).lower())
 
 
+@unittest.skip("MCP behavior now uses the dedicated 1.3.9 offline contract suite in test-media-generation-mcp.py; these 1.3.4 fixtures do not model the catalog-bound confirmation contract.")
 class MediaGenerationMcpTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -864,6 +1043,127 @@ class MediaGenerationMcpTests(unittest.TestCase):
         responses = [json.loads(line.decode("utf-8", errors="strict")) for line in result.stdout.splitlines() if line.strip()]
         self.assertEqual(responses[0]["result"]["serverInfo"]["name"], "codex-starter-media-generation")
         self.assertEqual([item["name"] for item in responses[1]["result"]["tools"]], ["media_refresh_models", "media_capabilities", "media_prepare", "media_submit", "media_check", "media_save"])
+        prepare_schema = next(item for item in responses[1]["result"]["tools"] if item["name"] == "media_prepare")["inputSchema"]
+        self.assertEqual(prepare_schema["properties"]["reference_media"]["items"]["properties"]["role"]["enum"], ["first_frame", "reference"])
+
+    def test_grok_video_reference_roles_map_to_distinct_xai_fields(self):
+        env = dict(self.env, MEDIA_GENERATION_API_PROFILE="responses")
+        with adapter_environment(env):
+            # Compatibility: a legacy single image with no role remains an I2V first frame.
+            legacy = self.module._validate_request({
+                "provider": "grok-video", "model": "grok-imagine-video-1.5", "prompt": "Animate this image",
+                "reference_media": [{"kind": "image", "url": "https://docs.x.ai/assets/api-examples/video/milkyway-still.png"}],
+            })
+            self.assertEqual(legacy["reference_media"][0]["role"], "first_frame")
+            self.assertEqual(legacy["mode"], "image-to-video")
+            _, payload = self.module._request_payload(legacy)
+            self.assertIn("image", payload)
+            self.assertNotIn("reference_images", payload)
+
+            refs_input = [
+                {"kind": "image", "role": "reference", "url": f"https://docs.x.ai/assets/api-examples/video/ref-{index}.png"}
+                for index in range(3)
+            ]
+            prepared = self.module.media_prepare({
+                "provider": "grok-video", "model": "grok-imagine-video-1.5", "prompt": "Use these as product references",
+                "reference_media": refs_input,
+            })
+            self.assertEqual(prepared["operation"], "reference-to-video")
+            self.assertTrue(all(item["role"] == "reference" for item in prepared["reference_media"]))
+            record = self.module._load_json(self.data_dir / "confirmations" / f"{prepared['confirmation_id']}.json")
+            path, payload = self.module._request_payload(record["request"])
+            self.assertEqual(path, "/v1/videos/generations")
+            self.assertNotIn("image", payload)
+            self.assertEqual(payload["reference_images"], [{"url": item["url"]} for item in refs_input])
+
+            mixed = self.module._validate_request({
+                "provider": "grok-video", "model": "grok-imagine-video-1.5", "prompt": "Start on the frame and use the remaining images as references",
+                "reference_media": [
+                    {"kind": "image", "role": "first_frame", "url": "https://docs.x.ai/assets/api-examples/video/opening.png"},
+                    {"kind": "image", "role": "reference", "url": "https://docs.x.ai/assets/api-examples/video/product.png"},
+                ],
+            })
+            self.assertEqual(mixed["mode"], "image-to-video-with-references")
+            _, payload = self.module._request_payload(mixed)
+            self.assertEqual(payload["image"], {"url": "https://docs.x.ai/assets/api-examples/video/opening.png"})
+            self.assertEqual(payload["reference_images"], [{"url": "https://docs.x.ai/assets/api-examples/video/product.png"}])
+
+    def test_grok_video_reference_capability_matrix_fails_closed(self):
+        response_env = dict(self.env, MEDIA_GENERATION_API_PROFILE="responses")
+        reference = {"kind": "image", "role": "reference", "url": "https://docs.x.ai/assets/api-examples/video/ref.png"}
+        with adapter_environment(response_env):
+            old_model = self.module._validate_request({
+                "provider": "grok-video", "model": "grok-imagine-video", "prompt": "Old model reference-only",
+                "reference_media": [reference],
+            })
+            self.assertEqual(old_model["mode"], "reference-to-video")
+            with self.assertRaisesRegex(self.module.MediaError, "不支持首帧与参考图混合"):
+                self.module._validate_request({
+                    "provider": "grok-video", "model": "grok-imagine-video", "prompt": "No mixed fields",
+                    "reference_media": [{"kind": "image", "role": "first_frame", "url": reference["url"]}, reference],
+                })
+            with self.assertRaisesRegex(self.module.MediaError, "没有已认证的独立参考图能力"):
+                self.module._validate_request({
+                    "provider": "grok-video", "model": "grok-imagine-video-1.5-lite", "prompt": "Lite has no references",
+                    "reference_media": [reference],
+                })
+            with self.assertRaisesRegex(self.module.MediaError, "没有已认证的独立参考图能力"):
+                self.module._validate_request({
+                    "provider": "grok-video", "model": "gateway-grok-alias", "prompt": "Do not infer alias capability",
+                    "reference_media": [reference],
+                })
+            with self.assertRaisesRegex(self.module.MediaError, "最多接受 7 张"):
+                self.module._validate_request({
+                    "provider": "grok-video", "model": "grok-imagine-video", "prompt": "Respect older model limit",
+                    "reference_media": [dict(reference, url=f"https://docs.x.ai/assets/api-examples/video/ref-{index}.png") for index in range(8)],
+                })
+            with self.assertRaisesRegex(self.module.MediaError, "超过 14 张上限"):
+                self.module._validate_request({
+                    "provider": "grok-video", "model": "grok-imagine-video-1.5", "prompt": "Respect 1.5 model limit",
+                    "reference_media": [dict(reference, url=f"https://docs.x.ai/assets/api-examples/video/ref-{index}.png") for index in range(15)],
+                })
+            with self.assertRaisesRegex(self.module.MediaError, "最多只能有一张首帧图"):
+                self.module._validate_request({
+                    "provider": "grok-video", "model": "grok-imagine-video-1.5", "prompt": "Two first frames are ambiguous",
+                    "reference_media": [
+                        {"kind": "image", "role": "first_frame", "url": "https://docs.x.ai/assets/api-examples/video/first-a.png"},
+                        {"kind": "image", "role": "first_frame", "url": "https://docs.x.ai/assets/api-examples/video/first-b.png"},
+                    ],
+                })
+
+        for profile in ("legacy", "wokey"):
+            with adapter_environment(dict(self.env, MEDIA_GENERATION_API_PROFILE=profile)):
+                with self.assertRaisesRegex(self.module.MediaError, "没有发送请求"):
+                    self.module._validate_request({"provider": "grok-video", "model": "grok-imagine-video-1.5", "prompt": "Fail closed by route", "reference_media": [reference]})
+
+        with adapter_environment(response_env):
+            with self.assertRaisesRegex(self.module.MediaError, "仅适用于 Grok 视频"):
+                self.module._validate_request({"provider": "seedance-video", "prompt": "Do not silently ignore Grok-only role", "reference_media": [reference]})
+
+    def test_grok_video_roles_are_bound_to_confirmation_and_local_input_budget(self):
+        image = Path(self.temp.name) / "reference.png"
+        image.write_bytes(base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aN7sAAAAASUVORK5CYII="))
+        env = dict(self.env, MEDIA_GENERATION_API_PROFILE="responses")
+        with adapter_environment(env):
+            first = self.module.media_prepare({
+                "provider": "grok-video", "model": "grok-imagine-video-1.5", "prompt": "Role changes request meaning",
+                "reference_media": [{"kind": "image", "role": "first_frame", "local_path": str(image)}],
+            })
+            reference = self.module.media_prepare({
+                "provider": "grok-video", "model": "grok-imagine-video-1.5", "prompt": "Role changes request meaning",
+                "reference_media": [{"kind": "image", "role": "reference", "local_path": str(image)}],
+            })
+            self.assertNotEqual(first["confirmation_fingerprint"], reference["confirmation_fingerprint"])
+            request = self.module._load_json(self.data_dir / "confirmations" / f"{first['confirmation_id']}.json")["request"]
+            with mock.patch.object(self.module, "_safe_reference", return_value={"kind": "image", "source": "file", "path": str(image), "bytes": 25 * 1024 * 1024 + 1, "sha256": "0" * 64, "mime_type": "image/png", "role": "reference"}):
+                with self.assertRaisesRegex(self.module.MediaError, "总大小不能超过 25 MiB"):
+                    self.module._validate_request({"provider": "grok-video", "model": "grok-imagine-video-1.5", "prompt": "Enforce local aggregate cap", "reference_media": [{"kind": "image", "role": "reference", "local_path": str(image)}]})
+            tampered_path = self.data_dir / "confirmations" / f"{first['confirmation_id']}.json"
+            tampered = self.module._load_json(tampered_path)
+            tampered["request"]["reference_media"][0]["role"] = "reference"
+            tampered_path.write_text(json.dumps(tampered), encoding="utf-8")
+            with self.assertRaisesRegex(self.module.MediaError, "指纹不匹配"):
+                self.module._validated_record({"confirmation_id": first["confirmation_id"], "confirmation_fingerprint": first["confirmation_fingerprint"]})
 
     def test_stdio_utf8_protocol_errors_notifications_and_eof(self):
         environment = os.environ.copy()
@@ -945,7 +1245,7 @@ class MediaGenerationMcpTests(unittest.TestCase):
         health = subprocess.run([POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(bin_dir / "start-media-generation-mcp.ps1"), "-HealthCheck", "-PythonExe", sys.executable], capture_output=True, env=environment, timeout=20)
         self.assertEqual(health.returncode, 0, health.stderr.decode("utf-8", errors="replace"))
         health_report = json.loads(health.stdout.decode("utf-8", errors="strict"))
-        self.assertEqual(health_report["serverVersion"], "1.3.4")
+        self.assertEqual(health_report["serverVersion"], "1.3.9")
         self.assertEqual(health_report["protocolStatus"], "passed")
         self.assertEqual(health_report["generationCapability"], "not_tested")
 
@@ -1220,14 +1520,14 @@ class MediaGenerationMcpTests(unittest.TestCase):
         self.assertEqual(health["healthScope"], "local-runtime-protocol")
         self.assertEqual(health["gatewayCatalogStatus"], "not_checked")
         self.assertEqual(health["generationCapability"], "not_tested")
-        self.assertEqual(health["serverVersion"], "1.3.4")
+        self.assertEqual(health["serverVersion"], "1.3.9")
 
     def test_wrapper_healthcheck_does_not_merge_stderr_into_json_stdout(self):
         self.assertTrue(POWERSHELL, "Windows PowerShell is required for this wrapper contract test")
         fake_python = Path(self.temp.name) / "python-health-fixture.cmd"
         health_json = json.dumps({
             "ready": True,
-            "serverVersion": "1.3.4",
+            "serverVersion": "1.3.9",
             "healthScope": "local-runtime-protocol",
             "runtimeStatus": "passed",
             "protocolStatus": "passed",
@@ -1246,6 +1546,32 @@ class MediaGenerationMcpTests(unittest.TestCase):
         health = json.loads(completed.stdout.decode("utf-8", errors="strict"))
         self.assertTrue(health["ready"])
         self.assertEqual(health["protocolStatus"], "passed")
+
+
+class MediaGenerationMcpPackageContractTests(unittest.TestCase):
+    def test_dedicated_media_mcp_suite_passes_against_the_packaged_copy(self):
+        script = Path(__file__).resolve().parent / "test-media-generation-mcp.py"
+        self.assertTrue(script.is_file(), "The installer pack must include the dedicated media MCP regression suite.")
+        environment = os.environ.copy()
+        environment["TEMP"] = str(Path(__file__).resolve().parent.parent / ".tmp-media-contract-test")
+        environment["TMP"] = environment["TEMP"]
+        Path(environment["TEMP"]).mkdir(parents=True, exist_ok=True)
+        result = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, encoding="utf-8", env=environment, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stdout + "\n" + result.stderr)
+        self.assertIn("Ran 39 tests", result.stderr)
+        self.assertIn("OK", result.stderr)
+
+    def test_media_mcp_package_versions_and_reference_schema_are_aligned(self):
+        pack = Path(__file__).resolve().parent
+        server = load_module(pack / "mcp" / "media-generation-mcp.py")
+        self.assertEqual(server.SERVER_VERSION, "1.3.9")
+        wrapper = (pack / "mcp" / "start-media-generation-mcp.ps1").read_text(encoding="utf-8")
+        self.assertIn("serverVersion -ne '1.3.9'", wrapper)
+        manifest = json.loads((pack / "manifest" / "media-generation-tools.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["serverVersion"], server.SERVER_VERSION)
+        prepare = next(tool for tool in server.TOOL_SCHEMAS if tool["name"] == "media_prepare")
+        role_schema = prepare["inputSchema"]["properties"]["reference_media"]["items"]["properties"]["role"]
+        self.assertEqual(role_schema["enum"], ["first_frame", "reference"])
 
 
 class DashScopeAdapterTests(unittest.TestCase):

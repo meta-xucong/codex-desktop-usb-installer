@@ -1416,6 +1416,14 @@ export function OfflineHome({
                 {busyAction === "ccswitch" ? <Icon name="loader" className="spinicon" /> : <Icon name="gear" />}
                 {busyAction === "ccswitch" ? t("offline.ccswitchLaunching") : t("offline.ccswitchLaunch")}
               </button>
+              <button
+                className="btn ghost connection-entry"
+                onClick={() => setModelManagerOpen(true)}
+                disabled={disabled || !codexActionsAllowed}
+                data-testid="manage-upstream-models"
+              >
+                <Icon name="list" />{t("offline.nativeModelsManage")}
+              </button>
               {onOpenUninstall ? (
                 <button className="btn ghost danger" onClick={onOpenUninstall} disabled={disabled}>
                   <Icon name="trash" />{t("offline.uninstallBundle")}
@@ -1475,17 +1483,6 @@ export function OfflineHome({
             </button>
           ) : null}
         </div>
-
-        {showInstalled ? (
-          <button
-            className="btn ghost connection-entry"
-            onClick={() => setModelManagerOpen(true)}
-            disabled={disabled || !codexActionsAllowed}
-            data-testid="manage-upstream-models"
-          >
-            <Icon name="list" />{t("offline.nativeModelsManage")}
-          </button>
-        ) : null}
 
         <button
           className="btn ghost connection-entry"

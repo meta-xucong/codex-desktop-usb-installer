@@ -5,7 +5,7 @@ description: 通过统一媒体生成 MCP 调用已配置的 Seedance 视频模�
 
 # 统一 MCP 视频工作流
 
-本 Skill 只负责 Seedance 视频创作流程；HTTP 请求、凭据、确认记录、幂等提交、任务查询和下载均由统一 `media_generation` MCP 处理。只有用户明确选择 Seedance 外部服务时使用。
+本 Skill 只负责 Seedance 视频创作流程；HTTP 请求、凭据、确认记录、幂等提交、任务查询和下载均由统一 `media_generation` MCP 处理。用户明确选择 Seedance 时可使用；用户未指定 provider 时，只有 `media_capabilities` 将 Seedance 列为可用且适合作为默认线路时才可选择。若用户明确指定其他 provider 或生成方式，以用户指定为准。
 
 ## 启用条件
 

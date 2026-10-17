@@ -2729,8 +2729,11 @@ button.row.danger:hover {
   white-space: nowrap;
 }
 .upstream-model-manager-list {
-  display: grid;
+  display: flex;
+  flex-direction: column;
   gap: 0;
+  width: 100%;
+  min-width: 0;
   max-height: min(52vh, 420px);
   min-height: 0;
   margin: 0;
@@ -2742,6 +2745,9 @@ button.row.danger:hover {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
+  flex: 0 0 auto;
+  min-width: 0;
+  box-sizing: border-box;
   gap: 8px;
   min-height: 44px;
   padding: 5px 6px;
@@ -2775,32 +2781,68 @@ button.row.danger:hover {
 }
 .upstream-model-manager-row-actions {
   display: flex;
+  gap: 5px;
   min-width: 0;
   align-items: center;
   justify-content: flex-end;
 }
-.upstream-model-manager-reasoning-picker {
+.upstream-model-manager-add-panel {
   grid-column: 1 / -1;
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-  padding: 4px 0 7px;
-}
-.upstream-model-manager-reasoning-picker fieldset {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px 12px;
+  display: grid;
+  gap: 12px;
   min-width: 0;
-  margin: 0;
-  padding: 4px 8px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
+  margin: 4px 0 8px;
+  padding: 13px;
+  border: 1px solid var(--line-2);
+  border-radius: 12px;
+  background: var(--surface-3);
+  box-shadow: var(--elev-1);
 }
-.upstream-model-manager-reasoning-picker label {
-  display: inline-flex;
-  align-items: center;
+.upstream-model-manager-add-panel > p,
+.upstream-model-manager-add-heading p {
+  margin: 0;
+  color: var(--text-faint);
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.upstream-model-manager-add-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+.upstream-model-manager-add-heading > div {
+  display: grid;
   gap: 4px;
+  min-width: 0;
+}
+.upstream-model-manager-add-heading strong {
+  font-size: 13px;
+}
+.upstream-model-manager-add-model {
+  color: var(--text-soft);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+.upstream-model-manager-add-footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+.upstream-model-manager-add-ready {
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--success) 35%, var(--line));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--success) 8%, var(--surface-3));
+  color: var(--success, #27814c) !important;
 }
 .upstream-model-manager-reasoning-results {
   grid-column: 1 / -1;
@@ -2816,6 +2858,15 @@ button.row.danger:hover {
 .upstream-model-manager-reasoning-results li {
   display: inline-flex;
   gap: 4px;
+}
+.upstream-model-manager-reasoning-details {
+  grid-column: 1 / -1;
+  color: var(--text-faint);
+  font-size: 11px;
+}
+.upstream-model-manager-reasoning-details > summary {
+  width: fit-content;
+  cursor: pointer;
 }
 .reasoning-result-accepted_by_route { color: var(--success, #27814c); }
 .reasoning-result-rejected_by_route { color: var(--danger, #c43c35); }

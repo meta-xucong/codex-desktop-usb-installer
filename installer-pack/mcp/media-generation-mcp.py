@@ -23,6 +23,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -32,15 +33,20 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-SERVER_VERSION = "1.3.4"
+SERVER_VERSION = "1.3.9"
 PROTOCOL_VERSION = "2025-03-26"
 MAX_JSON_BYTES = 32 * 1024 * 1024
 HTTP_TIMEOUT_SECONDS = 600
 MAX_REFERENCE_BYTES = 25 * 1024 * 1024
+MAX_GROK_VIDEO_LOCAL_IMAGE_BYTES = 8 * 1024 * 1024
+MAX_GROK_VIDEO_REFERENCE_IMAGES = 14
+MAX_GROK_VIDEO_TOTAL_LOCAL_IMAGE_BYTES = 25 * 1024 * 1024
 MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024
 MAX_PNG_PIXELS = 100_000_000
 MAX_PNG_DECODED_BYTES = 256 * 1024 * 1024
 CONFIRMATION_TTL_SECONDS = 30 * 60
+MODEL_CATALOG_TTL_SECONDS = 24 * 60 * 60
+INTENT_LOCK_TIMEOUT_SECONDS = 10
 _CONFIRMATION_LOCKS: dict[str, threading.Lock] = {}
 _CONFIRMATION_LOCKS_GUARD = threading.Lock()
 PROVIDERS = {
@@ -62,7 +68,23 @@ AUDIO_TYPES = {"audio/mpeg", "audio/wav", "audio/mp4", "audio/aac", "audio/ogg",
 
 
 class MediaError(Exception):
-    pass
+    def __init__(self, message: str, *, code: str = "MEDIA_REQUEST_REJECTED", provider: str | None = None,
+                 model: str | None = None, http_status: int | None = None,
+                 provider_request_id: str | None = None, gateway_request_id: str | None = None,
+                 retryable: bool = False, submission_state: str | None = None,
+                 api_request_sent: bool | None = None, details: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.code = code
+        self.safe_message = message
+        self.provider = provider
+        self.model = model
+        self.http_status = http_status
+        self.provider_request_id = provider_request_id
+        self.gateway_request_id = gateway_request_id
+        self.retryable = retryable
+        self.submission_state = submission_state
+        self.api_request_sent = api_request_sent
+        self.details = details or {}
 
 
 def _config_path() -> Path:
@@ -82,8 +104,27 @@ def _runtime_config(*, allow_gateway_mismatch: bool = False) -> dict[str, Any]:
     if configured_host and active_host and configured_host != active_host:
         if allow_gateway_mismatch:
             return {}
-        raise MediaError("媒体模型缓存与当前网关不一致；请重新发现模型。")
+        raise MediaError("媒体模型缓存与当前网关不一致；请重新发现模型。", code="MODEL_CATALOG_ROUTE_MISMATCH")
     return value
+
+
+def _catalog_snapshot() -> dict[str, Any]:
+    config = _runtime_config()
+    ids = config.get("catalogIds")
+    verified = config.get("catalogVerifiedAt")
+    if not isinstance(ids, list) or not all(isinstance(item, str) for item in ids):
+        raise MediaError("尚未发现当前网关的媒体模型；请先刷新模型列表。", code="MODEL_CATALOG_MISSING")
+    try:
+        verified_at = int(verified)
+    except (TypeError, ValueError):
+        raise MediaError("媒体模型目录记录无效；请重新刷新模型列表。", code="MODEL_CATALOG_INVALID")
+    if int(time.time()) - verified_at > MODEL_CATALOG_TTL_SECONDS:
+        raise MediaError("模型列表已超过 24 小时；请先刷新模型列表。", code="MODEL_CATALOG_STALE")
+    if config.get("gateway") != _base() or config.get("profile") != _api_profile():
+        raise MediaError("媒体模型目录与当前网关配置不匹配；请重新刷新模型列表。", code="MODEL_CATALOG_ROUTE_MISMATCH")
+    return {"verified_at": verified_at, "ids": set(ids), "fingerprint": _token({
+        "gateway": _base(), "profile": _api_profile(), "verified_at": verified_at, "ids": sorted(set(ids))
+    })}
 
 
 def _configured_model(provider: str) -> str:
@@ -104,11 +145,22 @@ def _route_context() -> dict[str, str]:
 
 def media_refresh_models(args: dict[str, Any]) -> dict[str, Any]:
     """Explicit read-only discovery; never run network I/O in tools/list/prepare."""
-    response = _http_json("GET", "/v1/models", None, "catalog")
+    # Wokey's default model catalog is text-only. Ask explicitly for all
+    # modalities so the media model slots can be matched against its live list.
+    catalog_path = "/v1/models?output_modalities=all" if _api_profile() == "wokey" else "/v1/models"
+    response = _http_json("GET", catalog_path, None, "catalog")
     rows = response.get("data")
     if not isinstance(rows, list):
         raise MediaError("模型目录缺少 data 数组；未更新配置。")
-    available = {row["id"] for row in rows if isinstance(row, dict) and isinstance(row.get("id"), str)}
+    if len(rows) > 10000:
+        raise MediaError("模型目录项目数超过上限；未更新配置。", code="MODEL_CATALOG_INVALID")
+    available = set()
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get("id"), str):
+            continue
+        model_id = row["id"].strip()
+        if 0 < len(model_id) <= 256 and not any(ord(char) < 32 for char in model_id):
+            available.add(model_id)
     # Conservative defaults: choose exact advertised IDs, not vendor-branded chat models.
     preferred = {
         "image-2": ["gpt-image-2.5", "gpt-image-2"],
@@ -129,7 +181,7 @@ def media_refresh_models(args: dict[str, Any]) -> dict[str, Any]:
         else:
             models[provider] = next((model for model in preferred.get(provider, []) if model in available), "")
     config = {
-        "schemaVersion": 1, "gateway": _base(), "models": models,
+        "schemaVersion": 1, "gateway": _base(), "profile": _api_profile(), "models": models,
         "catalogVerifiedAt": int(time.time()), "catalogIds": sorted(available),
     }
     _atomic_json(_config_path(), config)
@@ -153,11 +205,318 @@ def _canonical(value: Any) -> bytes:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
+def _safe_identifier(value: Any, limit: int = 256) -> str | None:
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value or len(value) > limit or not re.fullmatch(r"[A-Za-z0-9._:-]+", value):
+        return None
+    return value
+
+
 def _atomic_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp-" + uuid.uuid4().hex)
-    temporary.write_bytes(json.dumps(value, ensure_ascii=False, indent=2).encode("utf-8"))
+    with temporary.open("wb") as stream:
+        stream.write(json.dumps(value, ensure_ascii=False, indent=2).encode("utf-8"))
+        stream.flush()
+        os.fsync(stream.fileno())
     os.replace(temporary, path)
+
+
+@contextlib.contextmanager
+def _intent_index_lock():
+    """Cross-process lock serializing intent scans and confirmation creation."""
+    identity = hashlib.sha256(str(_data_root().resolve()).casefold().encode("utf-8")).hexdigest()
+    lock_path = _data_root() / ".intent-index.lock"
+    deadline = time.monotonic() + INTENT_LOCK_TIMEOUT_SECONDS
+    if _uses_windows_mutex():
+        import ctypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.argtypes = (ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p)
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        kernel32.WaitForSingleObject.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+        kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+        kernel32.ReleaseMutex.argtypes = (ctypes.c_void_p,)
+        kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+        handle = kernel32.CreateMutexW(None, False, f"Local\\CodexMediaIntent-v1-{identity}")
+        if not handle:
+            raise MediaError("无法创建媒体意图互斥锁。", code="INTENT_LOCK_UNAVAILABLE")
+        acquired = False
+        try:
+            remaining = max(0, int((deadline - time.monotonic()) * 1000))
+            result = kernel32.WaitForSingleObject(handle, remaining)
+            if result not in (0x00000000, 0x00000080):
+                raise MediaError("媒体任务索引正被其他进程更新；请稍后重试。", code="INTENT_LOCK_TIMEOUT")
+            acquired = True
+            yield
+        finally:
+            if acquired:
+                kernel32.ReleaseMutex(handle)
+            kernel32.CloseHandle(handle)
+        return
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    acquired = False
+    try:
+        import fcntl
+        while time.monotonic() < deadline:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except OSError:
+                time.sleep(0.025)
+        if not acquired:
+            raise MediaError("媒体任务索引正被其他进程更新；请稍后重试。", code="INTENT_LOCK_TIMEOUT")
+        yield
+    finally:
+        if acquired:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _intent_fingerprint(request: dict[str, Any], *, legacy_roleless: bool = False, legacy_all_roles: bool = False) -> str:
+    refs = []
+    for item in request.get("reference_media", []):
+        reference_url = item.get("url")
+        if item.get("url_protected"):
+            reference_url = _unprotect_reference_url(item["url_protected"])
+        reference = {"kind": item.get("kind"), "source": item.get("source"),
+                     "sha256": item.get("sha256"), "url": reference_url}
+        # Explicit roles affect only Grok video intent. One short-lived build
+        # included the default role for every media provider; its exact legacy
+        # form remains verifiable below for already signed records.
+        if not legacy_roleless and (request.get("provider") == "grok-video" or legacy_all_roles):
+            reference["role"] = item.get("role", "first_frame")
+        refs.append(reference)
+    payload = {"gateway": request["route"]["gateway"], "profile": request["route"]["profile"],
+               "provider": request["provider"], "model": request["model"], "operation": request["mode"],
+               "parameters": request["parameters"], "prompt": request["prompt"], "references": refs}
+    return _token(payload)
+
+
+def _verified_intent_fingerprint(request: dict[str, Any], stored_intent: str) -> str | None:
+    """Verify a stored intent HMAC and return its current semantic fingerprint.
+
+    The legacy fallback is deliberately narrow: it is accepted only for records
+    whose immutable request contains no role keys, and thus retain the old
+    first-frame meaning. The enclosing record HMAC and key id must be verified by
+    the caller before this helper is used.
+    """
+    current = _intent_fingerprint(request)
+    if hmac.compare_digest(str(stored_intent), current):
+        return current
+    refs = request.get("reference_media", [])
+    if not isinstance(refs, list) or any(not isinstance(item, dict) or "role" in item for item in refs):
+        return None
+    for legacy in (
+        _intent_fingerprint(request, legacy_roleless=True),
+        _intent_fingerprint(request, legacy_all_roles=True),
+    ):
+        if hmac.compare_digest(str(stored_intent), legacy):
+            return current
+    return None
+
+
+def _url_origin(value: str) -> str:
+    parsed = urllib.parse.urlsplit(value)
+    host = parsed.hostname or ""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    port = f":{parsed.port}" if parsed.port else ""
+    return f"{parsed.scheme}://{host}{port}"
+
+
+def _protect_reference_url(value: str) -> str:
+    """Protect signed/reference URLs at rest; production Windows uses user DPAPI."""
+    raw = value.encode("utf-8")
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        class DataBlob(ctypes.Structure):
+            _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
+
+        source = ctypes.create_string_buffer(raw)
+        source_blob = DataBlob(len(raw), ctypes.cast(source, ctypes.POINTER(ctypes.c_ubyte)))
+        output_blob = DataBlob()
+        crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        crypt32.CryptProtectData.argtypes = (ctypes.POINTER(DataBlob), wintypes.LPCWSTR, ctypes.POINTER(DataBlob), ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(DataBlob))
+        crypt32.CryptProtectData.restype = wintypes.BOOL
+        kernel32.LocalFree.argtypes = (ctypes.c_void_p,)
+        kernel32.LocalFree.restype = ctypes.c_void_p
+        if not crypt32.CryptProtectData(ctypes.byref(source_blob), "Codex media reference URL", None, None, None, 0, ctypes.byref(output_blob)):
+            raise MediaError("无法使用当前 Windows 用户保护媒体参考链接。", code="REFERENCE_PROTECTION_FAILED")
+        try:
+            protected = ctypes.string_at(output_blob.pbData, output_blob.cbData)
+        finally:
+            kernel32.LocalFree(output_blob.pbData)
+        return "dpapi:" + base64.b64encode(protected).decode("ascii")
+    if os.environ.get("MEDIA_GENERATION_TEST_MODE") == "1":
+        # Reversible test-only envelope for non-Windows CI; never enabled in a
+        # normal install and never treated as production encryption.
+        nonce = os.urandom(16)
+        key = _secret_key()
+        stream = bytearray()
+        counter = 0
+        while len(stream) < len(raw):
+            stream.extend(hmac.new(key, b"test-reference-url" + nonce + counter.to_bytes(4, "big"), hashlib.sha256).digest())
+            counter += 1
+        cipher = bytes(a ^ b for a, b in zip(raw, stream))
+        tag = hmac.new(key, b"test-reference-url-tag" + nonce + cipher, hashlib.sha256).digest()
+        return "test:" + base64.b64encode(nonce + tag + cipher).decode("ascii")
+    raise MediaError("当前平台无法保护持久化的签名参考链接；没有保存请求。", code="REFERENCE_PROTECTION_UNAVAILABLE")
+
+
+def _unprotect_reference_url(value: str) -> str:
+    try:
+        prefix, encoded = value.split(":", 1)
+        protected = base64.b64decode(encoded, validate=True)
+        if prefix == "dpapi" and os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+
+            class DataBlob(ctypes.Structure):
+                _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
+
+            source = ctypes.create_string_buffer(protected)
+            source_blob = DataBlob(len(protected), ctypes.cast(source, ctypes.POINTER(ctypes.c_ubyte)))
+            output_blob = DataBlob()
+            crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            description = wintypes.LPWSTR()
+            crypt32.CryptUnprotectData.argtypes = (ctypes.POINTER(DataBlob), ctypes.POINTER(wintypes.LPWSTR), ctypes.POINTER(DataBlob), ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(DataBlob))
+            crypt32.CryptUnprotectData.restype = wintypes.BOOL
+            kernel32.LocalFree.argtypes = (ctypes.c_void_p,)
+            kernel32.LocalFree.restype = ctypes.c_void_p
+            if not crypt32.CryptUnprotectData(ctypes.byref(source_blob), ctypes.byref(description), None, None, None, 0, ctypes.byref(output_blob)):
+                raise MediaError("当前 Windows 用户无法解密媒体参考链接。", code="REFERENCE_PROTECTION_FAILED")
+            try:
+                raw = ctypes.string_at(output_blob.pbData, output_blob.cbData)
+            finally:
+                kernel32.LocalFree(output_blob.pbData)
+                if description:
+                    kernel32.LocalFree(description)
+            return raw.decode("utf-8")
+        if prefix == "test" and os.environ.get("MEDIA_GENERATION_TEST_MODE") == "1":
+            if len(protected) < 48:
+                raise ValueError("short test envelope")
+            nonce, tag, cipher = protected[:16], protected[16:48], protected[48:]
+            key = _secret_key()
+            expected = hmac.new(key, b"test-reference-url-tag" + nonce + cipher, hashlib.sha256).digest()
+            if not hmac.compare_digest(tag, expected):
+                raise ValueError("test envelope tag mismatch")
+            stream = bytearray()
+            counter = 0
+            while len(stream) < len(cipher):
+                stream.extend(hmac.new(key, b"test-reference-url" + nonce + counter.to_bytes(4, "big"), hashlib.sha256).digest())
+                counter += 1
+            return bytes(a ^ b for a, b in zip(cipher, stream)).decode("utf-8")
+    except MediaError:
+        raise
+    except Exception as exc:
+        raise MediaError("媒体参考链接保护数据损坏；为避免错误提交已停止。", code="REFERENCE_PROTECTION_FAILED") from exc
+    raise MediaError("无法读取当前媒体参考链接保护数据。", code="REFERENCE_PROTECTION_UNAVAILABLE")
+
+
+def _protect_request_urls(request: dict[str, Any]) -> dict[str, Any]:
+    protected = json.loads(_canonical(request).decode("utf-8"))
+    for item in protected.get("reference_media", []):
+        if item.get("source") == "url" and item.get("url"):
+            item["url_protected"] = _protect_reference_url(item.pop("url"))
+    return protected
+
+
+def _restore_request_urls(request: dict[str, Any]) -> dict[str, Any]:
+    restored = json.loads(_canonical(request).decode("utf-8"))
+    for item in restored.get("reference_media", []):
+        if item.get("source") == "url" and item.get("url_protected"):
+            item["url"] = _unprotect_reference_url(item.pop("url_protected"))
+    return restored
+
+
+def _protect_artifact_urls(artifacts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    protected = json.loads(_canonical(artifacts).decode("utf-8"))
+    for item in protected:
+        if item.get("url"):
+            item["url_protected"] = _protect_reference_url(item.pop("url"))
+    return protected
+
+
+def _restore_artifact_urls(artifacts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    restored = json.loads(_canonical(artifacts).decode("utf-8"))
+    for item in restored:
+        if item.get("url_protected"):
+            item["url"] = _unprotect_reference_url(item.pop("url_protected"))
+    return restored
+
+
+def _public_artifacts(artifacts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    public = []
+    for artifact in artifacts:
+        item = {key: value for key, value in artifact.items() if key not in {"url", "url_protected", "value"}}
+        url = artifact.get("url")
+        if url:
+            item["url_origin"] = _url_origin(url)
+        elif artifact.get("url_protected"):
+            try:
+                item["url_origin"] = _url_origin(_unprotect_reference_url(artifact["url_protected"]))
+            except MediaError:
+                item["url_origin"] = None
+        public.append(item)
+    return public
+
+
+def _intent_conflicts(intent: str) -> list[dict[str, Any]]:
+    folder = _data_root() / "confirmations"
+    if not folder.exists():
+        return []
+    conflicts = []
+    active_states = {"prepared", "submitting", "task_created", "in_progress", "submission_unknown", "completed_pending_save"}
+    for path in folder.glob("media-*.json"):
+        try:
+            record = _load_json(path)
+            state = str(record.get("state", ""))
+            if not record.get("intent_fingerprint"):
+                if state in {"submission_unknown", "submitting", "prepared", "task_created", "in_progress", "completed_pending_save"}:
+                    raise MediaError("发现无法识别版本的活动媒体记录；为避免重复计费，不能判断其是否与当前请求相同。", code="UNRESOLVED_SUBMISSION_INDEX_UNAVAILABLE")
+                continue
+            if record.get("intent_fingerprint_key_id") != hashlib.sha256(_secret_key()).hexdigest()[:16]:
+                raise MediaError("媒体任务索引密钥版本不匹配；为避免重复计费，已停止准备新任务。", code="UNRESOLVED_SUBMISSION_INDEX_UNAVAILABLE")
+            expected_record = _token({key: record.get(key) for key in ("version", "confirmation_id", "created_at", "expires_at", "request", "catalog_fingerprint", "catalog_verified_at")})
+            stored_intent = str(record.get("intent_fingerprint", ""))
+            normalized_intent = _verified_intent_fingerprint(record.get("request", {}), stored_intent)
+            if not hmac.compare_digest(str(record.get("fingerprint", "")), expected_record) or normalized_intent is None:
+                raise MediaError("媒体任务索引校验失败；为避免重复计费，已停止准备新任务。", code="UNRESOLVED_SUBMISSION_INDEX_UNAVAILABLE")
+            if not hmac.compare_digest(normalized_intent, intent):
+                continue
+            if state == "submitting":
+                if _confirmation_operation_is_active(str(record.get("confirmation_id", ""))):
+                    raise MediaError("相同请求仍在发送或等待上游响应；请等待当前请求返回后再处理。", code="INTENT_SUBMISSION_IN_PROGRESS", provider=record.get("request", {}).get("provider"), model=record.get("request", {}).get("model"), submission_state="submitting", api_request_sent=record.get("api_request_sent"))
+                if record.get("api_request_sent") is not False:
+                    record["state"] = "submission_unknown"
+                    record["recovered_at"] = int(time.time())
+                    record["last_error"] = "Recovered interrupted submission; acceptance may have occurred."
+                    _atomic_json(path, record)
+                    state = "submission_unknown"
+                else:
+                    record["state"] = "interrupted_before_send"
+                    _atomic_json(path, record)
+                    state = "interrupted_before_send"
+            elif state == "prepared" and int(record.get("expires_at", 0)) < int(time.time()):
+                record["state"] = "expired"
+                _atomic_json(path, record)
+                state = "expired"
+            if state in active_states:
+                conflicts.append(record)
+        except MediaError:
+            raise
+        except Exception as exc:
+            raise MediaError("媒体任务索引包含损坏记录；为避免重复计费，已停止准备新任务。", code="UNRESOLVED_SUBMISSION_INDEX_UNAVAILABLE") from exc
+    return conflicts
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -173,6 +532,9 @@ def _load_json(path: Path) -> dict[str, Any]:
 def _secret_key() -> bytes:
     path = _data_root() / ".confirmation-key"
     if not path.exists():
+        records = _data_root() / "confirmations"
+        if records.exists() and any(records.glob("media-*.json")):
+            raise MediaError("本地媒体确认密钥缺失但已有任务记录；为避免重复计费风险，已停止操作。", code="UNRESOLVED_SUBMISSION_INDEX_UNAVAILABLE")
         candidate = os.urandom(32)
         try:
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -271,14 +633,32 @@ def _model(provider: str, requested: str = "") -> str:
     configured = _configured_model(provider)
     if provider == "minimax-video" and not configured:
         raise MediaError("统一媒体上游尚未配置 MiniMax 视频模型；没有发送 API 请求，也不会回退到 Grok 或 Seedance。")
-    if provider == "minimax-video" and requested and requested.strip() != configured:
-        raise MediaError("MiniMax 视频请求只能使用统一媒体配置中的 MEDIA_MINIMAX_VIDEO_MODEL。")
+    if requested and configured and requested.strip() != configured:
+        raise MediaError("请求模型必须与当前 provider 明确配置的模型完全一致；请在连接设置中选择模型后刷新目录。", code="MODEL_NOT_CONFIGURED_FOR_PROVIDER", provider=provider, model=requested)
+    if requested and not configured:
+        raise MediaError("当前 provider 尚未配置模型；不能仅因模型出现在目录中就推断其媒体能力。", code="MODEL_NOT_CONFIGURED_FOR_PROVIDER", provider=provider, model=requested)
     model = str(requested or configured).strip()
     if not model:
         raise MediaError(f"未配置 {PROVIDERS[provider]['model_env']}；请填写服务方提供的模型名。")
     if len(model) > 256 or any(ord(char) < 32 for char in model):
         raise MediaError("模型名格式无效。")
+    catalog = _catalog_snapshot()
+    if model not in catalog["ids"]:
+        raise MediaError("所选模型不在当前网关最近验证的模型列表中；请刷新列表并选择准确模型 ID。", code="MODEL_NOT_AVAILABLE", provider=provider, model=model)
     return model
+
+
+def _image_mime_from_bytes(data: bytes) -> str:
+    """Identify supported image containers from their bytes, not their filename."""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return "application/octet-stream"
 
 
 def _safe_reference(item: Any) -> dict[str, Any]:
@@ -287,25 +667,82 @@ def _safe_reference(item: Any) -> dict[str, Any]:
     kind = str(item.get("kind", "image")).strip().lower()
     if kind not in {"image", "video", "audio"}:
         raise MediaError("参考素材 kind 只允许 image、video 或 audio。")
+    role = str(item.get("role", "")).strip().lower()
+    if role and role not in {"first_frame", "reference"}:
+        raise MediaError("Grok 视频图片 role 只允许 first_frame 或 reference。", code="INVALID_REFERENCE_ROLE")
     url = str(item.get("url", "")).strip()
     local_path = str(item.get("local_path", "")).strip()
     if bool(url) == bool(local_path):
         raise MediaError("每项参考素材必须且只能提供 url 或 local_path 之一。")
     if url:
         _validate_public_url(url)
-        return {"kind": kind, "source": "url", "url": url}
+        result = {"kind": kind, "source": "url", "url": url}
+        if role:
+            result["role"] = role
+        return result
     path = Path(local_path).expanduser().resolve()
     if not path.is_file():
         raise MediaError(f"参考文件不存在或不是普通文件: {path.name}")
-    size = path.stat().st_size
+    raw = path.read_bytes()
+    size = len(raw)
     if size <= 0 or size > MAX_REFERENCE_BYTES:
         raise MediaError(f"参考文件大小必须在 1 字节至 {MAX_REFERENCE_BYTES} 字节之间。")
-    mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    mime = _image_mime_from_bytes(raw[:16]) if kind == "image" else (mimetypes.guess_type(path.name)[0] or "application/octet-stream")
     allowed = IMAGE_TYPES if kind == "image" else VIDEO_TYPES if kind == "video" else AUDIO_TYPES
     if mime not in allowed:
+        if kind == "image":
+            raise MediaError("本地图片内容格式无法识别；请使用 PNG、JPEG、WebP 或 GIF 文件。")
         raise MediaError(f"参考文件 MIME 类型与 {kind} 不匹配。")
-    digest = hashlib.sha256(path.read_bytes()).hexdigest()
-    return {"kind": kind, "source": "file", "path": str(path), "bytes": size, "sha256": digest, "mime_type": mime}
+    digest = hashlib.sha256(raw).hexdigest()
+    result = {"kind": kind, "source": "file", "path": str(path), "bytes": size, "sha256": digest, "mime_type": mime}
+    if role:
+        result["role"] = role
+    return result
+
+
+def _grok_video_dimensions(params: dict[str, Any], provider: str, model: str) -> dict[str, str]:
+    missing = sorted(
+        name for name in ("aspect_ratio", "resolution")
+        if not str(params.get(name, "")).strip()
+    )
+    if missing:
+        raise MediaError(
+            "Grok video 必须在 parameters 中明确提供 aspect_ratio 和 resolution；请根据本次视频需求选择后再准备。",
+            code="VIDEO_PARAMETERS_REQUIRED",
+            provider=provider,
+            model=model,
+            details={
+                "missing_parameters": missing,
+                "aspect_ratio_options": ["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3"],
+                "resolution_options": ["480p", "720p", "1080p"],
+            },
+        )
+    clean = {
+        "aspect_ratio": str(params["aspect_ratio"]).strip(),
+        "resolution": str(params["resolution"]).strip(),
+    }
+    for name, allowed in (("aspect_ratio", {"1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3"}), ("resolution", {"480p", "720p", "1080p"})):
+        if clean[name] not in allowed:
+            raise MediaError(f"Grok video 参数 {name} 不受支持。", code="INVALID_PARAMETER", provider=provider, model=model)
+    return clean
+
+
+def _validate_grok_video_local_image_sizes(reference_media: list[dict[str, Any]], provider: str, model: str) -> None:
+    local_images = [
+        item for item in reference_media
+        if item.get("kind") == "image" and item.get("source") == "file"
+    ]
+    if any(int(item.get("bytes", 0)) > MAX_GROK_VIDEO_LOCAL_IMAGE_BYTES for item in local_images):
+        raise MediaError(
+            "Grok 视频每张本地图片不能超过 8 MiB；请压缩图片后重新准备。",
+            code="REFERENCE_SIZE_LIMIT", provider=provider, model=model,
+        )
+    total_bytes = sum(int(item.get("bytes", 0)) for item in local_images)
+    if total_bytes > MAX_GROK_VIDEO_TOTAL_LOCAL_IMAGE_BYTES:
+        raise MediaError(
+            "Grok 视频本地图片总大小不能超过 25 MiB。",
+            code="REFERENCE_SIZE_LIMIT", provider=provider, model=model,
+        )
 
 
 def _validate_request(args: dict[str, Any]) -> dict[str, Any]:
@@ -317,12 +754,28 @@ def _validate_request(args: dict[str, Any]) -> dict[str, Any]:
         raise MediaError("prompt 不能为空，且最多 30000 个字符。")
     model = _model(provider, str(args.get("model", "")))
     refs = args.get("reference_media", [])
-    if not isinstance(refs, list) or len(refs) > 12:
-        raise MediaError("reference_media 必须是数组，最多 12 项。")
+    if not isinstance(refs, list):
+        raise MediaError("reference_media 必须是数组。")
+    max_references = 15 if provider == "grok-video" else 5 if provider == "grok-image" else 12
+    if len(refs) > max_references:
+        if provider == "grok-video":
+            raise MediaError("Grok 视频 reference_media 最多 15 项（1 张首帧 + 14 张参考图）。")
+        if provider == "grok-image":
+            raise MediaError("Grok Imagine 图片编辑最多接受 5 张参考图。")
+        raise MediaError("此 provider 的 reference_media 最多 12 项。")
     normalized_refs = [_safe_reference(item) for item in refs]
     params = args.get("parameters", {})
     if not isinstance(params, dict):
         raise MediaError("parameters 必须是对象。")
+    allowed_parameters = {
+        "image-2": {"size", "n"}, "grok-image": {"n", "aspect_ratio", "resolution", "quality"},
+        "grok-video": {"duration", "aspect_ratio", "resolution", "generate_audio"},
+        "seedance-video": {"duration", "ratio", "watermark", "generate_audio"},
+        "minimax-video": {"duration", "ratio", "aspect_ratio", "resolution"},
+    }[provider]
+    extra_parameters = sorted(set(params) - allowed_parameters)
+    if extra_parameters:
+        raise MediaError(f"不支持的 {provider} 参数: {', '.join(extra_parameters[:8])}。", code="UNSUPPORTED_PARAMETER", provider=provider, model=model)
     request: dict[str, Any] = {
         "provider": provider,
         "model": model,
@@ -331,13 +784,18 @@ def _validate_request(args: dict[str, Any]) -> dict[str, Any]:
         "parameters": {},
         "route": _route_context(),
     }
+    if provider != "grok-video" and any("role" in item for item in normalized_refs):
+        raise MediaError("图片 role 仅适用于 Grok 视频；其他 provider 不接受该字段。", code="INVALID_REFERENCE_ROLE", provider=provider, model=model)
     if provider == "image-2":
         if any(item["kind"] != "image" for item in normalized_refs):
             raise MediaError("Image-2 仅接受 image 参考素材。")
         size = str(params.get("size", "auto" if _api_profile() == "responses" else "2048x2048"))
         if size not in IMAGE_SIZES and size != "auto":
             raise MediaError("Image-2 size 不在已支持的 2K 尺寸清单中。")
-        n = int(params.get("n", 1))
+        try:
+            n = int(params.get("n", 1))
+        except (TypeError, ValueError):
+            raise MediaError("图片数量 n 必须是整数。", code="INVALID_PARAMETER", provider=provider, model=model)
         if not 1 <= n <= 8:
             raise MediaError("图片数量 n 必须在 1–8 之间。")
         if _api_profile() == "responses" and n != 1:
@@ -353,7 +811,10 @@ def _validate_request(args: dict[str, Any]) -> dict[str, Any]:
             raise MediaError("Grok image 仅接受 image 参考素材。")
         if len(normalized_refs) > 5:
             raise MediaError("Grok Imagine 单次最多接受 5 张参考图。")
-        n = int(params.get("n", 1))
+        try:
+            n = int(params.get("n", 1))
+        except (TypeError, ValueError):
+            raise MediaError("图片数量 n 必须是整数。", code="INVALID_PARAMETER", provider=provider, model=model)
         if not 1 <= n <= 10:
             raise MediaError("图片数量 n 必须在 1–10 之间。")
         if _api_profile() == "wokey" and (n != 1 or normalized_refs):
@@ -368,34 +829,60 @@ def _validate_request(args: dict[str, Any]) -> dict[str, Any]:
         request["mode"] = "edit" if normalized_refs else "generate"
         request["parameters"] = clean
     elif provider == "grok-video":
-        if len(normalized_refs) > 1 or any(item["kind"] != "image" for item in normalized_refs):
-            raise MediaError("Grok video 当前只接受 0 或 1 张起始帧图片。")
+        if any(item["kind"] != "image" for item in normalized_refs):
+            raise MediaError("Grok video 只接受图片素材。", code="INVALID_REFERENCE_KIND", provider=provider, model=model)
+        for item in normalized_refs:
+            # Legacy clients omitted role and historically meant one pinned start frame.
+            item["role"] = item.get("role", "first_frame")
+        first_frames = [item for item in normalized_refs if item["role"] == "first_frame"]
+        references = [item for item in normalized_refs if item["role"] == "reference"]
+        if len(first_frames) > 1:
+            raise MediaError("Grok 视频最多只能有一张首帧图；其他图片请显式标为 reference。", code="TOO_MANY_FIRST_FRAMES", provider=provider, model=model)
+        _validate_grok_video_local_image_sizes(normalized_refs, provider, model)
         if _api_profile() == "wokey" and normalized_refs:
-            raise MediaError("Wokey 视频参考素材需要 multipart；当前 MCP 适配暂只支持文生视频。")
-        clean = {}
+            raise MediaError("当前 Wokey 视频路由尚未认证图片/参考图协议；没有发送请求。", code="REFERENCE_MODE_UNSUPPORTED", provider=provider, model=model)
+        if references:
+            if _api_profile() != "responses":
+                raise MediaError("当前媒体路由尚未认证 Grok reference_images；没有发送请求。", code="REFERENCE_MODE_UNSUPPORTED", provider=provider, model=model)
+            reference_limits = {"grok-imagine-video-1.5": 14, "grok-imagine-video": 7}
+            reference_limit = reference_limits.get(model)
+            if reference_limit is None:
+                raise MediaError("当前 Grok 视频模型没有已认证的独立参考图能力；没有发送请求。", code="REFERENCE_MODE_UNSUPPORTED", provider=provider, model=model)
+            if len(references) > reference_limit:
+                raise MediaError(f"当前模型最多接受 {reference_limit} 张参考图。", code="TOO_MANY_REFERENCES", provider=provider, model=model)
+            if first_frames and model != "grok-imagine-video-1.5":
+                raise MediaError("当前 Grok 视频模型不支持首帧与参考图混合；请明确选一种输入语义。", code="MIXED_REFERENCE_MODE_UNSUPPORTED", provider=provider, model=model)
+        clean = _grok_video_dimensions(params, provider, model)
         if "duration" in params:
-            duration = int(params["duration"])
+            try:
+                duration = int(params["duration"])
+            except (TypeError, ValueError):
+                raise MediaError("Grok 视频时长必须是整数。", code="INVALID_PARAMETER", provider=provider, model=model)
             if not 1 <= duration <= 15:
                 raise MediaError("Grok 视频时长必须为 1–15 秒整数。")
             clean["duration"] = duration
-        for name, allowed in (("aspect_ratio", {"1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3"}), ("resolution", {"480p", "720p", "1080p"})):
-            value = str(params.get(name, "")).strip()
-            if value:
-                if value not in allowed:
-                    raise MediaError(f"Grok video 参数 {name} 不受支持。")
-                clean[name] = value
         if "generate_audio" in params:
             if not isinstance(params["generate_audio"], bool):
                 raise MediaError("generate_audio 必须是布尔值。")
             clean["generate_audio"] = params["generate_audio"]
-        request["mode"] = "image-to-video" if normalized_refs else "text-to-video"
+        if not normalized_refs:
+            request["mode"] = "text-to-video"
+        elif references and first_frames:
+            request["mode"] = "image-to-video-with-references"
+        elif references:
+            request["mode"] = "reference-to-video"
+        else:
+            request["mode"] = "image-to-video"
         request["parameters"] = clean
     elif provider == "seedance-video":
         if _api_profile() == "wokey" and normalized_refs:
             raise MediaError("Wokey 视频参考素材需要 multipart；当前 MCP 适配暂只支持文生视频。")
         if any(item["source"] == "file" for item in normalized_refs):
             raise MediaError("Seedance 参考素材目前必须使用服务方可访问的 HTTPS URL；MCP 不会擅自上传素材。")
-        duration = int(params.get("duration", 8))
+        try:
+            duration = int(params.get("duration", 8))
+        except (TypeError, ValueError):
+            raise MediaError("Seedance 时长必须是整数。", code="INVALID_PARAMETER", provider=provider, model=model)
         if not 4 <= duration <= 15:
             raise MediaError("Seedance duration 当前校验为 4–15 秒整数；请以目标模型文档为准。")
         ratio = str(params.get("ratio", "16:9"))
@@ -419,7 +906,10 @@ def _validate_request(args: dict[str, Any]) -> dict[str, Any]:
             raise MediaError("MiniMax 视频模型暂只支持统一上游的 Wokey 兼容模式；请勿尝试官方 MiniMax API 或其他猜测端点。")
         if normalized_refs:
             raise MediaError("当前统一上游的 MiniMax 视频槽位暂只支持文生视频。")
-        duration = int(params.get("duration", 4))
+        try:
+            duration = int(params.get("duration", 4))
+        except (TypeError, ValueError):
+            raise MediaError("MiniMax 视频 duration 必须是整数。", code="INVALID_PARAMETER", provider=provider, model=model)
         if not 1 <= duration <= 15:
             raise MediaError("MiniMax 视频 duration 必须是 1–15 秒整数；请遵循上游模型限制。")
         ratio = str(params.get("ratio", params.get("aspect_ratio", "16:9")))
@@ -453,7 +943,8 @@ def _confirmation_operation_lock(confirmation_id: str, operation: str):
     with _CONFIRMATION_LOCKS_GUARD:
         local_lock = _CONFIRMATION_LOCKS.setdefault(lock_key, threading.Lock())
     if not local_lock.acquire(blocking=False):
-        raise MediaError(f"该任务正在{operation}；请稍后重试，不要重复提交。")
+        code = "SUBMISSION_ALREADY_STARTED" if operation == "提交" else "OPERATION_IN_PROGRESS"
+        raise MediaError(f"该任务正在{operation}；请稍后重试，不要重复提交。", code=code)
     if _uses_windows_mutex():
         import ctypes
 
@@ -477,7 +968,8 @@ def _confirmation_operation_lock(confirmation_id: str, operation: str):
             if wait_result in (0x00000000, 0x00000080):  # WAIT_OBJECT_0 / WAIT_ABANDONED
                 acquired = True
             elif wait_result == 0x00000102:  # WAIT_TIMEOUT
-                raise MediaError(f"该任务正在{operation}；请稍后重试，不要重复提交。")
+                code = "SUBMISSION_ALREADY_STARTED" if operation == "提交" else "OPERATION_IN_PROGRESS"
+                raise MediaError(f"该任务正在{operation}；请稍后重试，不要重复提交。", code=code)
             else:
                 raise OSError(ctypes.get_last_error(), f"WaitForSingleObject failed: {wait_result:#x}")
             yield
@@ -504,7 +996,8 @@ def _confirmation_operation_lock(confirmation_id: str, operation: str):
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             acquired = True
         except OSError as exc:
-            raise MediaError(f"该任务正在{operation}；请稍后重试，不要重复提交。") from exc
+            code = "SUBMISSION_ALREADY_STARTED" if operation == "提交" else "OPERATION_IN_PROGRESS"
+            raise MediaError(f"该任务正在{operation}；请稍后重试，不要重复提交。", code=code) from exc
         yield
     finally:
         if acquired:
@@ -519,20 +1012,95 @@ def _confirmation_operation_lock(confirmation_id: str, operation: str):
         local_lock.release()
 
 
+def _confirmation_operation_is_active(confirmation_id: str) -> bool:
+    """Check a confirmation's operation lock without waiting or changing state."""
+    if not re.fullmatch(r"media-[0-9a-f]{32}", confirmation_id):
+        return False
+    lock_identity = hashlib.sha256(confirmation_id.encode("utf-8")).hexdigest()
+    lock_path = _confirmation_path(confirmation_id).with_suffix(".operation-lock")
+    with _CONFIRMATION_LOCKS_GUARD:
+        local_lock = _CONFIRMATION_LOCKS.get(str(lock_path.resolve()))
+        if local_lock is not None and local_lock.locked():
+            return True
+    if _uses_windows_mutex():
+        import ctypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.argtypes = (ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p)
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        kernel32.WaitForSingleObject.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+        kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+        kernel32.ReleaseMutex.argtypes = (ctypes.c_void_p,)
+        kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+        handle = kernel32.CreateMutexW(None, False, f"Local\\CodexMediaMcp-{lock_identity}")
+        if not handle:
+            raise MediaError("无法检查媒体任务互斥锁。", code="INTENT_LOCK_UNAVAILABLE")
+        try:
+            outcome = kernel32.WaitForSingleObject(handle, 0)
+            if outcome in (0x00000000, 0x00000080):
+                kernel32.ReleaseMutex(handle)
+                return False
+            if outcome == 0x00000102:
+                return True
+            raise MediaError("无法检查媒体任务互斥锁。", code="INTENT_LOCK_UNAVAILABLE")
+        finally:
+            kernel32.CloseHandle(handle)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        import fcntl
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
 def media_prepare(args: dict[str, Any]) -> dict[str, Any]:
     request = _validate_request(args)
+    persisted_request = _protect_request_urls(request)
     created = int(time.time())
     confirmation_id = "media-" + uuid.uuid4().hex
-    payload = {"version": 1, "confirmation_id": confirmation_id, "created_at": created, "expires_at": created + CONFIRMATION_TTL_SECONDS, "request": request}
+    catalog = _catalog_snapshot()
+    payload = {"version": 1, "confirmation_id": confirmation_id, "created_at": created, "expires_at": created + CONFIRMATION_TTL_SECONDS, "request": persisted_request,
+               "catalog_fingerprint": catalog["fingerprint"], "catalog_verified_at": catalog["verified_at"]}
     fingerprint = _token(payload)
-    record = dict(payload, fingerprint=fingerprint, state="prepared", api_request_sent=False)
-    _atomic_json(_confirmation_path(confirmation_id), record)
-    refs = [{"kind": item["kind"], "source": item["source"], "url": item.get("url"), "file_name": Path(item["path"]).name if item.get("path") else None, "bytes": item.get("bytes"), "sha256": item.get("sha256")} for item in request["reference_media"]]
+    intent = _intent_fingerprint(request)
+    key_id = hashlib.sha256(_secret_key()).hexdigest()[:16]
+    ack_text = "确认此前任务可能已计费且仍要求新生成"
+    with _intent_index_lock():
+        conflicts = _intent_conflicts(intent)
+        unknown = [item for item in conflicts if item.get("state") == "submission_unknown"]
+        prepared = next((item for item in conflicts if item.get("state") == "prepared"), None)
+        if prepared:
+            raise MediaError("相同请求已有待确认任务；请继续使用该确认单，不要重复准备。", code="INTENT_ALREADY_PREPARED", provider=request["provider"], model=request["model"], submission_state="prepared", api_request_sent=False, details={"confirmation_id": prepared.get("confirmation_id"), "expires_at": prepared.get("expires_at")})
+        if conflicts:
+            prior = conflicts[0]
+            allow_repeat = bool(unknown) and all(not item.get("repeat_ack_consumed") for item in unknown) and str(args.get("repeat_after_unknown_ack", "")).strip() == ack_text
+            if not allow_repeat:
+                raise MediaError("相同请求存在未解决的上游任务；请求可能已计费。先核对上游；如确需再次生成，必须明确确认可能重复计费。", code="UNRESOLVED_PRIOR_SUBMISSION", provider=request["provider"], model=request["model"], submission_state=prior.get("state"), api_request_sent=prior.get("api_request_sent"), details={"confirmation_id": prior.get("confirmation_id"), "submission_id": prior.get("submission_id"), "task_id": prior.get("task_id"), "created_at": prior.get("created_at"), "may_have_been_billed": True})
+            payload["supersedes_unknown_submission_ids"] = [str(item.get("submission_id") or item["confirmation_id"]) for item in unknown]
+            payload["repeat_after_unknown_acknowledged"] = True
+            payload["acknowledged_at"] = created
+        record = dict(payload, fingerprint=fingerprint, intent_fingerprint=intent,
+                      intent_fingerprint_key_id=key_id, fingerprint_key_id=key_id,
+                      submission_id=uuid.uuid4().hex, request_digest_hmac=_token(request),
+                      idempotency_forwarded=False, state="prepared", api_request_sent=False)
+        _atomic_json(_confirmation_path(confirmation_id), record)
+        if payload.get("repeat_after_unknown_acknowledged"):
+            for previous in unknown:
+                previous["repeat_ack_consumed"] = True
+                previous["repeat_ack_consumed_at"] = created
+                _atomic_json(_confirmation_path(str(previous["confirmation_id"])), previous)
+    refs = [{"kind": item["kind"], "role": item.get("role"), "source": item["source"], "url_origin": _url_origin(item["url"]) if item.get("url") else None, "file_name": Path(item["path"]).name if item.get("path") else None, "bytes": item.get("bytes"), "sha256": item.get("sha256")} for item in request["reference_media"]]
     return {
         "success": True,
         "mode": "prepared",
         "api_request_sent": False,
         "confirmation_id": confirmation_id,
+        "submission_id": record["submission_id"],
         "confirmation_fingerprint": fingerprint,
         "expires_at_epoch": payload["expires_at"],
         "provider": request["provider"],
@@ -552,7 +1120,7 @@ def _validated_record(args: dict[str, Any], *, allow_submitting: bool = False) -
     path = _confirmation_path(confirmation_id)
     record = _load_json(path)
     fingerprint = str(args.get("confirmation_fingerprint", "")).strip()
-    expected = _token({key: record.get(key) for key in ("version", "confirmation_id", "created_at", "expires_at", "request")})
+    expected = _token({key: record.get(key) for key in ("version", "confirmation_id", "created_at", "expires_at", "request", "catalog_fingerprint", "catalog_verified_at")})
     if not fingerprint or not hmac.compare_digest(fingerprint, expected) or not hmac.compare_digest(str(record.get("fingerprint", "")), expected):
         raise MediaError("确认指纹不匹配；拒绝继续。")
     if not allow_submitting and int(record.get("expires_at", 0)) < int(time.time()):
@@ -566,14 +1134,31 @@ def _validated_record(args: dict[str, Any], *, allow_submitting: bool = False) -
         # A crash can happen after the durable intent marker and before the
         # response/task_id is saved. Fail closed and never repeat a possibly
         # billed request.
-        record["state"] = "submission_unknown"
-        record["last_error"] = "Process ended while submission was in progress; verify upstream before any manual recovery."
-        record["recovered_at"] = int(time.time())
-        record["api_request_sent"] = True
+        if record.get("api_request_sent") is False:
+            record["state"] = "interrupted_before_send"
+            record["submission_state"] = "interrupted_before_send"
+        else:
+            record["state"] = "submission_unknown"
+            record["last_error"] = "Process ended while submission may have reached the upstream."
+            record["recovered_at"] = int(time.time())
+        _atomic_json(path, record)
+    if record.get("operation_state") == "checking":
+        record["operation_state"] = ""
+        record["operation_token"] = ""
+        _atomic_json(path, record)
+    elif record.get("operation_state") == "saving":
+        record["operation_state"] = ""
+        record["operation_token"] = ""
+        if record.get("state") in {"completed", "completed_pending_save"}:
+            record["state"] = "completed_pending_save"
+        output = _data_root() / "outputs" / str(record.get("confirmation_id", ""))
+        if output.exists():
+            for partial in output.glob("*.part"):
+                partial.unlink(missing_ok=True)
         _atomic_json(path, record)
     allowed_states = {"prepared"}
     if allow_submitting:
-        allowed_states |= {"submitting", "submission_unknown", "submission_rejected", "task_created", "completed", "failed"}
+        allowed_states |= {"submitting", "submission_unknown", "submission_rejected", "task_created", "in_progress", "provider_status_unknown", "completed", "completed_pending_save", "completed_saved", "completed_missing_artifacts", "completed_without_artifact", "failed", "interrupted_before_send"}
     if record.get("state") not in allowed_states:
         raise MediaError(f"该确认清单已进入 {record.get('state')} 状态，不能重复提交。")
     # Once submitted, retrieval belongs to the upstream task and must survive
@@ -598,7 +1183,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         raise MediaError("媒体服务 API 返回重定向；为避免泄露凭据，已拒绝跟随。")
 
 
-def _http_json(method: str, path: str, payload: dict[str, Any] | bytes | None, provider: str, idempotency_key: str | None = None, content_type: str = "application/json", before_request: Callable[[], None] | None = None) -> dict[str, Any]:
+def _http_json(method: str, path: str, payload: dict[str, Any] | bytes | None, provider: str, idempotency_key: str | None = None, content_type: str = "application/json", before_request: Callable[[], None] | None = None, sensitive_texts: tuple[str, ...] = ()) -> dict[str, Any]:
     key = _api_key()
     if not key:
         raise MediaError("未配置 MEDIA_GENERATION_API_KEY；没有发送 API 请求。")
@@ -618,8 +1203,10 @@ def _http_json(method: str, path: str, payload: dict[str, Any] | bytes | None, p
         if not agent:
             raise MediaError("Seedance 网关需要 MEDIA_GENERATION_AGENT_ID。")
         headers["agent-id"] = agent
-    if idempotency_key and (profile == "wokey" or provider in {"image-2", "seedance-video"}):
-        headers["Idempotency-Key"] = idempotency_key
+    # The local idempotency key is persisted for correlation only. Do not emit an
+    # header named `Idempotency-Key`: no provider in the current kit has a verified
+    # upstream idempotency contract, so retries remain forbidden after uncertainty.
+    # The local single-use state machine is not an upstream duplicate-charge guarantee.
     data = _canonical(payload) if isinstance(payload, dict) else payload
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
     opener = urllib.request.build_opener(_NoRedirect)
@@ -632,20 +1219,84 @@ def _http_json(method: str, path: str, payload: dict[str, Any] | bytes | None, p
                 raise MediaError("媒体服务 JSON 响应超过大小上限。")
             parsed = json.loads(raw.decode("utf-8-sig"))
     except urllib.error.HTTPError as exc:
-        body = exc.read(8192).decode("utf-8", errors="replace")
-        body = body.replace(key, "<redacted>")
+        try:
+            provider_body = json.loads(exc.read(8192).decode("utf-8", errors="replace"))
+        except Exception:
+            provider_body = {}
+        provider_error = provider_body.get("error", {}) if isinstance(provider_body, dict) else {}
+        provider_code = str(provider_error.get("code", "")).casefold() if isinstance(provider_error, dict) else ""
+        remote_detail = _safe_upstream_error_detail(provider_body, payload, api_key=key, sensitive_texts=sensitive_texts)
+        headers_obj = exc.headers or {}
+        provider_request_id = next((_safe_identifier(headers_obj.get(name)) for name in ("x-request-id", "request-id", "x-amzn-requestid") if _safe_identifier(headers_obj.get(name))), None)
+        gateway_request_id = next((_safe_identifier(headers_obj.get(name)) for name in ("x-gateway-request-id", "x-wokey-request-id") if _safe_identifier(headers_obj.get(name))), None)
         if method == "POST" and (exc.code >= 500 or exc.code in {408, 425, 429}):
-            raise MediaError(f"提交状态未知（HTTP {exc.code}）；为避免重复计费，不会自动重试。") from exc
-        raise MediaError(f"媒体服务拒绝请求（HTTP {exc.code}）：{body[:600]}") from exc
+            message = f"上游 HTTP {exc.code}，提交结果未知；请勿重新提交。"
+            if remote_detail:
+                message += f" 服务端诊断：{remote_detail}"
+            raise MediaError(message, code="SUBMISSION_UNKNOWN", provider=provider, http_status=exc.code, provider_request_id=provider_request_id, gateway_request_id=gateway_request_id, submission_state="submission_unknown", api_request_sent=True) from exc
+        if method != "POST" and exc.code >= 500:
+            raise MediaError(f"上游暂时无法响应（HTTP {exc.code}）；可稍后查询同一任务。", code="UPSTREAM_UNAVAILABLE", provider=provider, http_status=exc.code, provider_request_id=provider_request_id, gateway_request_id=gateway_request_id, retryable=True, api_request_sent=False) from exc
+        mapping = {401: ("UPSTREAM_AUTH_FAILED", "上游认证失败。"), 403: ("UPSTREAM_AUTH_FAILED", "上游拒绝当前账户或能力权限。"), 404: ("UPSTREAM_MODEL_NOT_FOUND", "上游未找到请求的模型或接口。"), 400: ("UPSTREAM_INPUT_REJECTED", "上游拒绝请求参数或内容。"), 422: ("UPSTREAM_INPUT_REJECTED", "上游拒绝请求参数或内容。")}
+        code, safe_message = mapping.get(exc.code, ("UPSTREAM_REQUEST_REJECTED", f"上游拒绝请求（HTTP {exc.code}）。"))
+        if provider_code in {"content_policy_violation", "safety_violation", "content_policy"}:
+            code, safe_message = "UPSTREAM_CONTENT_POLICY", "上游内容政策拒绝了本次请求。"
+        if remote_detail:
+            safe_message += f" 服务端诊断：{remote_detail}"
+        raise MediaError(safe_message, code=code, provider=provider, http_status=exc.code, provider_request_id=provider_request_id, gateway_request_id=gateway_request_id, submission_state="submission_rejected" if method == "POST" else None, api_request_sent=method == "POST") from exc
     except MediaError:
         raise
     except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
         if method == "POST":
-            raise MediaError(f"提交状态未知（{type(exc).__name__}）；为避免重复计费，不会自动重试。") from exc
-        raise MediaError(f"媒体服务暂时无法响应（{type(exc).__name__}）；原任务状态未更改。") from exc
+            raise MediaError("提交状态未知：连接在提交后中断，无法确认上游是否接受；请勿重新提交。", code="SUBMISSION_UNKNOWN", provider=provider, submission_state="submission_unknown", api_request_sent=True) from exc
+        raise MediaError("媒体服务暂时无法响应；原任务状态未更改。", code="UPSTREAM_UNAVAILABLE", provider=provider, retryable=True, api_request_sent=False) from exc
     if not isinstance(parsed, dict):
         raise MediaError("媒体服务返回了非对象 JSON。")
     return parsed
+
+
+def _safe_upstream_error_detail(error_body: Any, request_payload: dict[str, Any] | bytes | None, *, api_key: str = "", sensitive_texts: tuple[str, ...] = ()) -> str | None:
+    """Return a short upstream error reason without echoing credentials or request text."""
+    if not isinstance(error_body, dict):
+        return None
+    error = error_body.get("error")
+    candidates = []
+    if isinstance(error, dict):
+        candidates.append(error.get("message"))
+    elif isinstance(error, str):
+        candidates.append(error)
+    candidates.extend((error_body.get("message"), error_body.get("detail")))
+    message = next((value.strip() for value in candidates if isinstance(value, str) and value.strip()), None)
+    if not message:
+        return None
+
+    private_texts: set[str] = {value for value in sensitive_texts if isinstance(value, str) and value}
+    def collect_private_text(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if str(key).casefold() in {"prompt", "text"} and isinstance(item, str) and item:
+                    private_texts.add(item)
+                else:
+                    collect_private_text(item)
+        elif isinstance(value, list):
+            for item in value:
+                collect_private_text(item)
+    if isinstance(request_payload, dict):
+        collect_private_text(request_payload)
+    if api_key:
+        message = message.replace(api_key, "[API key redacted]")
+    for private_text in sorted(private_texts, key=len, reverse=True):
+        message = message.replace(private_text, "[request text omitted]")
+
+    message = re.sub(r"(?i)\bBearer\s+[^\s,;]+", "Bearer [REDACTED]", message)
+    message = re.sub(r"(?i)\b(?:sk|rk|pk)-[A-Za-z0-9._-]{8,}", "[REDACTED]", message)
+    message = re.sub(r"(?i)\b(?:signed[-_ ]?query|query)[-_=][^\s,;]+", "[query redacted]", message)
+    message = re.sub(r"(?i)\b(api[_-]?key|authorization|access[_-]?token|secret)\s*[:=]\s*[^\s,;]+", r"\1=[REDACTED]", message)
+    message = re.sub(r"(?i)data:[^\s,;]+;base64,[A-Za-z0-9+/=_-]+", "[media data omitted]", message)
+    message = re.sub(r"https?://[^\s\"'<>]+", "[URL omitted]", message)
+    message = " ".join("".join(" " if unicodedata.category(char) == "Cc" else char for char in message).split())
+    if not message:
+        return None
+    return message[:200].rstrip() + ("…" if len(message) > 200 else "")
 
 
 def _multipart_image_request(record: dict[str, Any], idempotency_key: str, before_request: Callable[[], None] | None = None) -> dict[str, Any]:
@@ -665,7 +1316,7 @@ def _multipart_image_request(record: dict[str, Any], idempotency_key: str, befor
         chunks.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"image[{index}]\"; filename=\"{safe_name}\"\r\nContent-Type: {mime}\r\n\r\n".encode("utf-8") + raw + b"\r\n")
     chunks.append(f"--{boundary}--\r\n".encode("ascii"))
     url_path = "/api/llm/openai/v1/images/edits"
-    return _http_json("POST", url_path, b"".join(chunks), "image-2", idempotency_key, f"multipart/form-data; boundary={boundary}", before_request)
+    return _http_json("POST", url_path, b"".join(chunks), "image-2", idempotency_key, f"multipart/form-data; boundary={boundary}", before_request, sensitive_texts=(str(request.get("prompt", "")),))
 
 
 def _request_payload(request: dict[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -696,6 +1347,14 @@ def _request_payload(request: dict[str, Any]) -> tuple[str, dict[str, Any]]:
             return "/v1/images/generations", {"model": request["model"], "prompt": request["prompt"], "size": params["size"], "n": 1}
         if provider == "grok-image":
             return "/v1/images/generations", {"model": request["model"], "prompt": request["prompt"], "n": 1}
+        if provider == "grok-video":
+            dimensions = _grok_video_dimensions(params, provider, request["model"])
+            body = {"model": request["model"], "prompt": request["prompt"], "ratio": dimensions["aspect_ratio"], "video_resolution": dimensions["resolution"]}
+            if "duration" in params:
+                body["duration_seconds"] = int(params["duration"])
+            mode = "image_to_video" if request["reference_media"] else "text_to_video"
+            body["mode"] = mode
+            return "/v1/videos", body
         duration = int(params.get("duration", 4))
         ratio = str(params.get("aspect_ratio", params.get("ratio", "16:9")))
         resolution = str(params.get("resolution", "720p" if provider in {"seedance-video", "minimax-video"} else "480p"))
@@ -724,7 +1383,11 @@ def _request_payload(request: dict[str, Any]) -> tuple[str, dict[str, Any]]:
                         raise MediaError("Grok 参考图片在提交前改变；请重新准备并确认。")
                     image_url = f"data:{item['mime_type']};base64," + base64.b64encode(data).decode("ascii")
                 images.append({"type": "image_url", "url": image_url})
-            body = {"model": request["model"], "prompt": request["prompt"], "images": images, **params}
+            body = {"model": request["model"], "prompt": request["prompt"], **params}
+            if len(images) == 1:
+                body["image"] = images[0]
+            else:
+                body["images"] = images
             return "/v1/images/edits", body
         return "/v1/images/generations", {"model": request["model"], "prompt": request["prompt"], **params}
     if provider == "minimax-video":
@@ -733,17 +1396,22 @@ def _request_payload(request: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         raise MediaError("MiniMax 视频路由尚未配置模型；没有发送 API 请求。")
     if provider == "grok-video":
         body = {"model": request["model"], "prompt": request["prompt"], **params}
-        if request["reference_media"]:
-            item = request["reference_media"][0]
+        first_frame = next((item for item in request["reference_media"] if item.get("role", "first_frame") == "first_frame"), None)
+        reference_images = [item for item in request["reference_media"] if item.get("role", "first_frame") == "reference"]
+
+        def image_url(item: dict[str, Any]) -> str:
             if item["source"] == "file":
                 path = Path(item["path"])
                 raw = path.read_bytes()
                 if len(raw) > MAX_REFERENCE_BYTES or hashlib.sha256(raw).hexdigest() != item["sha256"]:
-                    raise MediaError("Grok 起始帧在提交前改变；请重新准备并确认。")
-                url = f"data:{item['mime_type']};base64," + base64.b64encode(raw).decode("ascii")
-            else:
-                url = item["url"]
-            body["image"] = {"url": url}
+                    raise MediaError("Grok 视频本地图片在提交前改变；请重新准备并确认。")
+                return f"data:{item['mime_type']};base64," + base64.b64encode(raw).decode("ascii")
+            return item["url"]
+
+        if first_frame:
+            body["image"] = {"url": image_url(first_frame)}
+        if reference_images:
+            body["reference_images"] = [{"url": image_url(item)} for item in reference_images]
         return "/v1/videos/generations", body
     content = [{"type": "text", "text": request["prompt"]}]
     role_by_kind = {"image": "reference_image", "video": "reference_video", "audio": "reference_audio"}
@@ -764,9 +1432,24 @@ def _request_payload(request: dict[str, Any]) -> tuple[str, dict[str, Any]]:
 def _extract_task_id(provider: str, response: dict[str, Any]) -> str:
     task_id = response.get("request_id") if provider == "grok-video" else None
     task_id = task_id or response.get("task_id") or response.get("id")
-    if not isinstance(task_id, str) or not task_id.strip() or len(task_id) > 512:
-        raise MediaError("服务响应未包含有效 task_id；请求结果不确定，请勿直接重新提交。")
+    if not isinstance(task_id, str) or not task_id.strip() or len(task_id) > 512 or any(ord(char) < 32 for char in task_id):
+        raise MediaError("服务响应未包含有效 task_id；请求结果不确定，请勿直接重新提交。", code="SUBMISSION_UNKNOWN", submission_state="submission_unknown", api_request_sent=True)
     return task_id.strip()
+
+
+def _base64_image_mime(value: str) -> str:
+    """Infer the image container from a bounded base64 prefix, never from the provider name."""
+    if not isinstance(value, str) or not value:
+        return "application/octet-stream"
+    try:
+        signature = base64.b64decode(value[:64], validate=True)
+    except (ValueError, TypeError):
+        return "application/octet-stream"
+    if signature.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if signature.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    return "application/octet-stream"
 
 
 def _artifacts(response: Any, provider: str | None = None, *, output_scope: bool = False) -> list[dict[str, Any]]:
@@ -775,12 +1458,12 @@ def _artifacts(response: Any, provider: str | None = None, *, output_scope: bool
         if response.get("type") == "image_generation_call":
             result = response.get("result")
             if isinstance(result, str) and result:
-                found.append({"kind": "base64", "value": result, "mime_type": "image/png"})
+                found.append({"kind": "base64", "value": result, "mime_type": _base64_image_mime(result)})
         for key, value in response.items():
             is_output = key in {"video_url", "content_url", "b64_json"} or (output_scope and key == "url")
             if is_output and isinstance(value, str) and value:
                 if key == "b64_json":
-                    found.append({"kind": "base64", "value": value, "mime_type": "image/png"})
+                    found.append({"kind": "base64", "value": value, "mime_type": _base64_image_mime(value)})
                 elif key == "content_url" and value.startswith("/") and (
                     _api_profile() == "wokey" or (provider and PROVIDERS[provider]["family"] == "video")
                 ):
@@ -812,8 +1495,8 @@ def _response_summary(response: dict[str, Any], artifacts: list[dict[str, Any]])
     encoded = _canonical(response)
     return {
         "status": str(status)[:80] if status is not None else None,
-        "task_id": str(task_id)[:256] if task_id is not None else None,
-        "request_id": str(request_id)[:256] if request_id is not None else None,
+        "task_id": _safe_identifier(task_id),
+        "request_id": _safe_identifier(request_id),
         "response_bytes": len(encoded),
         "response_sha256": hashlib.sha256(encoded).hexdigest(),
         "top_level_keys": sorted(str(key)[:80] for key in response)[:100],
@@ -830,51 +1513,129 @@ def media_submit(args: dict[str, Any]) -> dict[str, Any]:
 
 def _media_submit_locked(args: dict[str, Any]) -> dict[str, Any]:
     path, record = _validated_record(args)
+    if record.get("state") != "prepared" or record.get("operation_token"):
+        raise MediaError("该确认单已开始处理；请勿重复提交。", code="SUBMISSION_ALREADY_STARTED", provider=record.get("request", {}).get("provider"), model=record.get("request", {}).get("model"), submission_state=record.get("state"), api_request_sent=record.get("api_request_sent"))
     if str(args.get("user_confirmation", "")).strip() not in {"确认", "就按这份生成"}:
         raise MediaError("正式提交只接受用户已明确回复“确认”或“就按这份生成”的执行调用。")
-    provider = record["request"]["provider"]
+    request = _restore_request_urls(record["request"])
+    provider = request["provider"]
+    if provider == "grok-video":
+        # Recheck at submit time as well: confirmations created by an older
+        # MCP release can remain valid during the confirmation TTL.
+        _validate_grok_video_local_image_sizes(request.get("reference_media", []), provider, request.get("model", ""))
+        try:
+            _grok_video_dimensions(request.get("parameters", {}), provider, request.get("model", ""))
+        except MediaError as exc:
+            raise MediaError(
+                "这份 Grok 视频确认单缺少有效画幅或分辨率，不能继续提交。请重新准备请求并明确选择这两个参数。",
+                code="CONFIRMATION_STALE",
+                provider=provider,
+                model=request.get("model"),
+                api_request_sent=False,
+                details=exc.details,
+            ) from exc
     _base()
     if not _api_key():
         raise MediaError("未配置 MEDIA_GENERATION_API_KEY；没有发送 API 请求。")
-    model = _model(provider, record["request"]["model"])
+    model = _model(provider, request["model"])
+    catalog = _catalog_snapshot()
+    if (catalog["fingerprint"] != record.get("catalog_fingerprint") or model not in catalog["ids"]):
+        raise MediaError("模型目录在确认后发生变化；请重新发现模型并再次确认。", code="CONFIRMATION_STALE", provider=provider, model=model)
     if _api_profile() not in {"wokey", "responses"} and provider == "image-2" and not os.environ.get("MEDIA_GENERATION_AGENT_ID", "").strip():
         raise MediaError("当前图像网关需要 MEDIA_GENERATION_AGENT_ID；没有发送 API 请求。")
     if _api_profile() != "wokey" and provider == "seedance-video" and not os.environ.get("MEDIA_GENERATION_AGENT_ID", "").strip():
         raise MediaError("当前网关此 provider 需要 MEDIA_GENERATION_AGENT_ID；没有发送 API 请求。")
-    for reference in record["request"].get("reference_media", []):
+    for reference in request.get("reference_media", []):
         if reference.get("source") == "url":
             _validate_public_url(reference["url"], resolve=True)
-    # Persist before network I/O. Any crash or ambiguous network result blocks another POST.
-    record["state"] = "submitting"
-    record["submitted_at"] = int(time.time())
-    record["api_request_sent"] = False
+    # Intent scanning/recovery and the submitting transition use the same
+    # cross-process lock. The operation token is checked again immediately
+    # before the first network byte is sent.
+    with _intent_index_lock():
+        path, record = _validated_record(args)
+        if record.get("state") != "prepared" or record.get("operation_token"):
+            raise MediaError("该确认单已开始处理；请勿重复提交。", code="SUBMISSION_ALREADY_STARTED", provider=provider, model=model, submission_state=record.get("state"), api_request_sent=record.get("api_request_sent"))
+        if not hmac.compare_digest(str(record.get("request_digest_hmac", "")), _token(request)):
+            raise MediaError("确认单请求摘要不匹配；拒绝提交。", code="CONFIRMATION_INTEGRITY_FAILED")
+        stored_intent = str(record.get("intent_fingerprint", ""))
+        if not stored_intent or record.get("intent_fingerprint_key_id") != hashlib.sha256(_secret_key()).hexdigest()[:16]:
+            raise MediaError("该确认单没有可验证的唯一意图预留；为避免重复计费，拒绝提交旧确认单。", code="INTENT_RESERVATION_UNAVAILABLE", provider=provider, model=model)
+        intent = _verified_intent_fingerprint(record.get("request", {}), stored_intent)
+        if intent is None:
+            raise MediaError("该确认单的唯一意图摘要无法验证；为避免重复计费，拒绝提交。", code="INTENT_RESERVATION_UNAVAILABLE", provider=provider, model=model)
+        conflicts = _intent_conflicts(intent)
+        own = [item for item in conflicts if item.get("confirmation_id") == record.get("confirmation_id")]
+        foreign = [item for item in conflicts if item.get("confirmation_id") != record.get("confirmation_id")]
+        if not own:
+            raise MediaError("该确认单已不再持有有效的意图预留；拒绝提交。", code="INTENT_RESERVATION_LOST", provider=provider, model=model)
+        if foreign:
+            allowed_unknowns = {str(value) for value in record.get("supersedes_unknown_submission_ids", [])}
+            foreign_ids = {str(item.get("submission_id") or item.get("confirmation_id")) for item in foreign}
+            if all(item.get("state") == "prepared" for item in foreign):
+                # Older versions could leave multiple prepared confirmations
+                # for one intent. The explicitly submitted one wins; retire
+                # the others before any request can leave this process.
+                for item in foreign:
+                    item["state"] = "superseded"
+                    item["superseded_by_confirmation_id"] = record["confirmation_id"]
+                    item["superseded_at"] = int(time.time())
+                    _atomic_json(_confirmation_path(str(item["confirmation_id"])), item)
+            else:
+                repeat_ack_valid = bool(record.get("repeat_after_unknown_acknowledged")) and all(
+                    item.get("state") == "submission_unknown"
+                    and item.get("repeat_ack_consumed") is True
+                    and str(item.get("submission_id") or item.get("confirmation_id")) in allowed_unknowns
+                    for item in foreign
+                )
+                if not repeat_ack_valid or not foreign_ids.issubset(allowed_unknowns):
+                    raise MediaError("相同请求存在另一份活动确认单；为避免重复计费，本确认单不能提交。", code="INTENT_RESERVATION_CONFLICT", provider=provider, model=model, submission_state="prepared", api_request_sent=False)
+        record["state"] = "submitting"
+        record["operation_state"] = "submitting"
+        record["operation_token"] = uuid.uuid4().hex
+        operation_token = record["operation_token"]
+        record["submitted_at"] = int(time.time())
+        record["api_request_sent"] = False
+        _atomic_json(path, record)
+    idempotency_key = hmac.new(_secret_key(), record["submission_id"].encode("utf-8"), hashlib.sha256).hexdigest()
+    record["idempotency_key_sha256"] = hashlib.sha256(idempotency_key.encode()).hexdigest()
+    record["idempotency_forwarded"] = False
     _atomic_json(path, record)
-    idempotency_key = hmac.new(_secret_key(), record["confirmation_id"].encode("utf-8"), hashlib.sha256).hexdigest()
 
     def mark_request_started() -> None:
         # Conservative durable marker: once this is written, no failure may
         # cause an automatic retry, even if the socket failed before send.
-        record["api_request_sent"] = True
-        record["request_started_at"] = int(time.time())
-        _atomic_json(path, record)
+        with _intent_index_lock():
+            current = _load_json(path)
+            if current.get("state") != "submitting" or current.get("operation_token") != operation_token or current.get("api_request_sent") is not False:
+                raise MediaError("提交状态已被恢复或改变；未发送网络请求。", code="SUBMISSION_CANCELLED_BEFORE_SEND", provider=provider, model=model, submission_state=current.get("state"), api_request_sent=current.get("api_request_sent"))
+            current["api_request_sent"] = True
+            current["submission_state"] = "request_started"
+            current["request_started_at"] = int(time.time())
+            _atomic_json(path, current)
+            record.update(current)
 
     try:
-        request = record["request"]
         if provider == "image-2" and request["mode"] == "edit" and _api_profile() == "legacy":
-            response = _multipart_image_request(record, idempotency_key, mark_request_started)
+            response = _multipart_image_request(dict(record, request=request), idempotency_key, mark_request_started)
         elif provider == "image-2" and request["mode"] == "edit" and _api_profile() == "wokey":
             raise MediaError("当前 Wokey 图片编辑尚未验证契约；没有发送 API 请求。")
         else:
             api_path, body = _request_payload(request)
             response = _http_json("POST", api_path, body, provider, idempotency_key, before_request=mark_request_started)
     except MediaError as exc:
-        text = str(exc)
-        record["state"] = "submission_unknown" if "状态未知" in text else "submission_rejected"
-        record["last_error"] = text[:800]
+        record["state"] = exc.submission_state or ("submission_unknown" if record.get("api_request_sent") else "submission_rejected")
+        record["operation_state"] = ""
+        record["operation_token"] = ""
+        record["last_error"] = exc.safe_message[:300]
+        record["last_error_code"] = exc.code
+        record["provider_request_id"] = exc.provider_request_id
+        record["gateway_request_id"] = exc.gateway_request_id
         _atomic_json(path, record)
         raise
     except Exception as exc:
         record["state"] = "submission_unknown"
+        record["operation_state"] = ""
+        record["operation_token"] = ""
         record["last_error"] = f"{type(exc).__name__}: response processing failed"
         _atomic_json(path, record)
         raise MediaError("服务已响应但无法可靠解析；提交状态未知，不会自动重试。") from exc
@@ -885,15 +1646,19 @@ def _media_submit_locked(args: dict[str, Any]) -> dict[str, Any]:
     pending = status in {"queued", "pending", "processing", "running", "in_progress", "submitted"}
     if failed:
         record["state"] = "failed"
+        record["last_error"] = "上游将任务标记为失败；请查看服务方任务详情。"
+    elif status in {"completed", "succeeded", "success", "done", "finished"} and not artifacts:
+        record["state"] = "completed_without_artifact"
+        record["last_error"] = "上游报告任务完成但没有可识别的媒体产物。"
     elif artifacts and not pending:
-        record["state"] = "completed"
+        record["state"] = "completed_pending_save"
     elif provider == "image-2" and _api_profile() == "responses":
         record["state"] = "submission_unknown"
         record["last_error"] = "Responses API returned no image_generation_call.result"
         record["response_summary"] = _response_summary(response, _artifacts(response, provider))
         record["api_request_sent"] = True
         _atomic_json(path, record)
-        raise MediaError("图像请求已发送，但 Responses 响应中没有 image_generation_call.result；请先核对网关任务和账单，不要重试。")
+        raise MediaError("图像请求已发送，但 Responses 响应中没有 image_generation_call.result；请先核对网关任务和账单，不要重试。", code="SUBMISSION_UNKNOWN", provider=provider, model=model, submission_state="submission_unknown", api_request_sent=True)
     else:
         try:
             task_id = _extract_task_id(provider, response)
@@ -902,19 +1667,27 @@ def _media_submit_locked(args: dict[str, Any]) -> dict[str, Any]:
             record["last_error"] = str(exc)
             _atomic_json(path, record)
             raise
-        record["state"] = "task_created"
+        record["state"] = "in_progress" if pending else "task_created"
         record["task_id"] = task_id
     record["api_request_sent"] = True
     record["response_summary"] = _response_summary(response, artifacts)
-    record["artifacts"] = artifacts
-    record["idempotency_key_sha256"] = hashlib.sha256(idempotency_key.encode()).hexdigest()
+    record["artifacts"] = _protect_artifact_urls(artifacts)
+    record["operation_state"] = ""
+    record["operation_token"] = ""
     _atomic_json(path, record)
     saved = []
-    if provider == "image-2" and _api_profile() == "responses" and record["state"] == "completed":
-        saved = _save_artifacts(record)
-        record["saved_artifacts"] = saved
-        _atomic_json(path, record)
-    return {"success": not failed, "state": record["state"], "provider": provider, "model": model, "task_id": task_id, "artifacts": [{k: v for k, v in item.items() if k != "value"} for item in artifacts], "saved": saved, "api_request_sent": True, "note": "异步任务请调用 media_check；已完成结果可用 media_save 保存；未知提交不得重发。"}
+    if provider == "image-2" and _api_profile() == "responses" and record["state"] == "completed_pending_save":
+        try:
+            saved = _save_artifacts(record)
+            record["saved_artifacts"] = saved
+            record["state"] = "completed_saved"
+            _atomic_json(path, record)
+        except MediaError:
+            record["state"] = "completed_pending_save"
+            record["last_error_code"] = "ARTIFACT_SAVE_PENDING"
+            _atomic_json(path, record)
+            raise
+    return {"success": record["state"] not in {"failed", "completed_without_artifact", "submission_unknown"}, "state": record["state"], "provider": provider, "model": model, "confirmation_id": record["confirmation_id"], "submission_id": record["submission_id"], "task_id": task_id, "artifacts": _public_artifacts(artifacts), "saved": saved, "api_request_sent": True, "note": "异步任务请调用 media_check；completed_pending_save 可用 media_save 恢复；未知提交不得重发。"}
 
 
 def _query_path(provider: str, task_id: str) -> str:
@@ -936,28 +1709,50 @@ def media_check(args: dict[str, Any]) -> dict[str, Any]:
     with _confirmation_operation_lock(str(args.get("confirmation_id", "")), "检查"):
         path, record = _validated_record(args, allow_submitting=True)
         state = str(record.get("state", ""))
-        if state == "completed":
-            return {"success": True, "state": state, "artifacts": [{k: v for k, v in item.items() if k != "value"} for item in record.get("artifacts", [])], "api_request_sent": False, "deduplicated": True}
-        if state != "task_created" or not record.get("task_id"):
+        if state in {"completed", "completed_saved"}:
+            return {"success": True, "state": state, "artifacts": _public_artifacts(record.get("artifacts", [])), "api_request_sent": False, "deduplicated": True}
+        if state == "completed_pending_save":
+            return {"success": True, "state": state, "artifacts": _public_artifacts(record.get("artifacts", [])), "api_request_sent": False, "next_tool": "media_save"}
+        if state not in {"task_created", "in_progress", "provider_status_unknown"} or not record.get("task_id"):
             raise MediaError(f"当前任务状态为 {state}；没有可查询的 task_id。未知提交只能等待人工查账，不能重发。")
         provider = record["request"]["provider"]
-        response = _http_json("GET", _query_path(provider, record["task_id"]), None, provider)
+        record["operation_state"] = "checking"
+        record["operation_token"] = uuid.uuid4().hex
+        token = record["operation_token"]
+        _atomic_json(path, record)
+        try:
+            response = _http_json("GET", _query_path(provider, record["task_id"]), None, provider)
+        except MediaError:
+            current = _load_json(path)
+            if current.get("operation_token") == token:
+                current["operation_state"] = ""
+                current["operation_token"] = ""
+                _atomic_json(path, current)
+            raise
         status = str(response.get("status", response.get("task_status", "unknown"))).strip().lower()
         arts = _artifacts(response, provider)
         if status in {"failed", "error", "cancelled", "expired", "rejected"}:
             record["state"] = "failed"
-            record["last_error"] = str(response.get("error") or response.get("message") or status)[:800]
+            record["last_error"] = "上游将任务标记为失败；请查看服务方任务详情。"
             record["response_summary"] = _response_summary(response, arts)
             _atomic_json(path, record)
         elif status in {"completed", "succeeded", "success", "done", "finished"}:
-            record["state"] = "completed" if arts else "task_created"
-            record["artifacts"] = arts
+            record["state"] = "completed_pending_save" if arts else "completed_without_artifact"
+            record["artifacts"] = _protect_artifact_urls(arts)
             record["response_summary"] = _response_summary(response, arts)
-            _atomic_json(path, record)
-        return {"success": record["state"] not in {"failed", "submission_unknown"}, "state": record["state"], "provider_status": status, "provider": provider, "task_id": record["task_id"], "artifacts": [{k: v for k, v in item.items() if k != "value"} for item in arts], "api_request_sent": True}
+        elif status in {"queued", "pending", "processing", "running", "in_progress", "submitted"}:
+            record["state"] = "in_progress"
+        else:
+            record["state"] = "provider_status_unknown"
+        record["operation_state"] = ""
+        record["operation_token"] = ""
+        record["last_provider_status"] = status[:80]
+        record["last_checked_at"] = int(time.time())
+        _atomic_json(path, record)
+        return {"success": record["state"] not in {"failed", "submission_unknown", "provider_status_unknown", "completed_missing_artifacts", "completed_without_artifact"}, "state": record["state"], "provider_status": status, "provider": provider, "task_id": record["task_id"], "artifacts": _public_artifacts(arts), "api_request_sent": True, "poll_after_seconds": 10 if record["state"] == "in_progress" else None}
 
 
-def _safe_download(url: str, destination: Path) -> int:
+def _safe_download(url: str, destination: Path) -> tuple[int, str]:
     _validate_public_url(url, resolve=True)
     opener = urllib.request.build_opener(_NoRedirect)
     headers = {"Accept": "*/*", "User-Agent": "Codex-Media-MCP/1.0"}
@@ -972,6 +1767,7 @@ def _safe_download(url: str, destination: Path) -> int:
     total = 0
     try:
         with opener.open(request, timeout=HTTP_TIMEOUT_SECONDS) as response, temporary.open("wb") as stream:
+            content_type = str(response.headers.get("Content-Type", "")).split(";", 1)[0].strip().casefold()
             declared = int(response.headers.get("Content-Length") or 0)
             if declared > MAX_DOWNLOAD_BYTES:
                 raise MediaError("结果文件超过本地下载上限。")
@@ -985,8 +1781,24 @@ def _safe_download(url: str, destination: Path) -> int:
                 stream.write(block)
         if total <= 0:
             raise MediaError("结果文件为空。")
+        with temporary.open("rb") as check_stream:
+            signature = check_stream.read(32)
+        content_type = content_type.casefold()
+        signatures = {
+            "image/png": signature.startswith(b"\x89PNG\r\n\x1a\n"),
+            "image/jpeg": signature.startswith(b"\xff\xd8\xff"),
+            "image/webp": len(signature) >= 12 and signature[:4] == b"RIFF" and signature[8:12] == b"WEBP",
+            "image/gif": signature.startswith((b"GIF87a", b"GIF89a")),
+            "video/mp4": b"ftyp" in signature[:16],
+            "video/quicktime": b"ftyp" in signature[:16],
+            "video/x-m4v": b"ftyp" in signature[:16],
+            "video/webm": signature.startswith(b"\x1aE\xdf\xa3"),
+        }
+        known = [(mime, matches) for mime, matches in signatures.items() if matches]
+        if not known or (content_type in signatures and not signatures[content_type]) or (content_type and content_type != "application/octet-stream" and content_type not in signatures):
+            raise MediaError("下载结果的 MIME 类型或文件头无效。", code="ARTIFACT_INTEGRITY_FAILED")
         os.replace(temporary, destination)
-        return total
+        return total, content_type
     except Exception:
         try:
             temporary.unlink(missing_ok=True)
@@ -1102,7 +1914,7 @@ def _save_artifacts(record: dict[str, Any]) -> list[dict[str, Any]]:
     output_root = _data_root() / "outputs" / record["confirmation_id"]
     output_root.mkdir(parents=True, exist_ok=True)
     saved = []
-    for index, artifact in enumerate(record.get("artifacts", []), 1):
+    for index, artifact in enumerate(_restore_artifact_urls(record.get("artifacts", [])), 1):
         if artifact.get("kind") == "base64":
             try:
                 raw = base64.b64decode(artifact.get("value", ""), validate=True)
@@ -1110,13 +1922,16 @@ def _save_artifacts(record: dict[str, Any]) -> list[dict[str, Any]]:
                 raise MediaError("图像 Base64 数据无效。") from exc
             if len(raw) > MAX_DOWNLOAD_BYTES:
                 raise MediaError("图像结果超过本地文件上限。")
-            mime = str(artifact.get("mime_type", ""))
+            # Re-sniff persisted base64 data on save as well. Older records may
+            # have been written by versions that labeled every image result as
+            # PNG, even when a provider returned JPEG bytes.
+            mime = _base64_image_mime(str(artifact.get("value", "")))
             if mime == "image/png":
                 _validate_png(raw)
                 extension = ".png"
             elif mime == "image/jpeg":
-                if not raw.startswith(b"\xff\xd8\xff"):
-                    raise MediaError("图像结果不是有效的 JPEG 文件。")
+                if not raw.startswith(b"\xff\xd8\xff") or not raw.endswith(b"\xff\xd9"):
+                    raise MediaError("JPEG 图像结果不完整或缺少结束标记。", code="ARTIFACT_INTEGRITY_FAILED")
                 extension = ".jpg"
             else:
                 raise MediaError("图像结果格式不受支持。")
@@ -1129,7 +1944,7 @@ def _save_artifacts(record: dict[str, Any]) -> list[dict[str, Any]]:
                 temporary = target.with_name(target.name + ".tmp-" + uuid.uuid4().hex)
                 temporary.write_bytes(raw)
                 os.replace(temporary, target)
-            saved.append({"path": str(target.resolve()), "bytes": len(raw), "kind": artifact.get("kind", "image")})
+            saved.append({"path": str(target.resolve()), "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest(), "kind": artifact.get("kind", "image")})
         elif artifact.get("url"):
             url = _validate_public_url(artifact["url"])
             parsed = urllib.parse.urlsplit(url)
@@ -1138,22 +1953,81 @@ def _save_artifacts(record: dict[str, Any]) -> list[dict[str, Any]]:
             if suffix not in allowed_exts:
                 suffix = ".mp4" if artifact.get("kind") == "video" else ".png"
             target = output_root / f"result-{index}{suffix}"
-            size = target.stat().st_size if target.exists() else _safe_download(url, target)
-            saved.append({"path": str(target.resolve()), "bytes": size, "kind": artifact.get("kind", "image")})
+            kind = artifact.get("kind", "image")
+            prior = (record.get("saved_artifacts") or [])
+            previous = prior[index - 1] if len(prior) >= index else None
+            if target.exists():
+                raw = target.read_bytes()
+                digest = hashlib.sha256(raw).hexdigest()
+                if not isinstance(previous, dict) or previous.get("sha256") != digest or int(previous.get("bytes", -1)) != len(raw):
+                    raise MediaError("已存在的本地媒体结果缺少可信校验值或内容已被修改；拒绝复用。", code="ARTIFACT_INTEGRITY_FAILED")
+                content_type = mimetypes.guess_type(target.name)[0] or ""
+                size = len(raw)
+            else:
+                size, content_type = _safe_download(url, target)
+                raw = target.read_bytes()
+                digest = hashlib.sha256(raw).hexdigest()
+            allowed_types = IMAGE_TYPES if kind == "image" else VIDEO_TYPES
+            if content_type and content_type not in allowed_types and content_type != "application/octet-stream":
+                target.unlink(missing_ok=True)
+                raise MediaError("结果 Content-Type 与图像/视频类型不匹配。", code="ARTIFACT_INTEGRITY_FAILED")
+            if kind == "image":
+                valid_magic = raw.startswith((b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a")) or (len(raw) >= 12 and raw[:4] == b"RIFF" and raw[8:12] == b"WEBP")
+            else:
+                valid_magic = b"ftyp" in raw[:16] or raw.startswith(b"\x1aE\xdf\xa3")
+            if not valid_magic:
+                target.unlink(missing_ok=True)
+                raise MediaError("结果文件头与图像/视频格式不匹配。", code="ARTIFACT_INTEGRITY_FAILED")
+            if kind == "image" and raw.startswith(b"\x89PNG\r\n\x1a\n"):
+                _validate_png(raw)
+            if kind == "image" and raw.startswith(b"\xff\xd8\xff") and not raw.endswith(b"\xff\xd9"):
+                target.unlink(missing_ok=True)
+                raise MediaError("JPEG 结果缺少结束标记。", code="ARTIFACT_INTEGRITY_FAILED")
+            saved.append({"path": str(target.resolve()), "bytes": size, "sha256": digest, "kind": kind})
     return saved
 
 
 def media_save(args: dict[str, Any]) -> dict[str, Any]:
     with _confirmation_operation_lock(str(args.get("confirmation_id", "")), "保存"):
         path, record = _validated_record(args, allow_submitting=True)
-        if record.get("state") not in {"completed", "task_created"}:
+        if record.get("state") not in {"completed", "completed_saved", "completed_pending_save", "task_created"}:
             raise MediaError("仅已完成或已有异步 task_id 的任务可保存；先调用 media_check。")
         if record.get("state") == "task_created":
             raise MediaError("任务尚未完成；先调用 media_check 获取结果。")
-        saved = record.get("saved_artifacts") or _save_artifacts(record)
-        record["saved_artifacts"] = saved
-        _atomic_json(path, record)
         output_root = _data_root() / "outputs" / record["confirmation_id"]
+        if output_root.exists():
+            for partial in output_root.glob("*.part"):
+                partial.unlink(missing_ok=True)
+        if record.get("operation_state"):
+            raise MediaError("该媒体任务正在检查或保存；请稍后重试。", code="OPERATION_IN_PROGRESS", submission_state=record.get("state"))
+        record["operation_state"] = "saving"
+        record["operation_token"] = uuid.uuid4().hex
+        token = record["operation_token"]
+        _atomic_json(path, record)
+        try:
+            saved = record.get("saved_artifacts") or _save_artifacts(record)
+        except Exception:
+            current = _load_json(path)
+            if current.get("operation_token") == token:
+                current["operation_state"] = ""
+                current["operation_token"] = ""
+                current["state"] = "completed_pending_save"
+                _atomic_json(path, current)
+            raise
+        record["saved_artifacts"] = saved
+        record["state"] = "completed_saved"
+        record["operation_state"] = ""
+        record["operation_token"] = ""
+        record["saved_at"] = int(time.time())
+        _atomic_json(path, record)
+        for item in saved:
+            saved_path = Path(str(item.get("path", ""))).resolve()
+            try:
+                saved_path.relative_to(output_root.resolve())
+            except ValueError as exc:
+                raise MediaError("保存记录指向任务目录之外；拒绝报告成功。", code="ARTIFACT_INTEGRITY_FAILED") from exc
+            if not saved_path.is_file() or saved_path.stat().st_size != int(item.get("bytes", -1)) or hashlib.sha256(saved_path.read_bytes()).hexdigest() != item.get("sha256"):
+                raise MediaError("已保存结果与本地校验值不一致；拒绝报告成功。", code="ARTIFACT_INTEGRITY_FAILED")
         return {"success": True, "saved": saved, "output_dir": str(output_root.resolve()), "api_request_sent": False}
 
 
@@ -1177,12 +2051,19 @@ def _configured() -> dict[str, Any]:
         missing = [name for name, ok in (("MEDIA_GENERATION_API_BASE_URL", base_ok), ("MEDIA_GENERATION_API_KEY", key_ok), (config["model_env"], model_ok)) if not ok]
         if not route_ok:
             missing.append("MEDIA_GENERATION_API_PROFILE=wokey" if provider == "minimax-video" else "MEDIA_GENERATION_AGENT_ID")
+        catalog_ok = False
+        try:
+            catalog_ok = model in _catalog_snapshot()["ids"]
+        except MediaError:
+            pass
         providers[provider] = {"configured": provider_configured, "missing": missing, "model": model,
+                               "catalog_verified_model": catalog_ok,
                                "can_accept_explicit_model": base_ok and key_ok and route_ok and provider != "minimax-video"}
     cached = _runtime_config(allow_gateway_mismatch=True)
     active_gateway = os.environ.get("MEDIA_GENERATION_API_BASE_URL", "").strip().rstrip("/")
     catalog_matches = bool(cached.get("gateway")) and cached.get("gateway") == active_gateway
     catalog_at = cached.get("catalogVerifiedAt") if catalog_matches else None
+    catalog_fresh = bool(catalog_at and int(time.time()) - int(catalog_at) <= MODEL_CATALOG_TTL_SECONDS and cached.get("profile") == _api_profile())
     catalog_count = len(cached.get("catalogIds", [])) if catalog_matches and isinstance(cached.get("catalogIds"), list) else 0
     return {
         "local_runtime": "available",
@@ -1191,7 +2072,7 @@ def _configured() -> dict[str, Any]:
         "base_url_configured": base_ok,
         "api_profile": _api_profile(),
         "http_timeout_seconds": HTTP_TIMEOUT_SECONDS,
-        "gateway_catalog": {"status": "previously_verified" if catalog_at else "not_checked", "verified_at": catalog_at, "model_count": catalog_count},
+        "gateway_catalog": {"status": "fresh" if catalog_fresh else "stale" if catalog_at else "not_checked", "verified_at": catalog_at, "model_count": catalog_count, "ttl_seconds": MODEL_CATALOG_TTL_SECONDS},
         "generation_capability": "not_tested",
         "providers": providers,
         "price_source": "not available from this MCP; check the provider before approval",
@@ -1199,9 +2080,9 @@ def _configured() -> dict[str, Any]:
 
 
 TOOL_SCHEMAS = [
-    {"name": "media_refresh_models", "description": "使用统一网关只读模型目录发现并保存默认媒体模型；联网认证但不提交生成任务。", "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}},
+    {"name": "media_refresh_models", "description": "使用统一网关只读模型目录发现并保存默认媒体模型。联网认证，不提交生成任务；目录可用于准备请求 24 小时，目录命中不代表生成权限已实测。", "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}},
     {"name": "media_capabilities", "description": "查看本地运行时、凭据/模型配置和最近一次网关目录验证状态；不联网、不计费。真实生图/视频能力默认未测试。", "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}},
-    {"name": "media_prepare", "description": "离线准备图片或视频请求，创建 30 分钟有效、不可变的本地确认记录；不联网、不提交计费任务。正式生成前必须向用户展示摘要并等待明确确认。", "inputSchema": {"type": "object", "properties": {"provider": {"type": "string", "enum": list(PROVIDERS)}, "prompt": {"type": "string", "minLength": 1}, "model": {"type": "string"}, "reference_media": {"type": "array", "items": {"type": "object", "properties": {"kind": {"type": "string", "enum": ["image", "video", "audio"]}, "url": {"type": "string"}, "local_path": {"type": "string"}}, "required": ["kind"], "additionalProperties": False}}, "parameters": {"type": "object"}}, "required": ["provider", "prompt"], "additionalProperties": False}},
+    {"name": "media_prepare", "description": "离线准备图片或视频请求，要求模型在当前网关最近 24 小时目录中；创建 30 分钟有效的本地确认记录，不提交计费任务。Grok 视频图片请显式设置 role=first_frame 或 role=reference；旧调用省略 role 时按首帧处理。Grok 视频必须在 parameters 中明确提供非空 aspect_ratio 和 resolution。正式生成前必须展示实际请求摘要并等待用户明确确认；未知提交不自动重发。", "inputSchema": {"type": "object", "properties": {"provider": {"type": "string", "enum": list(PROVIDERS)}, "prompt": {"type": "string", "minLength": 1}, "model": {"type": "string"}, "reference_media": {"type": "array", "items": {"type": "object", "properties": {"kind": {"type": "string", "enum": ["image", "video", "audio"]}, "role": {"type": "string", "enum": ["first_frame", "reference"]}, "url": {"type": "string"}, "local_path": {"type": "string"}}, "required": ["kind"], "additionalProperties": False}}, "parameters": {"type": "object"}, "repeat_after_unknown_ack": {"type": "string", "enum": ["确认此前任务可能已计费且仍要求新生成"]}}, "required": ["provider", "prompt"], "additionalProperties": False}},
     {"name": "media_submit", "description": "使用 media_prepare 返回的确认 ID/指纹提交一次计费请求。只有用户明确确认该确切请求后才调用；图像同步结果会在本机验证并保存，状态未知时禁止重发。", "inputSchema": {"type": "object", "properties": {"confirmation_id": {"type": "string"}, "confirmation_fingerprint": {"type": "string"}, "user_confirmation": {"type": "string", "enum": ["确认", "就按这份生成"]}}, "required": ["confirmation_id", "confirmation_fingerprint", "user_confirmation"], "additionalProperties": False}},
     {"name": "media_check", "description": "仅查询同一确认记录已创建的异步任务；不会创建或重发任务。", "inputSchema": {"type": "object", "properties": {"confirmation_id": {"type": "string"}, "confirmation_fingerprint": {"type": "string"}}, "required": ["confirmation_id", "confirmation_fingerprint"], "additionalProperties": False}},
     {"name": "media_save", "description": "把已完成任务返回的图像/视频 URL 或 base64 结果保存到本机媒体输出目录；仅下载结果，不提交新的计费任务。", "inputSchema": {"type": "object", "properties": {"confirmation_id": {"type": "string"}, "confirmation_fingerprint": {"type": "string"}}, "required": ["confirmation_id", "confirmation_fingerprint"], "additionalProperties": False}},
@@ -1222,6 +2103,42 @@ def _call_tool(name: str, args: dict[str, Any]) -> Any:
     if name == "media_save":
         return media_save(args)
     raise MediaError(f"未知工具: {name}")
+
+
+def _media_error_envelope(exc: MediaError) -> dict[str, Any]:
+    result: dict[str, Any] = {"success": False, "state": exc.submission_state or "rejected",
+                              "error": {"code": exc.code, "safe_message": exc.safe_message,
+                                        "retryable": bool(exc.retryable)}}
+    for key, value in (("http_status", exc.http_status), ("provider_request_id", exc.provider_request_id),
+                       ("gateway_request_id", exc.gateway_request_id)):
+        if value is not None:
+            result["error"][key] = value
+    if exc.provider is not None:
+        result["provider"] = exc.provider
+    if exc.model is not None:
+        result["model"] = exc.model
+    if exc.api_request_sent is not None:
+        result["api_request_sent"] = exc.api_request_sent
+    result.update({key: value for key, value in exc.details.items() if value is not None})
+    return result
+
+
+def _normalize_tool_result(name: str, args: dict[str, Any], value: dict[str, Any]) -> dict[str, Any]:
+    """Stable top-level tool envelope while preserving legacy result fields."""
+    result = dict(value)
+    result.setdefault("success", True)
+    result.setdefault("state", "reported")
+    for key in ("provider", "model", "confirmation_id", "submission_id", "task_id"):
+        if result.get(key) is None:
+            candidate = args.get(key)
+            if candidate is not None:
+                result[key] = candidate
+    result.setdefault("api_request_sent", False)
+    result.setdefault("artifacts", [])
+    result.setdefault("saved", [])
+    result.setdefault("error", None)
+    result.setdefault("timestamps", {"returned_at_epoch": int(time.time())})
+    return result
 
 
 def _send(message: dict[str, Any]) -> None:
@@ -1276,10 +2193,13 @@ def main() -> None:
             name = str(params.get("name", ""))
             args = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
             try:
-                result = _call_tool(name, args)
+                result = _normalize_tool_result(name, args, _call_tool(name, args))
                 _send({"jsonrpc": "2.0", "id": request_id, "result": {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}], "isError": False}})
             except MediaError as exc:
-                _send({"jsonrpc": "2.0", "id": request_id, "result": {"content": [{"type": "text", "text": str(exc)}], "isError": True}})
+                envelope = _normalize_tool_result(name, args, _media_error_envelope(exc))
+                envelope["success"] = False
+                envelope["error"] = envelope.pop("error")
+                _send({"jsonrpc": "2.0", "id": request_id, "result": {"content": [{"type": "text", "text": json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))}], "structuredContent": envelope, "isError": True}})
             except Exception as exc:  # Do not leak traceback or environment data into the MCP stream.
                 _send({"jsonrpc": "2.0", "id": request_id, "result": {"content": [{"type": "text", "text": f"媒体 MCP 内部错误: {type(exc).__name__}"}], "isError": True}})
         elif request_id is not None:
@@ -1325,7 +2245,7 @@ if __name__ == "__main__":
                     and len(tools) == len(TOOL_SCHEMAS)
                     and any("统一" in str(item.get("description", "")) for item in tools)
                     and capabilities.get("generation_capability") == "not_tested"
-                    and capabilities.get("gateway_catalog", {}).get("status") in {"not_checked", "previously_verified"}
+                    and capabilities.get("gateway_catalog", {}).get("status") in {"not_checked", "fresh", "stale"}
                 )
                 protocol_error = "protocol_contract_mismatch" if not protocol_ready else ""
             except Exception as exc:

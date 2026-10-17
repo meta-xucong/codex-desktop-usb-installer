@@ -1,31 +1,13 @@
 {
   "schemaVersion": 2,
   "id": "codex-starter",
-  "version": "1.5.3",
+  "version": "1.5.4",
   "hashScope": "all pack files except file-manifest.json and checksums.sha256; text files use LF canonicalization",
   "files": [
     {
-      "path": "ENVIRONMENT-MCP-INVENTORY.md",
-      "sha256": "1e2b30d3a00d739ccae01854c6665b2e6b894db812c4b2cd45e29e2b0973f42c",
-      "bytes": 9231,
-      "owned": true
-    },
-    {
-      "path": "Install-Codex-Starter.cmd",
-      "sha256": "fe7fa6d3fed9ac616380e787b35e02ef5310617caadaa5000eb2991bf9534728",
-      "bytes": 707,
-      "owned": true
-    },
-    {
-      "path": "README.md",
-      "sha256": "4675c4ee4149a3683e9435db1387e35d1bd85675af0b6390a6150b17670283ce",
-      "bytes": 15922,
-      "owned": true
-    },
-    {
       "path": "agents/content.toml",
-      "sha256": "991237be24c5690a9bf4668112c9c4cf453f4591f8b5846a8370afde37c52d46",
-      "bytes": 1150,
+      "sha256": "38151ddbef5e8157bf5b68b332111d46300b8c0d671466d113e42d81a75e4288",
+      "bytes": 1478,
       "owned": true
     },
     {
@@ -66,14 +48,8 @@
     },
     {
       "path": "audit-codex-compatibility.py",
-      "sha256": "a0224c0fd8c5cf43792815628072b63b67beffaaf4ee4bb601b436c42c41ae78",
-      "bytes": 65356,
-      "owned": true
-    },
-    {
-      "path": "config-fragments/README.md",
-      "sha256": "200a96d9f0846d883956bacb0cb810b131ae814c52049f58196e851a9aae250a",
-      "bytes": 1726,
+      "sha256": "8ff5865b105ecc26017edb17c3581944bf546c55ebaa0f4ffdb0453c6844a85e",
+      "bytes": 65686,
       "owned": true
     },
     {
@@ -101,21 +77,27 @@
       "owned": true
     },
     {
+      "path": "config-fragments/README.md",
+      "sha256": "200a96d9f0846d883956bacb0cb810b131ae814c52049f58196e851a9aae250a",
+      "bytes": 1726,
+      "owned": true
+    },
+    {
       "path": "configure-codex.ps1",
-      "sha256": "dc67a71394ba431dd1eba5450c4af03d202f1b19185bbb36d1608a258f9deab1",
-      "bytes": 6916,
+      "sha256": "adc3cce9eca57234398632d8b98783a34252d40430ee701f85cd89a44cf9fae7",
+      "bytes": 9010,
       "owned": true
     },
     {
       "path": "dependencies.json",
-      "sha256": "d86c799433ad0dfcab94145c4a8ca7343c88d42c72bcde701ab46953af2996d5",
-      "bytes": 119962,
+      "sha256": "3a6407b3feede3e9aea635ae5611714ad7dfb50416adfea773555c48cea652cb",
+      "bytes": 120071,
       "owned": true
     },
     {
       "path": "docs/CODEX-ADAPTATION-DEVELOPMENT.md",
-      "sha256": "6124d7f53142778f3b8f43e44f3cbf8725458b1343ad2a65906d0eae192acfa3",
-      "bytes": 22098,
+      "sha256": "9540f348aa89b059f861b6a75402623911130b22181b1d2be25a72a6a9602709",
+      "bytes": 22291,
       "owned": true
     },
     {
@@ -137,15 +119,21 @@
       "owned": true
     },
     {
+      "path": "docs/media-mcp-reliability-v1.3.3.md",
+      "sha256": "0b825480d92d5b46d938a9ff394b1cb05ab4a8ec75ece9018f9aab60f50973d8",
+      "bytes": 12121,
+      "owned": true
+    },
+    {
       "path": "docs/POST-MERGE-CORRECTIVE-DEVELOPMENT.md",
       "sha256": "95b864caf40a76d44f5e7390fdd4d36ad52f3da419d6ad568ac91b11305c35b0",
       "bytes": 6877,
       "owned": true
     },
     {
-      "path": "docs/media-mcp-reliability-v1.3.3.md",
-      "sha256": "0b825480d92d5b46d938a9ff394b1cb05ab4a8ec75ece9018f9aab60f50973d8",
-      "bytes": 12121,
+      "path": "ENVIRONMENT-MCP-INVENTORY.md",
+      "sha256": "1e2b30d3a00d739ccae01854c6665b2e6b894db812c4b2cd45e29e2b0973f42c",
+      "bytes": 9231,
       "owned": true
     },
     {
@@ -155,8 +143,14 @@
       "owned": true
     },
     {
+      "path": "Install-Codex-Starter.cmd",
+      "sha256": "fe7fa6d3fed9ac616380e787b35e02ef5310617caadaa5000eb2991bf9534728",
+      "bytes": 707,
+      "owned": true
+    },
+    {
       "path": "install-to-codex.ps1",
-      "sha256": "67860f3e95c6d2e9fa150d17798f077c37082da95d78984fd180df0ad3a935ef",
+      "sha256": "f1531c56219e4d2b3d2334e9ae1561caf0ff78243a9b61fc2ff2f6ae72261188",
       "bytes": 56176,
       "owned": true
     },
@@ -216,14 +210,14 @@
     },
     {
       "path": "manifest/mcp-servers.json",
-      "sha256": "733c0f265ba5303040c4e9c64c181a28a22365220873d28659ceb8c01a209968",
-      "bytes": 9744,
+      "sha256": "baa068f804537dafc95084c1649bf6a472e3392495ff323c991725f481ca9aeb",
+      "bytes": 10138,
       "owned": true
     },
     {
       "path": "manifest/media-generation-tools.json",
-      "sha256": "b62debedf94d940c73b50016969dbe6d2bf6ee137588847b327cea442aac7fdf",
-      "bytes": 2342,
+      "sha256": "4c40114cbfd48d1456656f2c5dd98c3258d8450e7375612e366da9703bb2effa",
+      "bytes": 2790,
       "owned": true
     },
     {
@@ -234,20 +228,14 @@
     },
     {
       "path": "manifest/skill-audit.json",
-      "sha256": "67a3bb12666830575cb406bdb59c1f19902544df53737747bf02d588b90ded0d",
-      "bytes": 83530,
+      "sha256": "54ac637b3aaa993827d15f6c79c97513b5a1fa5fb1954b3384a6edf20f12b0e9",
+      "bytes": 83586,
       "owned": true
     },
     {
       "path": "manifest/source-notes.md",
       "sha256": "a8535e7e76a215ff2ee9fb09b4211ff2076444283fb69bc71fb2c78d0a04196e",
       "bytes": 3189,
-      "owned": true
-    },
-    {
-      "path": "mcp/README.md",
-      "sha256": "89e39ac97ffd18fa51add6f391e880829eb5ef3b48975a5030c9b8bf1465bf7c",
-      "bytes": 601,
       "owned": true
     },
     {
@@ -270,20 +258,26 @@
     },
     {
       "path": "mcp/mcp-servers.json",
-      "sha256": "a34fe825b72ed07e72c287d528f87a687719ea8b565d7f08063bb1a011a02000",
-      "bytes": 9742,
+      "sha256": "baa068f804537dafc95084c1649bf6a472e3392495ff323c991725f481ca9aeb",
+      "bytes": 10138,
       "owned": true
     },
     {
       "path": "mcp/media-generation-mcp.py",
-      "sha256": "98cf9c7960ad2b4843d9209399c57d957958fca94cf363e96ca51adaa7109c8b",
-      "bytes": 74118,
+      "sha256": "400cd52d52ab29ca7dc910358e777be5deff86fef9fac80db4f59141c5294df9",
+      "bytes": 131512,
       "owned": true
     },
     {
       "path": "mcp/media-generation.template.env",
       "sha256": "3da56c9d830f9f48b9401a12de8ae06f844af38a9cc0681e4a762b1c2e36ea7b",
       "bytes": 759,
+      "owned": true
+    },
+    {
+      "path": "mcp/README.md",
+      "sha256": "89e39ac97ffd18fa51add6f391e880829eb5ef3b48975a5030c9b8bf1465bf7c",
+      "bytes": 601,
       "owned": true
     },
     {
@@ -294,8 +288,8 @@
     },
     {
       "path": "mcp/start-media-generation-mcp.ps1",
-      "sha256": "af1532340d08ae57980f4c40169047d34e60ab14fd7be160fcdee0d1c4962a1d",
-      "bytes": 8895,
+      "sha256": "e781e12a15acd6b5a2c857b575ac996adf95053b3cca4f85b882ef2028def7a1",
+      "bytes": 6825,
       "owned": true
     },
     {
@@ -306,26 +300,20 @@
     },
     {
       "path": "pack.json",
-      "sha256": "fd2a4248d7cf9ae6372979e4cdfe9d9f1d64023cf5d91b4a16799484ef663bbc",
+      "sha256": "a2877556f1244d4d571cf0405c1ab416d23de06277b101c448c6e63d64799f2c",
       "bytes": 4072,
       "owned": true
     },
     {
+      "path": "README.md",
+      "sha256": "4675c4ee4149a3683e9435db1387e35d1bd85675af0b6390a6150b17670283ce",
+      "bytes": 15922,
+      "owned": true
+    },
+    {
       "path": "render-codex-config.ps1",
-      "sha256": "1ed30e65b6251602f2cef5586a17bf25465ff0cbbb5755679b466f2dccf26d1c",
+      "sha256": "9d3463cb727faa96b1969cbf7ddb391b14b16dc79664c5e69385b2b71a101016",
       "bytes": 11997,
-      "owned": true
-    },
-    {
-      "path": "runtime/README.md",
-      "sha256": "8778556ff3e66e5cd37f8d5d620688c2580bffe7a60adf9acb54ec71491b750c",
-      "bytes": 1676,
-      "owned": true
-    },
-    {
-      "path": "runtime/THIRD-PARTY-NOTICES.md",
-      "sha256": "7617af654cfaadfe73fd0ef99bb634e7ff808811529c3a0b8456ba7ac4fcd5f1",
-      "bytes": 1005,
       "owned": true
     },
     {
@@ -869,9 +857,21 @@
       "owned": true
     },
     {
+      "path": "runtime/README.md",
+      "sha256": "8778556ff3e66e5cd37f8d5d620688c2580bffe7a60adf9acb54ec71491b750c",
+      "bytes": 1676,
+      "owned": true
+    },
+    {
       "path": "runtime/requirements-python-win-x64-py312.in",
       "sha256": "d406dfbaa5264b040ab48a4207dd9d0ddf49d77340122e708047c78ee46a50dc",
       "bytes": 627,
+      "owned": true
+    },
+    {
+      "path": "runtime/THIRD-PARTY-NOTICES.md",
+      "sha256": "7617af654cfaadfe73fd0ef99bb634e7ff808811529c3a0b8456ba7ac4fcd5f1",
+      "bytes": 1005,
       "owned": true
     },
     {
@@ -887,21 +887,15 @@
       "owned": true
     },
     {
-      "path": "skills/canvas/SKILL.md",
-      "sha256": "bf76e2423ad3b93513029cfc0efc54a2e6739b53c244dfe4f7e7554cfd5ae6ee",
-      "bytes": 1160,
-      "owned": true
-    },
-    {
       "path": "skills/canvas/agents/openai.yaml",
       "sha256": "07e2ea5845c5656701ecd051e3fa22cba58d21f4daf6d0634603e370372691eb",
       "bytes": 288,
       "owned": true
     },
     {
-      "path": "skills/china-stock-analysis/SKILL.md",
-      "sha256": "d61cee09a599f7db432ab9d88397355f9c097d58befa0e40a17feda97f52660f",
-      "bytes": 7658,
+      "path": "skills/canvas/SKILL.md",
+      "sha256": "bf76e2423ad3b93513029cfc0efc54a2e6739b53c244dfe4f7e7554cfd5ae6ee",
+      "bytes": 1160,
       "owned": true
     },
     {
@@ -965,6 +959,12 @@
       "owned": true
     },
     {
+      "path": "skills/china-stock-analysis/SKILL.md",
+      "sha256": "d61cee09a599f7db432ab9d88397355f9c097d58befa0e40a17feda97f52660f",
+      "bytes": 7658,
+      "owned": true
+    },
+    {
       "path": "skills/china-stock-analysis/templates/analysis_report.md",
       "sha256": "4ca48e30728201389f10929d404b7d9845b7ce70cca5f3b1416953a8bc9e6024",
       "bytes": 3069,
@@ -989,12 +989,6 @@
       "owned": true
     },
     {
-      "path": "skills/daily-reflection/SKILL.md",
-      "sha256": "32770860186a4edef1071f90a514509cb4c994f12d5836532f4dad1c07750321",
-      "bytes": 21783,
-      "owned": true
-    },
-    {
       "path": "skills/daily-reflection/scripts/reflection.ps1",
       "sha256": "2d78bec6f6de84384a6b612a0ea01830d7944929694fadcecae5c81bfa93ad76",
       "bytes": 1896,
@@ -1007,9 +1001,9 @@
       "owned": true
     },
     {
-      "path": "skills/data-assistant/SKILL.md",
-      "sha256": "e10129777a52c421e451d30d382b5751d26a77bf4977da03b1d4ec9394426fd5",
-      "bytes": 2711,
+      "path": "skills/daily-reflection/SKILL.md",
+      "sha256": "32770860186a4edef1071f90a514509cb4c994f12d5836532f4dad1c07750321",
+      "bytes": 21783,
       "owned": true
     },
     {
@@ -1019,15 +1013,21 @@
       "owned": true
     },
     {
-      "path": "skills/docx-butler/SKILL.md",
-      "sha256": "ac85bf87ec4502c377b31b58da9da3f91c48cb39337852037db91417680c7739",
-      "bytes": 12028,
+      "path": "skills/data-assistant/SKILL.md",
+      "sha256": "e10129777a52c421e451d30d382b5751d26a77bf4977da03b1d4ec9394426fd5",
+      "bytes": 2711,
       "owned": true
     },
     {
       "path": "skills/docx-butler/agents/openai.yaml",
       "sha256": "83bd450d2dca8bce7fe7deae6af4e9c429cee5081665fa91d01a37de6eca6df9",
       "bytes": 286,
+      "owned": true
+    },
+    {
+      "path": "skills/docx-butler/SKILL.md",
+      "sha256": "ac85bf87ec4502c377b31b58da9da3f91c48cb39337852037db91417680c7739",
+      "bytes": 12028,
       "owned": true
     },
     {
@@ -1040,12 +1040,6 @@
       "path": "skills/email-expert/SKILL.md",
       "sha256": "1a9b6fcf1ecbd7f995623d228fa921847451e3ba9649db7743b4126ba5b8b63d",
       "bytes": 4184,
-      "owned": true
-    },
-    {
-      "path": "skills/excel-xlsx/SKILL.md",
-      "sha256": "021c19f1f3060c13ec2f51c6e0e71a1bd301b2ceb21f2b8b73e86cbd664d6dff",
-      "bytes": 3669,
       "owned": true
     },
     {
@@ -1067,9 +1061,9 @@
       "owned": true
     },
     {
-      "path": "skills/feishu-doc/SKILL.md",
-      "sha256": "578dd987de48a9901a70562e75d593026e45d16343dd95efc87155e53b67d034",
-      "bytes": 2485,
+      "path": "skills/excel-xlsx/SKILL.md",
+      "sha256": "021c19f1f3060c13ec2f51c6e0e71a1bd301b2ceb21f2b8b73e86cbd664d6dff",
+      "bytes": 3669,
       "owned": true
     },
     {
@@ -1079,9 +1073,9 @@
       "owned": true
     },
     {
-      "path": "skills/feishu-drive/SKILL.md",
-      "sha256": "58069b7c57f8b9ae49d493c1a303d49e0eef8073b901e5c5cd2bdb328f1b03ff",
-      "bytes": 2215,
+      "path": "skills/feishu-doc/SKILL.md",
+      "sha256": "578dd987de48a9901a70562e75d593026e45d16343dd95efc87155e53b67d034",
+      "bytes": 2485,
       "owned": true
     },
     {
@@ -1091,9 +1085,9 @@
       "owned": true
     },
     {
-      "path": "skills/feishu-perm/SKILL.md",
-      "sha256": "bceeb7c058937e5aa97e9eec7523e7c28c1e6cf1d2bc26a1016406659979546f",
-      "bytes": 1965,
+      "path": "skills/feishu-drive/SKILL.md",
+      "sha256": "58069b7c57f8b9ae49d493c1a303d49e0eef8073b901e5c5cd2bdb328f1b03ff",
+      "bytes": 2215,
       "owned": true
     },
     {
@@ -1103,9 +1097,9 @@
       "owned": true
     },
     {
-      "path": "skills/feishu-wiki/SKILL.md",
-      "sha256": "1386e9ae1bd18d365e7be683286ee8fa07d04727f7678c050213c821c5237a21",
-      "bytes": 2203,
+      "path": "skills/feishu-perm/SKILL.md",
+      "sha256": "bceeb7c058937e5aa97e9eec7523e7c28c1e6cf1d2bc26a1016406659979546f",
+      "bytes": 1965,
       "owned": true
     },
     {
@@ -1115,9 +1109,9 @@
       "owned": true
     },
     {
-      "path": "skills/fitness-coach/SKILL.md",
-      "sha256": "82cfff4858e8e991267587e0b3ccecfd8e78f3a2e25d50a19e9612756e0172d4",
-      "bytes": 11504,
+      "path": "skills/feishu-wiki/SKILL.md",
+      "sha256": "1386e9ae1bd18d365e7be683286ee8fa07d04727f7678c050213c821c5237a21",
+      "bytes": 2203,
       "owned": true
     },
     {
@@ -1139,9 +1133,9 @@
       "owned": true
     },
     {
-      "path": "skills/fund-portfolio/SKILL.md",
-      "sha256": "a2588e7af9709962da95e1e6cfcc8503b8bf56272da899a0d1920563cb9285a7",
-      "bytes": 4653,
+      "path": "skills/fitness-coach/SKILL.md",
+      "sha256": "82cfff4858e8e991267587e0b3ccecfd8e78f3a2e25d50a19e9612756e0172d4",
+      "bytes": 11504,
       "owned": true
     },
     {
@@ -1175,15 +1169,15 @@
       "owned": true
     },
     {
-      "path": "skills/grok-video-prompt-compiler/.gitignore",
-      "sha256": "0ad5d444f39c41d389f6662b233b9a93d2d1047e1038db1a6801c8731f185f88",
-      "bytes": 50,
+      "path": "skills/fund-portfolio/SKILL.md",
+      "sha256": "a2588e7af9709962da95e1e6cfcc8503b8bf56272da899a0d1920563cb9285a7",
+      "bytes": 4653,
       "owned": true
     },
     {
-      "path": "skills/grok-video-prompt-compiler/SKILL.md",
-      "sha256": "7264ab4d2508d00c417a530cc61059e3a5f7fa94f8419c0463676343feceb9c4",
-      "bytes": 14498,
+      "path": "skills/grok-video-prompt-compiler/.gitignore",
+      "sha256": "0ad5d444f39c41d389f6662b233b9a93d2d1047e1038db1a6801c8731f185f88",
+      "bytes": 50,
       "owned": true
     },
     {
@@ -1259,15 +1253,15 @@
       "owned": true
     },
     {
-      "path": "skills/growth-analyst/SKILL.md",
-      "sha256": "4f8033d05a90b28da9606d9ec23a80de0787acd1a647d184a8ed1a989fbb1860",
-      "bytes": 7257,
+      "path": "skills/grok-video-prompt-compiler/SKILL.md",
+      "sha256": "70d7026265b847018bdf65a95f86e2685399b1da5333eaccf504694921b28912",
+      "bytes": 15201,
       "owned": true
     },
     {
-      "path": "skills/healthcheck/SKILL.md",
-      "sha256": "e22cfdda6d98cfd852bf2d27bf774efc0b3cc3e19a678a0a13d32ce2c92e4ed5",
-      "bytes": 1186,
+      "path": "skills/growth-analyst/SKILL.md",
+      "sha256": "4f8033d05a90b28da9606d9ec23a80de0787acd1a647d184a8ed1a989fbb1860",
+      "bytes": 7257,
       "owned": true
     },
     {
@@ -1277,9 +1271,9 @@
       "owned": true
     },
     {
-      "path": "skills/hyperframes-video/SKILL.md",
-      "sha256": "21beea0c3c90f78c2119879a9772d1fc684c5d4a29560f8ccd6828f9ff96eada",
-      "bytes": 1493,
+      "path": "skills/healthcheck/SKILL.md",
+      "sha256": "e22cfdda6d98cfd852bf2d27bf774efc0b3cc3e19a678a0a13d32ce2c92e4ed5",
+      "bytes": 1186,
       "owned": true
     },
     {
@@ -1289,9 +1283,9 @@
       "owned": true
     },
     {
-      "path": "skills/image-2/SKILL.md",
-      "sha256": "ab5525fb77d8c8e85f830861a1cce1bed07ddb3892dfde3fed0a3858eae01a1c",
-      "bytes": 3502,
+      "path": "skills/hyperframes-video/SKILL.md",
+      "sha256": "21beea0c3c90f78c2119879a9772d1fc684c5d4a29560f8ccd6828f9ff96eada",
+      "bytes": 1493,
       "owned": true
     },
     {
@@ -1301,9 +1295,15 @@
       "owned": true
     },
     {
+      "path": "skills/image-2/SKILL.md",
+      "sha256": "ab5525fb77d8c8e85f830861a1cce1bed07ddb3892dfde3fed0a3858eae01a1c",
+      "bytes": 3502,
+      "owned": true
+    },
+    {
       "path": "skills/image-prompt-generator/SKILL.md",
-      "sha256": "96b35d13f70c947c92870790072d7ca1c7def1ed067e6be8229aff3d1ffb7431",
-      "bytes": 16225,
+      "sha256": "3d5cdf685d0c444f4dda06b76e474ad871e3e97ed9cca5d277985dd7d1c3a2cc",
+      "bytes": 16318,
       "owned": true
     },
     {
@@ -1313,21 +1313,15 @@
       "owned": true
     },
     {
-      "path": "skills/local-video-editing/SKILL.md",
-      "sha256": "ef69e1e12a6a16914ac846baf739cb8354f481aba8897a4fd4c1d13e69abf10b",
-      "bytes": 1021,
-      "owned": true
-    },
-    {
       "path": "skills/local-video-editing/agents/openai.yaml",
       "sha256": "1e2e6e6346f0bdbecb19859f45dac0528c67e310eac50282fa846ace8da57f89",
       "bytes": 283,
       "owned": true
     },
     {
-      "path": "skills/macro-research/SKILL.md",
-      "sha256": "7d3fdf2cbbb8fb0d0a79baae173d7a7ee0f1a44fd8f410edf53bb89de8df2d09",
-      "bytes": 6048,
+      "path": "skills/local-video-editing/SKILL.md",
+      "sha256": "ef69e1e12a6a16914ac846baf739cb8354f481aba8897a4fd4c1d13e69abf10b",
+      "bytes": 1021,
       "owned": true
     },
     {
@@ -1355,9 +1349,9 @@
       "owned": true
     },
     {
-      "path": "skills/manim-animation/SKILL.md",
-      "sha256": "80c22ef1740ac160f7bb652280e665e628597c24276547473b0aba8f0bc686a7",
-      "bytes": 1134,
+      "path": "skills/macro-research/SKILL.md",
+      "sha256": "7d3fdf2cbbb8fb0d0a79baae173d7a7ee0f1a44fd8f410edf53bb89de8df2d09",
+      "bytes": 6048,
       "owned": true
     },
     {
@@ -1367,9 +1361,9 @@
       "owned": true
     },
     {
-      "path": "skills/market-sizing-analysis/SKILL.md",
-      "sha256": "7035c30ae98e1aa884ea1944838a580c9c6822953ded32916915b58b227e419f",
-      "bytes": 12624,
+      "path": "skills/manim-animation/SKILL.md",
+      "sha256": "80c22ef1740ac160f7bb652280e665e628597c24276547473b0aba8f0bc686a7",
+      "bytes": 1134,
       "owned": true
     },
     {
@@ -1385,9 +1379,9 @@
       "owned": true
     },
     {
-      "path": "skills/meal-planner/SKILL.md",
-      "sha256": "7a4a00213abc5cc730cc2ae4a94ced6f8131a666795d89d598a85fa39b14e8bc",
-      "bytes": 11424,
+      "path": "skills/market-sizing-analysis/SKILL.md",
+      "sha256": "7035c30ae98e1aa884ea1944838a580c9c6822953ded32916915b58b227e419f",
+      "bytes": 12624,
       "owned": true
     },
     {
@@ -1409,21 +1403,27 @@
       "owned": true
     },
     {
+      "path": "skills/meal-planner/SKILL.md",
+      "sha256": "7a4a00213abc5cc730cc2ae4a94ced6f8131a666795d89d598a85fa39b14e8bc",
+      "bytes": 11424,
+      "owned": true
+    },
+    {
       "path": "skills/meeting-secretary/SKILL.md",
       "sha256": "b90358bcf099c8ec7786fda62fc472d4af17a70e29090d94f13701febf13b4fb",
       "bytes": 4715,
       "owned": true
     },
     {
-      "path": "skills/minimax-video-gen/SKILL.md",
-      "sha256": "0e789b0017d52cea333a5e54647dea6aac56ac05da7234ec143ff8e1a25d71f3",
-      "bytes": 2424,
-      "owned": true
-    },
-    {
       "path": "skills/minimax-video-gen/agents/openai.yaml",
       "sha256": "a543b9e61f52876f8cdb1177f32d4a8997b766accb6296a0bd95df4db8107d97",
       "bytes": 432,
+      "owned": true
+    },
+    {
+      "path": "skills/minimax-video-gen/SKILL.md",
+      "sha256": "0e789b0017d52cea333a5e54647dea6aac56ac05da7234ec143ff8e1a25d71f3",
+      "bytes": 2424,
       "owned": true
     },
     {
@@ -1436,12 +1436,6 @@
       "path": "skills/multi-search-engine/CHANNELLOG.md",
       "sha256": "cb8a448c0455678910863ed6af0819ba1c537c0df3c444407852a556fe4121d9",
       "bytes": 1135,
-      "owned": true
-    },
-    {
-      "path": "skills/multi-search-engine/SKILL.md",
-      "sha256": "84b40e37aaed7d1ae73f390f48c6fc5de9830d8d3ec305cea20e769f0e66f3f9",
-      "bytes": 1494,
       "owned": true
     },
     {
@@ -1463,15 +1457,21 @@
       "owned": true
     },
     {
-      "path": "skills/node-connect/SKILL.md",
-      "sha256": "e7cbfa88765511c0cb9131eb7967c9286772731f6c62720217d1c04a21ef7a5b",
-      "bytes": 939,
+      "path": "skills/multi-search-engine/SKILL.md",
+      "sha256": "84b40e37aaed7d1ae73f390f48c6fc5de9830d8d3ec305cea20e769f0e66f3f9",
+      "bytes": 1494,
       "owned": true
     },
     {
       "path": "skills/node-connect/agents/openai.yaml",
       "sha256": "21a833aa8fb1f225e20ec08ecc3ddad5c1c0c5cb0fbeea371a524ea4b0749392",
       "bytes": 313,
+      "owned": true
+    },
+    {
+      "path": "skills/node-connect/SKILL.md",
+      "sha256": "e7cbfa88765511c0cb9131eb7967c9286772731f6c62720217d1c04a21ef7a5b",
+      "bytes": 939,
       "owned": true
     },
     {
@@ -1487,21 +1487,15 @@
       "owned": true
     },
     {
-      "path": "skills/pdf-processing-toolkit/LICENSE.txt",
-      "sha256": "75321dc441322504f9d6bae6daf0feb13d09dd5409b86f5e074d6d05ce4ca4be",
-      "bytes": 1257,
-      "owned": true
-    },
-    {
-      "path": "skills/pdf-processing-toolkit/SKILL.md",
-      "sha256": "6273d62b327307b7d9c2bdef5fdaaf0686e7eecaee1e2746ab1d2af7d6fb8cf3",
-      "bytes": 1958,
-      "owned": true
-    },
-    {
       "path": "skills/pdf-processing-toolkit/agents/openai.yaml",
       "sha256": "fabd18736b5829449ff027973629c2d661354a9f74a5cc965415688ff3a76c01",
       "bytes": 335,
+      "owned": true
+    },
+    {
+      "path": "skills/pdf-processing-toolkit/LICENSE.txt",
+      "sha256": "75321dc441322504f9d6bae6daf0feb13d09dd5409b86f5e074d6d05ce4ca4be",
+      "bytes": 1257,
       "owned": true
     },
     {
@@ -1511,9 +1505,9 @@
       "owned": true
     },
     {
-      "path": "skills/powerpoint-pptx/SKILL.md",
-      "sha256": "6a9eeae3ac3d364a965528e5264db52d19d77fcaa2d9a7037873a6a58763d14d",
-      "bytes": 3832,
+      "path": "skills/pdf-processing-toolkit/SKILL.md",
+      "sha256": "6273d62b327307b7d9c2bdef5fdaaf0686e7eecaee1e2746ab1d2af7d6fb8cf3",
+      "bytes": 1958,
       "owned": true
     },
     {
@@ -1535,15 +1529,15 @@
       "owned": true
     },
     {
-      "path": "skills/powerpoint-pptx/slides.md",
-      "sha256": "0e0b4c8297d1c7684defd2a4a960b503906a82ebc521a28f106c8b306d8a1a1a",
-      "bytes": 2631,
+      "path": "skills/powerpoint-pptx/SKILL.md",
+      "sha256": "6a9eeae3ac3d364a965528e5264db52d19d77fcaa2d9a7037873a6a58763d14d",
+      "bytes": 3832,
       "owned": true
     },
     {
-      "path": "skills/python-env-setup/SKILL.md",
-      "sha256": "4610c3300dc7e87f02d4f9cafe8957e48a38195b7af7ce38fe711be8550dcf3f",
-      "bytes": 1467,
+      "path": "skills/powerpoint-pptx/slides.md",
+      "sha256": "0e0b4c8297d1c7684defd2a4a960b503906a82ebc521a28f106c8b306d8a1a1a",
+      "bytes": 2631,
       "owned": true
     },
     {
@@ -1553,15 +1547,15 @@
       "owned": true
     },
     {
-      "path": "skills/safe-disk-operations/SKILL.md",
-      "sha256": "decd0705a8ea5d2429ed15cb37cae440e1f693440bf69ba72288330ae948c573",
-      "bytes": 6112,
+      "path": "skills/python-env-setup/SKILL.md",
+      "sha256": "4610c3300dc7e87f02d4f9cafe8957e48a38195b7af7ce38fe711be8550dcf3f",
+      "bytes": 1467,
       "owned": true
     },
     {
-      "path": "skills/seedance2-0-video-gen/SKILL.md",
-      "sha256": "40c0a716565a9c44e3d68708129b42e02848d0c7923f1e9d6c4995295efbd671",
-      "bytes": 2820,
+      "path": "skills/safe-disk-operations/SKILL.md",
+      "sha256": "decd0705a8ea5d2429ed15cb37cae440e1f693440bf69ba72288330ae948c573",
+      "bytes": 6112,
       "owned": true
     },
     {
@@ -1571,9 +1565,9 @@
       "owned": true
     },
     {
-      "path": "skills/self-improvement-agent/SKILL.md",
-      "sha256": "3603f2516bbe2eca2b9c73305a454b673485038e36a8ecb37f6a0b58c5bf37f4",
-      "bytes": 1958,
+      "path": "skills/seedance2-0-video-gen/SKILL.md",
+      "sha256": "e08240a847b6d07bb0793bd088290803fb7f06e82224a6c77f6ca825e910582a",
+      "bytes": 3013,
       "owned": true
     },
     {
@@ -1595,9 +1589,9 @@
       "owned": true
     },
     {
-      "path": "skills/skills-search/SKILL.md",
-      "sha256": "76ba7ec117600622efe4f9024546b6e78c583548098c29f434c17534f5435b3f",
-      "bytes": 1648,
+      "path": "skills/self-improvement-agent/SKILL.md",
+      "sha256": "3603f2516bbe2eca2b9c73305a454b673485038e36a8ecb37f6a0b58c5bf37f4",
+      "bytes": 1958,
       "owned": true
     },
     {
@@ -1607,15 +1601,15 @@
       "owned": true
     },
     {
-      "path": "skills/traffic-hunter/SKILL.md",
-      "sha256": "7f1e2e2df998b05b11f9613dddb21a637ed0249f2983935873fea9518f5b2e53",
-      "bytes": 5170,
+      "path": "skills/skills-search/SKILL.md",
+      "sha256": "76ba7ec117600622efe4f9024546b6e78c583548098c29f434c17534f5435b3f",
+      "bytes": 1648,
       "owned": true
     },
     {
-      "path": "skills/travel-planner/SKILL.md",
-      "sha256": "016b7b1013ca631106fafe85a7f46e27f9b1a398cfb7c0a8a90b8e7bf76e6607",
-      "bytes": 16230,
+      "path": "skills/traffic-hunter/SKILL.md",
+      "sha256": "7f1e2e2df998b05b11f9613dddb21a637ed0249f2983935873fea9518f5b2e53",
+      "bytes": 5170,
       "owned": true
     },
     {
@@ -1649,15 +1643,15 @@
       "owned": true
     },
     {
-      "path": "skills/user-research/SKILL.md",
-      "sha256": "aa6a193ca34cc561dca6fab6134be502ae94e224b5815489270ed85f7be5cb40",
-      "bytes": 3811,
+      "path": "skills/travel-planner/SKILL.md",
+      "sha256": "016b7b1013ca631106fafe85a7f46e27f9b1a398cfb7c0a8a90b8e7bf76e6607",
+      "bytes": 16230,
       "owned": true
     },
     {
-      "path": "skills/venture-analysis/SKILL.md",
-      "sha256": "a48e4f34edfe8baf62d093574f94bf8b7c5dc0c0c2669ba85a41dbf1e90303b9",
-      "bytes": 6172,
+      "path": "skills/user-research/SKILL.md",
+      "sha256": "aa6a193ca34cc561dca6fab6134be502ae94e224b5815489270ed85f7be5cb40",
+      "bytes": 3811,
       "owned": true
     },
     {
@@ -1691,9 +1685,9 @@
       "owned": true
     },
     {
-      "path": "skills/video-prompt-generator/SKILL.md",
-      "sha256": "38f6c25bce4344c88d51da4bdd6dab5941650c24161d92c7b4ab9d5cf115d62b",
-      "bytes": 13610,
+      "path": "skills/venture-analysis/SKILL.md",
+      "sha256": "a48e4f34edfe8baf62d093574f94bf8b7c5dc0c0c2669ba85a41dbf1e90303b9",
+      "bytes": 6172,
       "owned": true
     },
     {
@@ -1703,9 +1697,9 @@
       "owned": true
     },
     {
-      "path": "skills/wealth-allocation/SKILL.md",
-      "sha256": "d80639df416021b08c3a81e67193f1b08984666e431616ab24dccea9b189a54c",
-      "bytes": 3998,
+      "path": "skills/video-prompt-generator/SKILL.md",
+      "sha256": "282b3a02b5d41adf3255b7b385ec908c2e81c68a5a0d2452f75a4dacd1c25901",
+      "bytes": 13856,
       "owned": true
     },
     {
@@ -1733,15 +1727,21 @@
       "owned": true
     },
     {
-      "path": "skills/weather-forecast/SKILL.md",
-      "sha256": "5445b29decbbea972ecae152650144a83d6ae7ee46defcdebd15cf9974c66570",
-      "bytes": 1655,
+      "path": "skills/wealth-allocation/SKILL.md",
+      "sha256": "d80639df416021b08c3a81e67193f1b08984666e431616ab24dccea9b189a54c",
+      "bytes": 3998,
       "owned": true
     },
     {
       "path": "skills/weather-forecast/scripts/weather_db.ps1",
       "sha256": "aac008ae6fac35985932b3e481c422ec53bab2e8d4c4f698e2ac5ddf7a196f22",
       "bytes": 1744,
+      "owned": true
+    },
+    {
+      "path": "skills/weather-forecast/SKILL.md",
+      "sha256": "5445b29decbbea972ecae152650144a83d6ae7ee46defcdebd15cf9974c66570",
+      "bytes": 1655,
       "owned": true
     },
     {
@@ -1757,12 +1757,6 @@
       "owned": true
     },
     {
-      "path": "skills/web-content-fetcher/SKILL.md",
-      "sha256": "56156eced6d6ae3708cff9ad450dfc01141874ba06277cbfe5ed439e9a674912",
-      "bytes": 1491,
-      "owned": true
-    },
-    {
       "path": "skills/web-content-fetcher/requirements.txt",
       "sha256": "7b490781bfb74488219a1a090728d581f43c50af16d770022dbd7a42fc9e1d9c",
       "bytes": 48,
@@ -1775,9 +1769,9 @@
       "owned": true
     },
     {
-      "path": "skills/web-search-extraction/SKILL.md",
-      "sha256": "495d33139c4a2278458c4fc8a83b99067747faf1c28052d7385d50f2953f324a",
-      "bytes": 3340,
+      "path": "skills/web-content-fetcher/SKILL.md",
+      "sha256": "56156eced6d6ae3708cff9ad450dfc01141874ba06277cbfe5ed439e9a674912",
+      "bytes": 1491,
       "owned": true
     },
     {
@@ -1793,9 +1787,9 @@
       "owned": true
     },
     {
-      "path": "skills/wechat-article-creator/SKILL.md",
-      "sha256": "bdfe9a41a3d72618467f1ab7f3a7d082f72362e8a36bf3f2ee7c580ac41d7470",
-      "bytes": 9483,
+      "path": "skills/web-search-extraction/SKILL.md",
+      "sha256": "495d33139c4a2278458c4fc8a83b99067747faf1c28052d7385d50f2953f324a",
+      "bytes": 3340,
       "owned": true
     },
     {
@@ -1823,15 +1817,21 @@
       "owned": true
     },
     {
-      "path": "skills/word-docx/SKILL.md",
-      "sha256": "714917f7890271d3991715647a4f1df797c5be810cf24d4ab6c80f5c1205c0c0",
-      "bytes": 3669,
+      "path": "skills/wechat-article-creator/SKILL.md",
+      "sha256": "bdfe9a41a3d72618467f1ab7f3a7d082f72362e8a36bf3f2ee7c580ac41d7470",
+      "bytes": 9483,
       "owned": true
     },
     {
       "path": "skills/word-docx/agents/openai.yaml",
       "sha256": "8a2d7384c7867bfe556c98cf1f2049393cd4ae0e946d003ec2fb9f0063233796",
       "bytes": 273,
+      "owned": true
+    },
+    {
+      "path": "skills/word-docx/SKILL.md",
+      "sha256": "714917f7890271d3991715647a4f1df797c5be810cf24d4ab6c80f5c1205c0c0",
+      "bytes": 3669,
       "owned": true
     },
     {
@@ -1848,8 +1848,14 @@
     },
     {
       "path": "test-adapter-contracts.py",
-      "sha256": "98a64c6481fdde003806d92b9d4a535b6a5f2dedbfef6e0b3550583795002277",
-      "bytes": 101063,
+      "sha256": "48b1bd8f978572849d877a4fe16fe5d6fc07724edb849bd3908597bdba37015a",
+      "bytes": 122273,
+      "owned": true
+    },
+    {
+      "path": "test-media-generation-mcp.py",
+      "sha256": "af38eb4dbaddfc7d90b5c0d2107673639190a76de5450a34f28788e454ea7204",
+      "bytes": 93442,
       "owned": true
     }
   ]

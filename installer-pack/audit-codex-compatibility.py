@@ -555,7 +555,7 @@ def check_external_adapters(audit: Audit) -> None:
     for marker in (
         '"image-2"', '"grok-image"', '"grok-video"', '"seedance-video"',
         "hmac.compare_digest", "CONFIRMATION_TTL_SECONDS", 'record["state"] = "submitting"',
-        '"Idempotency-Key"', "submission_unknown", "MAX_REFERENCE_BYTES", "MAX_DOWNLOAD_BYTES",
+        "submission_unknown", "MAX_REFERENCE_BYTES", "MAX_DOWNLOAD_BYTES",
         '"media_prepare"', '"media_submit"', '"media_check"', '"media_save"',
         '"responses"', '"/v1/responses"', 'image_generation_call',
         '"/v1/images/generations"', '"/v1/videos/generations"',
@@ -566,6 +566,10 @@ def check_external_adapters(audit: Audit) -> None:
             audit.error(f"Unified media MCP lacks required contract marker: {marker}")
     if "requests." in media_code or "httpx." in media_code:
         audit.error("Unified media MCP has an undeclared third-party Python dependency.")
+    if '"Idempotency-Key"' in media_code or '"idempotency-key"' in media_code:
+        audit.error("Unified media MCP must not forward an unverified upstream idempotency header.")
+    if 'idempotency_forwarded=False' not in media_code:
+        audit.error("Unified media MCP must explicitly record that no upstream idempotency contract is verified.")
     if '"IMAGE_2_API_KEY"' in media_code or '"SEEDANCE_API_KEY"' in media_code:
         audit.error("Unified media MCP still reads retired provider-specific credentials.")
     if (audit.root / "skills" / "image-2" / "scripts" / "image_2_gen.py").exists():

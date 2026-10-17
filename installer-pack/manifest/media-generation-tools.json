@@ -1,12 +1,15 @@
 {
   "schemaVersion": 1,
   "serverId": "media-generation",
-  "serverVersion": "1.3.4",
+  "serverVersion": "1.3.9",
   "healthLayers": {
     "runtime": "CPython 3.12+ and packaged service launch",
     "protocol": "initialize, tools/list, media_capabilities over strict UTF-8 JSON-RPC stdio",
     "gatewayCatalog": "authenticated GET /v1/models; last check only, timestamp and count are reported",
     "generationCapability": "not proven until a user-approved real generation succeeds",
+    "modelCatalogTtlSeconds": 86400,
+    "unknownSubmissionPolicy": "same-intent requests remain blocked; no automatic replay; one explicit repeat acknowledgement at most",
+    "providerIdempotencyContractsVerified": [],
     "internalHttpTimeoutSeconds": 600,
     "externalToolTimeoutSeconds": 1500
   },
@@ -44,7 +47,7 @@
       "name": "media_prepare",
       "network": false,
       "mayBill": false,
-      "description": "Validate inputs and write a signed, expiring, immutable confirmation manifest."
+      "description": "Validate inputs against the fresh gateway catalog and write a signed, expiring, immutable confirmation manifest; same-intent active/unknown submissions are reserved."
     },
     {
       "name": "media_submit",
@@ -53,7 +56,9 @@
       "requiresPriorExplicitUserApproval": true,
       "requiresConfirmationIdAndFingerprint": true,
       "singleUse": true,
-      "unknownOutcomeRetry": "never"
+      "unknownOutcomeRetry": "never",
+      "structuredErrorEnvelope": true,
+      "upstreamIdempotencyHeaderForwarded": false
     },
     {
       "name": "media_check",
@@ -65,7 +70,7 @@
       "name": "media_save",
       "network": true,
       "mayBill": false,
-      "operation": "download-existing-result-only",
+      "operation": "download-existing-result-only; verify MIME, signature and SHA-256 on save/reuse",
       "maxBytes": 536870912
     }
   ]

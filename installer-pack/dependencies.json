@@ -1769,7 +1769,7 @@
         "信息图与场景设计"
       ],
       "healthCheck": "frontmatter, pack-copy, and dependency health-check path",
-      "notes": "提示词生成不依赖图像服务；用户明确要求实际图片时优先使用 Codex 原生图像能力，外部 image-2 仅显式调用。"
+      "notes": "提示词生成不依赖图像服务；用户只要提示词时仅输出提示词。用户要求实际生成或编辑图片时，U 盘默认路由到统一 media_generation MCP；只有用户在当前对话明确指定其他方式时才改用该方式。"
     },
     {
       "id": "industry-analysis",

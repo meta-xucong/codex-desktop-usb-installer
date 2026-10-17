@@ -357,7 +357,11 @@ describe("OfflineHome", () => {
     expect(api.gatewayModelProbe).not.toHaveBeenCalled();
     expect(api.manageNativeModelCatalog).not.toHaveBeenCalled();
 
-    await user.click(screen.getByRole("button", { name: "管理模型" }));
+    const manageModels = screen.getByRole("button", { name: "管理模型" });
+    const uninstall = screen.getByRole("button", { name: "卸载 Codex 与 CCSwitch" });
+    expect(manageModels.compareDocumentPosition(uninstall) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+    await user.click(manageModels);
     await screen.findByRole("heading", { name: "管理模型" });
     await waitFor(() => expect(api.gatewayModelProbe).toHaveBeenCalledTimes(1));
     expect(api.gatewayModelProbe.mock.calls[0]?.[0].selectedModelIds).toEqual([]);

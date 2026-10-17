@@ -94,10 +94,10 @@
 
 ### 4.2 图像能力路由
 
-`image-prompt-generator` 的职责是产生提示词，不依赖任何生成服务即可完成。只有用户明确要求生成图片时才进入第二阶段：
+`image-prompt-generator` 的职责是产生提示词，不依赖任何生成服务即可完成。用户要求实际生成图片时进入第二阶段，并默认走统一媒体 MCP：
 
 1. 提示词任务只交付提示词，不触发生成。
-2. U 盘版收到实际生图请求时调用 `$image-2`，默认使用签名授权连接的 `gpt-image-2.5` Responses API。
+2. U 盘版收到实际生图请求时直接调用 `$image-2`，默认使用签名授权连接的 `gpt-image-2.5` Responses API；用户明确指定其他方式时才切换。
 3. MCP 在同一提交中提取图片、校验 PNG 并保存到本机；未获用户对本次请求的明确确认时不提交。
 
 验收：仓库文本中不存在作为工具名使用的 `image2`；U 盘版默认安装 `image-2` 和统一 MCP，外部请求仍走两阶段确认。
@@ -154,7 +154,7 @@ Skill 中的脚本均以当前 Skill 目录为基准。说明文本必须要求 
 
 ### 4.6 统一图像/视频 MCP
 
-Image-2、Grok 图片/视频和 Seedance 由同一个本地 STDIO `media_generation` MCP 提供，不再各自安装直连 HTTP 脚本。Codex 原生图片能力仍是普通图片请求的默认入口；只有用户明确选择外部 provider 时，才使用对应 Skill 和配置模型。
+Image-2、Grok 图片/视频和 Seedance 由同一个本地 STDIO `media_generation` MCP 提供，不再各自安装直连 HTTP 脚本。U 盘版实际图片/视频生成默认走此 MCP；只有用户在当前对话明确指定其他生成方式时，才切换到指定工具。仅请求提示词、分镜或方案时，不提交媒体任务。
 
 1. `media_capabilities` 检查本机配置；默认模型缺失时可调用 `media_refresh_models`，只读查询网关目录并保存非敏感模型 ID。`media_prepare` 离线校验请求并写入 30 分钟有效的确认记录；只有用户明确确认后才能调用 `media_submit`。
 2. U 盘版的 Base URL 和 Key 由启动器从已签名 License 运行时提供，不写入用户环境或 Codex 配置。Image-2 默认模型为 `gpt-image-2.5`，走 `/v1/responses`；Seedance 可能仍要求服务方提供 `agent-id`。不猜模型、价格或退款规则。
@@ -206,7 +206,7 @@ U 盘安装闭环：安装器预装 CPython 3.12 并对媒体 MCP 执行离线�
 2. 修正 `image-prompt-generator`。
 3. 重写四个飞书 Skill，并同步 `agents/openai.yaml`。
 4. 为全部 25 个非核心 Skill 补齐符合长度约束的 `short_description`、显式 `$skill-id` 的 `default_prompt` 和隐式调用门控。
-5. 修正 7 个自定义 Agent：原生网页/图像优先，外部适配器显式选择，PDF 许可证隔离，输出路径不再固定。
+5. 修正 7 个自定义 Agent：原生网页优先；实际图片/视频默认走统一媒体 MCP，其他媒体工具仅在用户明确指定时使用；PDF 许可证隔离，输出路径不再固定。
 6. 修复 `web-content-fetcher/scripts/fetch.py` 的可选依赖加载。
 7. 为带脚本的 Skill 补充目录解析约定。
 8. 重写 Image-2 / Seedance Skill 契约并加固脚本，补齐专用连接字段和项目数据路径。
