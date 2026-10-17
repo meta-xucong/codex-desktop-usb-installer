@@ -22,12 +22,11 @@ The production 404token Sub2API logs also show successful Kimi requests and the 
 ## Verification
 
 - Packaged USB media MCP suite: 54 tests passed.
-- Development-copy media MCP suite: 53 tests passed.
 - Installer adapter contracts: 76 tests passed, 25 skipped by their existing policy.
 - Independent audit found that the initial union enums could still advertise invalid cross-provider values; the final schema now narrows values per provider and adds tests for those boundaries.
 - Capability-pack integrity check and offline pack audit passed.
 - Python bytecode compilation passed for service and tests.
-- Three live text-only Kimi K3 tool-call probes through 404token returned a single `media_prepare` call with valid `duration`, `aspect_ratio`, and `resolution`; the actual packaged MCP `media_prepare` accepted all three. Each returned `api_request_sent=false`; no image/video generation was submitted.
+- Three live text-only Kimi K3 tool-call probes through 404token returned a single `media_prepare` call with valid `duration`, `aspect_ratio`, and `resolution`; the actual packaged MCP `media_prepare` accepted all three. Each returned `api_request_sent=false`; no image/video generation was submitted. These probes preceded the final provider-conditional schema tightening; the final schema was verified by the 54-test packaged suite and independent source audit, not by another live Kimi call.
 - Production logs show successful Kimi `/v1/responses` requests and expected account/model mapping. This proves route transport and model mapping, not every possible Kimi conversation.
 
 ## Deployment boundary
