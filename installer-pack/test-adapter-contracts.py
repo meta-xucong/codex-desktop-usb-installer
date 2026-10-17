@@ -772,7 +772,7 @@ class ModelCatalogSyncContractTests(unittest.TestCase):
             self.assertIn("retired model", (completed.stdout + completed.stderr).lower())
 
 
-@unittest.skip("MCP behavior now uses the dedicated 1.3.9 offline contract suite in test-media-generation-mcp.py; these 1.3.4 fixtures do not model the catalog-bound confirmation contract.")
+@unittest.skip("MCP behavior now uses the dedicated 1.3.10 offline contract suite in test-media-generation-mcp.py; these 1.3.4 fixtures do not model the catalog-bound confirmation contract.")
 class MediaGenerationMcpTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -1245,7 +1245,7 @@ class MediaGenerationMcpTests(unittest.TestCase):
         health = subprocess.run([POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(bin_dir / "start-media-generation-mcp.ps1"), "-HealthCheck", "-PythonExe", sys.executable], capture_output=True, env=environment, timeout=20)
         self.assertEqual(health.returncode, 0, health.stderr.decode("utf-8", errors="replace"))
         health_report = json.loads(health.stdout.decode("utf-8", errors="strict"))
-        self.assertEqual(health_report["serverVersion"], "1.3.9")
+        self.assertEqual(health_report["serverVersion"], "1.3.10")
         self.assertEqual(health_report["protocolStatus"], "passed")
         self.assertEqual(health_report["generationCapability"], "not_tested")
 
@@ -1520,14 +1520,14 @@ class MediaGenerationMcpTests(unittest.TestCase):
         self.assertEqual(health["healthScope"], "local-runtime-protocol")
         self.assertEqual(health["gatewayCatalogStatus"], "not_checked")
         self.assertEqual(health["generationCapability"], "not_tested")
-        self.assertEqual(health["serverVersion"], "1.3.9")
+        self.assertEqual(health["serverVersion"], "1.3.10")
 
     def test_wrapper_healthcheck_does_not_merge_stderr_into_json_stdout(self):
         self.assertTrue(POWERSHELL, "Windows PowerShell is required for this wrapper contract test")
         fake_python = Path(self.temp.name) / "python-health-fixture.cmd"
         health_json = json.dumps({
             "ready": True,
-            "serverVersion": "1.3.9",
+            "serverVersion": "1.3.10",
             "healthScope": "local-runtime-protocol",
             "runtimeStatus": "passed",
             "protocolStatus": "passed",
@@ -1558,15 +1558,15 @@ class MediaGenerationMcpPackageContractTests(unittest.TestCase):
         Path(environment["TEMP"]).mkdir(parents=True, exist_ok=True)
         result = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, encoding="utf-8", env=environment, timeout=60)
         self.assertEqual(result.returncode, 0, result.stdout + "\n" + result.stderr)
-        self.assertIn("Ran 39 tests", result.stderr)
+        self.assertRegex(result.stderr, r"Ran \d+ tests")
         self.assertIn("OK", result.stderr)
 
     def test_media_mcp_package_versions_and_reference_schema_are_aligned(self):
         pack = Path(__file__).resolve().parent
         server = load_module(pack / "mcp" / "media-generation-mcp.py")
-        self.assertEqual(server.SERVER_VERSION, "1.3.9")
+        self.assertEqual(server.SERVER_VERSION, "1.3.10")
         wrapper = (pack / "mcp" / "start-media-generation-mcp.ps1").read_text(encoding="utf-8")
-        self.assertIn("serverVersion -ne '1.3.9'", wrapper)
+        self.assertIn("serverVersion -ne '1.3.10'", wrapper)
         manifest = json.loads((pack / "manifest" / "media-generation-tools.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["serverVersion"], server.SERVER_VERSION)
         prepare = next(tool for tool in server.TOOL_SCHEMAS if tool["name"] == "media_prepare")

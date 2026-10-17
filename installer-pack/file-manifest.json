@@ -150,8 +150,8 @@
     },
     {
       "path": "install-to-codex.ps1",
-      "sha256": "f1531c56219e4d2b3d2334e9ae1561caf0ff78243a9b61fc2ff2f6ae72261188",
-      "bytes": 56176,
+      "sha256": "9478f7a5d74db75f3e894cbe45a7eeffb48d58a4591bed2f1a5d62727dfc18bf",
+      "bytes": 56177,
       "owned": true
     },
     {
@@ -210,14 +210,14 @@
     },
     {
       "path": "manifest/mcp-servers.json",
-      "sha256": "baa068f804537dafc95084c1649bf6a472e3392495ff323c991725f481ca9aeb",
-      "bytes": 10138,
+      "sha256": "6ba94da9f544843f0efde3e9c43b175a4b6a1521c4247a1b3c33e931c281db50",
+      "bytes": 10307,
       "owned": true
     },
     {
       "path": "manifest/media-generation-tools.json",
-      "sha256": "4c40114cbfd48d1456656f2c5dd98c3258d8450e7375612e366da9703bb2effa",
-      "bytes": 2790,
+      "sha256": "8d39312fb3ad95b72d18f672b386d62b2ca52901d3c804bea97503480849cee1",
+      "bytes": 2791,
       "owned": true
     },
     {
@@ -258,14 +258,14 @@
     },
     {
       "path": "mcp/mcp-servers.json",
-      "sha256": "baa068f804537dafc95084c1649bf6a472e3392495ff323c991725f481ca9aeb",
-      "bytes": 10138,
+      "sha256": "6ba94da9f544843f0efde3e9c43b175a4b6a1521c4247a1b3c33e931c281db50",
+      "bytes": 10307,
       "owned": true
     },
     {
       "path": "mcp/media-generation-mcp.py",
-      "sha256": "400cd52d52ab29ca7dc910358e777be5deff86fef9fac80db4f59141c5294df9",
-      "bytes": 131512,
+      "sha256": "c168c112f4526a7941c9852243c352f0b098edf13f6c18ea51ea45f8db5e4bd9",
+      "bytes": 136932,
       "owned": true
     },
     {
@@ -288,8 +288,8 @@
     },
     {
       "path": "mcp/start-media-generation-mcp.ps1",
-      "sha256": "e781e12a15acd6b5a2c857b575ac996adf95053b3cca4f85b882ef2028def7a1",
-      "bytes": 6825,
+      "sha256": "4ec808935d2faa9ec35fa8fd50071b56a92c8cc55d800f4d362c449601474111",
+      "bytes": 6826,
       "owned": true
     },
     {
@@ -312,8 +312,8 @@
     },
     {
       "path": "render-codex-config.ps1",
-      "sha256": "9d3463cb727faa96b1969cbf7ddb391b14b16dc79664c5e69385b2b71a101016",
-      "bytes": 11997,
+      "sha256": "a1d7e9760095b2687008f293f8b6174d25ad921b3258195a1f76a98719bf5807",
+      "bytes": 11998,
       "owned": true
     },
     {
@@ -1848,14 +1848,14 @@
     },
     {
       "path": "test-adapter-contracts.py",
-      "sha256": "48b1bd8f978572849d877a4fe16fe5d6fc07724edb849bd3908597bdba37015a",
-      "bytes": 122273,
+      "sha256": "ed11742948a98b55d184a7f52fa87adc3e07c6cee0dcc4342cca25cb7333e72d",
+      "bytes": 122284,
       "owned": true
     },
     {
       "path": "test-media-generation-mcp.py",
-      "sha256": "af38eb4dbaddfc7d90b5c0d2107673639190a76de5450a34f28788e454ea7204",
-      "bytes": 93442,
+      "sha256": "9769798f89308c1e045a7a7e0691f0aefa88e358ae5e91c37834a3ce33f5a5a5",
+      "bytes": 96530,
       "owned": true
     }
   ]

@@ -40,7 +40,7 @@ if ($HealthCheck) {
     }
     if ($healthExitCode -ne 0) { throw "The bundled Python media MCP health check failed: $healthDiagnostic" }
     try { $health = $healthOutput | ConvertFrom-Json } catch { throw 'The bundled Python media MCP returned invalid health JSON.' }
-    if (-not $health.ready -or [string]$health.serverVersion -ne '1.3.9' -or [string]$health.healthScope -ne 'local-runtime-protocol' -or [string]$health.runtimeStatus -ne 'passed' -or [string]$health.protocolStatus -ne 'passed' -or [string]$health.gatewayCatalogStatus -ne 'not_checked' -or [string]$health.generationCapability -ne 'not_tested' -or [int]$health.toolCount -ne 6) { throw 'The bundled Python media MCP local runtime/protocol check failed.' }
+    if (-not $health.ready -or [string]$health.serverVersion -ne '1.3.10' -or [string]$health.healthScope -ne 'local-runtime-protocol' -or [string]$health.runtimeStatus -ne 'passed' -or [string]$health.protocolStatus -ne 'passed' -or [string]$health.gatewayCatalogStatus -ne 'not_checked' -or [string]$health.generationCapability -ne 'not_tested' -or [int]$health.toolCount -ne 6) { throw 'The bundled Python media MCP local runtime/protocol check failed.' }
     $health | ConvertTo-Json -Compress
     return
 }

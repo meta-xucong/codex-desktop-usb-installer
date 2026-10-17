@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-SERVER_VERSION = "1.3.9"
+SERVER_VERSION = "1.3.10"
 PROTOCOL_VERSION = "2025-03-26"
 MAX_JSON_BYTES = 32 * 1024 * 1024
 HTTP_TIMEOUT_SECONDS = 600
@@ -2079,10 +2079,82 @@ def _configured() -> dict[str, Any]:
     }
 
 
+MEDIA_PARAMETER_PROPERTIES = {
+    "size": {"type": "string", "description": "Image-2 output size; allowed values are declared for provider=image-2."},
+    "n": {"type": "integer", "minimum": 1, "maximum": 10, "description": "Number of images; use one image per request for widest gateway compatibility."},
+    "aspect_ratio": {"type": "string", "description": "Aspect ratio; allowed values are declared for the selected provider. Required for Grok video."},
+    "resolution": {"type": "string", "description": "Resolution; allowed values are declared for the selected provider. Required for Grok video."},
+    "quality": {"type": "string", "description": "Grok image quality; allowed values are declared for provider=grok-image."},
+    "duration": {"type": "integer", "minimum": 1, "maximum": 15, "description": "Video duration in seconds; provider-specific range is declared for each video provider."},
+    "generate_audio": {"type": "boolean", "description": "Whether the video includes generated audio; Seedance requires true."},
+    "ratio": {"type": "string", "description": "Video aspect ratio; allowed values are declared for the selected provider."},
+    "watermark": {"type": "boolean", "description": "Whether to add a watermark, when supported."},
+}
+
+MEDIA_PROVIDER_PARAMETER_SCHEMAS = {
+    "image-2": {
+        "properties": {"parameters": {"type": "object", "properties": {
+            "size": {"type": "string", "enum": ["auto", *sorted(IMAGE_SIZES)]},
+            "n": {"type": "integer", "minimum": 1, "maximum": 1},
+        }, "additionalProperties": False}},
+    },
+    "grok-image": {
+        "properties": {"parameters": {"type": "object", "properties": {
+            "n": {"type": "integer", "minimum": 1, "maximum": 1},
+            "aspect_ratio": {"type": "string", "enum": ["auto", "1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "2:1", "1:2", "19.5:9", "9:19.5", "20:9", "9:20", "21:9", "5:2"]},
+            "resolution": {"type": "string", "enum": ["1k", "2k"]},
+            "quality": {"type": "string", "enum": ["low", "medium", "auto"]},
+        }, "additionalProperties": False}},
+    },
+    "grok-video": {
+        "required": ["parameters"],
+        "properties": {"parameters": {"type": "object", "required": ["aspect_ratio", "resolution"], "properties": {
+            "duration": {"type": "integer", "minimum": 1, "maximum": 15},
+            "aspect_ratio": {"type": "string", "enum": ["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3"]},
+            "resolution": {"type": "string", "enum": ["480p", "720p", "1080p"]},
+            "generate_audio": {"type": "boolean"},
+        }, "additionalProperties": False}},
+    },
+    "seedance-video": {
+        "properties": {"parameters": {"type": "object", "properties": {
+            "duration": {"type": "integer", "minimum": 4, "maximum": 15},
+            "ratio": {"type": "string", "enum": ["16:9", "9:16", "1:1", "adaptive"]},
+            "watermark": {"type": "boolean"},
+            "generate_audio": {"const": True, "type": "boolean"},
+        }, "additionalProperties": False}},
+    },
+    "minimax-video": {
+        "properties": {"parameters": {"type": "object", "properties": {
+            "duration": {"type": "integer", "minimum": 1, "maximum": 15},
+            "ratio": {"type": "string", "enum": ["16:9", "9:16", "1:1", "4:3", "3:4", "3:2", "2:3", "adaptive"]},
+            "aspect_ratio": {"type": "string", "enum": ["16:9", "9:16", "1:1", "4:3", "3:4", "3:2", "2:3", "adaptive"]},
+            "resolution": {"type": "string", "enum": ["480p", "720p", "1080p"]},
+        }, "additionalProperties": False}},
+    },
+}
+
+for _provider_name, _provider_schema in MEDIA_PROVIDER_PARAMETER_SCHEMAS.items():
+    if _provider_name != "grok-video":
+        _provider_schema["properties"]["reference_media"] = {
+            "type": "array",
+            "items": {"not": {"required": ["role"]}},
+        }
+
+
+def _provider_parameter_schema(provider: str, schema: dict[str, Any]) -> dict[str, Any]:
+    """Constrain parameter enums/ranges to the provider's runtime contract."""
+    return {"if": {"properties": {"provider": {"const": provider}}, "required": ["provider"]}, "then": schema}
+
+
+MEDIA_PREPARE_PARAMETER_CONDITIONS = [
+    _provider_parameter_schema(provider, schema)
+    for provider, schema in MEDIA_PROVIDER_PARAMETER_SCHEMAS.items()
+]
+
 TOOL_SCHEMAS = [
     {"name": "media_refresh_models", "description": "使用统一网关只读模型目录发现并保存默认媒体模型。联网认证，不提交生成任务；目录可用于准备请求 24 小时，目录命中不代表生成权限已实测。", "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}},
     {"name": "media_capabilities", "description": "查看本地运行时、凭据/模型配置和最近一次网关目录验证状态；不联网、不计费。真实生图/视频能力默认未测试。", "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}},
-    {"name": "media_prepare", "description": "离线准备图片或视频请求，要求模型在当前网关最近 24 小时目录中；创建 30 分钟有效的本地确认记录，不提交计费任务。Grok 视频图片请显式设置 role=first_frame 或 role=reference；旧调用省略 role 时按首帧处理。Grok 视频必须在 parameters 中明确提供非空 aspect_ratio 和 resolution。正式生成前必须展示实际请求摘要并等待用户明确确认；未知提交不自动重发。", "inputSchema": {"type": "object", "properties": {"provider": {"type": "string", "enum": list(PROVIDERS)}, "prompt": {"type": "string", "minLength": 1}, "model": {"type": "string"}, "reference_media": {"type": "array", "items": {"type": "object", "properties": {"kind": {"type": "string", "enum": ["image", "video", "audio"]}, "role": {"type": "string", "enum": ["first_frame", "reference"]}, "url": {"type": "string"}, "local_path": {"type": "string"}}, "required": ["kind"], "additionalProperties": False}}, "parameters": {"type": "object"}, "repeat_after_unknown_ack": {"type": "string", "enum": ["确认此前任务可能已计费且仍要求新生成"]}}, "required": ["provider", "prompt"], "additionalProperties": False}},
+    {"name": "media_prepare", "description": "离线准备图片或视频请求；要求模型在当前网关最近 24 小时目录中，创建 30 分钟有效的本地确认记录，不提交计费任务。parameters 约束按 provider 切换：Image-2 使用 size/n（每次 1 张）；Grok 图片使用 n/aspect_ratio/resolution/quality（每次 1 张；aspect_ratio: auto、1:1、16:9、9:16、4:3、3:4、3:2、2:3、2:1、1:2、19.5:9、9:19.5、20:9、9:20、21:9、5:2；resolution: 1k/2k）；Grok 视频必须提供 aspect_ratio（1:1、16:9、9:16、4:3、3:4、3:2、2:3）和 resolution（480p/720p/1080p），duration 为 1–15 秒；Seedance 使用 duration（4–15）、ratio（16:9/9:16/1:1/adaptive）、watermark，generate_audio 若提供必须为 true；MiniMax 使用 duration、ratio/aspect_ratio（16:9/9:16/1:1/4:3/3:4/3:2/2:3/adaptive）和 resolution（480p/720p/1080p）。role 只适用于 Grok 视频；仅 responses 路由已支持 Grok 视频首帧/参考图，Wokey 路由不接受；Wokey Grok 图片只支持纯文生图，Seedance 和 MiniMax 视频当前也只支持文生视频。Grok 视频图片请显式设置 role=first_frame 或 role=reference；旧调用省略 role 时按首帧处理。正式生成前必须展示实际请求摘要并等待用户明确确认；未知提交不自动重发。", "inputSchema": {"type": "object", "properties": {"provider": {"type": "string", "enum": list(PROVIDERS)}, "prompt": {"type": "string", "minLength": 1}, "model": {"type": "string"}, "reference_media": {"type": "array", "items": {"type": "object", "properties": {"kind": {"type": "string", "enum": ["image", "video", "audio"]}, "role": {"type": "string", "enum": ["first_frame", "reference"]}, "url": {"type": "string"}, "local_path": {"type": "string"}}, "required": ["kind"], "additionalProperties": False}}, "parameters": {"type": "object", "description": "Provider-specific options; conditional schemas define allowed values and required fields for the selected provider.", "properties": MEDIA_PARAMETER_PROPERTIES, "additionalProperties": False}, "repeat_after_unknown_ack": {"type": "string", "enum": ["确认此前任务可能已计费且仍要求新生成"]}}, "required": ["provider", "prompt"], "additionalProperties": False, "allOf": MEDIA_PREPARE_PARAMETER_CONDITIONS}},
     {"name": "media_submit", "description": "使用 media_prepare 返回的确认 ID/指纹提交一次计费请求。只有用户明确确认该确切请求后才调用；图像同步结果会在本机验证并保存，状态未知时禁止重发。", "inputSchema": {"type": "object", "properties": {"confirmation_id": {"type": "string"}, "confirmation_fingerprint": {"type": "string"}, "user_confirmation": {"type": "string", "enum": ["确认", "就按这份生成"]}}, "required": ["confirmation_id", "confirmation_fingerprint", "user_confirmation"], "additionalProperties": False}},
     {"name": "media_check", "description": "仅查询同一确认记录已创建的异步任务；不会创建或重发任务。", "inputSchema": {"type": "object", "properties": {"confirmation_id": {"type": "string"}, "confirmation_fingerprint": {"type": "string"}}, "required": ["confirmation_id", "confirmation_fingerprint"], "additionalProperties": False}},
     {"name": "media_save", "description": "把已完成任务返回的图像/视频 URL 或 base64 结果保存到本机媒体输出目录；仅下载结果，不提交新的计费任务。", "inputSchema": {"type": "object", "properties": {"confirmation_id": {"type": "string"}, "confirmation_fingerprint": {"type": "string"}}, "required": ["confirmation_id", "confirmation_fingerprint"], "additionalProperties": False}},

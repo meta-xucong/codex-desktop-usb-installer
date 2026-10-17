@@ -1531,9 +1531,49 @@ class MediaMcpTestCase(unittest.TestCase):
         prepare_schema = next(tool["inputSchema"] for tool in replies[1]["result"]["tools"] if tool["name"] == "media_prepare")
         role_schema = prepare_schema["properties"]["reference_media"]["items"]["properties"]["role"]
         self.assertEqual(role_schema["enum"], ["first_frame", "reference"])
+        parameters_schema = prepare_schema["properties"]["parameters"]
+        self.assertEqual(parameters_schema["type"], "object")
+        self.assertFalse(parameters_schema["additionalProperties"])
+        self.assertEqual(parameters_schema["properties"]["aspect_ratio"]["type"], "string")
+        self.assertIn("provider-specific", parameters_schema["description"].lower())
+        conditionals = {item["if"]["properties"]["provider"]["const"]: item["then"] for item in prepare_schema["allOf"]}
+        for provider in ("image-2", "grok-image", "seedance-video", "minimax-video"):
+            role_guard = conditionals[provider]["properties"]["reference_media"]["items"]["not"]
+            self.assertEqual(role_guard, {"required": ["role"]})
+        grok_video_params = conditionals["grok-video"]["properties"]["parameters"]
+        self.assertEqual(grok_video_params["required"], ["aspect_ratio", "resolution"])
+        self.assertEqual(grok_video_params["properties"]["aspect_ratio"]["enum"], ["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3"])
+        self.assertEqual(grok_video_params["properties"]["resolution"]["enum"], ["480p", "720p", "1080p"])
+        self.assertNotIn("1k", grok_video_params["properties"]["resolution"]["enum"])
+        seedance_params = conditionals["seedance-video"]["properties"]["parameters"]
+        self.assertEqual(seedance_params["properties"]["ratio"]["enum"], ["16:9", "9:16", "1:1", "adaptive"])
+        self.assertEqual(seedance_params["properties"]["generate_audio"]["const"], True)
+        self.assertNotIn("4:3", seedance_params["properties"]["ratio"]["enum"])
+        self.assertEqual(conditionals["image-2"]["properties"]["parameters"]["properties"]["n"]["maximum"], 1)
+        self.assertEqual(conditionals["grok-image"]["properties"]["parameters"]["properties"]["n"]["maximum"], 1)
+        self.assertEqual(conditionals["grok-image"]["properties"]["parameters"]["properties"]["resolution"]["enum"], ["1k", "2k"])
+        self.assertEqual(conditionals["minimax-video"]["properties"]["parameters"]["properties"]["resolution"]["enum"], ["480p", "720p", "1080p"])
         capability = json.loads(replies[2]["result"]["content"][0]["text"])
         self.assertEqual(capability["generation_capability"], "not_tested")
         self.assertEqual(result.stderr, b"")
+        self.assertEqual(self.http.state.count("POST"), 0)
+
+    def test_kimi_shaped_tool_call_can_prepare_grok_video_without_retry_loop(self) -> None:
+        # Mirrors the arguments Kimi should produce from the advertised MCP
+        # schema. Preparation is local-only and must not submit a paid task.
+        self.refresh_catalog()
+        kimi_arguments = {
+            "provider": "grok-video",
+            "model": "grok-imagine-video-1.5",
+            "prompt": "Create a short vertical product clip.",
+            "parameters": {"duration": 5, "aspect_ratio": "9:16", "resolution": "480p"},
+        }
+        result = media._call_tool("media_prepare", kimi_arguments)
+        self.assertTrue(result["success"])
+        self.assertFalse(result["api_request_sent"])
+        self.assertEqual(result["parameters"]["duration"], 5)
+        self.assertEqual(result["parameters"]["aspect_ratio"], "9:16")
+        self.assertEqual(result["parameters"]["resolution"], "480p")
         self.assertEqual(self.http.state.count("POST"), 0)
 
     def test_structured_input_error_survives_tools_call_jsonrpc(self) -> None:
