@@ -772,7 +772,7 @@ class ModelCatalogSyncContractTests(unittest.TestCase):
             self.assertIn("retired model", (completed.stdout + completed.stderr).lower())
 
 
-@unittest.skip("MCP behavior now uses the dedicated 1.3.10 offline contract suite in test-media-generation-mcp.py; these 1.3.4 fixtures do not model the catalog-bound confirmation contract.")
+@unittest.skip("MCP behavior now uses the dedicated 1.3.11 offline contract suite in test-media-generation-mcp.py; these 1.3.4 fixtures do not model the catalog-bound confirmation contract.")
 class MediaGenerationMcpTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -990,29 +990,23 @@ class MediaGenerationMcpTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + "\n" + result.stderr)
         self.assertIn("5 tests passed", result.stdout)
 
-    def test_minimax_is_reserved_for_the_shared_wokey_media_slot(self):
-        with adapter_environment(self.env):
-            capabilities = self.module._configured()
-            self.assertFalse(capabilities["providers"]["minimax-video"]["configured"])
-            with self.assertRaisesRegex(self.module.MediaError, "尚未配置 MiniMax 视频模型"):
-                self.module.media_prepare({"provider": "minimax-video", "prompt": "No fallback"})
-
+    def test_minimax_remains_disabled_when_shared_gateway_model_is_injected(self):
         env = dict(
             self.env,
             MEDIA_GENERATION_API_PROFILE="wokey",
             MEDIA_GENERATION_API_BASE_URL="https://api.wokey.ai",
-            MEDIA_MINIMAX_VIDEO_MODEL="upstream-minimax-video",
+            MEDIA_GENERATION_API_KEY="contract-fixture",
+            MEDIA_MINIMAX_VIDEO_MODEL="MiniMax-H3",
         )
         with adapter_environment(env):
-            prepared = self.module.media_prepare({"provider": "minimax-video", "prompt": "Use the configured shared-upstream model"})
-            self.assertEqual(prepared["model"], "upstream-minimax-video")
-            record = self.module._load_json(self.data_dir / "confirmations" / f"{prepared['confirmation_id']}.json")
-            path, payload = self.module._request_payload(record["request"])
-            self.assertEqual(path, "/v1/videos")
-            self.assertEqual(payload["model"], "upstream-minimax-video")
-            self.assertEqual(self.module._query_path("minimax-video", "minimax-task"), "/v1/videos/minimax-task")
-            with self.assertRaisesRegex(self.module.MediaError, "只能使用统一媒体配置"):
-                self.module.media_prepare({"provider": "minimax-video", "model": "unconfigured-model", "prompt": "No model override"})
+            capabilities = self.module._configured()
+            slot = capabilities["providers"]["minimax-video"]
+            self.assertFalse(slot["available"])
+            self.assertFalse(slot["configured"])
+            self.assertEqual(slot["missing"], ["PROVIDER_ADAPTER_UNAVAILABLE"])
+            with self.assertRaisesRegex(self.module.MediaError, "没有已验证的官方 API 或统一网关适配"):
+                self.module.media_prepare({"provider": "minimax-video", "prompt": "No fallback"})
+        self.assertFalse((self.data_dir / "confirmations").exists())
 
     def test_provider_payloads_and_mcp_stdio_contract(self):
         with adapter_environment(self.env):
@@ -1245,7 +1239,7 @@ class MediaGenerationMcpTests(unittest.TestCase):
         health = subprocess.run([POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(bin_dir / "start-media-generation-mcp.ps1"), "-HealthCheck", "-PythonExe", sys.executable], capture_output=True, env=environment, timeout=20)
         self.assertEqual(health.returncode, 0, health.stderr.decode("utf-8", errors="replace"))
         health_report = json.loads(health.stdout.decode("utf-8", errors="strict"))
-        self.assertEqual(health_report["serverVersion"], "1.3.10")
+        self.assertEqual(health_report["serverVersion"], "1.3.11")
         self.assertEqual(health_report["protocolStatus"], "passed")
         self.assertEqual(health_report["generationCapability"], "not_tested")
 
@@ -1520,14 +1514,14 @@ class MediaGenerationMcpTests(unittest.TestCase):
         self.assertEqual(health["healthScope"], "local-runtime-protocol")
         self.assertEqual(health["gatewayCatalogStatus"], "not_checked")
         self.assertEqual(health["generationCapability"], "not_tested")
-        self.assertEqual(health["serverVersion"], "1.3.10")
+        self.assertEqual(health["serverVersion"], "1.3.11")
 
     def test_wrapper_healthcheck_does_not_merge_stderr_into_json_stdout(self):
         self.assertTrue(POWERSHELL, "Windows PowerShell is required for this wrapper contract test")
         fake_python = Path(self.temp.name) / "python-health-fixture.cmd"
         health_json = json.dumps({
             "ready": True,
-            "serverVersion": "1.3.10",
+            "serverVersion": "1.3.11",
             "healthScope": "local-runtime-protocol",
             "runtimeStatus": "passed",
             "protocolStatus": "passed",
@@ -1564,9 +1558,9 @@ class MediaGenerationMcpPackageContractTests(unittest.TestCase):
     def test_media_mcp_package_versions_and_reference_schema_are_aligned(self):
         pack = Path(__file__).resolve().parent
         server = load_module(pack / "mcp" / "media-generation-mcp.py")
-        self.assertEqual(server.SERVER_VERSION, "1.3.10")
+        self.assertEqual(server.SERVER_VERSION, "1.3.11")
         wrapper = (pack / "mcp" / "start-media-generation-mcp.ps1").read_text(encoding="utf-8")
-        self.assertIn("serverVersion -ne '1.3.10'", wrapper)
+        self.assertIn("serverVersion -ne '1.3.11'", wrapper)
         manifest = json.loads((pack / "manifest" / "media-generation-tools.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["serverVersion"], server.SERVER_VERSION)
         prepare = next(tool for tool in server.TOOL_SCHEMAS if tool["name"] == "media_prepare")

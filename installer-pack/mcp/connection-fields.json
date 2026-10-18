@@ -239,7 +239,7 @@
     {
       "id": "media-generation.minimax-video-model",
       "serviceId": "media-generation",
-      "label": "MiniMax 视频模型名（统一上游可用时填写）",
+      "label": "MiniMax 视频模型名（预留；当前不可用）",
       "type": "text",
       "required": false,
       "secret": false,
@@ -248,7 +248,7 @@
       "validation": {
         "maxLength": 256
       },
-      "help": "当前留空；仅当同一媒体上游实际开放 MiniMax 模型后填写。自动共用签名 U 盘授权提供的设备 Key，不需另填 Base URL 或 MiniMax 官方 API Key。",
+      "help": "当前为预留字段，填写也不会启用 MiniMax。官方 MiniMax 视频 API 需要独立 API Key、v2 端点和专用请求适配器；当前包未实现该适配器且没有上游账号。",
       "capabilities": [
         "mcp.media-generation"
       ]

@@ -49,7 +49,7 @@ Skill 仍然复制到一键安装包中但保持关闭，待用户填入凭据�
   closure 已进入安装包；安装器会在目标机完成哈希校验、隔离环境安装和健康检查。
 - 8 个 `guided-config` Skill 需要真实凭据、模型、端点、服务账号/OAuth 权限或本地锁定 npm cache；默认不启用，本轮也没有
   使用真实租户或付费 API 做端到端调用。
-- MiniMax 视频 Skill 使用统一媒体 MCP；当前 MiniMax 模型槽位为空，只有统一上游实际开放模型后才可用，不提供官方 MiniMax API 直连。
+- MiniMax 视频 Skill 仅提供能力状态说明和提示词整理；媒体生成当前不可用。模型字段是预留项，设置模型名或共享设备 Key 都不能启用。
   Cloudflare、Figma、Linear、Notion MCP 以 Codex 原生 Streamable HTTP/OAuth 配置进入向导；连接仍需相应账号、工作区权限和 Codex OAuth 授权。
 - `canvas`、`healthcheck`、`node-connect` 3 个外部 Skill 会写入启用配置，但没有后端或权限时必须明确安全失败；
   `pdf-processing-toolkit` 已补齐自维护许可证、离线依赖和读写/提取/生成 smoke test。
@@ -157,11 +157,11 @@ Skill 或全局 `AGENTS.md`。它会校验 `file-manifest.json` 与 `checksums.s
 三类内容分开管理：
 
 - MCP：登记 Feishu/Lark、统一媒体生成 2 个本地 STDIO 服务及 Cloudflare、Figma、Linear、Notion 4 个 Streamable HTTP OAuth 服务，见 [`manifest/mcp-servers.json`](manifest/mcp-servers.json)。远程 MCP 由向导可选写入 Codex 配置，授权由 Codex 与各服务完成；本地 Feishu 使用已锁定的离线 npm closure 和 wrapper。
-- 直连 API：仅 DashScope 网页搜索，见 [`manifest/api-services.json`](manifest/api-services.json)。Image-2、Grok 图片/视频、Seedance 视频和预留的 MiniMax 视频模型槽位统一经本地 `media_generation` MCP 调用。
+- 直连 API：仅 DashScope 网页搜索，见 [`manifest/api-services.json`](manifest/api-services.json)。Image-2、Grok 图片/视频和 Seedance 视频经本地 `media_generation` MCP 调用；MiniMax 槽位在 MCP 中保留但硬禁用。
 - 连接字段：统一的密钥、端点、认证方式、校验和能力映射，见 [`manifest/connection-fields.json`](manifest/connection-fields.json)。
   图形向导按这些清单生成表单，不在脚本中另维护一套凭据字段；所有外部连接都是显式选择后才启用。
 
-统一媒体 MCP 包含 Image-2、Grok 图片/视频、Seedance 视频，以及待上游开放后使用的 MiniMax 视频 provider。U 盘版从签名 License 自动读取设备 Key，并在 Codex 启动时传给 MCP；用户无需再次填写媒体 API 地址或 Key。Image-2 默认使用 `gpt-image-2.5` `/v1/responses` 路径，同一次提交会校验并保存 PNG。MiniMax 模型槽位当前留空，并仅接受统一上游的 Wokey 兼容路由，不访问 MiniMax 官方 API，也不会回退到其他模型。Seedance 按需填写上游要求的模型名和路由 ID。MCP 使用安装器预装的 CPython 3.12 标准库，不需要安装 `openai` 包或其他 MCP 专用依赖；安装时会执行离线健康检查。它不会猜价格、退款、账户余额或模型名；计费调用必须走准备清单、明确确认、单次提交和原任务查询，未知提交状态不会重试。Seedance 参考媒体目前使用服务端可访问的 HTTPS URL。
+统一媒体 MCP 的当前版本为 **1.3.11**；1.3.9 和 1.3.10 已废弃。升级安装后重启 Codex，才会加载新版服务。1.3.11 包含跨模型工具调用循环防护、静态兼容工具参数定义、结构化校验反馈和重复无效调用拦截，并保留已验证的图片编辑、视频首帧/参考图模式、单次提交和未知提交保护。MCP 支持 Image-2、Grok 图片/视频及 Seedance 视频。U 盘版从签名 License 自动读取设备 Key，并在 Codex 启动时传给 MCP；用户无需再次填写媒体 API 地址或 Key。Image-2 默认使用 `gpt-image-2.5` `/v1/responses` 路径，同一次提交会校验并保存 PNG。MiniMax 仅保留不可用的兼容槽位：官方 API 需要独立密钥、v2 端点和不同请求/查询契约；当前没有对应适配器或账号，填写模型名也不会启用。Seedance 按需填写上游要求的模型名和路由 ID。MCP 使用安装器预装的 CPython 3.12 标准库，不需要安装 `openai` 包或其他 MCP 专用依赖；安装时会执行离线健康检查。离线测试不代表上游生成已经实测可用；计费调用必须走准备清单、明确确认、单次提交和原任务查询，未知提交状态不会重试。Seedance 参考媒体目前使用服务端可访问的 HTTPS URL。
 模板在 `config-fragments/` 中，默认保持禁用。可先生成待人工合并的无密钥片段：
 
 ```powershell
@@ -207,4 +207,4 @@ Python，还会自动运行完整兼容性审计。安装器只消费已通过�
 
 ### 预留 MiniMax 模型槽位与可选远程 MCP
 
-能力包保留 MiniMax 视频工作流 Skill，但请求只经统一媒体 MCP，并使用签名 U 盘授权提供的共享设备 Key。当前没有配置 MiniMax 模型；只有统一上游开放模型并配置模型名后才会启用，不存在官方 API 直连。远程 MCP 需相应服务账号/工作区权限并由 Codex 完成 OAuth。
+能力包保留 MiniMax 视频工作流 Skill 用于状态说明和提示词整理。MiniMax provider 当前在 MCP 中硬禁用；设置模型名或共享设备 Key 都不能启用。官方 API 需要独立 API Key、v2 端点和专用适配器；当前没有适配器或上游账号。远程 MCP 需相应服务账号/工作区权限并由 Codex 完成 OAuth。

@@ -85,7 +85,7 @@ Codex 只按 `env_vars` 转发进程环境变量名，本机 wrapper 读取值�
 | 服务 | 用途 | 状态 | 必需连接字段 |
 |---|---|---|---|
 | `api.dashscope-web-search` | 网页搜索摘要适配 | guided-config | 专用 API Key、`compatible-mode/v1` 根级 HTTPS Base URL、实际联网搜索模型 |
-DashScope 是当前唯一单独的直连 API。Image-2、Grok、Seedance，以及未来由统一媒体上游开放后的 MiniMax 视频模型，都使用一个媒体 MCP 和签名 U 盘授权中的共享设备 Key。MiniMax 模型槽位 `MEDIA_MINIMAX_VIDEO_MODEL` 当前留空；不设置 MiniMax 官方 API Key 或官方 API Base URL。
+DashScope 是当前唯一单独的直连 API。Image-2、Grok、Seedance 使用媒体 MCP 和签名 U 盘授权中的共享设备 Key。MiniMax 官方视频 API 需要独立凭据、v2 端点和 H3 请求契约；当前没有专用适配或账号，因此 provider 保持不可用，设置 `MEDIA_MINIMAX_VIDEO_MODEL` 也不会启用。此包不设置 MiniMax 官方 API Key 或 Base URL。
 
 DashScope 脚本只接受 `compatible-mode/v1` 根地址并自行拼接 `/chat/completions`；模型必须通过
 `DASHSCOPE_MODEL` 或命令参数显式提供，不再沿用仓库中的示例模型名。未配置 Key 或模型时会在网络 I/O 前失败。

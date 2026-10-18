@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-SERVER_VERSION = "1.3.10"
+SERVER_VERSION = "1.3.11"
 PROTOCOL_VERSION = "2025-03-26"
 MAX_JSON_BYTES = 32 * 1024 * 1024
 HTTP_TIMEOUT_SECONDS = 600
@@ -47,6 +47,14 @@ MAX_PNG_DECODED_BYTES = 256 * 1024 * 1024
 CONFIRMATION_TTL_SECONDS = 30 * 60
 MODEL_CATALOG_TTL_SECONDS = 24 * 60 * 60
 INTENT_LOCK_TIMEOUT_SECONDS = 10
+PREPARE_FAILURE_WINDOW_SECONDS = 120
+PREPARE_FAILURE_MAX_INTENTS = 512
+PREPARE_FAILURE_INTENT_LIMIT = 3
+PREPARE_FAILURE_EXACT_LIMIT = 2
+PREPARE_FAILURE_MAX_EXACT_PER_INTENT = 3
+_PREPARE_FAILURES: dict[str, dict[str, Any]] = {}
+_PREPARE_FAILURES_LOCK = threading.Lock()
+_CONFIRMATION_KEY_LOCK = threading.Lock()
 _CONFIRMATION_LOCKS: dict[str, threading.Lock] = {}
 _CONFIRMATION_LOCKS_GUARD = threading.Lock()
 PROVIDERS = {
@@ -54,8 +62,8 @@ PROVIDERS = {
     "grok-image": {"family": "image", "model_env": "MEDIA_GROK_IMAGE_MODEL"},
     "grok-video": {"family": "video", "model_env": "MEDIA_GROK_VIDEO_MODEL"},
     "seedance-video": {"family": "video", "model_env": "MEDIA_SEEDANCE_MODEL"},
-    # MiniMax is intentionally just a shared-gateway slot. It remains unavailable
-    # until the user configures a model exposed by the selected unified upstream.
+    # MiniMax is a reserved provider only. It stays unavailable until a dedicated
+    # protocol-compatible adapter and separate official credential are audited.
     "minimax-video": {"family": "video", "model_env": "MEDIA_MINIMAX_VIDEO_MODEL"},
 }
 IMAGE_SIZES = {
@@ -529,23 +537,87 @@ def _load_json(path: Path) -> dict[str, Any]:
     return value
 
 
+@contextlib.contextmanager
+def _confirmation_key_initialization_lock():
+    """Serialize first-key creation across threads and MCP processes."""
+    root = _data_root()
+    identity = hashlib.sha256(str(root).casefold().encode("utf-8")).hexdigest()
+    deadline = time.monotonic() + INTENT_LOCK_TIMEOUT_SECONDS
+    _CONFIRMATION_KEY_LOCK.acquire()
+    if _uses_windows_mutex():
+        import ctypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.argtypes = (ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p)
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        kernel32.WaitForSingleObject.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+        kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+        kernel32.ReleaseMutex.argtypes = (ctypes.c_void_p,)
+        kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+        handle = kernel32.CreateMutexW(None, False, f"Local\\CodexMediaKey-v1-{identity}")
+        if not handle:
+            _CONFIRMATION_KEY_LOCK.release()
+            raise MediaError("无法创建媒体确认密钥互斥锁。", code="CONFIRMATION_KEY_LOCK_UNAVAILABLE")
+        acquired = False
+        try:
+            remaining = max(0, int((deadline - time.monotonic()) * 1000))
+            result = kernel32.WaitForSingleObject(handle, remaining)
+            if result not in (0x00000000, 0x00000080):
+                raise MediaError("媒体确认密钥正由其他进程初始化；请稍后重试。", code="CONFIRMATION_KEY_LOCK_TIMEOUT")
+            acquired = True
+            yield
+        finally:
+            if acquired:
+                kernel32.ReleaseMutex(handle)
+            kernel32.CloseHandle(handle)
+            _CONFIRMATION_KEY_LOCK.release()
+        return
+    lock_path = root / ".confirmation-key.lock"
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError as exc:
+        _CONFIRMATION_KEY_LOCK.release()
+        raise MediaError("无法打开媒体确认密钥互斥锁。", code="CONFIRMATION_KEY_LOCK_UNAVAILABLE") from exc
+    acquired = False
+    try:
+        import fcntl
+        while time.monotonic() < deadline:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except OSError:
+                time.sleep(0.025)
+        if not acquired:
+            raise MediaError("媒体确认密钥正由其他进程初始化；请稍后重试。", code="CONFIRMATION_KEY_LOCK_TIMEOUT")
+        yield
+    finally:
+        if acquired:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+        _CONFIRMATION_KEY_LOCK.release()
+
+
 def _secret_key() -> bytes:
     path = _data_root() / ".confirmation-key"
-    if not path.exists():
-        records = _data_root() / "confirmations"
-        if records.exists() and any(records.glob("media-*.json")):
-            raise MediaError("本地媒体确认密钥缺失但已有任务记录；为避免重复计费风险，已停止操作。", code="UNRESOLVED_SUBMISSION_INDEX_UNAVAILABLE")
-        candidate = os.urandom(32)
+    with _confirmation_key_initialization_lock():
+        if not path.exists():
+            records = _data_root() / "confirmations"
+            if records.exists() and any(records.glob("media-*.json")):
+                raise MediaError("本地媒体确认密钥缺失但已有任务记录；为避免重复计费风险，已停止操作。", code="UNRESOLVED_SUBMISSION_INDEX_UNAVAILABLE")
+            candidate = os.urandom(32)
+            try:
+                fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                with os.fdopen(fd, "wb") as stream:
+                    stream.write(candidate)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            except FileExistsError:
+                pass
         try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            with os.fdopen(fd, "wb") as stream:
-                stream.write(candidate)
-        except FileExistsError:
-            pass
-    try:
-        key = path.read_bytes()
-    except OSError as exc:
-        raise MediaError("无法读取本地确认密钥。") from exc
+            key = path.read_bytes()
+        except OSError as exc:
+            raise MediaError("无法读取本地确认密钥。") from exc
     if len(key) != 32:
         raise MediaError("本地确认密钥长度无效；为保护计费安全，拒绝继续。")
     return key
@@ -630,9 +702,12 @@ def _api_key() -> str:
 
 
 def _model(provider: str, requested: str = "") -> str:
+    if provider == "minimax-video":
+        raise MediaError(
+            "MiniMax 视频 provider 当前不可用：没有已验证的官方 API 或统一网关适配；没有发送 API 请求。",
+            code="PROVIDER_ADAPTER_UNAVAILABLE", provider=provider,
+        )
     configured = _configured_model(provider)
-    if provider == "minimax-video" and not configured:
-        raise MediaError("统一媒体上游尚未配置 MiniMax 视频模型；没有发送 API 请求，也不会回退到 Grok 或 Seedance。")
     if requested and configured and requested.strip() != configured:
         raise MediaError("请求模型必须与当前 provider 明确配置的模型完全一致；请在连接设置中选择模型后刷新目录。", code="MODEL_NOT_CONFIGURED_FOR_PROVIDER", provider=provider, model=requested)
     if requested and not configured:
@@ -715,6 +790,10 @@ def _grok_video_dimensions(params: dict[str, Any], provider: str, model: str) ->
                 "missing_parameters": missing,
                 "aspect_ratio_options": ["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3"],
                 "resolution_options": ["480p", "720p", "1080p"],
+                "allowed_values": {
+                    "aspect_ratio": ["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3"],
+                    "resolution": ["480p", "720p", "1080p"],
+                },
             },
         )
     clean = {
@@ -723,7 +802,8 @@ def _grok_video_dimensions(params: dict[str, Any], provider: str, model: str) ->
     }
     for name, allowed in (("aspect_ratio", {"1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3"}), ("resolution", {"480p", "720p", "1080p"})):
         if clean[name] not in allowed:
-            raise MediaError(f"Grok video 参数 {name} 不受支持。", code="INVALID_PARAMETER", provider=provider, model=model)
+            raise MediaError(f"Grok video 参数 {name} 不受支持。", code="INVALID_PARAMETER", provider=provider, model=model,
+                             details={"invalid_parameters": [name], "allowed_values": {name: sorted(allowed)}})
     return clean
 
 
@@ -745,14 +825,18 @@ def _validate_grok_video_local_image_sizes(reference_media: list[dict[str, Any]]
         )
 
 
-def _validate_request(args: dict[str, Any]) -> dict[str, Any]:
+def _validate_request_unchecked(args: dict[str, Any], *, prevalidated_model: str | None = None,
+                                prevalidated_route: dict[str, str] | None = None,
+                                prevalidated_profile: str | None = None) -> dict[str, Any]:
     provider = str(args.get("provider", "")).strip().lower()
+    if provider == "minimax-video":
+        raise MediaError("MiniMax 视频 provider 当前不可用；没有已验证的统一网关协议适配。", code="PROVIDER_ADAPTER_UNAVAILABLE", provider=provider)
     if provider not in PROVIDERS:
         raise MediaError("provider 必须是 image-2、grok-image、grok-video、seedance-video 或 minimax-video。")
     prompt = str(args.get("prompt", ""))
     if not prompt.strip() or len(prompt) > 30000:
         raise MediaError("prompt 不能为空，且最多 30000 个字符。")
-    model = _model(provider, str(args.get("model", "")))
+    model = prevalidated_model if prevalidated_model is not None else _model(provider, str(args.get("model", "")))
     refs = args.get("reference_media", [])
     if not isinstance(refs, list):
         raise MediaError("reference_media 必须是数组。")
@@ -771,25 +855,26 @@ def _validate_request(args: dict[str, Any]) -> dict[str, Any]:
         "image-2": {"size", "n"}, "grok-image": {"n", "aspect_ratio", "resolution", "quality"},
         "grok-video": {"duration", "aspect_ratio", "resolution", "generate_audio"},
         "seedance-video": {"duration", "ratio", "watermark", "generate_audio"},
-        "minimax-video": {"duration", "ratio", "aspect_ratio", "resolution"},
     }[provider]
     extra_parameters = sorted(set(params) - allowed_parameters)
     if extra_parameters:
-        raise MediaError(f"不支持的 {provider} 参数: {', '.join(extra_parameters[:8])}。", code="UNSUPPORTED_PARAMETER", provider=provider, model=model)
+        raise MediaError(f"不支持的 {provider} 参数: {', '.join(extra_parameters[:8])}。", code="UNSUPPORTED_PARAMETER", provider=provider, model=model,
+                         details={"invalid_parameters": extra_parameters[:8], "allowed_parameters": sorted(allowed_parameters)})
     request: dict[str, Any] = {
         "provider": provider,
         "model": model,
         "prompt": prompt,
         "reference_media": normalized_refs,
         "parameters": {},
-        "route": _route_context(),
+        "route": prevalidated_route if prevalidated_route is not None else _route_context(),
     }
+    api_profile = prevalidated_profile if prevalidated_profile is not None else _api_profile()
     if provider != "grok-video" and any("role" in item for item in normalized_refs):
         raise MediaError("图片 role 仅适用于 Grok 视频；其他 provider 不接受该字段。", code="INVALID_REFERENCE_ROLE", provider=provider, model=model)
     if provider == "image-2":
         if any(item["kind"] != "image" for item in normalized_refs):
             raise MediaError("Image-2 仅接受 image 参考素材。")
-        size = str(params.get("size", "auto" if _api_profile() == "responses" else "2048x2048"))
+        size = str(params.get("size", "auto" if api_profile == "responses" else "2048x2048"))
         if size not in IMAGE_SIZES and size != "auto":
             raise MediaError("Image-2 size 不在已支持的 2K 尺寸清单中。")
         try:
@@ -798,9 +883,9 @@ def _validate_request(args: dict[str, Any]) -> dict[str, Any]:
             raise MediaError("图片数量 n 必须是整数。", code="INVALID_PARAMETER", provider=provider, model=model)
         if not 1 <= n <= 8:
             raise MediaError("图片数量 n 必须在 1–8 之间。")
-        if _api_profile() == "responses" and n != 1:
+        if api_profile == "responses" and n != 1:
             raise MediaError("当前 Responses 图片适配只支持 n=1；多张需分别准备并确认。")
-        if _api_profile() == "wokey" and n != 1:
+        if api_profile == "wokey" and n != 1:
             raise MediaError("Wokey Image API 当前只支持 n=1。")
         request["mode"] = "edit" if normalized_refs else "generate"
         request["parameters"] = {"size": size, "n": n}
@@ -817,7 +902,7 @@ def _validate_request(args: dict[str, Any]) -> dict[str, Any]:
             raise MediaError("图片数量 n 必须是整数。", code="INVALID_PARAMETER", provider=provider, model=model)
         if not 1 <= n <= 10:
             raise MediaError("图片数量 n 必须在 1–10 之间。")
-        if _api_profile() == "wokey" and (n != 1 or normalized_refs):
+        if api_profile == "wokey" and (n != 1 or normalized_refs):
             raise MediaError("Wokey Grok 图片适配目前仅支持单张文生图；参考图编辑暂不可用。")
         clean = {"n": n}
         for name, allowed in (("aspect_ratio", {"auto", "1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "2:1", "1:2", "19.5:9", "9:19.5", "20:9", "9:20", "21:9", "5:2"}), ("resolution", {"1k", "2k"}), ("quality", {"low", "medium", "auto"})):
@@ -839,10 +924,10 @@ def _validate_request(args: dict[str, Any]) -> dict[str, Any]:
         if len(first_frames) > 1:
             raise MediaError("Grok 视频最多只能有一张首帧图；其他图片请显式标为 reference。", code="TOO_MANY_FIRST_FRAMES", provider=provider, model=model)
         _validate_grok_video_local_image_sizes(normalized_refs, provider, model)
-        if _api_profile() == "wokey" and normalized_refs:
+        if api_profile == "wokey" and normalized_refs:
             raise MediaError("当前 Wokey 视频路由尚未认证图片/参考图协议；没有发送请求。", code="REFERENCE_MODE_UNSUPPORTED", provider=provider, model=model)
         if references:
-            if _api_profile() != "responses":
+            if api_profile != "responses":
                 raise MediaError("当前媒体路由尚未认证 Grok reference_images；没有发送请求。", code="REFERENCE_MODE_UNSUPPORTED", provider=provider, model=model)
             reference_limits = {"grok-imagine-video-1.5": 14, "grok-imagine-video": 7}
             reference_limit = reference_limits.get(model)
@@ -875,7 +960,7 @@ def _validate_request(args: dict[str, Any]) -> dict[str, Any]:
             request["mode"] = "image-to-video"
         request["parameters"] = clean
     elif provider == "seedance-video":
-        if _api_profile() == "wokey" and normalized_refs:
+        if api_profile == "wokey" and normalized_refs:
             raise MediaError("Wokey 视频参考素材需要 multipart；当前 MCP 适配暂只支持文生视频。")
         if any(item["source"] == "file" for item in normalized_refs):
             raise MediaError("Seedance 参考素材目前必须使用服务方可访问的 HTTPS URL；MCP 不会擅自上传素材。")
@@ -902,25 +987,125 @@ def _validate_request(args: dict[str, Any]) -> dict[str, Any]:
         request["mode"] = "video-generation"
         request["parameters"] = clean
     else:
-        if _api_profile() != "wokey":
-            raise MediaError("MiniMax 视频模型暂只支持统一上游的 Wokey 兼容模式；请勿尝试官方 MiniMax API 或其他猜测端点。")
-        if normalized_refs:
-            raise MediaError("当前统一上游的 MiniMax 视频槽位暂只支持文生视频。")
-        try:
-            duration = int(params.get("duration", 4))
-        except (TypeError, ValueError):
-            raise MediaError("MiniMax 视频 duration 必须是整数。", code="INVALID_PARAMETER", provider=provider, model=model)
-        if not 1 <= duration <= 15:
-            raise MediaError("MiniMax 视频 duration 必须是 1–15 秒整数；请遵循上游模型限制。")
-        ratio = str(params.get("ratio", params.get("aspect_ratio", "16:9")))
-        if ratio not in {"16:9", "9:16", "1:1", "4:3", "3:4", "3:2", "2:3", "adaptive"}:
-            raise MediaError("MiniMax 视频 ratio 不受支持；请遵循上游模型限制。")
-        resolution = str(params.get("resolution", "720p"))
-        if resolution not in {"480p", "720p", "1080p"}:
-            raise MediaError("MiniMax 视频 resolution 只允许 480p、720p 或 1080p；请遵循上游模型限制。")
-        request["mode"] = "text-to-video"
-        request["parameters"] = {"duration": duration, "ratio": ratio, "resolution": resolution}
+        raise MediaError("MiniMax 视频 provider 当前不可用；没有已验证的统一网关协议适配。", code="PROVIDER_ADAPTER_UNAVAILABLE", provider=provider)
     return request
+
+
+def _validate_request(args: dict[str, Any]) -> dict[str, Any]:
+    """Keep catalog/configuration failures outside the local argument loop guard."""
+    provider = str(args.get("provider", "")).strip().lower()
+    prompt = str(args.get("prompt", ""))
+    prevalidated_model = None
+    prevalidated_route = None
+    prevalidated_profile = None
+    if provider in PROVIDERS and prompt.strip() and len(prompt) <= 30000:
+        # This preflight is deliberately outside the validation-error marker:
+        # stale/missing catalogs, disabled provider slots, and bad route config
+        # must not consume the user's correction budget.
+        prevalidated_model = _model(provider, str(args.get("model", "")))
+        prevalidated_profile = _api_profile()
+        prevalidated_route = {
+            "gateway": os.environ.get("MEDIA_GENERATION_API_BASE_URL", "").strip().rstrip("/"),
+            "profile": prevalidated_profile,
+            "agent_id": os.environ.get("MEDIA_GENERATION_AGENT_ID", "").strip(),
+        }
+    try:
+        return _validate_request_unchecked(
+            args, prevalidated_model=prevalidated_model,
+            prevalidated_route=prevalidated_route, prevalidated_profile=prevalidated_profile,
+        )
+    except MediaError as exc:
+        exc.prepare_validation_failure = True
+        exc.details.setdefault("api_request_sent", False)
+        exc.details.setdefault("confirmation_created", False)
+        exc.details.setdefault("recovery_action", "correct_arguments_once")
+        exc.details.setdefault(
+            "instruction",
+            "修正错误信息指出的字段后只重试一次；不要原样重复请求。",
+        )
+        raise
+
+
+def _prepare_intent_digest(args: dict[str, Any]) -> str:
+    provider = str(args.get("provider", "")).strip().lower()
+    prompt = str(args.get("prompt", ""))
+    references = args.get("reference_media", [])
+    identity: list[dict[str, str]] = []
+    if isinstance(references, list):
+        for item in references:
+            if not isinstance(item, dict):
+                identity.append({"invalid": hashlib.sha256(repr(type(item)).encode("ascii")).hexdigest()})
+                continue
+            source_value = str(item.get("local_path", "") or item.get("url", ""))
+            identity.append({
+                "kind": str(item.get("kind", "image")).strip().lower(),
+                "role": str(item.get("role", "")).strip().lower(),
+                "source": "local_path" if item.get("local_path") else "url" if item.get("url") else "missing",
+                "identity_digest": hashlib.sha256(source_value.encode("utf-8", errors="replace")).hexdigest(),
+            })
+    payload = {
+        "provider": provider,
+        "prompt_digest": hashlib.sha256(prompt.encode("utf-8", errors="replace")).hexdigest(),
+        "references": identity,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _prepare_exact_digest(args: dict[str, Any]) -> str:
+    raw = json.dumps(args, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str)
+    return hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _prepare_loop_guard_error(original: MediaError, failures: int) -> MediaError:
+    return MediaError(
+        "相同媒体请求已连续在本地参数校验失败；没有发送媒体请求。请停止调用工具，先由用户修改请求或参数。",
+        code="LOOP_GUARD", provider=original.provider, model=original.model,
+        retryable=False, api_request_sent=False,
+        details={
+            "confirmation_created": False,
+            "recovery_action": "stop_and_ask_user",
+            "instruction": "停止继续调用 media_prepare；等待用户修改请求或参数后再开始。",
+            "validation_failures": failures,
+        },
+    )
+
+
+def _prepare_failure_error(intent_digest: str, exact_digest: str, original: MediaError) -> MediaError | None:
+    now = time.monotonic()
+    with _PREPARE_FAILURES_LOCK:
+        expired = [
+            key for key, value in _PREPARE_FAILURES.items()
+            if now - float(value.get("updated_at", 0)) > PREPARE_FAILURE_WINDOW_SECONDS
+        ]
+        for key in expired:
+            _PREPARE_FAILURES.pop(key, None)
+        record = _PREPARE_FAILURES.get(intent_digest)
+        if record is None:
+            if len(_PREPARE_FAILURES) >= PREPARE_FAILURE_MAX_INTENTS:
+                oldest = min(_PREPARE_FAILURES, key=lambda key: float(_PREPARE_FAILURES[key].get("updated_at", 0)))
+                _PREPARE_FAILURES.pop(oldest, None)
+            record = {"updated_at": now, "total": 0, "exact": {}}
+            _PREPARE_FAILURES[intent_digest] = record
+        if record.get("guarded"):
+            return _prepare_loop_guard_error(original, int(record["total"]))
+        exact_counts = record["exact"]
+        if exact_digest not in exact_counts and len(exact_counts) >= PREPARE_FAILURE_MAX_EXACT_PER_INTENT:
+            record["guarded"] = True
+            return _prepare_loop_guard_error(original, int(record["total"]))
+        exact_count = int(exact_counts.get(exact_digest, 0))
+        record["total"] = int(record["total"]) + 1
+        exact_counts[exact_digest] = exact_count + 1
+        record["updated_at"] = now
+        reached_limit = exact_count + 1 >= PREPARE_FAILURE_EXACT_LIMIT or int(record["total"]) >= PREPARE_FAILURE_INTENT_LIMIT
+        if not reached_limit:
+            return None
+        record["guarded"] = True
+        return _prepare_loop_guard_error(original, int(record["total"]))
+
+
+def _clear_prepare_failures(intent_digest: str) -> None:
+    with _PREPARE_FAILURES_LOCK:
+        _PREPARE_FAILURES.pop(intent_digest, None)
 
 
 def _confirmation_path(confirmation_id: str) -> Path:
@@ -1059,7 +1244,15 @@ def _confirmation_operation_is_active(confirmation_id: str) -> bool:
 
 
 def media_prepare(args: dict[str, Any]) -> dict[str, Any]:
-    request = _validate_request(args)
+    prepare_intent = _prepare_intent_digest(args)
+    try:
+        request = _validate_request(args)
+    except MediaError as exc:
+        if getattr(exc, "prepare_validation_failure", False):
+            guarded = _prepare_failure_error(prepare_intent, _prepare_exact_digest(args), exc)
+            if guarded is not None:
+                raise guarded from exc
+        raise
     persisted_request = _protect_request_urls(request)
     created = int(time.time())
     confirmation_id = "media-" + uuid.uuid4().hex
@@ -1094,6 +1287,7 @@ def media_prepare(args: dict[str, Any]) -> dict[str, Any]:
                 previous["repeat_ack_consumed"] = True
                 previous["repeat_ack_consumed_at"] = created
                 _atomic_json(_confirmation_path(str(previous["confirmation_id"])), previous)
+    _clear_prepare_failures(prepare_intent)
     refs = [{"kind": item["kind"], "role": item.get("role"), "source": item["source"], "url_origin": _url_origin(item["url"]) if item.get("url") else None, "file_name": Path(item["path"]).name if item.get("path") else None, "bytes": item.get("bytes"), "sha256": item.get("sha256")} for item in request["reference_media"]]
     return {
         "success": True,
@@ -1357,7 +1551,7 @@ def _request_payload(request: dict[str, Any]) -> tuple[str, dict[str, Any]]:
             return "/v1/videos", body
         duration = int(params.get("duration", 4))
         ratio = str(params.get("aspect_ratio", params.get("ratio", "16:9")))
-        resolution = str(params.get("resolution", "720p" if provider in {"seedance-video", "minimax-video"} else "480p"))
+        resolution = str(params.get("resolution", "720p" if provider == "seedance-video" else "480p"))
         mode = "image_to_video" if request["reference_media"] else "text_to_video"
         return "/v1/videos", {
             "model": request["model"],
@@ -1391,9 +1585,7 @@ def _request_payload(request: dict[str, Any]) -> tuple[str, dict[str, Any]]:
             return "/v1/images/edits", body
         return "/v1/images/generations", {"model": request["model"], "prompt": request["prompt"], **params}
     if provider == "minimax-video":
-        if _api_profile() != "wokey":
-            raise MediaError("MiniMax 视频暂只支持统一上游的 Wokey 兼容模式；没有发送 API 请求。")
-        raise MediaError("MiniMax 视频路由尚未配置模型；没有发送 API 请求。")
+        raise MediaError("MiniMax 视频 provider 当前不可用；没有已验证的统一网关协议适配，没有发送 API 请求。", code="PROVIDER_ADAPTER_UNAVAILABLE", provider=provider)
     if provider == "grok-video":
         body = {"model": request["model"], "prompt": request["prompt"], **params}
         first_frame = next((item for item in request["reference_media"] if item.get("role", "first_frame") == "first_frame"), None)
@@ -1691,8 +1883,10 @@ def _media_submit_locked(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def _query_path(provider: str, task_id: str) -> str:
+    if provider == "minimax-video":
+        raise MediaError("MiniMax 视频 provider 当前不可用；没有已验证的任务查询协议。", code="PROVIDER_ADAPTER_UNAVAILABLE", provider=provider)
     encoded = urllib.parse.quote(task_id, safe="")
-    if _api_profile() == "wokey" and provider in {"grok-video", "seedance-video", "minimax-video"}:
+    if _api_profile() == "wokey" and provider in {"grok-video", "seedance-video"}:
         return f"/v1/videos/{encoded}"
     if provider == "image-2" and _api_profile() == "responses":
         raise MediaError("Responses API 图像生成是同步请求，没有异步轮询接口。")
@@ -2045,18 +2239,23 @@ def _configured() -> dict[str, Any]:
         )
         if provider == "seedance-video" and _api_profile() == "responses":
             route_ok = bool(os.environ.get("MEDIA_GENERATION_AGENT_ID", "").strip())
-        if provider == "minimax-video" and _api_profile() != "wokey":
-            route_ok = False
-        provider_configured = base_ok and key_ok and model_ok and route_ok
-        missing = [name for name, ok in (("MEDIA_GENERATION_API_BASE_URL", base_ok), ("MEDIA_GENERATION_API_KEY", key_ok), (config["model_env"], model_ok)) if not ok]
-        if not route_ok:
-            missing.append("MEDIA_GENERATION_API_PROFILE=wokey" if provider == "minimax-video" else "MEDIA_GENERATION_AGENT_ID")
+        provider_available = provider != "minimax-video"
+        provider_configured = base_ok and key_ok and model_ok and route_ok and provider_available
+        if not provider_available:
+            # Do not imply that filling shared-gateway settings can enable a
+            # provider whose API protocol and credential contract are unsupported.
+            missing = ["PROVIDER_ADAPTER_UNAVAILABLE"]
+        else:
+            missing = [name for name, ok in (("MEDIA_GENERATION_API_BASE_URL", base_ok), ("MEDIA_GENERATION_API_KEY", key_ok), (config["model_env"], model_ok)) if not ok]
+            if not route_ok:
+                missing.append("MEDIA_GENERATION_AGENT_ID")
         catalog_ok = False
-        try:
-            catalog_ok = model in _catalog_snapshot()["ids"]
-        except MediaError:
-            pass
-        providers[provider] = {"configured": provider_configured, "missing": missing, "model": model,
+        if provider_available:
+            try:
+                catalog_ok = model in _catalog_snapshot()["ids"]
+            except MediaError:
+                pass
+        providers[provider] = {"available": provider_available, "configured": provider_configured, "missing": missing, "model": model if provider_available else "",
                                "catalog_verified_model": catalog_ok,
                                "can_accept_explicit_model": base_ok and key_ok and route_ok and provider != "minimax-video"}
     cached = _runtime_config(allow_gateway_mismatch=True)
@@ -2078,18 +2277,6 @@ def _configured() -> dict[str, Any]:
         "price_source": "not available from this MCP; check the provider before approval",
     }
 
-
-MEDIA_PARAMETER_PROPERTIES = {
-    "size": {"type": "string", "description": "Image-2 output size; allowed values are declared for provider=image-2."},
-    "n": {"type": "integer", "minimum": 1, "maximum": 10, "description": "Number of images; use one image per request for widest gateway compatibility."},
-    "aspect_ratio": {"type": "string", "description": "Aspect ratio; allowed values are declared for the selected provider. Required for Grok video."},
-    "resolution": {"type": "string", "description": "Resolution; allowed values are declared for the selected provider. Required for Grok video."},
-    "quality": {"type": "string", "description": "Grok image quality; allowed values are declared for provider=grok-image."},
-    "duration": {"type": "integer", "minimum": 1, "maximum": 15, "description": "Video duration in seconds; provider-specific range is declared for each video provider."},
-    "generate_audio": {"type": "boolean", "description": "Whether the video includes generated audio; Seedance requires true."},
-    "ratio": {"type": "string", "description": "Video aspect ratio; allowed values are declared for the selected provider."},
-    "watermark": {"type": "boolean", "description": "Whether to add a watermark, when supported."},
-}
 
 MEDIA_PROVIDER_PARAMETER_SCHEMAS = {
     "image-2": {
@@ -2123,38 +2310,59 @@ MEDIA_PROVIDER_PARAMETER_SCHEMAS = {
             "generate_audio": {"const": True, "type": "boolean"},
         }, "additionalProperties": False}},
     },
-    "minimax-video": {
-        "properties": {"parameters": {"type": "object", "properties": {
-            "duration": {"type": "integer", "minimum": 1, "maximum": 15},
-            "ratio": {"type": "string", "enum": ["16:9", "9:16", "1:1", "4:3", "3:4", "3:2", "2:3", "adaptive"]},
-            "aspect_ratio": {"type": "string", "enum": ["16:9", "9:16", "1:1", "4:3", "3:4", "3:2", "2:3", "adaptive"]},
-            "resolution": {"type": "string", "enum": ["480p", "720p", "1080p"]},
-        }, "additionalProperties": False}},
-    },
 }
 
-for _provider_name, _provider_schema in MEDIA_PROVIDER_PARAMETER_SCHEMAS.items():
-    if _provider_name != "grok-video":
-        _provider_schema["properties"]["reference_media"] = {
-            "type": "array",
-            "items": {"not": {"required": ["role"]}},
-        }
+def _static_parameter_properties() -> dict[str, dict[str, Any]]:
+    """Build a portable union schema while keeping runtime checks provider-specific."""
+    merged: dict[str, dict[str, Any]] = {}
+    for provider, schema in MEDIA_PROVIDER_PARAMETER_SCHEMAS.items():
+        properties = schema.get("properties", {}).get("parameters", {}).get("properties", {})
+        for name, value in properties.items():
+            current = merged.setdefault(name, {key: item for key, item in value.items() if key not in {"enum", "const", "minimum", "maximum", "required"}})
+            enums = set(current.get("enum", []))
+            if isinstance(value.get("enum"), list):
+                enums.update(value["enum"])
+            if enums:
+                current["enum"] = sorted(enums, key=lambda item: str(item))
+            if isinstance(value.get("minimum"), (int, float)):
+                current["minimum"] = min(current.get("minimum", value["minimum"]), value["minimum"])
+            if isinstance(value.get("maximum"), (int, float)):
+                current["maximum"] = max(current.get("maximum", value["maximum"]), value["maximum"])
+            if value.get("type") == "integer":
+                current["type"] = "integer"
+            elif value.get("type") == "boolean" and "type" not in current:
+                current["type"] = "boolean"
+            elif value.get("type") == "string" and "type" not in current:
+                current["type"] = "string"
+    descriptions = {
+        "size": "Image-2 输出尺寸。",
+        "n": "图片数量；当前媒体链路建议每次生成一张。",
+        "aspect_ratio": "画面比例；Grok 视频必填。",
+        "resolution": "输出分辨率；Grok 视频必填。",
+        "quality": "Grok 图片质量档位。",
+        "duration": "视频时长（秒），具体范围由服务端按 provider 校验。",
+        "generate_audio": "是否生成音频；Seedance 当前要求 true。",
+        "ratio": "视频画面比例。",
+        "watermark": "是否添加水印（适用时）。",
+    }
+    # Legacy Image-2 runtime accepts up to 8; Responses/Wokey enforce n=1 at
+    # runtime. The portable schema must not reject that valid legacy range.
+    if "n" in merged:
+        # The static union must cover both legacy Image-2 (1..8) and
+        # non-Wokey Grok-image (1..10); provider/profile restrictions remain
+        # enforced by _validate_request.
+        merged["n"]["maximum"] = 10
+    for name, value in merged.items():
+        value["description"] = descriptions.get(name, "服务端会按 provider 校验。")
+    return merged
 
 
-def _provider_parameter_schema(provider: str, schema: dict[str, Any]) -> dict[str, Any]:
-    """Constrain parameter enums/ranges to the provider's runtime contract."""
-    return {"if": {"properties": {"provider": {"const": provider}}, "required": ["provider"]}, "then": schema}
-
-
-MEDIA_PREPARE_PARAMETER_CONDITIONS = [
-    _provider_parameter_schema(provider, schema)
-    for provider, schema in MEDIA_PROVIDER_PARAMETER_SCHEMAS.items()
-]
+MEDIA_PARAMETER_PROPERTIES = _static_parameter_properties()
 
 TOOL_SCHEMAS = [
-    {"name": "media_refresh_models", "description": "使用统一网关只读模型目录发现并保存默认媒体模型。联网认证，不提交生成任务；目录可用于准备请求 24 小时，目录命中不代表生成权限已实测。", "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}},
+    {"name": "media_refresh_models", "description": "仅在用户要求刷新/发现网关目录，或实际生成前明确需要解析默认模型时调用。使用统一网关认证联网并保存模型 ID，不提交生成任务；不得用于让保留/未支持 provider（如 MiniMax）看起来可用。目录命中不代表生成权限已实测。", "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}},
     {"name": "media_capabilities", "description": "查看本地运行时、凭据/模型配置和最近一次网关目录验证状态；不联网、不计费。真实生图/视频能力默认未测试。", "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}},
-    {"name": "media_prepare", "description": "离线准备图片或视频请求；要求模型在当前网关最近 24 小时目录中，创建 30 分钟有效的本地确认记录，不提交计费任务。parameters 约束按 provider 切换：Image-2 使用 size/n（每次 1 张）；Grok 图片使用 n/aspect_ratio/resolution/quality（每次 1 张；aspect_ratio: auto、1:1、16:9、9:16、4:3、3:4、3:2、2:3、2:1、1:2、19.5:9、9:19.5、20:9、9:20、21:9、5:2；resolution: 1k/2k）；Grok 视频必须提供 aspect_ratio（1:1、16:9、9:16、4:3、3:4、3:2、2:3）和 resolution（480p/720p/1080p），duration 为 1–15 秒；Seedance 使用 duration（4–15）、ratio（16:9/9:16/1:1/adaptive）、watermark，generate_audio 若提供必须为 true；MiniMax 使用 duration、ratio/aspect_ratio（16:9/9:16/1:1/4:3/3:4/3:2/2:3/adaptive）和 resolution（480p/720p/1080p）。role 只适用于 Grok 视频；仅 responses 路由已支持 Grok 视频首帧/参考图，Wokey 路由不接受；Wokey Grok 图片只支持纯文生图，Seedance 和 MiniMax 视频当前也只支持文生视频。Grok 视频图片请显式设置 role=first_frame 或 role=reference；旧调用省略 role 时按首帧处理。正式生成前必须展示实际请求摘要并等待用户明确确认；未知提交不自动重发。", "inputSchema": {"type": "object", "properties": {"provider": {"type": "string", "enum": list(PROVIDERS)}, "prompt": {"type": "string", "minLength": 1}, "model": {"type": "string"}, "reference_media": {"type": "array", "items": {"type": "object", "properties": {"kind": {"type": "string", "enum": ["image", "video", "audio"]}, "role": {"type": "string", "enum": ["first_frame", "reference"]}, "url": {"type": "string"}, "local_path": {"type": "string"}}, "required": ["kind"], "additionalProperties": False}}, "parameters": {"type": "object", "description": "Provider-specific options; conditional schemas define allowed values and required fields for the selected provider.", "properties": MEDIA_PARAMETER_PROPERTIES, "additionalProperties": False}, "repeat_after_unknown_ack": {"type": "string", "enum": ["确认此前任务可能已计费且仍要求新生成"]}}, "required": ["provider", "prompt"], "additionalProperties": False, "allOf": MEDIA_PREPARE_PARAMETER_CONDITIONS}},
+    {"name": "media_prepare", "description": "离线准备媒体请求；先用 media_capabilities 确认配置，并只填写所选 provider 的参数。服务端校验为准；被拒绝的预检不会发送媒体请求。修正指出的字段后只重试一次，不要重复原参数。图片/视频参考语义与路由限制保持 provider 现有规则。成功后才创建确认记录；提交前仍须展示请求并取得用户明确确认，未知提交绝不自动重发。", "inputSchema": {"type": "object", "properties": {"provider": {"type": "string", "enum": list(PROVIDERS)}, "prompt": {"type": "string", "minLength": 1}, "model": {"type": "string"}, "reference_media": {"type": "array", "items": {"type": "object", "properties": {"kind": {"type": "string", "enum": ["image", "video", "audio"]}, "role": {"type": "string", "enum": ["first_frame", "reference"]}, "url": {"type": "string"}, "local_path": {"type": "string"}}, "required": ["kind"], "additionalProperties": False}}, "parameters": {"type": "object", "description": "Provider-specific parameters; unsupported fields or values are rejected by server validation.", "properties": MEDIA_PARAMETER_PROPERTIES, "additionalProperties": False}, "repeat_after_unknown_ack": {"type": "string", "enum": ["确认此前任务可能已计费且仍要求新生成"]}}, "required": ["provider", "prompt"], "additionalProperties": False}},
     {"name": "media_submit", "description": "使用 media_prepare 返回的确认 ID/指纹提交一次计费请求。只有用户明确确认该确切请求后才调用；图像同步结果会在本机验证并保存，状态未知时禁止重发。", "inputSchema": {"type": "object", "properties": {"confirmation_id": {"type": "string"}, "confirmation_fingerprint": {"type": "string"}, "user_confirmation": {"type": "string", "enum": ["确认", "就按这份生成"]}}, "required": ["confirmation_id", "confirmation_fingerprint", "user_confirmation"], "additionalProperties": False}},
     {"name": "media_check", "description": "仅查询同一确认记录已创建的异步任务；不会创建或重发任务。", "inputSchema": {"type": "object", "properties": {"confirmation_id": {"type": "string"}, "confirmation_fingerprint": {"type": "string"}}, "required": ["confirmation_id", "confirmation_fingerprint"], "additionalProperties": False}},
     {"name": "media_save", "description": "把已完成任务返回的图像/视频 URL 或 base64 结果保存到本机媒体输出目录；仅下载结果，不提交新的计费任务。", "inputSchema": {"type": "object", "properties": {"confirmation_id": {"type": "string"}, "confirmation_fingerprint": {"type": "string"}}, "required": ["confirmation_id", "confirmation_fingerprint"], "additionalProperties": False}},

@@ -90,8 +90,8 @@
     },
     {
       "path": "dependencies.json",
-      "sha256": "3a6407b3feede3e9aea635ae5611714ad7dfb50416adfea773555c48cea652cb",
-      "bytes": 120071,
+      "sha256": "7d4006b0e1e6b41e2ff72968390911e4c600dd1c91933f354137cdb688c2ea1e",
+      "bytes": 120741,
       "owned": true
     },
     {
@@ -132,8 +132,8 @@
     },
     {
       "path": "ENVIRONMENT-MCP-INVENTORY.md",
-      "sha256": "1e2b30d3a00d739ccae01854c6665b2e6b894db812c4b2cd45e29e2b0973f42c",
-      "bytes": 9231,
+      "sha256": "5f960e3918cf58312a406d34591decb42f432468b1d60d1e282c02842e909d12",
+      "bytes": 9283,
       "owned": true
     },
     {
@@ -150,7 +150,7 @@
     },
     {
       "path": "install-to-codex.ps1",
-      "sha256": "9478f7a5d74db75f3e894cbe45a7eeffb48d58a4591bed2f1a5d62727dfc18bf",
+      "sha256": "a280230e8c4f8b1a0ca70813067c2817efec9b863e741516ee52ff699320af16",
       "bytes": 56177,
       "owned": true
     },
@@ -186,8 +186,8 @@
     },
     {
       "path": "manifest/connection-fields.json",
-      "sha256": "4a01c93b75d7c00691c77d22530a8c26959f142410b37b2a2d01b164dc98b291",
-      "bytes": 7389,
+      "sha256": "b9cdb18e2de0b998e61d9d582f2734510ecbe58bcb7d7bfaa31f2464cfc7513a",
+      "bytes": 7400,
       "owned": true
     },
     {
@@ -210,14 +210,14 @@
     },
     {
       "path": "manifest/mcp-servers.json",
-      "sha256": "6ba94da9f544843f0efde3e9c43b175a4b6a1521c4247a1b3c33e931c281db50",
-      "bytes": 10307,
+      "sha256": "c926370d5208ad6f501717bef6c85cb93aed4a6d46901a0783ba96dcb869aaca",
+      "bytes": 10375,
       "owned": true
     },
     {
       "path": "manifest/media-generation-tools.json",
-      "sha256": "8d39312fb3ad95b72d18f672b386d62b2ca52901d3c804bea97503480849cee1",
-      "bytes": 2791,
+      "sha256": "ba0a4d3babcbde9c9ee5abce8046088232f358e24cf9f4fad0756d9238492352",
+      "bytes": 3030,
       "owned": true
     },
     {
@@ -228,8 +228,8 @@
     },
     {
       "path": "manifest/skill-audit.json",
-      "sha256": "54ac637b3aaa993827d15f6c79c97513b5a1fa5fb1954b3384a6edf20f12b0e9",
-      "bytes": 83586,
+      "sha256": "7f442784b07dc0e77e8f2d72fe81e60754591ef28fd64d8a64bc49dfef4e12f7",
+      "bytes": 83652,
       "owned": true
     },
     {
@@ -246,8 +246,8 @@
     },
     {
       "path": "mcp/connection-fields.json",
-      "sha256": "4a01c93b75d7c00691c77d22530a8c26959f142410b37b2a2d01b164dc98b291",
-      "bytes": 7389,
+      "sha256": "b9cdb18e2de0b998e61d9d582f2734510ecbe58bcb7d7bfaa31f2464cfc7513a",
+      "bytes": 7400,
       "owned": true
     },
     {
@@ -258,26 +258,26 @@
     },
     {
       "path": "mcp/mcp-servers.json",
-      "sha256": "6ba94da9f544843f0efde3e9c43b175a4b6a1521c4247a1b3c33e931c281db50",
-      "bytes": 10307,
+      "sha256": "c926370d5208ad6f501717bef6c85cb93aed4a6d46901a0783ba96dcb869aaca",
+      "bytes": 10375,
       "owned": true
     },
     {
       "path": "mcp/media-generation-mcp.py",
-      "sha256": "c168c112f4526a7941c9852243c352f0b098edf13f6c18ea51ea45f8db5e4bd9",
-      "bytes": 136932,
+      "sha256": "0e735597e053dd8e0d7f5319f6fa1482aa22dbcff4be02ad234b4ff522e3f470",
+      "bytes": 145854,
       "owned": true
     },
     {
       "path": "mcp/media-generation.template.env",
-      "sha256": "3da56c9d830f9f48b9401a12de8ae06f844af38a9cc0681e4a762b1c2e36ea7b",
-      "bytes": 759,
+      "sha256": "dc3cd7a5540c31b876740e20c0c9dc40bf071494ae3524db586db5ac373d7256",
+      "bytes": 762,
       "owned": true
     },
     {
       "path": "mcp/README.md",
-      "sha256": "89e39ac97ffd18fa51add6f391e880829eb5ef3b48975a5030c9b8bf1465bf7c",
-      "bytes": 601,
+      "sha256": "1f7a7d8fc5d58202f5b8ae9fe4887f843d789b7d3f526a11583245e502839180",
+      "bytes": 662,
       "owned": true
     },
     {
@@ -288,7 +288,7 @@
     },
     {
       "path": "mcp/start-media-generation-mcp.ps1",
-      "sha256": "4ec808935d2faa9ec35fa8fd50071b56a92c8cc55d800f4d362c449601474111",
+      "sha256": "220944c08e49e04453f6cd2b5bad20140650d16391e8d205182ee95f3ee1c81f",
       "bytes": 6826,
       "owned": true
     },
@@ -306,13 +306,13 @@
     },
     {
       "path": "README.md",
-      "sha256": "4675c4ee4149a3683e9435db1387e35d1bd85675af0b6390a6150b17670283ce",
-      "bytes": 15922,
+      "sha256": "7eb1891e11f4704f7f85e3dab8d6847affb1b85ec80b338f7a5569e5824e97fd",
+      "bytes": 16288,
       "owned": true
     },
     {
       "path": "render-codex-config.ps1",
-      "sha256": "a1d7e9760095b2687008f293f8b6174d25ad921b3258195a1f76a98719bf5807",
+      "sha256": "ad2c1f3dbb4d723fe8772debb2facd74fc43e8ed0bc39b83cc672383106b8693",
       "bytes": 11998,
       "owned": true
     },
@@ -1416,14 +1416,14 @@
     },
     {
       "path": "skills/minimax-video-gen/agents/openai.yaml",
-      "sha256": "a543b9e61f52876f8cdb1177f32d4a8997b766accb6296a0bd95df4db8107d97",
-      "bytes": 432,
+      "sha256": "c3fe6ce3d78ead5980d52179e6711cf6df9246c1c2c03e9c10edf079facbc9cd",
+      "bytes": 410,
       "owned": true
     },
     {
       "path": "skills/minimax-video-gen/SKILL.md",
-      "sha256": "0e789b0017d52cea333a5e54647dea6aac56ac05da7234ec143ff8e1a25d71f3",
-      "bytes": 2424,
+      "sha256": "7fb19c34c0adefbd36d78c4ee200719d2802385fb232ba30ad83483c0db0fdb1",
+      "bytes": 2842,
       "owned": true
     },
     {
@@ -1848,14 +1848,14 @@
     },
     {
       "path": "test-adapter-contracts.py",
-      "sha256": "ed11742948a98b55d184a7f52fa87adc3e07c6cee0dcc4342cca25cb7333e72d",
-      "bytes": 122284,
+      "sha256": "7cc9109c4e19284fac351bbd5508ae5cae53b1bdc3436528b41e51b2cf912682",
+      "bytes": 121662,
       "owned": true
     },
     {
       "path": "test-media-generation-mcp.py",
-      "sha256": "9769798f89308c1e045a7a7e0691f0aefa88e358ae5e91c37834a3ce33f5a5a5",
-      "bytes": 96530,
+      "sha256": "66f1b8847eb79ff208343ea1c36537fa1589695269e4c4fcc0e26519dbeb2b0c",
+      "bytes": 108184,
       "owned": true
     }
   ]
