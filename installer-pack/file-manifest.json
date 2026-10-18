@@ -90,8 +90,8 @@
     },
     {
       "path": "dependencies.json",
-      "sha256": "7d4006b0e1e6b41e2ff72968390911e4c600dd1c91933f354137cdb688c2ea1e",
-      "bytes": 120741,
+      "sha256": "3a6407b3feede3e9aea635ae5611714ad7dfb50416adfea773555c48cea652cb",
+      "bytes": 120071,
       "owned": true
     },
     {
@@ -228,8 +228,8 @@
     },
     {
       "path": "manifest/skill-audit.json",
-      "sha256": "7f442784b07dc0e77e8f2d72fe81e60754591ef28fd64d8a64bc49dfef4e12f7",
-      "bytes": 83652,
+      "sha256": "54ac637b3aaa993827d15f6c79c97513b5a1fa5fb1954b3384a6edf20f12b0e9",
+      "bytes": 83586,
       "owned": true
     },
     {
@@ -1416,14 +1416,14 @@
     },
     {
       "path": "skills/minimax-video-gen/agents/openai.yaml",
-      "sha256": "c3fe6ce3d78ead5980d52179e6711cf6df9246c1c2c03e9c10edf079facbc9cd",
-      "bytes": 410,
+      "sha256": "a543b9e61f52876f8cdb1177f32d4a8997b766accb6296a0bd95df4db8107d97",
+      "bytes": 432,
       "owned": true
     },
     {
       "path": "skills/minimax-video-gen/SKILL.md",
-      "sha256": "7fb19c34c0adefbd36d78c4ee200719d2802385fb232ba30ad83483c0db0fdb1",
-      "bytes": 2842,
+      "sha256": "0e789b0017d52cea333a5e54647dea6aac56ac05da7234ec143ff8e1a25d71f3",
+      "bytes": 2424,
       "owned": true
     },
     {

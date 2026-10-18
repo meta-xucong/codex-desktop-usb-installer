@@ -23,6 +23,22 @@ Version 1.3.11 includes the portable static `media_prepare` schema, actionable s
 
 These are local source/package tests. They do not prove that a real Kimi-driven video was completed and saved.
 
+## Installer model-probe fixes included in the same release branch
+
+The release branch also includes the latest model-manager changes from the working tree:
+
+- Each model row has one primary action. Automatic detection unlocks a single confirmation action after a successful check; the previous duplicate add controls are removed.
+- A failed first check is shown as a real failure and can be retried with a fresh request ID. A passing result is required before adding.
+- The one-shot connectivity probe sends `store: false`, which avoids rejecting otherwise usable compatible gateways that do not support stored Responses. Full multi-turn capability checks continue to use storage where required.
+- HTTP 400 and explicitly unsupported `store` responses receive distinct safe diagnostic codes.
+
+Verification for these changes:
+
+- `npm test -- --run src/app/views/UpstreamModelManagerSheet.test.tsx`: **33/33 passed**.
+- Two focused Windows Rust tests passed: `one_shot_connectivity_request_is_stateless_but_full_probe_keeps_multiturn_storage` and `unsupported_store_is_classified_without_retaining_upstream_error_text`.
+
+These tests verify the model-manager regression logic. They do not constitute a full installer build or an upstream live request.
+
 ## Live Kimi result and limitation
 
 The recorded Kimi K3 attempt made one `media_prepare` call and did **not** loop. The subsequent single `media_submit` reached the media request path, but the acceptance harness crashed while reading the response, before recording the task ID or completing `media_check`/`media_save`. The video result is therefore **unverified**; do not treat the attempt as full end-to-end generation acceptance or submit it again without first resolving whether the prior request was accepted.

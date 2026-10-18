@@ -36,6 +36,8 @@ pub enum ProbeError {
     Cancelled,
     Unauthorized,
     Http,
+    Http400,
+    UnsupportedStore,
     InvalidResponse,
     InvalidCall,
     InvalidStream,
@@ -53,6 +55,8 @@ impl ProbeError {
             Self::Cancelled => "probe-cancelled",
             Self::Unauthorized => "upstream-auth",
             Self::Http => "upstream-http",
+            Self::Http400 => "upstream-http-400",
+            Self::UnsupportedStore => "upstream-store-unsupported",
             Self::InvalidResponse => "upstream-response",
             Self::InvalidCall => "tool-correlation-invalid",
             Self::InvalidStream => "stream-invalid",
@@ -71,6 +75,7 @@ impl ProbeError {
                 | Self::Cancelled
                 | Self::Unauthorized
                 | Self::Http
+                | Self::Http400
                 | Self::BudgetExhausted
                 | Self::ContextChanged
         )

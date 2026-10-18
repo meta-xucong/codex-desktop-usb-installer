@@ -183,6 +183,10 @@ impl<'a> ProbeClient<'a> {
                         if is_unsupported_reasoning_effort(status, &body) {
                             return Err(ProbeError::UnsupportedEffort);
                         }
+                        if is_unsupported_store(status, &body) {
+                            return Err(ProbeError::UnsupportedStore);
+                        }
+                        return Err(ProbeError::Http400);
                     }
                     return Err(ProbeError::Http);
                 }
@@ -332,16 +336,14 @@ impl<'a> ProbeClient<'a> {
         model: &str,
         token: &str,
         previous: Option<&str>,
+        store: bool,
     ) -> Result<Value, ProbeError> {
         let input = if previous.is_some() {
             "Repeat the original token exactly, with no other text.".into()
         } else {
             format!("Remember this token for later turns. Reply exactly {token}")
         };
-        let mut body = json!({"model":model,"input":input,"stream":false,"store":true});
-        if let Some(id) = previous {
-            body["previous_response_id"] = json!(id);
-        }
+        let body = text_probe_request_body(model, &input, previous, store);
         let response = self.response(model, body, "text").await?;
         if let Err(error) = require_text(&response, token) {
             let mut diag = self.diagnostic("text", Some(model));
@@ -355,7 +357,7 @@ impl<'a> ProbeClient<'a> {
     /// Send one bounded text challenge and require an exact echo. This is the
     /// only generation request used by the selective catalog quick test.
     pub async fn quick_text(&self, model: &str, token: &str) -> Result<(), ProbeError> {
-        self.text(model, token, None).await.map(|_| ())
+        self.text(model, token, None, false).await.map(|_| ())
     }
     /// Send one bounded text challenge with an explicit Codex reasoning effort.
     /// HTTP 400 is classified as a route rejection; all other failures remain unknown.
@@ -468,7 +470,7 @@ impl<'a> ProbeClient<'a> {
         };
         let token = format!("usb{}", uuid::Uuid::new_v4().simple());
         let id = model.model_id.clone();
-        let first = match self.text(&id, &token, None).await {
+        let first = match self.text(&id, &token, None, true).await {
             Ok(value) => {
                 model.checks.text = CapabilityState::Verified;
                 value
@@ -537,7 +539,7 @@ impl<'a> ProbeClient<'a> {
                     return;
                 }
             };
-            match self.text(&id, &token, Some(prior)).await {
+            match self.text(&id, &token, Some(prior), true).await {
                 Ok(value) => {
                     if !ids.insert(response_id(&value).unwrap_or_default().into()) {
                         finish_error(
@@ -570,6 +572,14 @@ fn reasoning_effort_request_body(model: &str, token: &str, effort: &str) -> Valu
         "max_output_tokens": 1024,
         "reasoning": {"effort": effort}
     })
+}
+
+fn text_probe_request_body(model: &str, input: &str, previous: Option<&str>, store: bool) -> Value {
+    let mut body = json!({"model":model,"input":input,"stream":false,"store":store});
+    if let Some(id) = previous {
+        body["previous_response_id"] = json!(id);
+    }
+    body
 }
 
 fn is_unsupported_reasoning_effort(status: u16, body: &[u8]) -> bool {
@@ -613,6 +623,29 @@ fn is_unsupported_reasoning_effort(status: u16, body: &[u8]) -> bool {
                     || text.contains("does not support")
             });
     effort_reference && explicitly_unsupported
+}
+
+fn is_unsupported_store(status: u16, body: &[u8]) -> bool {
+    if status != 400 || body.len() > REASONING_ERROR_BODY_LIMIT {
+        return false;
+    }
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return false;
+    };
+    let error = value.get("error").unwrap_or(&value);
+    let param = error
+        .get("param")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    param == "store"
+        || message.contains("store=true is not supported")
+        || message.contains("store is not supported")
 }
 
 fn finish_error(
@@ -1073,6 +1106,38 @@ mod tests {
         assert_eq!(body["store"], false);
         assert_eq!(body["stream"], false);
         assert!(body["input"].as_str().unwrap().contains("challenge"));
+    }
+
+    #[test]
+    fn one_shot_connectivity_request_is_stateless_but_full_probe_keeps_multiturn_storage() {
+        let quick = text_probe_request_body("vendor/model", "challenge", None, false);
+        assert_eq!(quick["store"], false);
+        assert!(quick.get("previous_response_id").is_none());
+
+        let conversation =
+            text_probe_request_body("vendor/model", "follow-up", Some("resp-1"), true);
+        assert_eq!(conversation["store"], true);
+        assert_eq!(conversation["previous_response_id"], "resp-1");
+    }
+
+    #[test]
+    fn unsupported_store_is_classified_without_retaining_upstream_error_text() {
+        assert!(is_unsupported_store(
+            400,
+            br#"{"error":{"message":"store=true is not supported: this service does not retain responses, set store to false"}}"#
+        ));
+        assert!(is_unsupported_store(
+            400,
+            br#"{"error":{"param":"store","message":"unsupported parameter"}}"#
+        ));
+        assert!(!is_unsupported_store(
+            400,
+            br#"{"error":{"message":"invalid API key"}}"#
+        ));
+        assert!(!is_unsupported_store(
+            401,
+            br#"{"error":{"param":"store","message":"unsupported parameter"}}"#
+        ));
     }
 
     #[test]
