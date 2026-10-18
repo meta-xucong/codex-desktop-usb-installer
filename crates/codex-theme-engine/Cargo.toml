@@ -17,7 +17,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt", "net", "time", "sync", "io-util", "macros"] }
 tokio-tungstenite = "0.30"
 url = "2"
-zip = { version = "8", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 tempfile = "3"
