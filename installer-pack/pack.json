@@ -4,7 +4,7 @@
   "version": "1.5.4",
   "sourceCommit": "3cfa9fca12e24b25be4b2f7f5b273e6b9fb22040",
   "sourceCommitRole": "build-input",
-  "sourceTreeSha256": "502329140d15b93b8404320cbd2a9ccd0af460670a383bfbf50294f9a8cb978e",
+  "sourceTreeSha256": "f24915cdd4593b4fce89f02c632536d006f30ec4ac71d45bebffdf873a6b24d0",
   "sourceDate": "2026-10-16",
   "compatibleCodex": {
     "minCodexVersion": "0.144.0",

@@ -19,6 +19,19 @@ from typing import Any
 MAX_INPUT_BYTES = 5 * 1024 * 1024
 
 
+def _ensure_finite_values(value: Any, path: str = "report") -> None:
+    """Reject non-finite values derived anywhere in the performance report."""
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"{path} 计算结果超出有限数值范围。")
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            _ensure_finite_values(item, f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            _ensure_finite_values(item, f"{path}[{index}]")
+
+
 def calculate_annualized_return(initial: float, current: float, years: float) -> float:
     if initial <= 0 or current <= 0 or years <= 0:
         raise ValueError("年化收益计算要求正的初值、终值和期间。")
@@ -49,7 +62,7 @@ def _finite(value: Any, field: str) -> float:
         raise ValueError(f"{field} 必须是有限数值。")
     try:
         number = float(value)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(f"{field} 必须是有限数值。") from exc
     if not math.isfinite(number):
         raise ValueError(f"{field} 必须是有限数值。")
@@ -71,7 +84,7 @@ def track_portfolio(
     risk_free_rate = _finite(risk_free_rate, "risk_free_rate")
     if initial_value <= 0 or current_value <= 0:
         raise ValueError("initial_value 和 current_value 必须为正。")
-    if not isinstance(months, int) or not 1 <= months <= 1200:
+    if isinstance(months, bool) or not isinstance(months, int) or not 1 <= months <= 1200:
         raise ValueError("months 必须是 1–1200 的整数。")
     if risk_free_rate <= -100:
         raise ValueError("risk_free_rate 必须大于 -100%。")
@@ -103,6 +116,8 @@ def track_portfolio(
         name = str(raw_name).strip()
         if not name:
             raise ValueError("benchmarks 包含空名称。")
+        if name in normalized_benchmarks:
+            raise ValueError(f"benchmarks 名称去除首尾空白后重复：{name}")
         normalized_benchmarks[name] = _finite(raw_return, f"benchmarks.{name}")
 
     monthly_returns = [(values[index] / values[index - 1] - 1) * 100 for index in range(1, len(values))]
@@ -120,7 +135,7 @@ def track_portfolio(
         }
         for name, value in normalized_benchmarks.items()
     }
-    return {
+    report = {
         "calculated_at": datetime.now(timezone.utc).isoformat(),
         "data_as_of": str(data_as_of).strip(),
         "sources": normalized_sources,
@@ -141,6 +156,8 @@ def track_portfolio(
             "脚本不内置基准收益、评分、调仓、止盈或止损建议。"
         ),
     }
+    _ensure_finite_values(report)
+    return report
 
 
 def _load_json(path_value: str, label: str) -> Any:
@@ -148,6 +165,29 @@ def _load_json(path_value: str, label: str) -> Any:
     if not path.is_file() or path.stat().st_size > MAX_INPUT_BYTES:
         raise ValueError(f"{label}不存在或超过 5 MiB。")
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _reject_output_overwrite(output_path: Path, input_paths: list[str | Path]) -> None:
+    """Reject replacing any JSON source read by this command, including aliases."""
+    for input_path in input_paths:
+        try:
+            resolved_output = output_path.expanduser().resolve()
+            resolved_input = Path(input_path).expanduser().resolve()
+            if resolved_output == resolved_input:
+                raise ValueError("--output must differ from input JSON files.")
+            # Inputs were successfully read before this guard. An absent output is
+            # safe; any other metadata error means identity cannot be established.
+            resolved_input.stat()
+            try:
+                resolved_output.stat()
+            except FileNotFoundError:
+                continue
+            if resolved_output.samefile(resolved_input):
+                raise ValueError("--output must differ from input JSON files.")
+        except ValueError:
+            raise
+        except OSError as exc:
+            raise ValueError("Cannot verify --output is distinct from input JSON files.") from exc
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -181,9 +221,13 @@ def main(argv: list[str] | None = None) -> int:
             args.as_of,
             args.source,
         )
-        output = json.dumps(report, ensure_ascii=False, indent=2)
+        output = json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False)
         if args.output:
             output_path = Path(args.output).expanduser().resolve()
+            _reject_output_overwrite(
+                output_path,
+                [args.history, *([args.benchmarks] if args.benchmarks else [])],
+            )
             output_path.write_text(output + "\n", encoding="utf-8")
             print(f"追踪报告已保存到: {output_path}")
         else:

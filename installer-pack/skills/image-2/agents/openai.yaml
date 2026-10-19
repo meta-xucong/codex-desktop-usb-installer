@@ -1,6 +1,6 @@
 interface:
   display_name: "图像生成连接"
-  short_description: "调用已配置的图像服务，安全生成、编辑并核对图片产物与费用。"
+  short_description: "准备 Image-2 参数或预检；只提交明确授权的生图请求。"
   default_prompt: "Use $image-2 to prepare and confirm this image generation request before submitting it."
 policy:
   allow_implicit_invocation: true

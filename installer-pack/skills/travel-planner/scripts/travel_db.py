@@ -6,7 +6,10 @@ Manages user travel preferences, past trips, and current trip plans.
 """
 
 import json
+import math
 import os
+import tempfile
+import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
@@ -53,16 +56,44 @@ def load_json(file_path: Path) -> Dict[str, Any]:
     ensure_db_files()
     try:
         with open(file_path, 'r') as f:
-            return json.load(f)
-    except (json.JSONDecodeError, FileNotFoundError):
+            value = json.load(f)
+    except json.JSONDecodeError as exc:
+        # Never turn corrupt persisted data into an empty object: a later save
+        # would silently overwrite the user's only copy of the file.
+        raise ValueError(
+            f"Travel data file '{file_path.name}' contains invalid JSON; refusing to overwrite it."
+        ) from exc
+    except FileNotFoundError:
         return {}
+    if not isinstance(value, dict):
+        raise ValueError(
+            f"Travel data file '{file_path.name}' top level must be a JSON object."
+        )
+    return value
 
 
 def save_json(file_path: Path, data: Dict[str, Any]) -> None:
-    """Save JSON to file."""
+    """Atomically save JSON without truncating the current copy on failure."""
     ensure_db_files()
-    with open(file_path, 'w') as f:
-        json.dump(data, f, indent=2)
+    serialized = json.dumps(data, indent=2)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=file_path.parent,
+            prefix=f".{file_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, file_path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 # ============================================================================
@@ -149,14 +180,19 @@ def add_trip(trip: Dict[str, Any], status: str = "current") -> str:
 
     Args:
         trip: Trip data
-        status: "current", "past", or "idea"
+        status: "current", "past", "idea", or the read API alias "ideas"
 
     Returns:
         Trip ID
     """
+    if status == "ideas":
+        status = "idea"
+    if status not in {"current", "past", "idea"}:
+        raise ValueError("status must be 'current', 'past', 'idea', or 'ideas'.")
+
     trips = load_json(TRIPS_FILE)
 
-    trip_id = str(datetime.now().timestamp())
+    trip_id = uuid.uuid4().hex
     trip["id"] = trip_id
     trip["created_at"] = datetime.now().isoformat()
 
@@ -189,8 +225,13 @@ def get_trip_by_id(trip_id: str) -> Optional[Dict[str, Any]]:
     """Get a specific trip by ID."""
     trips = load_json(TRIPS_FILE)
 
-    for trip_list in [trips["current_trips"], trips["past_trips"], trips["trip_ideas"]]:
-        for trip in trip_list:
+    for section in ("current_trips", "past_trips", "trip_ideas"):
+        for trip in trips[section]:
+            if not isinstance(trip, dict):
+                raise ValueError(
+                    f"Travel data file '{TRIPS_FILE.name}' section '{section}' "
+                    "contains a row that must be a JSON object."
+                )
             if trip.get("id") == trip_id:
                 return trip
     return None
@@ -227,25 +268,55 @@ def delete_trip(trip_id: str) -> bool:
 # BUDGET TRACKING
 # ============================================================================
 
+def _validated_expense_amount(expense: Any, label: str = "expense") -> int | float:
+    if not isinstance(expense, dict) or "amount" not in expense:
+        raise ValueError(f"{label}.amount 必须是有限的非负数值。")
+    amount = expense["amount"]
+    if isinstance(amount, bool) or not isinstance(amount, (int, float)):
+        raise ValueError(f"{label}.amount 必须是有限的非负数值。")
+    try:
+        finite_amount = math.isfinite(float(amount))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{label}.amount 必须是有限的非负数值。") from exc
+    if not finite_amount or amount < 0:
+        raise ValueError(f"{label}.amount 必须是有限的非负数值。")
+    return amount
+
 def add_expense(trip_id: str, expense: Dict[str, Any]) -> bool:
     """Add an expense to a trip."""
+    amount = _validated_expense_amount(expense)
+
     trips = load_json(TRIPS_FILE)
 
     for trip_list in [trips["current_trips"], trips["past_trips"]]:
         for trip in trip_list:
             if trip.get("id") == trip_id:
-                if "expenses" not in trip:
-                    trip["expenses"] = []
+                existing_expenses = trip.get("expenses", [])
+                if not isinstance(existing_expenses, list):
+                    raise ValueError("已有 expenses 数据必须是列表。")
+                existing_amounts = [
+                    _validated_expense_amount(item, f"expenses[{index}]")
+                    for index, item in enumerate(existing_expenses)
+                ]
+                saved_expense = dict(expense)
+                saved_expense["amount"] = amount
+                saved_expense["id"] = uuid.uuid4().hex
+                saved_expense["date"] = saved_expense.get("date", datetime.now().isoformat())
 
-                expense["id"] = datetime.now().timestamp()
-                expense["date"] = expense.get("date", datetime.now().isoformat())
-                trip["expenses"].append(expense)
+                try:
+                    total = sum(existing_amounts) + amount
+                    finite_total = math.isfinite(float(total))
+                except (TypeError, ValueError, OverflowError, AttributeError) as exc:
+                    raise ValueError("累计支出必须是有限数值。") from exc
+                if not finite_total:
+                    raise ValueError("累计支出超出有限数值范围。")
+
+                trip["expenses"] = [*existing_expenses, saved_expense]
 
                 # Update total spent
                 if "budget" not in trip:
                     trip["budget"] = {}
 
-                total = sum(e.get("amount", 0) for e in trip["expenses"])
                 trip["budget"]["spent"] = total
 
                 save_json(TRIPS_FILE, trips)
@@ -271,14 +342,33 @@ def get_budget_summary(trip_id: str) -> Dict[str, Any]:
     expenses = trip.get("expenses", [])
 
     total_budget = budget.get("total", 0)
-    spent = sum(e.get("amount", 0) for e in expenses)
+    if not isinstance(expenses, list):
+        raise ValueError("expenses 必须是列表。")
+    amounts = [
+        _validated_expense_amount(expense, f"expenses[{index}]")
+        for index, expense in enumerate(expenses)
+    ]
+    try:
+        spent = sum(amounts)
+        finite_spent = math.isfinite(float(spent))
+    except (TypeError, ValueError, OverflowError, AttributeError) as exc:
+        raise ValueError("累计支出必须是有限数值。") from exc
+    if not finite_spent:
+        raise ValueError("累计支出超出有限数值范围。")
     remaining = total_budget - spent
 
     # Category breakdown
     categories = {}
-    for expense in expenses:
+    for expense, amount in zip(expenses, amounts):
         category = expense.get("category", "Other")
-        categories[category] = categories.get(category, 0) + expense.get("amount", 0)
+        category_total = categories.get(category, 0) + amount
+        try:
+            finite_category_total = math.isfinite(float(category_total))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"类别 {category} 的累计支出必须是有限数值。") from exc
+        if not finite_category_total:
+            raise ValueError(f"类别 {category} 的累计支出超出有限数值范围。")
+        categories[category] = category_total
 
     return {
         "total_budget": total_budget,
@@ -302,7 +392,7 @@ def add_itinerary_item(trip_id: str, item: Dict[str, Any]) -> bool:
             if "itinerary" not in trip:
                 trip["itinerary"] = []
 
-            item["id"] = datetime.now().timestamp()
+            item["id"] = uuid.uuid4().hex
             trip["itinerary"].append(item)
 
             # Sort by date

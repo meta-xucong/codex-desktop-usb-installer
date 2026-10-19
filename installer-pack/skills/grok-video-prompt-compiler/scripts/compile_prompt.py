@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
 import sys
 from copy import deepcopy
@@ -45,12 +46,13 @@ def _optional_bool(value: Any) -> bool | None:
         return value
     if isinstance(value, str):
         normalized = value.strip().lower()
-        if normalized in {"true", "yes", "1"}:
+        if normalized in {"true", "yes", "1", "on"}:
             return True
-        if normalized in {"false", "no", "0"}:
+        if normalized in {"false", "no", "0", "off"}:
             return False
         if normalized in {"", "unknown", "null", "none"}:
             return None
+        return None
     return bool(value)
 
 
@@ -1306,6 +1308,26 @@ def example_spec(name: str) -> dict[str, Any]:
     }
 
 
+def _reject_output_overwrite(output_path: Path, input_path: Path) -> None:
+    """Prevent a report destination from replacing its source SceneSpec."""
+    try:
+        resolved_output = output_path.resolve()
+        resolved_input = input_path.resolve()
+    except (OSError, RuntimeError) as exc:
+        raise SpecError(f"cannot verify output/input paths safely: {exc}") from exc
+    if resolved_output == resolved_input:
+        raise SpecError("output path must not overwrite the input SceneSpec")
+    try:
+        if os.path.samefile(resolved_output, resolved_input):
+            raise SpecError("output path must not overwrite the input SceneSpec")
+    except FileNotFoundError:
+        # A new output file has no identity yet; canonical path comparison above
+        # still protects a direct alias.
+        pass
+    except OSError as exc:
+        raise SpecError(f"cannot verify output/input file identity safely: {exc}") from exc
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     group = parser.add_mutually_exclusive_group(required=True)
@@ -1314,6 +1336,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, help="Write report JSON to this path")
     args = parser.parse_args(argv)
     try:
+        if args.input and args.output:
+            _reject_output_overwrite(args.output, args.input)
         if args.input:
             spec = json.loads(args.input.read_text(encoding="utf-8"))
         else:

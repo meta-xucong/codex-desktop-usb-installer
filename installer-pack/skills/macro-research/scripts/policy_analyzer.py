@@ -23,7 +23,9 @@ MAX_INPUT_BYTES = 1024 * 1024
 
 
 def _text(value: Any, field: str) -> str:
-    normalized = str(value or "").strip()
+    if not isinstance(value, str):
+        raise ValueError(f"{field} 必须是文本。")
+    normalized = value.strip()
     if not normalized:
         raise ValueError(f"{field} 必须是非空文本。")
     return normalized
@@ -46,6 +48,27 @@ def load_policy_input(path_value: str) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise ValueError("政策输入 JSON 顶层必须是对象。")
     return raw
+
+
+def ensure_distinct_paths(input_value: str, output_value: str) -> None:
+    """Reject output paths that would replace the supplied policy scenario."""
+    try:
+        input_path = Path(input_value).expanduser().resolve()
+        output_path = Path(output_value).expanduser().resolve()
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("无法验证政策输入与输出路径。") from exc
+
+    if input_path == output_path:
+        raise ValueError("报告输出路径不能覆盖政策输入文件。")
+    try:
+        if input_path.samefile(output_path):
+            raise ValueError("报告输出路径不能指向政策输入文件。")
+    except FileNotFoundError:
+        # A not-yet-created output has no file identity; normalized path equality
+        # above still prevents a spelling alias to the input path.
+        return
+    except OSError as exc:
+        raise ValueError("无法确认政策输入与输出是否为同一文件，已拒绝写入。") from exc
 
 
 def validate_policy_input(raw: dict[str, Any]) -> dict[str, Any]:
@@ -143,6 +166,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        if args.output:
+            ensure_distinct_paths(args.input, args.output)
         report = generate_policy_analysis(load_policy_input(args.input))
         output = json.dumps(report, ensure_ascii=False, indent=2)
         if args.output:

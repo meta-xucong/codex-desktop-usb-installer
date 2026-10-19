@@ -20,10 +20,33 @@ MAX_INPUT_BYTES = 1024 * 1024
 ASSET_CLASSES = {"equity", "bond", "cash", "other"}
 
 
+def _reject_output_overwrite(output: Path, source: Path) -> None:
+    """Refuse to replace the reviewed portfolio through path aliases."""
+    try:
+        resolved_output = Path(output).expanduser().resolve()
+        resolved_source = Path(source).expanduser().resolve()
+        if resolved_output == resolved_source:
+            raise ValueError("--output must differ from portfolio input.")
+        resolved_source.stat()
+        try:
+            resolved_output.stat()
+        except FileNotFoundError:
+            return
+        if resolved_output.samefile(resolved_source):
+            raise ValueError("--output must differ from portfolio input.")
+    except ValueError:
+        raise
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("Cannot verify --output is distinct from portfolio input.") from exc
+
+
 def _required_number(data: dict[str, Any], key: str, minimum=None, maximum=None) -> float:
     if key not in data or isinstance(data[key], bool) or not isinstance(data[key], (int, float)):
         raise ValueError(f"{key} 必须是显式提供的数字。")
-    value = float(data[key])
+    try:
+        value = float(data[key])
+    except OverflowError as exc:
+        raise ValueError(f"{key} 必须是有限数字。") from exc
     if not math.isfinite(value):
         raise ValueError(f"{key} 必须是有限数字。")
     if minimum is not None and value < minimum:
@@ -192,6 +215,8 @@ def main(argv: list[str] | None = None) -> int:
         path = Path(args.portfolio).expanduser().resolve()
         if not path.is_file() or path.stat().st_size > MAX_INPUT_BYTES:
             raise ValueError("组合 JSON 不存在或超过 1 MiB。")
+        if args.output:
+            _reject_output_overwrite(Path(args.output), path)
         assessment = assess_risk(json.loads(path.read_text(encoding="utf-8")))
         output = json.dumps(assessment, ensure_ascii=False, indent=2)
         if args.output:

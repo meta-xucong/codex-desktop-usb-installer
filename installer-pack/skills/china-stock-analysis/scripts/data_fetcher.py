@@ -61,7 +61,7 @@ def safe_float(value: Any) -> float | None:
         value = value.replace("%", "").replace(",", "").replace("亿", "").strip()
     try:
         parsed = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return parsed if math.isfinite(parsed) else None
 
@@ -99,34 +99,41 @@ def _cache_directory() -> Path:
     return (data_root / "china-stock-analysis" / "cache").resolve()
 
 
-def get_cache_path(code: str, data_type: str) -> Path:
+def get_cache_path(code: str, data_type: str, years: int = 3) -> Path:
     code = _validate_code(code)
     if data_type not in DATA_TYPES:
         raise ValueError(f"不支持的数据类型：{data_type}")
+    year_suffix = ""
+    if data_type in {"financial", "all"}:
+        if isinstance(years, bool) or not isinstance(years, int) or not 1 <= years <= 10:
+            raise ValueError("years 必须是 1–10 之间的整数。")
+        year_suffix = f"_y{years}"
     directory = _cache_directory()
     directory.mkdir(parents=True, exist_ok=True)
-    return directory / f"{code}_{data_type}_{datetime.now().strftime('%Y%m%d')}.json"
+    return directory / f"{code}_{data_type}{year_suffix}_{datetime.now().strftime('%Y%m%d')}.json"
 
 
-def load_cache(code: str, data_type: str) -> dict[str, Any] | None:
-    path = get_cache_path(code, data_type)
+def load_cache(code: str, data_type: str, years: int = 3) -> dict[str, Any] | None:
+    path = get_cache_path(code, data_type, years)
     if not path.is_file() or path.stat().st_size > MAX_CACHE_BYTES:
         return None
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
-    if not isinstance(payload, dict) or payload.get("completeness", {}).get("status") != "complete":
+    completeness = payload.get("completeness") if isinstance(payload, dict) else None
+    if not isinstance(completeness, dict) or completeness.get("status") != "complete":
         return None
     payload = dict(payload)
     payload["cache"] = {"hit": True, "path": str(path)}
     return payload
 
 
-def save_cache(code: str, data_type: str, payload: dict[str, Any]) -> None:
-    if payload.get("completeness", {}).get("status") != "complete":
+def save_cache(code: str, data_type: str, payload: dict[str, Any], years: int = 3) -> None:
+    completeness = payload.get("completeness") if isinstance(payload, dict) else None
+    if not isinstance(completeness, dict) or completeness.get("status") != "complete":
         return
-    path = get_cache_path(code, data_type)
+    path = get_cache_path(code, data_type, years)
     temporary = path.with_suffix(path.suffix + ".tmp")
     try:
         temporary.write_text(json.dumps(payload, ensure_ascii=False, default=str), encoding="utf-8")
@@ -355,10 +362,10 @@ def fetch_stock_data(
     code = _validate_code(code)
     if data_type not in DATA_TYPES:
         raise ValueError(f"不支持的数据类型：{data_type}")
-    if not 1 <= years <= 10:
-        raise ValueError("years 必须在 1–10 之间。")
+    if isinstance(years, bool) or not isinstance(years, int) or not 1 <= years <= 10:
+        raise ValueError("years 必须是 1–10 之间的整数。")
     if use_cache:
-        cached = load_cache(code, data_type)
+        cached = load_cache(code, data_type, years)
         if cached is not None:
             return cached
     provider = provider or _provider()
@@ -423,7 +430,7 @@ def fetch_stock_data(
         "errors": errors,
     }
     if use_cache and status == "complete":
-        save_cache(code, data_type, result)
+        save_cache(code, data_type, result, years)
     return result
 
 
@@ -471,7 +478,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data-type", choices=DATA_TYPES, default="basic", help="请求的数据组件")
     parser.add_argument("--years", type=int, default=3, help="财务报表年数（1–10）")
     parser.add_argument("--no-cache", action="store_true", help="不读取或写入当日缓存")
-    parser.add_argument("--allow-partial", action="store_true", help="显式允许部分组件失败时返回退出码 0")
+    parser.add_argument(
+        "--allow-partial",
+        action="store_true",
+        help="显式允许保留并输出部分成功的数据（否则拒绝保留部分结果）",
+    )
     parser.add_argument("--output", help="输出 JSON 文件")
     return parser
 
@@ -511,6 +522,28 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 "completeness": {"status": "complete", "errors": []},
             }
+        completeness = result.get("completeness", {}) if isinstance(result, dict) else {}
+        status = completeness.get("status", "failed") if isinstance(completeness, dict) else "failed"
+        if status not in ("complete", "partial") or (status == "partial" and not args.allow_partial):
+            errors = completeness.get("errors", []) if isinstance(completeness, dict) else []
+            details = []
+            if isinstance(errors, list):
+                for item in errors:
+                    if isinstance(item, dict):
+                        component = str(item.get("component") or "组件")
+                        error = str(item.get("error") or "获取失败")
+                        details.append(f"{component}: {error}")
+                    else:
+                        details.append(str(item))
+            if status == "partial":
+                message = "部分数据未保留；如需保留部分结果，请显式传入 --allow-partial。"
+            else:
+                message = "数据获取失败，未生成结果。"
+            if details:
+                message += " 组件错误：" + "；".join(details)
+            print(message, file=sys.stderr)
+            return 1
+
         output = json.dumps(result, ensure_ascii=False, indent=2, default=str)
         if args.output:
             output_path = Path(args.output).expanduser().resolve()
@@ -518,8 +551,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"数据结果已保存到：{output_path}")
         else:
             print(output)
-        status = result.get("completeness", {}).get("status", "failed")
-        return 0 if status == "complete" or (args.allow_partial and status == "partial") else 1
+        return 0
     except (OSError, RuntimeError, ValueError) as exc:
         print(json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False), file=sys.stderr)
         return 1

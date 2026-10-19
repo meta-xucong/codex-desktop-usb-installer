@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "serverId": "media-generation",
-  "serverVersion": "1.3.10",
+  "serverVersion": "1.3.11",
   "healthLayers": {
     "runtime": "CPython 3.12+ and packaged service launch",
     "protocol": "initialize, tools/list, media_capabilities over strict UTF-8 JSON-RPC stdio",
@@ -15,16 +15,22 @@
   },
   "restartAfterInstall": true,
   "providerSlots": {
-    "active": ["image-2", "grok-image", "grok-video", "seedance-video"],
+    "active": [
+      "image-2",
+      "grok-image",
+      "grok-video",
+      "seedance-video"
+    ],
     "reserved": {
       "minimax-video": {
         "modelEnvironmentVariable": "MEDIA_MINIMAX_VIDEO_MODEL",
-        "enabledOnlyWhenConfigured": true,
+        "enabledOnlyWhenConfigured": false,
+        "adapterStatus": "disabled-unverified-protocol",
+        "reason": "MiniMax official video API uses a separate API key, v2 endpoints and multimodal content schema; no compatible unified-gateway adapter or upstream account is configured.",
         "currentModelConfigured": false,
-        "credentialSource": "signed-usb-license.device-api-key",
+        "credentialSource": "none-provider-disabled",
         "officialMiniMaxApi": false,
-        "automaticFallback": false,
-        "profile": "wokey"
+        "automaticFallback": false
       }
     }
   },

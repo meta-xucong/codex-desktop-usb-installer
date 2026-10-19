@@ -11,6 +11,8 @@ description: 通过统一媒体生成 MCP 调用已配置的 Seedance 视频模�
 
 先调用 `media_capabilities` 查看 `seedance-video` 是否已配置。签名 U 盘授权会自动提供共享设备 Key；Seedance 实际模型名和当前网关要求的 `MEDIA_GENERATION_AGENT_ID` 仍须来自上游配置。不要猜测模型、价格、预扣积分、退款条款或链接有效期。
 
+如果 `media_capabilities` 显示 Seedance 不可用、缺少模型/路由配置，或能力查询失败，立即向用户说明当前不能继续并停止。不得调用 `media_refresh_models` 来尝试修复或探测配置，也不得继续调用 `media_prepare`、切换 provider 或猜测备用模型。只有用户明确要求核查上游配置时，才另行说明核查可能产生的外部请求并等待授权。
+
 Seedance 参考素材当前必须是模型服务端可访问的公网 HTTPS URL；MCP 不会代替用户上传本地媒体。通过 `media_prepare` 的 `reference_media` 数组按原顺序传入 `kind` 为 `image`、`video` 或 `audio` 的 URL 项。相同 URL 重复出现时也保留，不排序、不去重。
 
 ## 执行步骤

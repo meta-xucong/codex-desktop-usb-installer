@@ -8,6 +8,7 @@ unless the output exists and can be opened again.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -33,6 +34,16 @@ def _required_file(path: str) -> Path:
     return value
 
 
+def _reject_output_overwrite(destination: Path, inputs: list[Path]) -> None:
+    """Refuse to replace any input when output paths alias the same file."""
+    resolved_destination = destination.resolve()
+    for source in inputs:
+        if resolved_destination == source.resolve():
+            raise ValueError(f"output path must differ from input PDF: {source}")
+        if destination.exists() and source.exists() and os.path.samefile(destination, source):
+            raise ValueError(f"output path must differ from input PDF: {source}")
+
+
 def info(path: str) -> int:
     PdfReader, _, _, _ = _imports()
     pdf = _required_file(path)
@@ -51,10 +62,40 @@ def extract(path: str, output: str | None) -> int:
     text = "\n\n".join(chunks)
     if output:
         destination = Path(output).expanduser()
+        _reject_output_overwrite(destination, [pdf])
         destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(text, encoding="utf-8")
-        if not destination.is_file():
-            raise IOError(f"PDF text output was not created: {destination}")
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{destination.name}.", suffix=".extract-tmp", dir=str(destination.parent)
+        )
+        temporary = Path(temporary_name)
+        try:
+            try:
+                handle = os.fdopen(descriptor, "w", encoding="utf-8", newline="")
+            except BaseException:
+                # fdopen did not take ownership, so close the raw descriptor before
+                # unlinking the stage (required for cleanup on Windows).
+                try:
+                    os.close(descriptor)
+                except BaseException:
+                    pass
+                try:
+                    temporary.unlink()
+                except BaseException:
+                    pass
+                raise
+            with handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            if not temporary.is_file():
+                raise IOError(f"PDF text output was not created: {destination}")
+            temporary.replace(destination)
+        except BaseException:
+            try:
+                temporary.unlink()
+            except BaseException:
+                pass
+            raise
     else:
         print(text)
     return 0
@@ -66,15 +107,31 @@ def merge(output: str, inputs: list[str]) -> int:
         raise ValueError("merge requires at least one input PDF")
     writer = PdfWriter()
     for item in inputs:
-        reader = PdfReader(str(_required_file(item)))
+        source = _required_file(item)
+        reader = PdfReader(str(source))
         for page in reader.pages:
             writer.add_page(page)
     destination = Path(output).expanduser()
+    _reject_output_overwrite(destination, [_required_file(item) for item in inputs])
     destination.parent.mkdir(parents=True, exist_ok=True)
-    with destination.open("wb") as handle:
-        writer.write(handle)
-    if not destination.is_file() or destination.stat().st_size == 0:
-        raise IOError(f"Merged PDF was not created: {destination}")
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=".merge-tmp", dir=str(destination.parent)
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            writer.write(handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if not temporary.is_file() or temporary.stat().st_size == 0:
+            raise IOError(f"Merged PDF was not created: {destination}")
+        os.replace(temporary, destination)
+    except BaseException:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
     return 0
 
 
@@ -82,11 +139,27 @@ def generate(output: str, text: str) -> int:
     _, _, _, canvas = _imports()
     destination = Path(output).expanduser()
     destination.parent.mkdir(parents=True, exist_ok=True)
-    document = canvas.Canvas(str(destination))
-    document.drawString(72, 720, text)
-    document.save()
-    if not destination.is_file() or destination.stat().st_size == 0:
-        raise IOError(f"Generated PDF was not created: {destination}")
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=".generate-tmp", dir=str(destination.parent)
+    )
+    temporary = Path(temporary_name)
+    try:
+        os.close(descriptor)
+        document = canvas.Canvas(str(temporary))
+        document.drawString(72, 720, text)
+        document.save()
+        if not temporary.is_file() or temporary.stat().st_size == 0:
+            raise IOError(f"Generated PDF was not created: {destination}")
+        with temporary.open("rb") as handle:
+            if handle.read(5) != b"%PDF-":
+                raise IOError(f"Generated PDF is invalid: {destination}")
+        os.replace(temporary, destination)
+    except BaseException:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
     return 0
 
 

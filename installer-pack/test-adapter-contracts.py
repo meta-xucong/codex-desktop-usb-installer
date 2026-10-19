@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import http.server
 import base64
+import hashlib
 import functools
 import json
 import os
@@ -39,7 +40,9 @@ STOCK_SCREENER_SCRIPT = ROOT / "skills" / "china-stock-analysis" / "scripts" / "
 REALTIME_QUOTE_SCRIPT = ROOT / "skills" / "china-stock-analysis" / "scripts" / "realtime_quote.py"
 STOCK_DATA_FETCHER_SCRIPT = ROOT / "skills" / "china-stock-analysis" / "scripts" / "data_fetcher.py"
 FINANCIAL_ANALYZER_SCRIPT = ROOT / "skills" / "china-stock-analysis" / "scripts" / "financial_analyzer.py"
+FEISHU_MCP_WRAPPER = ROOT / "mcp" / "start-feishu-mcp.ps1"
 STOCK_REPORT_TEMPLATE = ROOT / "skills" / "china-stock-analysis" / "templates" / "analysis_report.md"
+PAINPOINT_SKILL = ROOT / "skills" / "painpoint-analyzer" / "SKILL.md"
 CONFIGURE_SCRIPT = SCRIPT_ROOT / "configure-codex.ps1"
 RENDER_SCRIPT = SCRIPT_ROOT / "render-codex-config.ps1"
 PDF_TOOL_SCRIPT = ROOT / "skills" / "pdf-processing-toolkit" / "scripts" / "pdf_tool.py"
@@ -448,6 +451,30 @@ class CodexConfigureContractTests(unittest.TestCase):
             self.assertIn("unmanaged [mcp_servers.feishu]", " ".join(result.get("warnings", [])))
 
 
+class PainpointSkillExampleContractTests(unittest.TestCase):
+    def test_output_example_starts_with_complete_explicit_hypothetical_input(self):
+        content = PAINPOINT_SKILL.read_text(encoding="utf-8")
+        self.assertIn("## Output Example", content)
+        example = content.split("## Output Example", 1)[1]
+        example = example.split("```", 1)[1].split("```", 1)[0]
+        input_header = "【假设性完整输入（仅演示，不代表真实用户或市场事实）】"
+        analysis_header = "【条件性分析（只基于上方假设，不代表真实结论）】"
+        self.assertIn(input_header, example)
+        self.assertIn(analysis_header, example)
+        input_section, remainder = example.split(analysis_header, 1)
+        self.assertLess(example.index(input_header), example.index(analysis_header))
+        for label in ("卖什么：", "谁付钱：", "为何不买：", "流量来源/获客成本：", "最大业务卡点："):
+            with self.subTest(required_input=label):
+                self.assertIn(label, input_section)
+        self.assertIn("假设", input_section)
+        self.assertIn("尚未访谈验证", input_section)
+        self.assertIn("没有实测获客成本", input_section)
+        self.assertIn("没有证据判断这是伪需求", remainder)
+        self.assertIn("取得真实花费和转化数据后再计算获客成本", remainder)
+        self.assertNotIn("用户口头上说想要，但不愿意付钱", example)
+        self.assertNotIn("获客成本为 500", example)
+
+
 @unittest.skipUnless(POWERSHELL, "PowerShell is required for Skill activation contract tests")
 class SkillActivationContractTests(unittest.TestCase):
     def test_renderer_emits_manifest_derived_skill_entries(self):
@@ -772,7 +799,7 @@ class ModelCatalogSyncContractTests(unittest.TestCase):
             self.assertIn("retired model", (completed.stdout + completed.stderr).lower())
 
 
-@unittest.skip("MCP behavior now uses the dedicated 1.3.10 offline contract suite in test-media-generation-mcp.py; these 1.3.4 fixtures do not model the catalog-bound confirmation contract.")
+@unittest.skip("MCP behavior now uses the dedicated 1.3.11 offline contract suite in test-media-generation-mcp.py; these 1.3.4 fixtures do not model the catalog-bound confirmation contract.")
 class MediaGenerationMcpTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -990,29 +1017,23 @@ class MediaGenerationMcpTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + "\n" + result.stderr)
         self.assertIn("5 tests passed", result.stdout)
 
-    def test_minimax_is_reserved_for_the_shared_wokey_media_slot(self):
-        with adapter_environment(self.env):
-            capabilities = self.module._configured()
-            self.assertFalse(capabilities["providers"]["minimax-video"]["configured"])
-            with self.assertRaisesRegex(self.module.MediaError, "尚未配置 MiniMax 视频模型"):
-                self.module.media_prepare({"provider": "minimax-video", "prompt": "No fallback"})
-
+    def test_minimax_remains_disabled_when_shared_gateway_model_is_injected(self):
         env = dict(
             self.env,
             MEDIA_GENERATION_API_PROFILE="wokey",
             MEDIA_GENERATION_API_BASE_URL="https://api.wokey.ai",
-            MEDIA_MINIMAX_VIDEO_MODEL="upstream-minimax-video",
+            MEDIA_GENERATION_API_KEY="contract-fixture",
+            MEDIA_MINIMAX_VIDEO_MODEL="MiniMax-H3",
         )
         with adapter_environment(env):
-            prepared = self.module.media_prepare({"provider": "minimax-video", "prompt": "Use the configured shared-upstream model"})
-            self.assertEqual(prepared["model"], "upstream-minimax-video")
-            record = self.module._load_json(self.data_dir / "confirmations" / f"{prepared['confirmation_id']}.json")
-            path, payload = self.module._request_payload(record["request"])
-            self.assertEqual(path, "/v1/videos")
-            self.assertEqual(payload["model"], "upstream-minimax-video")
-            self.assertEqual(self.module._query_path("minimax-video", "minimax-task"), "/v1/videos/minimax-task")
-            with self.assertRaisesRegex(self.module.MediaError, "只能使用统一媒体配置"):
-                self.module.media_prepare({"provider": "minimax-video", "model": "unconfigured-model", "prompt": "No model override"})
+            capabilities = self.module._configured()
+            slot = capabilities["providers"]["minimax-video"]
+            self.assertFalse(slot["available"])
+            self.assertFalse(slot["configured"])
+            self.assertEqual(slot["missing"], ["PROVIDER_ADAPTER_UNAVAILABLE"])
+            with self.assertRaisesRegex(self.module.MediaError, "没有已验证的官方 API 或统一网关适配"):
+                self.module.media_prepare({"provider": "minimax-video", "prompt": "No fallback"})
+        self.assertFalse((self.data_dir / "confirmations").exists())
 
     def test_provider_payloads_and_mcp_stdio_contract(self):
         with adapter_environment(self.env):
@@ -1245,7 +1266,7 @@ class MediaGenerationMcpTests(unittest.TestCase):
         health = subprocess.run([POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(bin_dir / "start-media-generation-mcp.ps1"), "-HealthCheck", "-PythonExe", sys.executable], capture_output=True, env=environment, timeout=20)
         self.assertEqual(health.returncode, 0, health.stderr.decode("utf-8", errors="replace"))
         health_report = json.loads(health.stdout.decode("utf-8", errors="strict"))
-        self.assertEqual(health_report["serverVersion"], "1.3.10")
+        self.assertEqual(health_report["serverVersion"], "1.3.11")
         self.assertEqual(health_report["protocolStatus"], "passed")
         self.assertEqual(health_report["generationCapability"], "not_tested")
 
@@ -1520,14 +1541,14 @@ class MediaGenerationMcpTests(unittest.TestCase):
         self.assertEqual(health["healthScope"], "local-runtime-protocol")
         self.assertEqual(health["gatewayCatalogStatus"], "not_checked")
         self.assertEqual(health["generationCapability"], "not_tested")
-        self.assertEqual(health["serverVersion"], "1.3.10")
+        self.assertEqual(health["serverVersion"], "1.3.11")
 
     def test_wrapper_healthcheck_does_not_merge_stderr_into_json_stdout(self):
         self.assertTrue(POWERSHELL, "Windows PowerShell is required for this wrapper contract test")
         fake_python = Path(self.temp.name) / "python-health-fixture.cmd"
         health_json = json.dumps({
             "ready": True,
-            "serverVersion": "1.3.10",
+            "serverVersion": "1.3.11",
             "healthScope": "local-runtime-protocol",
             "runtimeStatus": "passed",
             "protocolStatus": "passed",
@@ -1564,14 +1585,103 @@ class MediaGenerationMcpPackageContractTests(unittest.TestCase):
     def test_media_mcp_package_versions_and_reference_schema_are_aligned(self):
         pack = Path(__file__).resolve().parent
         server = load_module(pack / "mcp" / "media-generation-mcp.py")
-        self.assertEqual(server.SERVER_VERSION, "1.3.10")
+        self.assertEqual(server.SERVER_VERSION, "1.3.11")
         wrapper = (pack / "mcp" / "start-media-generation-mcp.ps1").read_text(encoding="utf-8")
-        self.assertIn("serverVersion -ne '1.3.10'", wrapper)
+        self.assertIn("serverVersion -ne '1.3.11'", wrapper)
         manifest = json.loads((pack / "manifest" / "media-generation-tools.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["serverVersion"], server.SERVER_VERSION)
         prepare = next(tool for tool in server.TOOL_SCHEMAS if tool["name"] == "media_prepare")
         role_schema = prepare["inputSchema"]["properties"]["reference_media"]["items"]["properties"]["role"]
         self.assertEqual(role_schema["enum"], ["first_frame", "reference"])
+
+
+class FeishuNodeRuntimeFloorTests(unittest.TestCase):
+    def setUp(self):
+        if not WINDOWS_POWERSHELL:
+            self.skipTest("Windows PowerShell 5.1 is required for packaged wrapper compatibility tests.")
+        self.temporary = tempfile.TemporaryDirectory(prefix="feishu-node-floor-", dir=ROOT.parent / "tmp")
+        self.root = Path(self.temporary.name)
+        self.package_cache = self.root / "package-cache"
+        package = self.package_cache / "node_modules" / "@larksuiteoapi" / "lark-mcp"
+        (package / "dist").mkdir(parents=True)
+        (package / "package.json").write_text(
+            json.dumps({"name": "@larksuiteoapi/lark-mcp", "version": "0.5.1"}),
+            encoding="utf-8",
+        )
+        (package / "dist" / "cli.js").write_text("// synthetic; never launched in DryRun\n", encoding="utf-8")
+        self.env = os.environ.copy()
+        self.env.update(
+            {
+                "TEMP": str(self.root),
+                "TMP": str(self.root),
+                "CODEX_DATA_DIR": str(self.root / "codex-data"),
+                "FEISHU_APP_ID": "cli_SYNTHETIC_TEST",
+                "FEISHU_APP_SECRET": "SYNTHETIC_ONLY_SECRET",
+            }
+        )
+        self.addCleanup(self.temporary.cleanup)
+
+    def node_command(self, major: int, version: str | None = None) -> Path:
+        version = version or f"{major}.0.0"
+        command = self.root / f"node{major}.cmd"
+        command.write_text(f"@echo off\r\necho v{version}\r\n", encoding="ascii")
+        return command
+
+    def invoke_wrapper(self, node: Path) -> subprocess.CompletedProcess[str]:
+        env = dict(self.env, CODEX_NODE=str(node))
+        return subprocess.run(
+            [WINDOWS_POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(FEISHU_MCP_WRAPPER),
+             "-PackageCache", str(self.package_cache), "-DryRun"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            env=env,
+            timeout=30,
+            check=False,
+        )
+
+    def invoke_renderer(self, node: Path, output: Path) -> subprocess.CompletedProcess[str]:
+        env = dict(self.env, CODEX_NODE=str(node))
+        return subprocess.run(
+            [WINDOWS_POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(RENDER_SCRIPT),
+             "-OutputPath", str(output), "-TargetUserProfile", str(self.root / "profile"),
+             "-SkillRoot", str(self.root / "skills"), "-EnableFeishu",
+             "-FeishuWrapperPath", str(FEISHU_MCP_WRAPPER), "-FeishuPackageCache", str(self.package_cache)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            env=env,
+            timeout=45,
+            check=False,
+        )
+
+    def test_wrapper_requires_node_22_and_accepts_22_or_newer(self):
+        for major, expected_ready in ((20, False), (22, True), (24, True)):
+            with self.subTest(major=major):
+                completed = self.invoke_wrapper(self.node_command(major))
+                self.assertEqual(completed.returncode, 0, completed.stdout + "\n" + completed.stderr)
+                payload = json.loads(completed.stdout)
+                self.assertEqual(payload["nodeVersion"], f"{major}.0.0")
+                self.assertIs(payload["nodeReady"], expected_ready)
+                self.assertTrue(payload["packagePresent"])
+                self.assertTrue(payload["packageValidated"])
+                self.assertNotIn("SYNTHETIC_ONLY_SECRET", completed.stdout + completed.stderr)
+
+    def test_renderer_rejects_node_20_and_accepts_node_22_or_newer(self):
+        rejected = self.root / "node20-config.toml"
+        result20 = self.invoke_renderer(self.node_command(20), rejected)
+        self.assertNotEqual(result20.returncode, 0, result20.stdout)
+        self.assertIn("Node.js >=22 is required before enabling Feishu", result20.stdout + result20.stderr)
+        self.assertFalse(rejected.exists())
+
+        for major in (22, 24):
+            with self.subTest(major=major):
+                output = self.root / f"node{major}-config.toml"
+                completed = self.invoke_renderer(self.node_command(major), output)
+                self.assertEqual(completed.returncode, 0, completed.stdout + "\n" + completed.stderr)
+                self.assertTrue(output.is_file())
+                self.assertIn("[mcp_servers.feishu]", output.read_text(encoding="utf-8"))
+                self.assertNotIn("SYNTHETIC_ONLY_SECRET", completed.stdout + completed.stderr + output.read_text(encoding="utf-8"))
 
 
 class DashScopeAdapterTests(unittest.TestCase):
@@ -1780,6 +1890,65 @@ class LocalFeatureContractTests(unittest.TestCase):
             self.assertEqual(module.canonical_bytes(lf), module.canonical_bytes(crlf))
             self.assertEqual(len(module.canonical_bytes(lf)), len(module.canonical_bytes(crlf)))
 
+    def test_capability_source_tree_hash_is_canonical_and_excludes_generated_metadata(self):
+        module = load_module(ROOT.parent / "tools" / "refresh-capability-pack-metadata.py")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "notes.md"
+            source.write_bytes(b"first line\r\nsecond line\r\n")
+            for name in ("pack.json", "file-manifest.json", "checksums.sha256"):
+                (root / name).write_text("initial", encoding="utf-8")
+            expected = hashlib.sha256()
+            relative = b"notes.md"
+            canonical = b"first line\nsecond line\n"
+            expected.update(len(relative).to_bytes(4, "big"))
+            expected.update(relative)
+            expected.update(hashlib.sha256(canonical).digest())
+            first_hash = module.source_tree_sha256(root)
+            self.assertEqual(first_hash, expected.hexdigest())
+
+            source.write_bytes(canonical)
+            for name in ("pack.json", "file-manifest.json", "checksums.sha256"):
+                (root / name).write_text("changed metadata", encoding="utf-8")
+            (root / "__pycache__").mkdir()
+            (root / "__pycache__" / "transient.pyc").write_bytes(b"ignored")
+            self.assertEqual(module.source_tree_sha256(root), first_hash)
+
+            source.write_bytes(canonical + b"source edit")
+            self.assertNotEqual(module.source_tree_sha256(root), first_hash)
+
+    def test_capability_metadata_check_rejects_a_stale_source_tree_hash(self):
+        module = load_module(ROOT.parent / "tools" / "refresh-capability-pack-metadata.py")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "source.txt").write_text("initial source\n", encoding="utf-8")
+            (root / "pack.json").write_text(
+                json.dumps({"id": "fixture", "version": "1", "sourceTreeSha256": ""}),
+                encoding="utf-8",
+            )
+            manifest = {
+                "schemaVersion": 2,
+                "id": "fixture",
+                "version": "1",
+                "hashScope": "fixture",
+                "files": [
+                    {"path": "pack.json", "sha256": "", "bytes": 0, "owned": True},
+                    {"path": "source.txt", "sha256": "", "bytes": 0, "owned": True},
+                ],
+            }
+            (root / "file-manifest.json").write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            (root / "checksums.sha256").write_text("", encoding="utf-8")
+
+            module.refresh(root)
+            checked = module.check(root)
+            self.assertEqual(checked["sourceTreeSha256"], module.source_tree_sha256(root))
+            (root / "source.txt").write_text("changed source\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "sourceTreeSha256 is stale"):
+                module.check(root)
+
     def test_monthly_theme_extraction_is_deterministic_and_non_placeholder(self):
         module = load_module(REFLECTION_SCRIPT)
         reflections = [
@@ -1982,6 +2151,18 @@ class FinancialScenarioContractTests(unittest.TestCase):
         self.assertEqual(plan["transaction_cost_rate"], 2)
         self.assertNotIn("suggestions", plan)
 
+        allocator = load_module(ALLOCATOR_SCRIPT)
+        policy = {
+            "risk_level": "reviewed", "description": "synthetic", "as_of": "2026-10-19",
+            "sources": ["synthetic"],
+            "allocation": {"survival": 50, "growth": 40, "aggressive": 10},
+            "scenario_annual_return": 4, "scenario_max_drawdown": 15,
+            "emergency_months": 6, "rebalance_threshold": 5,
+        }
+        for args in ((True, 10000, 3), (100000, True, 3), (100000, 10000, True)):
+            with self.subTest(asset_allocator_args=args), self.assertRaises(ValueError):
+                allocator.generate_allocation_plan(*args, policy)
+
         tracker = load_module(TRACKER_SCRIPT)
         report = tracker.track_portfolio(
             100,
@@ -1996,6 +2177,104 @@ class FinancialScenarioContractTests(unittest.TestCase):
         self.assertEqual(report["benchmark_comparison"]["verified benchmark"]["benchmark_return"], 5)
         self.assertEqual(report["risk_free_rate"], 2)
         self.assertNotIn("suggestions", report)
+
+    def test_rebalance_rejects_colliding_normalized_asset_codes(self):
+        rebalance = load_module(REBALANCE_SCRIPT)
+        target = {"A": 50, "B": 50}
+        for label, current, conflicting_target in (
+            ("current", {"A": 50, " A ": 50, "B": 50}, target),
+            ("target", target, {"A": 50, " A ": 50, "B": 50}),
+        ):
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(ValueError, "规范化后重复"):
+                    rebalance.calculate_rebalance_plan(
+                        current, conflicting_target, 10000, 1, 0.1
+                    )
+
+        trimmed = rebalance.calculate_rebalance_plan(
+            {" A ": 50, "B": 50}, target, 10000, 1, 0.1
+        )
+        self.assertEqual(
+            [(item["asset"], item["current_percent"], item["target_percent"])
+             for item in trimmed["differences"]],
+            [("A", 50.0, 50.0), ("B", 50.0, 50.0)],
+        )
+
+    def test_rebalance_cli_returns_json_error_without_output_for_code_collision(self):
+        temp_root = ROOT.parent / "tmp"
+        temp_root.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=temp_root) as directory:
+            directory = Path(directory)
+            current = directory / "current.json"
+            target = directory / "target.json"
+            output = directory / "plan.json"
+            current.write_text(
+                json.dumps({"A": 50, " A ": 50, "B": 50}), encoding="utf-8"
+            )
+            target.write_text(json.dumps({"A": 50, "B": 50}), encoding="utf-8")
+            completed = subprocess.run(
+                [sys.executable, str(REBALANCE_SCRIPT), "--current", str(current),
+                 "--target", str(target), "--value", "10000", "--threshold", "1",
+                 "--transaction-cost-rate", "0.1", "--json", "--output", str(output)],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(completed.returncode, 1)
+            self.assertNotIn("Traceback", completed.stdout + completed.stderr)
+            payload = json.loads(completed.stdout)
+            self.assertFalse(payload["success"])
+            self.assertIn("规范化后重复", payload["error"])
+            self.assertFalse(output.exists())
+
+    def test_financial_numeric_helpers_reject_boolean_inputs(self):
+        builder = load_module(FUND_BUILDER_SCRIPT)
+        model = {
+            "risk_level": "reviewed", "description": "synthetic", "as_of": "2026-10-19",
+            "sources": ["synthetic"], "allocation": {"cash": 40, "equity": 60},
+            "scenario_annual_return": 4, "scenario_max_drawdown": 15, "fund_type_notes": {},
+        }
+        with self.assertRaises(ValueError):
+            builder.generate_portfolio(model, True, 3)
+        with self.assertRaises(ValueError):
+            builder.generate_portfolio(model, 100000, True)
+
+        tracker = load_module(TRACKER_SCRIPT)
+        with self.assertRaises(ValueError):
+            tracker.track_portfolio(100, 110, [{"value": 100}, {"value": 110}], True, 0, {}, "2026-10-19", ["synthetic"])
+
+        financial = load_module(FINANCIAL_MODEL_SCRIPT)
+        def financial_args(years=2, initial_users=1000):
+            return SimpleNamespace(
+                years=years, initial_active_users=initial_users, annual_net_user_growth_rate=10,
+                monthly_arpu=100, cac_per_new_user=50, gross_margin=70, monthly_churn_rate=3,
+                monthly_fixed_costs=50000, monthly_other_cash_outflow=10000, initial_cash=500000,
+                liquidity_buffer_months=6, as_of="2026-10-19", source=["synthetic"],
+            )
+        with self.assertRaises(ValueError):
+            financial.generate_model(financial_args(years=True))
+        with self.assertRaises(ValueError):
+            financial.generate_model(financial_args(initial_users=True))
+
+        valuation = load_module(VALUATION_SCRIPT)
+        assumptions = {
+            "as_of": "2026-10-19", "sources": ["synthetic"],
+            "comparable_valuation_range": [500, 1000], "revenue_multiple_range": [3, 5],
+            "scorecard_base_valuation": 800,
+            "scorecard_weights": {"team": 0.3, "product": 0.25, "market": 0.2, "competition": 0.15, "timing": 0.1},
+            "scorecard_factor_range": [0.5, 1.5], "range_factor": 0.2,
+        }
+        def valuation_args(team_score=7, years=5):
+            return SimpleNamespace(
+                stage="angel", industry="synthetic", revenue=1000000, growth_rate=20,
+                team_score=team_score, product_score=7, market_score=7, competition_score=7, timing_score=7,
+                target_return=30, exit_multiple=5, years=years,
+            )
+        for field in ("team_score", "product_score", "market_score", "competition_score", "timing_score"):
+            args = valuation_args()
+            setattr(args, field, True)
+            with self.subTest(valuation_score=field), self.assertRaises(ValueError):
+                valuation.generate_valuation_report(args, assumptions)
+        with self.assertRaises(ValueError):
+            valuation.generate_valuation_report(valuation_args(years=True), assumptions)
 
     def test_venture_models_require_attributed_assumptions(self):
         valuation = load_module(VALUATION_SCRIPT)

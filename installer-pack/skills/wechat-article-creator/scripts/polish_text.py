@@ -93,7 +93,7 @@ class ArticlePolisher:
         return {
             "issues": self.issues,
             "suggestions": self.suggestions,
-            "word_count": len(text),
+            "character_count": len(text),
             "paragraph_count": len(text.split('\n\n')),
             "avg_paragraph_length": len(text) // max(1, len(text.split('\n\n')))
         }
@@ -117,7 +117,7 @@ def main():
     print("=" * 60)
     print("ARTICLE ANALYSIS")
     print("=" * 60)
-    print(f"Word count: {result['word_count']}")
+    print(f"Character count: {result['character_count']}")
     print(f"Paragraph count: {result['paragraph_count']}")
     print(f"Avg paragraph length: {result['avg_paragraph_length']} chars")
     print()

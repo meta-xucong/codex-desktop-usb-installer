@@ -66,6 +66,8 @@ def test_upload_and_remote_verification_use_bundled_requests_offline() -> None:
 
     class FakeResponse:
         status_code = 200
+        url = "https://n.uguu.se/ref.jpg"
+        history = []
         headers = {"content-type": "image/jpeg; charset=binary"}
 
         def json(self):
@@ -110,6 +112,128 @@ def test_upload_and_remote_verification_use_bundled_requests_offline() -> None:
     assert verify["allow_redirects"] is True and verify["timeout"] == 60.0
 
 
+def test_remote_verification_requires_https_for_final_url_and_every_redirect_hop() -> None:
+    import upload_reference
+
+    image = b"\xff\xd8\xffsynthetic-image"
+    local = {"sha256": upload_reference.sha256(image)}
+
+    class FakeHop:
+        def __init__(self, url: str):
+            self.url = url
+
+    class FakeResponse:
+        status_code = 200
+        headers = {"content-type": "image/jpeg"}
+
+        def __init__(self, final_url: str, history: list[FakeHop] | None = None,
+                     status_code: int = 200, mime: str = "image/jpeg", data: bytes = image):
+            self.url = final_url
+            self.history = history or []
+            self.status_code = status_code
+            self.headers = {"content-type": mime}
+            self.data = data
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def iter_content(self, _chunk_size):
+            yield self.data
+
+    class FakeRequestException(Exception):
+        pass
+
+    class FakeSession:
+        trust_env = True
+
+        def __init__(self, response):
+            self.response = response
+
+        def get(self, _url, **kwargs):
+            assert kwargs["allow_redirects"] is True
+            return self.response
+
+    requests_stub = types.SimpleNamespace(Session=None, RequestException=FakeRequestException)
+    cases = (
+        (FakeResponse("http://mirror.invalid/final.jpg"), "final response URL"),
+        (FakeResponse("https://mirror.invalid/final.jpg", [FakeHop("https://n.uguu.se/start.jpg"),
+                                                           FakeHop("http://mirror.invalid/downgrade.jpg")]),
+         "redirect hop 2"),
+    )
+    for response, message in cases:
+        requests_stub.Session = lambda response=response: FakeSession(response)
+        with mock.patch.dict(sys.modules, {"requests": requests_stub}):
+            try:
+                upload_reference.verify_remote("https://n.uguu.se/start.jpg", local)
+            except UploadError as error:
+                assert message in str(error)
+            else:
+                raise AssertionError("HTTP redirect destination must never be verified")
+
+
+def test_remote_verification_keeps_https_status_mime_size_and_hash_checks() -> None:
+    import upload_reference
+
+    image = b"\xff\xd8\xffsynthetic-image"
+
+    class FakeResponse:
+        def __init__(self, *, status=200, mime="image/jpeg", data=image):
+            self.status_code = status
+            self.url = "https://n.uguu.se/ref.jpg"
+            self.history = [type("Hop", (), {"url": "https://n.uguu.se/start.jpg"})()]
+            self.headers = {"content-type": mime}
+            self.data = data
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def iter_content(self, _chunk_size):
+            yield self.data
+
+    class FakeRequestException(Exception):
+        pass
+
+    class FakeSession:
+        trust_env = True
+
+        def __init__(self, response):
+            self.response = response
+
+        def get(self, _url, **_kwargs):
+            return self.response
+
+    requests_stub = types.SimpleNamespace(Session=None, RequestException=FakeRequestException)
+
+    def check(response, local, message):
+        requests_stub.Session = lambda: FakeSession(response)
+        with mock.patch.dict(sys.modules, {"requests": requests_stub}):
+            try:
+                return upload_reference.verify_remote("https://n.uguu.se/ref.jpg", local)
+            except UploadError as error:
+                if message is None:
+                    raise
+                assert message in str(error)
+                return None
+        raise AssertionError("expected remote verification failure")
+
+    local = {"sha256": upload_reference.sha256(image)}
+    verified = check(FakeResponse(), local, None)
+    assert verified["verified"] is True
+    assert verified["remote_sha256"] == local["sha256"]
+
+    check(FakeResponse(status=404), local, "HTTP 404")
+    check(FakeResponse(mime="text/html"), local, "unsupported MIME")
+    with mock.patch.object(upload_reference, "MAX_BYTES", 5):
+        check(FakeResponse(), local, "exceeds 5 bytes")
+    check(FakeResponse(data=b"\xff\xd8\xffdifferent"), local, "SHA-256 differs")
+
+
 if __name__ == "__main__":
     tests = [
         test_detects_supported_signatures,
@@ -117,6 +241,8 @@ if __name__ == "__main__":
         test_inspection_reports_hash_and_mime,
         test_parses_only_one_https_uguu_url,
         test_upload_and_remote_verification_use_bundled_requests_offline,
+        test_remote_verification_requires_https_for_final_url_and_every_redirect_hop,
+        test_remote_verification_keeps_https_status_mime_size_and_hash_checks,
     ]
     for test in tests:
         test()

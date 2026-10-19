@@ -59,6 +59,73 @@ def hex_to_rgb(hex_color: str) -> tuple:
     return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
 
 
+def _wrap_text_to_width(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont, max_width: int) -> str:
+    """Wrap text at measured pixel width, preserving explicit paragraphs."""
+    lines = []
+    for paragraph in str(text).split("\n"):
+        line = ""
+        for char in paragraph:
+            candidate = line + char
+            candidate_bounds = draw.textbbox((0, 0), candidate, font=font)
+            if line and candidate_bounds[2] - candidate_bounds[0] > max_width:
+                lines.append(line.rstrip())
+                line = char.lstrip()
+            else:
+                line = candidate
+        lines.append(line.rstrip())
+    return "\n".join(lines)
+
+
+def _fit_title_layout(
+    draw: ImageDraw.ImageDraw,
+    title: str,
+    font_path: str,
+    base_size: int,
+    x: int,
+    y: int,
+    max_width: int,
+    bottom: int,
+    spacing: int = 10,
+    minimum_size: int = 16,
+):
+    """Return the largest title font that fits the horizontal and vertical safe area."""
+    for size in range(base_size, minimum_size - 1, -1):
+        font = ImageFont.truetype(font_path, size)
+        wrapped = _wrap_text_to_width(draw, title, font, max_width)
+        bounds = draw.multiline_textbbox((x, y), wrapped, font=font, spacing=spacing)
+        if bounds[0] >= x and bounds[2] <= x + max_width and bounds[3] <= bottom:
+            return wrapped, font, bounds
+    raise ValueError(
+        f"标题无法放入封面安全区域（最小字号 {minimum_size}px，安全宽度 {max_width}px）；"
+        "请缩短标题或调整封面尺寸。"
+    )
+
+
+def _fit_auxiliary_text(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font_path: str | None,
+    fallback_font: ImageFont.ImageFont,
+    base_size: int,
+    x: int,
+    y: int,
+    max_width: int,
+    bottom: int,
+    label: str,
+    minimum_size: int = 14,
+    spacing: int = 4,
+):
+    """Wrap and shrink subtitle/author text to a measured safe rectangle."""
+    sizes = range(base_size, minimum_size - 1, -1) if font_path else (None,)
+    for size in sizes:
+        font = ImageFont.truetype(font_path, size) if size is not None else fallback_font
+        wrapped = _wrap_text_to_width(draw, text, font, max_width)
+        bounds = draw.multiline_textbbox((x, y), wrapped, font=font, spacing=spacing)
+        if bounds[0] >= x and bounds[2] <= x + max_width and bounds[3] <= bottom:
+            return wrapped, font, bounds
+    raise ValueError(f"{label}无法放入封面安全区域；请缩短内容。")
+
+
 def generate_cover(
     title: str,
     subtitle: str = "",
@@ -70,6 +137,12 @@ def generate_cover(
     output_path: str = None
 ):
     """Generate a WeChat article cover image"""
+    resolved_output_path = None
+    if output_path is not None:
+        resolved_output_path = Path(output_path).expanduser().resolve()
+        if resolved_output_path.suffix.casefold() not in {".jpg", ".jpeg", ".png"}:
+            raise ValueError("--output 只支持 .jpg、.jpeg 或 .png 扩展名。")
+
     if not (256 <= width <= 8192 and 256 <= height <= 8192):
         raise ValueError("width 和 height 必须在 256 到 8192 之间。")
     if width * height > 40_000_000:
@@ -85,6 +158,7 @@ def generate_cover(
     draw = ImageDraw.Draw(img)
     
     # Try to load fonts (fallback to default if not available)
+    title_font_path = None
     try:
         # Cross-platform font paths
         font_paths = []
@@ -122,6 +196,7 @@ def generate_cover(
                 break
         
         if font_path:
+            title_font_path = font_path
             title_font = ImageFont.truetype(font_path, int(width * 0.08))
             subtitle_font = ImageFont.truetype(font_path, int(width * 0.04))
             author_font = ImageFont.truetype(font_path, int(width * 0.03))
@@ -160,53 +235,95 @@ def generate_cover(
     title_x = int(width * 0.1)
     title_y = int(height * 0.25)
     
-    # Word wrap for long titles
-    max_chars_per_line = 15
-    if len(title) > max_chars_per_line:
-        words = []
-        for i in range(0, len(title), max_chars_per_line):
-            words.append(title[i:i+max_chars_per_line])
-        title_wrapped = '\n'.join(words)
+    # Keep titles inside the 10%-90% horizontal safe area and above the subtitle.
+    title_spacing = 10
+    title_max_width = int(width * 0.8)
+    subtitle_y = int(height * 0.55)
+    title_bottom = subtitle_y - 16 if subtitle else int(height * 0.78)
+    if title_font_path is not None:
+        title_wrapped, title_font, _ = _fit_title_layout(
+            draw=draw,
+            title=title,
+            font_path=title_font_path,
+            base_size=int(width * 0.08),
+            x=title_x,
+            y=title_y,
+            max_width=title_max_width,
+            bottom=title_bottom,
+            spacing=title_spacing,
+        )
     else:
-        title_wrapped = title
+        title_wrapped = _wrap_text_to_width(draw, title, title_font, title_max_width)
+        title_bounds = draw.multiline_textbbox((title_x, title_y), title_wrapped, font=title_font, spacing=title_spacing)
+        if title_bounds[0] < title_x or title_bounds[2] > title_x + title_max_width or title_bounds[3] > title_bottom:
+            raise ValueError("当前字体无法将标题放入封面安全区域；请安装支持的字体或缩短标题。")
     
     draw.text(
         (title_x, title_y),
         title_wrapped,
         fill=primary_color,
         font=title_font,
-        spacing=10
+        spacing=title_spacing
     )
     
-    # Draw subtitle
-    if subtitle:
-        subtitle_y = int(height * 0.55)
-        draw.text(
-            (title_x, subtitle_y),
-            subtitle,
-            fill=hex_to_rgb(default_colors["secondary"]),
-            font=subtitle_font
-        )
-    
-    # Draw author
-    if author:
-        author_y = height - int(height * 0.12)
-        draw.text(
-            (title_x, author_y),
-            f"作者：{author}",
-            fill=text_color,
-            font=author_font
-        )
-    
-    # Draw date
+    # Reserve a measured bottom row for the author and date before fitting text.
+    author_y = height - int(height * 0.12)
     date_str = datetime.now().strftime("%Y.%m.%d")
     date_x = width - int(width * 0.1)
-    date_y = height - int(height * 0.12)
+    date_font = author_font
+    date_bounds = draw.textbbox((date_x, author_y), date_str, font=date_font, anchor="rm")
+
+    # Draw subtitle inside the gap between the title and bottom metadata row.
+    if subtitle:
+        subtitle_wrapped, subtitle_font, _ = _fit_auxiliary_text(
+            draw=draw,
+            text=subtitle,
+            font_path=title_font_path,
+            fallback_font=subtitle_font,
+            base_size=int(width * 0.04),
+            x=title_x,
+            y=subtitle_y,
+            max_width=title_max_width,
+            bottom=author_y - 16,
+            label="副标题",
+        )
+        draw.multiline_text(
+            (title_x, subtitle_y),
+            subtitle_wrapped,
+            fill=hex_to_rgb(default_colors["secondary"]),
+            font=subtitle_font,
+            spacing=4,
+        )
+
+    # Keep author text left of the date; reject content that cannot fit.
+    if author:
+        author_text = f"作者：{author}"
+        author_max_width = date_bounds[0] - title_x - 24
+        author_wrapped, author_font, _ = _fit_auxiliary_text(
+            draw=draw,
+            text=author_text,
+            font_path=title_font_path,
+            fallback_font=author_font,
+            base_size=int(width * 0.03),
+            x=title_x,
+            y=author_y,
+            max_width=author_max_width,
+            bottom=height - int(height * 0.05),
+            label="作者",
+            minimum_size=12,
+            spacing=2,
+        )
+        draw.multiline_text(
+            (title_x, author_y), author_wrapped, fill=text_color, font=author_font, spacing=2
+        )
+
+    # Draw date
+    date_y = author_y
     draw.text(
         (date_x, date_y),
         date_str,
         fill=text_color,
-        font=author_font,
+        font=date_font,
         anchor="rm"
     )
     
@@ -216,7 +333,7 @@ def generate_cover(
         output_dir.mkdir(parents=True, exist_ok=True)
         output_path = output_dir / f"cover_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
     else:
-        output_path = Path(output_path).expanduser().resolve()
+        output_path = resolved_output_path
         output_path.parent.mkdir(parents=True, exist_ok=True)
     
     output_path = Path(output_path).resolve()

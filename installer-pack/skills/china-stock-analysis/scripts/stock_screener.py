@@ -61,6 +61,20 @@ def _finite_optional(value: float | None, field: str) -> float | None:
     return number
 
 
+def _finite_display_number(value: Any, pandas_module) -> float | None:
+    """Convert optional provider fields to JSON-safe finite numbers or null."""
+    if value is None:
+        return None
+    try:
+        number = pandas_module.to_numeric(value, errors="coerce")
+        if pandas_module.isna(number):
+            return None
+        normalized = float(number)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return normalized if math.isfinite(normalized) else None
+
+
 def screen_stocks(
     scope: str,
     filters: dict[str, float | None],
@@ -123,23 +137,25 @@ def screen_stocks(
 
     sort_column = SORT_COLUMNS[sort_by]
     frame = frame.assign(_sort_value=pandas_module.to_numeric(frame[sort_column], errors="coerce"))
-    frame = frame.dropna(subset=["_sort_value"])
+    frame = frame[
+        frame["_sort_value"].map(
+            lambda value: _finite_display_number(value, pandas_module) is not None
+        )
+    ]
     frame = frame.sort_values("_sort_value", ascending=sort_by in {"pe", "pb"}).head(top_n)
 
     results = []
     for _, row in frame.iterrows():
-        market_cap = pandas_module.to_numeric(row.get("总市值"), errors="coerce")
+        market_cap = _finite_display_number(row.get("总市值"), pandas_module)
         results.append(
             {
                 "code": str(row.get("代码", "")).zfill(6),
                 "name": str(row.get("名称", "")),
-                "latest_price": row.get("最新价"),
-                "change_percent": row.get("涨跌幅"),
-                "pe_dynamic": row.get("市盈率-动态"),
-                "pb": row.get("市净率"),
-                "market_cap_100m": None
-                if pandas_module.isna(market_cap)
-                else round(float(market_cap) / 100_000_000, 2),
+                "latest_price": _finite_display_number(row.get("最新价"), pandas_module),
+                "change_percent": _finite_display_number(row.get("涨跌幅"), pandas_module),
+                "pe_dynamic": _finite_display_number(row.get("市盈率-动态"), pandas_module),
+                "pb": _finite_display_number(row.get("市净率"), pandas_module),
+                "market_cap_100m": None if market_cap is None else round(market_cap / 100_000_000, 2),
             }
         )
 
@@ -183,7 +199,7 @@ def main(argv: list[str] | None = None) -> int:
     }
     try:
         report = screen_stocks(args.scope, filters, args.sort_by, args.top)
-        output = json.dumps(report, ensure_ascii=False, indent=2, default=str)
+        output = json.dumps(report, ensure_ascii=False, indent=2, default=str, allow_nan=False)
         if args.output:
             output_path = Path(args.output).expanduser().resolve()
             output_path.write_text(output + "\n", encoding="utf-8")

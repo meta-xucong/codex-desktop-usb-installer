@@ -104,8 +104,8 @@
       "kind": "configuration",
       "required": true,
       "autoInstallable": false,
-      "healthCheck": "MEDIA_MINIMAX_VIDEO_MODEL exactly matches a video model enabled by the shared upstream",
-      "failureMessage": "当前尚未配置 MiniMax 视频模型；Skill 不会自动改用 Grok 或 Seedance。",
+      "healthCheck": "Future verified MiniMax adapter explicitly enables this provider; setting the model name alone must remain insufficient",
+      "failureMessage": "MiniMax provider is hard-disabled until a protocol-compatible adapter and separate official credential are implemented; a model name alone cannot enable it.",
       "dependentCapabilities": [
         "MiniMax 视频生成",
         "异步任务查询"
@@ -1228,6 +1228,23 @@
         "python-env-setup",
         "safe-disk-operations"
       ]
+    },
+    {
+      "id": "credential.minimax-api-key",
+      "kind": "credential",
+      "name": "credential.minimax-api-key",
+      "required": true,
+      "autoInstallable": false,
+      "secret": true,
+      "healthCheck": "MINIMAX_API_KEY configured only for a future verified official API adapter",
+      "failureMessage": "当前没有 MiniMax 官方账号或 API Key；签名 U 盘设备 Key 不能替代。",
+      "dependentCapabilities": [
+        "MiniMax 官方视频 API"
+      ],
+      "dependentSkills": [
+        "minimax-video-gen"
+      ],
+      "dependentAgents": []
     }
   ],
   "skills": [
@@ -1945,8 +1962,8 @@
       "enableWhen": [
         "skill-installed",
         "mcp.media-generation.ready",
-        "signed-usb-license.device-api-key",
-        "MEDIA_MINIMAX_VIDEO_MODEL",
+        "future-verified-minimax-adapter",
+        "credential.minimax-api-key",
         "user-approved-paid-task"
       ],
       "dependencyTypes": [
@@ -1956,15 +1973,15 @@
       ],
       "dependencies": [
         "mcp.media-generation",
-        "credential.usb-license-404token",
-        "config.MEDIA_MINIMAX_VIDEO_MODEL"
+        "config.MEDIA_MINIMAX_VIDEO_MODEL",
+        "credential.minimax-api-key"
       ],
       "dependentCapabilities": [
         "MiniMax 视频生成",
         "异步任务查询"
       ],
-      "healthCheck": "MCP reports the MiniMax slot unavailable when the model is blank and prepares a single-use request only when configured",
-      "notes": "保留 MiniMax 专用创作流程 Skill，但所有请求只经统一媒体 MCP，并共用签名 U 盘授权中的设备 Key。当前模型槽位留空；只有统一上游实际开放 MiniMax 视频模型后才可启用。无官方 MiniMax API 直连，也不回退到其他视频模型。"
+      "healthCheck": "MCP reports MiniMax unavailable and rejects prepare before network, even when MEDIA_MINIMAX_VIDEO_MODEL is injected",
+      "notes": "Skill is limited to availability guidance and prompt drafting. The official API uses separate credentials, v2 endpoints and H3 multimodal contract; no adapter/account is configured. Setting the shared model field cannot enable generation; no direct official API or provider fallback."
     },
     {
       "id": "multi-search-engine",

@@ -7,6 +7,7 @@ and generated pack layouts, but never reads user credentials or Codex history.
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 import re
@@ -20,6 +21,25 @@ from pathlib import Path
 MIN_CODEX_VERSION = (0, 144, 0)
 EXPECTED_AGENTS = 7
 FRONTMATTER_KEYS = {"name", "description"}
+
+
+def has_argparse_option(source: str, option: str) -> bool:
+    """Return whether Python syntax declares a static argparse option."""
+    try:
+        module = ast.parse(source)
+    except SyntaxError:
+        return False
+    for node in ast.walk(module):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr != "add_argument" or not node.args:
+            continue
+        first = node.args[0]
+        if isinstance(first, ast.Constant) and first.value == option:
+            return True
+    return False
+
+
 MODEL_CATALOG_FIELDS = {
     "id",
     "displayName",
@@ -807,12 +827,13 @@ def check_financial_data_truthfulness(audit: Audit) -> None:
         '"sources"',
         '"completeness"',
         '"status": status',
-        'parser.add_argument("--allow-partial"',
         'status == "complete"',
         "raise SystemExit(main())",
     ):
         if marker not in data_fetcher_code:
             audit.error(f"A-share data fetcher lacks provenance/completeness marker: {marker}")
+    if not has_argparse_option(data_fetcher_code, "--allow-partial"):
+        audit.error('A-share data fetcher lacks provenance/completeness marker: argparse --allow-partial option')
     for forbidden in (
         "except IOError:\n        pass",
         'print(f"获取全部A股失败:',

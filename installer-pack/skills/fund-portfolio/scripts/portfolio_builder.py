@@ -8,13 +8,35 @@
 import argparse
 import json
 import math
+import os
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
 
 
 MAX_MODEL_BYTES = 1024 * 1024
+
+
+def _reject_output_overwrite(output_path: str | Path, model_path: Path) -> None:
+    """Prevent the rendered report from replacing its reviewed source model."""
+    try:
+        resolved_output = Path(output_path).expanduser().resolve()
+        resolved_model = Path(model_path).expanduser().resolve()
+        if resolved_output == resolved_model:
+            raise ValueError("--output must differ from model input.")
+        resolved_model.stat()
+        try:
+            resolved_output.stat()
+        except FileNotFoundError:
+            return
+        if resolved_output.samefile(resolved_model):
+            raise ValueError("--output must differ from model input.")
+    except ValueError:
+        raise
+    except OSError as exc:
+        raise ValueError("Cannot verify --output is distinct from model input.") from exc
 
 
 def validate_allocation_model(model: Dict) -> Dict:
@@ -66,9 +88,9 @@ def validate_allocation_model(model: Dict) -> Dict:
 def generate_portfolio(model: Dict, amount: float, period_years: int) -> Dict:
     """按显式配置模型计算各类别金额。"""
     model = validate_allocation_model(model)
-    if not math.isfinite(amount) or amount <= 0:
+    if isinstance(amount, bool) or not math.isfinite(amount) or amount <= 0:
         raise ValueError("amount 必须是正数。")
-    if not isinstance(period_years, int) or not 1 <= period_years <= 100:
+    if isinstance(period_years, bool) or not isinstance(period_years, int) or not 1 <= period_years <= 100:
         raise ValueError("period_years 必须是 1 到 100 的整数。")
     
     portfolio = {
@@ -94,6 +116,8 @@ def generate_portfolio(model: Dict, amount: float, period_years: int) -> Dict:
     # 计算各类基金金额
     for fund_type, ratio in model["allocation"].items():
         fund_amount = amount * ratio / 100
+        if not math.isfinite(fund_amount):
+            raise ValueError(f"allocation.{fund_type} 派生金额超出有限数值范围。")
         portfolio["allocation"][fund_type] = {
             "ratio": ratio,
             "amount": fund_amount
@@ -157,6 +181,28 @@ def format_report(portfolio: Dict) -> str:
     return "\n".join(lines)
 
 
+def _write_json_atomic(output_path: Path, serialized: str) -> None:
+    """Stage a report beside its destination and publish only after a full write."""
+    output_path = Path(output_path).expanduser().resolve()
+    stage_path = None
+    try:
+        descriptor, stage_name = tempfile.mkstemp(
+            prefix=f".{output_path.name}.", suffix=".tmp", dir=str(output_path.parent)
+        )
+        stage_path = Path(stage_name)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(stage_path, output_path)
+    finally:
+        if stage_path is not None:
+            try:
+                stage_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="基金配置金额换算器")
     parser.add_argument("--model", required=True, help="用户审阅过的配置模型 JSON")
@@ -172,14 +218,15 @@ def main() -> int:
         model_path = Path(args.model).expanduser().resolve()
         if not model_path.is_file() or model_path.stat().st_size > MAX_MODEL_BYTES:
             raise ValueError("配置模型不存在或超过 1 MiB。")
+        if args.output:
+            _reject_output_overwrite(args.output, model_path)
         model = json.loads(model_path.read_text(encoding="utf-8"))
         portfolio = generate_portfolio(model, args.amount, args.period_years)
 
         if args.json or args.output:
-            output = json.dumps(portfolio, ensure_ascii=False, indent=2)
+            output = json.dumps(portfolio, ensure_ascii=False, indent=2, allow_nan=False)
             if args.output:
-                with open(args.output, 'w', encoding='utf-8') as f:
-                    f.write(output)
+                _write_json_atomic(Path(args.output), output)
                 print(f"方案已保存到: {args.output}")
             else:
                 print(output)

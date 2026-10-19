@@ -15,7 +15,7 @@
   ],
   "policy": {
     "defaultInstall": "core-ready, auto-installable-runtime, and unsupported entries are installed and enabled by default; guided-config entries wait for user credentials or MCP setup",
-    "implicitInvocation": "the rendered config enables core-ready, auto-installable-runtime, and unsupported Skills; guided-config Skills remain disabled until enableWhen passes",
+    "implicitInvocation": "Skills are installed/enabled according to status, while native implicit invocation is separately restricted by per-Skill openai.yaml policy (currently only image-2); other Skills require explicit $skill invocation",
     "dependencyModel": "Each dependency is an object; status never hides runtime, connection, credential, or capability closure.",
     "pythonRuntime": {
       "platform": "win_amd64",
@@ -1248,45 +1248,46 @@
           "kind": "mcp",
           "required": true,
           "autoInstallable": false,
-          "healthCheck": "media_generation exposes media_prepare/media_submit and the unified upstream reports minimax-video configured",
-          "failureMessage": "需要统一媒体 MCP、签名 U 盘授权中的设备 Key，以及由上游实际开放后填写的 MiniMax 视频模型名。"
+          "healthCheck": "MiniMax provider reports available=true only after a protocol-compatible adapter has been implemented and audited",
+          "failureMessage": "MiniMax 视频适配尚未实现；模型槽位或模型目录命中不能启用它。"
         },
         {
-          "id": "credential.usb-license-404token",
+          "id": "credential.minimax-api-key",
           "kind": "credential",
           "required": true,
-          "autoInstallable": true,
-          "healthCheck": "Signed USB device key is available in the Codex launch environment for the media MCP env_vars pass-through",
-          "failureMessage": "媒体 MCP 会从签名 U 盘授权读取共享 Key；不使用 MiniMax 官方 API Key。"
+          "autoInstallable": false,
+          "healthCheck": "MINIMAX_API_KEY configured only after the dedicated official API adapter is implemented",
+          "failureMessage": "当前没有 MiniMax 官方账号或 API Key；签名 U 盘设备 Key 不能替代。",
+          "secret": true
         },
         {
           "id": "config.MEDIA_MINIMAX_VIDEO_MODEL",
           "kind": "configuration",
           "required": true,
           "autoInstallable": false,
-          "healthCheck": "MEDIA_MINIMAX_VIDEO_MODEL exactly matches a video model enabled by the shared upstream",
-          "failureMessage": "当前尚未配置 MiniMax 视频模型；Skill 不会自动改用 Grok 或 Seedance。"
+          "healthCheck": "A future, audited official MiniMax adapter validates a model-specific contract; model name alone cannot enable this provider",
+          "failureMessage": "当前没有已验证的 MiniMax 上游或协议适配；Skill 不会自动改用 Grok 或 Seedance。"
         }
       ],
       "capabilities": [
-        "MiniMax 视频生成",
-        "异步任务查询"
+        "MiniMax 视频能力状态说明",
+        "提示词整理；媒体生成当前不可用"
       ],
       "installByDefault": false,
       "afterRemediationStatus": "guided-config",
       "enableWhen": [
         "skill-installed",
         "mcp.media-generation.ready",
-        "signed-usb-license.device-api-key",
-        "MEDIA_MINIMAX_VIDEO_MODEL",
+        "future-verified-minimax-adapter",
+        "credential.minimax-api-key",
         "user-approved-paid-task"
       ],
       "verification": {
         "skillFile": "skills/minimax-video-gen/SKILL.md",
         "windowsEntry": "Codex workflow / frontmatter",
-        "smoke": "MCP reports the MiniMax slot unavailable when the model is blank and prepares a single-use request only when configured"
+        "smoke": "MCP keeps MiniMax unavailable and rejects prepare even when a model name is injected; no network request is made"
       },
-      "notes": "保留 MiniMax 专用创作流程 Skill，但所有请求只经统一媒体 MCP，并共用签名 U 盘授权中的设备 Key。当前模型槽位留空；只有统一上游实际开放 MiniMax 视频模型后才可启用。无官方 MiniMax API 直连，也不回退到其他视频模型。"
+      "notes": "Skill is limited to availability guidance and prompt drafting. Official MiniMax video API uses an independent API key, v2 endpoints and H3 multimodal contract; current package has no adapter or upstream account. Setting the shared model field cannot enable generation. No official API calls or provider fallback."
     },
     {
       "id": "multi-search-engine",

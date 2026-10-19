@@ -10,8 +10,10 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -46,6 +48,26 @@ METRIC_GROUPS = {
     },
 }
 PERIOD_FIELDS = ("日期", "报告期", "报告日", "REPORT_DATE", "截止日期")
+
+
+def _reject_output_overwrite(output_path: str | Path, input_path: str | Path) -> None:
+    """Protect the source financial JSON from being replaced by its report."""
+    try:
+        resolved_output = Path(output_path).expanduser().resolve()
+        resolved_input = Path(input_path).expanduser().resolve()
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"cannot verify output/input paths safely: {exc}") from exc
+    if resolved_output == resolved_input:
+        raise ValueError("输出路径不能覆盖财务数据输入文件。")
+    try:
+        if os.path.samefile(resolved_output, resolved_input):
+            raise ValueError("输出路径不能覆盖财务数据输入文件。")
+    except FileNotFoundError:
+        # A distinct new destination has no identity yet; direct aliases were
+        # already rejected by canonical path comparison.
+        pass
+    except OSError as exc:
+        raise ValueError(f"cannot verify output/input file identity safely: {exc}") from exc
 
 
 def _safe_float(value: Any) -> float | None:
@@ -251,6 +273,25 @@ def _load_input(path_value: str) -> dict[str, Any]:
     return value
 
 
+def _write_report_atomic(output_path: Path, report_text: str) -> None:
+    """Write a complete report beside its destination, then atomically publish it."""
+    stage_path: Path | None = None
+    try:
+        fd, stage_name = tempfile.mkstemp(
+            prefix=f".{output_path.name}.", suffix=".tmp", dir=str(output_path.parent)
+        )
+        stage_path = Path(stage_name)
+        os.close(fd)
+        stage_path.write_text(report_text, encoding="utf-8")
+        os.replace(stage_path, output_path)
+    finally:
+        if stage_path is not None:
+            try:
+                stage_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="A 股财务字段与机械诊断分析器")
     parser.add_argument("--input", required=True, help="带来源和抓取时点的输入 JSON")
@@ -263,6 +304,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        if args.output:
+            _reject_output_overwrite(args.output, args.input)
         data = _load_input(args.input)
         if args.mode == "single":
             result = analyze_stock(data, level=args.level)
@@ -274,7 +317,7 @@ def main(argv: list[str] | None = None) -> int:
         output = json.dumps(result, ensure_ascii=False, indent=2, default=str)
         if args.output:
             output_path = Path(args.output).expanduser().resolve()
-            output_path.write_text(output + "\n", encoding="utf-8")
+            _write_report_atomic(output_path, output + "\n")
             print(f"分析结果已保存到：{output_path}")
         else:
             print(output)

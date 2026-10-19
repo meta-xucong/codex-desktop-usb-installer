@@ -27,10 +27,12 @@ User needs to create or modify PowerPoint (.pptx) files programmatically. Agent 
 from pptx import Presentation
 from pptx.util import Inches, Pt
 from pptx.enum.text import PP_ALIGN
-from pptx.dml.color import RgbColor
+from pptx.dml.color import RGBColor
 ```
 
-Install: `pip install python-pptx`
+Use the exact exported class name `RGBColor` (including capitalization) for RGB values.
+
+Use the installer-pack `CODEX_PYTHON` runtime and its preinstalled `python-pptx` dependency. Before creating a file, confirm the bundled runtime health check passed and `python-pptx` imports successfully. If either check fails, stop and report the missing runtime or dependency; do not use `pip install`, download packages, or silently switch to a system Python.
 
 ### 2. Presentation Structure
 ```python
@@ -115,13 +117,9 @@ This skill NEVER:
 - Store user data persistently
 
 ## Related Skills
-Install with `clawhub install <slug>` if user confirms:
-- `excel-xlsx` — spreadsheet automation
-- `word-docx` — document generation
-- `report` — structured report creation
-- `documents` — document management
+
+When a request also needs spreadsheet or Word-document work, use the corresponding installed Skill when available. Do not use the legacy `clawhub install` or `clawhub sync` commands from this package; if a capability is missing, explain that limitation and continue with available local tools where practical.
 
 ## Feedback
 
-- If useful: `clawhub star powerpoint-pptx`
-- Stay updated: `clawhub sync`
+Do not run external install, update, or feedback commands as part of ordinary presentation work.

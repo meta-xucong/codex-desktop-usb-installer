@@ -36,7 +36,7 @@ description: 通过用户显式配置的 DashScope OpenAI 兼容接口执行联�
     <python> "<skill-directory>/scripts/web_search.py" "<准确查询>" --model "<实际模型>"
     <python> "<skill-directory>/scripts/web_search.py" "<准确查询>" --model "<实际模型>" --max-words 500 --json
 
-`--max-words` 必须是 1–5000 的整数。响应体最多读取 5 MiB；超限、空结果、HTTP 错误、JSON 错误或网络失败都返回明确错误并以非零状态退出，即使使用 `--json` 也不会虚假成功。
+`--max-words` 必须是 1–5000 的整数。它只会把长度要求写入发给模型的自然语言提示，是软约束；适配器不统计或截断返回字数，模型可能返回超长内容，因此它不保证严格字数上限。若结果超长，应标出超出部分的边界并重新请求缩短，或交由用户审核；不得把适配器描述为能保证不超限。响应体最多读取 5 MiB；超限、空结果、HTTP 错误、JSON 错误或网络失败都返回明确错误并以非零状态退出，即使使用 `--json` 也不会虚假成功。
 
 ## 输出契约
 

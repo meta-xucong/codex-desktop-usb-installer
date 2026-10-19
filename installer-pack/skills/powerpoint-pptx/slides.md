@@ -71,6 +71,7 @@ right_content.text_frame.text = "Right column content"
 ```python
 from pptx.util import Inches, Pt
 from pptx.enum.shapes import MSO_SHAPE
+from pptx.dml.color import RGBColor
 
 # Add rectangle
 shape = slide.shapes.add_shape(
@@ -81,8 +82,8 @@ shape = slide.shapes.add_shape(
 
 # Style the shape
 shape.fill.solid()
-shape.fill.fore_color.rgb = RgbColor(0x1F, 0x77, 0xB4)
-shape.line.color.rgb = RgbColor(0x00, 0x00, 0x00)
+shape.fill.fore_color.rgb = RGBColor(0x1F, 0x77, 0xB4)
+shape.line.color.rgb = RGBColor(0x00, 0x00, 0x00)
 ```
 
 ## Text Box with Formatting

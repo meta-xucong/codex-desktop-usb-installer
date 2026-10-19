@@ -6,7 +6,12 @@ Manages user nutrition profiles, meal plans, food logs, and shopping lists.
 """
 
 import json
+import math
+import numbers
 import os
+import tempfile
+import uuid
+from collections.abc import Mapping
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional, Tuple
@@ -73,15 +78,32 @@ def load_json(file_path: Path) -> Dict[str, Any]:
     try:
         with open(file_path, 'r') as f:
             return json.load(f)
-    except (json.JSONDecodeError, FileNotFoundError):
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Meal planner data file '{file_path.name}' contains invalid JSON; refusing to continue."
+        ) from exc
+    except FileNotFoundError:
         return {}
 
 
 def save_json(file_path: Path, data: Dict[str, Any]) -> None:
-    """Save JSON to file."""
+    """Atomically save JSON without truncating the current copy on failure."""
     ensure_db_files()
-    with open(file_path, 'w') as f:
-        json.dump(data, f, indent=2)
+    serialized = json.dumps(data, indent=2)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=file_path.parent,
+            prefix=f".{file_path.name}.", suffix=".tmp", delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, file_path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 # ============================================================================
@@ -120,19 +142,61 @@ def update_profile_field(key: str, value: Any) -> None:
 # NUTRITION CALCULATIONS
 # ============================================================================
 
+def _positive_profile_number(profile: Dict[str, Any], field: str) -> float:
+    """Read one required, finite, positive numeric profile field."""
+    value = profile.get(field)
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        raise ValueError(f"{field} 必须是有限且大于 0 的数值。")
+    try:
+        value = float(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError(f"{field} 必须是有限且大于 0 的数值。") from exc
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{field} 必须是有限且大于 0 的数值。")
+    return value
+
+
+def _finite_positive_result(value: float, field: str) -> float:
+    """Reject unusable derived nutrition values before rounding or division."""
+    try:
+        finite = math.isfinite(value)
+    except (OverflowError, TypeError, ValueError):
+        finite = False
+    if not finite or value <= 0:
+        raise ValueError(f"{field} 必须是有限且大于 0 的数值。")
+    return value
+
+
+def _profile_enum(profile: Dict[str, Any], field: str, default: str, choices: set[str]) -> str:
+    """Use a compatibility default only when an enum field is truly absent."""
+    value = profile.get(field, default)
+    if not isinstance(value, str):
+        raise ValueError(f"{field} 必须是以下值之一: {', '.join(sorted(choices))}。")
+    normalized = value.strip().casefold()
+    if not normalized or normalized not in choices:
+        raise ValueError(f"{field} 必须是以下值之一: {', '.join(sorted(choices))}。")
+    return normalized
+
 def calculate_bmr(profile: Dict[str, Any]) -> float:
     """Calculate Basal Metabolic Rate using Mifflin-St Jeor equation."""
-    weight = profile.get("weight_kg", 70)
-    height = profile.get("height_cm", 170)
-    age = profile.get("age", 30)
-    gender = profile.get("gender", "male")
-    
-    if gender.lower() == "female":
-        bmr = 10 * weight + 6.25 * height - 5 * age - 161
-    else:
-        bmr = 10 * weight + 6.25 * height - 5 * age + 5
-    
-    return round(bmr, 0)
+    weight = _positive_profile_number(profile, "weight_kg")
+    height = _positive_profile_number(profile, "height_cm")
+    age = _positive_profile_number(profile, "age")
+    gender = profile.get("gender")
+    if not isinstance(gender, str) or not gender.strip():
+        raise ValueError("gender 必须是 male 或 female。")
+    gender = gender.strip().casefold()
+    if gender not in {"male", "female"}:
+        raise ValueError("gender 必须是 male 或 female。")
+
+    try:
+        if gender == "female":
+            bmr = 10 * weight + 6.25 * height - 5 * age - 161
+        else:
+            bmr = 10 * weight + 6.25 * height - 5 * age + 5
+    except OverflowError as exc:
+        raise ValueError("BMR 必须是有限且大于 0 的数值。") from exc
+    return _finite_positive_result(round(_finite_positive_result(bmr, "BMR"), 0), "BMR")
 
 
 def calculate_tdee(profile: Dict[str, Any]) -> float:
@@ -147,10 +211,14 @@ def calculate_tdee(profile: Dict[str, Any]) -> float:
         "very_high": 1.9       # 极高活动
     }
     
-    activity = profile.get("activity_level", "moderate")
-    multiplier = activity_multipliers.get(activity, 1.55)
+    activity = _profile_enum(profile, "activity_level", "moderate", set(activity_multipliers))
+    multiplier = activity_multipliers[activity]
     
-    return round(bmr * multiplier, 0)
+    try:
+        tdee = bmr * multiplier
+    except OverflowError as exc:
+        raise ValueError("TDEE 必须是有限且大于 0 的数值。") from exc
+    return _finite_positive_result(round(_finite_positive_result(tdee, "TDEE"), 0), "TDEE")
 
 
 def calculate_nutrition_targets(profile: Dict[str, Any] = None) -> Dict[str, Any]:
@@ -159,8 +227,8 @@ def calculate_nutrition_targets(profile: Dict[str, Any] = None) -> Dict[str, Any
         profile = get_profile()
     
     tdee = calculate_tdee(profile)
-    goal = profile.get("goal", "maintain")
-    weight = profile.get("weight_kg", 70)
+    goal = _profile_enum(profile, "goal", "maintain", {"muscle_gain", "fat_loss", "maintain", "health"})
+    weight = _positive_profile_number(profile, "weight_kg")
     
     # Adjust calories based on goal
     if goal == "muscle_gain":
@@ -182,13 +250,19 @@ def calculate_nutrition_targets(profile: Dict[str, Any] = None) -> Dict[str, Any
         carbs_pct = 0.50
         fat_pct = 0.25
     
+    _finite_positive_result(target_calories, "target_calories")
+
     # Calculate macros
-    protein_g = max(round(weight * protein_per_kg), round(target_calories * protein_pct / 4))
-    fat_g = round(target_calories * fat_pct / 9)
-    carbs_g = round(target_calories * carbs_pct / 4)
+    try:
+        protein_g = max(round(weight * protein_per_kg), round(target_calories * protein_pct / 4))
+        fat_g = round(target_calories * fat_pct / 9)
+        carbs_g = round(target_calories * carbs_pct / 4)
     
-    # Recalculate percentages based on actual grams
-    total_calculated_calories = protein_g * 4 + carbs_g * 4 + fat_g * 9
+        # Recalculate percentages based on actual grams
+        total_calculated_calories = protein_g * 4 + carbs_g * 4 + fat_g * 9
+    except (OverflowError, ZeroDivisionError) as exc:
+        raise ValueError("nutrition targets 必须是有限且有效的数值。") from exc
+    _finite_positive_result(total_calculated_calories, "total_calculated_calories")
     
     return {
         "calories": round(target_calories),
@@ -222,13 +296,19 @@ def get_plans(status: str = "all") -> Dict[str, List[Dict]]:
     return {}
 
 
-def add_plan(plan: Dict[str, Any], status: str = "active") -> str:
+def add_plan(
+    plan: Dict[str, Any],
+    status: str = "active",
+    *,
+    plan_id: str | None = None,
+    created_at: str | None = None,
+) -> str:
     """Add a new meal plan."""
     plans = load_json(PLANS_FILE)
     
-    plan_id = str(int(datetime.now().timestamp()))
+    plan_id = plan_id or uuid.uuid4().hex
     plan["id"] = plan_id
-    plan["created_at"] = datetime.now().isoformat()
+    plan["created_at"] = created_at or datetime.now().isoformat()
     plan["status"] = status
     
     if status == "active":
@@ -240,6 +320,19 @@ def add_plan(plan: Dict[str, Any], status: str = "active") -> str:
     
     save_json(PLANS_FILE, plans)
     return plan_id
+
+
+def remove_plan(plan_id: str) -> bool:
+    """Remove a plan by ID; used to compensate a failed paired CLI export."""
+    plans = load_json(PLANS_FILE)
+    for key in ["active_plans", "completed_plans", "plan_templates"]:
+        entries = plans.get(key, [])
+        for index, plan in enumerate(entries):
+            if plan.get("id") == plan_id:
+                del entries[index]
+                save_json(PLANS_FILE, plans)
+                return True
+    return False
 
 
 def get_plan_by_id(plan_id: str) -> Optional[Dict[str, Any]]:
@@ -269,22 +362,50 @@ def update_plan(plan_id: str, updates: Dict[str, Any]) -> bool:
 
 def substitute_ingredient(plan_id: str, old_ingredient: str, 
                          new_ingredient: str, reason: str = "") -> bool:
-    """Substitute an ingredient in a meal plan."""
+    """Substitute an ingredient and invalidate nutrition derived from it.
+
+    This API has no replacement nutrition source. Once a food name changes,
+    its old nutrient values and every containing aggregate are therefore
+    removed and marked for recalculation instead of being presented as current.
+    """
     plan = get_plan_by_id(plan_id)
     if not plan:
         return False
     
-    # Update in daily meals
+    matched = False
     for day in plan.get("days", []):
+        day_matched = False
         for meal in day.get("meals", []):
+            meal_matched = False
             for food in meal.get("foods", []):
                 if food.get("name") == old_ingredient:
+                    matched = True
+                    day_matched = True
+                    meal_matched = True
                     food["name"] = new_ingredient
                     food["substituted_from"] = old_ingredient
                     food["substitution_reason"] = reason
                     food["substituted_at"] = datetime.now().isoformat()
-    
-    return update_plan(plan_id, {"days": plan.get("days", [])})
+                    food["nutrition_status"] = "needs_recalculation"
+                    for nutrient in ("calories", "protein", "carbs", "fat"):
+                        food.pop(nutrient, None)
+
+            if meal_matched:
+                meal["nutrition_status"] = "needs_recalculation"
+                meal.pop("totals", None)
+        if day_matched:
+            day["nutrition_status"] = "needs_recalculation"
+            day.pop("daily_totals", None)
+            day.pop("targets_comparison", None)
+
+    if not matched:
+        return False
+
+    plan["nutrition_status"] = "needs_recalculation"
+    return update_plan(plan_id, {
+        "days": plan.get("days", []),
+        "nutrition_status": "needs_recalculation",
+    })
 
 
 # ============================================================================
@@ -292,18 +413,41 @@ def substitute_ingredient(plan_id: str, old_ingredient: str,
 # ============================================================================
 
 def log_meal(meal: Dict[str, Any]) -> str:
-    """Log a meal."""
+    """Log a meal after validating all supplied food nutrient values."""
+    if not isinstance(meal, dict):
+        raise ValueError("meal must be an object")
+    foods = meal.get("foods", [])
+    if not isinstance(foods, list):
+        raise ValueError("foods must be a list")
+    for index, food in enumerate(foods):
+        if not isinstance(food, dict):
+            raise ValueError(f"foods[{index}] must be an object")
+        for nutrient in ("calories", "protein", "carbs", "fat"):
+            value = food.get(nutrient, 0)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"foods[{index}].{nutrient} must be a finite non-negative number")
+            try:
+                finite = math.isfinite(value)
+            except (OverflowError, TypeError, ValueError):
+                finite = False
+            if not finite or value < 0:
+                raise ValueError(f"foods[{index}].{nutrient} must be a finite non-negative number")
+
     logs = load_json(LOGS_FILE)
     
-    log_id = str(int(datetime.now().timestamp()))
-    meal["log_id"] = log_id
-    meal["logged_at"] = datetime.now().isoformat()
+    log_id = uuid.uuid4().hex
+    logged_meal = dict(meal)
+    logged_meal["log_id"] = log_id
+    logged_meal["logged_at"] = datetime.now().isoformat()
     
     if "food_logs" not in logs:
         logs["food_logs"] = []
     
-    logs["food_logs"].append(meal)
+    logs["food_logs"].append(logged_meal)
     save_json(LOGS_FILE, logs)
+    # Preserve the historical successful-call behavior while invalid input
+    # never mutates the caller and failed persistence does not mutate it either.
+    meal.update({"log_id": log_id, "logged_at": logged_meal["logged_at"]})
     return log_id
 
 
@@ -387,34 +531,101 @@ def get_daily_summary(date: str = None) -> Dict[str, Any]:
 # ============================================================================
 
 def generate_shopping_list(plan_id: str, days: int = 7) -> Dict[str, List[Dict]]:
-    """Generate shopping list from meal plan."""
+    """Generate a shopping list using the restrictions frozen into the plan."""
     plan = get_plan_by_id(plan_id)
     if not plan:
         return {}
-    
-    # Aggregate ingredients
+
+    snapshot = plan.get("restriction_snapshot")
+    if not isinstance(snapshot, dict):
+        raise ValueError("plan restriction_snapshot is missing or invalid")
+    restrictions = {}
+    for key in ("allergies", "disliked_foods"):
+        values = snapshot.get(key)
+        if not isinstance(values, list) or any(
+            not isinstance(value, str) or not value.strip() for value in values
+        ):
+            raise ValueError(f"plan restriction_snapshot.{key} must be a list of non-empty strings")
+        restrictions[key] = [value.strip() for value in values]
+
+    is_restricted = bool(restrictions["allergies"] or restrictions["disliked_foods"])
+    matches_restriction = None
+    if is_restricted:
+        # Keep the same Unicode normalization and food alias table as recipe
+        # generation. If that canonical filter is unavailable, fail closed.
+        try:
+            from recipe_generator import _matches_restrictions
+        except (ImportError, AttributeError) as exc:
+            raise ValueError("cannot safely apply plan restrictions to shopping list") from exc
+        matches_restriction = _matches_restrictions
+
+    plan_days = plan.get("days")
+    if not isinstance(plan_days, list):
+        raise ValueError("plan.days must be a list")
+
+    # Validate every nested entry and amount before aggregation. A malformed
+    # later day must not leave a partial list that looks complete.
+    validated_days = []
+    for day_index, day in enumerate(plan_days):
+        day_path = f"plan.days[{day_index}]"
+        if not isinstance(day, Mapping):
+            raise ValueError(f"{day_path} must be a mapping")
+        meals = day.get("meals")
+        if not isinstance(meals, list):
+            raise ValueError(f"{day_path}.meals must be a list")
+        validated_foods = []
+        for meal_index, meal in enumerate(meals):
+            meal_path = f"{day_path}.meals[{meal_index}]"
+            if not isinstance(meal, Mapping):
+                raise ValueError(f"{meal_path} must be a mapping")
+            foods = meal.get("foods")
+            if not isinstance(foods, list):
+                raise ValueError(f"{meal_path}.foods must be a list")
+            for food_index, food in enumerate(foods):
+                food_path = f"{meal_path}.foods[{food_index}]"
+                if not isinstance(food, Mapping):
+                    raise ValueError(f"{food_path} must be a mapping")
+                name = food.get("name")
+                if not isinstance(name, str) or not name.strip():
+                    raise ValueError(f"{food_path}.name must be a non-empty string")
+                amount = food.get("amount")
+                try:
+                    amount_is_finite = (
+                        not isinstance(amount, bool)
+                        and isinstance(amount, numbers.Real)
+                        and math.isfinite(amount)
+                    )
+                except (OverflowError, TypeError, ValueError):
+                    amount_is_finite = False
+                if not amount_is_finite or amount < 0:
+                    raise ValueError(f"{food_path}.amount must be a finite non-negative number")
+                validated_foods.append((name.strip(), amount, food.get("unit", "g")))
+        validated_days.append(validated_foods)
+
+    # Aggregate only after the complete plan has passed structural and amount checks.
     ingredients = {}
-    
-    for day in plan.get("days", [])[:days]:
-        for meal in day.get("meals", []):
-            for food in meal.get("foods", []):
-                name = food.get("name", "")
-                amount = food.get("amount", 0)
-                unit = food.get("unit", "g")
-                
-                # Categorize ingredient
-                category = categorize_ingredient(name)
-                
-                key = f"{name}_{unit}"
-                if key in ingredients:
-                    ingredients[key]["amount"] += amount
-                else:
-                    ingredients[key] = {
-                        "name": name,
-                        "amount": amount,
-                        "unit": unit,
-                        "category": category
-                    }
+    for day_foods in validated_days[:days]:
+        for name, amount, unit in day_foods:
+            if matches_restriction and any(
+                matches_restriction(name, terms)
+                for terms in (restrictions["allergies"], restrictions["disliked_foods"])
+                if terms
+            ):
+                continue
+            category = categorize_ingredient(name)
+            key = f"{name}_{unit}"
+            if key in ingredients:
+                combined_amount = ingredients[key]["amount"] + amount
+                if not math.isfinite(combined_amount):
+                    raise ValueError(f"shopping list amount for {name!r} overflowed its finite range")
+                ingredients[key]["amount"] = combined_amount
+            else:
+                ingredients[key] = {
+                    "name": name,
+                    "amount": amount,
+                    "unit": unit,
+                    "category": category
+                }
     
     # Group by category
     shopping_list = {
@@ -559,7 +770,11 @@ if __name__ == "__main__":
         plan_id = sys.argv[2] if len(sys.argv) > 2 else None
         days = int(sys.argv[4]) if len(sys.argv) > 4 and sys.argv[3] == "--days" else 7
         if plan_id:
-            print(json.dumps(generate_shopping_list(plan_id, days), indent=2))
+            try:
+                print(json.dumps(generate_shopping_list(plan_id, days), indent=2))
+            except ValueError as exc:
+                print(f"Error: cannot generate shopping list: {exc}", file=sys.stderr)
+                sys.exit(1)
         else:
             print("Error: plan_id required")
     elif command == "export":

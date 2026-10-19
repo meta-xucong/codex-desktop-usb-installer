@@ -4,7 +4,7 @@
 
 `Install-Codex-Starter.cmd` 无参数运行时打开 `scripts/install-wizard.ps1`。向导负责两件事：
 
-1. 安装完整能力包：55 个 Skills、7 个 Agents、Python/Node 运行时、离线依赖、Feishu 与统一媒体 MCP、以及 Codex 托管配置；
+1. 安装完整能力包：56 个 Skills（49 默认启用、7 guided-config）、7 个 Agents、Python/Node 运行时、离线依赖、Feishu 与统一媒体 MCP、以及 Codex 托管配置；
 2. 让用户按需启用外部连接，而不是把密钥或第三方服务默认打开。
 
 向导不是第二套清单。表单从以下文件生成：
@@ -23,7 +23,7 @@
 - 选择 API 或统一媒体 MCP 会同时启用它关联的非核心 Skill；没有选择的服务 Skill 保持禁用；
 - 选择 Feishu 会启用 `feishu-doc`、`feishu-drive`、`feishu-perm` 和 `feishu-wiki`，并将 Feishu MCP 配置为启用；
 - 选择远程 MCP 会生成单独的 HTTPS MCP 配置并开启 Codex 原生 OAuth 流程；用户仍须在 Codex 中完成账号授权。未选择的服务会生成 `enabled = false` 配置。
-- 选择统一媒体 MCP 会启用本地服务并运行 Python 健康检查。Image-2 默认使用签名授权连接的 `gpt-image-2.5` Responses API；Grok、Seedance 和未来开放的 MiniMax 共用同一授权。Seedance 模型或路由 ID 只有在上游要求时才需配置。MiniMax 模型槽位保持空白，直到统一上游确实开放；不调用 MiniMax 官方 API，也不会自动改用其他模型。每次可能计费的生成仍须单独确认，未知提交不会重试。
+- 选择统一媒体 MCP 会启用本地服务并运行 Python 健康检查。Image-2 默认使用签名授权连接的 `gpt-image-2.5` Responses API；Grok、Seedance 使用统一媒体网关。MiniMax 模型字段是预留项，即使填写也不会启用：官方 API 使用独立凭据、v2 端点和不同的多模态请求/查询契约，当前没有适配器或上游账号。每次可能计费的生成仍须单独确认，未知提交不会重试。
 - 点击“跳过配置，直接安装”会安装完整包，但所有外部连接保持关闭。
 
 敏感字段使用密码框。向导只把非空且已选择服务的值写入当前 Windows 用户级环境变量和当前安装进程；Codex TOML、公开安装包、

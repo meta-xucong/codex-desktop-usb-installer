@@ -9,10 +9,93 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from fitness_db import get_profile, add_program
+from fitness_db import (
+    PROFILE_FILE,
+    PROGRAMS_FILE,
+    WORKOUTS_FILE,
+    get_profile,
+    add_program,
+)
 import json
+import os
+import tempfile
 from datetime import datetime, timedelta
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
+
+
+def _reject_output_overwrite(output_path: str | Path, protected_paths: list[Path]) -> None:
+    """Protect the profile and fitness databases from report output aliases."""
+    for protected_path in protected_paths:
+        try:
+            resolved_output = Path(output_path).expanduser().resolve()
+            resolved_protected = Path(protected_path).expanduser().resolve()
+            if resolved_output == resolved_protected:
+                raise ValueError("--output must differ from fitness data files.")
+            try:
+                resolved_protected.stat()
+            except FileNotFoundError:
+                continue
+            try:
+                resolved_output.stat()
+            except FileNotFoundError:
+                continue
+            if resolved_output.samefile(resolved_protected):
+                raise ValueError("--output must differ from fitness data files.")
+        except ValueError:
+            raise
+        except OSError as exc:
+            raise ValueError("Cannot verify --output is distinct from fitness data files.") from exc
+
+
+def _write_staged_program(path: Path, program: Dict[str, Any]) -> None:
+    """Write a complete JSON report to an already-created staging file."""
+    serialized = json.dumps(program, indent=2, ensure_ascii=False)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        handle.write(serialized)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _stage_program_output(output_path: str | Path, program: Dict[str, Any]) -> Path:
+    """Serialize and stage the report beside its destination before DB changes."""
+    output = Path(output_path).expanduser()
+    serialized = json.dumps(program, indent=2, ensure_ascii=False)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", newline="", dir=output.parent,
+            prefix=f".{output.name}.", suffix=".tmp", delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+        return temporary_path
+    except Exception:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
+
+
+def _restore_program_database(original_bytes: bytes) -> None:
+    """Atomically restore exact programs.json bytes after output publication fails."""
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=PROGRAMS_FILE.parent,
+            prefix=f".{PROGRAMS_FILE.name}.", suffix=".rollback.tmp", delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            handle.write(original_bytes)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, PROGRAMS_FILE)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 # ============================================================================
@@ -194,6 +277,8 @@ PROGRAM_PARAMETERS = {
     }
 }
 
+MAX_PROGRAM_DURATION_WEEKS = 52
+
 
 # ============================================================================
 # EXERCISE SELECTION
@@ -209,16 +294,67 @@ def filter_exercises_by_equipment(exercises: List[Dict], available_equipment: Li
     return filtered
 
 
+EXERCISE_AVOID_ALIASES = {
+    "overhead_press": {"杠铃肩推", "哑铃肩推", "阿诺德推举"},
+}
+
+
+def _get_exercise_library_names() -> set:
+    names = set()
+
+    def collect(value):
+        if isinstance(value, dict):
+            name = value.get("name")
+            if isinstance(name, str):
+                names.add(name)
+            else:
+                for child in value.values():
+                    collect(child)
+        elif isinstance(value, list):
+            for child in value:
+                collect(child)
+
+    collect(EXERCISE_LIBRARY)
+    return names
+
+
+def _expand_avoided_exercises(avoid_exercises: Optional[List[str]]) -> set:
+    """Expand documented exercise slugs into the names used by the library."""
+    if isinstance(avoid_exercises, str):
+        avoid_exercises = [avoid_exercises]
+
+    known_names = _get_exercise_library_names()
+    avoided = set()
+    for exercise in avoid_exercises or []:
+        if not isinstance(exercise, str):
+            raise ValueError("avoid_exercises entries must be strings")
+        if exercise in EXERCISE_AVOID_ALIASES:
+            avoided.update(EXERCISE_AVOID_ALIASES[exercise])
+        elif exercise in known_names:
+            avoided.add(exercise)
+        else:
+            raise ValueError(f"Unknown exercise in avoid_exercises: {exercise!r}")
+    return avoided
+
+
 def select_exercises(muscle_groups: List[str], equipment: List[str], 
-                     experience: str, num_exercises: int = 4) -> List[Dict]:
-    """Select appropriate exercises for given muscle groups."""
+                     experience: str, num_exercises: int = 4,
+                     avoid_exercises: Optional[List[str]] = None) -> List[Dict]:
+    """Select appropriate exercises while excluding profile-specific avoidances."""
     selected = []
+    avoided = _expand_avoided_exercises(avoid_exercises)
     
     for muscle in muscle_groups:
         muscle_key = muscle.replace("_", " ")
         
         # Get exercises for this muscle group
-        if muscle in EXERCISE_LIBRARY:
+        if muscle in {"biceps", "triceps"}:
+            # The templates name these groups directly, while the library stores them
+            # under arms. Keep this mapping intentionally limited to these two keys.
+            all_exercises = filter_exercises_by_equipment(
+                EXERCISE_LIBRARY["arms"][muscle], equipment
+            )
+        elif muscle in EXERCISE_LIBRARY:
             muscle_data = EXERCISE_LIBRARY[muscle]
             
             # Collect all exercises for this muscle
@@ -233,15 +369,18 @@ def select_exercises(muscle_groups: List[str], equipment: List[str],
                         all_exercises.extend(exercises)
             elif isinstance(muscle_data, list):
                 all_exercises = filter_exercises_by_equipment(muscle_data, equipment)
-            
-            # Filter by experience level
-            suitable = [ex for ex in all_exercises 
-                       if experience == "advanced" or 
-                       ex.get("difficulty", "beginner") in ["beginner", experience]]
-            
-            # Select first suitable exercise
-            if suitable and len(selected) < num_exercises:
-                selected.append(suitable[0])
+        else:
+            continue
+
+        # Filter by experience level
+        suitable = [ex for ex in all_exercises
+                    if experience == "advanced" or
+                    ex.get("difficulty", "beginner") in ["beginner", experience]]
+        suitable = [ex for ex in suitable if ex.get("name") not in avoided]
+
+        # Select first suitable exercise
+        if suitable and len(selected) < num_exercises:
+            selected.append(suitable[0])
     
     return selected
 
@@ -266,6 +405,30 @@ def get_exercise_tips(exercise_name: str) -> str:
         "平板支撑": "身体成一条直线，核心收紧",
     }
     return tips.get(exercise_name, "保持标准姿势，控制动作节奏")
+
+
+TRICEPS_COMPOUND_EXERCISES = {"双杠臂屈伸", "窄距卧推"}
+
+
+def _get_exercise_category(exercise_name: str) -> str:
+    """Look up a movement's library category, including nested arm groups."""
+    for group, muscle_data in EXERCISE_LIBRARY.items():
+        if group == "arms":
+            if any(ex.get("name") == exercise_name for ex in muscle_data["biceps"]):
+                return "isolation"
+            if any(ex.get("name") == exercise_name for ex in muscle_data["triceps"]):
+                return (
+                    "compound"
+                    if exercise_name in TRICEPS_COMPOUND_EXERCISES
+                    else "isolation"
+                )
+        elif isinstance(muscle_data, dict):
+            for category in ("compound", "isolation"):
+                if any(ex.get("name") == exercise_name for ex in muscle_data.get(category, [])):
+                    return category
+    # The core library is a flat list with no category metadata. Keep its
+    # output independent of selection order when no explicit category exists.
+    return "isolation"
 
 
 # ============================================================================
@@ -293,13 +456,18 @@ def generate_workout_day(day_structure: Dict, profile: Dict,
         reps = params["reps_range"]["week11_12"]
     
     # Select exercises
-    exercises = select_exercises(muscle_groups, equipment, experience, num_exercises=4)
+    exercises = select_exercises(
+        muscle_groups,
+        equipment,
+        experience,
+        num_exercises=4,
+        avoid_exercises=profile.get("avoid_exercises", []),
+    )
     
     # Build exercise list with parameters
     workout_exercises = []
-    for i, ex in enumerate(exercises):
-        is_compound = i < 2  # First 2 exercises are compound
-        category = "compound" if is_compound else "isolation"
+    for ex in exercises:
+        category = _get_exercise_category(ex["name"])
         
         sets = params["sets_per_exercise"].get(experience, 3)
         rest = params["rest_seconds"].get(category, 60)
@@ -313,11 +481,17 @@ def generate_workout_day(day_structure: Dict, profile: Dict,
             "tips": get_exercise_tips(ex["name"])
         })
     
+    unavailable = not workout_exercises
     return {
         "day": day_structure["day"],
+        "day_number": day_structure["day"],
         "focus": day_structure["focus"],
+        "status": "unavailable" if unavailable else "available",
+        "availability_reason": (
+            "没有符合器械条件且未被避开的动作。" if unavailable else None
+        ),
         "exercises": workout_exercises,
-        "estimated_duration": 45 + len(workout_exercises) * 10
+        "estimated_duration": 0 if unavailable else 45 + len(workout_exercises) * 10
     }
 
 
@@ -338,14 +512,27 @@ def generate_program(profile: Dict, program_data: Dict,
     duration = program_data.get("duration_weeks", 12)
     split_type = program_data.get("split_type", "upper_lower")
     days_per_week = program_data.get("days_per_week", 4)
+
+    if type(duration) is not int or not 1 <= duration <= MAX_PROGRAM_DURATION_WEEKS:
+        raise ValueError(
+            f"duration_weeks must be an integer from 1 to {MAX_PROGRAM_DURATION_WEEKS}"
+        )
+    if type(days_per_week) is not int or days_per_week < 1:
+        raise ValueError("days_per_week must be a positive integer")
     
     # Get split template
     split_template = SPLIT_TEMPLATES.get(split_type, SPLIT_TEMPLATES["upper_lower"])
+    if days_per_week > len(split_template["structure"]):
+        raise ValueError(
+            f"days_per_week cannot exceed {len(split_template['structure'])} "
+            f"for split_type {split_type!r}"
+        )
     
     # Generate workout days for the split
     workout_days = []
     for day_struct in split_template["structure"][:days_per_week]:
         workout_days.append({
+            "day": day_struct["day"],
             "day_number": day_struct["day"],
             "focus": day_struct["focus"],
             "muscle_groups": day_struct["muscle_groups"]
@@ -395,6 +582,25 @@ def generate_program(profile: Dict, program_data: Dict,
         "progression_strategy": PROGRAM_PARAMETERS.get(goal, PROGRAM_PARAMETERS["hypertrophy"]).get("volume_progression"),
         "intensity_techniques": PROGRAM_PARAMETERS.get(goal, PROGRAM_PARAMETERS["hypertrophy"]).get("intensity_techniques", [])
     }
+
+    unavailable_workouts = [
+        {
+            "week": week["week"],
+            "day": workout["day"],
+            "focus": workout["focus"],
+        }
+        for week in weeks
+        for workout in week["workouts"]
+        if workout.get("status") == "unavailable"
+    ]
+    total_workouts = sum(len(week["workouts"]) for week in weeks)
+    if not unavailable_workouts:
+        program["status"] = "available"
+    elif len(unavailable_workouts) == total_workouts:
+        program["status"] = "unavailable"
+    else:
+        program["status"] = "partial"
+    program["unavailable_workouts"] = unavailable_workouts
     
     return program
 
@@ -418,6 +624,14 @@ def get_week_notes(goal: str, week: int, total_weeks: int) -> str:
 
 def format_workout_for_display(workout: Dict) -> str:
     """Format a workout for display."""
+    if workout.get("status") == "unavailable":
+        return "\n".join([
+            f"训练日 {workout['day']} - {workout['focus']}",
+            "状态：不可用",
+            f"原因：{workout.get('availability_reason') or '没有可安排的动作。'}",
+            "预计时间: 0分钟",
+        ])
+
     lines = [
         f"训练日 {workout['day_number']} - {workout['focus']}",
         "=" * 40,
@@ -457,6 +671,15 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    if args.output:
+        try:
+            _reject_output_overwrite(
+                args.output,
+                [PROFILE_FILE, PROGRAMS_FILE, WORKOUTS_FILE],
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+
     # Load profile
     profile = get_profile()
     if not profile.get("initialized"):
@@ -473,17 +696,78 @@ if __name__ == "__main__":
     }
 
     # Generate program
-    program = generate_program(profile, program_data)
+    try:
+        program = generate_program(profile, program_data)
+    except ValueError as exc:
+        parser.error(str(exc))
 
-    # Save to database
-    program_id = add_program(program)
-    program["id"] = program_id
+    if program.get("status") == "unavailable":
+        print(
+            "Error: no available safe exercises for this program; nothing was saved.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
-    # Output
+    # Stage an output report before changing the program database. The
+    # database helper assigns final ID/status/timestamp fields, so refresh the
+    # staged bytes after persistence and before publishing them atomically.
     if args.output:
-        with open(args.output, 'w') as f:
-            json.dump(program, f, indent=2)
+        staged_output = None
+        try:
+            staged_output = _stage_program_output(args.output, program)
+        except (OSError, TypeError, ValueError):
+            print(
+                "Error: could not stage program output; no program was saved.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
+        try:
+            original_programs = PROGRAMS_FILE.read_bytes()
+        except OSError:
+            try:
+                staged_output.unlink(missing_ok=True)
+            except OSError:
+                pass
+            print(
+                "Error: could not read fitness program data; no program was saved.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
+        program_id = None
+        try:
+            program_id = add_program(program)
+            program["id"] = program_id
+            _write_staged_program(staged_output, program)
+            os.replace(staged_output, Path(args.output).expanduser())
+        except Exception:
+            rollback_failed = False
+            if program_id is not None:
+                try:
+                    _restore_program_database(original_programs)
+                except Exception:
+                    rollback_failed = True
+            try:
+                staged_output.unlink(missing_ok=True)
+            except OSError:
+                pass
+            if rollback_failed:
+                print(
+                    "Error: could not publish program output; rollback failed. "
+                    "Verify fitness data before retrying.",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    "Error: could not publish program output; the program was not saved.",
+                    file=sys.stderr,
+                )
+            sys.exit(2)
+
         print(f"Program generated: {args.output}")
         print(f"  Program ID: {program_id}")
     else:
-        print(json.dumps(program, indent=2))
+        program_id = add_program(program)
+        program["id"] = program_id
+        print(json.dumps(program, indent=2, ensure_ascii=False))

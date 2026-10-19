@@ -36,18 +36,22 @@ paragraph.font.size = Pt(20)
 
 ### Professional Blue
 ```python
-primary = RgbColor(0x1F, 0x77, 0xB4)    # Main blue
-secondary = RgbColor(0xAE, 0xC7, 0xE8)  # Light blue
-accent = RgbColor(0xFF, 0x7F, 0x0E)     # Orange accent
-text = RgbColor(0x33, 0x33, 0x33)       # Dark gray
+from pptx.dml.color import RGBColor
+
+primary = RGBColor(0x1F, 0x77, 0xB4)    # Main blue
+secondary = RGBColor(0xAE, 0xC7, 0xE8)  # Light blue
+accent = RGBColor(0xFF, 0x7F, 0x0E)     # Orange accent
+text = RGBColor(0x33, 0x33, 0x33)       # Dark gray
 ```
 
 ### Corporate Gray
 ```python
-primary = RgbColor(0x4A, 0x4A, 0x4A)    # Charcoal
-secondary = RgbColor(0x9B, 0x9B, 0x9B)  # Medium gray
-accent = RgbColor(0x00, 0x7A, 0xCC)     # Blue accent
-background = RgbColor(0xF5, 0xF5, 0xF5) # Light gray
+from pptx.dml.color import RGBColor
+
+primary = RGBColor(0x4A, 0x4A, 0x4A)    # Charcoal
+secondary = RGBColor(0x9B, 0x9B, 0x9B)  # Medium gray
+accent = RGBColor(0x00, 0x7A, 0xCC)     # Blue accent
+background = RGBColor(0xF5, 0xF5, 0xF5) # Light gray
 ```
 
 ## Margin and Spacing
@@ -128,10 +132,13 @@ def add_titled_slide(prs, title_text, layout_idx=1):
 
 ### Consistent Styling
 ```python
+from pptx.dml.color import RGBColor
+from pptx.util import Pt
+
 def style_title(title_shape):
     title_shape.text_frame.paragraphs[0].font.size = Pt(40)
     title_shape.text_frame.paragraphs[0].font.bold = True
-    title_shape.text_frame.paragraphs[0].font.color.rgb = RgbColor(0x1F, 0x77, 0xB4)
+    title_shape.text_frame.paragraphs[0].font.color.rgb = RGBColor(0x1F, 0x77, 0xB4)
 ```
 
 ## Common Presentation Structures

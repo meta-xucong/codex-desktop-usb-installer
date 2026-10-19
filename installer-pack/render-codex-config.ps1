@@ -83,7 +83,7 @@ if ($EnableFeishu) {
     if (-not [bool]$dryRunPlan.packagePresent -or -not [bool]$dryRunPlan.packageValidated) {
         throw "Locked Feishu package is absent or does not match the tool contract: $FeishuPackageCache"
     }
-    if (-not [bool]$dryRunPlan.nodeReady) { throw 'Node.js >=20 is required before enabling Feishu.' }
+    if (-not [bool]$dryRunPlan.nodeReady) { throw 'Node.js >=22 is required before enabling Feishu.' }
     $secretValue = [Environment]::GetEnvironmentVariable('FEISHU_APP_SECRET', 'Process')
     if ($dryRunText -match [regex]::Escape($secretValue)) { throw 'Feishu wrapper dry-run exposed App Secret.' }
 }
@@ -94,7 +94,7 @@ if ($EnableMediaGeneration) {
     $mediaHealthText = & $MediaMcpWrapperPath -HealthCheck | Out-String
     if ($LASTEXITCODE -ne 0) { throw 'Bundled Python media MCP health check failed.' }
     $mediaHealth = $mediaHealthText | ConvertFrom-Json
-    if (-not [bool]$mediaHealth.ready -or [string]$mediaHealth.serverVersion -ne '1.3.10' -or [string]$mediaHealth.healthScope -ne 'local-runtime-protocol' -or [string]$mediaHealth.protocolStatus -ne 'passed' -or [int]$mediaHealth.toolCount -ne 6) { throw 'Bundled Python media MCP local runtime/protocol check is unhealthy.' }
+    if (-not [bool]$mediaHealth.ready -or [string]$mediaHealth.serverVersion -ne '1.3.11' -or [string]$mediaHealth.healthScope -ne 'local-runtime-protocol' -or [string]$mediaHealth.protocolStatus -ne 'passed' -or [int]$mediaHealth.toolCount -ne 6) { throw 'Bundled Python media MCP local runtime/protocol check is unhealthy.' }
 }
 
 $mcpManifestPath = Join-Path $kitRoot 'manifest\mcp-servers.json'

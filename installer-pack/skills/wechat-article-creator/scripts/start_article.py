@@ -4,6 +4,7 @@ Quick start a new WeChat article with template
 """
 import argparse
 import os
+import sys
 from pathlib import Path
 from datetime import datetime
 
@@ -112,7 +113,36 @@ def create_article(title: str, topic: str = ""):
 """
     
     file_path = drafts_dir / filename
-    file_path.write_text(template, encoding='utf-8')
+    stem = file_path.stem
+    suffix = file_path.suffix
+    collision_index = 1
+    while True:
+        candidate = file_path if collision_index == 1 else drafts_dir / f"{stem}_{collision_index}{suffix}"
+        try:
+            # Exclusive creation makes the collision check atomic across callers.
+            draft_file = candidate.open("x", encoding="utf-8")
+        except FileExistsError:
+            collision_index += 1
+            continue
+
+        # This invocation owns candidate only after exclusive open succeeds.
+        try:
+            with draft_file:
+                draft_file.write(template)
+        except BaseException as write_error:
+            try:
+                candidate.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as cleanup_error:
+                if isinstance(write_error, OSError):
+                    raise OSError(
+                        f"{write_error}; failed to remove partial draft {candidate}: {cleanup_error}"
+                    ) from write_error
+                raise
+            raise
+        file_path = candidate
+        break
     
     print(f"Article created: {file_path}")
     print("\nNext steps:")
@@ -130,8 +160,13 @@ def main():
     parser.add_argument("--topic", default="", help="Article topic (optional)")
     
     args = parser.parse_args()
-    create_article(args.title, args.topic)
+    try:
+        create_article(args.title, args.topic)
+    except (OSError, UnicodeError) as exc:
+        print(f"Error: failed to create article draft: {exc}", file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

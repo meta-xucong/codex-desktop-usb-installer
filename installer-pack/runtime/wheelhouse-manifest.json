@@ -23,6 +23,30 @@
       ]
     },
     {
+      "package": "anyio",
+      "normalizedPackage": "anyio",
+      "version": "4.15.1",
+      "filename": "anyio-4.15.1-py3-none-any.whl",
+      "relativePath": "runtime/bundled/python-wheels/anyio-4.15.1-py3-none-any.whl",
+      "bytes": 132079,
+      "sha256": "6152fdbbf9a77fdec97731721bebf7c4c44f7c29b424b0065826173efc7ed101",
+      "tags": [
+        "py3-none-any"
+      ]
+    },
+    {
+      "package": "apify_fingerprint_datapoints",
+      "normalizedPackage": "apify-fingerprint-datapoints",
+      "version": "0.15.0",
+      "filename": "apify_fingerprint_datapoints-0.15.0-py3-none-any.whl",
+      "relativePath": "runtime/bundled/python-wheels/apify_fingerprint_datapoints-0.15.0-py3-none-any.whl",
+      "bytes": 761805,
+      "sha256": "fc9299b3136880f47b468897cd00ac622ad2c2a93e9cc9f972d10dbf5ed2b3aa",
+      "tags": [
+        "py3-none-any"
+      ]
+    },
+    {
       "package": "av",
       "normalizedPackage": "av",
       "version": "19.0.1",
@@ -42,6 +66,18 @@
       "relativePath": "runtime/bundled/python-wheels/beautifulsoup4-4.15.0-py3-none-any.whl",
       "bytes": 109924,
       "sha256": "d6f88de62e1d4e38ecb1077eb9724cd0eff29d2a08ca16a401e9b9e93f117cf9",
+      "tags": [
+        "py3-none-any"
+      ]
+    },
+    {
+      "package": "browserforge",
+      "normalizedPackage": "browserforge",
+      "version": "1.2.4",
+      "filename": "browserforge-1.2.4-py3-none-any.whl",
+      "relativePath": "runtime/bundled/python-wheels/browserforge-1.2.4-py3-none-any.whl",
+      "bytes": 37890,
+      "sha256": "fb1c14e62ac09de221dcfc73074200269f697596c642cb200ceaab1127a17542",
       "tags": [
         "py3-none-any"
       ]
@@ -223,6 +259,18 @@
       "relativePath": "runtime/bundled/python-wheels/glcontext-3.0.0-cp312-cp312-win_amd64.whl",
       "bytes": 12971,
       "sha256": "e80bb37ba727bd20c192f2754aea40c437a7665005c1001c10752f91913964e9",
+      "tags": [
+        "cp312-cp312-win_amd64"
+      ]
+    },
+    {
+      "package": "greenlet",
+      "normalizedPackage": "greenlet",
+      "version": "3.5.6",
+      "filename": "greenlet-3.5.6-cp312-cp312-win_amd64.whl",
+      "relativePath": "runtime/bundled/python-wheels/greenlet-3.5.6-cp312-cp312-win_amd64.whl",
+      "bytes": 324203,
+      "sha256": "7ac4abb3877c43af320392c664774eef6fa2cc063c79a55fc02d844a3cbe7395",
       "tags": [
         "cp312-cp312-win_amd64"
       ]
@@ -421,6 +469,18 @@
       ]
     },
     {
+      "package": "msgspec",
+      "normalizedPackage": "msgspec",
+      "version": "0.22.0",
+      "filename": "msgspec-0.22.0-cp312-cp312-win_amd64.whl",
+      "relativePath": "runtime/bundled/python-wheels/msgspec-0.22.0-cp312-cp312-win_amd64.whl",
+      "bytes": 192885,
+      "sha256": "6ad64f5c260866b0d543f89f50cee43628989c1433c5de7ce820281fa28a2611",
+      "tags": [
+        "cp312-cp312-win_amd64"
+      ]
+    },
+    {
       "package": "networkx",
       "normalizedPackage": "networkx",
       "version": "3.7",
@@ -494,6 +554,18 @@
       ]
     },
     {
+      "package": "patchright",
+      "normalizedPackage": "patchright",
+      "version": "1.64.1",
+      "filename": "patchright-1.64.1-py3-none-win_amd64.whl",
+      "relativePath": "runtime/bundled/python-wheels/patchright-1.64.1-py3-none-win_amd64.whl",
+      "bytes": 38665415,
+      "sha256": "3cd3e7e1e94034e3f3a732ef7d6f87376dc7d27a9b598de51565051acabf3428",
+      "tags": [
+        "py3-none-any"
+      ]
+    },
+    {
       "package": "pdfminer.six",
       "normalizedPackage": "pdfminer-six",
       "version": "20260107",
@@ -530,6 +602,30 @@
       ]
     },
     {
+      "package": "playwright",
+      "normalizedPackage": "playwright",
+      "version": "1.64.0",
+      "filename": "playwright-1.64.0-py3-none-win_amd64.whl",
+      "relativePath": "runtime/bundled/python-wheels/playwright-1.64.0-py3-none-win_amd64.whl",
+      "bytes": 38675591,
+      "sha256": "2c14d105548876b15bea5e7eca77bf0d8ff4ba0c607c1ae931067f3d1b010369",
+      "tags": [
+        "py3-none-any"
+      ]
+    },
+    {
+      "package": "Protego",
+      "normalizedPackage": "protego",
+      "version": "0.7.0",
+      "filename": "protego-0.7.0-py3-none-any.whl",
+      "relativePath": "runtime/bundled/python-wheels/protego-0.7.0-py3-none-any.whl",
+      "bytes": 13714,
+      "sha256": "944638aaee608f6c83fcad442695f3f9381a60be8d5007248f46b00f201fa5fc",
+      "tags": [
+        "py3-none-any"
+      ]
+    },
+    {
       "package": "pycairo",
       "normalizedPackage": "pycairo",
       "version": "1.29.2",
@@ -563,6 +659,18 @@
       "sha256": "65617e33033874b59d87db603aa1ed450633288aefead953b30bded59cb599a6",
       "tags": [
         "py2-none-any",
+        "py3-none-any"
+      ]
+    },
+    {
+      "package": "pyee",
+      "normalizedPackage": "pyee",
+      "version": "14.0.0",
+      "filename": "pyee-14.0.0-py3-none-any.whl",
+      "relativePath": "runtime/bundled/python-wheels/pyee-14.0.0-py3-none-any.whl",
+      "bytes": 15553,
+      "sha256": "3ac2d3229a9677f7de2c33d7f52fe25b638a46b19c413fea2edc8c6d0a644e4d",
+      "tags": [
         "py3-none-any"
       ]
     },
@@ -948,8 +1056,8 @@
   "transitiveClosure": {
     "required": true,
     "complete": true,
-    "wheelCount": 77,
-    "verification": "Every package referenced by the main Python lock and Manim lock resolves to a SHA-256-pinned wheel in the bundled wheelhouse."
+    "wheelCount": 86,
+    "verification": "All Python and Manim wheels are individually hashed and represented in the runtime lock or Manim lock."
   },
   "materializeScript": "runtime/materialize-python-wheelhouse.ps1",
   "materializeCommand": "powershell -ExecutionPolicy Bypass -File runtime/materialize-python-wheelhouse.ps1 -OutputRoot runtime/bundled/python-build -FindLinks runtime/bundled/python-wheels",

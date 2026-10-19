@@ -127,13 +127,13 @@
         "materializer": "runtime/materialize-python-wheelhouse.ps1",
         "indexPolicy": "approved package index; record the index URL and timestamp in the private media manifest",
         "archiveFilename": "runtime/bundled/python-wheels/",
-        "archiveBytes": 167504800,
-        "wheelCount": 77
+        "archiveBytes": 246323935,
+        "wheelCount": 86
       },
       "integrity": {
         "materializationStatus": "ready",
         "sha256": null,
-        "sha256Source": "Each of the 77 bundled wheels has an individual SHA-256 in runtime/bundled/python-wheelhouse-manifest.json and is verified before installation.",
+        "sha256Source": "Each of the 86 bundled wheels has an individual SHA-256 in runtime/bundled/python-wheelhouse-manifest.json and is verified before installation.",
         "authenticode": {
           "required": false,
           "evidence": "per-wheel SHA-256, PyPI/index provenance and signed media manifest"
@@ -283,7 +283,7 @@
       "artifactId": "runtime.hyperframes-cli",
       "materializationStatus": "network-bootstrap",
       "installReady": true,
-      "purpose": "Local HyperFrames composition CLI, pinned to npm package 0.8.134",
+      "purpose": "Local HyperFrames composition CLI, pinned to npm package 0.8.174",
       "relatedSkills": [
         "hyperframes-video"
       ],
@@ -291,7 +291,7 @@
       "optional": false,
       "source": {
         "registry": "https://registry.npmjs.org/hyperframes",
-        "package": "hyperframes@0.8.134",
+        "package": "hyperframes@0.8.174",
         "license": "Apache-2.0",
         "nodeEngine": ">=22"
       },

@@ -5,11 +5,11 @@ description: Read, write, and generate Excel files with correct types, dates, fo
 
 ## Setup
 
-On first use, read `setup.md` for integration guidelines. Ask user preferences naturally during conversation.
+Read `setup.md` when preference or memory handling is relevant. Do not delay a requested spreadsheet task for onboarding; ask about preferences only when the task depends on them or the user wants ongoing Excel-specific personalization.
 
 ## When to Use
 
-User needs to read, write, or generate Excel files (.xlsx, .xls, .xlsm). Agent handles type coercion, date serialization, formula evaluation, and cross-platform quirks.
+Use for reading, writing, and generating `.xlsx` files, and for `.xlsm` files when VBA preservation is required. This Skill's bundled `openpyxl` supports these OOXML formats; it does not read or write legacy `.xls` files. For `.xls`, convert it to `.xlsx` with Excel or LibreOffice first, or stop if conversion is unavailable.
 
 ## Architecture
 
@@ -39,7 +39,7 @@ Excel incorrectly treats 1900 as a leap year. Serial 60 represents Feb 29, 1900 
 Numbers beyond 15 digits silently truncate. Use TEXT format for: phone numbers, IDs, credit cards, any long numeric identifiers. Leading zeros also require TEXT.
 
 ### 4. Formulas vs Cached Values
-Cells may contain both formula and cached result. Some readers return formula string, others return cached value. Force recalculation if cached values might be stale.
+`openpyxl` stores and reads formula text but does not calculate formulas. By default, load with `data_only=False` to inspect formulas. `data_only=True` reads a cached result only when one exists in the file; it does not calculate a missing or stale result. When current results are needed, open and recalculate the workbook in Excel or LibreOffice, then save it there before reading cached values. Do not claim that setting workbook calculation flags or saving with `openpyxl` recalculates formulas.
 
 ### 5. Merged Cells Are Traps
 Only the top-left cell of a merged range holds the value. Reading other cells in the merge returns empty. Hidden rows/columns still contain data.
@@ -64,9 +64,10 @@ Loading large files fully into RAM causes memory issues. Use streaming readers (
 
 | Format | Rows | Columns | Notes |
 |--------|------|---------|-------|
-| XLSX | 1,048,576 | 16,384 (XFD) | Modern default |
-| XLS | 65,536 | 256 | Legacy, avoid |
-| CSV | Unlimited | Unlimited | No formatting |
+| XLSX | 1,048,576 | 16,384 (XFD) | Supported by bundled `openpyxl` |
+| XLSM | 1,048,576 | 16,384 (XFD) | Supported with `keep_vba=True` when loading and saved with `.xlsm`; macros are preserved, never run by `openpyxl` |
+| XLS | 65,536 | 256 | Not supported by bundled `openpyxl`; convert with Excel/LibreOffice first |
+| CSV | — | — | Text interchange format; not an Excel workbook format handled by this Skill's workbook workflow |
 
 ## Security & Privacy
 
@@ -80,12 +81,8 @@ Loading large files fully into RAM causes memory issues. Use streaming readers (
 - Require network access
 
 ## Related Skills
-Install with `clawhub install <slug>` if user confirms:
-- `csv` — CSV parsing and generation
-- `data` — Data processing patterns
-- `data-analysis` — Analysis workflows
+Do not use the legacy `clawhub install` or `clawhub sync` commands from this package. If a missing library blocks the requested task, report the dependency and use an available compatible tool where practical; install software only when the user requests it.
 
 ## Feedback
 
-- If useful: `clawhub star excel-xlsx`
-- Stay updated: `clawhub sync`
+Do not run external install, update, or feedback commands as part of ordinary spreadsheet work.

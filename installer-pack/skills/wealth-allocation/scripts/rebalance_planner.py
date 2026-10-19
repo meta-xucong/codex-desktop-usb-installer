@@ -19,6 +19,19 @@ from typing import Any
 MAX_INPUT_BYTES = 1024 * 1024
 
 
+def _ensure_finite_values(value: Any, path: str = "plan") -> None:
+    """Reject non-finite values derived anywhere in the rebalance plan."""
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"{path} 计算结果超出有限数值范围。")
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            _ensure_finite_values(item, f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            _ensure_finite_values(item, f"{path}[{index}]")
+
+
 def validate_allocations(raw: Any, label: str) -> dict[str, float]:
     if not isinstance(raw, dict) or not raw:
         raise ValueError(f"{label} 必须是非空的资产到百分比 JSON 对象。")
@@ -27,6 +40,8 @@ def validate_allocations(raw: Any, label: str) -> dict[str, float]:
         code = str(raw_code).strip()
         if not code:
             raise ValueError(f"{label} 包含空资产代码。")
+        if code in normalized:
+            raise ValueError(f"{label} 包含规范化后重复的资产代码。")
         if isinstance(raw_weight, bool):
             raise ValueError(f"{label}.{code} 必须是有限数值。")
         try:
@@ -88,7 +103,7 @@ def calculate_rebalance_plan(
             }
         )
     estimated_cost = total_decrease * transaction_cost_rate / 100
-    return {
+    plan = {
         "calculated_at": datetime.now(timezone.utc).isoformat(),
         "portfolio_value": float(total_value),
         "threshold_percentage_points": float(threshold),
@@ -107,6 +122,8 @@ def calculate_rebalance_plan(
             "结果不下单，不考虑税、买入费用、滑点、最小交易单位或账户限制。"
         ),
     }
+    _ensure_finite_values(plan)
+    return plan
 
 
 def _load_json(path_value: str, label: str) -> dict[str, Any]:
@@ -117,6 +134,15 @@ def _load_json(path_value: str, label: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{label} JSON 顶层必须是对象。")
     return value
+
+
+def _reject_output_overwrite(output: Path, inputs: list[Path]) -> None:
+    """Refuse to replace either allocation source through path aliases."""
+    for source in inputs:
+        if output.resolve() == source.resolve():
+            raise ValueError(f"--output must differ from input JSON: {source}")
+        if output.exists() and source.exists() and output.samefile(source):
+            raise ValueError(f"--output must differ from input JSON: {source}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -142,9 +168,13 @@ def main(argv: list[str] | None = None) -> int:
             args.threshold,
             args.transaction_cost_rate,
         )
-        output = json.dumps(plan, ensure_ascii=False, indent=2)
+        output = json.dumps(plan, ensure_ascii=False, indent=2, allow_nan=False)
         if args.output:
             output_path = Path(args.output).expanduser().resolve()
+            _reject_output_overwrite(
+                output_path,
+                [Path(args.current).expanduser().resolve(), Path(args.target).expanduser().resolve()],
+            )
             output_path.write_text(output + "\n", encoding="utf-8")
             print(f"差额计算已保存到: {output_path}")
         else:

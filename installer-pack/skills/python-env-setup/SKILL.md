@@ -22,6 +22,8 @@ powershell -ExecutionPolicy Bypass -File scripts/check_python_env.ps1 -Json
 脚本按 `python`、`py -3`、`python3` 顺序检查解释器，验证 `cpython-312`、`win_amd64` 和 x64，返回命令、绝对路径、ABI 和版本。它只调用解释器探针，
 不安装软件、不修改 PATH、不读取用户配置。
 
+必须以检查器的 JSON 输出作为唯一兼容性结论。若 PowerShell、脚本或某个启动器无法运行，停止并如实报告失败项；不得根据 PATH、文件夹名称、缓存标签或其他未执行的候选路径推断版本、实现、ABI、平台或架构，也不得转而输出整个 PATH、扫描安装目录或反复探测其他启动器。只有检查器返回完整且匹配的字段时才报告可用。
+
 ## 安装边界
 
 如果没有可用解释器，应先说明需要用户批准，并由用户使用组织批准的离线安装包或 Windows 软件管理
