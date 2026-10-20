@@ -969,6 +969,7 @@ pub fn run() {
             commands::historical_release_catalog,
             commands::historical_pick_local_package,
             commands::offline_payload_probe,
+            commands::win_check_install_preflight,
             commands::offline_payload_stage,
             commands::offline_payload_cleanup,
             commands::mac_install_historical_release,

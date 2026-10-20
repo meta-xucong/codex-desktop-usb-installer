@@ -58,6 +58,7 @@ import type {
   UninstallHandoffStatus,
   WinUpdateReport,
   UsbGuardStatus,
+  UsbInstallPreflightReport,
 } from "../shared/types";
 import { DEFAULT_SETTINGS, emptyOperationOutcome } from "../shared/types";
 
@@ -1093,6 +1094,13 @@ export const managerApi = {
     return invoke<OfflinePayloadReport>("offline_payload_probe", {
       packagePath: packagePath ?? null,
     });
+  },
+  /** Check 404token reachability and the signed API-key binding before install. */
+  winCheckInstallPreflight(): Promise<UsbInstallPreflightReport> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({ internetAvailable: true, apiKeyReady: true });
+    }
+    return invoke<UsbInstallPreflightReport>("win_check_install_preflight");
   },
   /** Stage the verified USB payload in the local temporary directory. */
   offlinePayloadStage(packagePath?: string): Promise<OfflineStageReport> {

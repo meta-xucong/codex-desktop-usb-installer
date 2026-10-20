@@ -1639,6 +1639,32 @@ pub fn require_signed_codex_install_bundle(
     require_signed_codex_reinstall_bundle(phase).map(Some)
 }
 
+/// Check whether the currently authorized USB install license carries the
+/// 404token binding needed by first-install setup.
+pub fn signed_install_account_binding_ready() -> Result<bool, AppError> {
+    if !guard_required() {
+        return Ok(true);
+    }
+    let authorization = require_signed_codex_install_bundle("install-account-binding")?
+        .ok_or_else(|| engine("当前进程不是受管 USB bundle，不能检查签名账号绑定"))?;
+    let license = read_license(&authorization.bundle_root)?
+        .ok_or_else(|| engine("usb_license_missing：当前 U 盘缺少许可证"))?;
+    let signed = validate_license(&license, &authorization.fingerprint)
+        .map_err(|error| engine(format!("usb_license_invalid：{error}")))?;
+    if !signed {
+        return Err(engine(
+            "usb_license_unsigned：自动导入账号需要有效的签名许可证",
+        ));
+    }
+    let Some(binding) = license.account_binding.as_ref() else {
+        return Ok(false);
+    };
+    license_core::validate_account_binding(binding)
+        .map_err(|error| engine(format!("usb_account_binding_invalid：{error}")))?;
+    Ok(binding.ccswitch.provider_id == "404token-sub2api"
+        && !binding.ccswitch.device_api_key.trim().is_empty())
+}
+
 /// Re-observe and authorize the exact physical bundle owned by this manager
 /// session.  Callers that hand work to a detached helper must persist this
 /// fingerprint; a renderer path or a drive letter is not an authorization

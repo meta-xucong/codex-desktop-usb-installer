@@ -1097,6 +1097,11 @@ export interface UsbGuardStatus {
   message: string;
 }
 
+export interface UsbInstallPreflightReport {
+  internetAvailable: boolean;
+  apiKeyReady: boolean;
+}
+
 /** Delivery metadata (optional schemaVersion-2 fields; packer enforces). */
 export interface CodexThemeMeta {
   version: string | null;

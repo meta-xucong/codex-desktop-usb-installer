@@ -162,6 +162,13 @@ fn windows_install_mode_for_settings() -> String {
     }
 }
 
+fn is_usb_install_path(requested_by_caller: bool, running_from_usb_bundle: bool) -> bool {
+    // The renderer flag is a hint for ordinary manager callers, not a security
+    // boundary. A signed USB build must remain on the USB path even if a stale
+    // or direct IPC caller omits the flag.
+    requested_by_caller || running_from_usb_bundle
+}
+
 fn validated_custom_proxy_for_settings(raw: &str, context: &str) -> Result<String, AppError> {
     validate_custom_proxy(raw).map_err(|e| {
         log::warn!("url_guard rejected {context} proxy reason={e}");
@@ -192,6 +199,45 @@ fn win_network_config_for_settings() -> Result<codex_win_engine::NetworkConfig, 
             Ok(codex_win_engine::NetworkConfig::custom(proxy))
         }
     }
+}
+
+async fn require_usb_install_network() -> Result<(), AppError> {
+    let network = win_network_config_for_settings()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        codex_win_engine::fetch_text_with_network("https://404token.xyz/", &network)
+            .map(|_| ())
+            .map_err(|error| {
+                AppError::Engine(format!(
+                    "USB installation requires internet access to 404token; connect to the internet and retry. No installation changes were started. ({error})"
+                ))
+            })
+    })
+    .await
+    .map_err(|error| AppError::Internal(format!("join: {error}")))?
+}
+
+fn require_usb_install_account_binding() -> Result<(), AppError> {
+    if !crate::app::usb_guard::guard_required() {
+        return Ok(());
+    }
+    if !crate::app::usb_guard::signed_install_account_binding_ready()? {
+        return Err(AppError::Engine(
+            "签名 U 盘未包含可用的 404token API Key，无法完成自动配置；请先重新签名。".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+async fn require_usb_install_preflight() -> Result<(), AppError> {
+    require_usb_install_network().await?;
+    require_usb_install_account_binding()
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsbInstallPreflightReport {
+    pub internet_available: bool,
+    pub api_key_ready: bool,
 }
 
 enum HistoricalReleaseNetwork {
@@ -1310,6 +1356,24 @@ pub async fn offline_payload_stage(
     .await
     .map_err(|error| AppError::Internal(format!("join: {error}")))?
     .map_err(Into::into)
+}
+
+/// Check network access and the signed API-key binding before the UI stages or
+/// installs any local payload. The mutating commands repeat both checks.
+#[tauri::command]
+pub async fn win_check_install_preflight(
+    state: State<'_, ManagerState>,
+) -> Result<UsbInstallPreflightReport, CommandError> {
+    if !matches!(state.target.os, OperatingSystem::Windows) {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    reject_uninstall_handoff(&state)?;
+    let internet_available = require_usb_install_network().await.is_ok();
+    let api_key_ready = require_usb_install_account_binding().is_ok();
+    Ok(UsbInstallPreflightReport {
+        internet_available,
+        api_key_ready,
+    })
 }
 
 /// Best-effort cleanup for a staged MSIX after a successful installation.  The
@@ -3570,6 +3634,11 @@ pub async fn win_perform_update(
             AppError::Internal("拒绝执行：Windows 更新必须带显式 confirm".to_string()).into(),
         );
     }
+    if crate::app::usb_guard::guard_required() {
+        // Recheck immediately before the install path: the UI preflight and
+        // background staging may have happened earlier or in another process.
+        require_usb_install_preflight().await?;
+    }
     let mut op = DetachedGuard::validate_tracked(&state, token)?;
     op.set_phase(OperationPhase::Preparing);
     let endpoints = windows_endpoints_for_settings(&state)?;
@@ -3726,9 +3795,13 @@ pub async fn win_install_historical_release(
     if !matches!(state.target.os, OperatingSystem::Windows) {
         return Err(AppError::UnsupportedPlatform.into());
     }
-    let install_to_usb = install_to_usb.unwrap_or(false);
+    let install_to_usb = is_usb_install_path(
+        install_to_usb.unwrap_or(false),
+        crate::app::usb_guard::guard_required(),
+    );
     if install_to_usb {
         crate::app::usb_guard::require_signed_codex_install_bundle("win-install-historical")?;
+        require_usb_install_preflight().await?;
     } else {
         crate::app::usb_guard::require_signed_codex_bundle("win-install-historical")?;
     }
@@ -4686,13 +4759,21 @@ pub async fn win_uninstall_bundle(
 #[cfg(test)]
 mod tests {
     use super::{
-        install_root_from_picked_dir, invalidate_retained_pause_if_stale,
+        install_root_from_picked_dir, invalidate_retained_pause_if_stale, is_usb_install_path,
         manager_update_matches_confirmation, normalize_windows_source_base,
         record_macos_policy_install_state, record_windows_policy_install_state,
         should_attempt_theme_codex_launch, validate_historical_architecture_with_compatibility,
         validate_install_root_path, validated_custom_proxy_for_settings,
         HistoricalPolicyInstallState, INSTALL_LOCATION_PROBE_PREFIX,
     };
+
+    #[test]
+    fn signed_usb_context_cannot_be_downgraded_by_omitting_renderer_flag() {
+        assert!(is_usb_install_path(false, true));
+        assert!(is_usb_install_path(true, false));
+        assert!(is_usb_install_path(true, true));
+        assert!(!is_usb_install_path(false, false));
+    }
 
     #[test]
     fn catalog_reload_uses_normal_usb_launch_instead_of_fixed_port_theme_hot_attach() {

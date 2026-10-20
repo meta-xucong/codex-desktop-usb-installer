@@ -675,6 +675,21 @@ export function OfflineHome({
         return false;
       }
       setUsbGuard(preflightGuard);
+      // The shipped USB package is local, but first install also configures
+      // online services. Check both the required gateway route and the signed
+      // API-key binding before staging anything; backend mutation boundaries
+      // repeat these checks independently.
+      const installPreflight = await managerApi.winCheckInstallPreflight();
+      if (!installPreflight.internetAvailable) {
+        setPhase("ready");
+        setNotice(t("offline.installRequiresNetwork"));
+        return false;
+      }
+      if (!installPreflight.apiKeyReady) {
+        setPhase("ready");
+        setNotice(t("offline.installRequiresBinding"));
+        return false;
+      }
       stage = await managerApi.offlinePayloadStage();
       setPhase("installing");
       const current = await managerApi.winStatus();

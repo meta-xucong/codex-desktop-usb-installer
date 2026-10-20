@@ -15,6 +15,7 @@ vi.mock("../../services/managerApi", async (importOriginal) => {
     ...actual,
     managerApi: {
       offlinePayloadProbe: vi.fn(),
+      winCheckInstallPreflight: vi.fn(),
       offlinePayloadStage: vi.fn(),
       offlinePayloadCleanup: vi.fn(),
       winStatus: vi.fn(),
@@ -122,6 +123,10 @@ describe("OfflineHome", () => {
     localStorage.removeItem("codex-usb-ccswitch-injection-issue-v1");
     localStorage.setItem("cam.lang", "zh-CN");
     api.offlinePayloadProbe.mockResolvedValue(PAYLOAD);
+    api.winCheckInstallPreflight.mockResolvedValue({
+      internetAvailable: true,
+      apiKeyReady: true,
+    });
     api.offlinePayloadStage.mockResolvedValue(STAGE);
     api.offlinePayloadCleanup.mockResolvedValue();
     api.winStatus.mockResolvedValue({ installed: null, status: "none" });
@@ -547,6 +552,38 @@ describe("OfflineHome", () => {
     const update = await screen.findByRole("button", { name: "检查并安装更新" });
     expect(update).toBeDisabled();
     expect(screen.getByText(/需要已配置签名许可证/)).toBeInTheDocument();
+  });
+
+  it("blocks the USB install before staging when 404token is unreachable", async () => {
+    const user = userEvent.setup();
+    api.winCheckInstallPreflight.mockResolvedValue({
+      internetAvailable: false,
+      apiKeyReady: true,
+    });
+    renderView();
+
+    await user.click(await screen.findByRole("button", { name: "一键安装" }));
+
+    expect(await screen.findByText(/安装需要连接互联网并能访问 404token/)).toBeInTheDocument();
+    expect(api.offlinePayloadStage).not.toHaveBeenCalled();
+    expect(api.winInstallHistoricalRelease).not.toHaveBeenCalled();
+    expect(api.installCapabilityPack).not.toHaveBeenCalled();
+  });
+
+  it("blocks the USB install before staging when the signed API key binding is missing", async () => {
+    const user = userEvent.setup();
+    api.winCheckInstallPreflight.mockResolvedValue({
+      internetAvailable: true,
+      apiKeyReady: false,
+    });
+    renderView();
+
+    await user.click(await screen.findByRole("button", { name: "一键安装" }));
+
+    expect(await screen.findByText(/签名 U 盘没有可自动导入的 404token API Key/)).toBeInTheDocument();
+    expect(api.offlinePayloadStage).not.toHaveBeenCalled();
+    expect(api.winInstallHistoricalRelease).not.toHaveBeenCalled();
+    expect(api.installCapabilityPack).not.toHaveBeenCalled();
   });
 
   it("stages the payload and launches CCSwitch without running model probes", async () => {
