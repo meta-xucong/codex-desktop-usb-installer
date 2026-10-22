@@ -45,6 +45,11 @@ pub(crate) struct VerifiedRuntime {
     /// all candidate probes have extracted their verified CLI copy.
     pub trusted_payload_pin: fs::File,
 }
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct VerifiedRuntimeFailure {
+    pub stage: &'static str,
+    pub code: &'static str,
+}
 pub struct NativeBatch {
     pub results: Vec<NativeProbeResult>,
     pub selection: Option<SelectionReply>,
@@ -267,12 +272,21 @@ fn verified_runtime(
 pub(crate) fn verified_catalog_runtime(
     cancelled: &AtomicBool,
     deadline: Instant,
-) -> Result<VerifiedRuntime, &'static str> {
+) -> Result<VerifiedRuntime, VerifiedRuntimeFailure> {
+    let mut stage = "usb-guard";
     if !usb_guard::guard_required() {
-        return Err("native-usb-required");
+        return Err(VerifiedRuntimeFailure {
+            stage,
+            code: "native-usb-required",
+        });
     }
-    let root = usb_guard::authorized_usb_codex_root().map_err(|_| "native-binding-unavailable")?;
-    verified_runtime_inner(&root, None, cancelled, deadline)
+    stage = "usb-installation-root";
+    let root = usb_guard::authorized_usb_codex_root().map_err(|_| VerifiedRuntimeFailure {
+        stage,
+        code: "native-binding-unavailable",
+    })?;
+    verified_runtime_inner_staged(&root, None, cancelled, deadline, &mut stage)
+        .map_err(|code| VerifiedRuntimeFailure { stage, code })
 }
 
 #[cfg(windows)]
@@ -282,19 +296,41 @@ fn verified_runtime_inner(
     cancelled: &AtomicBool,
     deadline: Instant,
 ) -> Result<VerifiedRuntime, &'static str> {
+    let mut stage = "usb-guard";
+    verified_runtime_inner_staged(
+        installation_root,
+        expected_version,
+        cancelled,
+        deadline,
+        &mut stage,
+    )
+}
+
+#[cfg(windows)]
+fn verified_runtime_inner_staged(
+    installation_root: &Path,
+    expected_version: Option<&str>,
+    cancelled: &AtomicBool,
+    deadline: Instant,
+    stage: &mut &'static str,
+) -> Result<VerifiedRuntime, &'static str> {
     use std::os::windows::fs::MetadataExt;
+    *stage = "usb-guard";
     if !usb_guard::guard_required() {
         return Err("native-usb-required");
     }
+    *stage = "usb-bundle-authorization";
     usb_guard::require_signed_codex_bundle("native-model-verification")
         .map_err(|_| "native-binding-unavailable")?
         .ok_or("native-usb-required")?;
+    *stage = "usb-bundle-location";
     let status = usb_guard::current_status();
     let bundle = status
         .bundle_path
         .as_deref()
         .map(PathBuf::from)
         .ok_or("native-usb-required")?;
+    *stage = "installation-link-check";
     for raw in [installation_root, &bundle.join("apps").join("Codex")] {
         for ancestor in raw.ancestors() {
             let meta =
@@ -304,6 +340,7 @@ fn verified_runtime_inner(
             }
         }
     }
+    *stage = "installation-root-resolution";
     let expected_root = fs::canonicalize(bundle.join("apps").join("Codex"))
         .map_err(|_| "native-installation-unavailable")?;
     let actual_root =
@@ -311,6 +348,7 @@ fn verified_runtime_inner(
     if actual_root != expected_root {
         return Err("native-installation-mismatch");
     }
+    *stage = "installation-executable-location";
     let executable = actual_root.join("resources").join("codex.exe");
     for p in executable.ancestors() {
         let meta = fs::symlink_metadata(p).map_err(|_| "native-executable-unavailable")?;
@@ -318,21 +356,26 @@ fn verified_runtime_inner(
             return Err("native-executable-unavailable");
         }
     }
+    *stage = "runtime-executable-hash";
     let runtime_hashes = hash_runtime_with_console_normalization(&executable, cancelled, deadline)?;
     // Packaged internal executables need not carry an individual signature.
     // Compare their bytes with the original, signature-verified MSIX instead.
+    *stage = "release-package-location";
     check(cancelled, deadline)?;
     let manager = env::current_exe().map_err(|_| "native-package-unavailable")?;
     // Stage first: the release-manifest hash and Authenticode check are both
     // applied to a local package snapshot. All later ZIP reads use this same
     // staged package, never the mutable removable-drive path.
+    *stage = "release-package-stage-and-hash";
     let staged = crate::app::offline_payload::stage_offline_payload(&manager, None, None, false)
         .map_err(|_| "native-package-unavailable")?;
     let trusted_payload_path = PathBuf::from(&staged.staged_path);
     let payload = staged.payload;
+    *stage = "release-package-manifest-hash";
     if !payload.hash_verified || !staged.sha256.eq_ignore_ascii_case(&payload.sha256) {
         return Err("native-package-unavailable");
     }
+    *stage = "release-package-pin-and-authenticode";
     let mut authenticode = None;
     let trusted_payload_pin = crate::app::offline_payload::verify_pinned_staged_payload(
         &trusted_payload_path,
@@ -354,6 +397,7 @@ fn verified_runtime_inner(
     {
         return Err("native-package-unavailable");
     }
+    *stage = "release-package-identity";
     let staged_identity = codex_win_engine::read_msix_identity(&trusted_payload_path)
         .map_err(|_| "native-package-unavailable")?;
     codex_win_engine::validate_codex_identity(
@@ -362,6 +406,7 @@ fn verified_runtime_inner(
         Some(payload.architecture.as_str()),
     )
     .map_err(|_| "native-package-unavailable")?;
+    *stage = "release-package-version";
     if codex_win_engine::read_codex_app_version_from_msix(&trusted_payload_path)
         .is_some_and(|version| version != payload.codex_desktop_version)
     {
@@ -370,6 +415,7 @@ fn verified_runtime_inner(
     if expected_version.is_some_and(|version| payload.codex_desktop_version != version) {
         return Err("native-package-version-mismatch");
     }
+    *stage = "release-cli-entry-location";
     let entry_path = crate::app::offline_payload::read_app_entry(&trusted_payload_path)
         .map_err(|_| "native-package-unavailable")?
         .as_deref()
@@ -387,14 +433,17 @@ fn verified_runtime_inner(
         return Err("native-package-unavailable");
     }
     let trusted_cli_entry_path = format!("{parent}/resources/codex.exe");
+    *stage = "release-cli-member-open";
     let file = fs::File::open(&trusted_payload_path).map_err(|_| "native-package-unavailable")?;
     let mut archive = zip::ZipArchive::new(file).map_err(|_| "native-package-unavailable")?;
     let mut entry = archive
         .by_name(&trusted_cli_entry_path)
         .map_err(|_| "native-package-unavailable")?;
+    *stage = "release-cli-member-size";
     if entry.size() > 1024 * 1024 * 1024 {
         return Err("native-package-unavailable");
     }
+    *stage = "release-cli-member-hash";
     let mut hash = Sha256::new();
     let mut buffer = vec![0u8; 1024 * 1024];
     loop {
@@ -408,11 +457,13 @@ fn verified_runtime_inner(
         hash.update(&buffer[..n]);
     }
     let packaged: String = hash.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    *stage = "runtime-cli-byte-comparison";
     if packaged != runtime_hashes.raw_sha256
         && runtime_hashes.normalized_console_sha256.as_deref() != Some(packaged.as_str())
     {
         return Err("native-executable-changed");
     }
+    *stage = "release-cli-verified";
     Ok(VerifiedRuntime {
         executable,
         executable_sha256: runtime_hashes.raw_sha256,
@@ -435,8 +486,11 @@ fn verified_runtime(
 pub(crate) fn verified_catalog_runtime(
     _: &AtomicBool,
     _: Instant,
-) -> Result<VerifiedRuntime, &'static str> {
-    Err("native-platform-unsupported")
+) -> Result<VerifiedRuntime, VerifiedRuntimeFailure> {
+    Err(VerifiedRuntimeFailure {
+        stage: "platform-check",
+        code: "native-platform-unsupported",
+    })
 }
 
 fn complete_gateway(model: &ModelCapabilityReport) -> bool {
@@ -526,7 +580,11 @@ pub async fn collect(
     // Native evidence may still be collected and reported without activation.
     for model in models {
         if !complete_gateway(model) {
-            log::info!("codex_native_model_probe run_id={} model={} outcome=skipped code=incomplete-gateway-checks", run_id, model.model_id);
+            log::info!(
+                "codex_native_model_probe run_id={} model={} outcome=skipped code=incomplete-gateway-checks",
+                run_id,
+                model.model_id
+            );
             continue;
         }
         let candidate_deadline = candidate_deadlines
@@ -569,7 +627,11 @@ pub async fn collect(
                 batch.results.push(result)
             }
             Ok(Ok(_)) => {
-                log::warn!("codex_native_model_probe run_id={} model={} outcome=failed code=native-executable-changed", run_id, model_id);
+                log::warn!(
+                    "codex_native_model_probe run_id={} model={} outcome=failed code=native-executable-changed",
+                    run_id,
+                    model_id
+                );
                 model.error_code = Some("native-executable-changed".into());
             }
             Ok(Err(error)) => {
@@ -582,7 +644,11 @@ pub async fn collect(
                 model.error_code = Some(error.code().into());
             }
             Err(_) => {
-                log::warn!("codex_native_model_probe run_id={} model={} outcome=failed code=native-worker-failed", run_id, model_id);
+                log::warn!(
+                    "codex_native_model_probe run_id={} model={} outcome=failed code=native-worker-failed",
+                    run_id,
+                    model_id
+                );
                 model.error_code = Some("native-worker-failed".into());
             }
         }
@@ -1046,7 +1112,7 @@ where
             let path = match file {
                 SelectionStateFile::Catalog => &catalog,
                 SelectionStateFile::Config | SelectionStateFile::Auth => {
-                    return Err("selection-rollback-incomplete")
+                    return Err("selection-rollback-incomplete");
                 }
             };
             atomic_file::write_atomic(path, previous).map_err(|_| "selection-rollback-incomplete")
@@ -1055,7 +1121,7 @@ where
             let path = match file {
                 SelectionStateFile::Catalog => &catalog,
                 SelectionStateFile::Config | SelectionStateFile::Auth => {
-                    return Err("selection-rollback-incomplete")
+                    return Err("selection-rollback-incomplete");
                 }
             };
             fs::remove_file(path).map_err(|_| "selection-rollback-incomplete")

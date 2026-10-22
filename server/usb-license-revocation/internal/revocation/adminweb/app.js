@@ -381,7 +381,7 @@
 
   $("refresh-button").addEventListener("click", () => loadLicenses());
   $("model-catalog-run-button").addEventListener("click", async () => {
-    if (!window.confirm("这会刷新所有符合条件的 404token 账号上游目录，并按已批准规则更新账号映射。不会发送模型生成请求。确定开始吗？")) return;
+    if (!window.confirm("这会刷新所有符合条件的 404token 账号上游目录、按已批准规则更新映射，并对官方证据不足的已映射文本模型调用原生账号测试接口发起真实生成请求。请求可能消耗上游额度，成功后也可能恢复账号状态；账号 model_mapping 改写、模型名不完全匹配或结果不完整时会忽略该模型。确定开始吗？")) return;
     const button = $("model-catalog-run-button");
     button.disabled = true;
     try {

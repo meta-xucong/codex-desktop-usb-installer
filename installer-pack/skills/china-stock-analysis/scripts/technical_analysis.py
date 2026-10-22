@@ -14,25 +14,10 @@ Usage:
 
 import argparse
 import json
-import math
 import re
 import sys
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple
-
-
-def _finite_float_series(values: List[float], field: str) -> List[float]:
-    """Return a float series and fail closed on missing or non-finite input."""
-    converted: List[float] = []
-    for index, value in enumerate(values, start=1):
-        try:
-            number = float(value)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError(f"{field}第{index}条K线必须是有限数值。") from exc
-        if not math.isfinite(number):
-            raise ValueError(f"{field}第{index}条K线必须是有限数值。")
-        converted.append(number)
-    return converted
 
 
 def calculate_ma(prices: List[float], period: int) -> List[float]:
@@ -124,8 +109,6 @@ def calculate_rsi(prices: List[float], period: int = 14) -> float:
     avg_gain = sum(gains[-period:]) / period
     avg_loss = sum(losses[-period:]) / period
     
-    if avg_gain == 0 and avg_loss == 0:
-        return 50.0
     if avg_loss == 0:
         return 100.0
     
@@ -216,16 +199,11 @@ def identify_trend(prices: List[float], ma5: List[float], ma20: List[float]) -> 
     # 均线方向
     ma5_rising = ma5[-1] > ma5[-5] if len(ma5) >= 5 and ma5[-5] else False
     ma20_rising = ma20[-1] > ma20[-10] if len(ma20) >= 10 and ma20[-10] else False
-    ma5_falling = ma5[-1] < ma5[-5] if len(ma5) >= 5 and ma5[-5] else False
-    ma20_falling = ma20[-1] < ma20[-10] if len(ma20) >= 10 and ma20[-10] else False
     
-    if not any((ma5_rising, ma20_rising, ma5_falling, ma20_falling)):
-        trend = "横盘整理"
-        strength = 0
-    elif short_above_long and price_above_ma20 and ma5_rising and ma20_rising:
+    if short_above_long and price_above_ma20 and ma5_rising and ma20_rising:
         trend = "上升趋势"
         strength = 3
-    elif not short_above_long and not price_above_ma20 and ma5_falling and ma20_falling:
+    elif not short_above_long and not price_above_ma20 and not ma5_rising and not ma20_rising:
         trend = "下降趋势"
         strength = -3
     elif short_above_long and price_above_ma20:
@@ -273,27 +251,7 @@ def generate_technical_analysis(code: str, prices: List[float],
                                 highs: List[float], lows: List[float],
                                 volumes: List[float], period: str) -> Dict:
     """生成技术分析报告"""
-    prices = _finite_float_series(prices, "收盘价")
-    highs = _finite_float_series(highs, "最高价")
-    lows = _finite_float_series(lows, "最低价")
-    volumes = _finite_float_series(volumes, "成交量")
-
-    lengths = {
-        "收盘价": len(prices),
-        "最高价": len(highs),
-        "最低价": len(lows),
-        "成交量": len(volumes),
-    }
-    if len(set(lengths.values())) != 1:
-        details = "，".join(f"{field}={length}" for field, length in lengths.items())
-        raise ValueError(f"K线数组长度不一致：{details}。")
-
-    for index, (close, high, low) in enumerate(zip(prices, highs, lows), start=1):
-        if not low <= close <= high:
-            raise ValueError(
-                f"第{index}条K线的OHLC关系无效，必须满足最低价 <= 收盘价 <= 最高价。"
-            )
-
+    
     # 计算指标
     ma5 = calculate_ma(prices, 5)
     ma10 = calculate_ma(prices, 10)
@@ -435,10 +393,10 @@ def fetch_market_data(
     if len(frame) < 60:
         raise RuntimeError(f"有效 K 线只有 {len(frame)} 条，至少需要 60 条。")
 
-    prices = _finite_float_series(frame["收盘"].tolist(), "收盘价")
-    highs = _finite_float_series(frame["最高"].tolist(), "最高价")
-    lows = _finite_float_series(frame["最低"].tolist(), "最低价")
-    volumes = _finite_float_series(frame["成交量"].tolist(), "成交量")
+    prices = [float(value) for value in frame["收盘"].tolist()]
+    highs = [float(value) for value in frame["最高"].tolist()]
+    lows = [float(value) for value in frame["最低"].tolist()]
+    volumes = [float(value) for value in frame["成交量"].tolist()]
     as_of = str(frame["日期"].tolist()[-1])
     return prices, highs, lows, volumes, as_of
 
@@ -470,7 +428,7 @@ def main() -> int:
         report["observations"] = len(prices)
         
         if args.json or args.output:
-            output = json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False)
+            output = json.dumps(report, ensure_ascii=False, indent=2)
             if args.output:
                 with open(args.output, 'w', encoding='utf-8') as f:
                     f.write(output)
@@ -483,7 +441,7 @@ def main() -> int:
     except Exception as e:
         error = {"error": str(e), "code": args.code, "period": args.period}
         if args.json:
-            print(json.dumps(error, ensure_ascii=False, allow_nan=False))
+            print(json.dumps(error, ensure_ascii=False))
         else:
             print(f"分析失败: {e}", file=sys.stderr)
         return 1

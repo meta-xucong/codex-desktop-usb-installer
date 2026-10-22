@@ -28,6 +28,11 @@ foreach ($variable in @("CODEX_404TOKEN_ADMIN_API_KEY", "SUB2API_ADMIN_API_KEY")
     }
 }
 $adminApiKeyEmbedded = $null -ne $embeddedAdminApiKeyVariable
+$expectedAdminApiKeyLength = if ($adminApiKeyEmbedded) {
+    ([Environment]::GetEnvironmentVariable($embeddedAdminApiKeyVariable, "Process") -replace "\s", "").Length
+} else {
+    0
+}
 if (-not [string]::IsNullOrWhiteSpace($Sub2ApiConfigPath)) {
     throw "正式签名器禁止通过 Sub2ApiConfigPath 旁置或复制管理员 Key；请使用 CODEX_404TOKEN_ADMIN_API_KEY 或 SUB2API_ADMIN_API_KEY 编译时内置"
 }
@@ -150,6 +155,34 @@ if (-not [string]::IsNullOrWhiteSpace($PortableVaultPath)) {
     $portableVaultBindingVerified = $true
 }
 
+# Verify the exact published executable with runtime credential overrides
+# removed. A manifest flag based only on build-shell environment presence is
+# insufficient: the exact GUI executable must load the generated credential.
+$adminApiKeyRuntimeVerified = $false
+$adminKeyDiagnosticPath = Join-Path $outputFull ".admin-key-diagnostic.json"
+$previousAdminKey = [Environment]::GetEnvironmentVariable("CODEX_404TOKEN_ADMIN_API_KEY", "Process")
+$previousFallbackAdminKey = [Environment]::GetEnvironmentVariable("SUB2API_ADMIN_API_KEY", "Process")
+try {
+    [Environment]::SetEnvironmentVariable("CODEX_404TOKEN_ADMIN_API_KEY", $null, "Process")
+    [Environment]::SetEnvironmentVariable("SUB2API_ADMIN_API_KEY", $null, "Process")
+    $diagnosticProcess = Start-Process -FilePath $publishedExe -ArgumentList @("--diagnose-admin-key", $adminKeyDiagnosticPath) -Wait -PassThru
+    if ($diagnosticProcess.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $adminKeyDiagnosticPath -PathType Leaf)) {
+        throw "发布版签名器未能完成管理员 Key 自检；未生成可交付包"
+    }
+    $adminKeyDiagnostic = Get-Content -Raw -LiteralPath $adminKeyDiagnosticPath | ConvertFrom-Json
+    if ($adminKeyDiagnostic.source -cne "embedded" -or
+        [int]$adminKeyDiagnostic.resolvedLength -le 0 -or
+        [int]$adminKeyDiagnostic.resolvedLength -ne $expectedAdminApiKeyLength -or
+        [int]$adminKeyDiagnostic.embeddedPrimaryLength -ne $expectedAdminApiKeyLength) {
+        throw "发布版签名器加载的内置管理员 Key 与本次提供的 Key 不一致；未生成可交付包"
+    }
+    $adminApiKeyRuntimeVerified = $true
+} finally {
+    [Environment]::SetEnvironmentVariable("CODEX_404TOKEN_ADMIN_API_KEY", $previousAdminKey, "Process")
+    [Environment]::SetEnvironmentVariable("SUB2API_ADMIN_API_KEY", $previousFallbackAdminKey, "Process")
+    Remove-Item -LiteralPath $adminKeyDiagnosticPath -Force -ErrorAction SilentlyContinue
+}
+
 function Get-Sha256([string]$Path) {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
@@ -168,6 +201,7 @@ $manifest = [ordered]@{
     portableVaultIncluded = $portableVaultIncluded
     portableVaultBindingVerified = $portableVaultBindingVerified
     adminApiKeyEmbedded = $adminApiKeyEmbedded
+    adminApiKeyRuntimeVerified = $adminApiKeyRuntimeVerified
     adminApiKeySource = if ($adminApiKeyEmbedded) {
         "compile-time-embedded"
     } else {

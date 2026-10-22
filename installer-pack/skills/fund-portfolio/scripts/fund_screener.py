@@ -10,28 +10,13 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 import sys
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 
 SOURCE_INTERFACE = "akshare.fund_open_fund_rank_em"
-
-
-def _validate_return_threshold(value: Any, name: str) -> None:
-    if value is None:
-        return
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"{name}必须是有限数值。")
-    try:
-        finite = math.isfinite(value)
-    except (TypeError, OverflowError):
-        finite = False
-    if not finite:
-        raise ValueError(f"{name}必须是有限数值。")
 
 
 def safe_float(value: Any) -> float | None:
@@ -62,8 +47,6 @@ def screen_funds(
     """Fetch once and apply only supported filters; provider is injectable for tests."""
     if not 1 <= top_n <= 500:
         raise ValueError("top 必须在 1–500 之间。")
-    _validate_return_threshold(min_return_1y, "min_return_1y")
-    _validate_return_threshold(min_return_3y, "min_return_3y")
     ak = provider or _load_akshare()
     try:
         frame = ak.fund_open_fund_rank_em()
@@ -134,31 +117,6 @@ def format_output(report: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _atomic_write_report(output_path: Path, output: str) -> None:
-    """Publish a complete report without truncating an existing destination."""
-    file_descriptor = None
-    staged_path = None
-    try:
-        file_descriptor, staged_name = tempfile.mkstemp(
-            dir=output_path.parent,
-            prefix=f".{output_path.name}.",
-            suffix=".tmp",
-        )
-        staged_path = Path(staged_name)
-        handle = os.fdopen(file_descriptor, "w", encoding="utf-8", newline="")
-        file_descriptor = None
-        with handle:
-            handle.write(output + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(staged_path, output_path)
-    finally:
-        if file_descriptor is not None:
-            os.close(file_descriptor)
-        if staged_path is not None:
-            staged_path.unlink(missing_ok=True)
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="基金公开排行字段筛选器")
     parser.add_argument("--type", help="基金类型包含文本")
@@ -175,10 +133,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         report = screen_funds(args.type, args.min_return_1y, args.min_return_3y, args.top)
-        output = json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False)
+        output = json.dumps(report, ensure_ascii=False, indent=2)
         if args.output:
             output_path = Path(args.output).expanduser().resolve()
-            _atomic_write_report(output_path, output)
+            output_path.write_text(output + "\n", encoding="utf-8")
             print(f"结果已保存到: {output_path}")
         elif args.json:
             print(output)

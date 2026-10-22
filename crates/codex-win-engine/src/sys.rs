@@ -5113,6 +5113,19 @@ enum PortableLaunchFailure {
 }
 
 #[cfg(any(windows, test))]
+const USB_COLD_START_WINDOW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+#[cfg(any(windows, test))]
+const USB_COMPATIBILITY_WINDOW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+#[cfg(any(windows, test))]
+fn stable_window_reports_same_process(
+    first: &crate::windows_process::UsableWindowReport,
+    followup: &crate::windows_process::UsableWindowReport,
+) -> bool {
+    first.pid == followup.pid
+}
+
+#[cfg(any(windows, test))]
 impl PortableLaunchFailure {
     fn should_retry_compatibility(&self) -> bool {
         matches!(self, Self::NoUsableWindow(_))
@@ -5143,8 +5156,8 @@ fn launch_portable_with_usable_window(
     options: &LaunchOptions,
     software_rendering: bool,
     no_sandbox: bool,
+    window_timeout: std::time::Duration,
 ) -> Result<CodexLaunchReport, PortableLaunchFailure> {
-    const WINDOW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
     const STABILITY_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
 
     if let Err(error) = crate::windows_process::start_console_window_watcher(root) {
@@ -5160,7 +5173,7 @@ fn launch_portable_with_usable_window(
         PortableLaunchFailure::Fatal(EngineError::Io(format!("launch Codex: {error}")))
     })?;
 
-    let first = match crate::windows_process::wait_for_usable_window_for_root(root, WINDOW_TIMEOUT)
+    let first = match crate::windows_process::wait_for_usable_window_for_root(root, window_timeout)
     {
         Ok(report) => report,
         Err(error) => {
@@ -5185,54 +5198,73 @@ fn launch_portable_with_usable_window(
             }
         };
         if let Some(stable) = stable {
-            if child.try_wait().ok().flatten().is_none() {
-                std::mem::forget(child);
+            if stable_window_reports_same_process(&window, &stable) {
+                if child.try_wait().ok().flatten().is_none() {
+                    std::mem::forget(child);
+                }
+                let launch_mode = portable_launch_mode(software_rendering, no_sandbox);
+                log::info!(
+                    "portable Codex usable window confirmed mode={launch_mode} pid={} size={}x{} initially_visible={} foreground_accepted={}",
+                    stable.pid,
+                    stable.width,
+                    stable.height,
+                    window.was_visible,
+                    stable.foreground_accepted
+                );
+                return Ok(CodexLaunchReport {
+                    launch_mode: launch_mode.to_string(),
+                    usable_window_confirmed: true,
+                    no_sandbox,
+                    message: match (software_rendering, no_sandbox) {
+                        (false, false) => "Codex 已按常规渲染模式启动。".to_string(),
+                        (false, true) => {
+                            "Codex 已按常规渲染模式启动；此设备需要关闭 Chromium 沙箱。".to_string()
+                        }
+                        (true, false) => "Codex 已用软件渲染兼容模式启动。".to_string(),
+                        (true, true) => {
+                            "Codex 已用软件渲染兼容模式启动；此设备需要关闭 Chromium 沙箱。"
+                                .to_string()
+                        }
+                    },
+                });
             }
-            let launch_mode = portable_launch_mode(software_rendering, no_sandbox);
-            log::info!(
-                "portable Codex usable window confirmed mode={launch_mode} pid={} size={}x{} initially_visible={} foreground_accepted={}",
-                stable.pid,
-                stable.width,
-                stable.height,
-                window.was_visible,
-                stable.foreground_accepted
+            log::warn!(
+                "portable Codex startup window changed process during stability check first_pid={} followup_pid={}",
+                window.pid,
+                stable.pid
             );
-            return Ok(CodexLaunchReport {
-                launch_mode: launch_mode.to_string(),
-                usable_window_confirmed: true,
-                no_sandbox,
-                message: match (software_rendering, no_sandbox) {
-                    (false, false) => "Codex 已按常规渲染模式启动。".to_string(),
-                    (false, true) => {
-                        "Codex 已按常规渲染模式启动；此设备需要关闭 Chromium 沙箱。".to_string()
-                    }
-                    (true, false) => "Codex 已用软件渲染兼容模式启动。".to_string(),
-                    (true, true) => {
-                        "Codex 已用软件渲染兼容模式启动；此设备需要关闭 Chromium 沙箱。".to_string()
-                    }
-                },
-            });
         }
     }
 
-    let exit = child
-        .try_wait()
-        .ok()
-        .flatten()
-        .and_then(|status| status.code())
-        .map(|code| code.to_string())
-        .unwrap_or_else(|| "仍有后台进程但没有可用窗口".to_string());
+    let child_state = match child.try_wait() {
+        Ok(Some(status)) => format!(
+            "exited(code={:?},success={})",
+            status.code(),
+            status.success()
+        ),
+        Ok(None) => "child-still-running".to_string(),
+        Err(error) => format!("child-status-unavailable({error})"),
+    };
+    let root_processes_running = crate::windows_process::processes_running_for_root(root)
+        .map_err(PortableLaunchFailure::Fatal)?;
+    log::warn!(
+        "portable Codex startup has no usable window mode={} child_state={} install_root_process_tree_running={} window_timeout_ms={}",
+        portable_launch_mode(software_rendering, no_sandbox),
+        child_state,
+        root_processes_running,
+        window_timeout.as_millis()
+    );
     // The retry must not attach to a broken first attempt or leave its GPU
     // cache locks alive. Scope shutdown to this exact portable program root.
-    if crate::windows_process::processes_running_for_root(root)
-        .map_err(PortableLaunchFailure::Fatal)?
-    {
+    if root_processes_running {
         crate::windows_process::close_processes_for_root(5, root)
             .map_err(PortableLaunchFailure::Fatal)?;
     }
     Err(PortableLaunchFailure::NoUsableWindow(format!(
-        "未显示稳定的 Codex 可操作窗口（模式={}，状态={exit}）",
-        portable_launch_mode(software_rendering, no_sandbox)
+        "未显示稳定的 Codex 可操作窗口（模式={}，子进程状态={}，安装目录进程仍运行={}）",
+        portable_launch_mode(software_rendering, no_sandbox),
+        child_state,
+        root_processes_running
     )))
 }
 
@@ -5279,8 +5311,14 @@ pub fn launch_codex_with_options(
             // forced --disable-gpu here, which could surface Electron's
             // title-less Chrome_WidgetWin_0 renderer as a full-size black
             // window.  Keep software rendering as a bounded fallback.
-            match launch_portable_with_usable_window(root, &exe, &options, false, first_no_sandbox)
-            {
+            match launch_portable_with_usable_window(
+                root,
+                &exe,
+                &options,
+                false,
+                first_no_sandbox,
+                USB_COLD_START_WINDOW_TIMEOUT,
+            ) {
                 Ok(report) => return Ok(report),
                 Err(first_failure) if first_failure.should_retry_compatibility() => {
                     let first_error = first_failure.to_string();
@@ -5293,6 +5331,7 @@ pub fn launch_codex_with_options(
                         &options,
                         true,
                         true,
+                        USB_COMPATIBILITY_WINDOW_TIMEOUT,
                     )
                     .map_err(|fallback_error| {
                         EngineError::Io(format!(
@@ -5826,6 +5865,50 @@ mod tests {
         assert!(!compatibility_error.should_retry_compatibility());
         assert!(!cleanup_error.should_retry_compatibility());
         assert!(no_usable_window.should_retry_compatibility());
+    }
+
+    #[test]
+    fn usb_launch_uses_a_bounded_cold_start_grace_and_shorter_fallback() {
+        assert_eq!(super::USB_COLD_START_WINDOW_TIMEOUT.as_secs(), 45);
+        assert_eq!(super::USB_COMPATIBILITY_WINDOW_TIMEOUT.as_secs(), 20);
+        assert!(super::USB_COLD_START_WINDOW_TIMEOUT > super::USB_COMPATIBILITY_WINDOW_TIMEOUT);
+        // Worst case: both window probes, two three-second stability checks,
+        // and two process-close waits of up to ten seconds each (five seconds
+        // graceful wait plus five seconds after force-close).
+        assert!(
+            super::USB_COLD_START_WINDOW_TIMEOUT
+                + super::USB_COMPATIBILITY_WINDOW_TIMEOUT
+                + std::time::Duration::from_secs(6)
+                + std::time::Duration::from_secs(20)
+                <= std::time::Duration::from_secs(91)
+        );
+    }
+
+    #[test]
+    fn usb_launch_stability_requires_the_same_process() {
+        let first = crate::windows_process::UsableWindowReport {
+            pid: 100,
+            width: 1200,
+            height: 800,
+            was_visible: true,
+            foreground_accepted: true,
+        };
+        let same_process = crate::windows_process::UsableWindowReport {
+            pid: 100,
+            ..first.clone()
+        };
+        let replaced_process = crate::windows_process::UsableWindowReport {
+            pid: 101,
+            ..first.clone()
+        };
+        assert!(super::stable_window_reports_same_process(
+            &first,
+            &same_process
+        ));
+        assert!(!super::stable_window_reports_same_process(
+            &first,
+            &replaced_process
+        ));
     }
 
     #[cfg(windows)]

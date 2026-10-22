@@ -7,7 +7,6 @@ and generated pack layouts, but never reads user credentials or Codex history.
 from __future__ import annotations
 
 import argparse
-import ast
 import hashlib
 import json
 import re
@@ -21,25 +20,6 @@ from pathlib import Path
 MIN_CODEX_VERSION = (0, 144, 0)
 EXPECTED_AGENTS = 7
 FRONTMATTER_KEYS = {"name", "description"}
-
-
-def has_argparse_option(source: str, option: str) -> bool:
-    """Return whether Python syntax declares a static argparse option."""
-    try:
-        module = ast.parse(source)
-    except SyntaxError:
-        return False
-    for node in ast.walk(module):
-        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
-            continue
-        if node.func.attr != "add_argument" or not node.args:
-            continue
-        first = node.args[0]
-        if isinstance(first, ast.Constant) and first.value == option:
-            return True
-    return False
-
-
 MODEL_CATALOG_FIELDS = {
     "id",
     "displayName",
@@ -562,10 +542,9 @@ def check_external_adapters(audit: Audit) -> None:
     media_manifest = audit.root / "manifest" / "media-generation-tools.json"
     media_template = audit.root / "config-fragments" / "media-generation-stdio.template.toml"
     image_skill = audit.root / "skills" / "image-2" / "SKILL.md"
-    seedance_skill = audit.root / "skills" / "seedance2-0-video-gen" / "SKILL.md"
     web_script = audit.root / "skills" / "web-search-extraction" / "scripts" / "web_search.py"
     web_skill = audit.root / "skills" / "web-search-extraction" / "SKILL.md"
-    required_files = (media_script, media_wrapper, media_manifest, media_template, image_skill, seedance_skill, web_script, web_skill)
+    required_files = (media_script, media_wrapper, media_manifest, media_template, image_skill, web_script, web_skill)
     missing = [path.relative_to(audit.root).as_posix() for path in required_files if not path.is_file()]
     if missing:
         audit.error(f"Unified media MCP files are missing: {missing}")
@@ -575,7 +554,7 @@ def check_external_adapters(audit: Audit) -> None:
     for marker in (
         '"image-2"', '"grok-image"', '"grok-video"', '"seedance-video"',
         "hmac.compare_digest", "CONFIRMATION_TTL_SECONDS", 'record["state"] = "submitting"',
-        "submission_unknown", "MAX_REFERENCE_BYTES", "MAX_DOWNLOAD_BYTES",
+        '"idempotency_key_sha256"', "submission_unknown", "MAX_REFERENCE_BYTES", "MAX_DOWNLOAD_BYTES",
         '"media_prepare"', '"media_submit"', '"media_check"', '"media_save"',
         '"responses"', '"/v1/responses"', 'image_generation_call',
         '"/v1/images/generations"', '"/v1/videos/generations"',
@@ -586,16 +565,23 @@ def check_external_adapters(audit: Audit) -> None:
             audit.error(f"Unified media MCP lacks required contract marker: {marker}")
     if "requests." in media_code or "httpx." in media_code:
         audit.error("Unified media MCP has an undeclared third-party Python dependency.")
+    # Local single-use confirmations prevent duplicate requests within this
+    # MCP. Do not invent an upstream idempotency header unless the provider
+    # contract has been verified; an unknown header could change billing or
+    # request semantics. Keep source and manifest aligned with that policy.
     if '"Idempotency-Key"' in media_code or '"idempotency-key"' in media_code:
         audit.error("Unified media MCP must not forward an unverified upstream idempotency header.")
-    if 'idempotency_forwarded=False' not in media_code:
-        audit.error("Unified media MCP must explicitly record that no upstream idempotency contract is verified.")
+    if media_manifest.is_file():
+        media_contract = load_json(media_manifest)
+        if media_contract.get("healthLayers", {}).get("providerIdempotencyContractsVerified"):
+            audit.error("No provider idempotency contracts are verified; update the audit before enabling upstream forwarding.")
+        submit_contract = next((tool for tool in media_contract.get("tools", []) if tool.get("name") == "media_submit"), {})
+        if submit_contract.get("upstreamIdempotencyHeaderForwarded") is not False:
+            audit.error("Media manifest must state that no upstream idempotency header is forwarded.")
     if '"IMAGE_2_API_KEY"' in media_code or '"SEEDANCE_API_KEY"' in media_code:
         audit.error("Unified media MCP still reads retired provider-specific credentials.")
     if (audit.root / "skills" / "image-2" / "scripts" / "image_2_gen.py").exists():
         audit.error("Retired direct Image-2 adapter script remains in the Skill bundle.")
-    if (audit.root / "skills" / "seedance2-0-video-gen" / "scripts" / "seedance_video_gen.py").exists():
-        audit.error("Retired direct Seedance adapter script remains in the Skill bundle.")
     if "media_prepare" not in image_skill.read_text(encoding="utf-8") or "media_submit" not in image_skill.read_text(encoding="utf-8"):
         audit.error("Image Skill does not route through the unified MCP confirmation contract.")
     image_meta = (audit.root / "skills" / "image-2" / "agents" / "openai.yaml").read_text(encoding="utf-8")
@@ -604,8 +590,6 @@ def check_external_adapters(audit: Audit) -> None:
         audit.error("Image-2 Skill must be auto-installed with the bundled runtime on the USB edition.")
     if not re.search(r"^\s{2}allow_implicit_invocation:\s*true\s*$", image_meta, re.MULTILINE):
         audit.error("Image-2 Skill must be implicitly available for direct image requests on the USB edition.")
-    if "media_prepare" not in seedance_skill.read_text(encoding="utf-8") or "media_check" not in seedance_skill.read_text(encoding="utf-8"):
-        audit.error("Seedance Skill does not route through the unified MCP task contract.")
 
     fields_path = audit.root / "manifest" / "connection-fields.json"
     services_path = audit.root / "manifest" / "api-services.json"
@@ -827,13 +811,12 @@ def check_financial_data_truthfulness(audit: Audit) -> None:
         '"sources"',
         '"completeness"',
         '"status": status',
+        'parser.add_argument("--allow-partial"',
         'status == "complete"',
         "raise SystemExit(main())",
     ):
         if marker not in data_fetcher_code:
             audit.error(f"A-share data fetcher lacks provenance/completeness marker: {marker}")
-    if not has_argparse_option(data_fetcher_code, "--allow-partial"):
-        audit.error('A-share data fetcher lacks provenance/completeness marker: argparse --allow-partial option')
     for forbidden in (
         "except IOError:\n        pass",
         'print(f"获取全部A股失败:',

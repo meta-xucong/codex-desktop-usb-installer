@@ -213,8 +213,6 @@ Repeat for each day, ensuring:
 - Transportation details
 - Estimated costs
 - Booking notes
-- Include at least one concrete alternative for each travel day or a clearly mapped trip-wide fallback for likely disruptions (weather, closure, fatigue, or delay). Name the substitute activity/route and explain its schedule, transport, and budget effect; a generic instruction to "adjust the budget" is not an alternative plan.
-- For each alternative, state what disruption triggers it and give a usable replacement arrangement, including the transport and schedule change plus the time or budget effect. If those details are unknown, mark them for confirmation instead of presenting a generic adjustment as a complete fallback.
 
 **B. Budget Breakdown**
 
@@ -434,8 +432,6 @@ expense = {
 
 add_expense(trip_id, expense)
 ```
-
-`expense["amount"]` must be a finite non-negative number. Negative values, booleans, strings, and non-finite numbers are rejected without changing the travel database.
 
 View budget status:
 

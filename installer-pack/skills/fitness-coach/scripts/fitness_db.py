@@ -6,14 +6,9 @@ Manages user fitness profiles, training programs, and workout logs.
 """
 
 import json
-import math
 import os
-import tempfile
-import uuid
-from functools import wraps
 from pathlib import Path
 from datetime import datetime, timedelta
-from threading import RLock
 from typing import Dict, Any, List, Optional
 
 DB_DIR = Path(os.environ.get("CODEX_DATA_DIR", Path.cwd() / "codex-data")) / "fitness_coach"
@@ -21,21 +16,7 @@ PROFILE_FILE = DB_DIR / "profile.json"
 PROGRAMS_FILE = DB_DIR / "programs.json"
 WORKOUTS_FILE = DB_DIR / "workouts.json"
 
-# Serializes in-process database transactions. This is a thread lock, not a
-# cross-process file lock; callers that mutate files use it around the complete
-# load-modify-save sequence rather than only around the final atomic replace.
-_DATABASE_TRANSACTION_LOCK = RLock()
 
-
-def _transactional_mutation(function):
-    @wraps(function)
-    def locked(*args, **kwargs):
-        with _DATABASE_TRANSACTION_LOCK:
-            return function(*args, **kwargs)
-    return locked
-
-
-@_transactional_mutation
 def ensure_db_files() -> None:
     """Ensure all database files exist."""
     DB_DIR.mkdir(parents=True, exist_ok=True)
@@ -79,33 +60,15 @@ def load_json(file_path: Path) -> Dict[str, Any]:
     try:
         with open(file_path, 'r') as f:
             return json.load(f)
-    except json.JSONDecodeError as exc:
-        raise ValueError(
-            f"Fitness data file '{file_path.name}' contains invalid JSON; refusing to continue."
-        ) from exc
-    except FileNotFoundError:
+    except (json.JSONDecodeError, FileNotFoundError):
         return {}
 
 
-@_transactional_mutation
 def save_json(file_path: Path, data: Dict[str, Any]) -> None:
-    """Atomically save JSON without truncating the current copy on failure."""
+    """Save JSON to file."""
     ensure_db_files()
-    serialized = json.dumps(data, indent=2)
-    temporary_path = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", dir=file_path.parent,
-            prefix=f".{file_path.name}.", suffix=".tmp", delete=False,
-        ) as handle:
-            temporary_path = Path(handle.name)
-            handle.write(serialized)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary_path, file_path)
-    finally:
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
+    with open(file_path, 'w') as f:
+        json.dump(data, f, indent=2)
 
 
 # ============================================================================
@@ -123,7 +86,6 @@ def get_profile() -> Dict[str, Any]:
     return load_json(PROFILE_FILE)
 
 
-@_transactional_mutation
 def save_profile(profile: Dict[str, Any]) -> None:
     """Save user fitness profile."""
     data = load_json(PROFILE_FILE)
@@ -133,7 +95,6 @@ def save_profile(profile: Dict[str, Any]) -> None:
     save_json(PROFILE_FILE, data)
 
 
-@_transactional_mutation
 def update_profile_field(key: str, value: Any) -> None:
     """Update a specific profile field."""
     profile = load_json(PROFILE_FILE)
@@ -142,7 +103,6 @@ def update_profile_field(key: str, value: Any) -> None:
     save_json(PROFILE_FILE, profile)
 
 
-@_transactional_mutation
 def add_goal(goal: str) -> None:
     """Add a fitness goal."""
     profile = load_json(PROFILE_FILE)
@@ -153,7 +113,6 @@ def add_goal(goal: str) -> None:
     save_json(PROFILE_FILE, profile)
 
 
-@_transactional_mutation
 def add_equipment(equipment: str) -> None:
     """Add available equipment."""
     profile = load_json(PROFILE_FILE)
@@ -164,7 +123,6 @@ def add_equipment(equipment: str) -> None:
     save_json(PROFILE_FILE, profile)
 
 
-@_transactional_mutation
 def add_limitation(limitation: str) -> None:
     """Add a physical limitation."""
     profile = load_json(PROFILE_FILE)
@@ -199,7 +157,6 @@ def get_programs(status: str = "all") -> Dict[str, List[Dict]]:
     return {}
 
 
-@_transactional_mutation
 def add_program(program: Dict[str, Any], status: str = "active") -> str:
     """
     Add a new training program.
@@ -213,7 +170,7 @@ def add_program(program: Dict[str, Any], status: str = "active") -> str:
     """
     programs = load_json(PROGRAMS_FILE)
     
-    program_id = uuid.uuid4().hex
+    program_id = str(int(datetime.now().timestamp()))
     program["id"] = program_id
     program["created_at"] = datetime.now().isoformat()
     program["status"] = status
@@ -243,7 +200,6 @@ def get_program_by_id(program_id: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-@_transactional_mutation
 def update_program(program_id: str, updates: Dict[str, Any]) -> bool:
     """Update a program."""
     programs = load_json(PROGRAMS_FILE)
@@ -258,7 +214,6 @@ def update_program(program_id: str, updates: Dict[str, Any]) -> bool:
     return False
 
 
-@_transactional_mutation
 def complete_program(program_id: str) -> bool:
     """Mark an active program as completed."""
     programs = load_json(PROGRAMS_FILE)
@@ -274,7 +229,6 @@ def complete_program(program_id: str) -> bool:
     return False
 
 
-@_transactional_mutation
 def delete_program(program_id: str) -> bool:
     """Delete a program."""
     programs = load_json(PROGRAMS_FILE)
@@ -288,7 +242,6 @@ def delete_program(program_id: str) -> bool:
     return False
 
 
-@_transactional_mutation
 def substitute_exercise(program_id: str, old_exercise: str, new_exercise: str, 
                         reason: str = "") -> bool:
     """Substitute an exercise in a program."""
@@ -312,7 +265,6 @@ def substitute_exercise(program_id: str, old_exercise: str, new_exercise: str,
 # WORKOUT LOGGING
 # ============================================================================
 
-@_transactional_mutation
 def log_workout(workout: Dict[str, Any]) -> str:
     """
     Log a completed workout.
@@ -320,97 +272,24 @@ def log_workout(workout: Dict[str, Any]) -> str:
     Returns:
         Workout log ID
     """
-    new_volume = _validate_workout(workout, "new workout")
     workouts = load_json(WORKOUTS_FILE)
-    existing_workouts = workouts.get("workouts", [])
-    if not isinstance(existing_workouts, list):
-        raise ValueError("Fitness workout database must contain a workout list.")
-    for index, existing in enumerate(existing_workouts):
-        _validate_workout(existing, f"stored workout {index}")
-
-    # Check whether the persisted history would remain safe for aggregate reports.
-    existing_volumes = [
-        _validate_workout(item, f"stored workout {index}")
-        for index, item in enumerate(existing_workouts)
-    ]
-    _finite_nonnegative_sum(
-        existing_volumes + [new_volume],
-        "workout history volume",
-    )
-
-    log_id = uuid.uuid4().hex
-    stored_workout = dict(workout)
-    stored_workout["log_id"] = log_id
-    stored_workout["logged_at"] = datetime.now().isoformat()
-
-    workouts.setdefault("workouts", []).append(stored_workout)
+    
+    log_id = str(int(datetime.now().timestamp()))
+    workout["log_id"] = log_id
+    workout["logged_at"] = datetime.now().isoformat()
+    
+    if "workouts" not in workouts:
+        workouts["workouts"] = []
+    
+    workouts["workouts"].append(workout)
     save_json(WORKOUTS_FILE, workouts)
     return log_id
-
-
-def _finite_nonnegative_sum(values: List[float], label: str) -> float:
-    total = 0.0
-    for value in values:
-        total += value
-        if not math.isfinite(total):
-            raise ValueError(f"{label} must remain finite.")
-    return total
-
-
-def _validate_workout(workout: Any, label: str) -> float:
-    """Validate logged set values and return this workout's finite volume."""
-    if not isinstance(workout, dict):
-        raise ValueError(f"{label} must be an object.")
-    exercises = workout.get("exercises", [])
-    if not isinstance(exercises, list):
-        raise ValueError(f"{label} exercises must be a list.")
-
-    total_volume = 0.0
-    for exercise_index, exercise in enumerate(exercises):
-        if not isinstance(exercise, dict):
-            raise ValueError(f"{label} exercise {exercise_index} must be an object.")
-        sets = exercise.get("sets", [])
-        if not isinstance(sets, list):
-            raise ValueError(f"{label} exercise {exercise_index} sets must be a list.")
-        for set_index, set_record in enumerate(sets):
-            set_label = f"{label} exercise {exercise_index} set {set_index}"
-            if not isinstance(set_record, dict) or "weight" not in set_record or "reps" not in set_record:
-                raise ValueError(f"{set_label} must include numeric weight and repetitions.")
-            weight = set_record["weight"]
-            reps = set_record["reps"]
-            if isinstance(weight, bool) or not isinstance(weight, (int, float)):
-                raise ValueError(f"{set_label} weight must be a finite non-negative number.")
-            if isinstance(reps, bool) or not isinstance(reps, (int, float)):
-                raise ValueError(f"{set_label} repetitions must be a non-negative integer.")
-            try:
-                weight = float(weight)
-                reps_number = float(reps)
-            except (OverflowError, TypeError, ValueError) as exc:
-                raise ValueError(f"{set_label} contains an out-of-range number.") from exc
-            if not math.isfinite(weight) or weight < 0:
-                raise ValueError(f"{set_label} weight must be a finite non-negative number.")
-            if not math.isfinite(reps_number) or reps_number < 0 or not reps_number.is_integer():
-                raise ValueError(f"{set_label} repetitions must be a non-negative integer.")
-            volume = weight * reps_number
-            estimated_1rm = weight if reps_number == 1 else weight * (1 + reps_number / 30)
-            if not math.isfinite(volume) or not math.isfinite(estimated_1rm):
-                raise ValueError(f"{set_label} produces a non-finite training metric.")
-            total_volume += volume
-            if not math.isfinite(total_volume):
-                raise ValueError(f"{label} training volume must remain finite.")
-    return total_volume
 
 
 def get_workouts(program_id: str = None, limit: int = None) -> List[Dict[str, Any]]:
     """Get workout logs, optionally filtered by program."""
     workouts = load_json(WORKOUTS_FILE)
     all_workouts = workouts.get("workouts", [])
-    if not isinstance(all_workouts, list):
-        raise ValueError("Fitness workout database must contain a workout list.")
-    history_volumes = []
-    for index, workout in enumerate(all_workouts):
-        history_volumes.append(_validate_workout(workout, f"stored workout {index}"))
-    _finite_nonnegative_sum(history_volumes, "workout history volume")
     
     if program_id:
         all_workouts = [w for w in all_workouts if w.get("program_id") == program_id]
@@ -426,11 +305,7 @@ def get_workouts(program_id: str = None, limit: int = None) -> List[Dict[str, An
 def get_workout_by_id(log_id: str) -> Optional[Dict[str, Any]]:
     """Get a specific workout log."""
     workouts = load_json(WORKOUTS_FILE)
-    all_workouts = workouts.get("workouts", [])
-    if not isinstance(all_workouts, list):
-        raise ValueError("Fitness workout database must contain a workout list.")
-    for index, workout in enumerate(all_workouts):
-        _validate_workout(workout, f"stored workout {index}")
+    for workout in workouts.get("workouts", []):
         if workout.get("log_id") == log_id:
             return workout
     return None
@@ -555,27 +430,11 @@ def get_personal_records() -> Dict[str, Dict[str, Any]]:
 
 def calculate_1rm(weight: float, reps: int) -> float:
     """Calculate estimated 1-rep max using Epley formula."""
-    if isinstance(weight, bool) or not isinstance(weight, (int, float)):
-        raise ValueError("weight must be a finite non-negative number.")
-    try:
-        weight = float(weight)
-        reps_number = float(reps)
-    except (OverflowError, TypeError, ValueError) as exc:
-        raise ValueError("weight and reps must be finite non-negative numbers.") from exc
-    if isinstance(reps, bool) or not isinstance(reps, (int, float)):
-        raise ValueError("reps must be a non-negative integer.")
-    if (not math.isfinite(weight) or weight < 0 or not math.isfinite(reps_number)
-            or reps_number < 0 or not reps_number.is_integer()):
-        raise ValueError("weight and reps must be finite and non-negative.")
-    reps = int(reps_number)
     if reps == 1:
         return weight
     if reps == 0 or weight == 0:
         return 0
-    estimate = weight * (1 + reps / 30)
-    if not math.isfinite(estimate):
-        raise ValueError("estimated 1-rep max must remain finite.")
-    return estimate
+    return weight * (1 + reps / 30)
 
 
 # ============================================================================
@@ -639,7 +498,6 @@ def export_all() -> Dict[str, Any]:
     }
 
 
-@_transactional_mutation
 def reset_all() -> None:
     """Reset all data (use with caution)."""
     for file_path in [PROFILE_FILE, PROGRAMS_FILE, WORKOUTS_FILE]:

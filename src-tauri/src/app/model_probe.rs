@@ -52,6 +52,11 @@ pub struct ProbeClient<'a> {
     requests_started: AtomicUsize,
     timeouts: ProbeTimeouts,
 }
+
+fn should_retry_connect(error: ProbeError, retry_used: bool) -> bool {
+    error == ProbeError::Connect && !retry_used
+}
+
 impl<'a> ProbeClient<'a> {
     pub fn new(
         base: &str,
@@ -147,7 +152,9 @@ impl<'a> ProbeClient<'a> {
             let mut operation = Box::pin(async {
                 self.requests_started.fetch_add(1, Ordering::AcqRel);
                 let mut response = request.send().await.map_err(|e| {
-                    if e.is_timeout() {
+                    if e.is_connect() {
+                        ProbeError::Connect
+                    } else if e.is_timeout() {
                         ProbeError::Timeout
                     } else {
                         ProbeError::Network
@@ -183,6 +190,10 @@ impl<'a> ProbeClient<'a> {
                         if is_unsupported_reasoning_effort(status, &body) {
                             return Err(ProbeError::UnsupportedEffort);
                         }
+                        if is_unsupported_store(status, &body) {
+                            return Err(ProbeError::UnsupportedStore);
+                        }
+                        return Err(ProbeError::Http400);
                     }
                     return Err(ProbeError::Http);
                 }
@@ -332,16 +343,14 @@ impl<'a> ProbeClient<'a> {
         model: &str,
         token: &str,
         previous: Option<&str>,
+        store: bool,
     ) -> Result<Value, ProbeError> {
         let input = if previous.is_some() {
             "Repeat the original token exactly, with no other text.".into()
         } else {
             format!("Remember this token for later turns. Reply exactly {token}")
         };
-        let mut body = json!({"model":model,"input":input,"stream":false,"store":true});
-        if let Some(id) = previous {
-            body["previous_response_id"] = json!(id);
-        }
+        let body = text_probe_request_body(model, &input, previous, store);
         let response = self.response(model, body, "text").await?;
         if let Err(error) = require_text(&response, token) {
             let mut diag = self.diagnostic("text", Some(model));
@@ -355,7 +364,7 @@ impl<'a> ProbeClient<'a> {
     /// Send one bounded text challenge and require an exact echo. This is the
     /// only generation request used by the selective catalog quick test.
     pub async fn quick_text(&self, model: &str, token: &str) -> Result<(), ProbeError> {
-        self.text(model, token, None).await.map(|_| ())
+        self.text(model, token, None, false).await.map(|_| ())
     }
     /// Send one bounded text challenge with an explicit Codex reasoning effort.
     /// HTTP 400 is classified as a route rejection; all other failures remain unknown.
@@ -366,8 +375,22 @@ impl<'a> ProbeClient<'a> {
         effort: &str,
     ) -> Result<(), ProbeError> {
         let body = reasoning_effort_request_body(model, token, effort);
-        let response = self.response(model, body, "reasoning-effort").await?;
-        require_text(&response, token)
+        // This probe answers whether the route accepts the requested effort.
+        // A completed response for the requested model proves that; requiring
+        // the model to echo a synthetic challenge incorrectly marks valid
+        // reasoning routes as unknown when their output wording differs.
+        let mut connect_retry_used = false;
+        loop {
+            match self.response(model, body.clone(), "reasoning-effort").await {
+                Err(error) if should_retry_connect(error, connect_retry_used) => {
+                    connect_retry_used = true;
+                    self.check()?;
+                    tokio::time::sleep(Duration::from_millis(120)).await;
+                    self.check()?;
+                }
+                result => return result.map(|_| ()),
+            }
+        }
     }
     async fn tool_start(
         &self,
@@ -468,7 +491,7 @@ impl<'a> ProbeClient<'a> {
         };
         let token = format!("usb{}", uuid::Uuid::new_v4().simple());
         let id = model.model_id.clone();
-        let first = match self.text(&id, &token, None).await {
+        let first = match self.text(&id, &token, None, true).await {
             Ok(value) => {
                 model.checks.text = CapabilityState::Verified;
                 value
@@ -537,7 +560,7 @@ impl<'a> ProbeClient<'a> {
                     return;
                 }
             };
-            match self.text(&id, &token, Some(prior)).await {
+            match self.text(&id, &token, Some(prior), true).await {
                 Ok(value) => {
                     if !ids.insert(response_id(&value).unwrap_or_default().into()) {
                         finish_error(
@@ -570,6 +593,14 @@ fn reasoning_effort_request_body(model: &str, token: &str, effort: &str) -> Valu
         "max_output_tokens": 1024,
         "reasoning": {"effort": effort}
     })
+}
+
+fn text_probe_request_body(model: &str, input: &str, previous: Option<&str>, store: bool) -> Value {
+    let mut body = json!({"model":model,"input":input,"stream":false,"store":store});
+    if let Some(id) = previous {
+        body["previous_response_id"] = json!(id);
+    }
+    body
 }
 
 fn is_unsupported_reasoning_effort(status: u16, body: &[u8]) -> bool {
@@ -613,6 +644,29 @@ fn is_unsupported_reasoning_effort(status: u16, body: &[u8]) -> bool {
                     || text.contains("does not support")
             });
     effort_reference && explicitly_unsupported
+}
+
+fn is_unsupported_store(status: u16, body: &[u8]) -> bool {
+    if status != 400 || body.len() > REASONING_ERROR_BODY_LIMIT {
+        return false;
+    }
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return false;
+    };
+    let error = value.get("error").unwrap_or(&value);
+    let param = error
+        .get("param")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    param == "store"
+        || message.contains("store=true is not supported")
+        || message.contains("store is not supported")
 }
 
 fn finish_error(
@@ -1065,6 +1119,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_a_pre_request_connection_failure_gets_one_automatic_retry() {
+        assert!(should_retry_connect(ProbeError::Connect, false));
+        assert!(!should_retry_connect(ProbeError::Connect, true));
+        for ambiguous_or_terminal in [
+            ProbeError::Network,
+            ProbeError::Timeout,
+            ProbeError::Unauthorized,
+            ProbeError::Http,
+            ProbeError::Http400,
+            ProbeError::Incomplete,
+        ] {
+            assert!(!should_retry_connect(ambiguous_or_terminal, false));
+        }
+    }
+
+    #[test]
     fn reasoning_effort_request_is_explicit_and_output_bounded() {
         let body = reasoning_effort_request_body("vendor/model", "challenge", "high");
         assert_eq!(body["model"], "vendor/model");
@@ -1073,6 +1143,38 @@ mod tests {
         assert_eq!(body["store"], false);
         assert_eq!(body["stream"], false);
         assert!(body["input"].as_str().unwrap().contains("challenge"));
+    }
+
+    #[test]
+    fn one_shot_connectivity_request_is_stateless_but_full_probe_keeps_multiturn_storage() {
+        let quick = text_probe_request_body("vendor/model", "challenge", None, false);
+        assert_eq!(quick["store"], false);
+        assert!(quick.get("previous_response_id").is_none());
+
+        let conversation =
+            text_probe_request_body("vendor/model", "follow-up", Some("resp-1"), true);
+        assert_eq!(conversation["store"], true);
+        assert_eq!(conversation["previous_response_id"], "resp-1");
+    }
+
+    #[test]
+    fn unsupported_store_is_classified_without_retaining_upstream_error_text() {
+        assert!(is_unsupported_store(
+            400,
+            br#"{"error":{"message":"store=true is not supported: this service does not retain responses, set store to false"}}"#
+        ));
+        assert!(is_unsupported_store(
+            400,
+            br#"{"error":{"param":"store","message":"unsupported parameter"}}"#
+        ));
+        assert!(!is_unsupported_store(
+            400,
+            br#"{"error":{"message":"invalid API key"}}"#
+        ));
+        assert!(!is_unsupported_store(
+            401,
+            br#"{"error":{"param":"store","message":"unsupported parameter"}}"#
+        ));
     }
 
     #[test]
@@ -1162,7 +1264,7 @@ mod tests {
                 "id":"resp-fixture",
                 "model":"vendor/model",
                 "status":"completed",
-                "output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"challenge"}]}]
+                "output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"A completed response is enough to confirm that the route accepted this effort."}]}]
             })).unwrap();
             write!(stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -1195,6 +1297,36 @@ mod tests {
         assert_eq!(body["reasoning"]["effort"], "high");
         assert_eq!(body["max_output_tokens"], 1024);
         assert_eq!(body["store"], false);
+    }
+
+    #[tokio::test]
+    async fn reasoning_effort_probe_does_not_retry_an_ambiguous_connection_timeout() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+
+        let client = ProbeClient::with_timeouts(
+            &format!("http://{address}/v1/"),
+            "fixture-key",
+            Arc::new(AtomicBool::new(false)),
+            Instant::now() + Duration::from_secs(3),
+            ProbeTimeouts::new(Duration::from_secs(1), Duration::from_secs(1)),
+        )
+        .unwrap();
+        let error = client
+            .quick_text_with_effort("vendor/model", "challenge", "high")
+            .await
+            .expect_err("closed local port must remain unavailable");
+
+        match error {
+            ProbeError::Connect => assert_eq!(client.requests_started(), 2),
+            ProbeError::Timeout | ProbeError::Network => {
+                assert_eq!(client.requests_started(), 1)
+            }
+            other => panic!("unexpected closed-port failure: {other:?}"),
+        }
     }
 
     fn tool_response() -> Value {

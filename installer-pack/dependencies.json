@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
   "id": "codex-starter",
-  "version": "1.5.3",
+  "version": "1.5.4",
   "policy": "No secrets, caches, history, databases, drafts or user content.",
   "system": [
     {
@@ -100,21 +100,6 @@
       ]
     },
     {
-      "id": "config.MEDIA_MINIMAX_VIDEO_MODEL",
-      "kind": "configuration",
-      "required": true,
-      "autoInstallable": false,
-      "healthCheck": "Future verified MiniMax adapter explicitly enables this provider; setting the model name alone must remain insufficient",
-      "failureMessage": "MiniMax provider is hard-disabled until a protocol-compatible adapter and separate official credential are implemented; a model name alone cannot enable it.",
-      "dependentCapabilities": [
-        "MiniMax 视频生成",
-        "异步任务查询"
-      ],
-      "dependentSkills": [
-        "minimax-video-gen"
-      ]
-    },
-    {
       "id": "connection.dashscope-base-url",
       "kind": "connection",
       "required": true,
@@ -175,9 +160,7 @@
         "统一 MCP 两阶段确认"
       ],
       "dependentSkills": [
-        "image-2",
-        "minimax-video-gen",
-        "seedance2-0-video-gen"
+        "image-2"
       ]
     },
     {
@@ -245,7 +228,7 @@
       "required": true,
       "autoInstallable": true,
       "transport": "stdio",
-      "healthCheck": "media_generation returns strict UTF-8 tools/list with media_refresh_models, media_capabilities, media_prepare, media_submit, media_check and media_save",
+      "healthCheck": "media_generation strict UTF-8 tools/list includes media_refresh_models, media_capabilities, media_prepare, media_submit, media_check and media_save",
       "failureMessage": "统一媒体 MCP 未安装、未启用或不可用时，不提交外部计费请求。",
       "dependentCapabilities": [
         "异步文生图",
@@ -254,8 +237,6 @@
       ],
       "dependentSkills": [
         "image-2",
-        "minimax-video-gen",
-        "seedance2-0-video-gen",
         "wechat-article-creator"
       ],
       "dependentAgents": [
@@ -598,6 +579,33 @@
       ]
     },
     {
+      "id": "runtime.python",
+      "kind": "runtime",
+      "required": true,
+      "autoInstallable": true,
+      "minVersion": "3.12",
+      "lockedVersion": "3.12.10",
+      "abi": "cp312",
+      "platform": "win_amd64",
+      "healthCheck": "bundled CPython 3.12; scripts/compile_prompt.py --help",
+      "failureMessage": "需要随 U 盘安装的 Python 3.12 运行时。",
+      "pythonPackages": [
+        {
+          "name": "requests",
+          "version": "2.34.2",
+          "importName": "requests"
+        }
+      ],
+      "dependentCapabilities": [
+        "Grok 视频提示词编译",
+        "视频能力风险审计",
+        "生成结果验收清单"
+      ],
+      "dependentSkills": [
+        "grok-video-prompt-compiler"
+      ]
+    },
+    {
       "id": "runtime.python312",
       "kind": "runtime",
       "required": true,
@@ -627,7 +635,6 @@
         "meal-planner",
         "pdf-processing-toolkit",
         "powerpoint-pptx",
-        "seedance2-0-video-gen",
         "travel-planner",
         "venture-analysis",
         "wealth-allocation",
@@ -1023,20 +1030,6 @@
       ]
     },
     {
-      "id": "skill.seedance2-0-video-gen",
-      "kind": "skill",
-      "name": "seedance2-0-video-gen",
-      "required": false,
-      "autoInstallable": true,
-      "healthCheck": "skills/seedance2-0-video-gen/SKILL.md exists",
-      "dependentCapabilities": [
-        "新媒体内容架构与创意生产，覆盖公众号、小红书、图片提示词、视频提示词和脚本。"
-      ],
-      "dependentAgents": [
-        "content"
-      ]
-    },
-    {
       "id": "skill.traffic-hunter",
       "kind": "skill",
       "name": "traffic-hunter",
@@ -1228,23 +1221,6 @@
         "python-env-setup",
         "safe-disk-operations"
       ]
-    },
-    {
-      "id": "credential.minimax-api-key",
-      "kind": "credential",
-      "name": "credential.minimax-api-key",
-      "required": true,
-      "autoInstallable": false,
-      "secret": true,
-      "healthCheck": "MINIMAX_API_KEY configured only for a future verified official API adapter",
-      "failureMessage": "当前没有 MiniMax 官方账号或 API Key；签名 U 盘设备 Key 不能替代。",
-      "dependentCapabilities": [
-        "MiniMax 官方视频 API"
-      ],
-      "dependentSkills": [
-        "minimax-video-gen"
-      ],
-      "dependentAgents": []
     }
   ],
   "skills": [
@@ -1673,6 +1649,30 @@
       "notes": "筛选器只暴露 AkShare 排行接口实际读取的基金类型及 1/3 年收益字段，接口失败非零退出。配置构建器要求带来源的用户审阅模型，只换算金额并保留 fund_type_notes 原标签；定投只比较显式收益场景。风险评估器删除硬编码波动率、风险评级、适配人群和调仓/止损建议，要求完整来源、时点与场景参数。"
     },
     {
+      "id": "grok-video-prompt-compiler",
+      "path": "skills/grok-video-prompt-compiler",
+      "status": "requires-runtime",
+      "afterRemediationStatus": "auto-installable-runtime",
+      "installByDefault": true,
+      "enableWhen": [
+        "skill-installed",
+        "runtime-healthy"
+      ],
+      "dependencyTypes": [
+        "runtime"
+      ],
+      "dependencies": [
+        "runtime.python"
+      ],
+      "dependentCapabilities": [
+        "Grok 视频提示词编译",
+        "视频能力风险审计",
+        "生成结果验收清单"
+      ],
+      "healthCheck": "frontmatter, package closure, compiler help, and prompt safety/contract tests",
+      "notes": "随包预装的离线提示词编译工作流；参考图上传依赖随包 Python 运行时中的 requests 2.34.2（已列入依赖并锁定到离线 wheelhouse）；媒体 MCP 和 API 凭据只在实际生成时需要，付费任务仍须逐次获得用户明确确认。"
+    },
+    {
       "id": "growth-analyst",
       "path": "skills/growth-analyst",
       "status": "ready",
@@ -1786,7 +1786,7 @@
         "信息图与场景设计"
       ],
       "healthCheck": "frontmatter, pack-copy, and dependency health-check path",
-      "notes": "提示词生成不依赖图像服务；用户只要提示词时仅输出提示词。用户要求实际生成或编辑图片时，U 盘默认路由到统一 media_generation MCP；只有用户在当前对话明确指定其他方式时才改用该方式。"
+      "notes": "提示词生成不依赖图像服务；用户明确要求实际图片时优先使用 Codex 原生图像能力，外部 image-2 仅显式调用。"
     },
     {
       "id": "industry-analysis",
@@ -1952,36 +1952,6 @@
       ],
       "healthCheck": "frontmatter, pack-copy, and dependency health-check path",
       "notes": ""
-    },
-    {
-      "id": "minimax-video-gen",
-      "path": "skills/minimax-video-gen",
-      "status": "requires-credential",
-      "afterRemediationStatus": "guided-config",
-      "installByDefault": false,
-      "enableWhen": [
-        "skill-installed",
-        "mcp.media-generation.ready",
-        "future-verified-minimax-adapter",
-        "credential.minimax-api-key",
-        "user-approved-paid-task"
-      ],
-      "dependencyTypes": [
-        "configuration",
-        "credential",
-        "mcp"
-      ],
-      "dependencies": [
-        "mcp.media-generation",
-        "config.MEDIA_MINIMAX_VIDEO_MODEL",
-        "credential.minimax-api-key"
-      ],
-      "dependentCapabilities": [
-        "MiniMax 视频生成",
-        "异步任务查询"
-      ],
-      "healthCheck": "MCP reports MiniMax unavailable and rejects prepare before network, even when MEDIA_MINIMAX_VIDEO_MODEL is injected",
-      "notes": "Skill is limited to availability guidance and prompt drafting. The official API uses separate credentials, v2 endpoints and H3 multimodal contract; no adapter/account is configured. Setting the shared model field cannot enable generation; no direct official API or provider fallback."
     },
     {
       "id": "multi-search-engine",
@@ -2170,36 +2140,6 @@
       ],
       "healthCheck": "frontmatter, pack-copy, and dependency health-check path",
       "notes": "已移除与磁盘安全无关的财务计算触发器和一律拒绝只读检查的旧策略；当前流程与 Codex 的精确授权、只读预检、可恢复优先和用户改动保护原则一致。"
-    },
-    {
-      "id": "seedance2-0-video-gen",
-      "path": "skills/seedance2-0-video-gen",
-      "status": "requires-credential",
-      "afterRemediationStatus": "guided-config",
-      "installByDefault": false,
-      "enableWhen": [
-        "skill-installed",
-        "runtime.python312",
-        "mcp.media-generation",
-        "signed-usb-license.device-api-key"
-      ],
-      "dependencyTypes": [
-        "credential",
-        "mcp",
-        "runtime"
-      ],
-      "dependencies": [
-        "runtime.python312",
-        "mcp.media-generation",
-        "credential.usb-license-404token"
-      ],
-      "dependentCapabilities": [
-        "视频生成",
-        "媒体顺序保护",
-        "统一 MCP 确认与任务查询"
-      ],
-      "healthCheck": "frontmatter, pack-copy, and dependency health-check path",
-      "notes": "通过统一 media_generation MCP 调用 Seedance 路由；共享设备 Key 来自签名 U 盘授权，Seedance 模型和路由 ID 仍按服务方实际配置。当前参考媒体需为服务方可访问的 HTTPS URL，按输入顺序保留。不猜测价格、预扣积分、退款规则或链接期限。"
     },
     {
       "id": "self-improvement-agent",
@@ -2901,8 +2841,7 @@
       "optionalSkills": [
         "wechat-article-creator",
         "web-search-extraction",
-        "image-2",
-        "seedance2-0-video-gen"
+        "image-2"
       ],
       "blockedSkills": [],
       "connectionDependencies": [
@@ -2981,17 +2920,6 @@
           "required": false,
           "autoInstallable": true,
           "healthCheck": "skills/image-2/SKILL.md exists",
-          "dependentCapabilities": [
-            "新媒体内容架构与创意生产，覆盖公众号、小红书、图片提示词、视频提示词和脚本。"
-          ]
-        },
-        {
-          "id": "skill.seedance2-0-video-gen",
-          "kind": "skill",
-          "name": "seedance2-0-video-gen",
-          "required": false,
-          "autoInstallable": true,
-          "healthCheck": "skills/seedance2-0-video-gen/SKILL.md exists",
           "dependentCapabilities": [
             "新媒体内容架构与创意生产，覆盖公众号、小红书、图片提示词、视频提示词和脚本。"
           ]

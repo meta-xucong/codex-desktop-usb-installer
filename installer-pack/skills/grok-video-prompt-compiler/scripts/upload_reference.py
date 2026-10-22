@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -20,25 +19,6 @@ UPLOAD_ENDPOINT = "https://uguu.se/upload.php"
 
 class UploadError(ValueError):
     pass
-
-
-def _reject_output_overwrite(output_path: Path, input_path: Path) -> None:
-    """Prevent the JSON report from replacing the reference image."""
-    try:
-        resolved_output = output_path.resolve()
-        resolved_input = input_path.resolve()
-    except (OSError, RuntimeError) as exc:
-        raise UploadError(f"cannot verify output/input paths safely: {exc}") from exc
-    if resolved_output == resolved_input:
-        raise UploadError("output path must not overwrite the input reference image")
-    try:
-        if os.path.samefile(resolved_output, resolved_input):
-            raise UploadError("output path must not overwrite the input reference image")
-    except FileNotFoundError:
-        # The output may not exist yet; direct aliases were checked above.
-        pass
-    except OSError as exc:
-        raise UploadError(f"cannot verify output/input file identity safely: {exc}") from exc
 
 
 def detect_mime(data: bytes) -> str:
@@ -78,14 +58,6 @@ def inspect_local(path: Path) -> dict[str, Any]:
 
 def _content_type(value: str | None) -> str:
     return (value or "").split(";", 1)[0].strip().lower()
-
-
-def _require_absolute_https_url(value: Any, label: str) -> None:
-    if not isinstance(value, str):
-        raise UploadError(f"reference {label} must be an absolute HTTPS URL")
-    parsed = urlparse(value)
-    if parsed.scheme.lower() != "https" or not parsed.netloc:
-        raise UploadError(f"reference {label} must be an absolute HTTPS URL")
 
 
 def parse_uguu_response(payload: Any) -> str:
@@ -145,12 +117,6 @@ def verify_remote(url: str, local: dict[str, Any], timeout: float = 60.0) -> dic
     session.trust_env = False
     try:
         with session.get(url, headers=headers, timeout=timeout, allow_redirects=True, stream=True) as response:
-            history = getattr(response, "history", None)
-            if not isinstance(history, (list, tuple)):
-                raise UploadError("reference URL response has invalid redirect history")
-            for index, hop in enumerate(history, start=1):
-                _require_absolute_https_url(getattr(hop, "url", None), f"redirect hop {index}")
-            _require_absolute_https_url(getattr(response, "url", None), "final response URL")
             if response.status_code < 200 or response.status_code >= 300:
                 raise UploadError(f"reference URL verification failed with HTTP {response.status_code}")
             mime = _content_type(response.headers.get("content-type"))
@@ -163,8 +129,6 @@ def verify_remote(url: str, local: dict[str, Any], timeout: float = 60.0) -> dic
                 if total > MAX_BYTES:
                     raise UploadError(f"reference URL exceeds {MAX_BYTES} bytes")
                 chunks.append(chunk)
-    except UploadError:
-        raise
     except requests.RequestException as exc:
         raise UploadError(f"reference URL request failed: {type(exc).__name__}") from exc
     remote_data = b"".join(chunks)
@@ -193,8 +157,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
     try:
-        if args.output:
-            _reject_output_overwrite(args.output, args.input)
         report = upload_and_verify(args.input)
         encoded = json.dumps(report, ensure_ascii=False, indent=2)
         if args.output:

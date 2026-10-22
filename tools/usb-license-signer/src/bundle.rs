@@ -292,7 +292,11 @@ fn validate_usb_manifest(manifest: &Value) -> Result<(), SignerError> {
     require_bool_equals(manifest, "/programLayout/createsWpSystem", false)?;
     require_bool_equals(manifest, "/programLayout/directShellLaunch", false)?;
 
-    require_string_equals(manifest, "/dataLayout/codexHome", "%USERPROFILE%/.codex")?;
+    require_string_equals(
+        manifest,
+        "/dataLayout/codexHome",
+        "%LOCALAPPDATA%/CodexAppManager/usb-codex-home",
+    )?;
     require_string_equals(manifest, "/dataLayout/roaming", "%APPDATA%/Codex")?;
     require_string_equals(manifest, "/dataLayout/local", "%LOCALAPPDATA%/Codex")?;
     require_bool_equals(manifest, "/dataLayout/onUsb", false)?;
@@ -311,7 +315,7 @@ fn validate_usb_manifest(manifest: &Value) -> Result<(), SignerError> {
     require_string_equals(
         manifest,
         "/managedContent/configLocation",
-        "%USERPROFILE%/.codex/config.toml",
+        "%LOCALAPPDATA%/CodexAppManager/usb-codex-home/config.toml",
     )?;
     require_bool_equals(manifest, "/managedContent/secretsIncluded", false)?;
     require_string_equals(

@@ -17,6 +17,12 @@ export default defineConfig({
       ...configDefaults.exclude,
       ".claude/**",
       ".codex-audit/**",
+      // Local audit/release workspaces may contain extracted third-party test
+      // suites. They are evidence, not part of this app's Vitest suite.
+      ".tmp-*/**",
+      ".release-worktree-*/**",
+      "tmp/**",
+      "installer-pack/**",
       "CCSwitch/CCSwitch/**",
     ],
     environment: "jsdom",

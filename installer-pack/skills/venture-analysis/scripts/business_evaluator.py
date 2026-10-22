@@ -35,7 +35,7 @@ def _number(value: Any, field: str, minimum: float | None = None, maximum: float
         raise ValueError(f"{field} 必须是有限数值。")
     try:
         number = float(value)
-    except (OverflowError, TypeError, ValueError) as exc:
+    except (TypeError, ValueError) as exc:
         raise ValueError(f"{field} 必须是有限数值。") from exc
     if not math.isfinite(number):
         raise ValueError(f"{field} 必须是有限数值。")
@@ -63,27 +63,6 @@ def load_input(path_value: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("评估输入 JSON 顶层必须是对象。")
     return value
-
-
-def ensure_distinct_paths(input_value: str, output_value: str) -> None:
-    """Reject normalized and same-file aliases before the output can overwrite input."""
-    try:
-        input_path = Path(input_value).expanduser().resolve()
-        output_path = Path(output_value).expanduser().resolve()
-    except (OSError, RuntimeError) as exc:
-        raise ValueError("无法验证评估输入与输出路径。") from exc
-
-    if input_path == output_path:
-        raise ValueError("评估输出路径不能覆盖输入 JSON。")
-    try:
-        if input_path.samefile(output_path):
-            raise ValueError("评估输出路径不能指向输入 JSON。")
-    except FileNotFoundError:
-        # A new output path has no file identity yet; the normalized path check above
-        # still prevents replacing the input through a spelling alias.
-        return
-    except OSError as exc:
-        raise ValueError("无法确认评估输入与输出是否为同一文件，已拒绝写入。") from exc
 
 
 def validate_business_input(raw: dict[str, Any]) -> dict[str, Any]:
@@ -198,8 +177,6 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        if args.output:
-            ensure_distinct_paths(args.input, args.output)
         report = generate_evaluation(load_input(args.input))
         output = json.dumps(report, ensure_ascii=False, indent=2)
         if args.output:

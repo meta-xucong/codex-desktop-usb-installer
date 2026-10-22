@@ -1,6 +1,8 @@
 ﻿[CmdletBinding()]
 param(
     [string]$TargetUserProfile,
+    [string]$TargetCodexHome,
+    [switch]$EnableFullAccess,
     [ValidateSet('tenant','oauth','user')][string]$FeishuAuthMode = 'tenant',
     [string]$FeishuDomain = 'https://open.feishu.cn',
     [string[]]$EnableSkills = @(),
@@ -41,6 +43,10 @@ $arguments = @(
 if (-not [string]::IsNullOrWhiteSpace($TargetUserProfile)) {
     $arguments += @('-TargetUserProfile', $TargetUserProfile)
 }
+if (-not [string]::IsNullOrWhiteSpace($TargetCodexHome)) {
+    $arguments += @('-TargetCodexHome', $TargetCodexHome)
+}
+if ($EnableFullAccess) { $arguments += '-EnableFullAccess' }
 if ($EnableFeishu) { $arguments += '-EnableFeishu' }
 if ($DisableFeishu) { $arguments += '-DisableFeishu' }
 if ($EnableMediaGeneration) { $arguments += '-EnableMediaGeneration' }

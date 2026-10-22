@@ -1,25 +1,25 @@
 {
-    "schemaVersion":  1,
-    "product":  "codex-usb",
-    "displayName":  "Codex Switch",
-    "sourceRepository":  "https://github.com/farion1231/cc-switch",
-    "sourceCommit":  "1d44b1ba41987cddeb8096fadba8190fab465cbb",
-    "sourceVersion":  "3.14.1",
-    "artifact":  {
-                     "file":  "CodexSwitch.exe",
-                     "sha256":  "CD6CF836CA0EF95EE087E897A9966F590F80B9B6FDCF6D43BB8E87AA3628604B",
-                     "kind":  "portable-executable",
-                     "installerBundle":  false
-                 },
-    "providerCatalog":  "providers.json",
-    "secretsIncluded":  false,
-    "notes":  [
-                  "404TOKEN is a third-party Sub2API relay, not an OpenAI official endpoint.",
-                  "A verified USB license injects one device API key for the unified-api-internal group at runtime.",
-                  "CCSwitch saves the USB key to its normal private provider database, switches the provider, and returns a nonce-bound acknowledgement only after local readback succeeds.",
-      "The standard USB manager passes the signed device key through the legacy startup environment contract; this build also supports an optional nonce-bound acknowledgement for integrations that request it.",
-                  "Model discovery does not gate normal provider activation or Codex launch.",
-                  "The device key is never included in this static resource bundle or providers.json.",
-                  "The Windows MSI/NSIS wrapper is not included in this P0 artifact."
-              ]
+  "schemaVersion": 1,
+  "product": "codex-usb",
+  "displayName": "Codex Switch",
+  "sourceRepository": "https://github.com/farion1231/cc-switch",
+  "sourceCommit": "1d44b1ba41987cddeb8096fadba8190fab465cbb",
+  "sourceVersion": "3.14.1",
+  "artifact": {
+    "file": "CodexSwitch.exe",
+    "sha256": "04607C8E8E8122E3D7A7FA3B0C360FA7144556D72772BE4A761AA4989BC36DB2",
+    "kind": "portable-executable",
+    "installerBundle": false
+  },
+  "providerCatalog": "providers.json",
+  "secretsIncluded": false,
+  "notes": [
+    "404TOKEN is a third-party Sub2API relay, not an OpenAI official endpoint.",
+    "A verified USB license injects one device API key for the unified-api-internal group at runtime.",
+    "CCSwitch saves the USB key to its normal private provider database, switches the provider, and returns a nonce-bound acknowledgement only after local readback succeeds.",
+    "The USB manager reports injection success only after validating that acknowledgement; on failure it keeps the CCSwitch window visible and shows an error on its home page.",
+    "Model discovery does not gate normal provider activation or Codex launch.",
+    "The device key is never included in this static resource bundle or providers.json.",
+    "The Windows MSI/NSIS wrapper is not included in this P0 artifact."
+  ]
 }

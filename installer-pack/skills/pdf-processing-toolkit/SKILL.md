@@ -34,7 +34,5 @@ CODEX_PYTHON scripts/pdf_tool.py generate output.pdf --text "示例"
 CODEX_PYTHON scripts/pdf_tool.py smoke
 ```
 
-`extract --output` 会先在目标目录写入完整暂存文本，再发布到目标路径。暂存写入失败时，已有目标文件保持原字节内容，脚本会清理本次创建的暂存文件；成功时才用完整提取文本替换目标。省略 `--output` 时仍将文本输出到标准输出。
-
 如果 `pypdf`、`pdfplumber` 或 `reportlab` 无法导入，应停止操作并报告具体包名和运行时路径；
 不要退回到猜测 PDF 内容或声称已经写入文件。

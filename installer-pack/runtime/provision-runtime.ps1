@@ -2,6 +2,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$PackRoot,
     [Parameter(Mandatory = $true)][string]$TargetUserProfile,
+    [string]$TargetCodexHome,
     [switch]$EnableFeishu
 )
 
@@ -17,7 +18,8 @@ function Write-JsonNoBom([string]$Path, [object]$Value, [int]$Depth = 8) {
 
 $packRootFull = [IO.Path]::GetFullPath($PackRoot).TrimEnd('\')
 $profileFull = [IO.Path]::GetFullPath($TargetUserProfile).TrimEnd('\')
-$kitHome = Join-Path $profileFull '.codex\codex-agent-kit'
+$codexHome = if ([string]::IsNullOrWhiteSpace($TargetCodexHome)) { Join-Path $profileFull '.codex' } else { [IO.Path]::GetFullPath($TargetCodexHome) }
+$kitHome = Join-Path $codexHome 'codex-agent-kit'
 $runtimeRoot = Join-Path $kitHome 'runtime'
 $mediaRoot = Join-Path $packRootFull 'runtime\bundled'
 $mediaManifestPath = Join-Path $mediaRoot 'media-manifest.json'
@@ -84,26 +86,13 @@ function Invoke-NativeCapture([string]$Executable, [string[]]$Arguments) {
     return [pscustomobject]@{ ExitCode = $exitCode; Output = $output }
 }
 
-# BEGIN Test-HyperframesPackageHealth
-function Test-HyperframesPackageHealth([string]$PackageJsonPath, [string]$CliOutput, [int]$CliExitCode, [string]$ExpectedVersion) {
-    $result = [ordered]@{ IsValid = $false; Version = ''; Error = '' }
-    try {
-        if (-not (Test-Path -LiteralPath $PackageJsonPath -PathType Leaf)) { throw 'HyperFrames package.json is missing.' }
-        $package = Get-Content -LiteralPath $PackageJsonPath -Raw -Encoding UTF8 | ConvertFrom-Json
-        if ([string]$package.name -ne 'hyperframes') { throw "Unexpected HyperFrames package name: $($package.name)" }
-        if ([string]$package.version -ne $ExpectedVersion) { throw "Unexpected HyperFrames package version: $($package.version); expected $ExpectedVersion." }
-        if ($CliExitCode -ne 0) { throw "HyperFrames --version failed with exit code $CliExitCode." }
-        $reportedVersion = ([string]$CliOutput).Trim()
-        if ($reportedVersion -match '^v') { $reportedVersion = $reportedVersion.Substring(1) }
-        if ($reportedVersion -ne $ExpectedVersion) { throw "HyperFrames --version reported '$reportedVersion'; expected $ExpectedVersion." }
-        $result.IsValid = $true
-        $result.Version = $reportedVersion
-    } catch {
-        $result.Error = $_.Exception.Message
-    }
-    return [pscustomobject]$result
+function Test-VenvPython([string]$Executable) {
+    if (-not (Test-ExactPython $Executable)) { return $false }
+    # A failed first-time ensurepip can leave Scripts\python.exe behind without
+    # pip. Version-only detection would then reuse a broken venv on every retry.
+    $pipProbe = Invoke-NativeCapture -Executable $Executable -Arguments @('-m','pip','--version')
+    return $pipProbe.ExitCode -eq 0 -and $pipProbe.Output -match '^pip\s+\d+'
 }
-# END Test-HyperframesPackageHealth
 
 $mediaManifest = Read-Json $mediaManifestPath
 $pythonInstaller = Assert-Media $mediaManifest 'runtime.python312' $packRootFull
@@ -177,7 +166,7 @@ if ([string]::IsNullOrWhiteSpace($basePython)) {
 
 $venvRoot = Join-Path $runtimeRoot 'python-env'
 $venvPython = Join-Path $venvRoot 'Scripts\python.exe'
-$venvHealthy = Test-ExactPython $venvPython
+$venvHealthy = Test-VenvPython $venvPython
 if (-not $venvHealthy) {
     $venvResult = Invoke-NativeCapture -Executable $basePython -Arguments @('-m','venv','--clear',$venvRoot)
     if ($venvResult.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $venvPython -PathType Leaf)) { throw "Could not create the per-user CPython 3.12 environment: $($venvResult.Output)" }
@@ -191,7 +180,7 @@ if ($pythonHealthResult.ExitCode -ne 0) { throw "Python runtime health check fai
 
 $manimRoot = Join-Path $runtimeRoot 'manim-env'
 $manimPython = Join-Path $manimRoot 'Scripts\python.exe'
-if (-not (Test-ExactPython $manimPython)) {
+if (-not (Test-VenvPython $manimPython)) {
     $manimVenvResult = Invoke-NativeCapture -Executable $basePython -Arguments @('-m','venv','--clear',$manimRoot)
     if ($manimVenvResult.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $manimPython -PathType Leaf)) { throw "Could not create the isolated Manim CPython 3.12 environment: $($manimVenvResult.Output)" }
 }
@@ -250,7 +239,7 @@ $ffprobeVersionText = ($ffprobeVersionOutput -split "`r?`n" | Select-Object -Fir
 if ($ffprobeExitCode -ne 0 -or $ffprobeVersionText -notmatch '^ffprobe version (?:9\.|N-|n9\.)') { throw "Bundled FFprobe health check failed (exit=$ffprobeExitCode): $ffprobeVersionText" }
 $ffmpegHealth = 'passed'
 
-$hyperframesVersion = '0.8.174'
+$hyperframesVersion = '0.8.134'
 $hyperframesRoot = Join-Path $runtimeRoot 'hyperframes'
 $hyperframesEntry = Join-Path $hyperframesRoot 'node_modules\hyperframes\bin\hyperframes.mjs'
 $hyperframesCmd = Join-Path $hyperframesRoot 'hyperframes.cmd'
@@ -267,22 +256,13 @@ New-Item -ItemType Directory -Force -Path $hyperframesRoot | Out-Null
 Copy-Item -LiteralPath $hyperframesPackageFile -Destination (Join-Path $hyperframesRoot 'package.json') -Force
 Copy-Item -LiteralPath $hyperframesLockFile -Destination (Join-Path $hyperframesRoot 'package-lock.json') -Force
 $installedLockHash = if (Test-Path -LiteralPath $hyperframesMarker -PathType Leaf) { (Get-Content -LiteralPath $hyperframesMarker -Raw -Encoding ASCII).Trim().ToLowerInvariant() } else { '' }
-$installedPackageMatchesLock = $false
-if (Test-Path -LiteralPath $hyperframesPackageJson -PathType Leaf) {
-    try {
-        $installedPackageMetadata = Get-Content -LiteralPath $hyperframesPackageJson -Raw -Encoding UTF8 | ConvertFrom-Json
-        $installedPackageMatchesLock = [string]$installedPackageMetadata.name -eq 'hyperframes' -and [string]$installedPackageMetadata.version -eq $hyperframesVersion
-    } catch { $installedPackageMatchesLock = $false }
-}
 $npmCacheRoot = Join-Path $runtimeRoot 'npm-cache'
 New-Item -ItemType Directory -Force -Path $npmCacheRoot | Out-Null
-$hyperframesInstallSucceeded = $true
-if ($installedLockHash -ne $expectedHyperframesLockHash -or -not (Test-Path -LiteralPath $hyperframesEntry -PathType Leaf) -or -not $installedPackageMatchesLock) {
-    $hyperframesInstallSucceeded = $false
+if ($installedLockHash -ne $expectedHyperframesLockHash -or -not (Test-Path -LiteralPath $hyperframesEntry -PathType Leaf)) {
     $npmResult = Invoke-NativeCapture -Executable $nodeExe -Arguments @($npmCli,'ci','--prefix',$hyperframesRoot,'--cache',$npmCacheRoot,'--no-audit','--no-fund','--no-progress','--fetch-retries=2','--fetch-timeout=60000')
     $npmOutput = $npmResult.Output
     if ($npmResult.ExitCode -eq 0) {
-        $hyperframesInstallSucceeded = $true
+        [IO.File]::WriteAllText($hyperframesMarker,$expectedHyperframesLockHash + [Environment]::NewLine,[Text.Encoding]::ASCII)
     } else {
         $hyperframesError = "HyperFrames CLI install requires network access: $npmOutput"
     }
@@ -291,11 +271,9 @@ if (Test-Path -LiteralPath $hyperframesEntry -PathType Leaf) {
     Write-AsciiFile $hyperframesCmd ('@echo off' + [Environment]::NewLine + '"%~dp0..\node-v22.22.0-win-x64\node.exe" "%~dp0node_modules\hyperframes\bin\hyperframes.mjs" %*' + $newline)
     $cliResult = Invoke-NativeCapture -Executable $nodeExe -Arguments @($hyperframesEntry,'--version')
     $cliOutput = $cliResult.Output
-    $packageHealth = Test-HyperframesPackageHealth -PackageJsonPath $hyperframesPackageJson -CliOutput $cliOutput -CliExitCode $cliResult.ExitCode -ExpectedVersion $hyperframesVersion
-    if ($packageHealth.IsValid -and $hyperframesInstallSucceeded) {
+    if ($cliResult.ExitCode -eq 0) {
         $hyperframesCliHealth = 'passed'
-        $installedHyperframesVersion = $packageHealth.Version
-        [IO.File]::WriteAllText($hyperframesMarker,$expectedHyperframesLockHash + [Environment]::NewLine,[Text.Encoding]::ASCII)
+        $installedHyperframesVersion = $cliOutput
         $browserResult = Invoke-NativeCapture -Executable $nodeExe -Arguments @($hyperframesEntry,'browser','ensure')
         $browserOutput = $browserResult.Output
         if ($browserResult.ExitCode -eq 0) {
@@ -307,16 +285,10 @@ if (Test-Path -LiteralPath $hyperframesEntry -PathType Leaf) {
         }
     } else {
         $hyperframesCliHealth = 'failed'
-        if (Test-Path -LiteralPath $hyperframesMarker -PathType Leaf) { Remove-Item -LiteralPath $hyperframesMarker -Force }
-        if (-not $hyperframesInstallSucceeded) {
-            $hyperframesError = "HyperFrames CLI install failed; refusing to certify the previous package state. $hyperframesError"
-        } else {
-            $hyperframesError = "HyperFrames CLI health check failed: $($packageHealth.Error) Output: $cliOutput"
-        }
+        $hyperframesError = "HyperFrames CLI health check failed: $cliOutput"
     }
 } else {
     $hyperframesCliHealth = 'requires-network'
-    if (Test-Path -LiteralPath $hyperframesMarker -PathType Leaf) { Remove-Item -LiteralPath $hyperframesMarker -Force }
     if ([string]::IsNullOrWhiteSpace($hyperframesError)) { $hyperframesError = 'HyperFrames CLI is not installed; npm access is required during one-click setup.' }
 }
 

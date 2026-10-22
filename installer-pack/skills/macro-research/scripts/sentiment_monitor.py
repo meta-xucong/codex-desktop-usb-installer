@@ -101,18 +101,6 @@ def validate_sentiment_data(data: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _ensure_finite_numbers(value: Any, path: str = "report") -> None:
-    """Reject non-finite derived arithmetic before serialization."""
-    if isinstance(value, float) and not math.isfinite(value):
-        raise ValueError(f"{path} 计算结果超出有限数值范围。")
-    if isinstance(value, dict):
-        for key, item in value.items():
-            _ensure_finite_numbers(item, f"{path}.{key}")
-    elif isinstance(value, (list, tuple)):
-        for index, item in enumerate(value):
-            _ensure_finite_numbers(item, f"{path}[{index}]")
-
-
 def calculate_weighted_index(indicators: dict[str, float], weights: dict[str, float]) -> dict[str, Any]:
     contributions = {key: indicators[key] * weights[key] for key in INDICATOR_KEYS}
     return {
@@ -156,7 +144,7 @@ def generate_sentiment_report(index_name: str, data: dict[str, Any]) -> dict[str
     index_name = str(index_name or "").strip()
     if not index_name:
         raise ValueError("index_name 必须是非空文本。")
-    report = {
+    return {
         "calculated_at": datetime.now(timezone.utc).isoformat(),
         "data_as_of": validated["as_of"],
         "sources": validated["sources"],
@@ -167,8 +155,6 @@ def generate_sentiment_report(index_name: str, data: dict[str, Any]) -> dict[str
         "fund_flow": analyze_fund_flow(validated["fund_flow"]),
         "methodology": "只计算显式权重的合成值及广度、量比、资金流算术；不生成仓位、止损或交易建议。",
     }
-    _ensure_finite_numbers(report)
-    return report
 
 
 def format_report(report: dict[str, Any]) -> str:
@@ -199,40 +185,17 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def ensure_distinct_paths(input_value: str | Path, output_value: str | Path) -> tuple[Path, Path]:
-    """Reject output paths that resolve to the sentiment input file."""
-    try:
-        input_path = Path(input_value).expanduser().resolve()
-        output_path = Path(output_value).expanduser().resolve()
-    except (OSError, RuntimeError) as exc:
-        raise ValueError("无法验证情绪输入与报告输出路径。") from exc
-
-    if input_path == output_path:
-        raise ValueError("报告输出路径不能覆盖情绪输入文件。")
-    try:
-        if input_path.samefile(output_path):
-            raise ValueError("报告输出路径不能指向情绪输入文件。")
-    except FileNotFoundError:
-        # A new output has no file identity; normalized equality was checked above.
-        pass
-    except OSError as exc:
-        raise ValueError("无法确认情绪输入与报告输出是否为同一文件，已拒绝写入。") from exc
-    return input_path, output_path
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
         path = Path(args.input).expanduser().resolve()
-        output_path = None
-        if args.output:
-            path, output_path = ensure_distinct_paths(path, args.output)
         if not path.is_file() or path.stat().st_size > MAX_INPUT_BYTES:
             raise ValueError("输入 JSON 不存在或超过 1 MiB。")
         report = generate_sentiment_report(args.index, json.loads(path.read_text(encoding="utf-8")))
-        output = json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False)
-        if output_path is not None:
+        output = json.dumps(report, ensure_ascii=False, indent=2)
+        if args.output:
+            output_path = Path(args.output).expanduser().resolve()
             output_path.write_text(output + "\n", encoding="utf-8")
             print(f"报告已保存到: {output_path}")
         elif args.json:
@@ -240,7 +203,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(format_report(report))
         return 0
-    except (OSError, ValueError, OverflowError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
         if args.json:
             print(json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False))
         else:

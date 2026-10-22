@@ -2,16 +2,16 @@
   "schemaVersion": 2,
   "id": "codex-starter",
   "version": "1.5.4",
-  "sourceCommit": "3cfa9fca12e24b25be4b2f7f5b273e6b9fb22040",
+  "sourceCommit": "1ee1a9640175710fff52a3c98b0e6cf9fe459c09",
   "sourceCommitRole": "build-input",
-  "sourceTreeSha256": "f24915cdd4593b4fce89f02c632536d006f30ec4ac71d45bebffdf873a6b24d0",
-  "sourceDate": "2026-10-16",
+  "sourceTreeSha256": "5eb315a434f81913eaec5a7e881dd76b8c8dfc1fc8e4061defcd64f6452cf281",
+  "sourceDate": "2026-10-06",
   "compatibleCodex": {
     "minCodexVersion": "0.144.0",
     "testedCodexVersion": "0.157.1",
     "agentFormat": "TOML with name/description/developer_instructions",
     "skillRoot": "%USERPROFILE%\\.agents\\skills",
-    "agentRoot": "%USERPROFILE%\\.codex\\agents",
+    "agentRoot": "%CODEX_HOME%\\agents",
     "windows": [
       "10",
       "11"

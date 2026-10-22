@@ -25,52 +25,40 @@ def calculate_regular_sip(
     annual_return: float
 ) -> Dict:
     """按调用者给出的年化收益假设计算普通定投场景。"""
-    if isinstance(monthly_amount, bool) or not math.isfinite(monthly_amount) or monthly_amount <= 0:
+    if not math.isfinite(monthly_amount) or monthly_amount <= 0:
         raise ValueError("monthly_amount 必须是正数。")
-    if isinstance(years, bool) or not isinstance(years, int) or not 1 <= years <= 100:
+    if not isinstance(years, int) or not 1 <= years <= 100:
         raise ValueError("years 必须是 1 到 100 的整数。")
-    if isinstance(annual_return, bool) or not math.isfinite(annual_return) or not -100 < annual_return <= 1000:
+    if not math.isfinite(annual_return) or not -100 < annual_return <= 1000:
         raise ValueError("annual_return 必须大于 -100% 且不超过 1000%。")
     months = years * 12
     monthly_rate = annual_return / 100 / 12
-
-    try:
-        # 累计投入
-        total_invested = monthly_amount * months
-        if not math.isfinite(total_invested):
-            raise ValueError("计算结果超出可表示范围，请降低金额或期限。")
-
-        # 未来价值（年金终值公式）
-        if monthly_rate == 0:
-            future_value = total_invested
-        else:
-            future_value = monthly_amount * ((1 + monthly_rate) ** months - 1) / monthly_rate
-        if not math.isfinite(future_value):
-            raise ValueError("计算结果超出可表示范围，请降低收益率或期限。")
-
-        # 总收益
-        total_return = future_value - total_invested
-        return_rate = (total_return / total_invested) * 100 if total_invested > 0 else 0
-        if not math.isfinite(total_return) or not math.isfinite(return_rate):
-            raise ValueError("计算结果超出可表示范围，请降低金额、收益率或期限。")
-
-        # 生成明细
-        details = []
-        accumulated = 0
-        for month in range(1, months + 1):
-            accumulated = accumulated * (1 + monthly_rate) + monthly_amount
-            if not math.isfinite(accumulated):
-                raise ValueError("逐年明细超出可表示范围，请降低收益率或期限。")
-            if month % 12 == 0:
-                invested_to_date = monthly_amount * month
-                details.append({
-                    "year": month // 12,
-                    "invested": invested_to_date,
-                    "value": accumulated,
-                    "return": accumulated - invested_to_date
-                })
-    except OverflowError as error:
-        raise ValueError("计算结果超出可表示范围，请降低收益率或期限。") from error
+    
+    # 累计投入
+    total_invested = monthly_amount * months
+    
+    # 未来价值（年金终值公式）
+    if monthly_rate == 0:
+        future_value = total_invested
+    else:
+        future_value = monthly_amount * ((1 + monthly_rate) ** months - 1) / monthly_rate
+    
+    # 总收益
+    total_return = future_value - total_invested
+    return_rate = (total_return / total_invested) * 100 if total_invested > 0 else 0
+    
+    # 生成明细
+    details = []
+    accumulated = 0
+    for month in range(1, months + 1):
+        accumulated = accumulated * (1 + monthly_rate) + monthly_amount
+        if month % 12 == 0:
+            details.append({
+                "year": month // 12,
+                "invested": monthly_amount * month,
+                "value": accumulated,
+                "return": accumulated - monthly_amount * month
+            })
     
     return {
         "strategy": "普通定投",

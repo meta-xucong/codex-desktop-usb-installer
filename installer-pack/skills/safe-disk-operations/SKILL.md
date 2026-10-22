@@ -44,9 +44,7 @@ Before changing state:
 - Keep one shell end-to-end. On Windows, use native PowerShell file cmdlets with `-LiteralPath`; do not enumerate paths in PowerShell and pass
   them to `cmd.exe`, batch built-ins, or another shell for deletion or movement.
 - Do not build destructive commands from string concatenation, command substitution, unresolved environment variables, or broad globs.
-- Before any recursive delete, move, rename, copy, merge, or overwrite, run a read-only preflight over the exact planned tree. Enumerate descendants without following links; inspect the target, every descendant, and each path component for symbolic links, junctions, mount points, or any reparse point. Verify the physically resolved target remains inside the exact user-approved directory; a lexical prefix check alone is not sufficient.
-- If any item is a reparse point/link, path resolution leaves the approved directory, or the preflight cannot reliably inspect every item, stop the entire recursive batch and report the exact path and reason. Do not follow, traverse through, or remove the link and then continue with the rest of the batch. Keep all data unchanged until the user approves a safe revised scope.
-- Recheck the planned tree immediately before execution. Afterward, perform a read-only postcondition check on the exact authorized paths and report partial failures without claiming full success.
+- For recursive deletion or movement, validate that every resolved target stays inside the user-named directory.
 - When merging trees, define collision behavior first. Default to preserving the destination and reporting conflicts.
 - For copy-then-delete migration, compare file counts and hashes for important data before removing the source.
 - If an operation removes material data, report what was removed and whether recovery is available.

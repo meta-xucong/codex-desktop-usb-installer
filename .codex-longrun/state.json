@@ -1,50 +1,1068 @@
 {
-  "objective": "完成 G39.5 USB 一键安装交付：修复 CCSwitch 生产启动、统一 API 分组和单 Key 注册契约、原生模型目录刷新、安装器进度与启动状态体验，重建正式绑定 profile、CCSwitch、管理器、完整 U 盘目录及压缩包，并完成可复现验证。",
-  "current_phase": "G39.5/r16 404token account retry closure",
+  "objective": "完成当前 U 盘 Codex 开发源 installer-pack 中 56 个 Skills 与 7 个 Agents 的全面可用性审计；按冻结清单逐项验证源闭包、行为/路由、依赖和失败边界；授权范围内修复并保留可复现证据，直到全部达到明确终态或具体外部前置条件记录完整。",
+  "current_phase": "Continue source-attributable G3/G4 behavior and route coverage across all 56 Skills and 7 Agents; current G1/G2 package gates pass, but natural-route coverage and source-load lifecycle remain incomplete.",
   "phase_status": "in_progress",
-  "completed_phases": ["Discover project structure", "Freeze development contract", "Implement Skill Hub diagnostics, model policy, and G22 uninstall hardening", "Build and verify EXE, USB bundle, capability pack, and signer", "Independent audit, artifact rebuild, commit, and GitHub push", "Audit and rebuild G39.4 signer with embedded administrator credential", "Rebuild formally bound manager, CCSwitch and complete USB package", "Create and verify final USB and signer archives", "Implement and verify G39.5/r8 field repairs and native Codex model catalog bridge", "Rebuild and verify G39.5/r8 complete USB package", "Final G39.5/r8 regression, engine fixture repair, embedded-key signer rebuild, and archive verification", "G39.5/r9 unified-api-internal catalog sync, static/network verification, and complete USB package rebuild", "G39.5/r10 USB installer UX, model-refresh status, startup-state repair, and complete package rebuild", "G39.5/r11 fresh EXE, signer, profile binding, and complete package rebuild", "G39.5/r12 install-stall and second-stage-uninstall repair, regression, and complete package rebuild", "G39.5/r13 portable extraction root-cause repair, regression, and complete package rebuild", "G39.5/r14 real extraction progress, slow-media write optimization, and one-click recharge", "G39.5/r15 CCSwitch auto-provisioning, tray startup, upstream model-refresh retry, and complete package rebuild"],
+  "completed_phases": [
+    "USB source and pack selected; frozen blueprint/checklist/vectors established",
+    "G0/G1/G2 closure baseline and current source snapshot established",
+    "Incremental S003 quote and all-script source smoke completed and independently reviewed",
+    "Incremental S018 four-script source smoke completed and independently reviewed; overall PARTIAL retained",
+    "Incremental S049 three-script helper smoke 9/9 completed and independently reviewed; overall PARTIAL retained",
+    "Incremental S017 fitness_db isolated helper smoke 4/4 independently reviewed; overall PARTIAL retained",
+    "Incremental S043 PowerShell search source smoke 5/5 independently reviewed; overall PARTIAL retained",
+    "Incremental S051 weather_db isolated config smoke 10/10 independently reviewed; S019 Grok compiler/upload helper suites 34/34 independently reviewed; both overall PARTIAL retained",
+    "G4 current USB seven-Agent TOMLs compared with current OpenAI custom-agent schema; 13/13 independently reviewed; runtime source/loading/child lifecycle remains INSUFFICIENT_EVIDENCE",
+    "S042 explicit no-save source rule patched; package integrity/G1 revalidated; independent review complete; model route remains PARTIAL",
+    "S009 docx-butler source remediation and source-pinned synthetic DOCX structural validation",
+    "S012 excel-xlsx preference/onboarding remediation and 7-assertion workbook smoke",
+    "S038 powerpoint-pptx stale external command cleanup and package revalidation",
+    "S052 optional fetch adapter dependency contract correction and offline mock smoke",
+    "S047 all four current USB source scripts covered by synthetic source-direct smoke; two batches independently reviewed; overall PARTIAL retained",
+    "Incremental S054 wechat-article-creator character-count fix; 2 package regressions + 9 source assertions + independent review; overall PARTIAL retained",
+    "S037 current USB PDF helper source-direct smoke 9/9 executed in isolated tmp; independent review pending; overall PARTIAL retained",
+    "Independent S037 review passed with scoped limitations; S053 packaged offline mock suite rerun 8/8; S053 remains NOT_TESTABLE for natural route",
+    "S053 additional current USB adapter contract smoke passed 19/19 under mocks; natural route remains NOT_TESTABLE",
+    "S037 PDF helper same-path/alias overwrite fixed for extract and merge; 6 focused tests (5 pass, one environment skip) and independent review pass; full adapter 81/25; G1/G2/metadata and 748-row evidence ledger closed; overall S037 remains PARTIAL.",
+    "S049 rebalance CLI current/target output-alias overwrite fixed; synthetic baseline reproduced exit-0 data loss; focused CLI regressions 4/4 and independent review pass; adapter 81/25; G1/G2/metadata and 759-row evidence ledger closed; overall S049 remains PARTIAL.",
+    "S045 travel plan export now rejects output aliases to both trips and preferences databases; reproduced prior full-DB overwrite; focused 4/4, travel suite 23/23, adapter 81/25 and independent audit pass; G1/G2/metadata and 771-row evidence ledger closed; overall S045 remains PARTIAL.",
+    "S045 add_trip status mismatch fixed: ideas aliases to idea; unsupported statuses fail before read/ID/input mutation; trip status tests 3/3, full travel suite 26/26, independent review pass; adapter 81/25; G1/G2/metadata and 783-row evidence ledger closed.",
+    "S045 travel_db.save_json now serializes before writing and atomically replaces via same-directory temp; serializer and replace failures preserve prior database and clean temp; focused 2/2, full travel suite 28/28, independent audit pass; adapter 81/25; G1/G2/metadata and 795-row evidence ledger closed.",
+    "Shared non-atomic JSON writes in meal_db, fitness_db and reflection_db fixed using pre-serialization and same-directory temp/fsync/replace; cross-Skill suite 3/3, local suites 10/10, 22/22, 5/5, independent review pass; adapter 81/25; G1/G2/metadata and 811-row evidence ledger closed.",
+    "Incremental S003 financial cache horizon isolation fixed; 5/5 offline regressions and independent audit passed; G1/G2/adapter/metadata and 819-row evidence closure passed; S003 remains PARTIAL overall.",
+    "Incremental Agent office/general destructive file-operation instruction boundary fixed; static contract 3/3 and independent review passed; G1/G2/metadata and evidence ledger 826-row closure passed.",
+    "Incremental S045 travel budget validation fixed; focused 6/6, full travel suite 34/34, independent audit PASS; adapter/G1/G2/metadata and 835-row evidence closure passed.",
+    "S045 travel budget negative/nonfinite validation closed; focused 6/6, full travel suite 34/34, independent audit PASS, G1/G2/metadata and evidence ledger 835-row closure passed.",
+    "Incremental S053 Web Search response parsing hardened for malformed JSON shape, invalid UTF-8, recursion depth, and integer digit limit; mock suite 13/13, independent audit PASS; adapter/G1/G2/metadata and evidence ledger 843-row closure passed; natural route remains NOT_TESTABLE.",
+    "Incremental S018 Fund Portfolio and S019 Grok compiler CLI output/input alias overwrites fixed; synthetic baselines reproduced data loss; focused tests 5/5 each, Fund full suite 10/10, Grok existing compiler/upload helper tests 34/34; independent read-only audits PASS; adapter 81/25, G1/G2 and metadata pass; evidence ledger 865 rows closed; natural routes/upstream remain PARTIAL.",
+    "S019 Grok reference uploader output/source alias overwrite fixed with pre-upload rejection and stable resolve/identity errors; S003 valuation CLI output aliases to either stock data or reviewed assumptions fixed before JSON load; focused Grok 12/12 and S003 6/6, existing Grok helper functions 34/34; independent audits PASS; adapter 81/25, G1/G2 and metadata pass; evidence ledger 875 rows closed.",
+    "S003 financial_analyzer input/output overwrite fixed; synthetic baseline reproduced source hash loss; focused 6/6 and independent review PASS; package adapter 81/25, G1/G2/metadata pass; evidence ledger 881 rows closed; S003 remains PARTIAL for natural routing and live data.",
+    "S018 venture valuation overflow produces Infinity fixed on full report path; synthetic extreme case now fails cleanly and ordinary finite case succeeds; focused 2/2, independent audit PASS; adapter 81/25, G1/G2/metadata pass; evidence ledger 888 rows closed; individual scenario helper direct calls remain outside check.",
+    "S027 sentiment monitor derived volume-ratio and fund-flow overflow to Infinity fixed; finite-value report guard and allow_nan=False added; separate overflow/output suppression/normal tests 4/4, independent audit PASS; package G1/G2/adapter/metadata pass; evidence ledger 895 rows closed.",
+    "S003 DCF zero-denominator and derived Infinity cases fixed on complete valuation report/CLI path; rejects discount <= -100%, recursively validates finite values, allow_nan=False; combined S003 tests 9/9, independent PASS; adapter 81/25, G1/G2/metadata pass; evidence ledger 902 rows closed.",
+    "S049 asset allocator finite-derived-value and output-alias defects fixed; focused 8/8, full 18/18, independent PASS; latest package G1/G2/adapter/metadata pass, evidence ledger 910 rows closed.",
+    "S018 fund portfolio derived amount overflow fixed; focused 9/9, full 14/14; independent audit PASS; package G1/G2/adapter/metadata pass, evidence ledger 918 rows closed.",
+    "S018 venture financial_model finite-derived-result and oversized-integer overflow failures fixed; focused 6/6, full 8/8, independent PASS; latest package G1/G2/adapter/metadata pass, evidence ledger 926 rows closed.",
+    "S049 rebalance planner derived amount overflow fixed; legacy-equivalent baseline reproduced exit-0 Infinity; focused 7/7, full Wealth Allocation 21/21, independent PASS; latest package G1/G2/adapter/metadata pass, evidence ledger 935 rows closed.",
+    "S018 risk_assessor output-to-input overwrite fixed; baseline reproduced exit-0 source mutation; focused 6/6, fund-portfolio full 20/20, independent PASS; current package G1/G2/adapter/metadata pass, evidence ledger 943 rows closed.",
+    "S049 portfolio_tracker derived monthly-return/volatility overflow fixed; baseline exit-0 Infinity reproduced; focused 10/10, full Wealth Allocation 25/25, independent PASS; package G1/G2/adapter/metadata pass, evidence ledger 951 rows closed.",
+    "S045 travel expense finite nonnegative boundary and cumulative overflow fixed; pre-fix negative/Infinity baselines, focused 5/5, full travel suite 39/39, independent PASS; latest package G1/G2/adapter/metadata passed and 962-row evidence ledger closed.",
+    "S017 Fitness Coach workout/set input validation and finite metric boundary fixed; pre-fix negative-reps baseline, focused 7/7, full suite 34/34, independent review PASS; package G1/G2/adapter/metadata passed and 971-row evidence ledger closed.",
+    "S007 historical weekly-review habit range, streak anchor and canonical date/CLI boundaries fixed; legacy mismatch reproduced, focused 8/8, full suite 13/13, independent review PASS; package G1/G2/adapter/metadata passed and 981-row evidence ledger closed. Seven Agent TOMLs received second-pass source review with no new concrete defect; runtime remains untested.",
+    "S003 malformed China Stock Analysis cache metadata fixed; baseline reproduced, focused 3/3 and full suite 23/23, independent PASS; package G1/G2/adapter/metadata passed; evidence ledger 1038 rows closed.",
+    "S003 flat-price technical analysis defect fixed: neutral trend/RSI, strong rising/falling retained, mixed/cross cases regression-covered; independent PASS; package gates passed; evidence ledger 1046 rows closed.",
+    "S018 Fund Screener non-finite/type-invalid threshold bypass fixed; legacy baseline reproduced, focused 2/2 and full Fund Portfolio 22/22, two-round independent PASS after Decimal fix; package gates passed; evidence ledger 1055 rows closed.",
+    "S018 Risk Assessor oversized JSON integer OverflowError fixed; baseline reproduced, focused 2/2 and full Fund Portfolio 24/24, independent PASS; package gates passed; evidence ledger 1063 rows closed.",
+    "S003 realtime quote minute-volume totals reconciled to mutually exclusive session buckets including opening call; lunch/out-of-session excluded; baseline reproduced, focused 3/3 and full S003 31/31, independent PASS; package gates passed; evidence ledger 1071 rows closed.",
+    "Incremental S003 technical_analysis non-finite K-line rejection; frozen D0/I1/A0 contract, baseline, focused 4/4, full suite 39/39 and independent audit PASS; G1/G2/adapter/metadata and 1099-row evidence closure passed; natural route/live provider remain unverified.",
+    "Incremental S017 Fitness Coach Program Generator output-failure repair; reproduced persistent-plan duplicate on retry, frozen D0/I1/A0 contract, focused 3/3 and full suite 37/37, independent audit PASS; G1/G2/adapter/metadata and 1110-row evidence closure passed; route/runtime remains unverified.",
+    "Incremental S037 PDF merge partial-write failure fixed with same-directory staged atomic publication; synthetic baseline, focused 2/2, full suite 8 passed/1 hard-link ACL skip, runtime smoke, independent audit PASS; G1/G2/adapter/metadata and 1122-row evidence closure passed; crash, ACL and route limits retained.",
+    "Incremental S045 Travel Planner nested trip shape validation; reproduced three AttributeError traceback cases, frozen D0/I1/A0 contract, focused 4/4 and full suite 43/43, independent audit PASS; G1/G2/adapter/metadata and 1133-row evidence closure passed; CLI top-level nonmapping subcase and routing remain unverified.",
+    "Incremental S052 max_chars positive-integer validation; mocked legacy -1/0 truncation reproduced, focused 3/3 and full suite 10/10, independent audit PASS; G1/G2/adapter/metadata and 1144-row evidence closure passed; no real network or natural route tested.",
+    "Incremental S047 due-diligence checklist partial-write preservation; frozen local failure baseline, focused 3/3 and full Venture Analysis suite 16/16, independent audit PASS including replace failure injection; G1/G2/adapter/metadata and 1155-row evidence closure passed; device/crash/ACL limits retained.",
+    "Incremental S054 cover unsupported-extension early validation; old directory-creation side effect reproduced, focused 2/2/full suite 14/14, independent audit PASS; G1/G2/adapter/metadata and 1166-row evidence closure passed; local Pillow only, route/runtime remain unverified.",
+    "Incremental S003 data_fetcher safe_float oversized integer handling; fake-provider 10**400 OverflowError baseline, focused 3/3/full suite 42/42, independent audit PASS; G1/G2/adapter/metadata and 1177-row evidence closure passed; live AkShare/routing remain unverified.",
+    "Incremental S030 BMR gender shape validation; null-gender CLI traceback baseline, supported normalized male/female contract, focused 3/3/full suite 25/25, independent audit PASS; G1/G2/adapter/metadata and 1188-row evidence closure passed; only synthetic profiles tested.",
+    "Incremental S030 Meal Planner numeric body-profile validation; bool profile ZeroDivisionError baseline reproduced; focused5/5, full30/30, independent PASS; G1/G2/adapter/metadata pass; 1200-row evidence ledger closed. S054 draft filename collision is next candidate.",
+    "Incremental S054 WeChat Article Creator same-title draft collision and partial-write failure; two baselines reproduced; exclusive create with suffix, owned partial cleanup, concise CLI error; focused3/3/full17/17, independent second review PASS; G1/G2/adapter/metadata passed; evidence ledger1214 rows closed. S051 weather config partial-write failure baseline now reproduced; atomic-save repair next.",
+    "Incremental S051 Weather Forecast config write failure; isolated Set-Content truncation baseline; same-directory GUID stage plus File.Replace/Move; PS5.1 and PS7 harnesses, independent audit PASS; G1/G2/adapter/metadata passed; evidence ledger1226 closed. S037 PDF generate() distinct partial-output baseline reproduced; remediation next.",
+    "Incremental S037 PDF generate partial-write failure fixed with same-directory staging and verified atomic publish; focused 2/2, PDF suite 9 pass/1 environment skip, real local smoke and independent audit PASS; package G1/G2/adapter/metadata pass; evidence ledger 1242 rows verified with zero stale/missing paths or hashes; overall PARTIAL retained.",
+    "Incremental S047 Business Evaluator oversized integer OverflowError fixed as field-specific validation error; focused 3/3, Venture suite 19/19, independent audit PASS; package G1/G2/adapter/metadata pass; evidence ledger 1242 rows verified with zero stale/missing paths or hashes; overall PARTIAL retained.",
+    "Incremental S045 Travel Planner trips.json top-level array traceback fixed with fail-closed JSON object validation; focused 2/2, Travel Planner full 45/45, independent audit PASS; package G1/G2/adapter/metadata pass; evidence ledger 1252 rows verified with zero missing/stale evidence paths or hashes; overall PARTIAL retained.",
+    "Incremental S027 Cycle Analyzer reviewed allocation oversized-int OverflowError fixed as field-specific finite-number validation; focused2/2, Macro Research full16/16, independent audit PASS; package G1/G2/adapter/metadata pass; evidence ledger1262 rows verified with zero missing/stale paths or hashes; overall PARTIAL retained.",
+    "Incremental S003 realtime_quote minute volume overflow fixed with finite/nonnegative validation and stable CLI error envelope; focused4/4, China Stock full46/46, independent audit PASS; package G1/G2/adapter/metadata pass; evidence ledger1272 rows verified with zero missing/stale paths or hashes; overall PARTIAL retained.",
+    "Incremental S003 minute amount aggregate overflow fixed with finite aggregate validation and strict-compatible error envelope; focused2/2, China Stock full48/48, independent audit PASS; package G1/G2/adapter/metadata pass; evidence ledger1282 verified with zero missing/stale paths or hashes; overall PARTIAL retained.",
+    "Incremental S045 get_trip_by_id now rejects non-object persisted trip rows with section-specific error; focused2/2, Travel Planner full47/47, independent PASS; package G1/G2/adapter/metadata pass; evidence ledger1292 verified with zero missing/stale paths or hashes; overall PARTIAL retained.",
+    "Incremental S030 vegan filter now excludes whole recipes with known animal-derived ingredients or fails clearly; focused4/4, Meal Planner full34/34, independent PASS; package G1/G2/adapter/metadata pass; evidence ledger1302 verified with zero missing/stale paths or hashes. Residual: Chinese breakfast catalog has no vegan-safe recipe, so no successful vegan day plan; keto/low-carb/vegetarian semantics remain unimplemented.",
+    "Incremental S030 vegan-only Chinese candidates now reuse exact existing ingredient records for default three meals and four-meal snack; focused5/5, Meal Planner35/35, independent behavior PASS; G1/G2/adapter/metadata PASS at sourceTree 476d793b1c871137c4e049ad42eb163883230f861dde64175b6be8fa4b498541; evidence ledger1310 verified with zero missing/stale paths or hashes. Residual: sample daily totals ~1109 kcal/31g protein vs illustrative 2000/100 target, limited variety/cuisine, hidden ingredients/cross-contact and routing/runtime unproven; S030 remains PARTIAL.",
+    "Incremental S049 portfolio_tracker now normalizes float(huge_json_int) OverflowError to field-specific ValueError; focused3/3, Wealth Allocation28/28, independent PASS; G1/G2/adapter/metadata pass at sourceTree aeeb06ec9652ede69b7ebfe5f5047d358a7db787e2a6c43bbf28470376e4955e; evidence ledger1321 verified, missing/stale 0. Overall PARTIAL retained.",
+    "Incremental S019 Grok full_body explicit off now parses false; recognized boolean tokens normalized, unknown strings remain None; focused4/4, Grok suite16/16, compiler29/29, fake upload5/5; independent PASS; package gates pass at sourceTree bf11324939d8a4e588628f0a29cf58bd69e061456ee9dc8fe35d11e11b74b7f6; evidence ledger1334 verified, missing/stale 0. Overall PARTIAL retained.",
+    "Incremental Fund Screener report publication now stages same-directory output and atomically replaces only after successful complete write; injected partial stage failure preserves old hash and cleans stage; focused3/3, Fund Portfolio27/27, independent PASS; package G1/G2/adapter/metadata pass at sourceTree 26d75529de20183eb3c12f4a639481415e2cafea1343939f963d8044951ebe88; evidence ledger1345 verified. No AkShare/network. Overall PARTIAL retained.",
+    "Incremental Web Content Fetcher optional missing html2text/Scrapling now returns actionable nonzero CLI error with no traceback/output; mock success retains max_chars; focused3/3, suite13/13 including S052 lazy-image regressions, independent PASS; package G1/G2/adapter/metadata pass at sourceTree 0c97d3a74f6ee881dc2e9f6479f6a0557d2c7b9f303922fd2faad66aeb0c5bf4; ledger1356 verified. No network. Overall PARTIAL retained.",
+    "Incremental Venture Valuation now rejects exact/normalized/samefile assumptions-output aliases before reading/generation; distinct output succeeds; focused4/4, Venture Analysis23/23, independent PASS; package gates pass at sourceTree 44916ecdc7022b93185a55dd246128f587d6164e35d8279edb8ddd29a4785d31; evidence ledger1367 verified. Physical hardlink restricted; samefile mocked. Overall PARTIAL retained.",
+    "Incremental S027 sentiment_monitor rejects direct/normalized/samefile input-output aliases before input read; preserves source, distinct output valid; existing finite guards remain; focused4/4, Macro Research20/20, independent PASS; package gates pass at sourceTree b83c9e2894fb1ca63aa163654288049c57b9353854383a8fd7d40a94c8c48533; evidence ledger1378 verified. Samefile mocked; no route/USB proof. Overall PARTIAL retained.",
+    "Incremental Skills Search installed-layout fallback now scans <codex-root>/skills, returns unknown without audit catalog; packaged-root verified behavior unchanged; focused fixture PASS on Windows PowerShell 5.1 and PowerShell 7.6.5; BOM verified; independent PASS; package gates pass at sourceTree bf1d984d0e88dae673a864a32acfa8155c01c9d3830212f1229df698d5e78b04; evidence ledger1389 verified. Old S043 PS5.1 smoke only has no-BOM Chinese assertion harness issue. Overall PARTIAL retained.",
+    "Incremental S003 Financial Analyzer report now uses same-directory stage and atomic replace; injected write/replace failures preserve prior report/input and clean stage; focused3/3, China Stock Analysis51/51, independent PASS; package gates pass at sourceTree a3c386f6b88bf0e6b73e8b6a43678cd6ff9b040f57184c3020db08f4a28cbdc3; evidence ledger1400 verified. No provider/network. Overall PARTIAL retained.",
+    "Incremental S027 policy_analyzer now rejects object/list/number/boolean/blank values in text slots and collection text items; focused3/3, Macro Research23/23, independent PASS; 13 slots/3 collection fields extra-reviewed; package gates pass at sourceTree 6992a3d6fd2f901ce8aac4e68b8042e2c537dd2adec2a2c923f7d941809e9694; evidence ledger1411 verified. Does not validate claim truth. Overall PARTIAL retained.",
+    "Incremental S052 Web Content Fetcher truncation disclosure; helper returns explicit truncated state and CLI reports only actual truncation; focused5/5, CLI3/3, suite15/15, independent review PASS; G1/G2/adapter/metadata and diff-check pass at sourceTree 88c16ef25840902134720b3310bfa3e07455dffde869af0483ab9fddb6909001; evidence ledger1420 rows verified with zero missing/stale. S052 remains PARTIAL; natural route, real sites and USB runtime unverified.",
+    "Incremental S019 reference-upload now rejects HTTP at every redirect hop and final URL before verified=true; baseline reproduced HTTP downgrade acceptance; focused7/7, Grok suite16/16, independent audit PASS; G1/G2/adapter/metadata and diff-check pass at sourceTree adde286d139399f9b1ae153ef44e645ba9c1edfb796ed1c52d9d2eba37a2b826. No upstream request; Uguu behavior, routing and USB runtime remain unverified.",
+    "S045 invalid departure dates no longer fabricate a +30-day timeline; direct and plan entrypoints require calendar-valid YYYY-MM-DD before time calculations/preferences; timezone datetimes rejected; focused3/3, Travel Planner53/53, independent PASS; package gates passed at sourceTree 7c9725950d2ff61cf792e3d278d5f1b3b3cc3a0cc1098e838484f92275f667fb. Natural route/USB runtime unverified.",
+    "S030 shopping-list allergy contract fixed; plan-local restriction snapshot and shared alias filter; entire nested plan and finite nonnegative amounts validated before aggregation; CLI invalid nested rows fail closed with no traceback/partial stdout; focused11/11, Meal Planner56/56, second independent audit PASS; package gates passed at sourceTree 7c9725950d2ff61cf792e3d278d5f1b3b3cc3a0cc1098e838484f92275f667fb.",
+    "S003 data_fetcher now requires --allow-partial to retain/print partial data; no opt-in preserves an existing output and creates no new file, with concise component errors; opt-in partial and complete paths pass; failed result is never persisted. focused6/6, China Stock Analysis62/62, independent audit PASS; package gates passed at sourceTree 7c9725950d2ff61cf792e3d278d5f1b3b3cc3a0cc1098e838484f92275f667fb.",
+    "Feishu MCP Node floor unified with manifest >=22 in wrapper and config renderer; synthetic Node20 rejected, 22/24 accepted, rejected configuration sentinel preserved; focused2/2, adapter83 pass/25 superseded skips, independent audit PASS, PowerShell5.1 parse/BOM PASS; package gates passed at sourceTree 7c9725950d2ff61cf792e3d278d5f1b3b3cc3a0cc1098e838484f92275f667fb. Real Feishu launch/OAuth unverified.",
+    "Final-wave source package closure after S045/S030/S003/Feishu remediations: metadata refresh and G1 pass with 56 Skills/7 Agents, 408 manifest files and zero closure/hash mismatches; G2 Windows PowerShell 5.1 parses 16 files; adapter83/25 skips; metadata --check and git diff --check pass; evidence ledger1476 unique rows all paths/hashes verified, missing0/stale0. Meal Planner’s three user-authorized test-default files are absent.",
+    "S045 strict departure date CLI regression expanded to 4/4 focused and 54/54 suite; Painpoint Analyzer example/contract inconsistency fixed and independently reviewed; final package gates rerun at sourceTree 8624020f048c3da5f7684234f7581270735693bcda99896bb7e8426f9c049c48.",
+    "Remaining text-skill/local-source contract scan completed independently; no new strong candidate; S053 max-words remains insufficient evidence; no missing references sampled.",
+    "S037 PDF extraction partial-write candidate closed: same-directory staged write and atomic replace, fdopen descriptor cleanup, original error preservation; focused4/4 and independent second audit PASS; final package gates refreshed at sourceTree b7eb0ac9e555216a823d097098cc73579a6b22be35d0697db400a083645f4cec.",
+    "S049 Portfolio Tracker normalized benchmark collision closed: skill requires unique trimmed names; duplicate rejection, normal distinct entries, and CLI preservation independently pass; final package gates refreshed at sourceTree c9c14634d2e084a85f74aea93b254a8e69afad397aab8885367934909922f1e3.",
+    "S038 PowerPoint RGBColor documentation fixed and independently verified against locked wheel; S012 Excel format/formula claims narrowed to bundled openpyxl capability and independently smoke tested; final G1/G2/adapter/metadata/diff gates passed at sourceTree a33304d26e610df49bc724cfa80295c46d14d2611f9ab0f45e49dc326189ce0a.",
+    "S010 efficiency-toolkit file-organization safety guidance aligned with general/office boundaries; focused static contract 5/5 and independent read-only review PASS; report/evidence ledger current; S010 remains PARTIAL because natural route and runtime file-operation interception are untested.",
+    "G2 adapter suite rerun with TEMP/TMP inside writable workspace: 84 passed, 25 expected legacy skips; prior errors traced to default sandbox Temp permissions, not product test failures.",
+    "S010 password guidance corrected against current NIST SP 800-63B-4 and independently reviewed; unique passwords, manager/MFA, compromise-based rotation and single-factor 15-character scope; focused 4/4.",
+    "S040 recursive reparse-point and junction escape guidance hardened; source-contract 6/6 and independent read-only review PASS; no real junction operation executed; S040 remains PARTIAL.",
+    "S029 market-sizing formulas corrected for joint/conditional SAM filters, unequal segment weights, and annual ARPU double-counting; focused3/3, prior source smoke PASS, independent review PASS; overall PARTIAL retained because natural routing/live market data are unverified.",
+    "S046 user-research inference boundaries corrected: population estimates require a defensible probability sample/design, sample results stay n/N, validation template captures method/evidence/limits, and privacy/data-reuse rules are explicit; focused4/4, independent review PASS; overall PARTIAL retained because natural route/runtime/real research not tested.",
+    "Codex compatibility auditor false negative for multiline argparse declaration fixed using AST; focused marker5/5 incl docstring/comment/multiline edge cases; compatibility audit15 checks PASS; independent review PASS.",
+    "Final package gates after source updates: G1 56 Skills/7 Agents, 422 manifest/423 checksums, 424 audit-tree files excluding91 transient; PS5.1 17 files, compatibility15 checks, media MCP64/64, adapter84/25 expected skips, metadata/diff PASS. Evidence ledger 1586 unique IDs, missing0/stale0. Package sourceTreeSha256 66b18db14b98a713ed0d955cbf33872ac539be2d7fbd38715e9fb2abf2610a44.",
+    "Final S029/S046 rerun: S029 formula contract3/3 plus original source smoke PASS; S046 inference/privacy contract4/4; all evidence filed. Ledger finalized at 1589 unique IDs, missing0/stale0.",
+    "Final independent AST marker review PASS: static argparse literal detection handles multiline/comments/parentheses and excludes docstrings/ordinary strings; dynamic option expressions intentionally outside static scope.",
+    "S029 Consumer Markets Markdown fence defect fixed: replaced nested code fences with two inline formulas; focused contract expanded to include fence balance (4/4), original source smoke PASS, independent review confirms 9 fence pairs and correct arithmetic.",
+    "Latest post-S029 Markdown repair package sourceTreeSha256 1ead93f84590cb6f2843da1a633e177570634a3b87cf3605812c044a16461bbe; G1 tree SHA 76cd5f818940d74b45041835d131e84cee281eee0b61afbd2328fd6591bfce1a, 424 files/91 transient excluded; manifest422/checksums423. G2 compatibility15, marker5/5, PS51 17, media64, adapter84/25, metadata/diff PASS; ledger1600 unique, missing0/stale0.",
+    "Incremental S031 meeting-secretary send/sync authorization boundary and 35-minute agenda totals corrected; focused source-contract 4/4 and independent review PASS; G1/G2 package gates passed; natural USB route/new-source runtime remains unverified.",
+    "Incremental S035 offer-designer markup vs gross-margin formulas and evidence-gated STEP 4 components corrected; focused source-contract 4/4 and independent review PASS; G1/G2 package gates passed; natural USB route/new-source runtime remains unverified.",
+    "Incremental S036 painpoint-analyzer evidence boundary: filled five answers no longer imply validation; unknown/sample-scope/source labels added; focused5/5 and independent review PASS; overall PARTIAL retained.",
+    "Incremental S050 weather: ambiguous-location disambiguation, timezone labels, stale/malformed/mismatched response fail-closed and compact-format evidence gates; focused6/6 and independent review PASS; overall PARTIAL retained.",
+    "S056 xiaohongshu-writing source remediation: 9/9 contract tests and independent review PASS; package gates pass; G0 proxy 17/56 Skills and 4/7 Agent TOMLs; overall PARTIAL because natural routing and USB runtime provenance remain unverified.",
+    "S055 word-docx source contract corrected: UI promises structure verification and renderer-conditional visual inspection; path/no-overwrite/dependency/DOCM boundaries added; source tests 5/5, synthetic DOCX roundtrip 1/1, independent audit PASS; G1 56/7 and compatibility pass; overall PARTIAL pending natural route, USB runtime provenance and visual QA of revised source.",
+    "S013-S016 Feishu static source contracts strengthened to 8/8 and independently reviewed; G1/G2/metadata/diff gates pass; live MCP inventory confirms no Feishu tools, so runtime remains NOT_TESTABLE.",
+    "S028 current-source reconciliation: explicit-only route contract 2/2 rerun; G1/G2 evidence references and manifest count refreshed; G3 rows recounted to 9 PASS / 42 PARTIAL / 0 FAIL / 5 NOT_TESTABLE.",
+    "S028 frozen negative no-render vector: explicit local Codex CLI probe returned text-only Pythagorean explanation; runtime Skill hashes match USB source; no render/write observed; exit status was not exposed, so evidence remains PARTIAL.",
+    "G4 isolated source-Agent runtime retry completed with a precise external blocker: endpoint reachable, but isolated CODEX_HOME lacks an authorized bearer; no response or child events. Source TOML not implicated.",
+    "S052 Scrapling fetchers extra and locked wheelhouse validated: 62 locked Python packages/86 combined wheels; offline resolution and isolated install pass; loopback HTTP source smoke and 15 package tests pass. G1/G2 current-source closure refreshed. S052 remains PARTIAL for external page quality, natural Skill routing, and actual USB provisioner lifecycle.",
+    "S056 Codex CLI project-scoped natural-route positive/negative smoke used a byte-identical 3-file USB skill tree; positive trace read source SKILL.md, unrelated HR-email negative did not; overall S056 remains PARTIAL for installer lifecycle and broader prompts.",
+    "G0 local content-proxy hashes refreshed against current USB source c928d399...f3b037: 16/56 Skills exact matches, 40 differ, 0 missing; Agent TOMLs 4/7 exact, 3 differ. Content equality does not prove runtime load.",
+    "S056 frozen positive/negative vectors rerun from saved prompt files; exact USB-source project copy; independent review PASS; promoted to project-scoped exact-source PASS, not global install proof.",
+    "S031 current-source project harness route pair passed (positive with approved fixture, negative exact); focused contract 4/4, G1 metadata closure pass, independent audit pass; current source SHA c3d0e65ebecb09cdffb56dffdc9361be9183e354a4f54a7430cadc3499d36688; overall scoped PASS.",
+    "S048 video-prompt-generator current source exact frozen positive/negative route smoke passed; 4/4 source files matched, focused contract 6/6, independent audit PASS, no media generation.",
+    "S006 conversion-optimizer current USB source exact frozen positive/negative route smoke passed; 2/2 files matched, focused contract 8/8, independent audit PASS.",
+    "S035 offer-designer current USB source positive explicit-route smoke passed; 3/3 files matched, useful positioning/tier/pricing/sales-page output, independent review PASS."
+  ],
   "next_actions": [
-    "Run real sign/install/CCSwitch-tray/model-refresh/update/uninstall/recharge acceptance on a clean NTFS removable drive using release/usb-oneclick-g39.5-20260922-r16-account-retry-manager-final and the existing validated signer",
-    "Rebuild and replace the production signer with the r16 signer source only in a secure environment that provides the original compile-time administrator Key; do not ship the no-key compile artifact",
-    "If retesting CCSwitch on this workstation, first close the pre-existing external D:/AI/cc-switch instance so the single-instance smoke is isolated",
-    "Record target-machine evidence if any device-specific regression is found"
+    "Continue source-direct behavior/dependency/failure checks for remaining Skills where local offline evidence is feasible.",
+    "Keep each skill/agent terminal status separated into verified behavior, explicit runtime limitation, and external prerequisite; do not claim USB source routing from platform role tests.",
+    "G4 runtime closure requires an approved authentication method for isolated CODEX_HOME; do not copy the user profile auth file."
   ],
   "tests_run": [
-    "CCSwitch frontend serial Vitest: 223 passed across 37 files",
-    "npm run build, check, and lint: passed",
-    "Manager Rust library tests: 436 passed, 3 ignored",
-    "USB signer crate tests: 48 passed, GUI tests: 4 passed with compile-time embedded administrator credential",
-    "Capability-pack audit: 50 Skills, 7 Agents, 253 files, hashes and model policy passed",
-    "Adapter contract tests: 41 passed",
-    "USB bundle verification: latest MSIX, payload identity, manager binding, prerequisites and no static usb-license.json passed",
-    "G39.4 formal pair preflight: bundle, signer manifest, portable vault, profile, releaseId, keyId and public-key digest matched",
-    "G39.4 package verification: verify-usb.ps1 -InternalSigned -SkipNetwork passed; signer startup window smoke passed",
-    "G39.5/r7 archives created: complete rebuilt USB package and embedded-key signer package",
-    "G39.5/r8: model catalog 7/7, install transaction 13/13, command layer 27/27, engine full suite 179 passed + 1 ignored after lexical USB path fix, manager 445 passed + 3 ignored, frontend 361 passed, TypeScript/lint/format/target checks passed",
-    "Final signer: 48 core tests, clippy -D warnings, direct same-process compile-time credential verification, startup smoke, no text credential hits, no sub2api-config.json",
-    "Final package: 289-file USB directory, 8-file signer directory, package/payload/one-click/pair/CCSwitch/PE gates passed; both ZIP central directories contain all required entries",
-    "G39.5/r9: provider catalog unified-api-internal label, runtime model source, no fixed model list, CCSwitch static/network verification, manager rebuild, final2 USB package verification, and ZIP archive listing passed",
-    "G39.5/r10: single-bar progress UI, bounded/visible model refresh with post-install auto-refresh, USB startup status re-read/path normalization, password-card removal, 32 OfflineHome tests, 364 root frontend tests, model catalog 7/7, package/one-click/CCSwitch/network/PE/signing-pair gates and ZIP listing passed",
-    "G39.5/r11: fresh manager/launcher build, new r11 profile, fresh signer with embedded admin credential and portable vault, 289-file USB package, USB ZIP SHA-256 CF754FDB4953E7AB7CC8D72087C71D06DCA0BF65EEFF582F852C1286957ED818, separate signer ZIP SHA-256 16BFB98F22592237874F51D8E7A8789EB70FBB7B36A5DD38A3F9AF844EC6B359, package/payload/one-click/CCSwitch/network/PE/signing-pair/archive gates passed",
-    "G39.5/r12: portable fallback phase moved to interruptible Applying before first rename; uninstall handoff/encoded finalizer/bookkeeping reconciliation repaired; 447 manager Rust tests passed + 3 ignored, Windows x64/custom-protocol, TypeScript, ESLint and diff checks passed; fresh 289-file USB package manager SHA-256 B3DBAC10DFC27BD2A2858A28882E8E969716E77AF394BD53D247041B35C18A8D, USB ZIP SHA-256 08AE0767D39524C532F76ACA3FF04A62FB5D93F44968464BFC25AB35731EEE91, signer ZIP SHA-256 888F555EEA3282593CC149ED2BE07E66844D2312589AD4E11131FBF0B89F656C, package/payload/one-click/PE/signing-pair/archive gates passed",
-    "G39.5/r13: root cause confirmed as duplicate full-write extraction on removable media; manifest-directed one-pass app-tree streaming extraction plus per-file length checks and periodic progress logs added; engine 180 passed + 1 ignored plus real r13 MSIX transaction hook passed in 49.29s locally, manager 447 passed + 3 ignored, frontend 364 passed, TypeScript/ESLint/target/format/diff checks passed; 289-file USB package manager SHA-256 C1464191A9EB3A84283CF77B311173DC7E6FCDEDE373BFEAF37001C2AD3DF677, USB ZIP SHA-256 799393F47F0207CD21458617546C3767B64CF103BF366A0EFDBBF2B2261B0A83, signer ZIP SHA-256 7BF8ACCE06E29ABA890FF7FE20883303C307D853AD76345B774AE9541217CFAD, package/payload/one-click/PE/signing-pair/archive gates passed",
-    "G39.5/r14: extraction progress callback uses application-tree byte totals, reusable 1 MiB copy buffer and throttled UI events; manager exposes compact 404token recharge-code card with on-demand login and safe 400/409 errors; engine 180 + 1 ignored, manager 447 + 3 ignored, frontend 365, TypeScript/ESLint/Windows target/format/diff checks passed; r14 package and signer pair gates passed, manager SHA-256 DC75E35C0C1A050235E5211E3879E3573C29CAD81D1FE6399ED11F885DF85262",
-    "G39.5/r15: CCSwitch source rebuilt with USB provider bootstrap/retry and hidden tray startup; native model refresh uses bounded upstream retries and explicit 404token diagnostics; OfflineHome/managerApi 60/60, model catalog 7/7, CCSwitch manager 9/9, window engine 5 + helper, release tests 56/56, TypeScript/offline bundle/package/CCSwitch/PE/payload/signing-pair gates passed; complete directory manager SHA-256 2E6E02CE3DBD43412EFC7DBCE16C8C68A5B11890F6742272C0B0ACCCCD829C38 and CCSwitch SHA-256 927AF2AA40E2F5E1B08ECEF90C9BA8063DFB9667007E4F7AF12395463E867378",
-    "G39.5/r16: signer create-user stable idempotency/recovery fixture passed; signer 49 library + 4 GUI tests, manager account 10/10, full manager 451/3 ignored, root targeted UI 60/60, release 56/56, offline bundle, manager release build and r16 package/USB/one-click/payload/CCSwitch/PE/signing-pair gates passed; manager SHA-256 95711EE5FEA0BB375789075BF3FFDFF40C2C92E58F4F700C62A72ADA3888BDC0; signer production EXE intentionally retained until secure admin-Key build",
-    "G39.5/r16 final: native model-refresh renderer watchdog increased from 60s to 75s after timing audit; check/lint and targeted UI 60/60 passed; final 289-file package release/usb-oneclick-g39.5-20260922-r16-account-retry-manager-final rebuilt and package/one-click/payload/CCSwitch/PE/signing-pair verification passed; final manager SHA-256 9C216EAC5AF7EB2761699B4908003CE7DE8D4E592A82D4DD5CE7D10759A52BD8"
+    {
+      "command": "python -B docs/capability-audit-evidence-20261018/S003-financial-valuation-source-smoke-20261019.py",
+      "result": "passed",
+      "summary": "11/11 checks across five S003 scripts; independent audit passed; together with quote adapter 5/5, all six S003 scripts have focused helper checks; overall PARTIAL.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B docs/capability-audit-evidence-20261018/S049-wealth-allocation-source-smoke-20261019.py",
+      "result": "passed",
+      "summary": "9/9 synthetic checks across all three S049 scripts; independent audit passed; overall PARTIAL.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B docs/capability-audit-evidence-20261018/S017-fitness-db-source-smoke-20261019.py",
+      "result": "passed",
+      "summary": "4/4 isolated DB helper checks; temp directory cleaned; independent audit passed; overall PARTIAL.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "docs/capability-audit-evidence-20261018/S043-skills-search-source-smoke-20261019.ps1",
+      "result": "passed",
+      "summary": "5/5 source-search checks; independent audit passed; overall PARTIAL.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "evidence-manifest path/hash/unique-ID validator",
+      "result": "passed",
+      "summary": "350 unique records; zero missing evidence paths or SHA-256 mismatches.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B installer-pack/skills/grok-video-prompt-compiler/scripts/test_compile_prompt.py; python -B installer-pack/skills/grok-video-prompt-compiler/scripts/test_upload_reference.py (TEMP/TMP isolated under workspace tmp)",
+      "result": "passed",
+      "summary": "29/29 prompt compiler checks and 5/5 reference-helper checks; independent rerun passed; fake requests only; workspace temp cleaned; S019 remains PARTIAL. First default-temp attempt failed due sandbox temp permissions and is separately recorded.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "evidence-manifest path/hash/unique-ID validator",
+      "result": "passed",
+      "summary": "358 records; unique IDs; zero missing evidence paths and zero SHA-256 mismatches.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B docs/capability-audit-evidence-20261018/G4-current-usb-agent-official-schema-smoke-20261019.py",
+      "result": "passed",
+      "summary": "13/13 checks passed and independently rerun: seven TOMLs parse and meet required fields; pack, manifest and installer placement close. G4 remains INSUFFICIENT_EVIDENCE for runtime loading, routing, child lifecycle.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "evidence-manifest path/hash/unique-ID validator",
+      "result": "passed",
+      "summary": "362 records; unique IDs; zero missing paths or SHA-256 mismatches.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "powershell -NoProfile -ExecutionPolicy Bypass -File docs/capability-audit-evidence-20261018/S042-filesystem-protocol-smoke-20261019.ps1",
+      "result": "passed",
+      "summary": "7/7 source-contract and guarded synthetic filesystem protocol checks. No Codex model turn or Skill route was invoked; S042 remains PARTIAL.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python tools/refresh-capability-pack-metadata.py installer-pack; python tools/refresh-capability-pack-metadata.py --check installer-pack; python installer-pack/audit-codex-compatibility.py --root installer-pack --require-codex; powershell tools/verify-capability-pack-powershell.ps1 -Root installer-pack",
+      "result": "passed",
+      "summary": "313 manifest entries, 314 checksums; metadata check passed; all 15 compatibility checks passed; PowerShell BOM/parser gate passed for 14 files. G1 structural closure: 56 Skills, 7 Agents, zero package hash/closure mismatch. Current package tree SHA adbf19c5b466aa1b318da5de35f756f4b3313905e6528f761e633c16b70ffe2c.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "evidence-manifest path/hash/unique-ID validator",
+      "result": "passed",
+      "summary": "373 records, unique IDs, zero missing paths, zero SHA-256 mismatches; independent S042 review recorded.",
+      "timestamp": "2026-10-19"
+    },
+    "S009 source-pinned synthetic DOCX: ZIP/XML structure and placeholder fidelity passed; LibreOffice renderer unavailable, visual QA not run; remains PARTIAL.",
+    "Evidence manifest: 387 unique records, zero duplicate IDs, missing paths, or SHA-256 mismatches after refreshing three S042 current-package hashes.",
+    "S012 source-pinned workbook smoke: 7/7 passed; formula cache and native spreadsheet renderer remain untested.",
+    "G1 post-S012: 56 Skills/7 Agents; package tree d17112ad78160f2b974a443880feae920a24e95ddbecc20eb559c9704488a29e; 315 package files, 16 transient caches excluded.",
+    "Evidence manifest expanded to 400 unique records; final path/hash closure pending validation.",
+    "Final S012 ledger closure: 400 unique records, all evidence paths exist, all SHA-256 values match.",
+    "S012 independent rerun: generic synthetic openpyxl workbook smoke 7/7 passed in isolated unique temp; no Skill/model route evidence.",
+    "S012 setup wording aligned after independent review; final package tree d108a244e2d418d94087c36f6f312bef6e7ffdc15442d5b9af759724107c7a9f.",
+    "Final S012 manifest closure after independent audit and evidence renaming: 401 unique records, 0 path/hash/ID issues.",
+    "Final S012 package tree d108a244e2d418d94087c36f6f312bef6e7ffdc15442d5b9af759724107c7a9f; G1 56 Skills/7 Agents pass; compatibility 15/15.",
+    "S038 PowerPoint stale ClawHub install/update/feedback advice removed; package closure 56 Skills/7 Agents pass; compatibility 15/15.",
+    "S038 final package closure: G1 56 Skills/7 Agents, compatibility 15/15; package tree f0112507d031c20c9a1f832706f099627462a04a927c83cc76503e07ad134898.",
+    "Evidence manifest after S038: 405 unique entries; zero missing paths, hash mismatches, or duplicate IDs.",
+    "S038 independent review PASS; old source proxy marked historical, current G0/G1 references now use matching S038 G1 snapshot. S038 remains PARTIAL.",
+    "Final evidence manifest: 406 unique rows; 0 missing paths, hash mismatches, or duplicate IDs.",
+    "S052 offline adapter contract: 4/4 passed for lazy images, selector/link/image, full-page fallback/truncation, and missing-dependency fail-closed before request.",
+    "S052 G1: 56 Skills/7 Agents, zero closure/hash mismatches; tree 8d627667f454a32902579e18a5766b6d6cb0f709146fd20f32b32f6a4f3eda07; compatibility 15/15.",
+    "S052 evidence ledger currently 417 unique entries, zero path/hash/ID errors; independent review pending.",
+    {
+      "command": "python -B docs/capability-audit-evidence-20261018/S047-financial-model-source-smoke-20261019.py",
+      "result": "passed",
+      "summary": "15 numeric + 6 contract assertions; zero churn and NaN fail closed without report; independent rerun passed; S047 remains PARTIAL.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B docs/capability-audit-evidence-20261018/S047-venture-scripts-source-smoke-20261019.py",
+      "result": "passed",
+      "summary": "22 grouped assertions across business evaluator, valuation analyzer, and due diligence; two invalid-weight cases fail closed; independent rerun passed.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "evidence-manifest path/hash/unique-ID validator",
+      "result": "passed",
+      "summary": "451 records, 451 unique IDs, zero missing paths or SHA-256 mismatches; S047 source suite evidence added.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B -m unittest discover -s installer-pack/skills/wechat-article-creator/scripts -p test_polish_text.py -v",
+      "result": "passed",
+      "summary": "2/2 character-count and newline-count package regressions.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B docs/capability-audit-evidence-20261018/S054-wechat-article-scripts-source-smoke-20261019.py",
+      "result": "passed",
+      "summary": "9 source-direct assertions, including exact 40-million-pixel rejection message and no output; independent review passed; S054 remains PARTIAL.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B tools/refresh-capability-pack-metadata.py installer-pack --check; python -B installer-pack/audit-codex-compatibility.py --root installer-pack --json; powershell -NoProfile -ExecutionPolicy Bypass -File tools/verify-capability-pack-powershell.ps1 -Root installer-pack; python -B docs/audit-capability-pack.py installer-pack --json",
+      "result": "passed",
+      "summary": "315 manifest files / 316 checksums; compatibility 15/15; PowerShell encoding/parser 14 files; G1 56 Skills/7 Agents, zero closure/hash mismatches; tree SHA 0d9bb260753490771ad9af934b5cc746a59e8970e65b0570bb5b2b40df340f6d.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "evidence-manifest path/hash/unique-ID validator",
+      "result": "passed",
+      "summary": "461 rows, 461 unique IDs, zero missing paths, duplicate IDs, or SHA-256 mismatches after S054 evidence registration.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B docs/capability-audit-evidence-20261018/S037-pdf-processing-source-smoke-20261019.py",
+      "result": "passed",
+      "summary": "9 synthetic source-direct CLI assertions; rerun by two independent reviewers, no temp residue; limited to host Python/dependencies; S037 remains PARTIAL.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B -m unittest discover -s installer-pack/skills/web-search-extraction/scripts -p test_web_search_errors.py -v",
+      "result": "passed",
+      "summary": "8/8 mocked offline cases: no-key/no-model fail before network, safe HTTP/network error handling, response-size guard, empty and success response, JSON escaped-key redaction; urlopen patched and not sent. S053 remains NOT_TESTABLE for runtime routing.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "evidence-manifest path/hash/unique-ID validator",
+      "result": "passed",
+      "summary": "465 rows, 465 unique IDs, zero missing paths, duplicate IDs, or SHA-256 mismatches after all S054, S037 and S053 additions.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B docs/capability-audit-evidence-20261018/S053-web-search-additional-contract-smoke-20261019.py",
+      "result": "passed",
+      "summary": "19 source-direct contract assertions, all urllib.request.urlopen calls mocked: input/base URL fail-before-network, malformed response/key redaction, and success request endpoint/headers/payload. S053 remains NOT_TESTABLE for runtime routing.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B -m unittest discover -s installer-pack/skills/travel-planner/scripts -p test_travel_db_trip_id_uniqueness.py -v",
+      "result": "passed",
+      "summary": "S045 fixed-clock trip, expense, and itinerary item ID uniqueness regressions 3/3; isolated temp DB cleaned.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B -m unittest discover -s installer-pack/skills/travel-planner/scripts -p test_travel_db_corrupt_json.py -v; python -B -m unittest discover -s installer-pack/skills/travel-planner/scripts -p test_plan_generator_itinerary.py -v",
+      "result": "passed",
+      "summary": "S045 corrupt JSON regression 3/3; itinerary generator suite 13/13.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B installer-pack/test-adapter-contracts.py (TEMP/TMP under repository tmp)",
+      "result": "passed",
+      "summary": "80 passed, 25 skipped.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B installer-pack/audit-codex-compatibility.py --root installer-pack --json",
+      "result": "passed",
+      "summary": "G2 15 checks; ok=true; no warnings/errors.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B tools/refresh-capability-pack-metadata.py installer-pack --check; python -B docs/audit-capability-pack.py installer-pack",
+      "result": "passed",
+      "summary": "Metadata 330/331; G1 56 Skills/7 Agents, 332 files/18 transient, no closure/hash mismatches; package tree 4a2af87763148bd4f2b26893b2c9b0d06db035af09f6375112db78917219b659. Initial G1 hash mismatch was due CRLF introduced by a source rewrite; normalized touched Python files to LF and reran successfully.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python docs/capability-audit-evidence-20261018/finalize-evidence-manifest.py; python docs/capability-audit-evidence-20261018/verify-evidence-manifest.py",
+      "result": "passed",
+      "summary": "710 unique evidence rows; zero missing paths, stale hashes, or duplicate IDs.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B -m unittest discover -s installer-pack/skills/fund-portfolio/scripts -p test_sip_calculator_overflow.py -v",
+      "result": "passed",
+      "summary": "S018 SIP suite 5/5; bool True/False rejected in all numeric parameters, valid annuity/CLI behavior retained; independent read-only rerun passed 5/5.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B installer-pack/test-adapter-contracts.py (TEMP/TMP under repository tmp)",
+      "result": "passed",
+      "summary": "80 passed, 25 skipped after S018 bool validation patch.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B installer-pack/audit-codex-compatibility.py --root installer-pack --json; python -B docs/audit-capability-pack.py installer-pack; python -B tools/refresh-capability-pack-metadata.py installer-pack --check",
+      "result": "passed",
+      "summary": "G2 15 checks; G1 56 Skills/7 Agents, 332 files/18 transient, no mismatch; metadata 330/331; package tree f16acde4cd468fe55e65f187611df16bd73c1ff69f42d36c14cc822be4dd653a.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "Evidence manifest finalizer and verifier",
+      "result": "passed",
+      "summary": "720 unique rows; zero missing paths, stale hashes, or duplicate IDs.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B installer-pack/test-adapter-contracts.py (TEMP/TMP under repository tmp)",
+      "result": "passed",
+      "summary": "81 passed, 25 skipped; added financial helper bool rejection vectors across 4 modules, existing valid fixtures retained. Independent rerun also 81/25.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B installer-pack/audit-codex-compatibility.py --root installer-pack --json; python -B docs/audit-capability-pack.py installer-pack; python -B tools/refresh-capability-pack-metadata.py installer-pack --check",
+      "result": "passed",
+      "summary": "G2 15 checks; G1 56 Skills/7 Agents, 332 files/19 transient, no mismatches; metadata 330/331; tree 20c87e0c12e1e5fd7ebab5f733d4a3544c07907cf28ab2cd245f23d44ea0ba9d.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "Evidence manifest finalizer and verifier",
+      "result": "passed",
+      "summary": "733 unique records; zero missing paths, stale hashes, or duplicate IDs.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B installer-pack/test-adapter-contracts.py (TEMP/TMP under repository tmp)",
+      "result": "passed",
+      "summary": "Final S004 expanded suite: 81 passed, 25 skipped; all 14 bool-valued fields across five helpers rejected; independent reviewer reran 81/25.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B installer-pack/skills/pdf-processing-toolkit/scripts/test_pdf_tool_output_aliases.py -v",
+      "result": "passed",
+      "summary": "6 focused cases: 5 passed, one actual hardlink skipped (Windows WinError 5); samefile mocked, CLI exit 2 and unchanged PDF SHA verified; independent rerun passed.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B installer-pack/test-adapter-contracts.py",
+      "result": "passed",
+      "summary": "81 passed, 25 skipped after S037 output-alias source regression; independent focused audit passed 6 cases (one hardlink environment skip).",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B installer-pack/audit-codex-compatibility.py --root installer-pack --json; python -B docs/audit-capability-pack.py installer-pack; python -B tools/refresh-capability-pack-metadata.py installer-pack --check",
+      "result": "passed",
+      "summary": "G2 15 checks no warnings/errors; G1 56 Skills/7 Agents, 333 files/20 transient, zero mismatches; metadata 331 manifest/332 checksum; tree 3d8125ae…; sourceTree c10e9f36….",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "Evidence manifest finalizer and verifier",
+      "result": "passed",
+      "summary": "748 unique records; zero missing paths, stale hashes, or duplicate IDs.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B -m unittest discover -s installer-pack/skills/wealth-allocation/scripts -p test_rebalance_output_aliases.py -v",
+      "result": "passed",
+      "summary": "4/4 passed; current-as-output and normalized target alias rejected with exit 1/JSON error, both source hashes unchanged; samefile mocked branch and separate-output success verified; independent rerun 4/4.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B installer-pack/test-adapter-contracts.py",
+      "result": "passed",
+      "summary": "81 passed, 25 skipped after S049 output-alias source fix.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B installer-pack/audit-codex-compatibility.py --root installer-pack --json; python -B docs/audit-capability-pack.py installer-pack; python -B tools/refresh-capability-pack-metadata.py installer-pack --check",
+      "result": "passed",
+      "summary": "G2 15 checks no warnings/errors; G1 56 Skills/7 Agents, 334 files/20 transient, zero mismatches; metadata 332 manifest/333 checksum; tree c6978e52…; sourceTree 9fa8370b….",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "Evidence manifest finalizer and verifier",
+      "result": "passed",
+      "summary": "759 unique records; zero missing paths, stale hashes, or duplicate IDs.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B -m unittest discover -s installer-pack/skills/travel-planner/scripts -p test_plan_export_output_aliases.py -v",
+      "result": "passed",
+      "summary": "4/4 passed; output aliases to trips/preferences DB rejected, both DB hashes preserved; distinct output works; samefile mocked; independent rerun 4/4.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B -m unittest discover -s installer-pack/skills/travel-planner/scripts -p test_*.py -v",
+      "result": "passed",
+      "summary": "Travel planner script suites 23/23 passed.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B installer-pack/test-adapter-contracts.py",
+      "result": "passed",
+      "summary": "81 passed, 25 skipped after S045 travel export alias fix.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B installer-pack/audit-codex-compatibility.py --root installer-pack --json; python -B docs/audit-capability-pack.py installer-pack; python -B tools/refresh-capability-pack-metadata.py installer-pack --check",
+      "result": "passed",
+      "summary": "G2 15 checks no warnings/errors; G1 56 Skills/7 Agents, 335 files/20 transient, zero mismatches; metadata 333 manifest/334 checksum; tree 65c57832…; sourceTree bd3bed73….",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "Evidence manifest finalizer and verifier",
+      "result": "passed",
+      "summary": "771 unique records; zero missing paths, stale hashes, or duplicate IDs.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B -m unittest discover -s installer-pack/skills/travel-planner/scripts -p test_travel_db_trip_status.py -v",
+      "result": "passed",
+      "summary": "3/3 passed; plural ideas normalized to idea and retrievable, current/past/idea persist, unknown status raises before DB/input mutation; independent rerun 3/3.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B -m unittest discover -s installer-pack/skills/travel-planner/scripts -p test_*.py -v",
+      "result": "passed",
+      "summary": "Full travel planner script regression discovery 26/26 passed; independent rerun 26/26.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B installer-pack/test-adapter-contracts.py",
+      "result": "passed",
+      "summary": "81 passed, 25 skipped after trip status contract fix.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B installer-pack/audit-codex-compatibility.py --root installer-pack --json; python -B docs/audit-capability-pack.py installer-pack; python -B tools/refresh-capability-pack-metadata.py installer-pack --check",
+      "result": "passed",
+      "summary": "G2 15 checks no warnings/errors; G1 56 Skills/7 Agents, 336 files/20 transient, zero mismatches; metadata 334 manifest/335 checksum; tree 6497df84…; sourceTree e879d12a….",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "Evidence manifest finalizer and verifier",
+      "result": "passed",
+      "summary": "783 unique records; zero missing paths, stale hashes, or duplicate IDs.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B -m unittest discover -s installer-pack/skills/travel-planner/scripts -p test_travel_db_atomic_save.py -v",
+      "result": "passed",
+      "summary": "2/2 passed; unserializable add_trip data preserves exact old DB bytes/hash and prior trip remains readable; mocked os.replace failure also preserves source and leaves no temp; independent rerun 2/2.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B -m unittest discover -s installer-pack/skills/travel-planner/scripts -p test_*.py -v",
+      "result": "passed",
+      "summary": "Full travel planner script regression discovery 28/28 passed; independent rerun 28/28.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B installer-pack/test-adapter-contracts.py",
+      "result": "passed",
+      "summary": "81 passed, 25 skipped after atomic travel DB save implementation.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B installer-pack/audit-codex-compatibility.py --root installer-pack --json; python -B docs/audit-capability-pack.py installer-pack; python -B tools/refresh-capability-pack-metadata.py installer-pack --check",
+      "result": "passed",
+      "summary": "G2 15 checks no warnings/errors; G1 56 Skills/7 Agents, 337 files/20 transient, zero mismatches; metadata 335 manifest/336 checksum; tree 5f1ec76a…; sourceTree da2992a9….",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "Evidence manifest finalizer and verifier",
+      "result": "passed",
+      "summary": "795 unique records; zero missing paths, stale hashes, or duplicate IDs.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B installer-pack/test-skill-db-atomic-save.py -v",
+      "result": "passed",
+      "summary": "Cross-Skill 3/3; serialization errors and mocked replace errors preserve prior bytes/readable record and clean temp; valid save completes for all three DBs; independent rerun 3/3.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B -m unittest discover -s installer-pack/skills/meal-planner/scripts -p test_*.py -v; fitness-coach and daily-reflection equivalent discovery",
+      "result": "passed",
+      "summary": "Meal planner 10/10; fitness coach 22/22; daily reflection 5/5; all independent reruns passed.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B installer-pack/test-adapter-contracts.py",
+      "result": "passed",
+      "summary": "81 passed, 25 skipped after cross-Skill atomic JSON write hardening.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B installer-pack/audit-codex-compatibility.py --root installer-pack --json; python -B docs/audit-capability-pack.py installer-pack; python -B tools/refresh-capability-pack-metadata.py installer-pack --check",
+      "result": "passed",
+      "summary": "G2 15 checks no warnings/errors; G1 56 Skills/7 Agents, 338 files/20 transient, zero mismatches; metadata 336 manifest/337 checksum; tree 91441d9a…; sourceTree a91fd0e7….",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "Evidence manifest finalizer and verifier",
+      "result": "passed",
+      "summary": "811 unique records; zero missing paths, stale hashes, or duplicate IDs.",
+      "timestamp": "2026-10-19"
+    },
+    "2026-10-19 S003 cache horizon unittest 5/5; adapter contracts 81 passed/25 skipped; G1 56 Skills/7 Agents zero mismatches; G2 15 checks ok; metadata 337/338; evidence manifest 819 unique with zero missing/stale.",
+    "2026-10-19 Agent file boundary static tests 3/3; independent rerun 3/3; G1 56 Skills/7 Agents zero mismatches; G2 15 checks ok; metadata 338/339; evidence ledger 826 unique, no missing/stale.",
+    "2026-10-19 S045 budget focused 6/6; entire travel script suite 34/34; adapter 81/25; G1 56 Skills/7 Agents, 341 files/20 transient, zero mismatch; G2 15 checks ok; metadata 339/340; evidence ledger 835 unique and closed.",
+    "S045 budget: focused 6/6; Travel Planner full suite 34/34; adapter 81/25; G1 56 Skills/7 Agents, 341 files/20 transient no mismatches; G2 15 checks; metadata 339/340; evidence ledger 835 unique no missing/stale.",
+    "2026-10-19 S053 response parsing 13/13 mocked offline; adapter 81/25; G1 56 Skills/7 Agents, 341 files/20 transient, zero mismatch; G2 15 checks; metadata 339/340; evidence ledger 843 unique with no missing/stale.",
+    {
+      "command": "S054 wechat unittest; S049 portfolio tracker; S017 fitness coach; S030 meal planner; package adapter, G1/G2 and metadata checks",
+      "result": "passed",
+      "summary": "S054 12/12; S049 focused 6/6/full 10/10; S017 focused 5/5/full 27/27; S030 focused 5/5/full 15/15; adapter 81 passed/25 skipped; G1 56 Skills/7 Agents, 344 tree files/20 transient, zero mismatches; G2 15 checks; metadata 342 manifest/343 checksums; evidence 858 unique, zero missing/stale.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "Fund Portfolio output alias suite + full scripts; Grok output alias unittest + existing 29 compiler function tests; G1/G2/adapter and metadata",
+      "result": "passed",
+      "summary": "Fund focused 5/5/full 10/10; Grok focused 5/5/existing 29/29; independent audits PASS; G1 56 Skills/7 Agents, 346 tree/20 transient; G2 15; adapter 81 passed/25 skipped; metadata 344/345, sourceTree e03ffa98…; ledger 866 unique, zero missing/stale.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "Grok compiler/upload path-alias suite; S003 valuation output-alias suite; package G1/G2/adapter and metadata",
+      "result": "passed",
+      "summary": "Grok aliases 12/12, existing helpers 34/34; valuation aliases 6/6; independent audits PASS; G1 56 Skills/7 Agents, 348 tree/20 transient; G2 15; adapter 81 passed/25 skipped; metadata 346/347, sourceTree b73dd983…; ledger 875 unique, zero missing/stale.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S003 financial analyzer output-alias unittest; G1/G2/adapter and metadata",
+      "result": "passed",
+      "summary": "Focused 6/6; independent audit PASS; G1 56 Skills/7 Agents, 349 audit tree/20 transient; G2 15; adapter 81/25; metadata 347/348, sourceTree 969db279…; evidence ledger 881 unique, zero missing/stale.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S018 venture valuation finite-result tests; G1/G2/adapter and metadata",
+      "result": "passed",
+      "summary": "Overflow and normal-input regressions 2/2; independent audit PASS; G1 56 Skills/7 Agents, 350 tree/20 transient; G2 15; adapter 81/25; metadata 348/349, sourceTree aa4ca7b3…; evidence ledger 888 unique, zero missing/stale.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S027 sentiment finite-result tests; G1/G2/adapter and metadata",
+      "result": "passed",
+      "summary": "Volume ratio/flow overflow, no output on error, normal JSON 4/4; independent audit PASS; G1 56 Skills/7 Agents, 351 tree/20 transient; G2 15; adapter 81/25; metadata 349/350, sourceTree 15ff825d…; ledger 895 unique, zero missing/stale.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S003 valuation alias + DCF boundary/overflow regression suites; G1/G2/adapter and metadata",
+      "result": "passed",
+      "summary": "Combined 9/9; independent audit PASS; G1 56 Skills/7 Agents, 352 tree/20 transient; G2 15; adapter 81/25; metadata 350/351, sourceTree 0f3e1eb8…; evidence ledger 902 unique, zero missing/stale.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S049 asset allocator focused/full suites; current G1/G2/adapter and metadata gates",
+      "result": "passed",
+      "summary": "Focused 8/8; full suite 18/18; independent audit PASS; G1 56 Skills/7 Agents, 353 audit files/20 transient; G2 15; adapter 81 passed/25 skipped; metadata 351/352, sourceTree 7f13682c…; evidence ledger 910 unique, zero missing/stale.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S018 fund portfolio overflow focused/full suites; current G1/G2/adapter and metadata gates",
+      "result": "passed",
+      "summary": "Focused 9/9; full suite 14/14; independent audit PASS; G1 56 Skills/7 Agents, 353 audit files/20 transient; G2 15; adapter 81 passed/25 skipped; metadata 351/352, sourceTree be5d5838…; evidence ledger 918 unique, zero missing/stale.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S018 venture financial_model focused/full suites; current G1/G2/adapter and metadata gates",
+      "result": "passed",
+      "summary": "Focused 6/6; full venture-analysis suite 8/8; independent audit PASS; G1 56 Skills/7 Agents, 354 audit files; G2 15; adapter 81 passed/25 skipped; metadata 352/353, sourceTree bfb7615d…; evidence ledger 926 unique, zero missing/stale.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S049 rebalance overflow baseline/focused/full tests; current G1/G2/adapter and metadata gates",
+      "result": "passed",
+      "summary": "Legacy-equivalent baseline reproduces exit 0 Infinity; focused 7/7; full Wealth Allocation suite 21/21; independent audit PASS; G1 56 Skills/7 Agents, 354 audit files; G2 15; adapter 81 passed/25 skipped; metadata 352/353, sourceTree e3d9f340…; evidence ledger 935 unique, zero missing/stale.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S018 risk assessor alias baseline/focused/full suite; current G1/G2/adapter and metadata gates",
+      "result": "passed",
+      "summary": "Baseline exit 0 overwrote portfolio input; focused 6/6; full fund-portfolio suite 20/20; independent audit PASS; G1 56 Skills/7 Agents, 355 audit files; G2 15; adapter 81 passed/25 skipped; metadata 353/354, sourceTree ceee120d…; evidence ledger 943 unique, zero missing/stale.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S049 portfolio tracker overflow baseline/focused/full suite; current G1/G2/adapter and metadata gates",
+      "result": "passed",
+      "summary": "Baseline exit 0 with Infinity; focused 10/10; full Wealth Allocation 25/25; independent audit PASS; G1 56 Skills/7 Agents, 355 audit files; G2 15; adapter 81 passed/25 skipped; metadata 353/354, sourceTree 138af756…; evidence ledger 951 unique, zero missing/stale.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S045 negative expense and cumulative overflow baseline/remediation; focused/full Skill tests; independent audit; package G1/G2/adapter/metadata",
+      "result": "passed",
+      "summary": "Legacy negative-expense and cumulative Infinity behaviors reproduced; focused 5/5; Travel Planner full suite 39/39; independent audit PASS; G1 56 Skills/7 Agents, 356 audit tree files with no closure mismatches; G2 15 checks; adapter 81 passed/25 superseded fixtures skipped; metadata 354/355, sourceTree d30108276f46…; evidence ledger 962 unique rows, zero missing/stale/duplicate.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S017 negative-repetition baseline/remediation, focused and full Fitness Coach suites, independent review, package G1/G2/adapter/metadata",
+      "result": "passed",
+      "summary": "Legacy negative reps reproduced (-600 volume, ~40 estimated 1RM); focused 7/7; full Fitness Coach suite 34/34 and independent rerun 34/34; G1 56 Skills/7 Agents, 357 audit-tree files with zero closure mismatches; G2 15 checks; adapter 81 passed/25 superseded fixtures skipped; metadata 355/356, sourceTree 49953fa8408c…; evidence ledger 971 unique rows closed.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S007 historical weekly habit-range baseline/remediation, focused/full Daily Reflection suites, independent audit, Agent TOML second pass, package G1/G2/adapter/metadata",
+      "result": "passed",
+      "summary": "Legacy mismatch reproduced (Oct 5–11 review returned Oct 12 log and 0% vs expected 100%); focused 8/8; Daily Reflection full suite 13/13 and independent rerun 13/13; Agent TOML second-pass source review found no new concrete source defect; G1 56 Skills/7 Agents, 358 audit-tree files without closure mismatches; G2 15; adapter 81 passed/25 superseded skips; metadata 356/357, sourceTree 3e054041cc15…; evidence ledger 981 unique records closed.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B installer-pack/skills/china-stock-analysis/scripts/test_data_fetcher_malformed_cache_shape.py -v; China Stock Analysis script suite; G1/G2/adapter/metadata gates",
+      "result": "passed",
+      "summary": "S003 malformed cache baseline reproduced; focused 3/3, full China Stock Analysis 23/23, independent audit PASS, G1/G2/adapter/metadata passed; evidence ledger 1038 rows closed. Adapter run used repo-local TEMP/TMP after sandbox denied system temp.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B installer-pack/skills/china-stock-analysis/scripts/test_technical_analysis_flat_market.py -v; China Stock Analysis full suite; G1/G2/adapter/metadata gates",
+      "result": "passed",
+      "summary": "Legacy flat-price misclassification reproduced; targeted 5/5, full S003 suite 28/28, independent audit PASS; package G1/G2/adapter/metadata passed; evidence ledger 1046 rows closed.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B installer-pack/skills/fund-portfolio/scripts/test_fund_screener_finite_thresholds.py -v; Fund Portfolio full suite; G1/G2/adapter/metadata gates",
+      "result": "passed",
+      "summary": "Legacy NaN bypass reproduced; Decimal direct-API boundary found and fixed after first independent review; second-round independent PASS; focused 2/2, suite 22/22, package G1/G2/adapter/metadata passed; ledger 1055 rows closed.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B installer-pack/skills/fund-portfolio/scripts/test_risk_assessor_large_integer.py -v; Fund Portfolio suite; G1/G2/adapter/metadata gates",
+      "result": "passed",
+      "summary": "Legacy 10**400 OverflowError traceback reproduced; now stable JSON error, no output, input preserved; focused 2/2, suite 24/24, independent PASS; package gates passed; ledger 1063 rows closed.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "python -B installer-pack/skills/china-stock-analysis/scripts/test_realtime_quote_minute_volume_buckets.py -v; China Stock Analysis suite; package gates",
+      "result": "passed",
+      "summary": "Legacy 09:25 unbucketed denominator reproduced; focused 3/3, full suite 31/31, independent PASS; G1/G2/adapter/metadata passed; evidence ledger 1071 rows closed.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "Meal Planner complete unittest suite; independent audit; G1/G2/adapter/metadata; evidence manifest finalizer/verifier",
+      "result": "passed",
+      "summary": "Output-parent legacy failure reproduced duplicate plans 1->2; staged report before persistence and compensating rollback fixed. Meal Planner 22/22; independent audit and rerun PASS; G1/G2/adapter/metadata passed; evidence ledger 1079 unique, zero missing/stale/duplicate.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S003 stock_screener finite JSON focused 4; complete China Stock Analysis suite; independent A0 audit; G1/G2/adapter/metadata; evidence ledger verification",
+      "result": "passed",
+      "summary": "Legacy synthetic provider produced invalid NaN JSON; now null normalization, non-finite sort exclusion, allow_nan=False and output preservation on serializer error. Focused 4/4, full suite 35/35, independent PASS and 35/35 rerun; G1/G2/adapter/metadata passed; evidence ledger 1089 unique and closed.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S017 baseline reproduction; focused 3; full Fitness Coach suite; independent audit; G1/G2/adapter/metadata; evidence ledger verification",
+      "result": "passed",
+      "summary": "Missing output parent previously persisted a plan and retry duplicated it (0→1→2). Now stages before DB mutation and atomically publishes; publication failure restores original programs DB. Focused 3/3, full 37/37, independent PASS; G1 56/7 with 371 audit-tree files and 20 transient exclusions; G2 15; adapter 81/25; metadata 369/370; evidence ledger 1110 IDs closed. Forced process interruption/concurrent DB writer remain limits; no natural route/runtime claim.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S037 synthetic PDF merge partial-writer failure baseline",
+      "result": "reproduced",
+      "summary": "Old merge opened existing output with wb before writer.write; synthetic writer wrote PARTIAL-PDF then raised OSError, changing sentinel bytes and SHA. Contract frozen for same-directory staging and atomic replace.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S037 baseline reproduction; focused 2; full PDF helper suite; runtime smoke; independent audit; G1/G2/adapter/metadata; evidence ledger verification",
+      "result": "passed",
+      "summary": "Fake writer partially overwrote sentinel before error on baseline. Current merge stages/fsyncs/verifies then atomically replaces; failed writer preserves old bytes and cleans temp. Focused2/2; full8 pass/1 hard-link ACL skip; smoke and two-input synthetic merge audit pass; package gates pass; evidence ledger 1122 rows closed. Crash/ACL/routing remain unverified.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S045 isolated synthetic CLI baseline for destination null/list and budget null",
+      "result": "reproduced",
+      "summary": "All three malformed persisted trip shapes exited 1 with uncaught AttributeError traceback; frozen contract requires concise field-specific ValueError and valid mapping compatibility.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S045 baseline reproduction; focused 4; full Travel Planner suite; independent audit; G1/G2/adapter/metadata; evidence ledger verification",
+      "result": "passed",
+      "summary": "destination null/list and budget null formerly leaked AttributeError tracebacks. Current validation returns field-specific errors; focused4/4, full43/43, independent PASS; G1 56/7 with 373 audit-tree files/21 transient exclusions; G2 passes; adapter81/25; metadata371/372; ledger 1133 rows closed. Top-level nonmapping CLI specific case and natural route/runtime remain unverified.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S052 mocked fetch baseline for max_chars -1 and 0",
+      "result": "reproduced",
+      "summary": "Mocked HTML converter returns 401 chars; old API silently returned 400 chars for -1 and empty body for 0. Contract requires positive integer validation before imports/network.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S052 baseline -1/0 reproduction; focused 3; full Web Content Fetcher suite; independent audit; G1/G2/adapter/metadata; evidence ledger verification",
+      "result": "passed",
+      "summary": "401-char mocked body previously returned 400 for -1 and empty for 0. API/CLI now validate positive integers before optional imports/network; focused3/3, full10/10, independent PASS; G1 56/7 and 374 audit files/24 transient; G2 pass; adapter81/25; metadata372/373; ledger1144 closed.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S047 injected partial Path.write_text failure baseline",
+      "result": "reproduced",
+      "summary": "Old checklist sentinel was replaced by partial UTF-8 Markdown bytes before injected OSError; CLI returned 1. Contract requires staging and atomic replacement.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S047 partial-write baseline; focused 3; full Venture Analysis suite; independent audit; G1/G2/adapter/metadata; evidence ledger verification",
+      "result": "passed",
+      "summary": "Injected partial direct write previously changed existing checklist bytes. Current same-directory stage+fsync+replace preserves old bytes on stage and replace failure; Markdown/JSON success tests pass. Focused3/3, full16/16, independent PASS; G1 56/7,375 audit files/31 transient; G2 pass; adapter81/25; metadata373/374; ledger1155 closed.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S054 unsupported cover extension side-effect baseline",
+      "result": "reproduced",
+      "summary": "generate_cover(.txt) raised ValueError but created a previously absent parent directory before checking suffix. Contract requires early validation before rendering/filesystem mutation.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S054 baseline unsupported extension; focused 2; full WeChat Article Creator suite; independent audit; G1/G2/adapter/metadata; evidence ledger verification",
+      "result": "passed",
+      "summary": "Unsupported .txt previously created parent directory before error; suffix now validated before render and mkdir. Focused2/2, full14/14, independent PASS; JPG/JPEG/PNG reopen; G1 56/7,376 files/36 transient; G2 pass; adapter81/25; metadata374/375; ledger1166 closed.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S003 fake-provider oversized optional numeric baseline",
+      "result": "reproduced",
+      "summary": "Fake stock basic-info provider returned total market cap 10**400; get_stock_info leaked OverflowError from safe_float instead of treating invalid optional value as missing.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S003 data_fetcher overflow baseline; focused 3; full China Stock Analysis suite; independent audit; G1/G2/adapter/metadata; evidence ledger verification",
+      "result": "passed",
+      "summary": "Fake provider 10**400 optional market cap previously leaked OverflowError; current safe_float returns None and preserves other record fields. Focused3/3, full42/42, independent PASS; G1 56/7, 377 files/37 transient; G2 pass; adapter81/25; metadata375/376; ledger1177 closed.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S030 isolated null-gender Meal Planner CLI baseline",
+      "result": "reproduced",
+      "summary": "Initialized profile with valid numeric fields but gender=null leaked AttributeError at gender.lower(); plan output remained absent. Frozen contract requires supported string validation and concise CLI ValueError handling.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S030 null-gender baseline; focused 3; full Meal Planner suite; independent audit; G1/G2/adapter/metadata; evidence ledger verification",
+      "result": "passed",
+      "summary": "Null gender previously leaked AttributeError; current validation rejects missing/null/nonstring/unsupported values before formula and preserves male/female results. Focused3/3, full25/25, independent PASS; G1 56/7 and 378 audit files/37 transient; G2 pass; adapter81/25; metadata376/377; ledger1188 closed.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S030 isolated bool-profile Meal Planner CLI baseline",
+      "result": "reproduced",
+      "summary": "age=true, height_cm=false, weight_kg=false previously produced ZeroDivisionError traceback in macro percentages with no report output.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S030 numeric profile focused/full tests, independent audit, G1/G2/adapter/metadata, evidence ledger",
+      "result": "passed",
+      "summary": "Finite positive non-bool numeric validation plus derived BMR/TDEE/target/macro denominator guards; focused5/5, Meal Planner30/30, independent PASS; G1 56/7 with 379 tree files/37 transient and zero mismatches; G2 ok; adapter81/25; metadata377/378 sourceTree b6e8088c9f2f61ddd3057484958b65184a58e83b0ca704ed49a011d7d1e4857f; ledger1200 all paths/hashes valid.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S054 fixed-clock same-title draft collision baseline",
+      "result": "reproduced",
+      "summary": "Two create_article calls with identical frozen timestamp/title returned the same Markdown path; second write replaced the USER EDIT SENTINEL with a fresh template. Isolated WECHAT_ARTICLE_DATA_DIR only.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S054 same-title draft collision and partial-write baselines; focused/full tests; independent review; package gates; evidence ledger",
+      "result": "passed",
+      "summary": "Frozen time duplicated title path and overwrote sentinel; injected post-create OSError left partial 50-byte draft. Exclusive open with suffix retries and owned partial cleanup fixes both; CLI concise failure. Focused3/3, full17/17, independent review PASS with narrow cleanup-reporting limit; G1 56/7 380 tree/37 transient no mismatches, G2 ok, adapter81/25, metadata378/379 sourceTree f4c1dadd3d6253b951c90401fae3f748c1fc87fc5ea33a0eb6e396b9ed83a5aa; ledger1214 closed.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S051 isolated weather config partial-write baseline",
+      "result": "reproduced",
+      "summary": "Injected Set-Content writes invalid JSON prefix then throws; isolated config SHA changes, post-failure JSON parse fails; only isolated config present. weather_db.ps1 unchanged.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S051 weather config partial-write baseline; PS5.1/PS7 harness; independent audit; G1/G2/adapter/metadata; evidence ledger",
+      "result": "passed",
+      "summary": "Old Set-Content partial write corrupted isolated config; now stage file CreateNew, Replace/Move and cleanup. PS5.1/PS7 both pass set/get, stage-write failure, locked destination failure, old SHA unchanged, no stage residue; independent PASS including CLI exit1; G1 56/7 381 tree/37 transient zero mismatch; G2 ok; adapter81/25; metadata379/380 sourceTree 16c55e13fdd06587b804447ce43bc82326558dfbbd589097aa0e764bc6962d0c; ledger1226 closed.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S037 isolated PDF generate partial-output baseline",
+      "result": "reproduced",
+      "summary": "Fake Canvas limited to an explicit repository tmp output path truncated sentinel bytes, wrote a 27-byte PDF prefix, then raised from save; failure caught and only isolated target changed. No real renderer.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S037 fake-Canvas generate partial-write baseline",
+      "result": "reproduced",
+      "summary": "Existing target sentinel was truncated and a PDF prefix written before injected save OSError.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S037 focused and PDF scripts regression suite",
+      "result": "passed_with_environment_skip",
+      "summary": "Focused 2/2; suite 9 passed and 1 hardlink test skipped due WinError 5. Local PDF generation/reopen/extract/merge smoke and independent audit passed.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S047 401-digit market.tam CLI baseline",
+      "result": "reproduced",
+      "summary": "Legacy CLI leaked OverflowError traceback; no output file.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S047 focused and Venture Analysis regression suite",
+      "result": "passed",
+      "summary": "Focused 3/3; full suite 19/19; independent audit passed; invalid CLI has field error without traceback/output, finite value accepted.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "Combined package G1/G2/adapter/metadata gates after S037/S047 tests",
+      "result": "passed",
+      "summary": "G1 56 Skills/7 Agents with no mismatches; G2 no warnings/errors; adapter 81 pass/25 skips; metadata 381 manifest files/382 checksums.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S045 valid JSON [] trips database CLI baseline",
+      "result": "reproduced",
+      "summary": "get_trip_by_id leaked TypeError traceback; no plan output and both database hashes unchanged in isolated directory.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S045 focused and Travel Planner regression suite",
+      "result": "passed",
+      "summary": "Focused2/2; full45/45; independent audit confirmed concise error for [] and valid mapping still generates plan with no DB mutation.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S045 package G1/G2/adapter/metadata gates",
+      "result": "passed",
+      "summary": "56 Skills/7 Agents with no closure mismatch; G2 no warnings/errors; adapter81 passed/25 superseded skips; metadata382/383.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S027 401-digit reviewed cycle allocation baseline",
+      "result": "reproduced",
+      "summary": "Legacy _number float conversion leaked OverflowError; output absent and rules SHA unchanged.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S027 focused and Macro Research suite",
+      "result": "passed",
+      "summary": "Focused2/2, full16/16, independent PASS; oversized input gets field error without mutation and finite allocation remains valid.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S027 package G1/G2/adapter/metadata gates",
+      "result": "passed",
+      "summary": "56 Skills/7 Agents no closure mismatch; G2 clean; adapter81 pass/25 skips; metadata383/384.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S003 fake provider minute volume 1e10000 baseline",
+      "result": "reproduced",
+      "summary": "Legacy integer conversion leaked OverflowError with no JSON error envelope; no network and no output.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S003 focused and China Stock Analysis suite",
+      "result": "passed",
+      "summary": "Focused4/4; full46/46; independent PASS; finite zero/positive bars and existing bucket behavior preserved.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S003 package G1/G2/adapter/metadata gates",
+      "result": "passed",
+      "summary": "56 Skills/7 Agents no mismatch; G2 clean; adapter81 pass/25 skips; metadata384/385.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S003 two finite 1e308 minute amounts aggregate baseline",
+      "result": "reproduced",
+      "summary": "Legacy CLI exit0/success=true emitted non-standard Infinity rejected by strict JSON parser; all providers mocked.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S003 focused and China Stock Analysis full suite",
+      "result": "passed",
+      "summary": "Focused2/2, full48/48, independent PASS; finite sum20 and existing buckets preserved.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S003 amount aggregate package gates",
+      "result": "passed",
+      "summary": "G1/G2 clean; adapter81 pass/25 skips; metadata385 manifest/386 checksums.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S045 current_trips:[null] lookup baseline",
+      "result": "reproduced",
+      "summary": "Legacy get_trip_by_id leaked AttributeError; isolated plan absent and DB hashes unchanged.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S045 focused and Travel Planner suite",
+      "result": "passed",
+      "summary": "Focused2/2, full47/47, independent PASS; valid row still generates plan.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S045 internal-row package gates",
+      "result": "passed",
+      "summary": "G1/G2 clean; adapter81 pass/25 skips; metadata386 manifest/387 checksums.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S030 vegan Chinese meal baseline",
+      "result": "reproduced",
+      "summary": "A vegan profile generated tea egg, eggs and fish because diet_type was ignored.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S030 vegan filter focused and Meal Planner suite",
+      "result": "passed_with_usability_gap",
+      "summary": "Focused4/4, full34/34, independent PASS for fail-closed whole-recipe filtering. Current Chinese breakfast catalog has no vegan-safe option; valid vegan plan is not generated.",
+      "timestamp": "2026-10-19"
+    },
+    {
+      "command": "S030 vegan package G1/G2/adapter/metadata",
+      "result": "passed",
+      "summary": "56 Skills/7 Agents no mismatch; G2 clean; adapter81 pass/25 skips; metadata387/388.",
+      "timestamp": "2026-10-19"
+    },
+    "Painpoint Analyzer static contract 1/1; independent review PASS; adapter84/25 expected skip; final G1/G2/metadata/diff checks pass at sourceTree 8624020f048c3da5f7684234f7581270735693bcda99896bb7e8426f9c049c48.",
+    "Independent read-only scan of remaining plain-text Skill contracts/examples and local references: no new strong violation; no source changes.",
+    "S037 extract focused4/4; independent PDF suite10/1 expected hardlink ACL skip and PDF smoke PASS; adapter84/25 expected skips; G1/G2/metadata/diff PASS.",
+    "S049 focused2/2; independent Wealth Allocation suite30/30, adapter84/25, CLI output preservation PASS; package gates G1/G2/metadata/diff PASS.",
+    "S038 focused2/2 + locked-wheel PPTX structural roundtrip PASS; S012 focused4/4 + workbook7/7 PASS; final adapter84/25 expected skips and package gates pass.",
+    "2026-10-19 current-source gates: G1 56 Skills/7 Agents, 412/413 files/checksums; G2 PowerShell 5.1 16 files; adapter 84 passed/25 expected skips; metadata/diff passed. Current byte-tree proxy equivalence: 23/56 Skills, 4/7 Agent TOMLs; ledger now includes equivalence snapshot and cleanup record.",
+    "2026-10-19 S002 Canvas metadata contract 3/3 + independent PASS; S006 claims contract 8/8 + independent PASS; S022 HyperFrames locked package/CLI version gate 8 scenarios in Windows PowerShell 5.1 + independent PASS; S053 max-words soft-limit contract 2/2 + independent PASS. G1 56/7 and 416/417 pass; PS5.1 parser/BOM 17 files; dedicated media MCP 64/64; full adapter suite attempt incomplete with application-side errors, see latest G2 evidence. Current sourceTree 3e4e71ad6d610357d53166cb8eb965c4c4e162947490321b568a29602dddec47.",
+    "Evidence manifest finalization after S002/S006/S022/S053 additions: 1533 unique cases, all paths present and evidence hashes current (missing=0, stale=0).",
+    "S010 focused source contract: 5/5 PASS; Windows PowerShell 5.1 pack encoding/parser: 17 files PASS; media MCP suite 64/64 PASS; G1 56/56 Skills + 7/7 Agents, 417 manifest files/418 checksums PASS; metadata check PASS; git diff --check PASS; evidence ledger 1541 unique paths/hashes PASS.",
+    "Full current-source adapter suite rerun with workspace TEMP/TMP: 84 passed, 25 expected skipped; metadata check 417/418 passed.",
+    "After S010 password guidance addition: G1 56/7 and 418/419 closure; PS5.1 17 files; media MCP64/64; adapter84 passed/25 expected skips; metadata and diff-check pass.",
+    "After S040 source change: G1 56/7 and 419/420 closure; PS5.1 17; media MCP64/64; adapter84/25 expected skips; metadata and diff-check PASS.",
+    "Post-S031/S035: focused 4/4 each; G1 56/7 and 424/425 metadata closure; compatibility15 + marker5/5; PS5.1 17 files; media64/64; adapter84 passed/25 expected skips; metadata and diff-check pass.",
+    "After S036/S050: G1 56/7 and metadata426/427; compatibility15 + marker5/5; PS5.1 17; media64/64; adapter84 passed/25 expected skips; metadata/diff pass. Evidence manifest pending final closure.",
+    "S024: image-prompt-generator source contracts 9/9; independent source review PASS; G1 56 Skills/7 Agents, 429 files, zero closure/hash mismatch; G2 compatibility 15/15, PS5.1 17 files, media64/64, adapter84 passed/25 expected skips; metadata and diff-check PASS. S024 overall PARTIAL (native route/runtime and real reference/image generation unproven).",
+    "S048: video-prompt-generator source contracts 6/6; independent source review PASS; G1 56 Skills/7 Agents, 430 files, zero closure/hash mismatch; G2 compatibility15/15, PS5.1 17 files, media64/64, adapter84 passed/25 expected skips; metadata/diff-check PASS. S048 overall PARTIAL: native route/runtime and real endpoint output unproven.",
+    "2026-10-19 S028 route contract rerun: python -B -m unittest skills.manim-animation.tests.test_route_contract -v — 2/2 PASS. Checklist counts recomputed from all 56 Skill rows; G1 metadata 433/434 and sourceTree 3f0d4cad4c85cb3e91c916c206bcd0188809d9c52d88c47bc23c681e88888cfb.",
+    "2026-10-19 S028 negative vector: explicit $manim-animation, Codex CLI read-only sandbox; text-only answer and equation correct, no scene/render/file output. USB/local SKILL.md and openai.yaml SHA-256 match. Evidence manifest 1654 unique, missing0/stale0. CLI exit status not exposed; S028 remains PARTIAL.",
+    "2026-10-19 G4 retry: staged all 7 USB TOMLs in fresh workspace CODEX_HOME; general.toml hash equals USB source. CLI exit1 with API 401 missing bearer; JSONL shows no model response or child lifecycle. No credentials copied; evidence ledger 1655 unique rows, missing0/stale0.",
+    "2026-10-19 S056 frozen positive/negative natural-route vectors were saved before invocation, byte-compared with the frozen vector table, and rerun in read-only Codex CLI harness; both exit 0 and independently reviewed. Checklist PASS (project-scoped exact-source proxy); G0 refreshed: 16/56 Skills match a local copy, 40 differ, 0 missing; Agent TOMLs 4/7 match.",
+    "2026-10-19 A03 growth Agent project-TOML smoke attempt: exact USB growth.toml copied (SHA matches), but Codex CLI collab spawn failed with no thread id; no child result and no source load proven. Keep G4 insufficient evidence; do not retry same path without runtime repair."
   ],
-  "known_bugs": [],
+  "known_bugs": [
+    "No current-source natural Skill route should be inferred from helper-level tests.",
+    "Longrun launcher could not start because longrun_supervisor module and fallback supervisor.py are unavailable in the environment.",
+    "S045: trip, expense, and itinerary item IDs previously collided under a frozen same-second clock; fixed with UUID4 strings; independent audits pass. Existing duplicate/numeric IDs are not migrated.",
+    "S018 SIP helper accepted bool as numeric monthly amount/years/annual return; fixed by explicitly rejecting bool before numeric checks; focused 5/5 and independent audit pass. Other invalid direct-Python types not in scope.",
+    "S004 five financial helpers (portfolio builder, asset allocator/tracker, venture model/valuation) accepted bool as numeric; explicit guards and regressions now cover all 14 relevant fields; independent audit pass.",
+    "S037 PDF helper extract/merge now reject output aliases before writing; baseline had silent successful PDF destruction. Independent audit passes; real hardlink test skipped under Windows WinError 5 and check/write TOCTOU is not covered.",
+    "S049 rebalance_planner now rejects output aliases to current/target allocation JSON; synthetic baseline had overwritten current while returning exit 0. Independent audit passes; actual symlink/hardlink and concurrent path replacement are not tested.",
+    "S045 plan export now rejects output aliases to trips and preferences database files; pre-fix CLI replaced full trips.json with one plan while returning success. Independent audit passes; actual symlink/hardlink and concurrent path replacement are untested.",
+    "S045 add_trip now maps ideas to idea and rejects unsupported status values before DB read or input mutation. Baseline source reconstruction confirmed old ideas status returned an ID but persisted nothing; independent review passes.",
+    "S045 travel_db.save_json now serializes fully before touching output and uses same-directory temp + os.replace; baseline unserializable field caused truncated trips.json. Independent audit passes; real disk-full/crash and directory fsync durability are not tested.",
+    "Meal, fitness, and daily-reflection JSON save helpers now pre-serialize and atomically replace through same-directory temp files; baseline reproduced truncation on serialization errors. Independent audit passes; real disk/power/concurrent-write failures are not simulated.",
+    "S003 data_fetcher financial cache horizon bug fixed. Old pre-fix cache files without horizon suffix remain cold on disk; no cleanup migration was performed.",
+    "Office/General Agent destructive file-operation authorization gap fixed in USB TOML; runtime Agent adherence remains untested.",
+    "S045 plan_generator negative/nonfinite budget and invalid duration inputs now fail closed; no max duration or full nested trip schema validation yet.",
+    "S045 budget validator rejects invalid numeric input; no maximum trip duration and malformed nested trip schema remain outside current numeric contract.",
+    "S053 web search upstream parse contract now fails closed on malformed JSON schema and parser exceptions; real service protocol and natural Skill routing remain unverified.",
+    "Real Windows hardlink alias behavior for current portfolio_tracker, fitness program generator, and meal plan generator remains untested because sandbox denied hardlink creation (WinError 5); samefile identity path is covered with mocks.",
+    "Fund Portfolio and Grok compiler samefile alias defense is covered with mocks; actual NTFS hardlink behavior remains untested because the sandbox denies hardlink creation (WinError 5).",
+    "S003 valuation and S019 Grok CLI path guards are mock-covered for samefile aliases; physical NTFS hardlinks and adversarial concurrent TOCTOU path changes remain untested.",
+    "S049 asset_allocator and S018 fund portfolio derived-number overflow paths now fail closed; hardlink identity is mock-covered and concurrent path mutation remains untested; natural Skill routing/runtime source and live providers remain unproven by CLI tests.",
+    "S018 venture financial_model extreme finite growth and oversized initial-user conversion now fail closed with stable JSON errors; live upstream data and natural Skill route remain untested.",
+    "S049 rebalance planner derived finite-input overflow now fails closed; samefile/path mutation boundaries remain as previously documented; no live account data used.",
+    "S018 risk_assessor now rejects output aliases to reviewed portfolio; real NTFS hardlink is mock-covered and concurrent TOCTOU remains untested.",
+    "S049 portfolio_tracker now fails closed on non-finite derived historical returns; synthetic values used, no live account data.",
+    "S045 travel expense API now rejects negative/bool/nonfinite/nonnumeric/missing/overflowing totals before mutation; old invalid persisted expense rows cause summaries/additions to fail closed and are not migrated.",
+    "S017 log_workout now rejects negative/bool/nonfinite/malformed set values and nonfinite derived/history volume; queries reject invalid legacy rows, which are not migrated. Natural Skill routing and USB runtime loading remain unproven.",
+    "S007 weekly reviews now use requested date bounds and historical end-date streaks; log/query date values must be canonical YYYY-MM-DD. Invalid old dates fail closed and are not migrated; natural routing/runtime remains unverified.",
+    "S007 log_reflection now prevalidates both stores, stages both JSON files and compensates a failed second replace; malformed habits and staging failure leave no partial mutation. Independent audit PASS, focused 6/6, full suite 19/19. Cross-process/power-loss atomicity across two replacements is not guaranteed.",
+    "S047 business_evaluator now rejects --output aliases to the input via normalized paths and samefile identity, and fails closed on identity-check errors. Independent audit PASS; focused 5/5 and full Venture Analysis 13/13. Physical Windows hardlink creation was denied (WinError 5); concurrent TOCTOU is untested.",
+    "S027 cycle_analyzer now rejects normalized/same-file output aliases to reviewed rules and fails closed when identity cannot be verified. Independent audit PASS; focused 5/5 and full Macro Research 9/9. Physical Windows hardlink creation was denied (WinError 5); TOCTOU untested.",
+    "S027 policy_analyzer now rejects normalized/same-file output aliases to its policy scenario input and fails closed when identity cannot be checked. Independent audit PASS; focused 5/5 and full Macro Research 14/14. Physical Windows hardlink denied WinError 5; TOCTOU untested.",
+    "S030 Meal Planner now rejects zero/negative/noninteger durations at the direct API and CLI before nutrition/profile persistence; invalid CLI values do not create output or mutate plans/profile. Independent audit PASS; focused 4/4 and full suite 19/19. No maximum positive duration imposed.",
+    "S003 malformed completeness metadata in stock cache now safely becomes a cache miss; fake-provider fallback verified. Live AkShare and concurrent cache replacement remain untested.",
+    "S003 technical analysis now classifies zero-slope averages as sideways and a zero-gain/zero-loss RSI window as 50. Strict finite-window slopes have no tolerance band; real provider and natural route remain untested.",
+    "S018 Fund Screener thresholds now reject bool, strings, Decimal, NaN and infinities before provider access; strict JSON serialization enabled. Tests use synthetic rows; live fund source and natural route remain untested.",
+    "S018 Risk Assessor numeric conversion now maps oversized JSON integers to stable field-specific ValueError before output. Synthetic source only; live inputs/routes remain untested.",
+    "S003 minute quote totals now use the same session-eligible rows as five exclusive buckets, including opening call; synthetic data only, real upstream timestamp format remains unverified.",
+    "S030 Meal Planner paired DB/report write cannot be process-crash atomic: forced termination after DB commit but before report replace bypasses compensation; a rollback failure is reported with details and requires plan verification before retry; final temp unlink permission errors may leave a staging file.",
+    "S003 stock_screener optional non-finite values are now normalized; synthetic provider proved the defect and tests pass, but real AkShare frequency and natural Skill route/runtime loading remain unverified.",
+    "S017 Program Generator output is staged before plan persistence; publication failure restores captured programs.json bytes. Forced termination between DB commit and output replacement bypasses compensation; concurrent DB writers are not locked and rollback could overwrite updates; rollback failure is not fault-injected. Synthetic/local only; natural route and USB runtime unverified.",
+    "S037 PDF merge uses staged atomic replacement and preserves old destination on writer failure. Hard-link identity is skipped under Windows ACL; crash/power-loss, existing destination ACL/metadata preservation, arbitrary PDFs and natural routing/runtime are unverified.",
+    "S052 max_chars is now positive-int only and checked before optional imports/network. Mocked only; real network, natural Skill route and USB runtime remain unverified.",
+    "S047 checklist atomic output uses local injected failures only; actual disk/device failure, process/power interruption, directory fsync and custom ACL/metadata preservation remain untested.",
+    "S054 unsupported suffix now fails before rendering/parent creation; tests use local Pillow and representative suffix casing only; natural routing/USB runtime untested.",
+    "S003 safe_float now handles unrepresentable optional values; no live AkShare response or natural route/runtime was used.",
+    "S030 Meal Planner BMR now validates gender; all checks use synthetic profiles. Nutrition/clinical accuracy and natural routing/USB runtime remain unverified.",
+    "S030 Meal Planner numeric fields now reject invalid values; only synthetic profiles were tested, so nutrition clinical suitability and natural routing/USB runtime remain unverified.",
+    "S054 draft creation has exclusive collision protection and partial-write cleanup; cleanup failure combined with a non-OSError may not attach the residual path. Natural Skill routing/USB runtime remain unverified.",
+    "S051 weather forecast config writes now preserve old bytes on staging/replace errors; tests use isolated synthetic config only; live weather provider, natural routing and USB runtime remain unverified.",
+    "S037 fake-renderer failure tests do not establish forced-termination/power-loss durability or ACL/metadata preservation; arbitrary PDFs, natural route and USB runtime remain unverified.",
+    "S047 oversized integer handling is verified with synthetic JSON only; natural routing, USB runtime, real project research and investment suitability remain unverified.",
+    "S045 trips.json top-level shape is validated as an object, but presence/type validation of all three internal trip-list keys remains outside the just-closed contract; natural route and USB runtime are unverified.",
+    "S027 allocation overflow is covered with synthetic reviewed rules; macroeconomic validity, live data, natural routing and USB runtime remain unverified.",
+    "S003 minute volume validation was exercised with fake responses only; real Sina response value/format distribution, live quotes, natural routing and USB runtime remain unverified.",
+    "S003 minute amount aggregate overflow was tested with synthetic finite extreme values; real Sina amounts, natural routing and USB runtime remain unverified.",
+    "S045 lookup rejects non-object trip rows; complete validation of every DB mutation path and every internal list shape has not been proven, and natural route/USB runtime remain unverified.",
+    "S030 advertised vegan plans cannot currently succeed for Chinese cuisine because the breakfast catalog has no safe vegan recipe; the filter now fails closed. Vegetarian/keto/low-carb filtering remains unimplemented and dietary/clinical suitability is unverified.",
+    "Painpoint static contract test asserts Output Example but not Best Practices prose; independent manual comparison confirms consistency. Natural routing/USB runtime untested.",
+    "S037 PDF extract does not claim power-loss durability or protect against malicious concurrent destination replacement; actual disk failures/real PDFs and natural USB runtime remain untested.",
+    "S049 uses synthetic benchmarks only; real historical source, suitability, natural routing and USB runtime are untested.",
+    "S012 real VBA-project preservation and Office/LibreOffice formula recalculation were not tested; S038 native PowerPoint visual rendering/natural routing untested.",
+    "Meal Planner default test runtime wrote three package-root codex-data files (logs/profile/recipes); user authorized exact cleanup and all three were removed. No backup; no runtime data remains at those paths.",
+    "S002 Canvas agent metadata previously asserted runtime unavailable before probing; corrected to probe-first fallback contract. S006 conversion examples previously contained unsupported performance/discount claims; corrected with evidence and synthetic-example boundaries. S022 installer now validates locked HyperFrames package metadata and CLI version before health marker. S053 max-words is now documented as prompt-only soft constraint; upstream model overrun remains possible.",
+    "S010 now requires exact per-item path/action authorization for file mutations; focused test is static string contract only and does not prove runtime interception or natural routing.",
+    "S029 formula and S046 inference remediations are source-contract only; do not claim natural route or real data validation.",
+    "Compatibility audit AST marker correction does not prove Skill invocation or Agent runtime provenance.",
+    "S024 static source contract and independent source review pass, but native Skill route, USB runtime loading, Image-2 upstream call, and actual reference-image transport are not verified.",
+    "S048 source contract covers interval/spec/style/structure rules; it does not establish natural routing, USB load provenance, real endpoint parameter support, or generated video quality."
+  ],
   "blockers": [
-    "Physical NTFS U-disk sign/install/uninstall acceptance remains device-bound and was not executed on this development workspace",
-    "Isolated CCSwitch runtime smoke was not repeated because an unrelated external D:/AI/cc-switch/app/cc-switch.exe already owned the single-instance listener; production bundle verification and package hash binding passed",
-    "The r16 signer source compiles and tests, but the distributed signer EXE was not replaced because this environment has no original compile-time administrator Key; replacing it with a no-key build would break the previously real-tested create-user path"
+    "Background supervisor unavailable: local launcher reports missing longrun_supervisor and no bundled supervisor.py exists under the installed skill. Manual audit can continue.",
+    "ServerChan exit notification was attempted three times by the longrun launcher but failed with WinError 10013; automatic notification delivery is unavailable in this environment."
   ],
   "done_criteria": [
-    "Requested implementation work is complete",
-    "Relevant tests or checks pass",
-    "Progress and verification are recorded"
+    "All 56 Skills and 7 Agents have explicit final evidence/status under the frozen checklist.",
+    "Every PASS is backed by a test of adequate scope; source-helper or local-equivalence proxy is not represented as natural routing.",
+    "Every evidence path, manifest SHA-256 and case ID closes with zero missing paths, duplicate IDs, or hash mismatches.",
+    "Remaining NOT_TESTABLE or PARTIAL items have a concrete external prerequisite or exact missing evidence recorded.",
+    "G4 Agent source, load and child lifecycle status is explicitly evidenced or specifically externally blocked."
   ],
-  "last_verified_at": "2026-09-22T22:15:00+08:00",
-  "created_at": "2026-09-13T03:02:00+08:00",
-  "updated_at": "2026-09-22T22:15:00+08:00"
+  "last_verified_at": "2026-10-19",
+  "created_at": "2026-10-19T02:15:14+08:00",
+  "updated_at": "2026-10-19",
+  "known_limitations": [
+    "S052 loopback fixture proves only local HTTP Fetcher behavior; it does not prove external website reachability/content quality, natural routing, or USB installer lifecycle.",
+    "S054 Codex natural-route attempt was source-ambiguous: same-named CODEX_HOME skill with divergent hash was loaded instead of the USB-source project copy; CLI behaved read-only so draft persistence was not tested.",
+    "S054 route harness selected a divergent same-name CODEX_HOME skill and stayed read-only; this is not USB-source route or draft-persistence evidence.",
+    "A03 project-level Agent runtime smoke did not reach a child: Codex CLI collaboration wait failed with no thread ID. The attempt does not diagnose the USB growth.toml."
+  ]
 }

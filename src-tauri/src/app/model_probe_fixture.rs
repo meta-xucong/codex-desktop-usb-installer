@@ -86,7 +86,10 @@ impl Fixture {
                         } else {
                             (404, "application/json", b"{}".to_vec())
                         };
-                        let header=format!("HTTP/1.1 {status} Fixture\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nx-request-id: fixture-request\r\nConnection: close\r\n\r\n",payload.len());
+                        let header = format!(
+                            "HTTP/1.1 {status} Fixture\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nx-request-id: fixture-request\r\nConnection: close\r\n\r\n",
+                            payload.len()
+                        );
                         stream.write_all(header.as_bytes()).unwrap();
                         stream.write_all(&payload).unwrap();
                     }

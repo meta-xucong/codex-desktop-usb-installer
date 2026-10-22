@@ -20,6 +20,208 @@
   },
   "artifacts": [
     {
+      "artifactId": "runtime.feishu-mcp-package",
+      "materializationStatus": "ready",
+      "installReady": true,
+      "purpose": "Offline npm package cache for the official Feishu/Lark MCP",
+      "package": {
+        "name": "@larksuiteoapi/lark-mcp",
+        "version": "0.5.1",
+        "license": "MIT",
+        "nodeEngine": ">=20.0.0",
+        "bin": "lark-mcp"
+      },
+      "source": {
+        "tarballUrl": "https://registry.npmjs.org/@larksuiteoapi/lark-mcp/-/lark-mcp-0.5.1.tgz",
+        "packageJsonUrl": "https://registry.npmjs.org/@larksuiteoapi/lark-mcp/0.5.1",
+        "integrity": "bundled package-lock.json preserves npm integrity for the 195-package closure",
+        "bundleFilename": "runtime/bundled/feishu-node-modules.zip",
+        "bundleBytes": 12898130,
+        "bundleSha256": "cbf988b8a1f1b9da7e8df418755b68d052961ff7e06881d4097dabbe76c36b9d"
+      },
+      "install": {
+        "command": "npm install --offline --ignore-scripts --prefix <private-feishu-cache> <locked-local-tarball>",
+        "healthCheck": "npm exec --offline --prefix <private-feishu-cache> -- @larksuiteoapi/lark-mcp@0.5.1 mcp --help",
+        "configCommand": "Use the private wrapper command from config-fragments/feishu-official-stdio.template.toml; do not put App Secret in Codex TOML."
+      },
+      "offlineConstraint": "The bundled ZIP contains the locked npm node_modules closure and package-lock.json. The installer extracts it without network access; Feishu still remains disabled until credentials and tenant permissions are supplied."
+    },
+    {
+      "artifactId": "runtime.ffmpeg-windows-x64",
+      "materializationStatus": "ready",
+      "installReady": true,
+      "purpose": "Local video editing and HyperFrames render encoding/probing",
+      "relatedSkills": [
+        "local-video-editing",
+        "hyperframes-video"
+      ],
+      "required": true,
+      "optional": false,
+      "source": {
+        "directUrl": "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n9.0-latest-win64-lgpl-shared-9.0.zip",
+        "releaseProject": "https://github.com/BtbN/FFmpeg-Builds",
+        "filename": "ffmpeg-n9.0-latest-win64-lgpl-shared-9.0.zip",
+        "bytes": 77221060
+      },
+      "integrity": {
+        "materializationStatus": "ready",
+        "sha256": "3f67595fb8c7be0c48d8f54b2a5a89175426a6d7b194065d0c08cca9bd95eb19",
+        "sha256Source": "Exact SHA-256 of the bundled BtbN release asset.",
+        "license": "Archive is the LGPL shared build; retain its included license notices and see runtime/THIRD-PARTY-NOTICES.md."
+      },
+      "install": {
+        "method": "extract-per-user",
+        "archive": "runtime/bundled/ffmpeg-n9.0-latest-win64-lgpl-shared-9.0.zip",
+        "scope": "current-user",
+        "path": "Private Codex Agent Kit runtime; wrappers ffmpeg.cmd, ffprobe.cmd and ffplay.cmd."
+      },
+      "healthCheck": "ffmpeg.cmd -version; ffprobe.cmd -version",
+      "uninstallUpgrade": "Replace only through a new exact-hash runtime pack."
+    },
+    {
+      "artifactId": "runtime.hyperframes-browser",
+      "materializationStatus": "network-bootstrap",
+      "installReady": true,
+      "purpose": "Chrome browser required for HyperFrames local rendering",
+      "relatedSkills": [
+        "hyperframes-video"
+      ],
+      "required": true,
+      "optional": false,
+      "source": {
+        "installer": "HyperFrames browser ensure",
+        "systemBrowser": "Use a compatible locally installed Chrome when available"
+      },
+      "install": {
+        "method": "hyperframes browser ensure",
+        "networkRequired": "only when no usable system/cached Chrome is found",
+        "scope": "current-user browser cache"
+      },
+      "healthCheck": "hyperframes.cmd doctor; runtime-state.json hyperframes.browserHealth == passed",
+      "offlineConstraint": "Offline install can use a previously available supported browser; otherwise mark requires-network."
+    },
+    {
+      "artifactId": "runtime.hyperframes-cli",
+      "materializationStatus": "network-bootstrap",
+      "installReady": true,
+      "purpose": "Local HyperFrames composition CLI, pinned to npm package 0.8.134",
+      "relatedSkills": [
+        "hyperframes-video"
+      ],
+      "required": true,
+      "optional": false,
+      "source": {
+        "registry": "https://registry.npmjs.org/hyperframes",
+        "package": "hyperframes@0.8.134",
+        "license": "Apache-2.0",
+        "nodeEngine": ">=22"
+      },
+      "integrity": {
+        "materializationStatus": "version-pinned",
+        "lock": "runtime/bundled/hyperframes-package-lock.json; every npm package tarball has registry integrity in the lock."
+      },
+      "install": {
+        "method": "npm user-prefix install",
+        "networkRequired": true,
+        "scope": "current-user",
+        "path": "runtime/hyperframes; exposes hyperframes.cmd only when installed",
+        "command": "npm ci --prefix <private-hyperframes-runtime> using the bundled, hashed package.json/package-lock.json contract"
+      },
+      "healthCheck": "hyperframes.cmd --version; runtime-state.json hyperframes.cliHealth == passed",
+      "offlineConstraint": "Without access to npm tarball URLs on first install, this capability is marked requires-network; later installs reuse the per-user lock marker and npm cache."
+    },
+    {
+      "artifactId": "runtime.manim",
+      "materializationStatus": "ready",
+      "installReady": true,
+      "purpose": "Isolated Manim Community animation authoring/rendering environment",
+      "relatedSkills": [
+        "manim-animation"
+      ],
+      "required": true,
+      "optional": false,
+      "version": "0.21.0",
+      "source": {
+        "package": "manim==0.21.0",
+        "lock": "runtime/bundled/manim-requirements.lock",
+        "wheelhouse": "runtime/bundled/python-wheels/"
+      },
+      "integrity": {
+        "materializationStatus": "ready",
+        "hashPolicy": "Every wheel in the lock has SHA-256; installed offline with pip --require-hashes."
+      },
+      "install": {
+        "method": "offline-python-venv",
+        "scope": "current-user",
+        "path": "runtime/manim-env; independent of runtime/python-env."
+      },
+      "healthCheck": "CODEX_MANIM_PYTHON -c \"import manim,av,manimpango; import importlib.metadata as m; assert m.version('manim') == '0.21.0'\"",
+      "optionalLatex": "MiKTeX/LaTeX only for Tex/MathTex formulas; basic scenes do not require it."
+    },
+    {
+      "artifactId": "runtime.node22-common",
+      "materializationStatus": "ready",
+      "installReady": true,
+      "purpose": "Shared user-local Node runtime for HyperFrames CLI and optional Feishu MCP",
+      "relatedSkills": [
+        "hyperframes-video",
+        "feishu-doc",
+        "feishu-drive",
+        "feishu-perm",
+        "feishu-wiki"
+      ],
+      "required": true,
+      "optional": false,
+      "source": {
+        "directUrl": "https://nodejs.org/dist/v22.22.0/node-v22.22.0-win-x64.zip",
+        "checksumUrl": "https://nodejs.org/dist/v22.22.0/SHASUMS256.txt",
+        "productVersion": "22.22.0",
+        "architecture": "x64",
+        "filename": "node-v22.22.0-win-x64.zip",
+        "bytes": 35556852
+      },
+      "integrity": {
+        "materializationStatus": "ready",
+        "sha256": "c97fa376d2becdc8863fcd3ca2dd9a83a9f3468ee7ccf7a6d076ec66a645c77a",
+        "sha256Source": "Official Node.js v22.22.0 SHASUMS256.txt; checked against the bundled archive.",
+        "authenticode": {
+          "required": false,
+          "publisher": "Node.js / OpenJS Foundation",
+          "evidence": "Official SHASUMS256.txt plus exact archive hash; ZIP does not carry Authenticode signatures."
+        }
+      },
+      "install": {
+        "method": "extract-per-user",
+        "archive": "runtime/bundled/node-v22.22.0-win-x64.zip",
+        "scope": "current-user",
+        "path": "Shared runtime under the private Codex Agent Kit home; no system PATH mutation."
+      },
+      "healthCheck": "node --version; require major version >=22",
+      "uninstallUpgrade": "Upgrade only with a newly pinned archive and matching checksum."
+    },
+    {
+      "artifactId": "runtime.product-design-dependencies",
+      "materializationStatus": "ready",
+      "installReady": true,
+      "purpose": "Offline Windows x64 dependency trees for the Product Design web and mobile starter templates",
+      "relatedSkills": [
+        "product-design"
+      ],
+      "required": true,
+      "optional": false,
+      "version": "0.1.56",
+      "platform": "win32-x64",
+      "source": {
+        "archive": "runtime/bundled/product-design-dependencies-win-x64.zip",
+        "runtime": "runtime.node22-common"
+      },
+      "integrity": {
+        "embeddedManifest": "product-design-dependencies.json",
+        "lockfileBound": true,
+        "sha256": "validated by installer and recorded in CODEX_HOME runtime marker"
+      }
+    },
+    {
       "artifactId": "runtime.python312",
       "materializationStatus": "ready",
       "installReady": true,
@@ -41,7 +243,6 @@
         "wechat-article-creator",
         "word-docx",
         "image-2",
-        "seedance2-0-video-gen",
         "web-search-extraction"
       ],
       "required": true,
@@ -112,7 +313,6 @@
         "word-docx",
         "web-content-fetcher",
         "image-2",
-        "seedance2-0-video-gen",
         "web-search-extraction"
       ],
       "required": false,
@@ -127,13 +327,13 @@
         "materializer": "runtime/materialize-python-wheelhouse.ps1",
         "indexPolicy": "approved package index; record the index URL and timestamp in the private media manifest",
         "archiveFilename": "runtime/bundled/python-wheels/",
-        "archiveBytes": 246323935,
-        "wheelCount": 86
+        "archiveBytes": 167504800,
+        "wheelCount": 77
       },
       "integrity": {
         "materializationStatus": "ready",
         "sha256": null,
-        "sha256Source": "Each of the 86 bundled wheels has an individual SHA-256 in runtime/bundled/python-wheelhouse-manifest.json and is verified before installation.",
+        "sha256Source": "Each of the 77 bundled wheels has an individual SHA-256 in runtime/bundled/python-wheelhouse-manifest.json and is verified before installation.",
         "authenticode": {
           "required": false,
           "evidence": "per-wheel SHA-256, PyPI/index provenance and signed media manifest"
@@ -150,186 +350,6 @@
       },
       "healthCheck": "CODEX_PYTHON -c \"import openpyxl,docx,pptx,pypdf; print('wheelhouse-ok')\"",
       "uninstallUpgrade": "Install a new versioned per-user environment and switch the runtime pointer only after all wheel hashes and import checks pass; retain the old environment for rollback."
-    },
-    {
-      "artifactId": "runtime.feishu-mcp-package",
-      "materializationStatus": "ready",
-      "installReady": true,
-      "purpose": "Offline npm package cache for the official Feishu/Lark MCP",
-      "package": {
-        "name": "@larksuiteoapi/lark-mcp",
-        "version": "0.5.1",
-        "license": "MIT",
-        "nodeEngine": ">=20.0.0",
-        "bin": "lark-mcp"
-      },
-      "source": {
-        "tarballUrl": "https://registry.npmjs.org/@larksuiteoapi/lark-mcp/-/lark-mcp-0.5.1.tgz",
-        "packageJsonUrl": "https://registry.npmjs.org/@larksuiteoapi/lark-mcp/0.5.1",
-        "integrity": "bundled package-lock.json preserves npm integrity for the 195-package closure",
-        "bundleFilename": "runtime/bundled/feishu-node-modules.zip",
-        "bundleBytes": 12898130,
-        "bundleSha256": "cbf988b8a1f1b9da7e8df418755b68d052961ff7e06881d4097dabbe76c36b9d"
-      },
-      "install": {
-        "command": "npm install --offline --ignore-scripts --prefix <private-feishu-cache> <locked-local-tarball>",
-        "healthCheck": "npm exec --offline --prefix <private-feishu-cache> -- @larksuiteoapi/lark-mcp@0.5.1 mcp --help",
-        "configCommand": "Use the private wrapper command from config-fragments/feishu-official-stdio.template.toml; do not put App Secret in Codex TOML."
-      },
-      "offlineConstraint": "The bundled ZIP contains the locked npm node_modules closure and package-lock.json. The installer extracts it without network access; Feishu still remains disabled until credentials and tenant permissions are supplied."
-    },
-    {
-      "artifactId": "runtime.node22-common",
-      "materializationStatus": "ready",
-      "installReady": true,
-      "purpose": "Shared user-local Node runtime for HyperFrames CLI and optional Feishu MCP",
-      "relatedSkills": [
-        "hyperframes-video",
-        "feishu-doc",
-        "feishu-drive",
-        "feishu-perm",
-        "feishu-wiki"
-      ],
-      "required": true,
-      "optional": false,
-      "source": {
-        "directUrl": "https://nodejs.org/dist/v22.22.0/node-v22.22.0-win-x64.zip",
-        "checksumUrl": "https://nodejs.org/dist/v22.22.0/SHASUMS256.txt",
-        "productVersion": "22.22.0",
-        "architecture": "x64",
-        "filename": "node-v22.22.0-win-x64.zip",
-        "bytes": 35556852
-      },
-      "integrity": {
-        "materializationStatus": "ready",
-        "sha256": "c97fa376d2becdc8863fcd3ca2dd9a83a9f3468ee7ccf7a6d076ec66a645c77a",
-        "sha256Source": "Official Node.js v22.22.0 SHASUMS256.txt; checked against the bundled archive.",
-        "authenticode": {
-          "required": false,
-          "publisher": "Node.js / OpenJS Foundation",
-          "evidence": "Official SHASUMS256.txt plus exact archive hash; ZIP does not carry Authenticode signatures."
-        }
-      },
-      "install": {
-        "method": "extract-per-user",
-        "archive": "runtime/bundled/node-v22.22.0-win-x64.zip",
-        "scope": "current-user",
-        "path": "Shared runtime under the private Codex Agent Kit home; no system PATH mutation."
-      },
-      "healthCheck": "node --version; require major version >=22",
-      "uninstallUpgrade": "Upgrade only with a newly pinned archive and matching checksum."
-    },
-    {
-      "artifactId": "runtime.ffmpeg-windows-x64",
-      "materializationStatus": "ready",
-      "installReady": true,
-      "purpose": "Local video editing and HyperFrames render encoding/probing",
-      "relatedSkills": [
-        "local-video-editing",
-        "hyperframes-video"
-      ],
-      "required": true,
-      "optional": false,
-      "source": {
-        "directUrl": "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n9.0-latest-win64-lgpl-shared-9.0.zip",
-        "releaseProject": "https://github.com/BtbN/FFmpeg-Builds",
-        "filename": "ffmpeg-n9.0-latest-win64-lgpl-shared-9.0.zip",
-        "bytes": 77221060
-      },
-      "integrity": {
-        "materializationStatus": "ready",
-        "sha256": "3f67595fb8c7be0c48d8f54b2a5a89175426a6d7b194065d0c08cca9bd95eb19",
-        "sha256Source": "Exact SHA-256 of the bundled BtbN release asset.",
-        "license": "Archive is the LGPL shared build; retain its included license notices and see runtime/THIRD-PARTY-NOTICES.md."
-      },
-      "install": {
-        "method": "extract-per-user",
-        "archive": "runtime/bundled/ffmpeg-n9.0-latest-win64-lgpl-shared-9.0.zip",
-        "scope": "current-user",
-        "path": "Private Codex Agent Kit runtime; wrappers ffmpeg.cmd, ffprobe.cmd and ffplay.cmd."
-      },
-      "healthCheck": "ffmpeg.cmd -version; ffprobe.cmd -version",
-      "uninstallUpgrade": "Replace only through a new exact-hash runtime pack."
-    },
-    {
-      "artifactId": "runtime.manim",
-      "materializationStatus": "ready",
-      "installReady": true,
-      "purpose": "Isolated Manim Community animation authoring/rendering environment",
-      "relatedSkills": [
-        "manim-animation"
-      ],
-      "required": true,
-      "optional": false,
-      "version": "0.21.0",
-      "source": {
-        "package": "manim==0.21.0",
-        "lock": "runtime/bundled/manim-requirements.lock",
-        "wheelhouse": "runtime/bundled/python-wheels/"
-      },
-      "integrity": {
-        "materializationStatus": "ready",
-        "hashPolicy": "Every wheel in the lock has SHA-256; installed offline with pip --require-hashes."
-      },
-      "install": {
-        "method": "offline-python-venv",
-        "scope": "current-user",
-        "path": "runtime/manim-env; independent of runtime/python-env."
-      },
-      "healthCheck": "CODEX_MANIM_PYTHON -c \"import manim,av,manimpango; import importlib.metadata as m; assert m.version('manim') == '0.21.0'\"",
-      "optionalLatex": "MiKTeX/LaTeX only for Tex/MathTex formulas; basic scenes do not require it."
-    },
-    {
-      "artifactId": "runtime.hyperframes-cli",
-      "materializationStatus": "network-bootstrap",
-      "installReady": true,
-      "purpose": "Local HyperFrames composition CLI, pinned to npm package 0.8.174",
-      "relatedSkills": [
-        "hyperframes-video"
-      ],
-      "required": true,
-      "optional": false,
-      "source": {
-        "registry": "https://registry.npmjs.org/hyperframes",
-        "package": "hyperframes@0.8.174",
-        "license": "Apache-2.0",
-        "nodeEngine": ">=22"
-      },
-      "integrity": {
-        "materializationStatus": "version-pinned",
-        "lock": "runtime/bundled/hyperframes-package-lock.json; every npm package tarball has registry integrity in the lock."
-      },
-      "install": {
-        "method": "npm user-prefix install",
-        "networkRequired": true,
-        "scope": "current-user",
-        "path": "runtime/hyperframes; exposes hyperframes.cmd only when installed",
-        "command": "npm ci --prefix <private-hyperframes-runtime> using the bundled, hashed package.json/package-lock.json contract"
-      },
-      "healthCheck": "hyperframes.cmd --version; runtime-state.json hyperframes.cliHealth == passed",
-      "offlineConstraint": "Without access to npm tarball URLs on first install, this capability is marked requires-network; later installs reuse the per-user lock marker and npm cache."
-    },
-    {
-      "artifactId": "runtime.hyperframes-browser",
-      "materializationStatus": "network-bootstrap",
-      "installReady": true,
-      "purpose": "Chrome browser required for HyperFrames local rendering",
-      "relatedSkills": [
-        "hyperframes-video"
-      ],
-      "required": true,
-      "optional": false,
-      "source": {
-        "installer": "HyperFrames browser ensure",
-        "systemBrowser": "Use a compatible locally installed Chrome when available"
-      },
-      "install": {
-        "method": "hyperframes browser ensure",
-        "networkRequired": "only when no usable system/cached Chrome is found",
-        "scope": "current-user browser cache"
-      },
-      "healthCheck": "hyperframes.cmd doctor; runtime-state.json hyperframes.browserHealth == passed",
-      "offlineConstraint": "Offline install can use a previously available supported browser; otherwise mark requires-network."
     }
   ]
 }

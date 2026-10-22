@@ -43,18 +43,6 @@ def _range(value: Any, name: str, minimum: float = 0) -> tuple[float, float]:
     return low, high
 
 
-def _ensure_finite_numbers(value: Any, path: str = "report") -> None:
-    """Reject non-finite derived values before they can become invalid JSON."""
-    if isinstance(value, float) and not math.isfinite(value):
-        raise ValueError(f"{path} 计算结果超出有限数值范围。")
-    if isinstance(value, dict):
-        for key, item in value.items():
-            _ensure_finite_numbers(item, f"{path}.{key}")
-    elif isinstance(value, (list, tuple)):
-        for index, item in enumerate(value):
-            _ensure_finite_numbers(item, f"{path}[{index}]")
-
-
 def validate_valuation_assumptions(data: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError("估值假设 JSON 顶层必须是对象。")
@@ -70,7 +58,7 @@ def validate_valuation_assumptions(data: dict[str, Any]) -> dict[str, Any]:
     weights = {key: _number(weights_raw[key], f"scorecard_weights.{key}", 0, 1) for key in SCORE_KEYS}
     if not math.isclose(sum(weights.values()), 1.0, abs_tol=0.000001):
         raise ValueError("scorecard_weights 合计必须为 1。")
-    report = {
+    return {
         "as_of": as_of,
         "sources": [item.strip() for item in sources],
         "comparable_valuation_range": _range(
@@ -84,7 +72,6 @@ def validate_valuation_assumptions(data: dict[str, Any]) -> dict[str, Any]:
         "scorecard_factor_range": _range(data.get("scorecard_factor_range"), "scorecard_factor_range"),
         "range_factor": _number(data.get("range_factor"), "range_factor", 0, 1),
     }
-    return report
 
 
 def comparable_company_scenario(
@@ -164,14 +151,14 @@ def generate_valuation_report(args, assumptions: dict[str, Any]) -> dict[str, An
     scores = {}
     for name in SCORE_KEYS:
         score = getattr(args, f"{name}_score")
-        if isinstance(score, bool) or not isinstance(score, int) or not 0 <= score <= 10:
+        if not isinstance(score, int) or not 0 <= score <= 10:
             raise ValueError(f"{name}_score 必须是 0–10 的整数。")
         scores[name] = score
     revenue = _number(args.revenue, "revenue", 0)
     growth_rate = _number(args.growth_rate, "growth_rate", -99.999, 10_000)
     target_return = _number(args.target_return, "target_return", 0.000001, 10_000)
     exit_multiple = _number(args.exit_multiple, "exit_multiple", 0.000001, 10_000)
-    if isinstance(args.years, bool) or not isinstance(args.years, int) or not 1 <= args.years <= 100:
+    if not isinstance(args.years, int) or not 1 <= args.years <= 100:
         raise ValueError("years 必须是 1–100 的整数。")
     stage = str(args.stage or "").strip()
     industry = str(args.industry or "").strip()
@@ -189,7 +176,7 @@ def generate_valuation_report(args, assumptions: dict[str, Any]) -> dict[str, An
     for method in methods:
         range_value = method.get("range") or method.get("range_envelope")
         ranges.append(range_value)
-    report = {
+    return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "assumptions_as_of": assumptions["as_of"],
         "sources": assumptions["sources"],
@@ -210,8 +197,6 @@ def generate_valuation_report(args, assumptions: dict[str, Any]) -> dict[str, An
             "未建模融资稀释、优先权、债务、税或交易条款。",
         ],
     }
-    _ensure_finite_numbers(report)
-    return report
 
 
 def format_report(report: dict[str, Any]) -> str:
@@ -225,27 +210,6 @@ def format_report(report: dict[str, Any]) -> str:
     lines.extend(f"- {item['method']}：{json.dumps(item, ensure_ascii=False, sort_keys=True)}" for item in report["methods"])
     lines.extend(["方法边界：" + report["methodology"], *["限制：" + item for item in report["limitations"]]])
     return "\n".join(lines)
-
-
-def ensure_distinct_paths(input_value: str | Path, output_value: str | Path) -> tuple[Path, Path]:
-    """Reject output paths that resolve to the assumptions source."""
-    try:
-        input_path = Path(input_value).expanduser().resolve()
-        output_path = Path(output_value).expanduser().resolve()
-    except (OSError, RuntimeError) as exc:
-        raise ValueError("无法验证估值假设输入与报告输出路径。") from exc
-
-    if input_path == output_path:
-        raise ValueError("估值报告输出路径不能覆盖输入假设文件。")
-    try:
-        if input_path.samefile(output_path):
-            raise ValueError("估值报告输出路径不能指向输入假设文件。")
-    except FileNotFoundError:
-        # A new output has no file identity yet; normalized path equality was checked above.
-        pass
-    except OSError as exc:
-        raise ValueError("无法确认估值假设输入与报告输出是否为同一文件，已拒绝写入。") from exc
-    return input_path, output_path
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -270,14 +234,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         path = Path(args.assumptions).expanduser().resolve()
-        output_path = None
-        if args.output:
-            path, output_path = ensure_distinct_paths(path, args.output)
         if not path.is_file() or path.stat().st_size > MAX_ASSUMPTIONS_BYTES:
             raise ValueError("估值假设文件不存在或超过 1 MiB。")
         report = generate_valuation_report(args, json.loads(path.read_text(encoding="utf-8")))
-        output = json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False)
-        if output_path is not None:
+        output = json.dumps(report, ensure_ascii=False, indent=2)
+        if args.output:
+            output_path = Path(args.output).expanduser().resolve()
             output_path.write_text(output + "\n", encoding="utf-8")
             print(f"估值场景已保存到: {output_path}")
         elif args.json:
@@ -285,7 +247,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(format_report(report))
         return 0
-    except (OSError, ValueError, OverflowError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
         if args.json:
             print(json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False))
         else:

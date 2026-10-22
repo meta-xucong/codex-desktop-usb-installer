@@ -1,6 +1,0 @@
-interface:
-  display_name: "MiniMax 视频工作流（统一媒体 MCP）"
-  short_description: "检查 MiniMax 视频能力并整理提示词；生成适配暂不可用。"
-  default_prompt: "Use $minimax-video-gen to check MiniMax availability or prepare a request without submitting. Do not refresh the model catalog or fall back when the adapter is unavailable."
-policy:
-  allow_implicit_invocation: false

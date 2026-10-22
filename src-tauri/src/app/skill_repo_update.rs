@@ -43,7 +43,7 @@ const NETWORK_METADATA_TIMEOUT: Duration = Duration::from_secs(8);
 const NETWORK_ARCHIVE_TIMEOUT: Duration = Duration::from_secs(20);
 const NETWORK_OPERATION_TIMEOUT: Duration = Duration::from_secs(45);
 const BASE_MANIFEST_SHA256: &str =
-    "54ac637b3aaa993827d15f6c79c97513b5a1fa5fb1954b3384a6edf20f12b0e9";
+    "6effd655adbfc6f3be80b1c8348c2da2c428ef9a3d1b77b0c9da05da055e9953";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -190,6 +190,7 @@ pub struct SkillRepoUpdateInfo {
     pub installable_count: u32,
     pub conflict_count: u32,
     pub skipped_count: u32,
+    pub product_design_skill_count: Option<u32>,
     pub attempts: Vec<SkillRepoSourceAttempt>,
     pub warning: Option<String>,
 }
@@ -216,6 +217,8 @@ pub struct SkillRepoApplyReport {
     pub last_good_generation: Option<String>,
     pub reloaded_required: bool,
     pub log_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub product_design_skill_count: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2315,6 +2318,7 @@ struct ResolvedSkillRepo {
 
 #[derive(Debug)]
 struct DownloadedSkillRepo {
+    expected: SkillRepoExpected,
     archive: Vec<u8>,
     attempts: Vec<SkillRepoSourceAttempt>,
 }
@@ -2655,7 +2659,40 @@ async fn resolve_latest_with_deadline(
     resolve_latest(client, directory, deadline).await
 }
 
-async fn download_expected(
+fn same_archive_identity(left: &SkillRepoExpected, right: &SkillRepoExpected) -> bool {
+    left.schema_version == right.schema_version
+        && left.repo == right.repo
+        && left.branch == right.branch
+        && left.commit == right.commit
+        && left.archive_size == right.archive_size
+        && left.archive_sha256 == right.archive_sha256
+}
+
+fn expected_for_fallback_source(
+    expected: &SkillRepoExpected,
+    source: &SkillHubSourceEntry,
+) -> SkillRepoExpected {
+    let mut rebased = expected.clone();
+    rebased.source_kind = source.kind;
+    rebased.source_id = source.id.clone();
+    rebased
+}
+
+fn pinned_timeout_fallback_allowed(error: &HotError, deadline: tokio::time::Instant) -> bool {
+    error.code == "SKILL_REPO_TIMEOUT" && tokio::time::Instant::now() < deadline
+}
+
+fn fallback_archive_matches_expected(
+    expected: &SkillRepoExpected,
+    actual_identity: &SkillRepoExpected,
+    archive: &[u8],
+) -> bool {
+    same_archive_identity(expected, actual_identity)
+        && archive.len() as u64 == expected.archive_size
+        && sha256(archive) == expected.archive_sha256
+}
+
+async fn download_expected_from_source(
     client: &reqwest::Client,
     directory: &SkillHubSourceDirectory,
     expected: &SkillRepoExpected,
@@ -2779,12 +2816,97 @@ async fn download_expected(
             }
         };
         Ok(DownloadedSkillRepo {
+            expected: expected.clone(),
             archive,
             attempts: attempts.clone(),
         })
     }
     .await;
     result.map_err(|error: HotError| error.with_attempts(&attempts))
+}
+
+async fn download_from_fallback_source(
+    client: &reqwest::Client,
+    directory: &SkillHubSourceDirectory,
+    expected: &SkillRepoExpected,
+    source: &SkillHubSourceEntry,
+    deadline: tokio::time::Instant,
+) -> Result<DownloadedSkillRepo, HotError> {
+    // Rebase only the source coordinates here. download_expected_from_source
+    // performs the source's before/after metadata (or commit) checks and
+    // verifies the archive against this exact pinned content identity. A
+    // separate preflight would consume the shared deadline and duplicate the
+    // same metadata request.
+    let candidate = expected_for_fallback_source(expected, source);
+    if !same_archive_identity(expected, &candidate) {
+        return Err(HotError::new(
+            "SKILL_REPO_STALE",
+            "备用来源身份与已确认内容不一致",
+        ));
+    }
+
+    match download_expected_from_source(client, directory, &candidate, deadline).await {
+        Ok(downloaded) => {
+            if !fallback_archive_matches_expected(
+                expected,
+                &downloaded.expected,
+                &downloaded.archive,
+            ) {
+                return Err(HotError::new(
+                    "SKILL_REPO_HASH_MISMATCH",
+                    "备用来源下载内容与已确认的 size/SHA-256 不一致",
+                )
+                .with_attempts(&downloaded.attempts));
+            }
+            Ok(downloaded)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn download_expected(
+    client: &reqwest::Client,
+    directory: &SkillHubSourceDirectory,
+    expected: &SkillRepoExpected,
+    deadline: tokio::time::Instant,
+) -> Result<DownloadedSkillRepo, HotError> {
+    match download_expected_from_source(client, directory, expected, deadline).await {
+        Ok(downloaded) => Ok(downloaded),
+        Err(primary_error) if pinned_timeout_fallback_allowed(&primary_error, deadline) => {
+            let mut attempts = primary_error.attempts.clone();
+            let mut fallbacks = directory.enabled_domestic();
+            fallbacks.extend(
+                [SourceKind::Relay, SourceKind::Github]
+                    .into_iter()
+                    .filter_map(|kind| directory.enabled_source(kind)),
+            );
+            fallbacks.retain(|source| source.enabled && source.id != expected.source_id);
+            fallbacks.sort_by_key(|source| (source.priority, source.id.clone()));
+            for source in fallbacks {
+                if tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+                match download_from_fallback_source(client, directory, expected, &source, deadline)
+                    .await
+                {
+                    Ok(mut downloaded) => {
+                        attempts.append(&mut downloaded.attempts);
+                        downloaded.attempts = attempts;
+                        log::warn!(
+                            "skill_hub_apply_fallback source_id={} kind={} commit={}",
+                            source.id,
+                            source.kind.as_str(),
+                            expected.commit
+                        );
+                        return Ok(downloaded);
+                    }
+                    Err(error) => attempts.extend(error.attempts),
+                }
+            }
+            Err(primary_error.with_attempts(&attempts))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 async fn download_expected_with_deadline(
@@ -4109,6 +4231,7 @@ fn apply_archive(
             last_good_generation: state.last_good_generation,
             reloaded_required: false,
             log_path: None,
+            product_design_skill_count: None,
         });
     }
 
@@ -4361,6 +4484,7 @@ fn apply_archive(
             last_good_generation: state.last_good_generation.clone(),
             reloaded_required: true,
             log_path: None,
+            product_design_skill_count: None,
         })
     })();
     match result {
@@ -4483,6 +4607,7 @@ pub async fn check_update(
             installable_count: installable,
             conflict_count: conflicts,
             skipped_count: 0,
+            product_design_skill_count: crate::app::capability_pack::product_design_plugin_status(),
             attempts,
             // Skill Hub is an intentionally independent capability overlay. It
             // does not change the signed Codex bundle or USB authorization, so
@@ -4528,7 +4653,7 @@ pub async fn apply_update(
     let attempts = downloaded.attempts;
     let skills = parse_archive(&downloaded.archive, Some(&expected.commit))
         .map_err(|error| CommandError::from(error.with_attempts(&attempts)))?;
-    apply_archive(expected, skills, app)
+    apply_archive(downloaded.expected, skills, app)
         .map_err(|error| CommandError::from(error.with_attempts(&attempts)))
 }
 
@@ -4707,6 +4832,68 @@ pub async fn rollback(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn skill_hub_fixture_server(
+        request_count: usize,
+        metadata: Vec<u8>,
+        archive: Vec<u8>,
+        delayed_archive_path: String,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture server");
+        let address = listener.local_addr().expect("fixture server address");
+        let worker = std::thread::spawn(move || {
+            let mut requests = Vec::with_capacity(request_count);
+            for _ in 0..request_count {
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
+                };
+                let metadata = metadata.clone();
+                let archive = archive.clone();
+                let delayed_archive_path = delayed_archive_path.clone();
+                requests.push(std::thread::spawn(move || {
+                    let mut stream = stream;
+                    let mut request = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    loop {
+                        let Ok(read) = stream.read(&mut chunk) else {
+                            break;
+                        };
+                        if read == 0 {
+                            break;
+                        }
+                        request.extend_from_slice(&chunk[..read]);
+                        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let request_line = String::from_utf8_lossy(&request);
+                    let path = request_line.split_whitespace().nth(1).unwrap_or_default();
+                    if path == delayed_archive_path {
+                        std::thread::sleep(Duration::from_millis(180));
+                    }
+                    let (content_type, body) = if path.ends_with("latest.json") {
+                        ("application/json", metadata.as_slice())
+                    } else {
+                        ("application/zip", archive.as_slice())
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.write_all(body);
+                    let _ = stream.flush();
+                }));
+            }
+            for request in requests {
+                let _ = request.join();
+            }
+        });
+        (format!("http://{address}/"), worker)
+    }
 
     fn zip_fixture(entries: &[(&str, &[u8], bool)]) -> Vec<u8> {
         use zip::write::SimpleFileOptions;
@@ -5045,6 +5232,179 @@ mod tests {
             "b".repeat(64)
         );
         assert!(expected_from_meta(uppercase_commit.as_bytes(), source).is_err());
+    }
+
+    #[test]
+    fn pinned_timeout_can_fallback_to_relay_only_for_the_exact_confirmed_archive() {
+        let directory = source_directory_fixture(true);
+        let primary = SkillRepoExpected {
+            schema_version: 1,
+            repo: REPO.into(),
+            branch: BRANCH.into(),
+            commit: "a".repeat(40),
+            source_kind: SourceKind::Domestic,
+            source_id: "cn-mirror-1".into(),
+            archive_size: 4,
+            archive_sha256: sha256(b"same"),
+        };
+        let relay = directory.source("ph-relay").unwrap();
+        let relay_identity = expected_for_fallback_source(&primary, relay);
+        let exact_archive = b"same";
+        assert!(pinned_timeout_fallback_allowed(
+            &network_timeout(),
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        ));
+        assert!(fallback_archive_matches_expected(
+            &primary,
+            &relay_identity,
+            exact_archive
+        ));
+        assert_eq!(relay_identity.source_id, "ph-relay");
+        assert_eq!(relay_identity.source_kind, SourceKind::Relay);
+
+        let mut changed_commit = relay_identity.clone();
+        changed_commit.commit = "b".repeat(40);
+        let mut changed_digest = relay_identity.clone();
+        changed_digest.archive_sha256 = "c".repeat(64);
+        assert!(!fallback_archive_matches_expected(
+            &primary,
+            &changed_commit,
+            exact_archive
+        ));
+        assert!(!fallback_archive_matches_expected(
+            &primary,
+            &changed_digest,
+            exact_archive
+        ));
+        assert!(!fallback_archive_matches_expected(
+            &primary,
+            &relay_identity,
+            b"diff"
+        ));
+    }
+
+    #[test]
+    fn pinned_timeout_fallback_refuses_permanent_errors_and_expired_deadlines() {
+        let deadline = tokio::time::Instant::now() - Duration::from_millis(1);
+        assert!(!pinned_timeout_fallback_allowed(
+            &network_timeout(),
+            deadline
+        ));
+        assert!(!pinned_timeout_fallback_allowed(
+            &HotError::new("SKILL_REPO_SOURCE_INVALID", "identity mismatch"),
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        ));
+    }
+
+    #[test]
+    fn apply_download_timeout_falls_back_to_relay_for_the_same_archive() {
+        let archive = b"fixture archive bytes".to_vec();
+        let commit = "a".repeat(40);
+        let metadata = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 1,
+            "repo": REPO,
+            "branch": BRANCH,
+            "commit": commit.clone(),
+            "archive": "archive.zip",
+            "size": archive.len(),
+            "sha256": sha256(&archive),
+        }))
+        .expect("metadata fixture");
+        let (base, server) = skill_hub_fixture_server(
+            5,
+            metadata,
+            archive.clone(),
+            "/cn-mirror-1/archive.zip".into(),
+        );
+        let mut directory = source_directory_fixture(true);
+        for source in &mut directory.sources {
+            source.enabled = source.id == "cn-mirror-1" || source.id == "ph-relay";
+            source.base = Some(format!("{}{}/", base, source.id));
+        }
+        let expected = SkillRepoExpected {
+            schema_version: 1,
+            repo: REPO.into(),
+            branch: BRANCH.into(),
+            commit,
+            source_kind: SourceKind::Domestic,
+            source_id: "cn-mirror-1".into(),
+            archive_size: archive.len() as u64,
+            archive_sha256: sha256(&archive),
+        };
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(60))
+            .build()
+            .expect("short-timeout fixture client");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let downloaded = runtime
+            .block_on(download_expected(
+                &client,
+                &directory,
+                &expected,
+                tokio::time::Instant::now() + Duration::from_secs(5),
+            ))
+            .expect("matching relay should recover the pinned archive download");
+        server.join().expect("fixture server thread");
+        assert_eq!(downloaded.expected.source_id, "ph-relay");
+        assert_eq!(downloaded.archive, archive);
+        assert!(downloaded.attempts.iter().any(|attempt| {
+            attempt.source_id == "cn-mirror-1" && attempt.result == SkillRepoAttemptResult::Timeout
+        }));
+        assert!(downloaded.attempts.iter().any(|attempt| {
+            attempt.source_id == "ph-relay" && attempt.result == SkillRepoAttemptResult::Ok
+        }));
+    }
+
+    #[test]
+    fn apply_download_does_not_fallback_after_deadline_or_accept_changed_identity() {
+        let archive = b"fixture archive bytes";
+        let mut expected = SkillRepoExpected {
+            schema_version: 1,
+            repo: REPO.into(),
+            branch: BRANCH.into(),
+            commit: "a".repeat(40),
+            source_kind: SourceKind::Domestic,
+            source_id: "cn-mirror-1".into(),
+            archive_size: archive.len() as u64,
+            archive_sha256: sha256(archive),
+        };
+        let directory = source_directory_fixture(true);
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("fixture client");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let expired = runtime.block_on(download_expected(
+            &client,
+            &directory,
+            &expected,
+            tokio::time::Instant::now() - Duration::from_millis(1),
+        ));
+        assert!(
+            expired.is_err(),
+            "expired deadline must not produce bytes to apply"
+        );
+
+        let relay = directory.source("ph-relay").unwrap();
+        let relay_identity = expected_for_fallback_source(&expected, relay);
+        assert!(fallback_archive_matches_expected(
+            &expected,
+            &relay_identity,
+            archive
+        ));
+        expected.archive_sha256 = "b".repeat(64);
+        assert!(!fallback_archive_matches_expected(
+            &expected,
+            &relay_identity,
+            archive
+        ));
     }
 
     #[test]

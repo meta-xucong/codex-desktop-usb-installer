@@ -19,6 +19,21 @@ fn main() {
         }
         return;
     }
+    if args
+        .first()
+        .is_some_and(|value| value == "--diagnose-admin-key")
+    {
+        let Some(output) = args.get(1) else {
+            std::process::exit(2);
+        };
+        if args.len() != 2 {
+            std::process::exit(2);
+        }
+        if gui::write_admin_key_diagnostic(std::path::Path::new(output)).is_err() {
+            std::process::exit(1);
+        }
+        return;
+    }
     gui::run();
 }
 

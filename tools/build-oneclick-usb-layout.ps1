@@ -509,7 +509,7 @@ $usbManifest = [ordered]@{
         transactionDirectory = ".staging"
         successState = "clean"
     }
-    description = "Offline Codex desktop extracted from a verified MSIX into the authorized USB bundle. Codex account, session, cache and configuration data remain in the normal local Windows profile; no external AppX volume or WpSystem data layout is used."
+    description = "Offline Codex desktop extracted from a verified MSIX into the authorized USB bundle. USB CODEX_HOME and permissions use a dedicated local profile separate from the user's normal Codex home; Electron profile data remains in the normal local Windows profile. No external AppX volume or WpSystem data layout is used."
     codexInstaller = [ordered]@{
         file = "CodexDesktopSetup.exe"
         size = [int64]$installerItem.Length
@@ -626,7 +626,7 @@ $usbManifest = [ordered]@{
         globalEnvironmentModified = $false
     }
     dataLayout = [ordered]@{
-        codexHome = "%USERPROFILE%/.codex"
+        codexHome = "%LOCALAPPDATA%/CodexAppManager/usb-codex-home"
         roaming = "%APPDATA%/Codex"
         local = "%LOCALAPPDATA%/Codex"
         onUsb = $false
@@ -637,7 +637,7 @@ $usbManifest = [ordered]@{
         skillsDirectory = "content/skills"
         mcpDirectory = "content/mcp"
         capabilityPackDirectory = "content/codex-starter-kit"
-        configLocation = "%USERPROFILE%/.codex/config.toml"
+        configLocation = "%LOCALAPPDATA%/CodexAppManager/usb-codex-home/config.toml"
         secretsIncluded = $false
         status = "bundled-auto-installable"
     }
@@ -652,7 +652,7 @@ $usbManifest = [ordered]@{
         "On first launch the manager passes the signed USB account binding to CCSwitch through the legacy startup environment. CCSwitch stores the 404TOKEN API key in its normal local provider database and activates the provider through its standard switch path; the manager does not wait for an acknowledgement file. After a usable window appears, CCSwitch is minimized once into the tray. Later use of the explicit Open CCSwitch button restores the window and does not minimize it again. A missing signed binding or launch failure is shown on the manager home page. The user can later switch providers and models in CCSwitch. Installation, Codex launch, and provider switching do not require a Manager model test. The Manager's Advanced gateway probe is optional and read-only: it does not apply a model or change configuration. A full matrix sends up to 12 generation requests per selected model (up to three models), may consume upstream quota, and requires separate user cost confirmation.",
         "If an older CCSwitch process already owns its single-instance localhost port, close that old process and use the manager retry entry; the manager reports the conflict instead of treating a refused localhost connection as a successful launch.",
         "In the CCSwitch Codex provider editor, Refresh models calls the current provider's /v1/models endpoint. It keeps every vendor, collapses only stable/latest/valid-date release aliases, and preserves the selected raw upstream model ID.",
-        "Codex is launched only by the authorized USB manager with CODEX_HOME fixed to %USERPROFILE%/.codex. The effective USB runtime policy starts with normal hardware rendering (no --disable-gpu) and automatically retries the proven software-rendering/no-sandbox fallback only if no stable usable window appears. Removing the USB triggers the existing five-second guarded shutdown.",
+        "Codex is launched only by the authorized USB manager with CODEX_HOME fixed to %LOCALAPPDATA%/CodexAppManager/usb-codex-home, separate from the normal local Codex home. The USB profile defaults to approval_policy=never and sandbox_mode=danger-full-access. The effective USB runtime policy starts with normal hardware rendering (no --disable-gpu) and automatically retries the proven software-rendering/no-sandbox fallback only if no stable usable window appears. Removing the USB triggers the existing five-second guarded shutdown.",
         "Ordinary uninstall removes <bundle>/apps/Codex and preserves local user data. Advanced purge remains a separate explicit confirmation. Source-media deletion is allowed only after the runtime tree has been removed, immutable release files still match SHA256SUMS.txt, and usb-license.json plus its atomic backup match the active lease fingerprint and handoff snapshot."
     )
     secretsIncluded = $false

@@ -29,7 +29,6 @@ manim-animation
 market-sizing-analysis
 meal-planner
 meeting-secretary
-minimax-video-gen
 multi-search-engine
 node-connect
 offer-designer
@@ -38,7 +37,6 @@ pdf-processing-toolkit
 powerpoint-pptx
 python-env-setup
 safe-disk-operations
-seedance2-0-video-gen
 self-improvement-agent
 skills-search
 traffic-hunter

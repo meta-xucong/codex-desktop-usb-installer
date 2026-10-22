@@ -13,6 +13,7 @@ TEXT_EXTENSIONS = {
     ".sha256", ".toml", ".txt", ".yaml", ".yml",
 }
 TRANSIENT_SEGMENTS = {".git", ".pytest_cache", "__pycache__"}
+SOURCE_TREE_EXCLUDED = {"pack.json", "file-manifest.json", "checksums.sha256"}
 
 
 def transient(relative: Path) -> bool:
@@ -28,6 +29,27 @@ def canonical_bytes(path: Path) -> bytes:
 
 def sha256(path: Path) -> str:
     return hashlib.sha256(canonical_bytes(path)).hexdigest()
+
+
+def source_tree_sha256(root: Path) -> str:
+    """Calculate the canonical package source identity without self-reference."""
+    root = root.absolute()
+    paths = sorted(
+        (
+            path for path in root.rglob("*")
+            if path.is_file()
+            and path.relative_to(root).as_posix() not in SOURCE_TREE_EXCLUDED
+            and not transient(path.relative_to(root))
+        ),
+        key=lambda path: path.relative_to(root).as_posix().casefold(),
+    )
+    digest = hashlib.sha256()
+    for path in paths:
+        relative = path.relative_to(root).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(4, "big"))
+        digest.update(relative)
+        digest.update(hashlib.sha256(canonical_bytes(path)).digest())
+    return digest.hexdigest()
 
 
 def sha256_bytes(path: Path, data: bytes) -> str:
@@ -95,21 +117,40 @@ def build_expected(root: Path) -> tuple[dict, str, str, int]:
     return manifest, manifest_text, checksum_text, len(listed)
 
 
-def refresh(root: Path) -> dict[str, int]:
-    manifest, manifest_text, checksum_text, manifest_count = build_expected(root)
+def refresh(root: Path) -> dict[str, object]:
     root = root.absolute()
+    pack_path = root / "pack.json"
+    pack = json.loads(pack_path.read_text(encoding="utf-8"))
+    pack["sourceTreeSha256"] = source_tree_sha256(root)
+    pack_path.write_text(
+        json.dumps(pack, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    manifest, manifest_text, checksum_text, manifest_count = build_expected(root)
     (root / "file-manifest.json").write_text(
         manifest_text, encoding="utf-8", newline="\n"
     )
     (root / "checksums.sha256").write_text(
         checksum_text, encoding="utf-8", newline="\n"
     )
-    return {"manifestFiles": manifest_count, "checksumFiles": manifest_count + 1}
+    return {
+        "manifestFiles": manifest_count,
+        "checksumFiles": manifest_count + 1,
+        "sourceTreeSha256": pack["sourceTreeSha256"],
+    }
 
 
-def check(root: Path) -> dict[str, int]:
+def check(root: Path) -> dict[str, object]:
     _, expected_manifest, expected_checksums, manifest_count = build_expected(root)
     root = root.absolute()
+    pack = json.loads((root / "pack.json").read_text(encoding="utf-8"))
+    expected_tree = source_tree_sha256(root)
+    if pack.get("sourceTreeSha256") != expected_tree:
+        raise ValueError(
+            "capability-pack sourceTreeSha256 is stale: "
+            f"expected {expected_tree}, got {pack.get('sourceTreeSha256')}"
+        )
     manifest_path = root / "file-manifest.json"
     checksum_path = root / "checksums.sha256"
     mismatches = []
@@ -121,7 +162,11 @@ def check(root: Path) -> dict[str, int]:
         raise ValueError(
             "capability-pack integrity metadata is stale: " + ", ".join(mismatches)
         )
-    return {"manifestFiles": manifest_count, "checksumFiles": manifest_count + 1}
+    return {
+        "manifestFiles": manifest_count,
+        "checksumFiles": manifest_count + 1,
+        "sourceTreeSha256": expected_tree,
+    }
 
 
 if __name__ == "__main__":

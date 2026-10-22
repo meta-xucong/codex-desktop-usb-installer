@@ -1,5 +1,2 @@
-# Optional batch adapter dependencies. Lower bounds only; this is not a version lock.
-# The fetchers extra is required to import HTTP Fetcher. `scrapling install` is only
-# needed if the adapter is changed to use a browser-based fetcher.
 scrapling[fetchers]>=0.4.0
 html2text>=2024.2.26

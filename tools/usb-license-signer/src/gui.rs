@@ -198,6 +198,16 @@ pub fn write_key_diagnostic(output: &std::path::Path) -> Result<(), String> {
     fs::write(output, bytes).map_err(|error| error.to_string())
 }
 
+/// Report only whether the GUI's normal administrator-key resolver is
+/// populated. This deliberately omits the credential itself and gives release
+/// tooling a way to verify the exact published executable after clearing its
+/// runtime environment variables.
+pub fn write_admin_key_diagnostic(output: &std::path::Path) -> Result<(), String> {
+    let value = sub2api::admin_api_key_diagnostics();
+    let bytes = serde_json::to_vec_pretty(&value).map_err(|error| error.to_string())?;
+    fs::write(output, bytes).map_err(|error| error.to_string())
+}
+
 unsafe fn run_windows() {
     startup_log("run_windows:start");
     let Some(_gui_instance_mutex) = (match acquire_gui_instance_mutex() {

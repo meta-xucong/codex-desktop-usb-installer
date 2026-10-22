@@ -42,7 +42,7 @@ type ProbeCache = {
 };
 
 const SAFE_PROBE_ERROR_CODE = /^[a-z0-9-]{1,64}$/;
-type ProbeFailureReasonKey = "auth" | "http" | "rejected" | "noCompatibleSettings" | "network" | "timeout" | "response" | "large" | "binding" | "cancelled" | "budget" | "incomplete" | "local" | "unknown";
+type ProbeFailureReasonKey = "auth" | "http" | "http400" | "storeUnsupported" | "rejected" | "noCompatibleSettings" | "network" | "timeout" | "response" | "large" | "binding" | "cancelled" | "budget" | "incomplete" | "local" | "unknown";
 
 function safeProbeErrorCode(value: unknown): string | null {
   return typeof value === "string" && SAFE_PROBE_ERROR_CODE.test(value) ? value : null;
@@ -68,8 +68,11 @@ function probeFailureReasonKey(code: string | null, localFailure = false): Probe
   switch (code) {
     case "upstream-auth": return "auth";
     case "upstream-http": return "http";
+    case "upstream-http-400": return "http400";
+    case "upstream-store-unsupported": return "storeUnsupported";
     case "effort-rejected": return "rejected";
     case "no-effort-accepted": return "noCompatibleSettings";
+    case "upstream-connect-failed":
     case "upstream-unavailable": return "network";
     case "probe-timeout": return "timeout";
     case "upstream-response":
@@ -180,10 +183,11 @@ export function UpstreamModelManagerSheet({
   const [availabilityById, setAvailabilityById] = useState<Record<string, Availability>>(() => readProbeCache()?.availabilityById ?? {});
   const [cacheUpdatedAtMs, setCacheUpdatedAtMs] = useState<number | null>(() => readProbeCache()?.updatedAtMs ?? null);
   const [bulkProgress, setBulkProgress] = useState<{ current: number; total: number } | null>(null);
+  const [confirmBulkTest, setConfirmBulkTest] = useState(false);
   const [loading, setLoading] = useState(false);
   const [testingId, setTestingId] = useState<string | null>(null);
   const [reasoningTestingId, setReasoningTestingId] = useState<string | null>(null);
-  const [reasoningSelectionModel, setReasoningSelectionModel] = useState<string | null>(null);
+  const [addRetryStatusById, setAddRetryStatusById] = useState<Record<string, "precommit_retryable" | "precommit_revalidate">>({});
   const [addingId, setAddingId] = useState<string | null>(null);
   const [resetting, setResetting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -236,7 +240,12 @@ export function UpstreamModelManagerSheet({
     }
   }, [invalidateTicket, t]);
 
-  const saveAvailability = useCallback((modelId: string, availability: Availability, errorCode?: string | null) => {
+  const saveAvailability = useCallback((
+    modelId: string,
+    availability: Availability,
+    errorCode?: string | null,
+    reportSnapshot: GatewayModelProbeReport | null = report,
+  ) => {
     const nextAvailability = { ...availabilityById, [modelId]: availability };
     const nextFailedIds = availability === "failed"
       ? (failedTestIds.includes(modelId) ? failedTestIds : [...failedTestIds, modelId])
@@ -247,7 +256,7 @@ export function UpstreamModelManagerSheet({
     setAvailabilityById(nextAvailability);
     setFailedTestIds(nextFailedIds);
     setFailureCodeById(nextFailureCodes);
-    if (report) setCacheUpdatedAtMs(writeProbeCache(report, nextAvailability, nextFailedIds, nextFailureCodes));
+    if (reportSnapshot) setCacheUpdatedAtMs(writeProbeCache(reportSnapshot, nextAvailability, nextFailedIds, nextFailureCodes));
   }, [availabilityById, failedTestIds, failureCodeById, report]);
 
   const clearAvailability = useCallback((modelId: string) => {
@@ -404,81 +413,15 @@ export function UpstreamModelManagerSheet({
     };
   }, [invalidateTicket, open, t, ticketRevision]);
 
-  const testModel = useCallback(async (model: ModelRow) => {
-    if (loading || testingId || reasoningTestingId || addingId || resetting || addRequestId.current || catalogStatus !== "ok" || !model.selectable || model.activeOnly) return;
-    const previous = tickets.current.get(model.id);
-    if (previous) {
-      invalidateTicket(model.id);
-    }
-    const currentSession = session.current;
-    const requestId = newRequestId("upstream-connectivity");
-    requestIds.current.add(requestId);
-    setTestingId(model.id);
-    setFailedTestIds((ids) => ids.filter((id) => id !== model.id));
-    setFailureCodeById((codes) => { const next = { ...codes }; delete next[model.id]; return next; });
-    setAvailabilityById((current) => { const next = { ...current }; delete next[model.id]; return next; });
-    setError(null);
-    setMessage(null);
-    try {
-      const next = await managerApi.gatewayModelProbe({
-        requestId,
-        selectedModelIds: [],
-        costConsent: false,
-        connectivityModelId: model.id,
-      });
-      if (session.current !== currentSession) return;
-      const result = next.results.find((item) => item.modelId === model.id);
-      const connectionMatchesDiscovery = report
-        && next.connectionFingerprint === report.connectionFingerprint
-        && next.credentialFingerprint === report.credentialFingerprint
-        && next.endpoint === report.endpoint;
-      if (next.status === "passed" && result?.passed && connectionMatchesDiscovery) {
-        saveAvailability(model.id, "passed");
-        setMessage(t("offline.nativeModelTestPassed", { model: model.id }));
-      } else {
-        const errorCode = next.status === "passed" && !connectionMatchesDiscovery
-          ? "binding-changed"
-          : safeProbeErrorCode(result?.errorCode ?? next.errorCode);
-        saveAvailability(model.id, "failed", errorCode);
-        requestIds.current.delete(requestId);
-        if (next.connectivityProofId) {
-          await managerApi.cancelGatewayModelProbe(requestId).catch(() => false);
-        }
-        if (next.status === "passed" && !connectionMatchesDiscovery) {
-          setError(t("offline.nativeModelManagerConnectionChanged"));
-          return;
-        }
-        const reason = t(`offline.nativeModelProbeFailureReason.${probeFailureReasonKey(errorCode)}` as const);
-        setError(t("offline.nativeModelProbeFailure", {
-          reason,
-          code: errorCode ?? t("offline.nativeModelProbeFailureNoCode"),
-        }));
-      }
-    } catch (cause) {
-      if (session.current === currentSession) {
-        const errorCode = commandProbeErrorCode(cause);
-        saveAvailability(model.id, "failed", errorCode);
-        const reason = t(`offline.nativeModelProbeFailureReason.${probeFailureReasonKey(errorCode, true)}` as const);
-        setError(t("offline.nativeModelProbeFailure", {
-          reason,
-          code: errorCode ?? t("offline.nativeModelProbeFailureNoCode"),
-        }));
-      }
-      requestIds.current.delete(requestId);
-    } finally {
-      if (session.current === currentSession) setTestingId(null);
-    }
-  }, [addingId, catalogStatus, invalidateTicket, loading, reasoningTestingId, report, resetting, saveAvailability, t, testingId]);
-
   const testReasoningEfforts = useCallback(async (model: ModelRow, efforts: string[]) => {
     if (loading || testingId || reasoningTestingId || addingId || resetting || addRequestId.current || catalogStatus !== "ok" || !model.selectable || model.activeOnly) return;
     if (efforts.length === 0) return;
-    if (!window.confirm(t("offline.nativeModelReasoningConfirm", { count: efforts.length, model: model.id }))) return;
     invalidateTicket(model.id);
     const currentSession = session.current;
     const requestId = newRequestId("upstream-reasoning");
     requestIds.current.add(requestId);
     setReasoningTestingId(model.id);
+    setAddRetryStatusById((current) => { const next = { ...current }; delete next[model.id]; return next; });
     setError(null);
     setMessage(null);
     try {
@@ -496,10 +439,11 @@ export function UpstreamModelManagerSheet({
         && next.connectionFingerprint === report.connectionFingerprint
         && next.credentialFingerprint === report.credentialFingerprint
         && next.endpoint === report.endpoint;
-      if (connectionMatchesDiscovery) {
-        setReport(next);
-        setCacheUpdatedAtMs(writeProbeCache(next, availabilityById, failedTestIds, failureCodeById));
-      }
+      // Every probe response carries the binding it actually used. Adopt it as
+      // the next comparison baseline even when it differs from cached discovery;
+      // otherwise every retry keeps comparing against the same stale binding.
+      setReport(next);
+      setCacheUpdatedAtMs(writeProbeCache(next, availabilityById, failedTestIds, failureCodeById));
       if (next.status === "passed" && next.reasoningProofId && next.connectivityProofId && proofLifetimeMs > 0 && connectionMatchesDiscovery) {
         tickets.current.set(model.id, {
           requestId,
@@ -512,7 +456,10 @@ export function UpstreamModelManagerSheet({
         setMessage(null);
       } else {
         if (next.reasoningProofId) await managerApi.cancelGatewayModelProbe(requestId).catch(() => false);
-        if (next.status === "passed" && !connectionMatchesDiscovery) setError(t("offline.nativeModelManagerConnectionChanged"));
+        if (next.status === "passed" && !connectionMatchesDiscovery) {
+          saveAvailability(model.id, "failed", "binding-changed", next);
+          setError(t("offline.nativeModelManagerConnectionChanged"));
+        }
         else {
           const errorCode = safeProbeErrorCode(
             next.errorCode === "no-effort-accepted"
@@ -520,6 +467,7 @@ export function UpstreamModelManagerSheet({
               : next.reasoningResults?.find((row) => row.errorCode)?.errorCode ?? next.errorCode,
           );
           const reason = t(`offline.nativeModelProbeFailureReason.${probeFailureReasonKey(errorCode)}` as const);
+          saveAvailability(model.id, "failed", errorCode, next);
           setError(t("offline.nativeModelProbeFailure", {
             reason,
             code: errorCode ?? t("offline.nativeModelProbeFailureNoCode"),
@@ -529,6 +477,7 @@ export function UpstreamModelManagerSheet({
     } catch (cause) {
       if (session.current === currentSession) {
         const errorCode = commandProbeErrorCode(cause);
+        saveAvailability(model.id, "failed", errorCode);
         const reason = t(`offline.nativeModelProbeFailureReason.${probeFailureReasonKey(errorCode, true)}` as const);
         setError(t("offline.nativeModelProbeFailure", {
           reason,
@@ -539,14 +488,13 @@ export function UpstreamModelManagerSheet({
       requestIds.current.delete(requestId);
       if (session.current === currentSession) setReasoningTestingId(null);
     }
-  }, [addingId, availabilityById, catalogStatus, failedTestIds, failureCodeById, invalidateTicket, loading, reasoningTestingId, report, resetting, t, testingId]);
+  }, [addingId, availabilityById, catalogStatus, failedTestIds, failureCodeById, invalidateTicket, loading, reasoningTestingId, report, resetting, saveAvailability, t, testingId]);
 
-  const testAllModels = useCallback(async () => {
+  const runTestAllModels = useCallback(async () => {
     if (loading || testingId || reasoningTestingId || addingId || resetting || addRequestId.current || catalogStatus !== "ok" || !report) return;
     const models = report.models.filter((model) => model.selectable);
     if (models.length === 0) return;
-    if (!window.confirm(t("offline.nativeModelManagerTestAllConfirm", { count: models.length }))) return;
-
+    setConfirmBulkTest(false);
     const currentSession = session.current;
     let passed = 0;
     let failed = 0;
@@ -617,6 +565,12 @@ export function UpstreamModelManagerSheet({
     }
   }, [addingId, availabilityById, catalogStatus, failedTestIds, failureCodeById, loading, reasoningTestingId, report, resetting, t, testingId]);
 
+  const testAllModels = useCallback(() => {
+    if (loading || testingId || reasoningTestingId || addingId || resetting || addRequestId.current || catalogStatus !== "ok" || !report) return;
+    setConfirmBulkTest(true);
+    setError(null);
+  }, [addingId, catalogStatus, loading, reasoningTestingId, report, resetting, testingId]);
+
   const addModel = useCallback(async (model: ModelRow) => {
     const ticket = tickets.current.get(model.id);
     if (!ticket || addingId || testingId || resetting || loading || addRequestId.current || model.activeOnly) return;
@@ -643,6 +597,11 @@ export function UpstreamModelManagerSheet({
         modelId: model.id,
         connectivityProofId: ticket.proofId,
       });
+      if (result.status === "precommit_retryable" || result.status === "precommit_revalidate") {
+        setAddRetryStatusById((current) => ({ ...current, [model.id]: result.status as "precommit_retryable" | "precommit_revalidate" }));
+        setError(result.message);
+        return;
+      }
       const removedTicket = tickets.current.delete(model.id);
       if (removedTicket) setTicketRevision((revision) => revision + 1);
       requestIds.current.delete(ticket.requestId);
@@ -666,7 +625,7 @@ export function UpstreamModelManagerSheet({
       } else {
         setError(null);
         setMessage(t("offline.nativeModelManagerAdded"));
-        setReasoningSelectionModel(null);
+        setAddRetryStatusById((current) => { const next = { ...current }; delete next[model.id]; return next; });
       }
     } catch (cause) {
       setError(errorMessage(cause) || t("offline.nativeModelManagerError"));
@@ -736,6 +695,9 @@ export function UpstreamModelManagerSheet({
   const catalogActionReasonId = `${titleId}-catalog-action-reason`;
   const managerTooltip = `${t("offline.nativeModelManagerSteps")}\n\n${t("offline.nativeModelManagerCostWarning")}`;
   const operationBusy = Boolean(loading || testingId || reasoningTestingId || addingId || resetting || addRequestId.current || bulkProgress);
+  const bulkTestableModels = report?.models.filter((model) => model.selectable) ?? [];
+  const bulkRequestMinimum = bulkTestableModels.length;
+  const bulkRequestEstimate = bulkTestableModels.length;
 
   return (
     <Sheet
@@ -786,6 +748,19 @@ export function UpstreamModelManagerSheet({
               : t("offline.nativeModelManagerTestAll")}
           </button>
         </div>
+            {confirmBulkTest ? (
+              <div className="upstream-model-manager-bulk-confirm" role="alertdialog" aria-label={t("offline.nativeModelManagerTestAllConfirm", { count: bulkTestableModels.length, minimum: bulkRequestMinimum, requests: bulkRequestEstimate })}>
+                <p>{t("offline.nativeModelManagerTestAllConfirm", { count: bulkTestableModels.length, minimum: bulkRequestMinimum, requests: bulkRequestEstimate })}</p>
+                <div className="upstream-model-manager-add-footer">
+                  <button type="button" className="btn ghost upstream-model-manager-compact-action" onClick={() => setConfirmBulkTest(false)}>
+                    {t("confirm.cancel")}
+                  </button>
+                  <button type="button" className="btn primary upstream-model-manager-compact-action" onClick={() => void runTestAllModels()}>
+                    {t("offline.nativeModelManagerTestAllStart")}
+                  </button>
+                </div>
+              </div>
+            ) : null}
 
         {report && cacheUpdatedAtMs !== null ? (
           <small
@@ -829,10 +804,10 @@ export function UpstreamModelManagerSheet({
                 ? t("offline.nativeModelManagerMissingUpstream")
                 : addingId === model.id
                   ? t("offline.nativeModelManagerAdding")
-                  : testingId === model.id
-                    ? t("offline.nativeModelManagerTesting")
-                    : reasoningTestingId === model.id
+                  : reasoningTestingId === model.id
                       ? t("offline.nativeModelReasoningTesting")
+                    : addRetryStatusById[model.id] === "precommit_revalidate"
+                      ? t("offline.nativeModelManagerAwaitingRevalidate")
                     : isActive
                       ? t("offline.nativeModelManagerActive")
                       : availability === "passed"
@@ -877,41 +852,40 @@ export function UpstreamModelManagerSheet({
                           <button
                             type="button"
                             className="btn primary upstream-model-manager-compact-action"
-                            onClick={() => {
-                              setReasoningSelectionModel(model.id);
-                              setError(null);
-                              setMessage(null);
-                            }}
-                            disabled={actionDisabled}
+                            onClick={() => void addModel(model)}
+                            disabled={actionDisabled || operationBusy}
                             aria-describedby={actionReasonId}
-                            title={t("offline.nativeModelManagerAdd")}
+                            title={t("offline.nativeModelManagerConfirmAdd")}
                           >
-                            {t("offline.nativeModelManagerAdd")}
+                            {addingId === model.id
+                              ? t("offline.nativeModelManagerAdding")
+                              : addRetryStatusById[model.id] === "precommit_revalidate"
+                                ? t("offline.nativeModelManagerRevalidateAdd")
+                                : addRetryStatusById[model.id] === "precommit_retryable"
+                                  ? t("offline.nativeModelManagerRetryAdd")
+                                  : t("offline.nativeModelManagerConfirmAdd")}
                           </button>
                         ) : (
                           <button
                             type="button"
-                            className="btn ghost upstream-model-manager-compact-action"
-                            onClick={() => setReasoningSelectionModel((current) => current === model.id ? null : model.id)}
-                            disabled={actionDisabled}
+                            className="btn primary upstream-model-manager-compact-action"
+                            onClick={() => void testReasoningEfforts(model, reasoningEffortsForModel(model.id))}
+                            disabled={actionDisabled || reasoningTestingId === model.id}
                             aria-describedby={actionReasonId}
-                            title={t("offline.nativeModelPrepareAddHelp")}
-                            aria-label={t("offline.nativeModelManagerPrepareAdd")}
+                            title={t("offline.nativeModelManagerPrepareAdd")}
+                            aria-label={reasoningTestingId === model.id
+                              ? t("offline.nativeModelReasoningTesting")
+                              : failed
+                                ? t("offline.nativeModelManagerRetryPrepare")
+                                : t("offline.nativeModelManagerPrepareAdd")}
                           >
-                            {t("offline.nativeModelManagerPrepareAdd")}
+                            {reasoningTestingId === model.id
+                              ? t("offline.nativeModelReasoningTesting")
+                              : failed
+                                ? t("offline.nativeModelManagerRetryPrepare")
+                                : t("offline.nativeModelManagerPrepareAdd")}
                           </button>
                         )}
-                        <button
-                            type="button"
-                            className="btn ghost upstream-model-manager-compact-action"
-                            onClick={() => void testModel(model)}
-                            disabled={actionDisabled}
-                            aria-describedby={actionReasonId}
-                            title={t("offline.nativeModelManagerTest")}
-                            aria-label={t("offline.nativeModelManagerTest")}
-                          >
-                            {testingId === model.id ? t("offline.nativeModelManagerTesting") : t("offline.nativeModelManagerTestShort")}
-                        </button>
                         {rowActionReason ? (
                           <small id={reasonId} className="sr-only">
                             {rowActionReason}
@@ -922,97 +896,22 @@ export function UpstreamModelManagerSheet({
                       <span className="upstream-model-manager-row-status-spacer" aria-hidden="true" />
                     )}
                   </div>
-                  {!isActive && !model.activeOnly && reasoningSelectionModel === model.id ? (
-                    <div className="upstream-model-manager-add-panel">
-                      <div className="upstream-model-manager-add-heading">
-                        <div>
-                          <strong>{ticket ? t("offline.nativeModelManagerConfirmTitle") : t("offline.nativeModelManagerPrepareTitle")}</strong>
-                          <span className="upstream-model-manager-add-model" dir="ltr">{model.id}</span>
-                        </div>
-                        <button
-                          type="button"
-                          className="icon-btn"
-                          aria-label={t("confirm.cancel")}
-                          onClick={() => setReasoningSelectionModel(null)}
-                          disabled={Boolean(addingId)}
-                        >
-                          <Icon name="close" />
-                        </button>
-                      </div>
-                      {ticket ? (
-                        <>
-                          <p>{t("offline.nativeModelManagerConfirmDescription")}</p>
-                          {error ? <p role="alert" className="upstream-model-manager-error">{error}</p> : null}
-                          {report?.reasoningModelId === model.id ? (
-                            <p className="upstream-model-manager-add-ready" role="status">
-                              {t("offline.nativeModelReasoningDone", {
-                                accepted: report.reasoningResults?.filter((row) => row.status === "accepted_by_route").length ?? 0,
-                              })}
-                            </p>
-                          ) : null}
-                          <div className="upstream-model-manager-add-footer">
-                            <button
-                              type="button"
-                              className="btn ghost upstream-model-manager-compact-action"
-                              onClick={() => setReasoningSelectionModel(null)}
-                              disabled={Boolean(addingId)}
-                            >
-                              {t("confirm.cancel")}
-                            </button>
-                            <button
-                              type="button"
-                              className="btn primary upstream-model-manager-compact-action"
-                              onClick={() => void addModel(model)}
-                              disabled={operationBusy || actionDisabled}
-                            >
-                              {addingId === model.id ? t("offline.nativeModelManagerAdding") : t("offline.nativeModelManagerConfirmAdd")}
-                            </button>
-                          </div>
-                        </>
-                      ) : (
-                        <>
-                          <p>{t("offline.nativeModelPrepareAddHelp")}</p>
-                          {error ? <p role="alert" className="upstream-model-manager-error">{error}</p> : null}
-                          <div className="upstream-model-manager-add-footer">
-                            <button
-                              type="button"
-                              className="btn ghost upstream-model-manager-compact-action"
-                              onClick={() => setReasoningSelectionModel(null)}
-                              disabled={Boolean(reasoningTestingId)}
-                            >
-                              {t("confirm.cancel")}
-                            </button>
-                            <button
-                              type="button"
-                              className="btn primary upstream-model-manager-compact-action"
-                              disabled={operationBusy}
-                              onClick={() => void testReasoningEfforts(model, reasoningEffortsForModel(model.id))}
-                            >
-                              {reasoningTestingId === model.id
-                                ? t("offline.nativeModelReasoningTesting")
-                                : t("offline.nativeModelReasoningStart")}
-                            </button>
-                          </div>
-                        </>
-                      )}
-                      {report?.reasoningModelId === model.id && report.reasoningResults?.length ? (
-                        <details className="upstream-model-manager-reasoning-details">
-                          <summary>{t("offline.nativeModelReasoningResults")}</summary>
-                          <ul className="upstream-model-manager-reasoning-results" aria-label={t("offline.nativeModelReasoningResults")}>
-                            {report.reasoningResults.map((result: GatewayReasoningEffortResult) => (
-                              <li key={result.effort}>
-                                <span>{result.effort}</span>
-                                <span className={`reasoning-result-${result.status}`}>
-                                  <span title={result.errorCode === "effort-probe-incomplete" ? t("offline.nativeModelReasoningIncomplete") : result.errorCode ?? undefined}>
-                                    {t(`offline.nativeModelReasoningStatus.${result.status}` as const)}
-                                  </span>
-                                </span>
-                              </li>
-                            ))}
-                          </ul>
-                        </details>
-                      ) : null}
-                    </div>
+                  {!isActive && !model.activeOnly && report?.reasoningModelId === model.id && report.reasoningResults?.length ? (
+                    <details className="upstream-model-manager-reasoning-details">
+                      <summary>{t("offline.nativeModelReasoningResults")}</summary>
+                      <ul className="upstream-model-manager-reasoning-results" aria-label={t("offline.nativeModelReasoningResults")}>
+                        {report.reasoningResults.map((result: GatewayReasoningEffortResult) => (
+                          <li key={result.effort}>
+                            <span>{result.effort}</span>
+                            <span className={`reasoning-result-${result.status}`}>
+                              <span title={result.errorCode === "effort-probe-incomplete" ? t("offline.nativeModelReasoningIncomplete") : result.errorCode ?? undefined}>
+                                {t(`offline.nativeModelReasoningStatus.${result.status}` as const)}
+                              </span>
+                            </span>
+                          </li>
+                        ))}
+                      </ul>
+                    </details>
                   ) : null}
                 </li>
               );
@@ -1038,7 +937,7 @@ export function UpstreamModelManagerSheet({
           </details>
         ) : null}
 
-        {error && !catalogActionReason && !reasoningSelectionModel ? <p role="alert" className="upstream-model-manager-error">{error}</p> : null}
+        {error && !catalogActionReason ? <p role="alert" className="upstream-model-manager-error">{error}</p> : null}
         {message ? <p role="status">{message}</p> : null}
 
         <div className="upstream-model-manager-reset">

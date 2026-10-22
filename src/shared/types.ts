@@ -317,6 +317,10 @@ export interface NativeModelCatalogActionReport {
   modelIds: string[];
   restartRequired: boolean;
   message: string;
+  errorCode?: string | null;
+  commitState?: "not_started" | "started" | "uncertain" | string;
+  proofState?: "valid" | "pending_validation" | "consumed" | "invalid" | "expired" | "none" | string;
+  retryable?: boolean;
   connectionFingerprint?: string | null;
   credentialFingerprint?: string | null;
 }
@@ -457,6 +461,8 @@ export interface SkillRepoUpdateInfo {
   installableCount: number;
   conflictCount: number;
   skippedCount: number;
+  /** Product Design is a separate offline plugin, not part of Skill Hub's repo-skill count. */
+  productDesignSkillCount?: number | null;
   /** Reserved for a real non-fatal runtime notice; normal Skill Hub updates are null. */
   warning: string | null;
 }
@@ -472,6 +478,7 @@ export interface SkillRepoApplyReport {
   lastGoodGeneration: string | null;
   reloadedRequired: boolean;
   logPath: string | null;
+  productDesignSkillCount?: number;
 }
 
 export interface SkillRepoRollbackReport {
@@ -1095,6 +1102,11 @@ export interface UsbGuardStatus {
   countdownSeconds: number | null;
   managedProcesses: UsbManagedProcess[];
   message: string;
+}
+
+export interface UsbInstallPreflightReport {
+  internetAvailable: boolean;
+  apiKeyReady: boolean;
 }
 
 /** Delivery metadata (optional schemaVersion-2 fields; packer enforces). */

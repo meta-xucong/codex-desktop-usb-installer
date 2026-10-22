@@ -2043,6 +2043,19 @@ button.themecard-art:focus-visible {
 .skill-repo-update-summary .btn {
   align-self: stretch;
 }
+.skill-repo-confirm {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+  box-shadow: var(--shadow-md);
+}
+.skill-repo-confirm p {
+  margin: 0;
+  line-height: 1.5;
+}
 .skill-repo-failure-details {
   margin-top: 8px;
   color: var(--text-soft);
@@ -2785,26 +2798,6 @@ button.row.danger:hover {
   min-width: 0;
   align-items: center;
   justify-content: flex-end;
-}
-.upstream-model-manager-add-panel {
-  grid-column: 1 / -1;
-  display: grid;
-  gap: 12px;
-  min-width: 0;
-  margin: 4px 0 8px;
-  padding: 13px;
-  border: 1px solid var(--line-2);
-  border-radius: 12px;
-  background: var(--surface-3);
-  box-shadow: var(--elev-1);
-}
-.upstream-model-manager-add-panel > p,
-.upstream-model-manager-add-heading p {
-  margin: 0;
-  color: var(--text-faint);
-  font-size: 12px;
-  line-height: 1.45;
-  overflow-wrap: anywhere;
 }
 .upstream-model-manager-add-heading {
   display: flex;

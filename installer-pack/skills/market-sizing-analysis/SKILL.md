@@ -31,10 +31,10 @@ Market sizing provides the foundation for startup strategy, fundraising, and bus
 
 **SOM (Serviceable Obtainable Market)**
 
-- Revenue or customer volume plausibly reachable within a stated horizon, based on explicit capacity and adoption assumptions
+- Realistic market share achievable in 3-5 years
 - Accounts for competition, resources, and market dynamics
 - Used for financial projections and fundraising
-- Do not use a universal SOM percentage. Derive scenarios from sales capacity, conversion, retention, competition, and time horizon; label unsupported inputs as assumptions.
+- Example: 2-5% of SAM based on competitive landscape
 
 ### When to Use Each Methodology
 
@@ -49,7 +49,7 @@ Market sizing provides the foundation for startup strategy, fundraising, and bus
 
 - Use when targeting specific customer segments
 - Best for new or niche markets
-- Can be granular and defensible when customer data and assumptions are supported
+- Most credible for investors
 - Builds from customer data and pricing
 
 **Value Theory**
@@ -70,20 +70,19 @@ Start with total market size and narrow to addressable segments.
 1. Identify total market category from research reports
 2. Apply geographic filters (target regions)
 3. Apply segment filters (target industries/customers)
-4. Apply explicit, evidenced segment filters; do not infer addressable customer counts from market-share claims alone.
+4. Calculate competitive positioning adjustments
 
 **Formula:**
 
 ```
 TAM = Total Market Category Size
-SAM = TAM × Joint Share Meeting All Geographic and Segment Filters
-SOM customers = min(serviceable customers, reachable customers under explicit sales/adoption/delivery capacity over the horizon)
-SOM revenue = SOM customers × annual revenue per customer
+SAM = TAM × Geographic % × Segment %
+SOM = SAM × Realistic Capture Rate (2-5%)
 ```
 
 **When to use:** Established markets with available research (e.g., SaaS, fintech, e-commerce)
 
-**Strengths:** Can provide a quick market context when the underlying source and definition are credible and documented
+**Strengths:** Quick, uses credible data, validates market existence
 
 **Limitations:** May overestimate for new categories, less granular
 
@@ -101,18 +100,14 @@ Build market size from customer segment calculations.
 **Formula:**
 
 ```
-TAM = Σ (Eligible Customers in Each Mutually Exclusive Segment × Annual Revenue per Customer)
-SAM = Σ (Eligible Customers in Each Serviceable, Mutually Exclusive Segment × Annual Revenue per Customer)
-SOM = min(serviceable customers, customers reachable at modeled go-to-market capacity) × annual revenue per customer
+TAM = Σ (Segment Size × Annual Revenue per Customer)
+SAM = TAM × (Segments You Can Serve / Total Segments)
+SOM = SAM × Realistic Penetration Rate (Year 3-5)
 ```
-
-Sum eligible revenue across the serviceable segments; do not scale TAM by the count of segments, because segments may differ greatly in customer count and revenue. For top-down estimates that only provide aggregate TAM, use a directly evidenced share that satisfies **all** filters. If applying filters sequentially, each later percentage must be conditional on the population remaining after the earlier filter. Do not multiply independent-looking geographic and segment percentages unless the joint share is evidenced or the independence assumption is stated and supported.
-
-**Synthetic teaching example:** Two mutually exclusive segments have annual revenues of $99 and $1, for TAM $100. If only the $99 segment is serviceable, SAM is $99; if only the $1 segment is serviceable, SAM is $1. Counting segments would incorrectly assign $50 to either case.
 
 **When to use:** B2B, niche markets, specific customer segments
 
-**Strengths:** Granular and auditable when customer counts, pricing, and segment definitions are evidenced
+**Strengths:** Most credible for investors, granular, defensible
 
 **Limitations:** Requires detailed customer research, time-intensive
 
@@ -125,17 +120,17 @@ Calculate based on value created and willingness to pay.
 1. Identify problem being solved
 2. Quantify current cost of problem (time, money, inefficiency)
 3. Calculate value of solution (savings, gains, efficiency)
-4. Model willingness to pay with customer evidence or clearly labeled sensitivity scenarios; there is no universal percentage.
+4. Estimate willingness to pay (typically 10-30% of value)
 5. Multiply by addressable customer base
 
 **Formula:**
 
 ```
 Value per Customer = Problem Cost × % Solved by Solution
-Price per Customer = Value × Assumed or observed willingness-to-pay rate
+Price per Customer = Value × Willingness to Pay % (10-30%)
 TAM = Total Potential Customers × Price per Customer
-SAM = TAM × Share of TAM Meeting All Buy and Serviceability Criteria
-SOM = reachable customers/revenue from an explicit capacity and adoption model
+SAM = TAM × % Meeting Buy Criteria
+SOM = SAM × Realistic Adoption Rate
 ```
 
 **When to use:** New categories, disruptive innovations, unclear existing markets
@@ -161,12 +156,10 @@ Clearly specify what market is being measured.
 **Example:**
 
 - Problem: E-commerce companies struggle with email marketing automation
-- Customers: a clearly defined subset of e-commerce stores
+- Customers: E-commerce stores with >$1M annual revenue
 - Category: AI-powered email marketing software
 - Geography: North America initially, global expansion
-- Horizon: a stated planning period selected for the analysis
-
-This is a scope illustration, not a market fact or recommended customer threshold.
+- Horizon: 3-5 year opportunity
 
 ### Step 2: Gather Data Sources
 
@@ -174,8 +167,6 @@ Use the current Codex session's native web search/browser when available. Open p
 and keep assumptions separate from observed data. If web access is unavailable, use only user-provided sources and state the verification gap.
 
 Identify credible data for calculations.
-
-For every decision-critical input, record the source URL or user-provided origin, publication date, reference period, unit, definition, geography, and access/verification status. Prefer primary data and independently corroborate material estimates where possible; syndicated copies of the same estimate are not independent sources. Reconcile different definitions as ranges instead of averaging unlike figures. Label each value as observed fact, user-provided data, assumption, or calculation. A broad sector revenue figure does not validate a niche customer count. Never invent citations, report titles, survey results, market shares, or current prices. If a source cannot be opened, say so and treat its claim as unverified.
 
 **Top-Down Sources:**
 
@@ -242,29 +233,39 @@ Narrow TAM to serviceable addressable market.
 SAM = TAM × (% matching all filters)
 ```
 
-**Example:** Apply documented geographic, product, customer, and regulatory filters to sourced customer/revenue data. Do not use unverified percentages to turn a broad category total into a precise SAM.
+**Example:**
+
+- TAM: $10B global email marketing
+- Geographic filter: 40% (North America)
+- Product filter: 30% (e-commerce focus)
+- Feature filter: 60% (need AI capabilities)
+- SAM = $10B × 0.40 × 0.30 × 0.60 = $720M
 
 ### Step 5: Calculate SOM
 
-Estimate reachable customer count and revenue under a stated horizon.
+Determine realistic obtainable market share.
 
 **Consider:**
 
 - Current market share of competitors
-- Sales capacity, conversion, retention, pricing, competition, and time horizon
+- Typical market share for new entrants (2-5%)
 - Resources available (funding, team, time)
 - Go-to-market effectiveness
 - Competitive advantages
-- A user-defined planning horizon; no standard duration applies to every market
+- Time to achieve (3-5 years typically)
 
-**Capacity-based scenarios:**
+**Conservative Approach:**
 
 ```
-Year-N customers = qualified opportunities × conversion, capped by delivery and sales capacity
-Year-N SOM revenue = reachable active customers × annual revenue per customer
+SOM (Year 3) = SAM × 2%
+SOM (Year 5) = SAM × 5%
 ```
 
-Report one or more time-based scenarios only when the underlying customer and capacity inputs are documented.
+**Example:**
+
+- SAM: $720M
+- Year 3 SOM: $720M × 2% = $14.4M
+- Year 5 SOM: $720M × 5% = $36M
 
 ### Step 6: Validate and Triangulate
 
@@ -272,7 +273,7 @@ Cross-check using multiple methods.
 
 **Validation Techniques:**
 
-1. Compare top-down and bottom-up results; explain differences in definitions, periods, and source quality rather than enforcing a universal tolerance.
+1. Compare top-down and bottom-up results (should be within 30%)
 2. Check against public company revenues in space
 3. Validate customer count assumptions
 4. Sense-check pricing assumptions
@@ -281,10 +282,10 @@ Cross-check using multiple methods.
 
 **Red Flags:**
 
-- TAM that does not meet the explicitly stated business or financing criteria; there is no universal minimum threshold
+- TAM that's too small (< $1B for VC-backed startups)
 - TAM that's too large (unsupported by data)
-- SOM that exceeds modeled sales, delivery, or customer adoption capacity
-- Material disagreement between methods that is left unexplained
+- SOM that's too aggressive (> 10% in 5 years for new entrant)
+- Inconsistency between methodologies (> 50% difference)
 
 ## Industry-Specific Considerations
 
@@ -327,17 +328,9 @@ TAM = Total Category GMV × Expected Take Rate
 
 **TAM Calculation:**
 
-If ARPU is annual:
-
-`TAM = Total Addressable Users × Annual ARPU`
-
-If revenue is measured per purchase instead:
-
-`TAM = Total Addressable Users × Average Spend per Purchase × Purchases per User per Year`
-
-Do not multiply annual ARPU by purchase frequency: annual ARPU already includes the year's purchases. State the ARPU period and use a matching 12-month frequency when using per-purchase spend.
-
-**Synthetic teaching example:** 10,000 users × $100 annual ARPU = $1,000,000 TAM. If $100 is average spend per purchase and users purchase twice per year, annual TAM is $2,000,000.
+```
+TAM = Total Users × ARPU × Purchase Frequency per Year
+```
 
 ### B2B Services
 
@@ -367,8 +360,8 @@ TAM = Total Target Companies × Average Deal Size × Deals per Year
 
 **Key Points:**
 
-- Select the method whose inputs and definitions can be evidenced; explain its limits
-- Triangulate with other methods when comparable data is available
+- Lead with bottom-up calculation (most credible)
+- Show triangulation with top-down
 - Explain conservative assumptions
 - Link to revenue projections
 - Highlight market growth rate
@@ -401,14 +394,15 @@ TAM = Total Target Companies × Average Deal Size × Deals per Year
 
 **Mistake 2: Overly Aggressive SOM**
 
-- Do not apply a generic market-share ceiling; show the capacity assumptions and uncertainty instead.
+- New entrants rarely capture > 5% in 5 years
 - Account for competition and resources
 - Show realistic ramp timeline
 
 **Mistake 3: Using Only Top-Down**
 
-- Top-down results alone may be too coarse for an operating plan
-- Use a second method when comparable evidence is available; explain when it is not
+- Investors prefer bottom-up validation
+- Top-down alone lacks credibility
+- Always triangulate with multiple methods
 
 **Mistake 4: Cherry-Picking Data**
 
@@ -440,18 +434,18 @@ Working examples with complete calculations:
 - **`examples/marketplace-sizing.md`** - Marketplace platform market opportunity calculation
 - **`examples/value-theory-example.md`** - Value-based market sizing for disruptive innovation
 
-Use these examples as templates. All included numbers are explicitly hypothetical and demonstrate arithmetic only; they are not market facts or validated benchmarks. Replace them with sourced inputs before making decisions.
+Use these examples as templates for your own market sizing analysis. Each includes real numbers, data sources, and assumptions documented clearly.
 
 ## Quick Start
 
 To perform market sizing analysis:
 
 1. **Define the market** - Problem, customers, category, geography
-2. **Choose methodology** - Select the method supported by the available evidence; triangulate when definitions can be aligned
+2. **Choose methodology** - Bottom-up (preferred) or top-down + triangulation
 3. **Gather data** - Industry reports, customer data, competitive intelligence
 4. **Calculate TAM** - Apply methodology formula
 5. **Narrow to SAM** - Apply product, geographic, segment filters
-6. **Estimate SOM** - model reachable customers/revenue from explicit capacity and adoption assumptions
+6. **Estimate SOM** - 2-5% realistic capture rate
 7. **Validate** - Cross-check with alternative methods
 8. **Document** - Show methodology, sources, assumptions
 9. **Present** - Structure for audience (investors, strategy, operations)

@@ -805,7 +805,6 @@ python scripts/reflection_db.py today
 
 # 生成本周复盘
 python scripts/reflection_db.py weekly
-# 可传入 YYYY-MM-DD 作为周起始日，习惯统计按该周日期范围取数
 
 # 查看习惯追踪
 python scripts/reflection_db.py habits

@@ -308,8 +308,8 @@ fn default_signature_state() -> String {
 }
 
 /// Local data paths used by the USB portable edition. Program and managed
-/// content live on the removable bundle; account, session, cache and Electron
-/// profile data remain in the user's ordinary Windows profile.
+/// content live on the removable bundle; Codex configuration has a dedicated
+/// local home so USB permissions never change the user's normal Codex config.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsbLocalDataPaths {
     pub codex_home: PathBuf,
@@ -1639,6 +1639,34 @@ pub fn require_signed_codex_install_bundle(
     require_signed_codex_reinstall_bundle(phase).map(Some)
 }
 
+/// Check whether the currently authorized USB install license carries the
+/// 404token binding needed by first-install setup. This intentionally uses the
+/// install authorization boundary, which also supports the narrowly scoped
+/// signed reactivation reinstall path that has no live lease yet.
+pub fn signed_install_account_binding_ready() -> Result<bool, AppError> {
+    if !guard_required() {
+        return Ok(true);
+    }
+    let authorization = require_signed_codex_install_bundle("install-account-binding")?
+        .ok_or_else(|| engine("当前进程不是受管 USB bundle，不能检查签名账号绑定"))?;
+    let license = read_license(&authorization.bundle_root)?
+        .ok_or_else(|| engine("usb_license_missing：当前 U 盘缺少许可证"))?;
+    let signed = validate_license(&license, &authorization.fingerprint)
+        .map_err(|error| engine(format!("usb_license_invalid：{error}")))?;
+    if !signed {
+        return Err(engine(
+            "usb_license_unsigned：自动导入账号需要有效的签名许可证",
+        ));
+    }
+    let Some(binding) = license.account_binding.as_ref() else {
+        return Ok(false);
+    };
+    license_core::validate_account_binding(binding)
+        .map_err(|error| engine(format!("usb_account_binding_invalid：{error}")))?;
+    Ok(binding.ccswitch.provider_id == "404token-sub2api"
+        && !binding.ccswitch.device_api_key.trim().is_empty())
+}
+
 /// Re-observe and authorize the exact physical bundle owned by this manager
 /// session.  Callers that hand work to a detached helper must persist this
 /// fingerprint; a renderer path or a drive letter is not an authorization
@@ -1770,10 +1798,11 @@ fn required_profile_path(name: &str) -> Result<PathBuf, AppError> {
 /// Validate that all mutable Codex state stays outside the removable product
 /// volume. This is an observed boundary, not an AppX policy assumption.
 pub fn local_data_paths() -> Result<UsbLocalDataPaths, AppError> {
-    let user_profile = required_profile_path("USERPROFILE")?;
     let roaming_app_data = required_profile_path("APPDATA")?;
     let local_app_data = required_profile_path("LOCALAPPDATA")?;
-    let codex_home = user_profile.join(".codex");
+    let codex_home = local_app_data
+        .join("CodexAppManager")
+        .join("usb-codex-home");
     let usb_root = current_bundle_volume_root()
         .and_then(|root| normalize_drive_root(&root.to_string_lossy()))
         .ok_or_else(|| engine("无法确定当前 U 盘卷，不能核验本地数据边界"))?;

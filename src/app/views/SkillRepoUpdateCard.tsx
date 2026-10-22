@@ -22,6 +22,7 @@ import { Sheet } from "../Sheet";
 
 type BusyAction = "check" | "apply" | "rollback" | null;
 type RetryAction = "check" | "rollback" | null;
+type ConfirmAction = "apply" | "rollback" | null;
 
 // The Rust command is bounded at 45 seconds plus a two-second join grace.
 // Keep a small renderer-side margin so a current backend error wins the race;
@@ -227,8 +228,10 @@ export function SkillRepoUpdateCard() {
   const { t } = useI18n();
   const busyRef = useRef<BusyAction>(null);
   const [busy, setBusy] = useState<BusyAction>(null);
+  const [confirmAction, setConfirmAction] = useState<ConfirmAction>(null);
   const [open, setOpen] = useState(false);
   const [info, setInfo] = useState<SkillRepoUpdateInfo | null>(null);
+  const [productDesignSkillCount, setProductDesignSkillCount] = useState<number | null>(null);
   const [report, setReport] = useState<SkillRepoApplyReport | null>(null);
   const [rollbackReport, setRollbackReport] = useState<SkillRepoRollbackReport | null>(null);
   const [failure, setFailure] = useState<FailureSurface | null>(null);
@@ -264,6 +267,7 @@ export function SkillRepoUpdateCard() {
     try {
       const nextInfo = await checkSkillRepoWithTimeout();
       setInfo(nextInfo);
+      setProductDesignSkillCount(nextInfo.productDesignSkillCount ?? null);
       setSourceAttempts(sanitizeSkillRepoAttempts(nextInfo.attempts));
       setSelectedSourceLabel(
         sourceLabelFromValue(nextInfo.sourceLabel) ?? sourceLabelForId(nextInfo.expected.sourceId),
@@ -279,7 +283,7 @@ export function SkillRepoUpdateCard() {
 
   const apply = async () => {
     if (busyRef.current !== null || !info) return;
-    if (!window.confirm(t("skillRepo.confirm"))) return;
+    setConfirmAction(null);
     const expected = info.expected;
     if (!begin("apply")) return;
     const checkedSourceLabel = selectedSourceLabel ?? sourceLabelForId(expected.sourceId);
@@ -293,6 +297,9 @@ export function SkillRepoUpdateCard() {
     try {
       const nextReport = await managerApi.skillRepoApplyUpdate(expected);
       setReport(nextReport);
+      if (nextReport.productDesignSkillCount) {
+        setProductDesignSkillCount(nextReport.productDesignSkillCount);
+      }
       setSelectedSourceLabel(sourceLabelForId(nextReport.identity.sourceId) ?? checkedSourceLabel);
     } catch (error) {
       setSourceAttempts(skillRepoAttempts(error));
@@ -304,7 +311,8 @@ export function SkillRepoUpdateCard() {
   };
 
   const rollback = async () => {
-    if (busyRef.current !== null || !window.confirm(t("skillRepo.rollbackConfirm"))) return;
+    if (busyRef.current !== null) return;
+    setConfirmAction(null);
     if (!begin("rollback")) return;
     setFailure(null);
     setInfo(null);
@@ -405,7 +413,12 @@ export function SkillRepoUpdateCard() {
           className="skill-repo-entry-button"
           aria-expanded={open}
           aria-controls={detailsId}
-          onClick={() => setOpen(true)}
+          onClick={() => {
+            setOpen(true);
+            void managerApi.skillRepoProductDesignStatus()
+              .then(setProductDesignSkillCount)
+              .catch(() => setProductDesignSkillCount(null));
+          }}
         >
           <Icon name="download" />
           <span>{t("skillRepo.entry")}</span>
@@ -416,7 +429,10 @@ export function SkillRepoUpdateCard() {
       <Sheet
         open={open}
         onDismiss={() => {
-          if (busy === null) setOpen(false);
+          if (busy === null) {
+            setConfirmAction(null);
+            setOpen(false);
+          }
         }}
         dismissable={busy === null}
         labelledBy={titleId}
@@ -437,10 +453,18 @@ export function SkillRepoUpdateCard() {
             <button type="button" className="btn primary" onClick={() => void check()} disabled={busy !== null}>
               {busy === "check" ? t("skillRepo.checking") : t("skillRepo.check")}
             </button>
-            <button type="button" className="btn ghost" onClick={() => void rollback()} disabled={busy !== null}>
+            <button type="button" className="btn ghost" onClick={() => setConfirmAction("rollback")} disabled={busy !== null}>
               {busy === "rollback" ? t("skillRepo.rollingBack") : t("skillRepo.rollback")}
             </button>
           </div>
+
+          {productDesignSkillCount ? (
+            <StatusBanner tone="ok">
+              <div data-testid="skill-repo-product-design-status">
+                {t("skillRepo.productDesignInstalled", { skills: productDesignSkillCount })}
+              </div>
+            </StatusBanner>
+          ) : null}
 
           {failure ? (
             <StatusBanner tone="err">
@@ -483,7 +507,7 @@ export function SkillRepoUpdateCard() {
             <div className="skill-repo-update-summary">
               <div>{t("skillRepo.version", { current: shortCommit(info.currentCommit), latest: shortCommit(info.latestCommit) })}</div>
               <div>{t("skillRepo.counts", { installable: info.installableCount, conflicts: info.conflictCount, skipped: info.skippedCount })}</div>
-              <button type="button" className="btn primary" onClick={() => void apply()} disabled={busy !== null || !info.updateAvailable}>
+              <button type="button" className="btn primary" onClick={() => setConfirmAction("apply")} disabled={busy !== null || !info.updateAvailable}>
                 {busy === "apply" ? t("skillRepo.updating") : t("skillRepo.update")}
               </button>
             </div>
@@ -493,6 +517,11 @@ export function SkillRepoUpdateCard() {
               <div data-testid="skill-repo-apply-result">
                 {t("skillRepo.result", { status: report.status, applied: report.applied.length, conflicts: report.conflicts.length })}
               </div>
+              {report.productDesignSkillCount ? (
+                <div data-testid="skill-repo-product-design-count">
+                  {t("skillRepo.usbProductDesign", { skills: report.productDesignSkillCount })}
+                </div>
+              ) : null}
               <div data-testid="skill-repo-apply-counts">
                 {t("skillRepo.counts", {
                   installable: report.applied.length,
@@ -527,6 +556,23 @@ export function SkillRepoUpdateCard() {
               {t("skillRepo.close")}
             </button>
           </div>
+          {confirmAction ? (
+            <div className="skill-repo-confirm" role="alertdialog" aria-modal="true">
+              <p>{t(confirmAction === "apply" ? "skillRepo.confirm" : "skillRepo.rollbackConfirm")}</p>
+              <div className="skill-repo-sheet-actions">
+                <button type="button" className="btn ghost" onClick={() => setConfirmAction(null)}>
+                  {t("confirm.cancel")}
+                </button>
+                <button
+                  type="button"
+                  className="btn primary"
+                  onClick={() => void (confirmAction === "apply" ? apply() : rollback())}
+                >
+                  {t(confirmAction === "apply" ? "confirm.ok" : "skillRepo.rollbackConfirmAction")}
+                </button>
+              </div>
+            </div>
+          ) : null}
         </div>
       </Sheet>
     </>

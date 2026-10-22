@@ -9,9 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -180,32 +178,6 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _atomic_write_text(path: Path, content: str) -> None:
-    """Write a complete same-directory staging file before replacing output."""
-    descriptor, staging_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-    )
-    staging_path = Path(staging_name)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(staging_path, path)
-    except BaseException:
-        # If fdopen itself failed, it did not take ownership of the descriptor.
-        try:
-            os.close(descriptor)
-        except OSError:
-            pass
-        raise
-    finally:
-        try:
-            staging_path.unlink()
-        except FileNotFoundError:
-            pass
-
-
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
@@ -218,7 +190,7 @@ def main(argv: list[str] | None = None) -> int:
         output = json.dumps(checklist, ensure_ascii=False, indent=2) if args.json else format_checklist(checklist)
         if args.output:
             path = Path(args.output).expanduser().resolve()
-            _atomic_write_text(path, output + "\n")
+            path.write_text(output + "\n", encoding="utf-8")
             print(f"尽调起点清单已保存到：{path}")
         else:
             print(output)

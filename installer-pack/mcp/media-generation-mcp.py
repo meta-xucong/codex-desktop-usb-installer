@@ -1424,16 +1424,10 @@ def _http_json(method: str, path: str, payload: dict[str, Any] | bytes | None, p
         provider_request_id = next((_safe_identifier(headers_obj.get(name)) for name in ("x-request-id", "request-id", "x-amzn-requestid") if _safe_identifier(headers_obj.get(name))), None)
         gateway_request_id = next((_safe_identifier(headers_obj.get(name)) for name in ("x-gateway-request-id", "x-wokey-request-id") if _safe_identifier(headers_obj.get(name))), None)
         if method == "POST" and (exc.code >= 500 or exc.code in {408, 425, 429}):
-            message = f"媒体服务链路返回 HTTP {exc.code}，提交结果未知；请勿重新提交。"
+            message = f"上游 HTTP {exc.code}，提交结果未知；请勿重新提交。"
             if remote_detail:
                 message += f" 服务端诊断：{remote_detail}"
-            diagnostics = {
-                "request_attempt_started": True,
-                "mcp_http_response_received": True,
-                "upstream_acceptance": "unknown",
-                "manual_reconciliation_required": True,
-            }
-            raise MediaError(message, code="SUBMISSION_UNKNOWN", provider=provider, http_status=exc.code, provider_request_id=provider_request_id, gateway_request_id=gateway_request_id, submission_state="submission_unknown", api_request_sent=True, details=diagnostics) from exc
+            raise MediaError(message, code="SUBMISSION_UNKNOWN", provider=provider, http_status=exc.code, provider_request_id=provider_request_id, gateway_request_id=gateway_request_id, submission_state="submission_unknown", api_request_sent=True) from exc
         if method != "POST" and exc.code >= 500:
             raise MediaError(f"上游暂时无法响应（HTTP {exc.code}）；可稍后查询同一任务。", code="UPSTREAM_UNAVAILABLE", provider=provider, http_status=exc.code, provider_request_id=provider_request_id, gateway_request_id=gateway_request_id, retryable=True, api_request_sent=False) from exc
         mapping = {401: ("UPSTREAM_AUTH_FAILED", "上游认证失败。"), 403: ("UPSTREAM_AUTH_FAILED", "上游拒绝当前账户或能力权限。"), 404: ("UPSTREAM_MODEL_NOT_FOUND", "上游未找到请求的模型或接口。"), 400: ("UPSTREAM_INPUT_REJECTED", "上游拒绝请求参数或内容。"), 422: ("UPSTREAM_INPUT_REJECTED", "上游拒绝请求参数或内容。")}
@@ -1447,13 +1441,7 @@ def _http_json(method: str, path: str, payload: dict[str, Any] | bytes | None, p
         raise
     except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
         if method == "POST":
-            diagnostics = {
-                "request_attempt_started": True,
-                "mcp_http_response_received": False,
-                "upstream_acceptance": "unknown",
-                "manual_reconciliation_required": True,
-            }
-            raise MediaError("提交状态未知：连接在提交后中断，无法确认上游是否接受；请勿重新提交。", code="SUBMISSION_UNKNOWN", provider=provider, submission_state="submission_unknown", api_request_sent=True, details=diagnostics) from exc
+            raise MediaError("提交状态未知：连接在提交后中断，无法确认上游是否接受；请勿重新提交。", code="SUBMISSION_UNKNOWN", provider=provider, submission_state="submission_unknown", api_request_sent=True) from exc
         raise MediaError("媒体服务暂时无法响应；原任务状态未更改。", code="UPSTREAM_UNAVAILABLE", provider=provider, retryable=True, api_request_sent=False) from exc
     if not isinstance(parsed, dict):
         raise MediaError("媒体服务返回了非对象 JSON。")
@@ -1832,10 +1820,6 @@ def _media_submit_locked(args: dict[str, Any]) -> dict[str, Any]:
         record["operation_token"] = ""
         record["last_error"] = exc.safe_message[:300]
         record["last_error_code"] = exc.code
-        if exc.http_status is not None:
-            record["http_status"] = exc.http_status
-        if exc.details:
-            record["submission_diagnostics"] = exc.details
         record["provider_request_id"] = exc.provider_request_id
         record["gateway_request_id"] = exc.gateway_request_id
         _atomic_json(path, record)
@@ -1923,28 +1907,6 @@ def media_check(args: dict[str, Any]) -> dict[str, Any]:
             return {"success": True, "state": state, "artifacts": _public_artifacts(record.get("artifacts", [])), "api_request_sent": False, "deduplicated": True}
         if state == "completed_pending_save":
             return {"success": True, "state": state, "artifacts": _public_artifacts(record.get("artifacts", [])), "api_request_sent": False, "next_tool": "media_save"}
-        if state == "submission_unknown" and not record.get("task_id"):
-            diagnostics = record.get("submission_diagnostics", {})
-            details = {
-                "original_request_attempt_started": bool(record.get("api_request_sent")),
-                "mcp_http_response_received": diagnostics.get("mcp_http_response_received"),
-                "upstream_acceptance": "unknown",
-                "task_id_available": False,
-                "manual_reconciliation_required": True,
-                "check_request_sent": False,
-            }
-            raise MediaError(
-                "提交状态未知且没有 task_id；本次状态查询没有发送网络请求。请联系服务方并提供错误中的请求关联 ID 核对；不要重发。",
-                code="SUBMISSION_STATUS_UNAVAILABLE",
-                provider=record.get("request", {}).get("provider"),
-                model=record.get("request", {}).get("model"),
-                http_status=record.get("http_status"),
-                provider_request_id=record.get("provider_request_id"),
-                gateway_request_id=record.get("gateway_request_id"),
-                submission_state="submission_unknown",
-                api_request_sent=False,
-                details=details,
-            )
         if state not in {"task_created", "in_progress", "provider_status_unknown"} or not record.get("task_id"):
             raise MediaError(f"当前任务状态为 {state}；没有可查询的 task_id。未知提交只能等待人工查账，不能重发。")
         provider = record["request"]["provider"]

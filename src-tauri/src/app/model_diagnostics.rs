@@ -31,11 +31,14 @@ pub fn safe_identifier(value: &str) -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeError {
+    Connect,
     Network,
     Timeout,
     Cancelled,
     Unauthorized,
     Http,
+    Http400,
+    UnsupportedStore,
     InvalidResponse,
     InvalidCall,
     InvalidStream,
@@ -48,11 +51,14 @@ pub enum ProbeError {
 impl ProbeError {
     pub fn code(self) -> &'static str {
         match self {
+            Self::Connect => "upstream-connect-failed",
             Self::Network => "upstream-unavailable",
             Self::Timeout => "probe-timeout",
             Self::Cancelled => "probe-cancelled",
             Self::Unauthorized => "upstream-auth",
             Self::Http => "upstream-http",
+            Self::Http400 => "upstream-http-400",
+            Self::UnsupportedStore => "upstream-store-unsupported",
             Self::InvalidResponse => "upstream-response",
             Self::InvalidCall => "tool-correlation-invalid",
             Self::InvalidStream => "stream-invalid",
@@ -66,11 +72,13 @@ impl ProbeError {
     pub fn retryable(self) -> bool {
         matches!(
             self,
-            Self::Network
+            Self::Connect
+                | Self::Network
                 | Self::Timeout
                 | Self::Cancelled
                 | Self::Unauthorized
                 | Self::Http
+                | Self::Http400
                 | Self::BudgetExhausted
                 | Self::ContextChanged
         )

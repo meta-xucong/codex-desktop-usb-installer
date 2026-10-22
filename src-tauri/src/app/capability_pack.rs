@@ -20,10 +20,11 @@ use crate::errors::AppError;
 
 const PACK_DIRECTORY: &str = "codex-starter-kit";
 const PACK_ID: &str = "codex-starter";
-const READINESS_RELATIVE: &str = ".codex/codex-agent-kit/readiness.json";
+const KIT_HOME_RELATIVE: &str = "codex-agent-kit";
+const READINESS_RELATIVE: &str = "codex-agent-kit/readiness.json";
 const MEDIA_AUTHORIZATION_RELATIVE: &str =
-    ".codex/codex-agent-kit/connections/media-generation.authorization.json";
-const CONNECTION_OWNERSHIP_RELATIVE: &str = ".codex/codex-agent-kit/connection-ownership.json";
+    "codex-agent-kit/connections/media-generation.authorization.json";
+const CONNECTION_OWNERSHIP_RELATIVE: &str = "codex-agent-kit/connection-ownership.json";
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const OWNED_CONNECTION_ENV_NAMES: &[&str] = &[
@@ -348,8 +349,8 @@ fn core_ready_from_readiness(
     }
 }
 
-fn readiness_summary(profile: &Path) -> ReadinessSummary {
-    let path = readiness_path(profile);
+fn readiness_summary(codex_home: &Path) -> ReadinessSummary {
+    let path = readiness_path(codex_home);
     let Ok(bytes) = fs::read(path) else {
         return ReadinessSummary {
             runtime_status: "unknown".to_string(),
@@ -406,7 +407,7 @@ fn readiness_summary(profile: &Path) -> ReadinessSummary {
             .pointer("/connections/mediaGeneration/enabled")
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
-        media_authorization_status: read_media_authorization_status(profile),
+        media_authorization_status: read_media_authorization_status(codex_home),
         media_gateway_catalog_status: value
             .pointer("/connections/mediaGeneration/gatewayCatalog")
             .and_then(|v| v.as_str())
@@ -451,9 +452,10 @@ fn readiness_summary(profile: &Path) -> ReadinessSummary {
 mod tests {
     use super::{
         core_ready_from_readiness, legacy_media_names_owned, media_install_ready,
-        media_install_switch, persist_connection_ownership, readiness_summary, strip_utf8_bom,
-        validate_options, write_media_authorization_status, CapabilityPackInstallOptions,
-        ConnectionOwnershipRecord, CONNECTION_OWNERSHIP_RELATIVE, PACK_ID,
+        media_install_switch, persist_connection_ownership, readiness_path, readiness_summary,
+        strip_utf8_bom, validate_options, write_media_authorization_status,
+        CapabilityPackInstallOptions, ConnectionOwnershipRecord, CONNECTION_OWNERSHIP_RELATIVE,
+        KIT_HOME_RELATIVE, PACK_ID,
     };
     use serde_json::json;
     use std::fs;
@@ -474,7 +476,8 @@ mod tests {
     fn utf8_bom_is_ignored_for_readiness_json() {
         let profile =
             std::env::temp_dir().join(format!("codex-readiness-bom-test-{}", uuid::Uuid::new_v4()));
-        let readiness_path = profile.join(".codex/codex-agent-kit/readiness.json");
+        let codex_home = profile.join(".codex");
+        let readiness_path = readiness_path(&codex_home);
         fs::create_dir_all(readiness_path.parent().unwrap()).unwrap();
         let json = serde_json::to_vec(&json!({
             "pack": {"id": PACK_ID, "version": "1.2.1"},
@@ -489,7 +492,7 @@ mod tests {
         bytes.extend(json);
         fs::write(&readiness_path, bytes).unwrap();
 
-        let summary = readiness_summary(&profile);
+        let summary = readiness_summary(&codex_home);
         assert!(summary.pack_identity_valid);
         assert_eq!(summary.pack_version.as_deref(), Some("1.2.1"));
         assert!(summary.core_ready);
@@ -506,7 +509,8 @@ mod tests {
             "codex-media-readiness-test-{}",
             uuid::Uuid::new_v4()
         ));
-        let kit = profile.join(".codex/codex-agent-kit");
+        let codex_home = profile.join(".codex");
+        let kit = codex_home.join(KIT_HOME_RELATIVE);
         let readiness_path = kit.join("readiness.json");
         let bin = kit.join("bin");
         let connections = kit.join("connections");
@@ -538,32 +542,35 @@ mod tests {
         )
         .unwrap();
 
-        write_media_authorization_status(&profile, "verified").unwrap();
-        let readiness = readiness_summary(&profile);
-        assert!(media_install_ready(&readiness, &profile));
+        write_media_authorization_status(&codex_home, "verified").unwrap();
+        let readiness = readiness_summary(&codex_home);
+        assert!(media_install_ready(&readiness, &codex_home));
         let mut pending_authorization = readiness.clone();
         pending_authorization.media_authorization_status = "pending".to_string();
-        assert!(!media_install_ready(&pending_authorization, &profile));
-        write_media_authorization_status(&profile, "pending").unwrap();
-        let refreshed = readiness_summary(&profile);
+        assert!(!media_install_ready(&pending_authorization, &codex_home));
+        write_media_authorization_status(&codex_home, "pending").unwrap();
+        let refreshed = readiness_summary(&codex_home);
         assert_eq!(refreshed.media_authorization_status, "pending");
-        assert!(!media_install_ready(&refreshed, &profile));
-        write_media_authorization_status(&profile, "verified").unwrap();
-        assert!(media_install_ready(&readiness_summary(&profile), &profile));
+        assert!(!media_install_ready(&refreshed, &codex_home));
+        write_media_authorization_status(&codex_home, "verified").unwrap();
+        assert!(media_install_ready(
+            &readiness_summary(&codex_home),
+            &codex_home
+        ));
         let mut stale_schema = readiness.clone();
         stale_schema.media_enabled = false;
-        assert!(!media_install_ready(&stale_schema, &profile));
+        assert!(!media_install_ready(&stale_schema, &codex_home));
         let mut unregistered = readiness.clone();
         unregistered.media_registered = false;
-        assert!(!media_install_ready(&unregistered, &profile));
+        assert!(!media_install_ready(&unregistered, &codex_home));
         let mut unhealthy = readiness.clone();
         unhealthy.media_protocol_status = "failed".to_string();
-        assert!(!media_install_ready(&unhealthy, &profile));
+        assert!(!media_install_ready(&unhealthy, &codex_home));
         fs::remove_file(bin.join("media-generation-mcp.py")).unwrap();
-        assert!(!media_install_ready(&readiness, &profile));
+        assert!(!media_install_ready(&readiness, &codex_home));
         fs::write(bin.join("media-generation-mcp.py"), "server").unwrap();
         fs::remove_file(connections.join("media-generation.credential.dpapi")).unwrap();
-        assert!(!media_install_ready(&readiness, &profile));
+        assert!(!media_install_ready(&readiness, &codex_home));
         let _ = fs::remove_dir_all(profile);
     }
 
@@ -594,10 +601,11 @@ mod tests {
             "codex-capability-ownership-test-{}",
             uuid::Uuid::new_v4()
         ));
-        fs::create_dir_all(&profile).unwrap();
-        persist_connection_ownership(&profile, &["FEISHU_APP_SECRET"]).unwrap();
-        persist_connection_ownership(&profile, &["DASHSCOPE_API_KEY"]).unwrap();
-        let path = profile.join(CONNECTION_OWNERSHIP_RELATIVE);
+        let codex_home = profile.join(".codex");
+        fs::create_dir_all(&codex_home).unwrap();
+        persist_connection_ownership(&codex_home, &["FEISHU_APP_SECRET"]).unwrap();
+        persist_connection_ownership(&codex_home, &["DASHSCOPE_API_KEY"]).unwrap();
+        let path = codex_home.join(CONNECTION_OWNERSHIP_RELATIVE);
         let record: ConnectionOwnershipRecord =
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(record.schema_version, 1);
@@ -672,8 +680,8 @@ fn overall_status(core_ready: bool, runtime_status: &str, config_status: &str) -
     }
 }
 
-fn media_install_ready(readiness: &ReadinessSummary, profile: &Path) -> bool {
-    let kit_home = profile.join(".codex/codex-agent-kit");
+fn media_install_ready(readiness: &ReadinessSummary, codex_home: &Path) -> bool {
+    let kit_home = codex_home.join(KIT_HOME_RELATIVE);
     readiness.media_registered
         && readiness.media_enabled
         && readiness.media_authorization_status == "verified"
@@ -788,6 +796,145 @@ fn sanitized_child_output(output: &Output, options: &CapabilityPackInstallOption
     chars.into_iter().collect()
 }
 
+/// Install the bundled Product Design plugin into the USB edition's isolated
+/// CODEX_HOME. This is called from the Skill Hub apply action so the plugin is
+/// available alongside the user's Skill Hub skills without touching the host
+/// Codex profile.
+pub fn install_product_design_plugin(app: &AppHandle) -> Result<u32, AppError> {
+    if !cfg!(target_os = "windows") {
+        return Err(AppError::Engine(
+            "离线 Product Design 插件安装仅支持 Windows U 盘版".to_string(),
+        ));
+    }
+    if !crate::app::usb_guard::guard_required() {
+        return Err(AppError::Engine(
+            "离线 Product Design 插件只允许安装到 U 盘版 CODEX_HOME".to_string(),
+        ));
+    }
+    let codex_home = crate::app::usb_guard::local_data_paths()?.codex_home;
+    let executable = std::env::current_exe()
+        .map_err(|error| AppError::Internal(format!("无法确定安装器路径: {error}")))?;
+    let resource_dir = app.path().resource_dir().ok();
+    let Some(pack_root) = find_pack(&executable, resource_dir.as_deref()) else {
+        return Err(AppError::Engine(
+            "未找到 U 盘安装包内的离线 Product Design 插件".to_string(),
+        ));
+    };
+    validate_pack(&pack_root)?;
+    let installer = pack_root.join("install-product-design-plugin.ps1");
+    if !installer.is_file() || is_reparse_point(&installer) {
+        return Err(AppError::Engine(
+            "U 盘安装包缺少离线 Product Design 安装脚本".to_string(),
+        ));
+    }
+    let mut command = Command::new("powershell.exe");
+    command.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]);
+    command
+        .arg(&installer)
+        .arg("-PackRoot")
+        .arg(&pack_root)
+        .arg("-TargetCodexHome")
+        .arg(&codex_home);
+    #[cfg(target_os = "windows")]
+    command.creation_flags(CREATE_NO_WINDOW);
+    let output = command
+        .output()
+        .map_err(|error| AppError::Engine(format!("启动离线 Product Design 安装失败: {error}")))?;
+    if !output.status.success() {
+        return Err(AppError::Engine(format!(
+            "离线 Product Design 安装失败，PowerShell 退出码: {}",
+            output.status
+        )));
+    }
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| AppError::Engine(format!("离线 Product Design 安装结果无效: {error}")))?;
+    let ready = report.get("status").and_then(|value| value.as_str()) == Some("ready")
+        && report.get("plugin").and_then(|value| value.as_str()) == Some("product-design")
+        && report.get("marketplace").and_then(|value| value.as_str())
+            == Some("usb-product-design-offline")
+        && report.get("enabled").and_then(|value| value.as_bool()) == Some(true)
+        && report.get("runtimeReady").and_then(|value| value.as_bool()) == Some(true)
+        && report.get("skillCount").and_then(|value| value.as_u64()) == Some(10);
+    if !ready {
+        return Err(AppError::Engine(
+            "离线 Product Design 安装未通过就绪校验".to_string(),
+        ));
+    }
+    log::info!(
+        "USB offline Product Design plugin ready in {}",
+        codex_home.display()
+    );
+    Ok(report
+        .get("skillCount")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default() as u32)
+}
+
+/// Return the Product Design skill count only when the USB Codex Home has a
+/// verified, enabled offline installation. This is read-only and is used by
+/// Skill Hub status so the plugin remains visible after navigating away from
+/// the one-time apply result.
+pub fn product_design_plugin_status() -> Option<u32> {
+    if !cfg!(target_os = "windows") || !crate::app::usb_guard::guard_required() {
+        return None;
+    }
+    let codex_home = crate::app::usb_guard::local_data_paths().ok()?.codex_home;
+    let config_text = fs::read_to_string(codex_home.join("config.toml")).ok()?;
+    let config: toml::Value = toml::from_str(&config_text).ok()?;
+    let marketplace_name = "usb-product-design-offline";
+    let plugin_name = "product-design";
+    let plugin_id = format!("{plugin_name}@{marketplace_name}");
+    if config
+        .get("plugins")?
+        .get(&plugin_id)?
+        .get("enabled")?
+        .as_bool()
+        != Some(true)
+    {
+        return None;
+    }
+    let marketplace_root = codex_home
+        .join("plugins")
+        .join("marketplaces")
+        .join(marketplace_name);
+    let marketplace_source = config
+        .get("marketplaces")?
+        .get(marketplace_name)?
+        .get("source")?
+        .as_str()?;
+    if PathBuf::from(marketplace_source) != marketplace_root {
+        return None;
+    }
+    let cache_plugin = codex_home
+        .join("plugins")
+        .join("cache")
+        .join(marketplace_name)
+        .join(plugin_name);
+    let manifest_path = cache_plugin.join(".codex-plugin").join("plugin.json");
+    let manifest: serde_json::Value = serde_json::from_slice(&fs::read(manifest_path).ok()?).ok()?;
+    let version = manifest.get("version")?.as_str()?;
+    if manifest.get("name")?.as_str()? != plugin_name || !cache_plugin.is_dir() {
+        return None;
+    }
+    let skill_count = fs::read_dir(cache_plugin.join("skills"))
+        .ok()?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_dir() && entry.path().join("SKILL.md").is_file())
+        .count() as u32;
+    if skill_count != 10 {
+        return None;
+    }
+    let runtime_root = codex_home.join("product-design-runtime");
+    let runtime_ready = fs::read_dir(runtime_root).ok()?.filter_map(Result::ok).any(|entry| {
+        let marker = entry.path().join(".installed-manifest.json");
+        let Ok(bytes) = fs::read(marker) else { return false };
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return false };
+        value.get("pluginVersion").and_then(serde_json::Value::as_str) == Some(version)
+            && value.get("platform").and_then(serde_json::Value::as_str) == Some("win32-x64")
+    });
+    runtime_ready.then_some(skill_count)
+}
+
 pub fn status(app: &AppHandle) -> Result<CapabilityPackReport, AppError> {
     if !cfg!(target_os = "windows") {
         return Ok(report_missing("当前平台不支持 Windows 能力包安装"));
@@ -802,7 +949,13 @@ pub fn status(app: &AppHandle) -> Result<CapabilityPackReport, AppError> {
     };
     let (version, _) = validate_pack(&source)?;
     let profile = user_profile()?;
-    let readiness = readiness_summary(&profile);
+    let usb_codex_home = if crate::app::usb_guard::guard_required() {
+        Some(crate::app::usb_guard::local_data_paths()?.codex_home)
+    } else {
+        None
+    };
+    let codex_home = usb_codex_home.unwrap_or_else(|| profile.join(".codex"));
+    let readiness = readiness_summary(&codex_home);
     let installed = readiness.pack_identity_valid
         && readiness.core_ready
         && readiness.pack_version.as_deref() == Some(version.as_str());
@@ -1279,8 +1432,16 @@ pub fn install(
         user_profile()?.display()
     );
     let profile = user_profile()?;
+    let usb_codex_home = if crate::app::usb_guard::guard_required() {
+        Some(crate::app::usb_guard::local_data_paths()?.codex_home)
+    } else {
+        None
+    };
+    let codex_home = usb_codex_home
+        .clone()
+        .unwrap_or_else(|| profile.join(".codex"));
     if options.enable_media_generation {
-        migrate_legacy_media_environment(&profile)?;
+        migrate_legacy_media_environment(&codex_home)?;
     }
     let mut command = Command::new("powershell.exe");
     command
@@ -1295,6 +1456,10 @@ pub fn install(
             "-FeishuDomain",
             non_empty(&options.feishu_domain).unwrap_or("https://open.feishu.cn"),
         ]);
+    if let Some(usb_codex_home) = usb_codex_home.as_ref() {
+        command.arg("-TargetCodexHome").arg(usb_codex_home);
+        command.arg("-EnableFullAccess");
+    }
     #[cfg(target_os = "windows")]
     command.creation_flags(CREATE_NO_WINDOW);
 
@@ -1413,7 +1578,7 @@ pub fn install(
         pack_version
     );
     let authorization_result = (|| {
-        persist_configured_environment(&options, &profile)?;
+        persist_configured_environment(&options, &codex_home)?;
         if options.enable_media_generation {
             crate::app::media_generation::sync_authorized_local_connection().map_err(|error| {
                 log::error!("media MCP credential persistence failed: {error}");
@@ -1435,17 +1600,17 @@ pub fn install(
     } else {
         "failed"
     };
-    if let Err(error) = write_media_authorization_status(&profile, authorization_status) {
+    if let Err(error) = write_media_authorization_status(&codex_home, authorization_status) {
         log::error!("media MCP authorization readiness update failed: {error}");
         return Err(error);
     }
     authorization_result?;
-    let readiness = readiness_summary(&profile);
+    let readiness = readiness_summary(&codex_home);
     let installed = readiness.pack_identity_valid
         && readiness.core_ready
         && readiness.pack_version.as_deref() == Some(pack_version.as_str());
     if !installed {
-        let readiness_file = readiness_path(&profile);
+        let readiness_file = readiness_path(&codex_home);
         log::error!(
             "capability pack readiness failed source={} version={} skills={} agents={} runtime={} config={} readiness={}",
             source.display(),
@@ -1467,7 +1632,7 @@ pub fn install(
             ),
         ));
     }
-    if options.enable_media_generation && !media_install_ready(&readiness, &profile) {
+    if options.enable_media_generation && !media_install_ready(&readiness, &codex_home) {
         log::error!(
             "media MCP readiness failed source={} version={} runtime={} protocol={} registered={} kit_home={}",
             source.display(),
@@ -1475,7 +1640,7 @@ pub fn install(
             readiness.media_runtime_status,
             readiness.media_protocol_status,
             readiness.media_registered,
-            profile.join(".codex/codex-agent-kit").display()
+            codex_home.join(KIT_HOME_RELATIVE).display()
         );
         return Err(AppError::Engine(format!(
             "统一媒体 MCP 未完成安装：部署文件、Codex 注册或协议自检未通过；请查看 {} 并从组件修复入口重试",

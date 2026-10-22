@@ -15,7 +15,7 @@ const BASE_RESOURCE_RELATIVE: &str = "resources/skill_repo_base_manifest.json";
 const SKILL_HUB_SOURCES_RELATIVE: &str = "resources/skill_hub_sources.json";
 const BASE_SOURCE_PATH: &str = "manifest/skill-audit.json";
 const BASE_RESOURCE_SOURCE: &str = "installer-pack/manifest/skill-audit.json";
-const BASE_SOURCE_SHA256: &str = "54ac637b3aaa993827d15f6c79c97513b5a1fa5fb1954b3384a6edf20f12b0e9";
+const BASE_SOURCE_SHA256: &str = "6effd655adbfc6f3be80b1c8348c2da2c428ef9a3d1b77b0c9da05da055e9953";
 
 // Release pins bind signed USB managers to the production license issuer and
 // the VPS that signs revocation decisions. Rotate the status public key only

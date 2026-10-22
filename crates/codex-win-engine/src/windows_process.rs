@@ -584,6 +584,8 @@ mod imp {
         pid_count: usize,
         candidate: Option<WindowCandidate>,
         startup_failure_dialog: Option<String>,
+        owned_window_count: usize,
+        rejected_window_count: usize,
     }
 
     struct ConsoleHideContext {
@@ -879,6 +881,7 @@ mod imp {
         if !pids.contains(&pid) {
             return 1;
         }
+        context.owned_window_count = context.owned_window_count.saturating_add(1);
         let mut class_name = [0_u16; 128];
         let class_length =
             unsafe { GetClassNameW(hwnd, class_name.as_mut_ptr(), class_name.len() as i32) };
@@ -893,6 +896,7 @@ mod imp {
         if class_name.eq_ignore_ascii_case("ConsoleWindowClass")
             || !is_user_operable_window(&class_name, &title)
         {
+            context.rejected_window_count = context.rejected_window_count.saturating_add(1);
             return 1;
         }
         if is_codex_startup_failure_dialog(&class_name, &title) {
@@ -916,6 +920,7 @@ mod imp {
         let width = rect.right.saturating_sub(rect.left);
         let height = rect.bottom.saturating_sub(rect.top);
         if !window_dimensions_are_usable(width, height) {
+            context.rejected_window_count = context.rejected_window_count.saturating_add(1);
             return 1;
         }
         let visible = unsafe { IsWindowVisible(hwnd) } != 0;
@@ -1004,6 +1009,8 @@ mod imp {
                     pid_count: pids.len(),
                     candidate: None,
                     startup_failure_dialog: None,
+                    owned_window_count: 0,
+                    rejected_window_count: 0,
                 };
                 // SAFETY: callback and context remain valid for this synchronous
                 // call; no pointer escapes EnumWindows.
@@ -1045,6 +1052,16 @@ mod imp {
                         // keep polling instead of reporting a false success
                         // that leaves the caller staring at a black/hidden
                         // startup surface.
+                        if Instant::now() >= deadline {
+                            log::warn!(
+                                "Codex window readiness deadline elapsed state=window-found-but-not-visible pid={} size={}x{}",
+                                candidate.pid,
+                                candidate.width,
+                                candidate.height
+                            );
+                            return Ok(None);
+                        }
+                        thread::sleep(Duration::from_millis(100));
                         continue;
                     }
                     let foreground_accepted = unsafe { SetForegroundWindow(candidate.hwnd) } != 0;
@@ -1056,8 +1073,23 @@ mod imp {
                         foreground_accepted,
                     }));
                 }
+                if Instant::now() >= deadline {
+                    log::warn!(
+                        "Codex window readiness deadline elapsed state=owned-windows-not-usable owned_window_count={} rejected_window_count={} process_count={}",
+                        context.owned_window_count,
+                        context.rejected_window_count,
+                        pids.len()
+                    );
+                    return Ok(None);
+                }
+            } else if Instant::now() >= deadline {
+                log::warn!(
+                    "Codex window readiness deadline elapsed state=no-owned-window process_count=0"
+                );
+                return Ok(None);
             }
             if Instant::now() >= deadline {
+                log::warn!("Codex window readiness deadline elapsed state=no-usable-window");
                 return Ok(None);
             }
             thread::sleep(Duration::from_millis(100));

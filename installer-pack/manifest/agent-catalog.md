@@ -21,7 +21,7 @@
 |---|---|---|---|---|
 | 全能官 | `multi-search-engine`、`image-prompt-generator`、`video-prompt-generator` | `web-search-extraction`、`data-assistant`、`docx-butler`、`excel-xlsx`、`word-docx`、`powerpoint-pptx` | Python wheelhouse；可选网页搜索 | 先交付文字、研究框架和提示词，文件任务说明缺口 |
 | 研究官 | `academic-research`、`competitor-intelligence`、`industry-analysis`、`user-research`、`market-sizing-analysis`、`multi-search-engine` | `web-search-extraction` | 可选网页搜索连接 | 只基于用户材料，标注无法实时核验 |
-| 创作官 | `xiaohongshu-writing`、`image-prompt-generator`、`video-prompt-generator` | `wechat-article-creator`、`web-search-extraction`、`image-2`、`seedance2-0-video-gen` | Python wheelhouse；图像/视频/搜索连接 | 输出成稿、提示词和分镜，不伪造图片/视频已生成 |
+| 创作官 | `xiaohongshu-writing`、`image-prompt-generator`、`video-prompt-generator` | `wechat-article-creator`、`web-search-extraction`、`image-2` | Python wheelhouse；图像/视频/搜索连接 | 输出成稿、提示词和分镜，不伪造图片/视频已生成 |
 | 投资官 | `china-stock-analysis`、`fund-portfolio`、`macro-research`、`venture-analysis`、`wealth-allocation` | `web-search-extraction` | Python wheelhouse；可选网页搜索连接 | 没有数据时只给方法、假设和风险，不编造行情 |
 | 增长官 | `painpoint-analyzer`、`offer-designer`、`traffic-hunter`、`conversion-optimizer`、`growth-analyst` | `web-search-extraction` | 可选网页搜索连接 | 基于用户业务数据和显式假设设计实验 |
 | 生活官 | `daily-reflection`、`weather-forecast`、`weather` | `fitness-coach`、`meal-planner`、`travel-planner`、`multi-search-engine`、`web-search-extraction` | Python wheelhouse；可选搜索连接 | 保留计划、清单和复盘文本；不伪造实时天气/价格 |
@@ -61,7 +61,7 @@
 ```
 
 若 Codex 当前版本不显示单独的 Agent 按钮，点名文字仍是稳定入口；Agent TOML 安装在
-`%USERPROFILE%\.codex\agents\` 后，重载 Codex 或打开新任务即可发现。
+`%CODEX_HOME%\agents\` 后，重载 Codex 或打开新任务即可发现。
 
 ## 每个 Agent 的工作纪律
 

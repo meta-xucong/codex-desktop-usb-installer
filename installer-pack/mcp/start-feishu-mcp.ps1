@@ -89,7 +89,7 @@ $nodeReady = $false
 if (-not [string]::IsNullOrWhiteSpace($nodePath)) {
     $nodeVersionText = (& $nodePath --version 2>&1 | Out-String).Trim().TrimStart('v')
     $nodeVersion = $null
-    $nodeReady = [version]::TryParse($nodeVersionText, [ref]$nodeVersion) -and $nodeVersion.Major -ge 22
+    $nodeReady = [version]::TryParse($nodeVersionText, [ref]$nodeVersion) -and $nodeVersion.Major -ge 20
 }
 
 $arguments = @(
@@ -132,9 +132,9 @@ if ($DryRun) {
 if (-not $packagePresent -or -not $packageValidated) {
     throw "Locked Feishu MCP package is not installed under PackageCache: $cacheFull"
 }
-if ([string]::IsNullOrWhiteSpace($nodePath)) { throw 'Node.js >=22 is required for the Feishu MCP server.' }
+if ([string]::IsNullOrWhiteSpace($nodePath)) { throw 'Node.js >=20 is required for the Feishu MCP server.' }
 if (-not $nodeReady) {
-    throw "Node.js >=22 is required; detected: $nodeVersionText"
+    throw "Node.js >=20 is required; detected: $nodeVersionText"
 }
 
 # Do not write to stdout before the child starts: stdout is reserved for MCP JSON-RPC.

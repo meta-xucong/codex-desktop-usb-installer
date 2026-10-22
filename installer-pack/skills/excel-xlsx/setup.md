@@ -1,10 +1,6 @@
 # Setup — Excel / XLSX
 
-Read this when preference or memory handling is relevant. Ask only questions needed for the current task or requested ongoing personalization.
-
-## File and calculation limits
-
-This Skill's bundled `openpyxl` path handles `.xlsx` and `.xlsm`. For `.xls`, ask the user to convert it with Excel or LibreOffice, or stop if no converter is available; do not imply that this runtime can process it. When modifying `.xlsm`, load with `keep_vba=True` and save with the `.xlsm` extension to preserve the VBA project. `openpyxl` does not run macros or calculate formulas. Cached formula results can be read only if already present; Excel or LibreOffice must recalculate and save the file when fresh results are required.
+Read this on first use to understand user preferences. Ask questions naturally during conversation.
 
 ## Your Attitude
 
@@ -12,13 +8,18 @@ You're helping someone who works with Excel files. They might be frustrated with
 
 **Use natural language:** Talk about Excel pitfalls and best practices, not about "memory files" or "config". The user cares about getting their spreadsheets right.
 
-## Preference handling
+## Priority Order
 
-For a one-off spreadsheet request, handle the requested task first and ask only questions needed to avoid a material mistake. Do not require an integration-preference interview before working.
+### 1. First: Integration (most important)
 
-If the user wants ongoing personalization, ask concise questions about relevant tools, platform, date conventions, ID handling, or large-file needs. Skip questions already answered or irrelevant to the current workflow.
+Before anything else, figure out WHEN this skill should activate.
 
-### Saving preferences
+Help the user understand what this enables:
+- "I can help whenever you're working with Excel files — reading, writing, or generating them. Should I jump in automatically when you mention spreadsheets, or only when you ask directly?"
+
+**Wait for their answer.** Once they say yes, confirm: "Got it, I'll help whenever you're working with Excel." Then save their preference.
+
+### 2. Then: Understand Their Situation
 
 Ask open questions to understand how they work with Excel:
 - What do they use Excel for? (reports, data import/export, analysis, templates?)
@@ -28,15 +29,24 @@ Ask open questions to understand how they work with Excel:
 
 Start broad, then narrow based on what matters to them.
 
+### 3. Finally: Preferences (only if they want)
+
 Some users have strong preferences about:
 - Date system (1900 vs 1904)
 - Date format (DD/MM/YYYY vs MM/DD/YYYY vs ISO)
 - How to handle numeric IDs (always text, or only when needed)
 - Large file handling (when to suggest streaming)
 
-Adapt to preferences they share. Don't push for details they don't care about.
+Adapt to them. Don't push for details they don't care about.
 
-## What may be saved (only with explicit consent)
+## Feedback After Each Response
+
+After the user shares something:
+1. Reflect back what you understood ("So you're using pandas to export CSVs to Excel for clients on Windows...")
+2. Connect it to how you'll help ("I'll make sure dates convert correctly and IDs don't lose precision")
+3. Then continue
+
+## What You're Saving (with consent)
 
 Only save after the user shares it:
 - Integration preference (when to activate)
@@ -45,6 +55,12 @@ Only save after the user shares it:
 - Date preferences (if mentioned)
 - Known pain points to watch for
 
-Save only the preferences the user explicitly agrees to retain. Never create or update a memory file merely because the user shared information during a one-off task. If the user declines or asks not to save, continue without persistence.
+Always confirm what you understood: "Got it, I'll warn you about the 1900 date bug when working with older files."
 
-Preferences are optional. Continue helping when no preference file exists or setup is incomplete, using workbook inspection and conservative defaults where needed.
+## When Setup is "Done"
+
+Once you know:
+1. When to activate
+2. What tools/platform they use
+
+...you're ready to help. Preferences build over time through normal use.

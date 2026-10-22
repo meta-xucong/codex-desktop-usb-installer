@@ -1,13 +1,9 @@
 # Render absolute paths after installation. The installer-generated fragment includes every Skill in
-# manifest/skill-audit.json (56 Skills in pack 1.5.4);
+# manifest/skill-audit.json (53 Skills in pack 1.5.4);
 # core-ready, auto-installable-runtime and unsupported entries default to enabled=true, while guided
 # credential/MCP entries remain disabled until their connection health checks pass.
 [[skills.config]]
 path = "__ABSOLUTE_SKILL_ROOT__\\image-2\\SKILL.md"
-enabled = false
-
-[[skills.config]]
-path = "__ABSOLUTE_SKILL_ROOT__\\seedance2-0-video-gen\\SKILL.md"
 enabled = false
 
 [[skills.config]]

@@ -43,6 +43,7 @@ const CCSWITCH_404TOKEN_DEVICE_KEY_ENV: &str = "CCSWITCH_404TOKEN_DEVICE_KEY";
 const CCSWITCH_404TOKEN_ACCOUNT_ENV: &str = "CCSWITCH_404TOKEN_ACCOUNT";
 const CCSWITCH_404TOKEN_GROUP_ENV: &str = "CCSWITCH_404TOKEN_GROUP_ID";
 const CCSWITCH_404TOKEN_PROVIDER_ENV: &str = "CCSWITCH_404TOKEN_PROVIDER";
+const CCSWITCH_USB_CODEX_HOME_ENV: &str = "CCSWITCH_USB_CODEX_HOME";
 const CCSWITCH_404TOKEN_HANDOFF_PATH_ENV: &str = "CCSWITCH_404TOKEN_HANDOFF_PATH";
 const CCSWITCH_404TOKEN_HANDOFF_NONCE_ENV: &str = "CCSWITCH_404TOKEN_HANDOFF_NONCE";
 const CCSWITCH_404TOKEN_HANDOFF_PROTOCOL: &str = "CODEX_USB_404TOKEN_HANDOFF_V1";
@@ -1308,18 +1309,31 @@ fn launch_with_intent(
         // workaround scoped to this child instead of changing a machine/user
         // environment variable used by unrelated WebView2 applications.
         .env(WEBVIEW2_ARGUMENTS_ENV, &webview2_arguments);
+    let usb_codex_home = if usb_mode {
+        Some(
+            crate::app::usb_guard::local_data_paths()
+                .map_err(|error| AppError::Engine(format!("无法确定 USB Codex 配置目录：{error}")))?
+                .codex_home,
+        )
+    } else {
+        None
+    };
     for name in [
         CCSWITCH_404TOKEN_DEVICE_KEY_ENV,
         CCSWITCH_404TOKEN_ACCOUNT_ENV,
         CCSWITCH_404TOKEN_GROUP_ENV,
         CCSWITCH_404TOKEN_PROVIDER_ENV,
+        CCSWITCH_USB_CODEX_HOME_ENV,
         CCSWITCH_404TOKEN_HANDOFF_PATH_ENV,
         CCSWITCH_404TOKEN_HANDOFF_NONCE_ENV,
     ] {
-        // These values are supplied only for a verified USB bootstrap. Never
-        // inherit a developer-shell or machine-level credential into an
-        // explicit user-open or normal local CCSwitch launch.
+        // Clear inherited USB credentials and paths first. The USB Codex home
+        // is re-added for managed USB launches; the device key remains limited
+        // to a verified bootstrap below.
         command.env_remove(name);
+    }
+    if let Some(home) = &usb_codex_home {
+        command.env(CCSWITCH_USB_CODEX_HOME_ENV, home);
     }
     for (name, value) in &account_environment {
         command.env(name, value);

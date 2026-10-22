@@ -18,6 +18,9 @@ export default tseslint.config(
       "dist/",
       "node_modules/",
       "src-tauri/",
+      // The portable capability pack contains independent plugin templates
+      // and runtime scripts; it is validated by its own install/contract tests.
+      "installer-pack/",
       // Rust crates; includes the injected renderer runtime template
       // (crates/codex-theme-engine/src/runtime/), which is browser-side JS
       // with substitution placeholders — not part of this app bundle.
@@ -34,9 +37,13 @@ export default tseslint.config(
       // Temporary installer/MCP/model-catalog validation trees can contain
       // extracted third-party runtimes; they are evidence, not app sources.
       ".tmp-*/**",
+      // Nested release worktrees are separate checked-out repositories; lint
+      // only the active product tree, not their generated/vendor contents.
+      ".release-worktree-*/**",
       // Retained local test evidence is likewise outside the product source
       // tree; copied third-party scripts here must not fail the renderer lint.
       ".test-tmp/**",
+      "tmp/**",
       // Local release/capability simulations contain bundled third-party
       // runtimes and extracted vendor JavaScript. They are test evidence, not
       // renderer sources, and must not make the product lint gate depend on a

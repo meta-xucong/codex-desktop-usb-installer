@@ -129,15 +129,17 @@ describe("SkillRepoUpdateCard", () => {
 
   it("checks then applies the frozen expected identity", async () => {
     api.skillRepoCheckUpdate.mockResolvedValue(INFO);
-    api.skillRepoApplyUpdate.mockResolvedValue(REPORT);
+    api.skillRepoApplyUpdate.mockResolvedValue({ ...REPORT, productDesignSkillCount: 10 });
     render(<I18nProvider><SkillRepoUpdateCard /></I18nProvider>);
 
     openDetails();
     fireEvent.click(screen.getByRole("button", { name: "Check updates" }));
     await waitFor(() => expect(screen.getByText(/Current/)).toBeTruthy());
     fireEvent.click(screen.getByRole("button", { name: "Update now" }));
+    fireEvent.click(screen.getByRole("alertdialog").querySelector("button.btn.primary")!);
     await waitFor(() => expect(api.skillRepoApplyUpdate).toHaveBeenCalledWith(INFO.expected));
     expect(screen.getByText(/Update success/)).toBeTruthy();
+    expect(screen.getByTestId("skill-repo-product-design-count")).toHaveTextContent("Product Design plugin is also enabled, with 10 skills.");
   });
 
   it("does not turn the compatibility warning field into a home-page warning", async () => {
@@ -283,6 +285,7 @@ describe("SkillRepoUpdateCard", () => {
     fireEvent.click(screen.getByRole("button", { name: "Check updates" }));
     await waitFor(() => expect(screen.getByRole("button", { name: "Update now" })).toBeEnabled());
     fireEvent.click(screen.getByRole("button", { name: "Update now" }));
+    fireEvent.click(screen.getByRole("alertdialog").querySelector("button.btn.primary")!);
 
     await waitFor(() => expect(screen.getByTestId("skill-repo-apply-result")).toHaveTextContent("Update partial"));
     expect(screen.getByTestId("skill-repo-apply-counts")).toHaveTextContent(
@@ -303,6 +306,7 @@ describe("SkillRepoUpdateCard", () => {
     fireEvent.click(screen.getByRole("button", { name: "Check updates" }));
     await waitFor(() => expect(screen.getByRole("button", { name: "Update now" })).toBeEnabled());
     fireEvent.click(screen.getByRole("button", { name: "Update now" }));
+    fireEvent.click(screen.getByRole("alertdialog").querySelector("button.btn.primary")!);
 
     await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
     expect(screen.getByRole("alert")).not.toHaveTextContent(rawFailure);
@@ -317,11 +321,12 @@ describe("SkillRepoUpdateCard", () => {
 
     openDetails();
     fireEvent.click(screen.getByRole("button", { name: "Rollback last version" }));
+    const confirm = screen.getByRole("alertdialog");
+    expect(confirm).toHaveTextContent("Roll back the last complete hot-update generation?");
+    fireEvent.click(confirm.querySelector("button.btn.primary")!);
 
     await waitFor(() => expect(api.skillRepoRollback).toHaveBeenCalledOnce());
-    expect(window.confirm).toHaveBeenCalledWith(
-      "Roll back the last complete hot-update generation?",
-    );
+    expect(window.confirm).not.toHaveBeenCalled();
     expect(screen.getByText(/Rolled back 2 Skills/)).toBeInTheDocument();
   });
 
@@ -336,6 +341,7 @@ describe("SkillRepoUpdateCard", () => {
 
     openDetails();
     fireEvent.click(screen.getByRole("button", { name: "Rollback last version" }));
+    fireEvent.click(screen.getByRole("alertdialog").querySelector("button.btn.primary")!);
 
     await waitFor(() => expect(screen.getByText(/Something didn’t finish/)).toBeInTheDocument());
     expect(screen.queryByText(/Rolled back/)).not.toBeInTheDocument();

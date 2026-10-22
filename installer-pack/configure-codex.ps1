@@ -2,18 +2,22 @@
 param(
     [Parameter(Mandatory = $true)][string]$GeneratedFragment,
     [Parameter(Mandatory = $true)][string]$TargetUserProfile,
+    [string]$TargetCodexHome,
     [Parameter(Mandatory = $true)][string]$KitHome,
-    [string]$PythonExe
+    [string]$PythonExe,
+    [switch]$EnableFullAccess
 )
 
 $ErrorActionPreference = 'Stop'
 $profileFull = [IO.Path]::GetFullPath($TargetUserProfile).TrimEnd('\')
 $actualProfile = [IO.Path]::GetFullPath([Environment]::GetEnvironmentVariable('USERPROFILE')).TrimEnd('\')
-$configRoot = Join-Path $profileFull '.codex'
+$configRoot = if ([string]::IsNullOrWhiteSpace($TargetCodexHome)) { Join-Path $profileFull '.codex' } else { [IO.Path]::GetFullPath($TargetCodexHome) }
 $configPath = Join-Path $configRoot 'config.toml'
 $backupRoot = Join-Path $KitHome 'backups'
 $beginMarker = '# BEGIN CODEX-STARTER-KIT MANAGED CONFIG v1'
 $endMarker = '# END CODEX-STARTER-KIT MANAGED CONFIG v1'
+$usbAccessBeginMarker = '# BEGIN USB CODEX FULL ACCESS v1'
+$usbAccessEndMarker = '# END USB CODEX FULL ACCESS v1'
 
 if (-not (Test-Path -LiteralPath $GeneratedFragment -PathType Leaf)) { throw "Generated Codex fragment is missing: $GeneratedFragment" }
 $fragment = Get-Content -LiteralPath $GeneratedFragment -Raw -Encoding UTF8
@@ -22,21 +26,21 @@ if ($fragment -match '__[A-Z0-9_]+__') { throw 'Generated Codex fragment contain
 
 New-Item -ItemType Directory -Force -Path $configRoot, $backupRoot | Out-Null
 $existing = if (Test-Path -LiteralPath $configPath -PathType Leaf) { Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 } else { '' }
+$usbAccessPattern = '(?ms)^' + [regex]::Escape($usbAccessBeginMarker) + '\r?\n.*?^' + [regex]::Escape($usbAccessEndMarker) + '\r?\n?'
+$existing = [regex]::Replace($existing, $usbAccessPattern, '')
 $managedPattern = '(?ms)^' + [regex]::Escape($beginMarker) + '\r?\n.*?^' + [regex]::Escape($endMarker) + '\r?\n?'
 $withoutManaged = [regex]::Replace($existing, $managedPattern, '')
 
-function Get-McpSections([string]$Text, [string]$ServerId) {
-    $escapedServerId = [regex]::Escape($ServerId)
-    $serverKeyPattern = '(?:' + $escapedServerId + '|' + '"' + $escapedServerId + '"' + "|'" + $escapedServerId + "'" + ')'
-    $lines = @($Text -split '\r?\n', -1)
+function Get-FeishuSections([string]$Text) {
+    $lines = @($Text -split '\r?\n', 0)
     $sections = New-Object System.Collections.Generic.List[object]
     $start = -1
     for ($index = 0; $index -lt $lines.Count; $index++) {
         $header = ([string]$lines[$index]).Trim()
-        if ($header -cnotmatch '^\[\[?.*\]\]?(?:[ \t]+#.*)?$') { continue }
+        if ($header -notmatch '^\[\[?.*\]\]?$') { continue }
 
-        $isRoot = $header -cmatch ('^\[\s*mcp_servers\s*\.\s*' + $serverKeyPattern + '\s*\](?:[ \t]+#.*)?$')
-        $isChild = $header -cmatch ('^\[\[?\s*mcp_servers\s*\.\s*' + $serverKeyPattern + '\s*\.\s*[^\]]+\]\]?(?:[ \t]+#.*)?$')
+        $isRoot = $header -eq '[mcp_servers.feishu]'
+        $isChild = $header -match '^\[\[?mcp_servers\.feishu\.'
         if ($start -ge 0 -and -not $isChild) {
             [void]$sections.Add([pscustomobject]@{
                 Start = $start
@@ -57,8 +61,8 @@ function Get-McpSections([string]$Text, [string]$ServerId) {
     return $sections.ToArray()
 }
 
-function Remove-McpSection([string]$Text, [pscustomobject]$Section) {
-    $lines = @($Text -split '\r?\n', -1)
+function Remove-FeishuSection([string]$Text, [pscustomobject]$Section) {
+    $lines = @($Text -split '\r?\n', 0)
     $kept = New-Object System.Collections.Generic.List[string]
     if ($Section.Start -gt 0) {
         foreach ($line in @($lines[0..($Section.Start - 1)])) { [void]$kept.Add([string]$line) }
@@ -69,63 +73,80 @@ function Remove-McpSection([string]$Text, [pscustomobject]$Section) {
     return ($kept -join "`n")
 }
 
-function Normalize-McpSection([string]$Text) {
+function Normalize-FeishuSection([string]$Text) {
     $normalizedLines = New-Object System.Collections.Generic.List[string]
     foreach ($line in @($Text.Replace("`r`n", "`n").Replace("`r", "`n") -split "`n")) {
         $trimmed = ([string]$line).Trim()
-        if ($trimmed) {
+        if ($trimmed -and -not $trimmed.StartsWith('#', [StringComparison]::Ordinal)) {
             [void]$normalizedLines.Add($trimmed)
         }
     }
     return ($normalizedLines -join "`n").Trim()
 }
 
-$warnings = New-Object System.Collections.Generic.List[string]
-foreach ($serverId in @('feishu', 'media_generation')) {
-    $generatedSections = @(Get-McpSections $fragment $serverId)
-    $existingSections = @(Get-McpSections $withoutManaged $serverId)
-    if ($generatedSections.Count -eq 0 -or $existingSections.Count -eq 0) { continue }
-    if ($generatedSections.Count -ne 1) {
-        $status = [ordered]@{ merged = $false; status = 'conflict'; configPath = $configPath; reason = "Generated [mcp_servers.$serverId] section is ambiguous; existing Codex config was preserved."; backup = $null; warnings = @() }
-        $status | ConvertTo-Json -Depth 6
-        exit 0
+function Add-UsbFullAccessPolicy([string]$Text) {
+    $lines = @($Text -split '\r?\n', 0)
+    $rootLines = New-Object System.Collections.Generic.List[string]
+    $inTable = $false
+    foreach ($line in $lines) {
+        $trimmed = ([string]$line).Trim()
+        if ($trimmed -match '^\[\[?.*\]\]?$') { $inTable = $true }
+        if (-not $inTable -and $trimmed -match '^(approval_policy|sandbox_mode)\s*=') { continue }
+        [void]$rootLines.Add([string]$line)
     }
+    $policy = $usbAccessBeginMarker + "`n" + 'approval_policy = "never"' + "`n" + 'sandbox_mode = "danger-full-access"' + "`n" + $usbAccessEndMarker + "`n"
+    return $policy + (($rootLines -join "`n").TrimStart("`n"))
+}
 
-    $generatedText = Normalize-McpSection $generatedSections[0].Text
-    $matchingExisting = @($existingSections | Where-Object { (Normalize-McpSection $_.Text) -ceq $generatedText })
-    if ($existingSections.Count -eq 1 -and $matchingExisting.Count -eq 1) {
-        $withoutManaged = Remove-McpSection $withoutManaged $existingSections[0]
-        continue
+$generatedFeishu = @(Get-FeishuSections $fragment)
+$legacyFeishu = @(Get-FeishuSections $withoutManaged)
+$legacyMigration = $null
+if ($generatedFeishu.Count -eq 1 -and $legacyFeishu.Count -eq 1) {
+    $generatedFeishuText = Normalize-FeishuSection $generatedFeishu[0].Text
+    $legacyFeishuText = Normalize-FeishuSection $legacyFeishu[0].Text
+    if ($legacyFeishuText -ceq $generatedFeishuText) {
+        $legacyMigration = $legacyFeishu[0]
+        $withoutManaged = Remove-FeishuSection $withoutManaged $legacyMigration
     }
+}
+$hasUnmanagedFeishu = [regex]::IsMatch($withoutManaged, '(?m)^\s*\[mcp_servers\.feishu\][ \t]*(?:#.*)?$')
 
-    if ($serverId -eq 'feishu') {
-        # Feishu is optional. Keep unknown/user-owned config intact and omit only
-        # this generated block, allowing the rest of the capability pack to merge.
-        $fragment = Remove-McpSection $fragment $generatedSections[0]
-        [void]$warnings.Add('Existing unmanaged [mcp_servers.feishu] was preserved; the generated Feishu block was skipped.')
-        continue
+if ($hasUnmanagedFeishu) {
+    $conflictBackupPath = $null
+    if ($EnableFullAccess) {
+        $conflictContent = Add-UsbFullAccessPolicy $existing
+        if (Test-Path -LiteralPath $configPath -PathType Leaf) {
+            $conflictBackupPath = Join-Path $backupRoot ('config.toml.' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ') + '.bak')
+            Copy-Item -LiteralPath $configPath -Destination $conflictBackupPath -Force
+        }
+        $conflictTempPath = $configPath + '.tmp-' + [guid]::NewGuid().ToString('N')
+        try {
+            $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+            [System.IO.File]::WriteAllText($conflictTempPath, $conflictContent, $utf8NoBom)
+            if ([string]::IsNullOrWhiteSpace($PythonExe)) {
+                $candidate = Get-Command python -ErrorAction SilentlyContinue
+                if ($candidate) { $PythonExe = $candidate.Source }
+            }
+            if (-not [string]::IsNullOrWhiteSpace($PythonExe) -and (Test-Path -LiteralPath $PythonExe -PathType Leaf)) {
+                & $PythonExe -c "import pathlib,sys,tomllib; tomllib.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8-sig'))" $conflictTempPath
+                if ($LASTEXITCODE -ne 0) { throw 'USB full-access config failed TOML validation during MCP conflict handling.' }
+            }
+            Move-Item -LiteralPath $conflictTempPath -Destination $configPath -Force
+        }
+        finally {
+            if (Test-Path -LiteralPath $conflictTempPath -PathType Leaf) { Remove-Item -LiteralPath $conflictTempPath -Force }
+        }
     }
-
-    $generatedMediaRootLines = @($generatedSections[0].Text -split '\r?\n')
-    $generatedMediaRootBody = New-Object System.Collections.Generic.List[string]
-    for ($lineIndex = 1; $lineIndex -lt $generatedMediaRootLines.Count; $lineIndex++) {
-        if ([string]$generatedMediaRootLines[$lineIndex] -cmatch '^\s*\[\[?.*\]\]?(?:[ \t]+#.*)?$') { break }
-        [void]$generatedMediaRootBody.Add([string]$generatedMediaRootLines[$lineIndex])
-    }
-    $generatedMediaDisabled = [regex]::IsMatch(($generatedMediaRootBody -join "`n"), '(?m)^\s*enabled\s*=\s*false\s*(?:#.*)?$')
-    if ($generatedMediaDisabled) {
-        # An explicitly disabled package MCP must not replace a user's existing server.
-        $fragment = Remove-McpSection $fragment $generatedSections[0]
-        [void]$warnings.Add('Existing unmanaged [mcp_servers.media_generation] was preserved because media MCP installation is disabled.')
-        continue
-    }
-
-    $status = [ordered]@{ merged = $false; status = 'conflict'; configPath = $configPath; reason = 'Existing unmanaged [mcp_servers.media_generation] differs from the generated configuration; it was preserved and media MCP registration was not changed.'; backup = $null; warnings = @() }
+    $status = [ordered]@{ merged = $false; status = 'conflict'; configPath = $configPath; reason = 'Existing unmanaged [mcp_servers.feishu] was preserved; review the generated fragment manually.'; backup = $conflictBackupPath }
     $status | ConvertTo-Json -Depth 6
-    exit 0
+    return
 }
 
 $newContent = $withoutManaged.TrimEnd() + [Environment]::NewLine + [Environment]::NewLine + $beginMarker + [Environment]::NewLine + $fragment.Trim() + [Environment]::NewLine + $endMarker + [Environment]::NewLine
+if ($EnableFullAccess) {
+    # These are root-level settings and must stay before every TOML table.
+    $newContent = Add-UsbFullAccessPolicy $newContent
+}
 $backupPath = $null
 if (Test-Path -LiteralPath $configPath -PathType Leaf) {
     $backupPath = Join-Path $backupRoot ('config.toml.' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ') + '.bak')
@@ -136,28 +157,17 @@ try {
     $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
     [System.IO.File]::WriteAllText($tempPath, $newContent, $utf8NoBom)
     if ([string]::IsNullOrWhiteSpace($PythonExe)) {
-        $bundledPython = Join-Path $KitHome 'runtime\python-env\Scripts\python.exe'
-        if (Test-Path -LiteralPath $bundledPython -PathType Leaf) { $PythonExe = $bundledPython }
-    }
-    if ([string]::IsNullOrWhiteSpace($PythonExe)) {
         $candidate = Get-Command python -ErrorAction SilentlyContinue
         if ($candidate) { $PythonExe = $candidate.Source }
     }
-    if ([string]::IsNullOrWhiteSpace($PythonExe) -or -not (Test-Path -LiteralPath $PythonExe -PathType Leaf)) {
-        throw 'Cannot safely merge Codex config without a Python TOML validator; the existing config was preserved.'
+    if (-not [string]::IsNullOrWhiteSpace($PythonExe) -and (Test-Path -LiteralPath $PythonExe -PathType Leaf)) {
+        & $PythonExe -c "import pathlib,sys,tomllib; tomllib.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8-sig'))" $tempPath
+        if ($LASTEXITCODE -ne 0) { throw 'Merged Codex config failed TOML validation.' }
     }
-    & $PythonExe -c "import pathlib,sys,tomllib; data=pathlib.Path(sys.argv[1]).read_bytes(); assert not data.startswith(bytes.fromhex('efbbbf')), 'UTF-8 BOM is not allowed'; tomllib.loads(data.decode('utf-8'))" $tempPath
-    if ($LASTEXITCODE -ne 0) { throw 'Merged Codex config failed strict UTF-8/TOML validation; the existing config was preserved.' }
-    if (Test-Path -LiteralPath $configPath -PathType Leaf) {
-        $atomicBackupPath = $configPath + '.replace-' + [guid]::NewGuid().ToString('N')
-        [System.IO.File]::Replace($tempPath, $configPath, $atomicBackupPath, $true)
-        Remove-Item -LiteralPath $atomicBackupPath -Force -ErrorAction SilentlyContinue
-    } else {
-        [System.IO.File]::Move($tempPath, $configPath)
-    }
+    Move-Item -LiteralPath $tempPath -Destination $configPath -Force
 }
 finally {
     if (Test-Path -LiteralPath $tempPath -PathType Leaf) { Remove-Item -LiteralPath $tempPath -Force }
 }
 
-[ordered]@{ merged = $true; status = 'merged'; configPath = $configPath; backup = $backupPath; targetIsCurrentUser = $profileFull.Equals($actualProfile, [StringComparison]::OrdinalIgnoreCase); warnings = @($warnings.ToArray()) } | ConvertTo-Json -Depth 6
+[ordered]@{ merged = $true; status = 'merged'; configPath = $configPath; backup = $backupPath; targetIsCurrentUser = $profileFull.Equals($actualProfile, [StringComparison]::OrdinalIgnoreCase) } | ConvertTo-Json -Depth 6

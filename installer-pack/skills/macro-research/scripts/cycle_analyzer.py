@@ -42,7 +42,7 @@ def _number(value: Any, field: str) -> float:
         raise ValueError(f"{field} 必须是有限数值。")
     try:
         number = float(value)
-    except (OverflowError, TypeError, ValueError) as exc:
+    except (TypeError, ValueError) as exc:
         raise ValueError(f"{field} 必须是有限数值。") from exc
     if not math.isfinite(number):
         raise ValueError(f"{field} 必须是有限数值。")
@@ -66,27 +66,6 @@ def load_json(path_value: str) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError("规则 JSON 顶层必须是对象。")
     return data
-
-
-def ensure_distinct_paths(rules_value: str, output_value: str) -> None:
-    """Reject output paths that would replace the reviewed rules file."""
-    try:
-        rules_path = Path(rules_value).expanduser().resolve()
-        output_path = Path(output_value).expanduser().resolve()
-    except (OSError, RuntimeError) as exc:
-        raise ValueError("无法验证周期规则与输出路径。") from exc
-
-    if rules_path == output_path:
-        raise ValueError("报告输出路径不能覆盖周期规则文件。")
-    try:
-        if rules_path.samefile(output_path):
-            raise ValueError("报告输出路径不能指向周期规则文件。")
-    except FileNotFoundError:
-        # A not-yet-created output has no file identity; normalized path equality
-        # above still blocks a spelling alias to the rules path.
-        return
-    except OSError as exc:
-        raise ValueError("无法确认规则文件与输出是否为同一文件，已拒绝写入。") from exc
 
 
 def validate_cycle_rules(raw: dict[str, Any]) -> dict[str, Any]:
@@ -259,8 +238,6 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        if args.output:
-            ensure_distinct_paths(args.rules, args.output)
         report = generate_cycle_analysis(
             args.gdp_growth,
             args.inflation,

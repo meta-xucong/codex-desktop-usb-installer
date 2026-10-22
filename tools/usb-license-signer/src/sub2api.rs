@@ -44,13 +44,9 @@ const PROVISION_RECOVERY_SCHEMA_VERSION: u32 = 1;
 const MAX_TRANSIENT_ATTEMPTS: u32 = 3;
 const RETRY_BASE_DELAY_MS: u64 = 500;
 
-// Production signer builds may embed the administrator credential at compile
-// time. The value comes from the build environment and is never written to
-// this source file or to a license/bundle. Runtime environment variables still
-// take precedence so managed deployments can rotate the credential without
-// rebuilding the signer.
-const EMBEDDED_ADMIN_API_KEY: Option<&str> = option_env!("CODEX_404TOKEN_ADMIN_API_KEY");
-const EMBEDDED_ADMIN_API_KEY_FALLBACK: Option<&str> = option_env!("SUB2API_ADMIN_API_KEY");
+// Generated from the release build environment. The source file is kept out of
+// version control and the credential is never written to a license or bundle.
+include!(concat!(env!("OUT_DIR"), "/embedded_admin_key.rs"));
 
 const API_PREFIX: &str = "/api/v1";
 const USER_AGENT: &str = "codex-usb-license-signer/1";
@@ -159,6 +155,29 @@ pub fn default_admin_api_key() -> String {
         }
     }
     embedded_admin_api_key().unwrap_or_default()
+}
+
+/// Non-secret build/runtime diagnostics used only by release verification.
+pub fn admin_api_key_diagnostics() -> Value {
+    let runtime_primary = std::env::var(ADMIN_API_KEY_ENV).ok();
+    let runtime_fallback = std::env::var(ADMIN_API_KEY_FALLBACK_ENV).ok();
+    let resolved = default_admin_api_key();
+    json!({
+        "resolvedLength": resolved.trim().len(),
+        "source": if runtime_primary.as_ref().is_some_and(|v| !v.trim().is_empty()) {
+            "runtime-primary"
+        } else if runtime_fallback.as_ref().is_some_and(|v| !v.trim().is_empty()) {
+            "runtime-fallback"
+        } else if embedded_admin_api_key().is_some() {
+            "embedded"
+        } else {
+            "missing"
+        },
+        "runtimePrimaryLength": runtime_primary.map(|v| v.trim().len()).unwrap_or(0),
+        "runtimeFallbackLength": runtime_fallback.map(|v| v.trim().len()).unwrap_or(0),
+        "embeddedPrimaryLength": EMBEDDED_ADMIN_API_KEY.map(|v| v.trim().len()).unwrap_or(0),
+        "embeddedFallbackLength": EMBEDDED_ADMIN_API_KEY_FALLBACK.map(|v| v.trim().len()).unwrap_or(0),
+    })
 }
 
 impl From<StoredConfig> for Sub2ApiConfig {

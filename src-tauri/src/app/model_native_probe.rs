@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const PROVIDER_ID: &str = "codex-native-probe";
 const CATALOG_IDENTITY: &str = "404token-unified-api-internal";
@@ -141,29 +141,89 @@ pub(crate) fn probe(input: NativeProbeInput) -> Result<NativeProbeResult, Native
 /// This is used only when the manager creates its first overlay, so adding a
 /// gateway model does not hide the client's existing native models.
 #[cfg(windows)]
+fn log_native_add_failure(
+    request_id: &str,
+    stage: &str,
+    error: NativeProbeError,
+    started: Instant,
+) {
+    log::warn!(
+        "native model catalog failure request_id={} stage={} code={} elapsed_ms={}",
+        safe_identifier(request_id)
+            .then_some(request_id)
+            .unwrap_or("invalid"),
+        stage,
+        error.code(),
+        started.elapsed().as_millis()
+    );
+}
+
+#[cfg(windows)]
+fn native_process_failure_stage(error: NativeProbeError) -> &'static str {
+    match error {
+        NativeProbeError::ProcessFailed => "process-transport",
+        NativeProbeError::RuntimeUnavailable => "process-job-attach",
+        NativeProbeError::CleanupFailed => "process-job-cleanup",
+        _ => "process-capture",
+    }
+}
+
+#[cfg(windows)]
 pub(crate) fn native_default_catalog(
+    request_id: &str,
     cancelled: &AtomicBool,
     deadline: std::time::Instant,
 ) -> Result<Value, NativeProbeError> {
-    check_limits(cancelled, deadline)?;
-    let mut area = TemporaryArea::create(cancelled, deadline)?;
-    let result = run_after_runtime_verification(
-        || verified_catalog_runtime(&area, cancelled, deadline),
-        |executable| {
-            win_process::capture(
-                executable,
-                &["debug", "models"],
-                &area,
-                None,
-                cancelled,
-                deadline,
-            )
-        },
-    )?;
+    let started = Instant::now();
+    check_limits(cancelled, deadline).map_err(|error| {
+        log_native_add_failure(request_id, "native-default-deadline", error, started);
+        error
+    })?;
+    let mut area = TemporaryArea::create(cancelled, deadline).map_err(|error| {
+        log_native_add_failure(request_id, "native-default-temp-area", error, started);
+        error
+    })?;
+    let executable = verified_catalog_runtime(request_id, &area, cancelled, deadline, started)?;
+    let result = win_process::capture(
+        &executable,
+        &["debug", "models"],
+        &area,
+        None,
+        cancelled,
+        deadline,
+    )
+    .map_err(|error| {
+        log_native_add_failure(
+            request_id,
+            native_process_failure_stage(error),
+            error,
+            started,
+        );
+        error
+    })?;
     if !result.status.success() {
+        log::warn!(
+            "native model catalog failure request_id={} stage=native-default-process-exit code=native-catalog-unsupported exit_code={:?} stdout_bytes={} elapsed_ms={}",
+            safe_identifier(request_id)
+                .then_some(request_id)
+                .unwrap_or("invalid"),
+            result.status.code(),
+            result.stdout.len(),
+            started.elapsed().as_millis()
+        );
         return Err(NativeProbeError::CatalogUnsupported);
     }
-    let models = native_models_from_debug_output(&result.stdout)?;
+    let models = native_models_from_debug_output(&result.stdout).map_err(|error| {
+        log::warn!(
+            "native model catalog failure request_id={} stage=native-default-json-parse code={} exit_code={:?} stdout_bytes={} elapsed_ms={}",
+            safe_identifier(request_id).then_some(request_id).unwrap_or("invalid"),
+            error.code(),
+            result.status.code(),
+            result.stdout.len(),
+            started.elapsed().as_millis()
+        );
+        error
+    })?;
     let catalog = json!({
         "schema_version": 1,
         "fetched_at": format!("unix:{}", unix_seconds()),
@@ -171,16 +231,39 @@ pub(crate) fn native_default_catalog(
         "identity": CATALOG_IDENTITY,
         "models": models,
     });
-    let bytes = serde_json::to_vec(&catalog).map_err(|_| NativeProbeError::CatalogUnsupported)?;
+    let bytes = serde_json::to_vec(&catalog).map_err(|_| {
+        let error = NativeProbeError::CatalogUnsupported;
+        log_native_add_failure(
+            request_id,
+            "native-default-catalog-serialize",
+            error,
+            started,
+        );
+        error
+    })?;
     if !within_catalog_limit(bytes.len()) {
-        return Err(NativeProbeError::OutputLimit);
+        let error = NativeProbeError::OutputLimit;
+        log::warn!(
+            "native model catalog failure request_id={} stage=native-default-catalog-size code={} catalog_bytes={} elapsed_ms={}",
+            safe_identifier(request_id)
+                .then_some(request_id)
+                .unwrap_or("invalid"),
+            error.code(),
+            bytes.len(),
+            started.elapsed().as_millis()
+        );
+        return Err(error);
     }
-    area.cleanup()?;
+    area.cleanup().map_err(|error| {
+        log_native_add_failure(request_id, "native-default-cleanup", error, started);
+        error
+    })?;
     Ok(catalog)
 }
 
 #[cfg(not(windows))]
 pub(crate) fn native_default_catalog(
+    _: &str,
     _: &AtomicBool,
     _: std::time::Instant,
 ) -> Result<Value, NativeProbeError> {
@@ -941,9 +1024,13 @@ fn prepare_probe(
     .map_err(|_| NativeProbeError::RuntimeUnavailable)?;
     let config_text = format!(
         "model_provider = \"{PROVIDER_ID}\"\nmodel_catalog_json = \"{}\"\nweb_search = \"disabled\"\n\n[shell_environment_policy]\ninherit = \"none\"\nset = {{ SystemRoot = \"{}\", WINDIR = \"{}\", PATH = \"{}\", TEMP = \"{}\", TMP = \"{}\" }}\n\n[model_providers.{PROVIDER_ID}]\nbase_url = \"{}\"\nwire_api = \"responses\"\nenv_key = \"{OPENAI_API_KEY}\"\n",
-        toml_string(&catalog_text), toml_string(&system_root), toml_string(&system_root),
-        toml_string(&shell_path.to_string_lossy()), toml_string(&TemporaryArea::text(&area.root)?),
-        toml_string(&TemporaryArea::text(&area.root)?), toml_string(gateway_base),
+        toml_string(&catalog_text),
+        toml_string(&system_root),
+        toml_string(&system_root),
+        toml_string(&shell_path.to_string_lossy()),
+        toml_string(&TemporaryArea::text(&area.root)?),
+        toml_string(&TemporaryArea::text(&area.root)?),
+        toml_string(gateway_base),
     );
     write_owned_file(&area.home.join("config.toml"), config_text.as_bytes())?;
     Ok(PreparedProbe {
@@ -1684,7 +1771,7 @@ mod win_process {
                     Ok(ProtocolEvent::Failure(error)) => return Err(error),
                     Err(mpsc::RecvTimeoutError::Timeout) => continue,
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        return Err(NativeProbeError::ProcessFailed)
+                        return Err(NativeProbeError::ProcessFailed);
                     }
                 }
             }
@@ -1855,64 +1942,120 @@ fn run_catalog_gate(
 /// spawning a second Codex process on every launch.
 #[cfg(windows)]
 pub(crate) fn validate_final_catalog(
+    request_id: &str,
     catalog: &[u8],
     cancelled: &AtomicBool,
     deadline: std::time::Instant,
 ) -> Result<(), NativeProbeError> {
-    check_limits(cancelled, deadline)?;
+    let started = Instant::now();
+    check_limits(cancelled, deadline).map_err(|error| {
+        log_native_add_failure(request_id, "native-final-deadline", error, started);
+        error
+    })?;
     if !within_catalog_limit(catalog.len()) {
-        return Err(NativeProbeError::OutputLimit);
+        let error = NativeProbeError::OutputLimit;
+        log_native_add_failure(request_id, "native-final-input-size", error, started);
+        return Err(error);
     }
-    let value: Value =
-        serde_json::from_slice(catalog).map_err(|_| NativeProbeError::CatalogUnsupported)?;
+    let value: Value = serde_json::from_slice(catalog).map_err(|_| {
+        let error = NativeProbeError::CatalogUnsupported;
+        log_native_add_failure(request_id, "native-final-input-parse", error, started);
+        error
+    })?;
     let entries = value
         .get("models")
         .and_then(Value::as_array)
-        .ok_or(NativeProbeError::CatalogUnsupported)?;
+        .ok_or_else(|| {
+            let error = NativeProbeError::CatalogUnsupported;
+            log_native_add_failure(request_id, "native-final-input-shape", error, started);
+            error
+        })?;
     if entries.is_empty() || entries.len() > 512 {
-        return Err(NativeProbeError::CatalogUnsupported);
+        let error = NativeProbeError::CatalogUnsupported;
+        log_native_add_failure(request_id, "native-final-input-count", error, started);
+        return Err(error);
     }
-    let mut area = TemporaryArea::create(cancelled, deadline)?;
+    let mut area = TemporaryArea::create(cancelled, deadline).map_err(|error| {
+        log_native_add_failure(request_id, "native-final-temp-area", error, started);
+        error
+    })?;
     let path = area.home.join("catalog.json");
-    write_owned_file(&path, catalog)?;
-    let config = format!(
-        "model_catalog_json = \"{}\"\n",
-        toml_string(&TemporaryArea::text(&path)?)
-    );
-    write_owned_file(&area.home.join("config.toml"), config.as_bytes())?;
-    let parsed = run_after_runtime_verification(
-        || verified_catalog_runtime(&area, cancelled, deadline),
-        |executable| {
-            win_process::capture(
-                executable,
-                &["debug", "models"],
-                &area,
-                None,
-                cancelled,
-                deadline,
-            )
-        },
-    )?;
+    write_owned_file(&path, catalog).map_err(|error| {
+        log_native_add_failure(request_id, "native-final-stage-catalog", error, started);
+        error
+    })?;
+    let config_path = TemporaryArea::text(&path).map_err(|error| {
+        log_native_add_failure(request_id, "native-final-config-path", error, started);
+        error
+    })?;
+    let config = format!("model_catalog_json = \"{}\"\n", toml_string(&config_path));
+    write_owned_file(&area.home.join("config.toml"), config.as_bytes()).map_err(|error| {
+        log_native_add_failure(request_id, "native-final-stage-config", error, started);
+        error
+    })?;
+    let executable = verified_catalog_runtime(request_id, &area, cancelled, deadline, started)?;
+    let parsed = win_process::capture(
+        &executable,
+        &["debug", "models"],
+        &area,
+        None,
+        cancelled,
+        deadline,
+    )
+    .map_err(|error| {
+        log_native_add_failure(
+            request_id,
+            native_process_failure_stage(error),
+            error,
+            started,
+        );
+        error
+    })?;
     if !parsed.status.success() || !catalog_output_matches(&parsed.stdout, &value) {
+        log::warn!(
+            "native model catalog failure request_id={} stage=native-final-process-validate code=native-catalog-unsupported exit_code={:?} stdout_bytes={} elapsed_ms={}",
+            safe_identifier(request_id)
+                .then_some(request_id)
+                .unwrap_or("invalid"),
+            parsed.status.code(),
+            parsed.stdout.len(),
+            started.elapsed().as_millis()
+        );
         return Err(NativeProbeError::CatalogUnsupported);
     }
-    area.cleanup()?;
+    area.cleanup().map_err(|error| {
+        log_native_add_failure(request_id, "native-final-cleanup", error, started);
+        error
+    })?;
     Ok(())
 }
 
 #[cfg(windows)]
 fn verified_catalog_runtime(
+    request_id: &str,
     area: &TemporaryArea,
     cancelled: &AtomicBool,
     deadline: std::time::Instant,
+    started: Instant,
 ) -> Result<PathBuf, NativeProbeError> {
     let verified =
         crate::app::model_catalog::verified_codex_runtime_for_catalog(cancelled, deadline)
-            .map_err(|code| match code {
-                "native-executable-changed" => NativeProbeError::ExecutableChanged,
-                "native-probe-cancelled" => NativeProbeError::Cancelled,
-                "native-probe-timeout" => NativeProbeError::DeadlineExceeded,
-                _ => NativeProbeError::ExecutableUnavailable,
+            .map_err(|failure| {
+                log::warn!(
+                    "native model catalog failure request_id={} stage={} code={} elapsed_ms={}",
+                    safe_identifier(request_id)
+                        .then_some(request_id)
+                        .unwrap_or("invalid"),
+                    failure.stage,
+                    failure.code,
+                    started.elapsed().as_millis()
+                );
+                match failure.code {
+                    "native-executable-changed" => NativeProbeError::ExecutableChanged,
+                    "native-probe-cancelled" => NativeProbeError::Cancelled,
+                    "native-probe-timeout" => NativeProbeError::DeadlineExceeded,
+                    _ => NativeProbeError::ExecutableUnavailable,
+                }
             })?;
     let copy = area.root.join("codex-verified.exe");
     extract_verified_cli_from_msix(
@@ -2056,6 +2199,7 @@ fn run_after_runtime_verification<T>(
 }
 #[cfg(not(windows))]
 pub(crate) fn validate_final_catalog(
+    _: &str,
     _: &[u8],
     _: &AtomicBool,
     _: std::time::Instant,
@@ -2993,6 +3137,19 @@ fn probe_windows(input: NativeProbeInput) -> Result<NativeProbeResult, NativePro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn process_failure_diagnostic_uses_transport_when_source_is_ambiguous() {
+        assert_eq!(
+            native_process_failure_stage(NativeProbeError::ProcessFailed),
+            "process-transport"
+        );
+        assert_eq!(
+            native_process_failure_stage(NativeProbeError::RuntimeUnavailable),
+            "process-job-attach"
+        );
+    }
 
     #[test]
     fn unverified_runtime_is_never_passed_to_codex_process_runner() {

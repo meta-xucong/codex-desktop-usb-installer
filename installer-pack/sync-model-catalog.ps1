@@ -2,6 +2,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$PackRoot,
     [Parameter(Mandatory = $true)][string]$TargetUserProfile,
+    [string]$TargetCodexHome,
     [Parameter(Mandatory = $true)][string]$KitHome,
     [string]$PythonExe
 )
@@ -11,7 +12,8 @@ $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 $profileFull = [IO.Path]::GetFullPath($TargetUserProfile).TrimEnd('\')
 $catalogSource = Join-Path $PackRoot 'model-catalog.json'
 $catalogTarget = Join-Path $KitHome 'model-catalog.json'
-$configPath = Join-Path $profileFull '.codex\config.toml'
+$codexHome = if ([string]::IsNullOrWhiteSpace($TargetCodexHome)) { Join-Path $profileFull '.codex' } else { [IO.Path]::GetFullPath($TargetCodexHome) }
+$configPath = Join-Path $codexHome 'config.toml'
 $backupRoot = Join-Path $KitHome 'backups'
 $beginMarker = '# BEGIN CODEX-STARTER-KIT MODEL POLICY v1'
 $endMarker = '# END CODEX-STARTER-KIT MODEL POLICY v1'
@@ -47,7 +49,15 @@ Assert-StrictProperties $catalog @('schemaVersion', 'preferredModel', 'retiredMo
 if (-not (Test-IntegerValue $catalog.schemaVersion) -or [int64]$catalog.schemaVersion -ne 1) { throw 'Model catalog schemaVersion must be integer 1.' }
 Assert-NonEmptyString $catalog.preferredModel 'Model catalog preferredModel'
 foreach ($metadataField in @('source', 'snapshotVersion', 'clientVersion')) {
-    if ($catalog.PSObject.Properties.Name -contains $metadataField) { Assert-NonEmptyString $catalog.$metadataField "Model catalog $metadataField" }
+    if ($catalog.PSObject.Properties.Name -contains $metadataField) {
+        # Windows PowerShell 5.1 ConvertFrom-Json turns ISO-8601 timestamps
+        # into DateTime values. Keep the catalog contract as a string when the
+        # snapshot version is round-tripped through that parser.
+        if ($metadataField -eq 'snapshotVersion' -and $catalog.$metadataField -is [datetime]) {
+            $catalog.snapshotVersion = $catalog.snapshotVersion.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+        }
+        Assert-NonEmptyString $catalog.$metadataField "Model catalog $metadataField"
+    }
 }
 if ($catalog.retiredModelIds -isnot [array]) { throw 'Model catalog retiredModelIds must be an array.' }
 $retiredIds = @()

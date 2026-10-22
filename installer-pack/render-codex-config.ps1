@@ -9,6 +9,7 @@ param(
     [string]$FeishuPackageCache,
     [string]$PythonExe,
     [string]$TargetUserProfile,
+    [string]$TargetCodexHome,
     [ValidateSet('tenant','oauth','user')][string]$FeishuAuthMode = 'tenant',
     [string]$FeishuDomain = 'https://open.feishu.cn',
     [string[]]$EnableSkills = @(),
@@ -35,10 +36,11 @@ if (Test-Path -LiteralPath (Join-Path $scriptContainer 'pack.json') -PathType Le
 $userProfile = $TargetUserProfile
 if ([string]::IsNullOrWhiteSpace($userProfile)) { $userProfile = [Environment]::GetEnvironmentVariable('USERPROFILE') }
 if ([string]::IsNullOrWhiteSpace($userProfile)) { throw 'USERPROFILE is required.' }
+if ([string]::IsNullOrWhiteSpace($TargetCodexHome)) { $TargetCodexHome = Join-Path $userProfile '.codex' }
 if ([string]::IsNullOrWhiteSpace($SkillRoot)) { $SkillRoot = Join-Path $userProfile '.agents\skills' }
-if ([string]::IsNullOrWhiteSpace($FeishuWrapperPath)) { $FeishuWrapperPath = Join-Path $userProfile '.codex\codex-agent-kit\bin\start-feishu-mcp.ps1' }
-if ([string]::IsNullOrWhiteSpace($MediaMcpWrapperPath)) { $MediaMcpWrapperPath = Join-Path $userProfile '.codex\codex-agent-kit\bin\start-media-generation-mcp.ps1' }
-if ([string]::IsNullOrWhiteSpace($FeishuPackageCache)) { $FeishuPackageCache = Join-Path $userProfile '.codex\codex-agent-kit\runtime\feishu' }
+if ([string]::IsNullOrWhiteSpace($FeishuWrapperPath)) { $FeishuWrapperPath = Join-Path $TargetCodexHome 'codex-agent-kit\bin\start-feishu-mcp.ps1' }
+if ([string]::IsNullOrWhiteSpace($MediaMcpWrapperPath)) { $MediaMcpWrapperPath = Join-Path $TargetCodexHome 'codex-agent-kit\bin\start-media-generation-mcp.ps1' }
+if ([string]::IsNullOrWhiteSpace($FeishuPackageCache)) { $FeishuPackageCache = Join-Path $TargetCodexHome 'codex-agent-kit\runtime\feishu' }
 
 $auditPath = Join-Path $kitRoot 'manifest\skill-audit.json'
 $templatePath = Join-Path $kitRoot 'config-fragments\feishu-official-stdio.template.toml'
@@ -83,7 +85,7 @@ if ($EnableFeishu) {
     if (-not [bool]$dryRunPlan.packagePresent -or -not [bool]$dryRunPlan.packageValidated) {
         throw "Locked Feishu package is absent or does not match the tool contract: $FeishuPackageCache"
     }
-    if (-not [bool]$dryRunPlan.nodeReady) { throw 'Node.js >=22 is required before enabling Feishu.' }
+    if (-not [bool]$dryRunPlan.nodeReady) { throw 'Node.js >=20 is required before enabling Feishu.' }
     $secretValue = [Environment]::GetEnvironmentVariable('FEISHU_APP_SECRET', 'Process')
     if ($dryRunText -match [regex]::Escape($secretValue)) { throw 'Feishu wrapper dry-run exposed App Secret.' }
 }
@@ -94,7 +96,7 @@ if ($EnableMediaGeneration) {
     $mediaHealthText = & $MediaMcpWrapperPath -HealthCheck | Out-String
     if ($LASTEXITCODE -ne 0) { throw 'Bundled Python media MCP health check failed.' }
     $mediaHealth = $mediaHealthText | ConvertFrom-Json
-    if (-not [bool]$mediaHealth.ready -or [string]$mediaHealth.serverVersion -ne '1.3.11' -or [string]$mediaHealth.healthScope -ne 'local-runtime-protocol' -or [string]$mediaHealth.protocolStatus -ne 'passed' -or [int]$mediaHealth.toolCount -ne 6) { throw 'Bundled Python media MCP local runtime/protocol check is unhealthy.' }
+    if (-not [bool]$mediaHealth.ready -or [string]$mediaHealth.serverVersion -ne '1.3.11' -or [string]$mediaHealth.healthScope -ne 'local-runtime-protocol' -or [string]$mediaHealth.runtimeStatus -ne 'passed' -or [string]$mediaHealth.protocolStatus -ne 'passed' -or [string]$mediaHealth.gatewayCatalogStatus -ne 'not_checked' -or [string]$mediaHealth.generationCapability -ne 'not_tested' -or [int]$mediaHealth.toolCount -ne 6) { throw 'Bundled Python media MCP local runtime/protocol check is unhealthy.' }
 }
 
 $mcpManifestPath = Join-Path $kitRoot 'manifest\mcp-servers.json'
@@ -148,29 +150,17 @@ $outputParent = Split-Path -Parent $outputFull
 if (-not (Test-Path -LiteralPath $outputParent)) { New-Item -ItemType Directory -Force -Path $outputParent | Out-Null }
 $tempPath = $outputFull + '.tmp-' + [guid]::NewGuid().ToString('N')
 try {
-    $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-    [System.IO.File]::WriteAllText($tempPath, $content, $utf8NoBom)
+    Set-Content -LiteralPath $tempPath -Value $content -Encoding UTF8
     $pythonPath = $PythonExe
-    if ([string]::IsNullOrWhiteSpace($pythonPath)) {
-        $bundledPython = Join-Path $userProfile '.codex\codex-agent-kit\runtime\python-env\Scripts\python.exe'
-        if (Test-Path -LiteralPath $bundledPython -PathType Leaf) { $pythonPath = $bundledPython }
-    }
     if ([string]::IsNullOrWhiteSpace($pythonPath)) {
         $python = Get-Command python -ErrorAction SilentlyContinue
         if ($python) { $pythonPath = $python.Source }
     }
-    if ([string]::IsNullOrWhiteSpace($pythonPath) -or -not (Test-Path -LiteralPath $pythonPath -PathType Leaf)) {
-        throw 'Cannot safely render Codex TOML without a Python TOML validator; the previous output was preserved.'
+    if (-not [string]::IsNullOrWhiteSpace($pythonPath) -and (Test-Path -LiteralPath $pythonPath -PathType Leaf)) {
+        & $pythonPath -c "import pathlib,sys,tomllib; tomllib.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8-sig'))" $tempPath
+        if ($LASTEXITCODE -ne 0) { throw 'Rendered TOML failed Python tomllib validation.' }
     }
-    & $pythonPath -c "import pathlib,sys,tomllib; data=pathlib.Path(sys.argv[1]).read_bytes(); assert not data.startswith(bytes.fromhex('efbbbf')), 'UTF-8 BOM is not allowed'; tomllib.loads(data.decode('utf-8'))" $tempPath
-    if ($LASTEXITCODE -ne 0) { throw 'Rendered TOML failed strict UTF-8/TOML validation; the previous output was preserved.' }
-    if (Test-Path -LiteralPath $outputFull -PathType Leaf) {
-        $atomicBackupPath = $outputFull + '.replace-' + [guid]::NewGuid().ToString('N')
-        [System.IO.File]::Replace($tempPath, $outputFull, $atomicBackupPath, $true)
-        Remove-Item -LiteralPath $atomicBackupPath -Force -ErrorAction SilentlyContinue
-    } else {
-        [System.IO.File]::Move($tempPath, $outputFull)
-    }
+    Move-Item -LiteralPath $tempPath -Destination $outputFull -Force
 } finally {
     if (Test-Path -LiteralPath $tempPath) { Remove-Item -LiteralPath $tempPath -Force }
 }

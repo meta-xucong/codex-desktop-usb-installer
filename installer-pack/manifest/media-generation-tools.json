@@ -15,22 +15,16 @@
   },
   "restartAfterInstall": true,
   "providerSlots": {
-    "active": [
-      "image-2",
-      "grok-image",
-      "grok-video",
-      "seedance-video"
-    ],
+    "active": ["image-2", "grok-image", "grok-video", "seedance-video"],
     "reserved": {
       "minimax-video": {
         "modelEnvironmentVariable": "MEDIA_MINIMAX_VIDEO_MODEL",
-        "enabledOnlyWhenConfigured": false,
-        "adapterStatus": "disabled-unverified-protocol",
-        "reason": "MiniMax official video API uses a separate API key, v2 endpoints and multimodal content schema; no compatible unified-gateway adapter or upstream account is configured.",
+        "enabledOnlyWhenConfigured": true,
         "currentModelConfigured": false,
-        "credentialSource": "none-provider-disabled",
+        "credentialSource": "signed-usb-license.device-api-key",
         "officialMiniMaxApi": false,
-        "automaticFallback": false
+        "automaticFallback": false,
+        "profile": "wokey"
       }
     }
   },

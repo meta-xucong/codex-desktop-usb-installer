@@ -85,7 +85,7 @@
       </section>
       <section class="panel model-catalog-panel" aria-labelledby="model-catalog-heading">
         <div class="panel-heading">
-          <div><h2 id="model-catalog-heading">上游模型目录</h2><p class="muted">刷新符合条件的 404token 账号目录，并按已批准规则整理映射。目录出现不代表模型生成已验证；本功能不发送模型生成请求。</p></div>
+          <div><h2 id="model-catalog-heading">上游模型目录</h2><p class="muted">刷新符合条件的 404token 账号目录并按已批准规则整理映射。官方证据不足的已映射文本模型会调用原生账号测试接口发起真实生成请求；可能消耗上游额度，成功后也可能恢复账号状态。只有模型名完全匹配且收到完整成功结果才算可用；账号 model_mapping 改写或结果不完整时会忽略该模型。</p></div>
           <button id="model-catalog-run-button" class="primary" type="button">刷新并整理模型</button>
         </div>
         <dl class="model-catalog-status">

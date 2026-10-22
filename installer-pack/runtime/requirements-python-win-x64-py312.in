@@ -12,7 +12,7 @@ pypdf==6.17.0
 pdfplumber==0.11.10
 reportlab==5.0.1
 Pillow==12.3.0
-scrapling[fetchers]==0.4.15
+scrapling==0.4.15
 html2text==2025.4.15
 # akshare declares jsonpath without a Windows wheel on the approved index.
 # The bundle carries a reproducibly built py3-none-any wheel for this exact version.

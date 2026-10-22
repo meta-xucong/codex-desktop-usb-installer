@@ -51,8 +51,8 @@
       "id": "runtime.hyperframes-package-json",
       "path": "runtime/bundled/hyperframes-package.json",
       "kind": "npm-lock-contract",
-      "source": "https://registry.npmjs.org/hyperframes/0.8.174",
-      "sha256": "645a8e50eef15e08e904bd160a1d05e2af40965ddce4d0d6e3e5263b9d723a3d",
+      "source": "https://registry.npmjs.org/hyperframes/0.8.134",
+      "sha256": "907747a9d9adfb41244fe8dfc3786d929c6b2261813ca509c58cf4429b88ee11",
       "bytes": 147,
       "install": "Copied into the per-user HyperFrames runtime and installed with npm ci from the locked dependency graph."
     },
@@ -61,8 +61,8 @@
       "path": "runtime/bundled/hyperframes-package-lock.json",
       "kind": "npm-lock-contract",
       "source": "https://registry.npmjs.org/",
-      "sha256": "d67f810d7c90673ff3b9bdc27e03c22ed1a3de62702ebb22893580c80e010eeb",
-      "bytes": 62818,
+      "sha256": "e6d58048a953a40e40df4cce287f45f2027ca38b750e0e6a45d68f48a80255d9",
+      "bytes": 62115,
       "install": "Copied into the per-user HyperFrames runtime and installed with npm ci from the locked dependency graph."
     }
   ],

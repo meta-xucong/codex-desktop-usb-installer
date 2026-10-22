@@ -23,11 +23,8 @@ function Find-CatalogRoot {
         if ($parent -eq $cursor) { break }
         $cursor = $parent
     }
-    $installedSkillsRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
-    if ((Split-Path -Leaf $installedSkillsRoot) -eq 'skills') {
-        return (Split-Path -Parent $installedSkillsRoot)
-    }
-    return $installedSkillsRoot
+    $installedRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+    return $installedRoot
 }
 
 function Get-FrontMatter([string]$Path) {

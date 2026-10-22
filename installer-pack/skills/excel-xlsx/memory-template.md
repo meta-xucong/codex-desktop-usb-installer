@@ -1,6 +1,6 @@
 # Memory Template — Excel / XLSX
 
-Only create this file in the configured Codex data location after the user explicitly consents to persistent preference storage. Never create the directory or file by default.
+Create `%CODEX_HOME%\data\excel-xlsx/memory.md` with this structure:
 
 ```markdown
 # Excel / XLSX Memory
@@ -41,7 +41,7 @@ large_files: suggest_streaming | handle_normally
 
 | Value | Meaning | Behavior |
 |-------|---------|----------|
-| `ongoing` | Still learning | Ask only for preferences relevant to a current task or requested personalization |
+| `ongoing` | Still learning | Gather context as they work |
 | `complete` | Has enough context | Work normally |
 | `paused` | User said "not now" | Don't ask, work with what you have |
 

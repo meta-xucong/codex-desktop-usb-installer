@@ -174,20 +174,13 @@ def fetch_minute_data_sina(
     rows: list[dict[str, Any]] = []
     for raw in raw_rows:
         try:
-            parsed_volume = float(raw["volume"])
-        except (KeyError, TypeError, ValueError, OverflowError) as exc:
-            raise RuntimeError("新浪分时接口返回了无效成交量。") from exc
-        if not math.isfinite(parsed_volume) or parsed_volume < 0:
-            raise RuntimeError("新浪分时接口成交量必须是有限的非负数值。")
-
-        try:
             row = {
                 "time": str(raw["day"]),
                 "open": float(raw["open"]),
                 "high": float(raw["high"]),
                 "low": float(raw["low"]),
                 "close": float(raw["close"]),
-                "volume_shares": int(parsed_volume),
+                "volume_shares": int(float(raw["volume"])),
                 "amount_cny": float(raw["amount"]),
             }
         except (KeyError, TypeError, ValueError) as exc:
@@ -203,41 +196,30 @@ def fetch_minute_data_sina(
 
 def analyze_minute_volume(minute_data: list[dict[str, Any]]) -> dict[str, Any]:
     """Calculate volume distributions; do not infer participant identity or intent."""
-    period_ranges = {
-        "open_call_auction": ("09:25", "09:30"),
-        "open_30min": ("09:30", "10:00"),
-        "mid_am": ("10:00", "11:30"),
-        "mid_pm": ("13:00", "14:30"),
-        "close_30min": ("14:30", "15:01"),
-    }
-
-    def period_for(row: dict[str, Any]) -> str | None:
-        minute = str(row.get("time", ""))[-8:-3]
-        return next(
-            (key for key, (start, end) in period_ranges.items() if start <= minute < end),
-            None,
-        )
-
-    assigned_rows = [
-        (row, period)
+    trading_rows = [
+        row
         for row in minute_data
         if row.get("volume_shares", 0) > 0
-        for period in [period_for(row)]
-        if period is not None
+        and "09:25" <= str(row.get("time", ""))[-8:-3] <= "15:00"
     ]
-    trading_rows = [row for row, _ in assigned_rows]
     if not trading_rows:
         raise ValueError("没有有效交易时段的分时数据。")
     total_volume = sum(int(row["volume_shares"]) for row in trading_rows)
     if total_volume <= 0:
         raise ValueError("分时总成交量必须大于零。")
-    total_amount = sum(float(row["amount_cny"]) for row in trading_rows)
-    if not math.isfinite(total_amount):
-        raise ValueError("分时总成交额超出有限数值范围。")
+
+    def period_volume(start: str, end: str) -> int:
+        return sum(
+            int(row["volume_shares"])
+            for row in trading_rows
+            if start <= str(row["time"])[-8:-3] < end
+        )
 
     periods = {
-        key: sum(int(row["volume_shares"]) for row, assigned_period in assigned_rows if assigned_period == key)
-        for key in period_ranges
+        "open_30min": period_volume("09:30", "10:00"),
+        "mid_am": period_volume("10:00", "11:30"),
+        "mid_pm": period_volume("13:00", "14:30"),
+        "close_30min": period_volume("14:30", "15:01"),
     }
     distribution = {
         key: {"volume_shares": volume, "percent": round(volume / total_volume * 100, 4)}
@@ -247,7 +229,7 @@ def analyze_minute_volume(minute_data: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "bar_count": len(trading_rows),
         "total_volume_shares": total_volume,
-        "total_amount_cny": round(total_amount, 4),
+        "total_amount_cny": round(sum(float(row["amount_cny"]) for row in trading_rows), 4),
         "distribution": distribution,
         "highest_volume_bars": [
             {

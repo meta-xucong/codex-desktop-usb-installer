@@ -98,15 +98,15 @@ for row_idx, row_data in enumerate(data, start=1):
 ## Table Styling
 
 ```python
-from pptx.dml.color import RGBColor
+from pptx.dml.color import RgbColor
 from pptx.enum.text import PP_ALIGN
 
 # Style header row
 for cell in table.rows[0].cells:
     cell.fill.solid()
-    cell.fill.fore_color.rgb = RGBColor(0x1F, 0x77, 0xB4)
+    cell.fill.fore_color.rgb = RgbColor(0x1F, 0x77, 0xB4)
     para = cell.text_frame.paragraphs[0]
-    para.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+    para.font.color.rgb = RgbColor(0xFF, 0xFF, 0xFF)
     para.alignment = PP_ALIGN.CENTER
 
 # Alternate row colors
@@ -114,7 +114,7 @@ for i, row in enumerate(table.rows[1:], start=1):
     for cell in row.cells:
         if i % 2 == 0:
             cell.fill.solid()
-            cell.fill.fore_color.rgb = RGBColor(0xF0, 0xF0, 0xF0)
+            cell.fill.fore_color.rgb = RgbColor(0xF0, 0xF0, 0xF0)
 ```
 
 ## Chart Types Reference

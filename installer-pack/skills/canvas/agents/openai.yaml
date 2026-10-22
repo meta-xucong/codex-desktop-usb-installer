@@ -1,6 +1,6 @@
 interface:
   display_name: "画布原型"
-  short_description: "先探测 Canvas 后端；可用时创建画布，不可用时生成安全 HTML 原型。"
-  default_prompt: "Use $canvas: first probe whether a Canvas backend is connected and permitted. If it is, create the requested canvas. If it is unavailable or permission is denied, explain that no external canvas was created and provide a safe local HTML prototype instead. Never claim an external action that did not happen."
+  short_description: "输出 HTML 原型说明；当前没有兼容的自动画布运行时。"
+  default_prompt: "Use $canvas to draft a safe HTML prototype and explain the unavailable canvas runtime."
 policy:
   allow_implicit_invocation: false

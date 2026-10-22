@@ -272,6 +272,10 @@ function Invoke-WizardInstall([switch]$SkipConnections) {
     if (@($selectedServices | Where-Object { [string]$_.id -eq 'media-generation' }).Count -gt 0) {
         $mediaModelFieldIds = @('media-generation.image2-model','media-generation.grok-image-model','media-generation.grok-video-model','media-generation.seedance-model','media-generation.minimax-video-model')
         $configuredMediaModelIds = @($mediaModelFieldIds | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$values[$_]) })
+        if ($configuredMediaModelIds.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show($script:Form, '统一媒体 MCP 至少需要填写一个服务方实际支持的模型名。', '请补全媒体配置', 'OK', 'Warning') | Out-Null
+            return
+        }
         $mediaModelsNeedingAgent = @('media-generation.seedance-model')
         $selectedModelsNeedingAgent = @($mediaModelsNeedingAgent | Where-Object { $_ -in $configuredMediaModelIds })
         if ($selectedModelsNeedingAgent.Count -gt 0 -and [string]::IsNullOrWhiteSpace([string]$values['media-generation.agent-id'])) {
@@ -407,7 +411,7 @@ foreach ($service in $serviceSpecs.ToArray()) {
     $serviceStatus.Width = 800
     $serviceStatus.Height = 24
     if ([string]$service.id -eq 'media-generation') {
-        $serviceStatus.Text = '媒体模型从当前上游目录自动匹配；设备 Key 从签名 U 盘授权自动读取。'
+        $serviceStatus.Text = '默认启用 Image-2；设备 Key 从签名 U 盘授权自动读取。'
         $serviceStatus.ForeColor = [System.Drawing.Color]::DarkGreen
     } elseif ($check.Checked) {
         $serviceStatus.Text = '默认启用；取消勾选即可跳过。'

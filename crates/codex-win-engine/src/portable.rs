@@ -2889,6 +2889,90 @@ fn remove_path_with_retry(operation: &str, path: &Path) -> io::Result<bool> {
     Ok(true)
 }
 
+fn sharing_violation_retry<F, R, S>(
+    mut action: F,
+    mut recover_install_processes: R,
+    mut sleep: S,
+) -> io::Result<()>
+where
+    F: FnMut() -> io::Result<()>,
+    R: FnMut() -> io::Result<()>,
+    S: FnMut(Duration),
+{
+    let mut recovered_processes = false;
+    for attempt in 0..=WINDOWS_FS_RETRY_DELAYS_MS.len() {
+        match action() {
+            Ok(()) => return Ok(()),
+            Err(error) if is_transient_windows_fs_error(&error) => {
+                // Only ERROR_SHARING_VIOLATION (32) triggers process recovery.
+                // Access denied (5) and lock violation (33) retain the former
+                // bounded backoff behavior without closing Codex processes.
+                if error.raw_os_error() == Some(32) && !recovered_processes {
+                    recover_install_processes().map_err(|recovery_error| {
+                        io::Error::new(
+                            io::ErrorKind::Other,
+                            format!("sharing-violation recovery failed: {recovery_error}"),
+                        )
+                    })?;
+                    recovered_processes = true;
+                }
+                let Some(delay_ms) = WINDOWS_FS_RETRY_DELAYS_MS.get(attempt).copied() else {
+                    return Err(error);
+                };
+                log::warn!(
+                    "portable uninstall transient filesystem error attempt={} retry_budget={} raw_os_error={:?} retrying_in_ms={delay_ms}",
+                    attempt + 1,
+                    WINDOWS_FS_RETRY_DELAYS_MS.len(),
+                    error.raw_os_error()
+                );
+                sleep(Duration::from_millis(delay_ms));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("bounded sharing-violation retry loop always returns")
+}
+
+fn remove_install_path_with_process_recovery(path: &Path) -> io::Result<bool> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let remove = || {
+        let result = if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            fs::remove_file(path)
+        } else {
+            fs::remove_dir_all(path)
+        };
+        match result {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        }
+    };
+    sharing_violation_retry(
+        remove,
+        || {
+            let running = crate::windows_process::processes_running_for_root(path)
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+            if running {
+                crate::windows_process::close_processes_for_root(2, path)
+                    .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+            }
+            Ok(())
+        },
+        thread::sleep,
+    )?;
+    match fs::symlink_metadata(path) {
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("path still exists after removal: {}", path.display()),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
 fn rename_portable_dir(operation: &str, from: &Path, to: &Path) -> Result<(), EngineError> {
     rename_directory_with_retry(operation, from, to).map_err(|err| io_err(operation, err))
 }
@@ -4942,7 +5026,7 @@ pub fn uninstall_portable(
     log::info!("portable uninstall start path={path}");
     close_codex_gracefully_for_root(30, install_root)?;
 
-    let removed_files = remove_path_with_retry("remove portable install", install_root)
+    let removed_files = remove_install_path_with_process_recovery(install_root)
         .map_err(|e| io_err("remove portable install", e))?;
 
     let mut meta = cleanup_portable_metadata(purge_user_data)?;
@@ -6834,6 +6918,111 @@ mod tests {
         assert_eq!(err.raw_os_error(), Some(5));
         assert_eq!(attempts.get(), WINDOWS_FS_RETRY_DELAYS_MS.len() + 1);
         assert_eq!(sleeps.get(), WINDOWS_FS_RETRY_DELAYS_MS.len());
+    }
+
+    #[test]
+    fn uninstall_sharing_violation_recovers_after_install_root_process_close() {
+        let released = Cell::new(false);
+        let recoveries = Cell::new(0usize);
+        let attempts = Cell::new(0usize);
+        let sleeps = Cell::new(0usize);
+        sharing_violation_retry(
+            || {
+                attempts.set(attempts.get() + 1);
+                if released.get() {
+                    Ok(())
+                } else {
+                    Err(io::Error::from_raw_os_error(32))
+                }
+            },
+            || {
+                recoveries.set(recoveries.get() + 1);
+                released.set(true);
+                Ok(())
+            },
+            |_| sleeps.set(sleeps.get() + 1),
+        )
+        .expect("retry after root-scoped Codex close should complete");
+        assert_eq!(recoveries.get(), 1);
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(sleeps.get(), 1);
+    }
+
+    #[test]
+    fn uninstall_sharing_violation_has_a_finite_budget_and_surfaces_failure() {
+        let recoveries = Cell::new(0usize);
+        let attempts = Cell::new(0usize);
+        let sleeps = Cell::new(0usize);
+        let error = sharing_violation_retry(
+            || {
+                attempts.set(attempts.get() + 1);
+                Err(io::Error::from_raw_os_error(32))
+            },
+            || {
+                recoveries.set(recoveries.get() + 1);
+                Ok(())
+            },
+            |_| sleeps.set(sleeps.get() + 1),
+        )
+        .expect_err("exhausted lock retries must be reported");
+        assert_eq!(error.raw_os_error(), Some(32));
+        assert_eq!(recoveries.get(), 1);
+        assert_eq!(attempts.get(), WINDOWS_FS_RETRY_DELAYS_MS.len() + 1);
+        assert_eq!(sleeps.get(), WINDOWS_FS_RETRY_DELAYS_MS.len());
+    }
+
+    #[test]
+    fn uninstall_access_and_lock_errors_retry_without_process_recovery() {
+        for code in [5, 33] {
+            let attempts = Cell::new(0usize);
+            let recoveries = Cell::new(0usize);
+            let sleeps = Cell::new(0usize);
+            sharing_violation_retry(
+                || {
+                    let attempt = attempts.get() + 1;
+                    attempts.set(attempt);
+                    if attempt == 1 {
+                        Err(io::Error::from_raw_os_error(code))
+                    } else {
+                        Ok(())
+                    }
+                },
+                || {
+                    recoveries.set(recoveries.get() + 1);
+                    Ok(())
+                },
+                |_| sleeps.set(sleeps.get() + 1),
+            )
+            .expect("transient access/lock error should retry once");
+            assert_eq!(attempts.get(), 2, "raw error {code}");
+            assert_eq!(sleeps.get(), 1, "raw error {code}");
+            assert_eq!(recoveries.get(), 0, "raw error {code}");
+        }
+    }
+
+    #[test]
+    fn uninstall_access_and_lock_errors_have_a_finite_budget() {
+        for code in [5, 33] {
+            let attempts = Cell::new(0usize);
+            let recoveries = Cell::new(0usize);
+            let sleeps = Cell::new(0usize);
+            let error = sharing_violation_retry(
+                || {
+                    attempts.set(attempts.get() + 1);
+                    Err(io::Error::from_raw_os_error(code))
+                },
+                || {
+                    recoveries.set(recoveries.get() + 1);
+                    Ok(())
+                },
+                |_| sleeps.set(sleeps.get() + 1),
+            )
+            .expect_err("retry exhaustion must surface the OS error");
+            assert_eq!(error.raw_os_error(), Some(code));
+            assert_eq!(attempts.get(), WINDOWS_FS_RETRY_DELAYS_MS.len() + 1);
+            assert_eq!(sleeps.get(), WINDOWS_FS_RETRY_DELAYS_MS.len());
+            assert_eq!(recoveries.get(), 0, "raw error {code}");
+        }
     }
 
     /// When the AppX data container cannot be enumerated, purge fails — this

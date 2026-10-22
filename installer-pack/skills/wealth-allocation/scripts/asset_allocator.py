@@ -10,7 +10,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -19,25 +18,6 @@ from typing import Dict
 
 MAX_TEMPLATE_BYTES = 1024 * 1024
 BUCKETS = ("survival", "growth", "aggressive")
-
-
-def _reject_output_overwrite(output_path: str | Path, input_path: str | Path) -> None:
-    """Prevent the allocation report from replacing its reviewed policy template."""
-    try:
-        resolved_output = Path(output_path).expanduser().resolve()
-        resolved_input = Path(input_path).expanduser().resolve()
-    except (OSError, RuntimeError) as exc:
-        raise ValueError(f"cannot verify output/input paths safely: {exc}") from exc
-    if resolved_output == resolved_input:
-        raise ValueError("输出路径不能覆盖策略模板输入文件。")
-    try:
-        if os.path.samefile(resolved_output, resolved_input):
-            raise ValueError("输出路径不能覆盖策略模板输入文件。")
-    except FileNotFoundError:
-        # A new output file has no identity yet; direct aliases were checked.
-        pass
-    except OSError as exc:
-        raise ValueError(f"cannot verify output/input file identity safely: {exc}") from exc
 
 
 def _number(data: Dict, key: str, minimum=None, maximum=None) -> float:
@@ -89,18 +69,6 @@ def validate_policy_template(template: Dict) -> Dict:
     }
 
 
-def _ensure_finite_numbers(value, path: str = "plan") -> None:
-    """Reject non-finite derived amounts before serialization."""
-    if isinstance(value, float) and not math.isfinite(value):
-        raise ValueError(f"{path} 计算结果超出有限数值范围。")
-    if isinstance(value, dict):
-        for key, item in value.items():
-            _ensure_finite_numbers(item, f"{path}.{key}")
-    elif isinstance(value, (list, tuple)):
-        for index, item in enumerate(value):
-            _ensure_finite_numbers(item, f"{path}[{index}]")
-
-
 def generate_allocation_plan(
     total_amount: float,
     monthly_expense: float,
@@ -110,7 +78,7 @@ def generate_allocation_plan(
     """Convert explicit policy percentages to amounts and expose every assumption."""
     template = validate_policy_template(template)
     for name, value in (("total_amount", total_amount), ("monthly_expense", monthly_expense), ("period_years", period_years)):
-        if isinstance(value, bool) or not math.isfinite(value) or value <= 0:
+        if not math.isfinite(value) or value <= 0:
             raise ValueError(f"{name} 必须是正数。")
 
     allocations = {
@@ -122,7 +90,7 @@ def generate_allocation_plan(
     }
     emergency_target = monthly_expense * template["emergency_months"]
     survival_amount = allocations["survival"]["amount"]
-    plan = {
+    return {
         "generated_at": datetime.now().isoformat(),
         "policy_as_of": template["as_of"],
         "sources": template["sources"],
@@ -143,8 +111,6 @@ def generate_allocation_plan(
         "rebalance_threshold": template["rebalance_threshold"],
         "methodology": "所有比例、收益/回撤场景、应急月数和再平衡阈值均来自显式模板；脚本只换算金额。",
     }
-    _ensure_finite_numbers(plan)
-    return plan
 
 
 def format_report(plan: Dict) -> str:
@@ -190,15 +156,13 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        if args.output:
-            _reject_output_overwrite(args.output, args.template)
         template_path = Path(args.template).expanduser().resolve()
         if not template_path.is_file() or template_path.stat().st_size > MAX_TEMPLATE_BYTES:
             raise ValueError("策略模板不存在或超过 1 MiB。")
         template = json.loads(template_path.read_text(encoding="utf-8"))
         plan = generate_allocation_plan(args.amount, args.monthly_expense, args.period_years, template)
         if args.json or args.output:
-            output = json.dumps(plan, ensure_ascii=False, indent=2, allow_nan=False)
+            output = json.dumps(plan, ensure_ascii=False, indent=2)
             if args.output:
                 output_path = Path(args.output).expanduser().resolve()
                 output_path.write_text(output, encoding="utf-8")
@@ -208,7 +172,7 @@ def main() -> int:
         else:
             print(format_report(plan))
         return 0
-    except (OSError, ValueError, ZeroDivisionError, OverflowError, json.JSONDecodeError) as error:
+    except (OSError, ValueError, json.JSONDecodeError) as error:
         if args.json:
             print(json.dumps({"error": str(error)}, ensure_ascii=False))
         else:

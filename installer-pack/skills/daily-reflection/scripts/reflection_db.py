@@ -5,12 +5,9 @@ Daily Reflection Database Manager
 Manages user reflection profiles, daily reflections, habit tracking, and goals.
 """
 
-import copy
 import json
 import os
 import re
-import tempfile
-import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional, Tuple
@@ -73,103 +70,21 @@ def ensure_db_files() -> None:
         WELLNESS_FILE.write_text(json.dumps(default_wellness, indent=2))
 
 
-def load_json(file_path: Path, ensure: bool = True) -> Dict[str, Any]:
+def load_json(file_path: Path) -> Dict[str, Any]:
     """Load JSON from file."""
-    if ensure:
-        ensure_db_files()
+    ensure_db_files()
     try:
         with open(file_path, 'r') as f:
             return json.load(f)
-    except json.JSONDecodeError as exc:
-        raise ValueError(
-            f"Daily reflection data file '{file_path.name}' contains invalid JSON; refusing to continue."
-        ) from exc
-    except FileNotFoundError:
+    except (json.JSONDecodeError, FileNotFoundError):
         return {}
 
 
 def save_json(file_path: Path, data: Dict[str, Any]) -> None:
-    """Atomically save JSON without truncating the current copy on failure."""
+    """Save JSON to file."""
     ensure_db_files()
-    serialized = json.dumps(data, indent=2)
-    temporary_path = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", dir=file_path.parent,
-            prefix=f".{file_path.name}.", suffix=".tmp", delete=False,
-        ) as handle:
-            temporary_path = Path(handle.name)
-            handle.write(serialized)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary_path, file_path)
-    finally:
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
-
-
-def _save_json_pair(
-    first_path: Path,
-    first_data: Dict[str, Any],
-    second_path: Path,
-    second_data: Dict[str, Any],
-) -> None:
-    """Stage two JSON files and restore the first if the second replace fails."""
-    first_content = json.dumps(first_data, indent=2)
-    second_content = json.dumps(second_data, indent=2)
-    first_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        original_first = first_path.read_bytes()
-    except FileNotFoundError:
-        original_first = None
-    first_temp = second_temp = rollback_temp = None
-    first_replaced = False
-    try:
-        for path, content in ((first_path, first_content), (second_path, second_content)):
-            with tempfile.NamedTemporaryFile(
-                mode="w", encoding="utf-8", dir=path.parent,
-                prefix=f".{path.name}.", suffix=".tmp", delete=False,
-            ) as handle:
-                staged = Path(handle.name)
-                if path == first_path:
-                    first_temp = staged
-                else:
-                    second_temp = staged
-                handle.write(content)
-                handle.flush()
-                os.fsync(handle.fileno())
-
-        os.replace(first_temp, first_path)
-        first_temp = None
-        first_replaced = True
-        os.replace(second_temp, second_path)
-        second_temp = None
-    except Exception as exc:
-        if first_replaced:
-            try:
-                with tempfile.NamedTemporaryFile(
-                    mode="wb", dir=first_path.parent,
-                    prefix=f".{first_path.name}.", suffix=".rollback.tmp", delete=False,
-                ) as handle:
-                    rollback_temp = Path(handle.name)
-                    if original_first is not None:
-                        handle.write(original_first)
-                        handle.flush()
-                        os.fsync(handle.fileno())
-                if original_first is None:
-                    first_path.unlink(missing_ok=True)
-                else:
-                    os.replace(rollback_temp, first_path)
-                    rollback_temp = None
-            except Exception as rollback_exc:
-                raise RuntimeError(
-                    f"Could not commit both data files and rollback '{first_path.name}': {rollback_exc}"
-                ) from exc
-        raise
-    finally:
-        for temporary_path in (first_temp, second_temp, rollback_temp):
-            if temporary_path is not None:
-                temporary_path.unlink(missing_ok=True)
+    with open(file_path, 'w') as f:
+        json.dump(data, f, indent=2)
 
 
 # ============================================================================
@@ -202,33 +117,9 @@ def save_profile(profile: Dict[str, Any]) -> None:
 
 def log_reflection(reflection: Dict[str, Any]) -> str:
     """Log a daily reflection."""
-    reflections = load_json(REFLECTIONS_FILE, ensure=False)
-    includes_habits = "habits" in reflection
-    habits = load_json(HABITS_FILE, ensure=False) if includes_habits else None
-    if not isinstance(reflections.get("reflections", []), list):
-        raise ValueError("Daily reflection data field 'reflections' must be a list.")
-    if any(not isinstance(item, dict) for item in reflections.get("reflections", [])):
-        raise ValueError("Each stored reflection must be an object.")
-    if includes_habits:
-        habits.setdefault("habits", [])
-        habits.setdefault("habit_logs", [])
-        if not isinstance(habits.get("habits", []), list):
-            raise ValueError("Daily reflection data field 'habits' must be a list.")
-        if not isinstance(habits.get("habit_logs", []), list):
-            raise ValueError("Daily reflection data field 'habit_logs' must be a list.")
-        if any(not isinstance(item, dict) for item in habits.get("habit_logs", [])):
-            raise ValueError("Each stored habit log must be an object.")
-        if not isinstance(reflection["habits"], list):
-            raise ValueError("Reflection field 'habits' must be a list.")
-        for index, habit in enumerate(reflection["habits"]):
-            if not isinstance(habit, dict) or not habit.get("habit_id"):
-                raise ValueError(f"Reflection habit {index} must be an object with a habit_id.")
-            if type(habit.get("completed", False)) is not bool:
-                raise ValueError(f"Reflection habit {index} completed must be a bool.")
-
-    caller_reflection = reflection
-    reflection = copy.deepcopy(reflection)
-    reflection_id = uuid.uuid4().hex
+    reflections = load_json(REFLECTIONS_FILE)
+    
+    reflection_id = str(int(datetime.now().timestamp()))
     reflection["reflection_id"] = reflection_id
     reflection["logged_at"] = datetime.now().isoformat()
     
@@ -245,41 +136,22 @@ def log_reflection(reflection: Dict[str, Any]) -> str:
     
     if existing_idx is not None:
         # Update existing
-        reflection_id = reflections["reflections"][existing_idx].get("reflection_id", reflection_id)
-        reflection["reflection_id"] = reflection_id
         reflections["reflections"][existing_idx] = reflection
     else:
         # Add new
         reflections["reflections"].append(reflection)
     
-    if includes_habits:
-        _parse_canonical_habit_date(date, "date")
+    save_json(REFLECTIONS_FILE, reflections)
+    
+    # Also update habit logs if habits are included
+    if "habits" in reflection:
         for habit in reflection["habits"]:
-            log_entry = {
-                "log_id": uuid.uuid4().hex,
-                "habit_id": habit["habit_id"],
-                "date": date,
-                "completed": habit.get("completed", False),
-                "note": habit.get("note", ""),
-                "logged_at": datetime.now().isoformat(),
-            }
-            existing_idx = next((
-                i for i, item in enumerate(habits["habit_logs"])
-                if item.get("habit_id") == log_entry["habit_id"] and item.get("date") == date
-            ), None)
-            if existing_idx is None:
-                habits["habit_logs"].append(log_entry)
-            else:
-                log_entry["log_id"] = habits["habit_logs"][existing_idx].get("log_id", log_entry["log_id"])
-                habits["habit_logs"][existing_idx] = log_entry
-        _save_json_pair(HABITS_FILE, habits, REFLECTIONS_FILE, reflections)
-        # Preserve the established input mutation behavior only after a successful save.
-        caller_reflection.clear()
-        caller_reflection.update(copy.deepcopy(reflection))
-    else:
-        save_json(REFLECTIONS_FILE, reflections)
-        caller_reflection.clear()
-        caller_reflection.update(copy.deepcopy(reflection))
+            log_habit(
+                habit_id=habit.get("habit_id"),
+                date=date,
+                completed=habit.get("completed", False),
+                note=habit.get("note", "")
+            )
     
     return reflection_id
 
@@ -326,7 +198,7 @@ def add_habit(habit: Dict[str, Any]) -> str:
     """Add a new habit to track."""
     habits = load_json(HABITS_FILE)
     
-    habit_id = uuid.uuid4().hex
+    habit_id = f"h{int(datetime.now().timestamp())}"
     habit["habit_id"] = habit_id
     habit["created_at"] = datetime.now().isoformat()
     
@@ -346,13 +218,10 @@ def get_habits() -> List[Dict[str, Any]]:
 
 def log_habit(habit_id: str, date: str, completed: bool, note: str = "") -> str:
     """Log a habit completion."""
-    if type(completed) is not bool:
-        raise ValueError("completed must be a bool.")
-    _parse_canonical_habit_date(date, "date")
     habits = load_json(HABITS_FILE)
     
     log_entry = {
-        "log_id": uuid.uuid4().hex,
+        "log_id": str(int(datetime.now().timestamp())),
         "habit_id": habit_id,
         "date": date,
         "completed": completed,
@@ -371,7 +240,6 @@ def log_habit(habit_id: str, date: str, completed: bool, note: str = "") -> str:
             break
     
     if existing_idx is not None:
-        log_entry["log_id"] = habits["habit_logs"][existing_idx].get("log_id", log_entry["log_id"])
         habits["habit_logs"][existing_idx] = log_entry
     else:
         habits["habit_logs"].append(log_entry)
@@ -380,106 +248,40 @@ def log_habit(habit_id: str, date: str, completed: bool, note: str = "") -> str:
     return log_entry["log_id"]
 
 
-def _parse_canonical_habit_date(value: str, label: str) -> datetime:
-    if not isinstance(value, str):
-        raise ValueError(f"{label} must use YYYY-MM-DD format.")
-    try:
-        parsed = datetime.strptime(value, "%Y-%m-%d")
-    except ValueError as exc:
-        raise ValueError(f"{label} must use YYYY-MM-DD format.") from exc
-    if parsed.strftime("%Y-%m-%d") != value:
-        raise ValueError(f"{label} must use zero-padded YYYY-MM-DD format.")
-    return parsed
-
-
-def get_habit_logs(
-    habit_id: str = None,
-    days: int = 30,
-    start_date: str = None,
-    end_date: str = None,
-) -> List[Dict[str, Any]]:
+def get_habit_logs(habit_id: str = None, days: int = 30) -> List[Dict[str, Any]]:
     """Get habit logs, optionally filtered by habit and date range."""
     habits = load_json(HABITS_FILE)
     all_logs = habits.get("habit_logs", [])
     
     if habit_id:
         all_logs = [l for l in all_logs if l.get("habit_id") == habit_id]
-
-    for index, log in enumerate(all_logs):
-        if not isinstance(log, dict):
-            raise ValueError(f"Habit log {index} must be an object.")
-        _parse_canonical_habit_date(log.get("date"), f"habit log {index} date")
-
-    # Explicit bounds make historical reports independent of today's date.
-    if start_date is not None:
-        _parse_canonical_habit_date(start_date, "start_date")
-    if end_date is not None:
-        _parse_canonical_habit_date(end_date, "end_date")
-    if start_date is not None and end_date is not None and start_date > end_date:
-        raise ValueError("start_date must not be after end_date.")
-    if start_date is None and end_date is None:
-        cutoff_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-        all_logs = [l for l in all_logs if l.get("date", "") >= cutoff_date]
-    else:
-        if start_date is not None:
-            all_logs = [l for l in all_logs if l.get("date", "") >= start_date]
-        if end_date is not None:
-            all_logs = [l for l in all_logs if l.get("date", "") <= end_date]
+    
+    # Filter by date range
+    cutoff_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    all_logs = [l for l in all_logs if l.get("date", "") >= cutoff_date]
     
     # Sort by date
     all_logs.sort(key=lambda x: x.get("date", ""))
     return all_logs
 
 
-def get_habit_stats(
-    habit_id: str,
-    days: int = 30,
-    start_date: str = None,
-    end_date: str = None,
-) -> Dict[str, Any]:
+def get_habit_stats(habit_id: str, days: int = 30) -> Dict[str, Any]:
     """Get statistics for a specific habit."""
-    if (start_date is None) != (end_date is None):
-        raise ValueError("start_date and end_date must be provided together.")
-    logs = get_habit_logs(habit_id, days, start_date, end_date)
-    period_days = days
-    if start_date is not None:
-        period_days = (datetime.strptime(end_date, "%Y-%m-%d") - datetime.strptime(start_date, "%Y-%m-%d")).days + 1
+    logs = get_habit_logs(habit_id, days)
     habit = None
     
     for h in get_habits():
         if h.get("habit_id") == habit_id:
             habit = h
             break
-
-    # Current streak is measured as of the report endpoint for an explicit range.
-    streak_logs = logs
-    reference_date = datetime.now().date()
-    if end_date is not None:
-        streak_logs = get_habit_logs(habit_id, start_date=None, end_date=end_date)
-        reference_date = datetime.strptime(end_date, "%Y-%m-%d").date()
-    streak_dates = sorted(
-        [l.get("date") for l in streak_logs if l.get("completed")], reverse=True
-    )
-    current_streak = 0
-    if streak_dates:
-        today = reference_date.strftime("%Y-%m-%d")
-        yesterday = (reference_date - timedelta(days=1)).strftime("%Y-%m-%d")
-        if streak_dates[0] in [today, yesterday]:
-            current_streak = 1
-            for i in range(1, len(streak_dates)):
-                expected_date = (datetime.strptime(streak_dates[i-1], "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
-                if streak_dates[i] == expected_date:
-                    current_streak += 1
-                else:
-                    break
     
     if not logs:
         return {
             "habit_id": habit_id,
             "habit_name": habit.get("name", "Unknown") if habit else "Unknown",
-            "period_days": period_days,
+            "period_days": days,
             "completion_rate": 0,
-            "current_streak": current_streak,
+            "current_streak": 0,
             "longest_streak": 0,
             "total_completions": 0
         }
@@ -488,11 +290,26 @@ def get_habit_stats(
     completed_count = sum(1 for l in logs if l.get("completed"))
     completion_rate = completed_count / len(logs) * 100 if logs else 0
     
+    # Calculate streaks
     dates = sorted([l.get("date") for l in logs if l.get("completed")], reverse=True)
+    current_streak = 0
     longest_streak = 0
-
+    
     if dates:
-        # Longest streak is scoped to the requested reporting period.
+        # Current streak
+        today = datetime.now().strftime("%Y-%m-%d")
+        yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        
+        if dates[0] in [today, yesterday]:
+            current_streak = 1
+            for i in range(1, len(dates)):
+                expected_date = (datetime.strptime(dates[i-1], "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+                if dates[i] == expected_date:
+                    current_streak += 1
+                else:
+                    break
+        
+        # Longest streak
         temp_streak = 1
         for i in range(1, len(dates)):
             prev_date = datetime.strptime(dates[i-1], "%Y-%m-%d")
@@ -507,7 +324,7 @@ def get_habit_stats(
     return {
         "habit_id": habit_id,
         "habit_name": habit.get("name", "Unknown") if habit else "Unknown",
-        "period_days": period_days,
+        "period_days": days,
         "completion_rate": round(completion_rate, 1),
         "current_streak": current_streak,
         "longest_streak": longest_streak,
@@ -516,18 +333,14 @@ def get_habit_stats(
     }
 
 
-def get_all_habits_status(
-    days: int = 7,
-    start_date: str = None,
-    end_date: str = None,
-) -> List[Dict[str, Any]]:
+def get_all_habits_status(days: int = 7) -> List[Dict[str, Any]]:
     """Get status for all habits."""
     habits = get_habits()
     result = []
     
     for habit in habits:
         habit_id = habit.get("habit_id")
-        stats = get_habit_stats(habit_id, days, start_date, end_date)
+        stats = get_habit_stats(habit_id, days)
         result.append({**habit, **stats})
     
     return result
@@ -541,7 +354,7 @@ def add_goal(goal: Dict[str, Any]) -> str:
     """Add a new goal."""
     goals = load_json(GOALS_FILE)
     
-    goal_id = uuid.uuid4().hex
+    goal_id = f"g{int(datetime.now().timestamp())}"
     goal["goal_id"] = goal_id
     goal["created_at"] = datetime.now().isoformat()
     goal["status"] = goal.get("status", "active")
@@ -608,9 +421,7 @@ def generate_weekly_review(week_start: str = None) -> Dict[str, Any]:
         monday = today - timedelta(days=today.weekday())
         week_start = monday.strftime("%Y-%m-%d")
     
-    week_start_date = _parse_canonical_habit_date(week_start, "week_start")
-    week_start = week_start_date.strftime("%Y-%m-%d")
-    week_end = (week_start_date + timedelta(days=6)).strftime("%Y-%m-%d")
+    week_end = (datetime.strptime(week_start, "%Y-%m-%d") + timedelta(days=6)).strftime("%Y-%m-%d")
     
     # Get reflections for the week
     reflections = get_reflections(week_start, week_end)
@@ -629,9 +440,7 @@ def generate_weekly_review(week_start: str = None) -> Dict[str, Any]:
     avg_energy = sum(energy_levels) / len(energy_levels) if energy_levels else 0
     
     # Get habit stats for the week
-    habits_status = get_all_habits_status(
-        days=7, start_date=week_start, end_date=week_end
-    )
+    habits_status = get_all_habits_status(days=7)
     
     # Get goal progress updates
     goals = get_goals("active")
@@ -792,7 +601,7 @@ def add_reading_plan(plan: Dict[str, Any]) -> str:
     """Add a new reading plan."""
     reading = load_json(READING_FILE)
     
-    plan_id = uuid.uuid4().hex
+    plan_id = f"rp{int(datetime.now().timestamp())}"
     plan["plan_id"] = plan_id
     plan["created_at"] = datetime.now().isoformat()
     
@@ -814,7 +623,7 @@ def log_reading_progress(progress: Dict[str, Any]) -> str:
     """Log reading progress for a book."""
     reading = load_json(READING_FILE)
     
-    log_id = uuid.uuid4().hex
+    log_id = str(int(datetime.now().timestamp()))
     progress["log_id"] = log_id
     progress["logged_at"] = datetime.now().isoformat()
     
@@ -877,7 +686,7 @@ def log_mental_wellness(entry: Dict[str, Any]) -> str:
     """Log a mental wellness entry."""
     wellness = load_json(WELLNESS_FILE)
     
-    entry_id = uuid.uuid4().hex
+    entry_id = str(int(datetime.now().timestamp()))
     entry["entry_id"] = entry_id
     entry["logged_at"] = datetime.now().isoformat()
     
@@ -970,11 +779,7 @@ if __name__ == "__main__":
             print("No reflection logged for today yet.")
     elif command == "weekly":
         week_start = sys.argv[2] if len(sys.argv) > 2 else None
-        try:
-            print(json.dumps(generate_weekly_review(week_start), indent=2))
-        except ValueError as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            sys.exit(2)
+        print(json.dumps(generate_weekly_review(week_start), indent=2))
     elif command == "monthly":
         if len(sys.argv) > 2:
             year, month = map(int, sys.argv[2].split("-"))

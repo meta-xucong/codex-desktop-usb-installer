@@ -15,57 +15,7 @@ function Ensure-Config {
     }
 }
 function Read-Config { Ensure-Config; return Get-Content -LiteralPath $configFile -Raw -Encoding UTF8 | ConvertFrom-Json }
-function Write-Config($Value) {
-    $json = $Value | ConvertTo-Json -Depth 12
-    $directory = Split-Path -Parent $configFile
-    $stageFile = $null
-    $stageOwned = $false
-    $backupFile = $null
-    $stream = $null
-    try {
-        # Reserve a unique staging file in the destination directory. CreateNew
-        # prevents this invocation from claiming or truncating someone else's file.
-        while (-not $stageOwned) {
-            $stageFile = Join-Path $directory (".config.{0}.tmp" -f [Guid]::NewGuid().ToString('N'))
-            try {
-                $stream = [System.IO.File]::Open(
-                    $stageFile,
-                    [System.IO.FileMode]::CreateNew,
-                    [System.IO.FileAccess]::Write,
-                    [System.IO.FileShare]::None
-                )
-                $stageOwned = $true
-            } catch [System.IO.IOException] {
-                if (Test-Path -LiteralPath $stageFile) { continue }
-                throw
-            }
-        }
-        $stream.Dispose()
-        $stream = $null
-
-        # Any failure here affects only the owned staging file, never config.json.
-        $json | Set-Content -LiteralPath $stageFile -Encoding UTF8
-
-        if (Test-Path -LiteralPath $configFile -PathType Leaf) {
-            $backupFile = Join-Path $directory (".config.{0}.bak" -f [Guid]::NewGuid().ToString('N'))
-            [System.IO.File]::Replace($stageFile, $configFile, $backupFile)
-        } else {
-            [System.IO.File]::Move($stageFile, $configFile)
-        }
-        $stageOwned = $false
-        if ($backupFile -and (Test-Path -LiteralPath $backupFile)) {
-            [System.IO.File]::Delete($backupFile)
-        }
-    } finally {
-        if ($null -ne $stream) { $stream.Dispose() }
-        if ($stageOwned -and $stageFile -and (Test-Path -LiteralPath $stageFile)) {
-            [System.IO.File]::Delete($stageFile)
-        }
-        if ($backupFile -and (Test-Path -LiteralPath $backupFile)) {
-            [System.IO.File]::Delete($backupFile)
-        }
-    }
-}
+function Write-Config($Value) { $Value | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $configFile -Encoding UTF8 }
 $config = Read-Config
 switch ($Command) {
     'has_city' { if ($config.initialized -and $config.default_city) { 'true' } else { 'false' } }

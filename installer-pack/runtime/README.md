@@ -13,7 +13,7 @@
 
 ## 联网初始化组件
 
-HyperFrames CLI 固定为 `hyperframes@0.8.174`，通过随包 Node/npm 安装。若本机没有兼容 Chrome，`hyperframes browser ensure` 会联网准备浏览器。网络断开时，其 CLI/浏览器健康状态写成 `requires-network`，不会阻断本地 Manim、FFmpeg、Python 或 Codex 的其余安装。恢复网络后可以运行 `hyperframes.cmd browser ensure` 重试。
+HyperFrames CLI 固定为 `hyperframes@0.8.134`，通过随包 Node/npm 安装。若本机没有兼容 Chrome，`hyperframes browser ensure` 会联网准备浏览器。网络断开时，其 CLI/浏览器健康状态写成 `requires-network`，不会阻断本地 Manim、FFmpeg、Python 或 Codex 的其余安装。恢复网络后可以运行 `hyperframes.cmd browser ensure` 重试。
 
 ## 可选组件和账号
 

@@ -15,7 +15,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,27 +24,6 @@ from typing import Any
 MAX_DATA_BYTES = 10 * 1024 * 1024
 MAX_ASSUMPTION_BYTES = 1024 * 1024
 METHODS = {"dcf", "ddm", "relative"}
-
-
-def _reject_output_overwrite(output_path: str | Path, input_paths: list[str | Path]) -> None:
-    """Prevent an analysis report from replacing either reviewed JSON input."""
-    try:
-        resolved_output = Path(output_path).expanduser().resolve()
-        resolved_inputs = [Path(item).expanduser().resolve() for item in input_paths]
-    except (OSError, RuntimeError) as exc:
-        raise ValueError(f"cannot verify output/input paths safely: {exc}") from exc
-    if resolved_output in resolved_inputs:
-        raise ValueError("输出路径不能覆盖股票数据或估值假设输入文件。")
-    for resolved_input in resolved_inputs:
-        try:
-            if os.path.samefile(resolved_output, resolved_input):
-                raise ValueError("输出路径不能覆盖股票数据或估值假设输入文件。")
-        except FileNotFoundError:
-            # A new output has no identity yet; normalized path equality above
-            # still protects direct aliases.
-            pass
-        except OSError as exc:
-            raise ValueError(f"cannot verify output/input file identity safely: {exc}") from exc
 
 
 def _text(value: Any, field: str) -> str:
@@ -118,8 +96,6 @@ def validate_valuation_assumptions(raw: dict[str, Any], methods: list[str]) -> d
             raise ValueError("dcf.forecast_years 必须是 1–30 的整数。")
         discount_rate = _number(dcf_raw.get("discount_rate"), "dcf.discount_rate")
         terminal_growth = _number(dcf_raw.get("terminal_growth"), "dcf.terminal_growth")
-        if discount_rate <= -100:
-            raise ValueError("dcf.discount_rate 必须大于 -100%。")
         if discount_rate <= terminal_growth:
             raise ValueError("dcf.discount_rate 必须大于 dcf.terminal_growth。")
         total_shares = _number(dcf_raw.get("total_shares"), "dcf.total_shares")
@@ -246,18 +222,6 @@ def relative_valuation(data: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _ensure_finite_numbers(value: Any, path: str = "report") -> None:
-    """Reject non-finite derived values before they reach JSON output."""
-    if isinstance(value, float) and not math.isfinite(value):
-        raise ValueError(f"{path} 计算结果超出有限数值范围。")
-    if isinstance(value, dict):
-        for key, item in value.items():
-            _ensure_finite_numbers(item, f"{path}.{key}")
-    elif isinstance(value, (list, tuple)):
-        for index, item in enumerate(value):
-            _ensure_finite_numbers(item, f"{path}[{index}]")
-
-
 def calculate_valuation(
     data: dict[str, Any],
     assumptions_raw: dict[str, Any],
@@ -289,7 +253,7 @@ def calculate_valuation(
 
     price = data.get("price") if isinstance(data.get("price"), dict) else {}
     current_price = _optional_number(price.get("latest_price"), "price.latest_price")
-    report = {
+    return {
         "code": str(data.get("code") or "").strip(),
         "name": str((data.get("basic_info") or {}).get("name") or "").strip()
         if isinstance(data.get("basic_info"), dict)
@@ -303,8 +267,6 @@ def calculate_valuation(
         "methods": results,
         "methodology": "只执行显式 DCF/DDM 场景算术和相对估值位置描述，不平均不同方法，也不输出高估/低估或交易结论。",
     }
-    _ensure_finite_numbers(report)
-    return report
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -323,13 +285,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        if args.output:
-            _reject_output_overwrite(args.output, [args.input, args.assumptions])
         methods = parse_methods(args.methods)
         data = load_json(args.input, MAX_DATA_BYTES, "股票数据 JSON")
         assumptions = load_json(args.assumptions, MAX_ASSUMPTION_BYTES, "估值假设 JSON")
         report = calculate_valuation(data, assumptions, methods, args.data_as_of, args.data_source)
-        output = json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False)
+        output = json.dumps(report, ensure_ascii=False, indent=2)
         if args.output:
             output_path = Path(args.output).expanduser().resolve()
             output_path.write_text(output + "\n", encoding="utf-8")
@@ -337,7 +297,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(output)
         return 0
-    except (OSError, ValueError, ZeroDivisionError, OverflowError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
         payload = json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
         print(payload if args.json else f"错误: {exc}", file=sys.stdout if args.json else sys.stderr)
         return 1

@@ -7,7 +7,7 @@
 1. 安装/复用 CPython 3.12；
 2. 创建独立 Python 虚拟环境并从本地 wheelhouse 安装完整传递依赖；
 3. 离线部署 Node.js 22、FFmpeg/FFprobe 和 Manim；解压锁定的飞书 MCP npm 依赖；联网时再安装 HyperFrames CLI 并准备 Chrome；
-4. 安装全部 56 个 Skill 和 7 个 Agent；
+4. 安装全部 54 个 Skill 和 7 个 Agent；
 5. 生成 Codex 的托管配置片段，并保留用户原有配置；
 6. 记录运行时、配置和连接健康状态；
 7. 在没有凭据时保持 Feishu/API 能力关闭，而不是伪装成可用。
@@ -68,7 +68,7 @@
         ↓
 离线安装 Manim 0.21 独立环境；检查 HyperFrames CLI/Chrome（npm/浏览器下载需要网络）；解压并验证 Feishu MCP npm closure / CLI
         ↓
-复制 56 Skills、7 Agents、manifest、连接模板
+复制 54 Skills、7 Agents、manifest、连接模板
         ↓
 渲染托管 Codex 配置并合并到用户 config.toml
         ↓
@@ -98,7 +98,7 @@ Python、Manim、Node 和 FFmpeg 的介质哈希/健康检查失败会终止运�
 
 - `manifest/runtime-artifacts.json`：运行时和 MCP 介质的版本、来源、哈希、签名/校验要求；
 - `runtime/bundled/media-manifest.json`：包内实际介质的相对路径、字节数和 SHA-256；
-- `runtime/wheelhouse-manifest.json`：86 个 wheel 的逐文件哈希；
+- `runtime/wheelhouse-manifest.json`：77 个 wheel 的逐文件哈希；
 - `runtime/bundled/python-requirements.lock`：带哈希的离线 pip 安装锁；
 - `installer-pack/checksums.sha256`：最终安装包文件清单。
 
@@ -108,11 +108,11 @@ Python、Manim、Node 和 FFmpeg 的介质哈希/健康检查失败会终止运�
 
 完整验收必须同时满足：
 
-- source audit：56 Skills、7 Agents、manifest 引用闭合；
+- source audit：54 Skills、7 Agents、manifest 引用闭合；
 - package audit：安装包没有缺失源文件或 transient 用户目录；
 - media audit：Python、Node、FFmpeg、Manim、Feishu npm closure、77 wheel 全部存在且哈希相符；
 - default smoke：核心安装可完成，runtime ready，Codex config merged；
-- full smoke：56 Skills / 7 Agents 全量安装可完成；
+- full smoke：54 Skills / 7 Agents 全量安装可完成；
 - dependency health：Python 导入探针、Node/FFmpeg 版本、Manim 导入和 Feishu CLI help 均通过；HyperFrames 在线初始化状态单独记录；
 - security：公开包不含密钥；高风险工具仍受 allowlist 和写操作确认策略约束；
 - repeatability：同一包在全新隔离 profile 上重复安装，结果一致且不污染主用户配置。

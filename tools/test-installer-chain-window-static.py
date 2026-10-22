@@ -17,7 +17,7 @@ TARGETS = {
 BATCH_LAUNCHER = ROOT / "installer-pack" / "Install-Codex-Starter.cmd"
 
 POWERSHELL_CALL = re.compile(
-    r"(?i)&\s*(?P<executable>powershell\.exe|\$[A-Za-z_]\w*(?:\.Source)?)\s+@(?P<arguments>[A-Za-z_]\w*)\b"
+    r"(?i)&\s*(?P<executable>powershell\.exe|\$powershell(?:Command\.Source)?)\s+@(?P<arguments>[A-Za-z_]\w*)\b"
 )
 WINDOW_STYLE = re.compile(
     r"(?i)(?:['\"]-WindowStyle['\"]\s*,\s*['\"]Hidden['\"]|-WindowStyle\s+Hidden)"
@@ -73,12 +73,9 @@ class InstallerChainWindowStaticTests(unittest.TestCase):
 
     def test_every_nested_powershell_call_uses_a_hidden_argument_array(self):
         expected = {
-            "install-to-codex.ps1": {
-                "runtimeArguments",
-                "renderArguments",
-                "configArguments",
-                "modelSyncArguments",
-            },
+            # install-to-codex invokes helper scripts in-process; these are
+            # splatted function/script parameters, not child PowerShell hosts.
+            "install-to-codex.ps1": set(),
             "install-wizard.ps1": {"installArgs"},
             "install-all.ps1": {"arguments"},
             "provision-runtime.ps1": set(),
@@ -118,9 +115,26 @@ class InstallerChainWindowStaticTests(unittest.TestCase):
                 f"unexpected child process launcher in {name}; classify it in this contract first",
             )
 
+    def test_install_all_forwards_the_isolated_codex_home(self):
+        source = self.read_target("install-all.ps1")
+        self.assertRegex(source, r"(?m)^\s*\[string\]\$TargetCodexHome\s*,?\s*$")
+        self.assertRegex(
+            source,
+            r"(?s)if\s*\(-not\s*\[string\]::IsNullOrWhiteSpace\(\$TargetCodexHome\)\)\s*\{\s*\$arguments\s*\+=\s*@\('-TargetCodexHome',\s*\$TargetCodexHome\)\s*\}",
+            "install-all must forward the USB-isolated CODEX_HOME to install-to-codex.ps1",
+        )
+
+    def test_install_all_forwards_usb_full_access_switch(self):
+        source = self.read_target("install-all.ps1")
+        self.assertRegex(source, r"(?m)^\s*\[switch\]\$EnableFullAccess\s*,?\s*$")
+        self.assertRegex(
+            source,
+            r"(?s)if\s*\(\$EnableFullAccess\)\s*\{\s*\$arguments\s*\+=\s*'-EnableFullAccess'\s*\}",
+            "the wrapper must pass full-access only when the trusted USB caller requested it",
+        )
+
     def test_hidden_window_options_are_limited_to_nested_install_processes(self):
         expected_arrays = {
-            "install-to-codex.ps1": {"runtimeArguments", "renderArguments", "configArguments", "modelSyncArguments"},
             "install-wizard.ps1": {"installArgs"},
             "install-all.ps1": {"arguments"},
         }

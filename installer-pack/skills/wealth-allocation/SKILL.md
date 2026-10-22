@@ -63,7 +63,6 @@ description: 使用用户审阅策略模板换算资产金额，并计算目标�
 `history` 必须是按月排列的 JSON 数组，每项含正数 `value`；点数恰好为 `months + 1`，首末值与
 `--initial/--current` 一致。同期无风险利率、数据时点和来源必填。只有提供已核验的“基准名称到同期年化收益率”
 JSON 对象时才生成差值比较。
-基准名称会去除首尾空白；若规范化后名称重复，脚本会拒绝计算，避免后一个值覆盖前一个值。
 
 ```text
 <python> "<skill-directory>/scripts/portfolio_tracker.py" \

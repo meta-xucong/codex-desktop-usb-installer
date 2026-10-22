@@ -180,8 +180,6 @@ class FakeHttpServer:
 
 class MediaMcpTestCase(unittest.TestCase):
     def setUp(self) -> None:
-        with media._PREPARE_FAILURES_LOCK:
-            media._PREPARE_FAILURES.clear()
         self.temp = tempfile.TemporaryDirectory(prefix="media-mcp-test-", dir=ROOT)
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
@@ -223,24 +221,6 @@ class MediaMcpTestCase(unittest.TestCase):
 
     def record_path(self, confirmation_id: str) -> Path:
         return self.data / "confirmations" / f"{confirmation_id}.json"
-
-    def test_minimax_reserved_slot_stays_unavailable_even_if_model_is_injected(self) -> None:
-        environment = {
-            "MEDIA_GENERATION_API_PROFILE": "wokey",
-            "MEDIA_MINIMAX_VIDEO_MODEL": "MiniMax-H3",
-        }
-        with unittest.mock.patch.dict(os.environ, environment, clear=False), unittest.mock.patch.object(
-            media, "_http_json", side_effect=AssertionError("MiniMax availability checks must not make network requests")
-        ):
-            capabilities = media._configured()
-            slot = capabilities["providers"]["minimax-video"]
-            self.assertFalse(slot["available"])
-            self.assertFalse(slot["configured"])
-            self.assertEqual(slot["model"], "")
-            self.assertEqual(slot["missing"], ["PROVIDER_ADAPTER_UNAVAILABLE"])
-            with self.assertRaisesRegex(media.MediaError, "没有已验证的官方 API 或统一网关适配"):
-                media.media_prepare({"provider": "minimax-video", "model": "MiniMax-H3", "prompt": "Offline contract fixture"})
-        self.assertFalse((self.data / "confirmations").exists())
 
     def test_image_mime_detector_recognizes_supported_signatures(self) -> None:
         fixtures = (
@@ -398,48 +378,94 @@ class MediaMcpTestCase(unittest.TestCase):
         self.assertEqual(body["reference_images"], [{"url": item["url"]} for item in images])
         self.assertEqual(self.http.state.count("POST"), 0, "payload mapping must not submit a generation")
 
-    def test_grok_video_local_reference_file_becomes_data_url_without_changing_role(self) -> None:
+    def test_grok_video_first_frame_and_reference_each_submit_poll_and_save(self) -> None:
         os.environ["MEDIA_GROK_VIDEO_MODEL"] = "grok-imagine-video-1.5"
-        self.refresh_catalog(["grok-imagine-video-1.5"])
+        os.environ["MEDIA_GENERATION_API_BASE_URL"] = "https://gateway.example.test"
         raw_image = valid_png()
-        local_path = self.root / "product-reference.png"
-        local_path.write_bytes(raw_image)
-        prepared = media.media_prepare({
-            "provider": "grok-video", "model": "grok-imagine-video-1.5", "prompt": "Use as a visual reference",
-            "reference_media": [{"kind": "image", "role": "reference", "local_path": str(local_path)}],
-            "parameters": {"duration": 4, "aspect_ratio": "16:9", "resolution": "480p"},
-        })
-        self.assertEqual(prepared["operation"], "reference-to-video")
-        record = json.loads(self.record_path(prepared["confirmation_id"]).read_text(encoding="utf-8"))
-        path, body = media._request_payload(media._restore_request_urls(record["request"]))
-        self.assertEqual(path, "/v1/videos/generations")
-        self.assertNotIn("image", body)
-        self.assertEqual(len(body["reference_images"]), 1)
-        image_url = body["reference_images"][0]["url"]
-        self.assertTrue(image_url.startswith("data:image/png;base64,"))
-        self.assertEqual(base64.b64decode(image_url.split(",", 1)[1]), raw_image)
-        self.assertEqual(self.http.state.count("POST"), 0, "preparing payload must not submit a generation")
+        raw_video = b"\x00\x00\x00\x18ftypmp42fixture"
+        expected_content_type = "video/mp4"
 
-    def test_grok_video_local_reference_over_gateway_limit_is_rejected_during_prepare(self) -> None:
+        for role in ("first_frame", "reference"):
+            with self.subTest(role=role):
+                self.refresh_catalog(["grok-imagine-video-1.5"])
+                image_path = self.root / f"{role}-input-with-jpg-suffix.jpg"
+                image_path.write_bytes(raw_image)
+                prepared = media.media_prepare({
+                    "provider": "grok-video",
+                    "model": "grok-imagine-video-1.5",
+                    "prompt": f"End-to-end mocked {role} video request",
+                    "reference_media": [{"kind": "image", "role": role, "local_path": str(image_path)}],
+                    "parameters": {"duration": 5, "aspect_ratio": "1:1", "resolution": "480p"},
+                })
+                self.assertEqual(prepared["operation"], "image-to-video" if role == "first_frame" else "reference-to-video")
+
+                task_id = f"task-{role}"
+                self.http.state.enqueue("/v1/videos/generations", 200, {"request_id": task_id, "status": "queued"})
+                submitted = media.media_submit(self.submit_args(prepared))
+                self.assertEqual(submitted["task_id"], task_id)
+                self.assertEqual(submitted["state"], "in_progress")
+
+                post = next(item for item in reversed(self.http.state.requests) if item["method"] == "POST" and item["path"] == "/v1/videos/generations")
+                body = json.loads(post["body"].decode("utf-8"))
+                self.assertEqual(post["headers"].get("Authorization"), f"Bearer {CANARY_KEY}")
+                self.assertEqual(body["model"], "grok-imagine-video-1.5")
+                self.assertEqual(body["duration"], 5)
+                self.assertEqual(body["aspect_ratio"], "1:1")
+                self.assertEqual(body["resolution"], "480p")
+                data_url = (body["image"]["url"] if role == "first_frame" else body["reference_images"][0]["url"])
+                self.assertTrue(data_url.startswith("data:image/png;base64,"))
+                self.assertEqual(base64.b64decode(data_url.split(",", 1)[1]), raw_image)
+                if role == "first_frame":
+                    self.assertNotIn("reference_images", body)
+                else:
+                    self.assertNotIn("image", body)
+                    self.assertEqual(len(body["reference_images"]), 1)
+
+                content_path = f"/v1/videos/{task_id}/content"
+                self.http.state.enqueue(f"/v1/videos/{task_id}", 200, {"status": "completed", "content_url": content_path})
+                checked = media.media_check(self.submit_args(prepared))
+                self.assertEqual(checked["state"], "completed_pending_save")
+
+                self.http.state.enqueue(content_path, 200, raw_video, {"Content-Type": expected_content_type})
+                # Exercise the actual HTTP downloader while replacing only DNS
+                # resolution; the fake opener still observes URL, headers, MIME,
+                # magic validation, and the saved bytes without socket access.
+                original_validate = media._validate_public_url
+                media._validate_public_url = lambda value, **_: value  # type: ignore[method-assign]
+                try:
+                    saved = media.media_save(self.submit_args(prepared))
+                finally:
+                    media._validate_public_url = original_validate  # type: ignore[method-assign]
+                self.assertTrue(saved["success"])
+                download = self.http.state.requests[-1]
+                self.assertEqual(download["method"], "GET")
+                self.assertEqual(download["path"], content_path)
+                self.assertEqual(download["headers"].get("Authorization"), f"Bearer {CANARY_KEY}")
+                artifact_path = Path(saved["saved"][0]["path"])
+                self.assertTrue(artifact_path.is_file())
+                self.assertEqual(artifact_path.read_bytes(), raw_video)
+                record = json.loads(self.record_path(prepared["confirmation_id"]).read_text(encoding="utf-8"))
+                self.assertEqual(record["state"], "completed_saved")
+                self.assertEqual(record["saved_artifacts"][0]["sha256"], hashlib.sha256(raw_video).hexdigest())
+
+        self.assertEqual(self.http.state.count("POST", "/v1/videos/generations"), 2)
+
+    def test_grok_video_local_image_gateway_limit_applies_before_prepare_and_submit(self) -> None:
         os.environ["MEDIA_GROK_VIDEO_MODEL"] = "grok-imagine-video-1.5"
         self.refresh_catalog(["grok-imagine-video-1.5"])
-        local_path = self.root / "oversized-reference.png"
-        with local_path.open("wb") as image_file:
+        oversized = self.root / "oversized-reference.png"
+        with oversized.open("wb") as image_file:
             image_file.write(b"\x89PNG\r\n\x1a\n")
             image_file.truncate(media.MAX_GROK_VIDEO_LOCAL_IMAGE_BYTES + 1)
-
-        with self.assertRaises(media.MediaError) as rejected:
+        with self.assertRaises(media.MediaError) as prepared_error:
             media.media_prepare({
-                "provider": "grok-video", "model": "grok-imagine-video-1.5", "prompt": "Reject oversize reference",
-                "reference_media": [{"kind": "image", "role": "reference", "local_path": str(local_path)}],
+                "provider": "grok-video", "model": "grok-imagine-video-1.5", "prompt": "oversized reference",
+                "reference_media": [{"kind": "image", "role": "reference", "local_path": str(oversized)}],
                 "parameters": {"duration": 4, "aspect_ratio": "16:9", "resolution": "480p"},
             })
-        self.assertEqual(getattr(rejected.exception, "code", None), "REFERENCE_SIZE_LIMIT")
-        self.assertIn("8 MiB", str(rejected.exception))
-        self.assertEqual(self.http.state.count("POST"), 0, "oversized reference must be rejected before any generation request")
+        self.assertEqual(getattr(prepared_error.exception, "code", None), "REFERENCE_SIZE_LIMIT")
+        self.assertIn("8 MiB", str(prepared_error.exception))
 
-        # Confirmations from the previous MCP release can remain valid for
-        # 30 minutes, so submit must enforce the same gateway bound too.
         legacy_record = {
             "state": "prepared",
             "request": {
@@ -449,10 +475,10 @@ class MediaMcpTestCase(unittest.TestCase):
             },
         }
         with unittest.mock.patch.object(media, "_validated_record", return_value=(self.root / "legacy.json", legacy_record)):
-            with self.assertRaises(media.MediaError) as submit_rejected:
+            with self.assertRaises(media.MediaError) as submitted_error:
                 media._media_submit_locked({"user_confirmation": "确认"})
-        self.assertEqual(getattr(submit_rejected.exception, "code", None), "REFERENCE_SIZE_LIMIT")
-        self.assertEqual(self.http.state.count("POST"), 0, "old oversized confirmation must also be blocked before POST")
+        self.assertEqual(getattr(submitted_error.exception, "code", None), "REFERENCE_SIZE_LIMIT")
+        self.assertEqual(self.http.state.count("POST"), 0)
 
     def test_grok_video_first_frame_and_reference_mix_is_explicit_and_model_scoped(self) -> None:
         os.environ["MEDIA_GROK_VIDEO_MODEL"] = "grok-imagine-video-1.5"
@@ -545,77 +571,6 @@ class MediaMcpTestCase(unittest.TestCase):
                 })
             self.assertEqual(getattr(too_many.exception, "code", None), "TOO_MANY_REFERENCES")
         self.assertEqual(self.http.state.count("POST"), 0)
-
-    def test_grok_video_first_frame_and_reference_each_submit_poll_and_save(self) -> None:
-        os.environ["MEDIA_GROK_VIDEO_MODEL"] = "grok-imagine-video-1.5"
-        os.environ["MEDIA_GENERATION_API_BASE_URL"] = "https://gateway.example.test"
-        raw_image = valid_png()
-        raw_video = b"\x00\x00\x00\x18ftypmp42fixture"
-        expected_content_type = "video/mp4"
-
-        for role in ("first_frame", "reference"):
-            with self.subTest(role=role):
-                self.refresh_catalog(["grok-imagine-video-1.5"])
-                image_path = self.root / f"{role}-input-with-jpg-suffix.jpg"
-                image_path.write_bytes(raw_image)
-                prepared = media.media_prepare({
-                    "provider": "grok-video", "model": "grok-imagine-video-1.5",
-                    "prompt": f"End-to-end mocked {role} video request",
-                    "reference_media": [{"kind": "image", "role": role, "local_path": str(image_path)}],
-                    "parameters": {"duration": 5, "aspect_ratio": "1:1", "resolution": "480p"},
-                })
-                self.assertEqual(prepared["operation"], "image-to-video" if role == "first_frame" else "reference-to-video")
-
-                task_id = f"task-{role}"
-                self.http.state.enqueue("/v1/videos/generations", 200, {"request_id": task_id, "status": "queued"})
-                submitted = media.media_submit(self.submit_args(prepared))
-                self.assertEqual(submitted["task_id"], task_id)
-                self.assertEqual(submitted["state"], "in_progress")
-
-                post = next(item for item in reversed(self.http.state.requests) if item["method"] == "POST" and item["path"] == "/v1/videos/generations")
-                body = json.loads(post["body"].decode("utf-8"))
-                self.assertEqual(post["headers"].get("Authorization"), f"Bearer {CANARY_KEY}")
-                self.assertEqual(body["model"], "grok-imagine-video-1.5")
-                self.assertEqual(body["duration"], 5)
-                self.assertEqual(body["aspect_ratio"], "1:1")
-                self.assertEqual(body["resolution"], "480p")
-                data_url = body["image"]["url"] if role == "first_frame" else body["reference_images"][0]["url"]
-                self.assertTrue(data_url.startswith("data:image/png;base64,"))
-                self.assertEqual(base64.b64decode(data_url.split(",", 1)[1]), raw_image)
-                if role == "first_frame":
-                    self.assertNotIn("reference_images", body)
-                else:
-                    self.assertNotIn("image", body)
-                    self.assertEqual(len(body["reference_images"]), 1)
-
-                content_path = f"/v1/videos/{task_id}/content"
-                self.http.state.enqueue(f"/v1/videos/{task_id}", 200, {"status": "completed", "content_url": content_path})
-                checked = media.media_check(self.submit_args(prepared))
-                self.assertEqual(checked["state"], "completed_pending_save")
-
-                self.http.state.enqueue(content_path, 200, raw_video, {"Content-Type": expected_content_type})
-                # Exercise the actual HTTP downloader while replacing only DNS
-                # resolution; the fake opener still observes URL, headers, MIME,
-                # magic validation, and the saved bytes without socket access.
-                original_validate = media._validate_public_url
-                media._validate_public_url = lambda value, **_: value  # type: ignore[method-assign]
-                try:
-                    saved = media.media_save(self.submit_args(prepared))
-                finally:
-                    media._validate_public_url = original_validate  # type: ignore[method-assign]
-                self.assertTrue(saved["success"])
-                download = self.http.state.requests[-1]
-                self.assertEqual(download["method"], "GET")
-                self.assertEqual(download["path"], content_path)
-                self.assertEqual(download["headers"].get("Authorization"), f"Bearer {CANARY_KEY}")
-                artifact_path = Path(saved["saved"][0]["path"])
-                self.assertTrue(artifact_path.is_file())
-                self.assertEqual(artifact_path.read_bytes(), raw_video)
-                record = json.loads(self.record_path(prepared["confirmation_id"]).read_text(encoding="utf-8"))
-                self.assertEqual(record["state"], "completed_saved")
-                self.assertEqual(record["saved_artifacts"][0]["sha256"], hashlib.sha256(raw_video).hexdigest())
-
-        self.assertEqual(self.http.state.count("POST", "/v1/videos/generations"), 2)
 
     def test_grok_video_parameters_are_required_and_invalid_values_fail_before_submit(self) -> None:
         self.refresh_catalog(["grok-imagine-video-1.5"])
@@ -743,8 +698,7 @@ class MediaMcpTestCase(unittest.TestCase):
     def test_http_502_unknown_state_preserves_sanitized_gateway_diagnostic(self) -> None:
         prepared = self.prepared_image("image URL MIME mismatch")
         diagnostic = "reference image data URL MIME type does not match its image data"
-        self.http.state.enqueue("/v1/responses", 502, {"error": {"code": "gateway_error", "message": diagnostic}},
-                                {"X-Request-ID": "provider-502", "X-Gateway-Request-ID": "gateway-502"})
+        self.http.state.enqueue("/v1/responses", 502, {"error": {"code": "gateway_error", "message": diagnostic}})
         with self.assertRaises(media.MediaError) as raised:
             media.media_submit(self.submit_args(prepared))
         self.assertEqual(raised.exception.code, "SUBMISSION_UNKNOWN")
@@ -755,36 +709,10 @@ class MediaMcpTestCase(unittest.TestCase):
         envelope = media._media_error_envelope(raised.exception)
         self.assertEqual(envelope["state"], "submission_unknown")
         self.assertIn(diagnostic, envelope["error"]["safe_message"])
-        self.assertTrue(envelope["request_attempt_started"])
-        self.assertTrue(envelope["mcp_http_response_received"])
-        self.assertEqual(envelope["upstream_acceptance"], "unknown")
-        self.assertTrue(envelope["manual_reconciliation_required"])
-        self.assertEqual(envelope["error"]["provider_request_id"], "provider-502")
-        self.assertEqual(envelope["error"]["gateway_request_id"], "gateway-502")
         record = json.loads(self.record_path(prepared["confirmation_id"]).read_text(encoding="utf-8"))
         self.assertEqual(record["state"], "submission_unknown")
         self.assertIn(diagnostic, record["last_error"])
-        self.assertEqual(record["http_status"], 502)
-        self.assertEqual(record["provider_request_id"], "provider-502")
-        self.assertEqual(record["gateway_request_id"], "gateway-502")
-        self.assertTrue(record["submission_diagnostics"]["mcp_http_response_received"])
         self.assertEqual(self.http.state.count("POST", "/v1/responses"), 1)
-
-        get_count_before_check = self.http.state.count("GET")
-        with self.assertRaises(media.MediaError) as check_error:
-            media.media_check({"confirmation_id": prepared["confirmation_id"], "confirmation_fingerprint": prepared["confirmation_fingerprint"]})
-        self.assertEqual(check_error.exception.code, "SUBMISSION_STATUS_UNAVAILABLE")
-        self.assertEqual(check_error.exception.http_status, 502)
-        self.assertEqual(check_error.exception.provider_request_id, "provider-502")
-        self.assertEqual(check_error.exception.gateway_request_id, "gateway-502")
-        check_envelope = media._media_error_envelope(check_error.exception)
-        self.assertFalse(check_envelope["api_request_sent"])
-        self.assertFalse(check_envelope["check_request_sent"])
-        self.assertTrue(check_envelope["original_request_attempt_started"])
-        self.assertTrue(check_envelope["mcp_http_response_received"])
-        self.assertEqual(check_envelope["upstream_acceptance"], "unknown")
-        self.assertTrue(check_envelope["manual_reconciliation_required"])
-        self.assertEqual(self.http.state.count("GET"), get_count_before_check)
 
     def test_upstream_diagnostic_redacts_short_multipart_text_and_actual_key(self) -> None:
         short_prompt = "hi"
@@ -1582,22 +1510,9 @@ class MediaMcpTestCase(unittest.TestCase):
         self.assertEqual(parameters_schema["type"], "object")
         self.assertFalse(parameters_schema["additionalProperties"])
         self.assertEqual(parameters_schema["properties"]["aspect_ratio"]["type"], "string")
-        self.assertIn("provider-specific", parameters_schema["description"].lower())
-        self.assertEqual(prepare_schema["type"], "object")
-        self.assertNotIn("allOf", prepare_schema)
-        serialized_schema = json.dumps(prepare_schema)
-        self.assertNotIn('"if"', serialized_schema)
-        self.assertNotIn('"then"', serialized_schema)
-        self.assertNotIn('"oneOf"', serialized_schema)
-        self.assertNotIn('"anyOf"', serialized_schema)
-        self.assertEqual(prepare_schema["properties"]["provider"]["enum"], list(media.PROVIDERS))
-        self.assertEqual(prepare_schema["properties"]["reference_media"]["items"]["properties"]["role"]["enum"], ["first_frame", "reference"])
-        generic_params = parameters_schema["properties"]
-        self.assertEqual(set(generic_params["aspect_ratio"]["enum"]), {"1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "2:1", "1:2", "19.5:9", "9:19.5", "20:9", "9:20", "21:9", "5:2", "auto"})
-        self.assertEqual(generic_params["resolution"]["enum"], ["1080p", "1k", "2k", "480p", "720p"])
-        self.assertEqual(generic_params["generate_audio"]["type"], "boolean")
-        self.assertNotIn("const", generic_params["generate_audio"])
-        self.assertEqual(generic_params["n"]["maximum"], 10)
+        self.assertEqual(parameters_schema["properties"]["aspect_ratio"]["enum"], media.MEDIA_PARAMETER_PROPERTIES["aspect_ratio"]["enum"])
+        self.assertEqual(parameters_schema["properties"]["resolution"]["enum"], ["1k", "2k", "480p", "720p", "1080p"])
+        self.assertIn("aspect_ratio and resolution are required", parameters_schema["description"])
         capability = json.loads(replies[2]["result"]["content"][0]["text"])
         self.assertEqual(capability["generation_capability"], "not_tested")
         self.assertEqual(result.stderr, b"")
@@ -1619,201 +1534,6 @@ class MediaMcpTestCase(unittest.TestCase):
         self.assertEqual(result["parameters"]["duration"], 5)
         self.assertEqual(result["parameters"]["aspect_ratio"], "9:16")
         self.assertEqual(result["parameters"]["resolution"], "480p")
-        self.assertEqual(self.http.state.count("POST"), 0)
-
-    def test_static_schema_covers_legacy_image2_count_while_runtime_keeps_profile_rules(self) -> None:
-        os.environ["MEDIA_GENERATION_API_PROFILE"] = "legacy"
-        self.refresh_catalog(["gpt-image-2.5"])
-        prepared = media.media_prepare({
-            "provider": "image-2", "model": "gpt-image-2.5", "prompt": "legacy batch image",
-            "parameters": {"size": "2048x2048", "n": 2},
-        })
-        self.assertEqual(prepared["parameters"]["n"], 2)
-        self.assertEqual(self.http.state.count("POST"), 0)
-        os.environ["MEDIA_GENERATION_API_PROFILE"] = "responses"
-        self.refresh_catalog(["gpt-image-2.5"])
-        with self.assertRaises(media.MediaError) as response_profile_rejected:
-            media.media_prepare({
-                "provider": "image-2", "model": "gpt-image-2.5", "prompt": "response count restriction",
-                "parameters": {"size": "auto", "n": 2},
-            })
-        self.assertIn("n=1", str(response_profile_rejected.exception))
-
-    def test_static_schema_covers_grok_image_count_while_wokey_keeps_runtime_limit(self) -> None:
-        os.environ["MEDIA_GENERATION_API_PROFILE"] = "responses"
-        os.environ["MEDIA_GROK_IMAGE_MODEL"] = "grok-imagine-image-2.0"
-        self.refresh_catalog(["grok-imagine-image-2.0"])
-        prepared = media.media_prepare({
-            "provider": "grok-image", "model": "grok-imagine-image-2.0", "prompt": "batch image schema range",
-            "parameters": {"n": 10, "aspect_ratio": "1:1", "resolution": "1k"},
-        })
-        self.assertEqual(prepared["parameters"]["n"], 10)
-        self.assertEqual(self.http.state.count("POST"), 0)
-
-        os.environ["MEDIA_GENERATION_API_PROFILE"] = "wokey"
-        self.refresh_catalog(["grok-imagine-image-2.0"])
-        with self.assertRaises(media.MediaError) as wokey_rejected:
-            media.media_prepare({
-                "provider": "grok-image", "model": "grok-imagine-image-2.0", "prompt": "wokey runtime limit",
-                "parameters": {"n": 2, "aspect_ratio": "1:1", "resolution": "1k"},
-            })
-        self.assertIn("Wokey", str(wokey_rejected.exception))
-
-    def test_confirmation_key_first_initialization_is_thread_safe(self) -> None:
-        path = self.data / ".confirmation-key"
-        self.assertFalse(path.exists())
-        barrier = threading.Barrier(16)
-        results: list[bytes | Exception] = []
-        result_lock = threading.Lock()
-
-        def initialize() -> None:
-            try:
-                barrier.wait(timeout=3)
-                key = media._secret_key()
-            except Exception as exc:
-                key = exc
-            with result_lock:
-                results.append(key)
-
-        workers = [threading.Thread(target=initialize) for _ in range(16)]
-        for worker in workers:
-            worker.start()
-        for worker in workers:
-            worker.join(timeout=5)
-        self.assertTrue(all(not worker.is_alive() for worker in workers))
-        self.assertEqual(len(results), 16)
-        self.assertTrue(all(isinstance(item, bytes) and len(item) == 32 for item in results), results)
-        self.assertTrue(all(item == results[0] for item in results))
-        self.assertEqual(path.read_bytes(), results[0])
-
-    def test_prepare_validation_failure_is_actionable_and_never_creates_confirmation(self) -> None:
-        os.environ["MEDIA_GROK_VIDEO_MODEL"] = "grok-imagine-video-1.5"
-        self.refresh_catalog(["grok-imagine-video-1.5"])
-        args = {"provider": "grok-video", "model": "grok-imagine-video-1.5", "prompt": CANARY_PROMPT, "parameters": {"duration": 5}}
-        with self.assertRaises(media.MediaError) as rejected:
-            media.media_prepare(args)
-        error = rejected.exception
-        self.assertEqual(error.code, "VIDEO_PARAMETERS_REQUIRED")
-        envelope = media._media_error_envelope(error)
-        self.assertFalse(envelope["api_request_sent"])
-        self.assertFalse(envelope["confirmation_created"])
-        self.assertEqual(envelope["missing_parameters"], ["aspect_ratio", "resolution"])
-        self.assertEqual(envelope["allowed_values"]["resolution"], ["480p", "720p", "1080p"])
-        self.assertEqual(envelope["recovery_action"], "correct_arguments_once")
-        self.assertEqual(list((self.data / "confirmations").glob("media-*.json")) if (self.data / "confirmations").exists() else [], [])
-        self.assertEqual(self.http.state.count("POST"), 0)
-
-    def test_prepare_loop_guard_stops_exact_repeat_then_allows_corrected_request(self) -> None:
-        os.environ["MEDIA_GROK_VIDEO_MODEL"] = "grok-imagine-video-1.5"
-        self.refresh_catalog(["grok-imagine-video-1.5"])
-        invalid = {"provider": "grok-video", "model": "grok-imagine-video-1.5", "prompt": "loop exact", "parameters": {"duration": 5}}
-        with self.assertRaises(media.MediaError) as first:
-            media.media_prepare(invalid)
-        self.assertNotEqual(first.exception.code, "LOOP_GUARD")
-        with self.assertRaises(media.MediaError) as second:
-            media.media_prepare(invalid)
-        self.assertEqual(second.exception.code, "LOOP_GUARD")
-        self.assertFalse(second.exception.retryable)
-        self.assertFalse(second.exception.api_request_sent)
-        self.assertEqual(second.exception.details["recovery_action"], "stop_and_ask_user")
-        corrected = copy.deepcopy(invalid)
-        corrected["parameters"].update({"aspect_ratio": "16:9", "resolution": "480p"})
-        prepared = media.media_prepare(corrected)
-        self.assertTrue(prepared["success"])
-        self.assertEqual(self.http.state.count("POST"), 0)
-
-    def test_prepare_loop_guard_stops_third_changed_attempt_but_not_other_intent(self) -> None:
-        os.environ["MEDIA_GROK_VIDEO_MODEL"] = "grok-imagine-video-1.5"
-        self.refresh_catalog(["grok-imagine-video-1.5"])
-        base = {"provider": "grok-video", "model": "grok-imagine-video-1.5", "prompt": "loop intent", "parameters": {"duration": 5}}
-        for resolution in ("480p", "720p"):
-            attempt = copy.deepcopy(base)
-            attempt["parameters"]["resolution"] = resolution
-            with self.assertRaises(media.MediaError):
-                media.media_prepare(attempt)
-        third = copy.deepcopy(base)
-        third["parameters"]["aspect_ratio"] = "16:9"
-        with self.assertRaises(media.MediaError) as blocked:
-            media.media_prepare(third)
-        self.assertEqual(blocked.exception.code, "LOOP_GUARD")
-        other = copy.deepcopy(third)
-        other["prompt"] = "different intent"
-        with self.assertRaises(media.MediaError) as independent:
-            media.media_prepare(other)
-        self.assertNotEqual(independent.exception.code, "LOOP_GUARD")
-        self.assertEqual(self.http.state.count("POST"), 0)
-
-    def test_prepare_loop_guard_is_concurrency_safe_and_does_not_count_catalog_failures(self) -> None:
-        os.environ["MEDIA_GROK_VIDEO_MODEL"] = "grok-imagine-video-1.5"
-        args = {"provider": "grok-video", "model": "grok-imagine-video-1.5", "prompt": "parallel invalid", "parameters": {}}
-        with self.assertRaises(media.MediaError) as catalog_error:
-            media.media_prepare(args)
-        self.assertEqual(catalog_error.exception.code, "MODEL_CATALOG_MISSING")
-        self.assertFalse(media._PREPARE_FAILURES)
-        os.environ["MEDIA_GROK_VIDEO_MODEL"] = "grok-imagine-video-1.5"
-        self.refresh_catalog(["grok-imagine-video-1.5"])
-        results: list[str] = []
-        lock = threading.Lock()
-
-        def invoke() -> None:
-            try:
-                media.media_prepare(args)
-                code = "success"
-            except media.MediaError as exc:
-                code = exc.code if exc.code == "LOOP_GUARD" else f"{exc.code}: {exc.safe_message}"
-            with lock:
-                results.append(code)
-
-        workers = [threading.Thread(target=invoke) for _ in range(8)]
-        for worker in workers:
-            worker.start()
-        for worker in workers:
-            worker.join(timeout=5)
-        self.assertTrue(all(not worker.is_alive() for worker in workers))
-        self.assertEqual(results.count("LOOP_GUARD"), 7, results)
-        self.assertEqual(self.http.state.count("POST"), 0)
-
-    def test_prepare_loop_guard_store_is_bounded_and_expired_entries_are_removed(self) -> None:
-        now = time.monotonic()
-        with media._PREPARE_FAILURES_LOCK:
-            media._PREPARE_FAILURES["expired"] = {"updated_at": now - media.PREPARE_FAILURE_WINDOW_SECONDS - 1, "total": 1, "exact": {}}
-            for index in range(media.PREPARE_FAILURE_MAX_INTENTS):
-                media._PREPARE_FAILURES[f"entry-{index}"] = {"updated_at": now + index, "total": 1, "exact": {}}
-        result = media._prepare_failure_error("new-entry", "exact", media.MediaError("invalid"))
-        self.assertIsNone(result)
-        self.assertNotIn("expired", media._PREPARE_FAILURES)
-        self.assertLessEqual(len(media._PREPARE_FAILURES), media.PREPARE_FAILURE_MAX_INTENTS)
-        for index in range(5):
-            media._prepare_failure_error("new-entry", f"variant-{index}", media.MediaError("invalid"))
-        self.assertLessEqual(len(media._PREPARE_FAILURES["new-entry"]["exact"]), media.PREPARE_FAILURE_MAX_EXACT_PER_INTENT)
-        serialized = json.dumps(media._PREPARE_FAILURES)
-        self.assertNotIn(CANARY_PROMPT, serialized)
-        self.assertNotIn(CANARY_KEY, serialized)
-
-    def test_validation_error_uses_structured_mcp_result_and_never_posts(self) -> None:
-        os.environ["MEDIA_GROK_VIDEO_MODEL"] = "grok-imagine-video-1.5"
-        self.refresh_catalog(["grok-imagine-video-1.5"])
-        request = {
-            "jsonrpc": "2.0", "id": 11, "method": "tools/call",
-            "params": {"name": "media_prepare", "arguments": {
-                "provider": "grok-video", "model": "grok-imagine-video-1.5",
-                "prompt": CANARY_PROMPT, "parameters": {"duration": 5},
-            }},
-        }
-        env = os.environ.copy()
-        env.update(self.env)
-        env["MEDIA_GROK_VIDEO_MODEL"] = "grok-imagine-video-1.5"
-        result = subprocess.run([sys.executable, str(SERVICE_PATH)], input=(json.dumps(request, ensure_ascii=False) + "\n").encode("utf-8"), stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=10, check=False)
-        self.assertEqual(result.returncode, 0)
-        reply = json.loads(result.stdout.decode("utf-8"))
-        self.assertTrue(reply["result"]["isError"])
-        structured = reply["result"]["structuredContent"]
-        self.assertEqual(structured["error"]["code"], "VIDEO_PARAMETERS_REQUIRED")
-        self.assertFalse(structured["api_request_sent"])
-        self.assertFalse(structured["confirmation_created"])
-        text_envelope = json.loads(reply["result"]["content"][0]["text"])
-        self.assertEqual(text_envelope, structured)
-        self.assertNotIn(CANARY_PROMPT, json.dumps(structured, ensure_ascii=False))
         self.assertEqual(self.http.state.count("POST"), 0)
 
     def test_structured_input_error_survives_tools_call_jsonrpc(self) -> None:

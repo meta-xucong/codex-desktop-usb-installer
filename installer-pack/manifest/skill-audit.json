@@ -15,7 +15,7 @@
   ],
   "policy": {
     "defaultInstall": "core-ready, auto-installable-runtime, and unsupported entries are installed and enabled by default; guided-config entries wait for user credentials or MCP setup",
-    "implicitInvocation": "Skills are installed/enabled according to status, while native implicit invocation is separately restricted by per-Skill openai.yaml policy (currently only image-2); other Skills require explicit $skill invocation",
+    "implicitInvocation": "the rendered config enables core-ready, auto-installable-runtime, and unsupported Skills; guided-config Skills remain disabled until enableWhen passes",
     "dependencyModel": "Each dependency is an object; status never hides runtime, connection, credential, or capability closure.",
     "pythonRuntime": {
       "platform": "win_amd64",
@@ -976,7 +976,7 @@
         "windowsEntry": "Codex workflow / frontmatter",
         "smoke": "frontmatter, pack-copy, and dependency health-check path"
       },
-      "notes": "提示词生成不依赖图像服务；用户只要提示词时仅输出提示词。用户要求实际生成图片时默认走统一 media_generation MCP；用户明确指定其他方式时才切换。"
+      "notes": "提示词生成不依赖图像服务；用户明确要求实际图片时优先使用 Codex 原生图像能力，外部 image-2 仅显式调用。"
     },
     {
       "id": "industry-analysis",
@@ -1237,57 +1237,6 @@
         "smoke": "frontmatter, pack-copy, and dependency health-check path"
       },
       "notes": ""
-    },
-    {
-      "id": "minimax-video-gen",
-      "status": "requires-credential",
-      "defaultEnabled": false,
-      "dependencies": [
-        {
-          "id": "mcp.media-generation",
-          "kind": "mcp",
-          "required": true,
-          "autoInstallable": false,
-          "healthCheck": "MiniMax provider reports available=true only after a protocol-compatible adapter has been implemented and audited",
-          "failureMessage": "MiniMax 视频适配尚未实现；模型槽位或模型目录命中不能启用它。"
-        },
-        {
-          "id": "credential.minimax-api-key",
-          "kind": "credential",
-          "required": true,
-          "autoInstallable": false,
-          "healthCheck": "MINIMAX_API_KEY configured only after the dedicated official API adapter is implemented",
-          "failureMessage": "当前没有 MiniMax 官方账号或 API Key；签名 U 盘设备 Key 不能替代。",
-          "secret": true
-        },
-        {
-          "id": "config.MEDIA_MINIMAX_VIDEO_MODEL",
-          "kind": "configuration",
-          "required": true,
-          "autoInstallable": false,
-          "healthCheck": "A future, audited official MiniMax adapter validates a model-specific contract; model name alone cannot enable this provider",
-          "failureMessage": "当前没有已验证的 MiniMax 上游或协议适配；Skill 不会自动改用 Grok 或 Seedance。"
-        }
-      ],
-      "capabilities": [
-        "MiniMax 视频能力状态说明",
-        "提示词整理；媒体生成当前不可用"
-      ],
-      "installByDefault": false,
-      "afterRemediationStatus": "guided-config",
-      "enableWhen": [
-        "skill-installed",
-        "mcp.media-generation.ready",
-        "future-verified-minimax-adapter",
-        "credential.minimax-api-key",
-        "user-approved-paid-task"
-      ],
-      "verification": {
-        "skillFile": "skills/minimax-video-gen/SKILL.md",
-        "windowsEntry": "Codex workflow / frontmatter",
-        "smoke": "MCP keeps MiniMax unavailable and rejects prepare even when a model name is injected; no network request is made"
-      },
-      "notes": "Skill is limited to availability guidance and prompt drafting. Official MiniMax video API uses an independent API key, v2 endpoints and H3 multimodal contract; current package has no adapter or upstream account. Setting the shared model field cannot enable generation. No official API calls or provider fallback."
     },
     {
       "id": "multi-search-engine",
@@ -1585,62 +1534,6 @@
         "smoke": "frontmatter, pack-copy, and dependency health-check path"
       },
       "notes": "已移除与磁盘安全无关的财务计算触发器和一律拒绝只读检查的旧策略；当前流程与 Codex 的精确授权、只读预检、可恢复优先和用户改动保护原则一致。"
-    },
-    {
-      "id": "seedance2-0-video-gen",
-      "status": "requires-credential",
-      "defaultEnabled": false,
-      "dependencies": [
-        {
-          "id": "runtime.python312",
-          "kind": "runtime",
-          "required": true,
-          "autoInstallable": true,
-          "minVersion": "3.12",
-          "lockedVersion": "3.12.10",
-          "abi": "cp312",
-          "platform": "win_amd64",
-          "healthCheck": "python-env-setup/scripts/check_python_env.ps1 -Json; require cpython-312/win_amd64",
-          "failureMessage": "需要安装 U 盘提供的 Python 3.12 per-user 运行时。"
-        },
-        {
-          "id": "mcp.media-generation",
-          "kind": "mcp",
-          "required": true,
-          "autoInstallable": true,
-          "transport": "stdio",
-          "healthCheck": "media_generation strict UTF-8 tools/list includes media_refresh_models, media_capabilities, media_prepare, media_submit, media_check and media_save",
-          "failureMessage": "统一媒体 MCP 未安装、未启用或不可用时，不提交外部计费请求。"
-        },
-        {
-          "id": "credential.usb-license-404token",
-          "kind": "credential",
-          "required": true,
-          "autoInstallable": true,
-          "secret": true,
-          "healthCheck": "USB launcher supplies the signed device key in the Codex launch environment for the media MCP env_vars pass-through",
-          "failureMessage": "没有有效签名 U 盘授权时不向媒体上游发送请求。"
-        }
-      ],
-      "capabilities": [
-        "视频生成",
-        "媒体顺序保护",
-        "统一 MCP 确认与任务查询"
-      ],
-      "installByDefault": false,
-      "afterRemediationStatus": "guided-config",
-      "enableWhen": [
-        "skill-installed",
-        "runtime.python312",
-        "mcp.media-generation",
-        "signed-usb-license.device-api-key"
-      ],
-      "verification": {
-        "skillFile": "skills/seedance2-0-video-gen/SKILL.md",
-        "windowsEntry": "media_generation MCP tools/list; signed device key from USB launch environment or current-user DPAPI fallback; missing credentials fail before generation requests",
-        "smoke": "frontmatter, pack-copy, and dependency health-check path"
-      },
-      "notes": "通过统一 media_generation MCP 调用 Seedance 路由；共享设备 Key 来自签名 U 盘授权，Seedance 模型和路由 ID 仍按服务方实际配置。当前参考媒体需为服务方可访问的 HTTPS URL，按输入顺序保留。不猜测价格、预扣积分、退款规则或链接期限。"
     },
     {
       "id": "self-improvement-agent",

@@ -1,0 +1,20 @@
+{
+  "name": "usb-product-design-offline",
+  "plugins": [
+    {
+      "interface": {
+        "displayName": "Product Design"
+      },
+      "source": {
+        "path": "./plugins/product-design",
+        "source": "local"
+      },
+      "policy": {
+        "authentication": "ON_INSTALL",
+        "installation": "AVAILABLE"
+      },
+      "name": "product-design",
+      "category": "Creativity"
+    }
+  ]
+}

@@ -321,7 +321,7 @@ Assert-CapabilityPackPowerShellCompatibility $capabilityPackOutput "copied USB p
 )
 [System.IO.File]::WriteAllText(
     (Join-Path $output "content\mcp\README.txt"),
-    "兼容性 MCP 资源目录。完整能力包位于同级 codex-starter-kit；MCP 配置写入本机 %USERPROFILE%\.codex\config.toml，密钥不得写入 U 盘。`r`n",
+    "兼容性 MCP 资源目录。完整能力包位于同级 codex-starter-kit；U 盘版 MCP 配置写入本机 %LOCALAPPDATA%\CodexAppManager\usb-codex-home\config.toml，密钥不得写入 U 盘。`r`n",
     $utf8NoBom
 )
 Copy-Item -LiteralPath $installer -Destination (Join-Path $output "CodexDesktopSetup.exe") -Force

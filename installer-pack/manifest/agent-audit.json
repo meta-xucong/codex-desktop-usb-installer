@@ -101,8 +101,7 @@
       "optionalSkills": [
         "wechat-article-creator",
         "web-search-extraction",
-        "image-2",
-        "seedance2-0-video-gen"
+        "image-2"
       ],
       "skills": [
         "xiaohongshu-writing",
@@ -110,8 +109,7 @@
         "video-prompt-generator",
         "wechat-article-creator",
         "web-search-extraction",
-        "image-2",
-        "seedance2-0-video-gen"
+        "image-2"
       ],
       "runtimeDependencies": [
         "runtime.python312",

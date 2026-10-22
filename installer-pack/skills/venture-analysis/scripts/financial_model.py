@@ -26,24 +26,11 @@ def _finite(value: Any, field: str) -> float:
         raise ValueError(f"{field} 必须是有限数值。")
     try:
         number = float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
+    except (TypeError, ValueError) as exc:
         raise ValueError(f"{field} 必须是有限数值。") from exc
     if not math.isfinite(number):
         raise ValueError(f"{field} 必须是有限数值。")
     return number
-
-
-def _ensure_finite_values(value: Any, path: str = "report") -> None:
-    """Reject derived NaN/Infinity anywhere in a generated report."""
-    if isinstance(value, float):
-        if not math.isfinite(value):
-            raise ValueError(f"{path} 计算结果超出有限数值范围。")
-    elif isinstance(value, dict):
-        for key, item in value.items():
-            _ensure_finite_values(item, f"{path}.{key}")
-    elif isinstance(value, list):
-        for index, item in enumerate(value):
-            _ensure_finite_values(item, f"{path}[{index}]")
 
 
 def calculate_unit_economics(
@@ -83,7 +70,7 @@ def project_financials(
     monthly_other_cash_outflow: float,
 ) -> list[dict[str, Any]]:
     projections = []
-    opening_users = _finite(initial_active_users, "initial_active_users")
+    opening_users = float(initial_active_users)
     annual_retention = (1 - monthly_churn_rate / 100) ** 12
     for year in range(1, years + 1):
         ending_users = max(0.0, opening_users * (1 + annual_net_user_growth_rate / 100))
@@ -148,9 +135,9 @@ def calculate_liquidity(
 def generate_model(args: SimpleNamespace) -> dict[str, Any]:
     years = args.years
     initial_users = args.initial_active_users
-    if isinstance(years, bool) or not isinstance(years, int) or not 1 <= years <= 30:
+    if not isinstance(years, int) or not 1 <= years <= 30:
         raise ValueError("years 必须是 1–30 的整数。")
-    if isinstance(initial_users, bool) or not isinstance(initial_users, int) or initial_users < 0:
+    if not isinstance(initial_users, int) or initial_users < 0:
         raise ValueError("initial_active_users 必须是非负整数。")
 
     values = {
@@ -212,7 +199,7 @@ def generate_model(args: SimpleNamespace) -> dict[str, Any]:
         values["monthly_other_cash_outflow"],
         values["liquidity_buffer_months"],
     )
-    model = {
+    return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "inputs_as_of": as_of,
         "sources": sources,
@@ -235,8 +222,6 @@ def generate_model(args: SimpleNamespace) -> dict[str, Any]:
             "脚本不使用 LTV/CAC 或回本期阈值判断健康度，也不推荐融资轮次。",
         ],
     }
-    _ensure_finite_values(model)
-    return model
 
 
 def format_report(model: dict[str, Any]) -> str:
@@ -287,7 +272,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         model = generate_model(args)
-        output = json.dumps(model, ensure_ascii=False, indent=2, allow_nan=False)
+        output = json.dumps(model, ensure_ascii=False, indent=2)
         if args.output:
             output_path = Path(args.output).expanduser().resolve()
             output_path.write_text(output + "\n", encoding="utf-8")
@@ -297,7 +282,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(format_report(model))
         return 0
-    except (OSError, ValueError, OverflowError) as exc:
+    except (OSError, ValueError) as exc:
         if args.json:
             print(json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False))
         else:

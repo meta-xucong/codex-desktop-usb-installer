@@ -53,7 +53,7 @@ static RUNS: Mutex<RunRegistry> = Mutex::new(RunRegistry {
 pub(crate) fn verified_codex_runtime_for_catalog(
     cancelled: &AtomicBool,
     deadline: Instant,
-) -> Result<activation::VerifiedRuntime, &'static str> {
+) -> Result<activation::VerifiedRuntime, activation::VerifiedRuntimeFailure> {
     activation::verified_catalog_runtime(cancelled, deadline)
 }
 
@@ -790,6 +790,11 @@ pub struct NativeModelCatalogActionReport {
     pub restart_required: bool,
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    pub commit_state: String,
+    pub proof_state: String,
+    pub retryable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub connection_fingerprint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credential_fingerprint: Option<String>,
@@ -1190,6 +1195,10 @@ fn action_report(
         model_ids,
         restart_required: restart_required(),
         message: message.to_owned(),
+        error_code: None,
+        commit_state: "not_started".into(),
+        proof_state: "none".into(),
+        retryable: false,
         connection_fingerprint: None,
         credential_fingerprint: None,
     }
@@ -1500,6 +1509,9 @@ pub(crate) fn add_tested_model_to_catalog(
     expected_binding: &codex_usb_license::UsbAccountBinding,
     cancelled: &AtomicBool,
     reasoning: &crate::app::gateway_model_probe::ReasoningEvidence,
+    deadline: Instant,
+    consume_proof: impl FnOnce() -> Result<(), AppError>,
+    stage: &std::sync::atomic::AtomicU8,
 ) -> Result<NativeModelCatalogActionReport, AppError> {
     let home = codex_home_dir().ok_or_else(|| engine("无法确定 Codex 用户目录"))?;
     let expected_home = home.clone();
@@ -1509,22 +1521,29 @@ pub(crate) fn add_tested_model_to_catalog(
         owner,
         reasoning,
         cancelled,
-        || {
-            Ok(
-                usb_guard::authorized_account_binding()?.as_ref() == Some(expected_binding)
-                    && codex_home_dir().as_deref() == Some(expected_home.as_path()),
-            )
+        || match usb_guard::authorized_account_binding() {
+            Ok(binding) => {
+                let current = binding.as_ref() == Some(expected_binding)
+                    && codex_home_dir().as_deref() == Some(expected_home.as_path());
+                if !current {
+                    stage.store(5, AtomicOrdering::Release);
+                }
+                Ok(current)
+            }
+            Err(error) => {
+                stage.store(5, AtomicOrdering::Release);
+                Err(error)
+            }
         },
         || {
+            stage.store(1, AtomicOrdering::Release);
             #[cfg(windows)]
             {
-                model_native_probe::native_default_catalog(
-                    cancelled,
-                    Instant::now() + REFRESH_BUDGET,
-                )
-                .map_err(|error| {
+                let result =
+                    model_native_probe::native_default_catalog(request_id, cancelled, deadline);
+                result.map_err(|error| {
                     engine(format!(
-                        "无法读取当前 Codex 原生模型目录（{}）；未写入模型",
+                        "读取随包 Codex 默认模型清单失败（{}）；未写入模型",
                         error.code()
                     ))
                 })
@@ -1535,14 +1554,13 @@ pub(crate) fn add_tested_model_to_catalog(
             }
         },
         |bytes| {
+            stage.store(2, AtomicOrdering::Release);
             #[cfg(windows)]
             {
-                model_native_probe::validate_final_catalog(
-                    bytes,
-                    cancelled,
-                    Instant::now() + REFRESH_BUDGET,
-                )
-                .map_err(|error| {
+                let result = model_native_probe::validate_final_catalog(
+                    request_id, bytes, cancelled, deadline,
+                );
+                result.map_err(|error| {
                     engine(format!(
                         "当前 Codex 不接受此模型目录（{}）；未写入配置",
                         error.code()
@@ -1555,6 +1573,7 @@ pub(crate) fn add_tested_model_to_catalog(
                 Ok(())
             }
         },
+        consume_proof,
         || crate::app::gateway_model_probe::mark_catalog_commit_started(request_id),
         mark_restart_required,
     )
@@ -1620,6 +1639,7 @@ where
         is_current,
         initial_catalog,
         validate_catalog,
+        || Ok(()),
         mark_commit,
         mark_restart,
     )
@@ -1635,6 +1655,7 @@ fn add_tested_model_files_with_reasoning<F, I, V, C, M>(
     is_current: F,
     initial_catalog: I,
     validate_catalog: V,
+    consume_proof: impl FnOnce() -> Result<(), AppError>,
     mark_commit: C,
     mark_restart: M,
 ) -> Result<NativeModelCatalogActionReport, AppError>
@@ -1658,7 +1679,7 @@ where
     }
     let _files = FILE_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let _process_lock = model_selection_client::lock_configuration()
-        .map_err(|_| engine("另一个 Codex 配置操作正在进行，请稍后重试模型添加"))?;
+        .map_err(|_| AppError::Busy("另一个 Codex 配置操作正在进行，请稍后重试模型添加".into()))?;
     ensure_reset_not_pending(home)?;
     if cancelled.load(AtomicOrdering::Acquire) {
         return Err(engine("模型添加已取消；未修改 Codex 目录"));
@@ -1742,7 +1763,7 @@ where
         None if managed => {
             return Err(engine(
                 "Codex 已引用管理器模型目录但目录文件缺失；未重建或覆盖，请先恢复默认模型",
-            ))
+            ));
         }
         None => initial_catalog()?,
     };
@@ -1759,7 +1780,7 @@ where
     .iter()
     .map(|effort| json!({"effort":effort,"description":format!("{effort} reasoning effort")}))
     .collect::<Vec<_>>();
-    if let Some(existing) = models
+    let already_added = if let Some(existing) = models
         .iter_mut()
         .find(|entry| entry.get("slug").and_then(Value::as_str) == Some(model_id))
     {
@@ -1769,20 +1790,19 @@ where
             == Some(reasoning.default_effort.as_str())
             && existing.get("supported_reasoning_levels") == Some(&json!(supported))
         {
-            return Ok(action_report(
-                "already_added",
-                existing_ids,
-                "该模型已在 Codex 目录中",
-            ));
+            true
+        } else {
+            existing["default_reasoning_level"] = json!(reasoning.default_effort);
+            existing["supported_reasoning_levels"] = json!(supported);
+            false
         }
-        existing["default_reasoning_level"] = json!(reasoning.default_effort);
-        existing["supported_reasoning_levels"] = json!(supported);
     } else {
         let mut entry = conservative_tested_model_entry(model_id, owner, models.len() + 1);
         entry["default_reasoning_level"] = json!(reasoning.default_effort);
         entry["supported_reasoning_levels"] = json!(supported);
         models.push(entry);
-    }
+        false
+    };
     let resulting_ids = catalog_model_ids(&catalog_value)?;
     let catalog_bytes =
         serde_json::to_vec_pretty(&catalog_value).map_err(|_| engine("模型目录序列化失败"))?;
@@ -1805,10 +1825,24 @@ where
         || read_optional(&catalog_backup)? != catalog_backup_snapshot
         || cancelled.load(AtomicOrdering::Acquire)
     {
-        return Err(engine("配置或账户在写入前已变化；未覆盖其他修改"));
+        return Err(AppError::Busy(
+            "配置或账户在写入前已变化；未覆盖其他修改".into(),
+        ));
     }
     if cancelled.load(AtomicOrdering::Acquire) {
         return Err(engine("模型添加已取消；未修改 Codex 目录"));
+    }
+    // Proof consumption linearizes under FILE_LOCK after all local snapshots,
+    // account binding and candidate catalog validation succeeded, but before
+    // the first atomic write. Precommit failures therefore leave the proof
+    // available for a bounded retry.
+    consume_proof()?;
+    if already_added {
+        return Ok(action_report(
+            "already_added",
+            existing_ids,
+            "该模型已在 Codex 目录中",
+        ));
     }
     mark_commit();
     atomic_file::write_atomic(&catalog, &catalog_bytes).map_err(|error| {
@@ -2651,17 +2685,17 @@ where
     let cancelled = match RUNS.lock().unwrap_or_else(|e| e.into_inner()).begin(&id) {
         Ok(flag) => flag,
         Err(RunAdmission::Busy) => {
-            return Ok(report(&id, "busy", "探测请求仍在收尾，或取消登记已达上限"))
+            return Ok(report(&id, "busy", "探测请求仍在收尾，或取消登记已达上限"));
         }
         Err(RunAdmission::Cancelled) => {
-            return Ok(report(&id, "cancelled", "探测在开始前已取消；未修改目录"))
+            return Ok(report(&id, "cancelled", "探测在开始前已取消；未修改目录"));
         }
         Err(RunAdmission::Finished) => {
             return Ok(report(
                 &id,
                 "cancelled",
                 "该请求已结束；重试须使用新请求 ID",
-            ))
+            ));
         }
     };
     let _active = ActiveRun { id: id.clone() };
@@ -2696,7 +2730,7 @@ where
                 &id,
                 "skipped",
                 "当前 provider 未配置本地 Responses 探测",
-            ))
+            ));
         }
     };
     let target = runtime_target.await;
@@ -3566,6 +3600,7 @@ mod tests {
             || Ok(true),
             || Ok(empty_native_catalog()),
             |_| Ok(()),
+            || Ok(()),
             || {},
             || Ok(()),
         )
@@ -3610,6 +3645,7 @@ mod tests {
             || Ok(true),
             || Ok(empty_native_catalog()),
             |_| Ok(()),
+            || Ok(()),
             || {},
             || Ok(()),
         );
@@ -3648,6 +3684,7 @@ mod tests {
             || Ok(true),
             || Ok(empty_native_catalog()),
             |_| Ok(()),
+            || Ok(()),
             || {},
             || Ok(()),
         )
@@ -3685,6 +3722,7 @@ mod tests {
             || Ok(true),
             || Ok(empty_native_catalog()),
             |_| Ok(()),
+            || Ok(()),
             || {},
             || Ok(()),
         );
@@ -3711,12 +3749,155 @@ mod tests {
             || Ok(true),
             || Ok(empty_native_catalog()),
             |_| Ok(()),
+            || Ok(()),
             || {},
             || Ok(()),
         );
 
         assert!(result.unwrap_err().to_string().contains("思考档位证据无效"));
         assert!(!catalog_path_for(home.path()).exists());
+    }
+
+    #[test]
+    fn proof_expiring_at_write_boundary_blocks_first_catalog_write() {
+        let home = CatalogTempHome::new();
+        let committed = std::sync::atomic::AtomicBool::new(false);
+        let reasoning = crate::app::gateway_model_probe::ReasoningEvidence {
+            efforts: vec!["medium".into()],
+            default_effort: "medium".into(),
+        };
+        let result = add_tested_model_files_with_reasoning(
+            home.path(),
+            "vendor/model",
+            None,
+            &reasoning,
+            &AtomicBool::new(false),
+            || Ok(true),
+            || Ok(empty_native_catalog()),
+            |_| Ok(()),
+            || Err(engine("fixture proof expired")),
+            || committed.store(true, AtomicOrdering::Release),
+            || Ok(()),
+        );
+
+        assert!(result.is_err());
+        assert!(!committed.load(AtomicOrdering::Acquire));
+        assert!(!catalog_path_for(home.path()).exists());
+        assert!(!config_path_for(home.path()).exists());
+    }
+
+    #[test]
+    fn add_and_reset_are_serialized_at_the_real_catalog_file_transaction_boundary() {
+        let home = CatalogTempHome::new();
+        let home_for_add = home.0.clone();
+        let home_for_reset = home.0.clone();
+        let reasoning = crate::app::gateway_model_probe::ReasoningEvidence {
+            efforts: vec!["medium".into()],
+            default_effort: "medium".into(),
+        };
+        let cancelled = AtomicBool::new(false);
+        let commit_started = Arc::new(AtomicBool::new(false));
+        let commit_started_for_add = commit_started.clone();
+        let (at_consume_tx, at_consume_rx) = std::sync::mpsc::channel();
+        let (release_add_tx, release_add_rx) = std::sync::mpsc::channel();
+        let add = std::thread::spawn(move || {
+            add_tested_model_files_with_reasoning(
+                &home_for_add,
+                "vendor/transaction-race",
+                None,
+                &reasoning,
+                &cancelled,
+                || Ok(true),
+                || Ok(empty_native_catalog()),
+                |_| Ok(()),
+                || {
+                    at_consume_tx.send(()).unwrap();
+                    release_add_rx.recv().unwrap();
+                    Ok(())
+                },
+                || commit_started_for_add.store(true, AtomicOrdering::Release),
+                || Ok(()),
+            )
+        });
+        at_consume_rx.recv().unwrap();
+
+        let (reset_waiting_tx, reset_waiting_rx) = std::sync::mpsc::channel();
+        let reset = std::thread::spawn(move || {
+            // Prove the real reset path is queued behind the Add's FILE_LOCK,
+            // then let it run through reset_owned_catalog_at after Add releases.
+            loop {
+                match FILE_LOCK.try_lock() {
+                    Err(std::sync::TryLockError::WouldBlock) => break,
+                    Err(std::sync::TryLockError::Poisoned(_)) => break,
+                    Ok(guard) => drop(guard),
+                }
+                std::thread::yield_now();
+            }
+            reset_waiting_tx.send(()).unwrap();
+            reset_owned_catalog_at(&home_for_reset, || Ok(()))
+        });
+        reset_waiting_rx.recv().unwrap();
+        release_add_tx.send(()).unwrap();
+
+        let added = add.join().unwrap().unwrap();
+        let reset = reset.join().unwrap().unwrap();
+        assert_eq!(added.status, "applied_restart_pending");
+        assert!(commit_started.load(AtomicOrdering::Acquire));
+        assert_eq!(reset.status, "applied_restart_pending");
+        let final_state = catalog_state_for_home(home.path()).unwrap();
+        assert!(!final_state
+            .model_ids
+            .iter()
+            .any(|model_id| model_id == "vendor/transaction-race"));
+    }
+
+    #[test]
+    fn already_added_consumes_one_time_proof_without_rewriting_catalog() {
+        let home = CatalogTempHome::new();
+        let cancelled = AtomicBool::new(false);
+        let reasoning = crate::app::gateway_model_probe::ReasoningEvidence {
+            efforts: vec!["medium".into()],
+            default_effort: "medium".into(),
+        };
+        add_tested_model_files_with_validator(
+            home.path(),
+            "vendor/existing",
+            None,
+            &cancelled,
+            || Ok(true),
+            || Ok(empty_native_catalog()),
+            |_| Ok(()),
+            || {},
+            || Ok(()),
+        )
+        .unwrap();
+        let catalog_path = catalog_path_for(home.path());
+        let before = std::fs::read(&catalog_path).unwrap();
+        let consumed = AtomicBool::new(false);
+        let commit_started = AtomicBool::new(false);
+
+        let report = add_tested_model_files_with_reasoning(
+            home.path(),
+            "vendor/existing",
+            None,
+            &reasoning,
+            &cancelled,
+            || Ok(true),
+            || panic!("existing catalog must not be reseeded"),
+            |_| Ok(()),
+            || {
+                consumed.store(true, AtomicOrdering::Release);
+                Ok(())
+            },
+            || commit_started.store(true, AtomicOrdering::Release),
+            || Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(report.status, "already_added");
+        assert!(consumed.load(AtomicOrdering::Acquire));
+        assert!(!commit_started.load(AtomicOrdering::Acquire));
+        assert_eq!(std::fs::read(&catalog_path).unwrap(), before);
     }
 
     #[test]
@@ -5441,7 +5622,9 @@ mod tests {
     }
     #[test]
     fn managed_removal_preserves_user_settings_and_rejects_corruption() {
-        let text=format!("model = \"user-selected\"\r\n{CONFIG_BEGIN}\r\nmodel_catalog_json = \"owned.json\"\r\n{CONFIG_END}\r\n[other]\r\nx = 1\r\n");
+        let text = format!(
+            "model = \"user-selected\"\r\n{CONFIG_BEGIN}\r\nmodel_catalog_json = \"owned.json\"\r\n{CONFIG_END}\r\n[other]\r\nx = 1\r\n"
+        );
         assert_eq!(
             remove_managed_config(&text).unwrap(),
             "model = \"user-selected\"\r\n[other]\r\nx = 1\r\n"
