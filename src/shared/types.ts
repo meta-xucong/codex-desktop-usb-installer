@@ -306,7 +306,7 @@ export interface LocalMediaModelSettings {
 }
 
 export interface NativeModelCatalogActionRequest {
-  operation: "state" | "add" | "reset";
+  operation: "state" | "prepare" | "add" | "reset";
   requestId?: string;
   modelId?: string;
   connectivityProofId?: string;
@@ -461,8 +461,6 @@ export interface SkillRepoUpdateInfo {
   installableCount: number;
   conflictCount: number;
   skippedCount: number;
-  /** Product Design is a separate offline plugin, not part of Skill Hub's repo-skill count. */
-  productDesignSkillCount?: number | null;
   /** Reserved for a real non-fatal runtime notice; normal Skill Hub updates are null. */
   warning: string | null;
 }

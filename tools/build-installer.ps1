@@ -142,6 +142,9 @@ try {
             throw "CCSwitch EXE 缺少确认式 404token API Key 注入协议标记 $handoffMarker；拒绝继续打包：$ccswitchSource"
         }
     }
+    if (-not $ccswitchBinaryText.Contains("CODEX_USB_MCP_PRESERVATION_V1")) {
+        throw "CCSwitch EXE 缺少 USB Codex MCP 保留实现标记；拒绝打包可能覆盖 config.toml 的旧版本：$ccswitchSource"
+    }
     $ccswitchVerifier = Join-Path $CcswitchArtifactDir "verify-product.ps1"
     if (-not (Test-Path -LiteralPath $ccswitchVerifier -PathType Leaf)) {
         throw "CCSwitch 产物缺少必需的 verify-product.ps1；拒绝打包未经确认式 API Key 注入校验的版本"

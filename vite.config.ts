@@ -21,6 +21,7 @@ export default defineConfig({
       // suites. They are evidence, not part of this app's Vitest suite.
       ".tmp-*/**",
       ".release-worktree-*/**",
+      "release/**",
       "tmp/**",
       "installer-pack/**",
       "CCSwitch/CCSwitch/**",

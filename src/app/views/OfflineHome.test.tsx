@@ -665,7 +665,7 @@ describe("OfflineHome", () => {
     await waitFor(() => expect(api.installCapabilityPack).toHaveBeenCalledTimes(1));
     expect(api.installCapabilityPack.mock.calls[0]?.[0]).toMatchObject({
       persistConnections: true,
-      enableMediaGeneration: false,
+      enableMediaGeneration: true,
       mediaGatewayCatalogStatus: "verified",
       mediaGatewayModelCount: 2,
       image2Model: "",
@@ -673,7 +673,7 @@ describe("OfflineHome", () => {
       grokVideoModel: "",
       seedanceModel: "",
     });
-    expect(await screen.findByText(/媒体生成暂未启用/)).toBeInTheDocument();
+    expect(await screen.findByText(/媒体 MCP 已注册/)).toBeInTheDocument();
   });
 
   it("preserves saved media selections when the catalog request fails", async () => {
@@ -693,11 +693,11 @@ describe("OfflineHome", () => {
     await waitFor(() => expect(api.installCapabilityPack).toHaveBeenCalledTimes(1));
     expect(api.installCapabilityPack.mock.calls[0]?.[0]).toMatchObject({
       persistConnections: false,
-      enableMediaGeneration: false,
+      enableMediaGeneration: true,
       mediaGatewayCatalogStatus: "failed",
       image2Model: "",
     });
-    expect(await screen.findByText(/媒体生成暂未启用/)).toBeInTheDocument();
+    expect(await screen.findByText(/媒体 MCP 已注册/)).toBeInTheDocument();
   });
 
   it("keeps an existing media MCP enabled when the catalog is unavailable but local routes are configured", async () => {

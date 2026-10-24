@@ -6,7 +6,7 @@ import { outcomeIsPartial } from "../../shared/types";
 import { resolveFailure } from "../errorCopy";
 import { Icon } from "../icons";
 import { useI18n } from "../i18n";
-import { NavBar, Ring, Toggle, StatusBanner, Tooltip } from "../components";
+import { NavBar, Ring, StatusBanner, Tooltip } from "../components";
 import { codexHomeDisplay } from "../paths";
 import { currentPlatform } from "../platform";
 import { Sheet } from "../Sheet";
@@ -67,10 +67,11 @@ function mergeAncillaryRetryOutcome(
 
 const CCSWITCH_INSTALL_DISPLAY = "%LOCALAPPDATA%\\Programs\\CodexSwitch";
 const CCSWITCH_DATA_DISPLAY = "%USERPROFILE%\\.cc-switch";
-// Mirrors the existing Windows purge lists; these are display strings only,
-// not new cleanup targets or ownership-based authorization to erase data.
+// Mirrors the exact Windows purge targets, including the USB manager's
+// non-default CODEX_HOME where its sessions survive normal app reinstalls.
 const CODEX_WINDOWS_DATA_PATHS = [
   "%USERPROFILE%\\.codex",
+  "%LOCALAPPDATA%\\CodexAppManager\\usb-codex-home",
   "%USERPROFILE%\\.agents\\skills",
   "%LOCALAPPDATA%\\Packages\\OpenAI.Codex_2p2nqsd0c76g0",
   "%LOCALAPPDATA%\\OpenAI\\Codex",
@@ -99,15 +100,6 @@ export function Uninstall({
   const win = platform === "windows";
   const bundledWindows = win && bundleMode;
   const codexHome = codexHomeDisplay(platform);
-  // Default to keeping the user's data (~/.codex on mac, %USERPROFILE%\.codex on
-  // Windows). Opting out is deliberate.
-  const [keepData, setKeepData] = useState(true);
-  const [purgeCodexData, setPurgeCodexData] = useState(true);
-  const [purgeCcswitchData, setPurgeCcswitchData] = useState(true);
-  // USB bundle removal is intentionally a complete local product cleanup by
-  // default. The user can turn either data class off in Advanced, but the
-  // final confirmation remains mandatory before any shared profile is erased.
-  const [forceManagerCleanup, setForceManagerCleanup] = useState(true);
   const [cleanupPending, setCleanupPending] = useState(false);
   const [sharedCleanupDeferred, setSharedCleanupDeferred] = useState(false);
   const [cleanupHandoffId, setCleanupHandoffId] = useState<string | null>(null);
@@ -134,10 +126,6 @@ export function Uninstall({
   const confirm2BodyId = useId();
   const purgeRetryTitleId = useId();
   const purgeRetryBodyId = useId();
-  const keepDataTitleId = useId();
-  const purgeCodexTitleId = useId();
-  const purgeCcswitchTitleId = useId();
-  const purgeManagerTitleId = useId();
 
   const refreshProbe = useCallback(async () => {
     setProbe("loading");
@@ -190,17 +178,12 @@ export function Uninstall({
     setCleanupHandoffId(null);
     setHandoffBusy(false);
     try {
-      // mac keeps ~/.codex via keepCodexHome; win purges via purgeUserData (the
-      // inverse) — both surface the backend message as the source of truth.
+      // An uninstall always removes app data as well as the program. The
+      // second confirmation explains the irreversible shared-profile cleanup.
       if (win) {
         const r = bundledWindows
-          ? await managerApi.winUninstallBundle(
-            true,
-            purgeCodexData,
-            purgeCcswitchData,
-            forceManagerCleanup,
-          )
-          : await managerApi.winUninstall(true, !keepData);
+          ? await managerApi.winUninstallBundle(true, true, true, true)
+          : await managerApi.winUninstall(true, true);
         if (!r.success || !r.outcome.primaryOk) {
           setError(t("uninstall.failed"));
           setErrorDetail([
@@ -240,7 +223,7 @@ export function Uninstall({
         }
         setDone(r.message);
       } else {
-        const r = await managerApi.macUninstall(keepData);
+        const r = await managerApi.macUninstall(false);
         if (r.removed && outcomeIsPartial(r.outcome)) {
           setPartialOutcome(r.outcome);
           setDone(t("uninstall.partial.summary"));
@@ -317,30 +300,24 @@ export function Uninstall({
     }
   };
 
-  // First confirm → run when keeping data; otherwise escalate to a second,
-  // explicit data-erasure confirm before doing anything destructive.
+  // Uninstall always erases local app data, so require the explicit final
+  // data-erasure confirmation on every platform and install mode.
   const onFirstConfirm = () => {
-    if (bundledWindows
-      ? !purgeCodexData && !purgeCcswitchData && !forceManagerCleanup
-      : keepData) {
-      void run();
-    } else {
-      setConfirmStep(2);
-    }
+    setConfirmStep(2);
   };
 
-  const dataPaths = codexHome;
-  const selectedSharedData = purgeCodexData || purgeCcswitchData || forceManagerCleanup;
+  const dataPaths = win ? CODEX_WINDOWS_DATA_PATHS : codexHome;
   const bundleSelection = (
     <div className="uninstall-selection">
-      <p><strong>{t(purgeCodexData ? "uninstall.bundle.codexErase" : "uninstall.bundle.codexKeep")}</strong>
+      <p>
+        <strong>{t("uninstall.bundle.codexErase")}</strong>
         <span className="rsub mono path" style={DATA_PATH_STYLE}>{CODEX_WINDOWS_DATA_PATHS}</span>
-        {!purgeCodexData ? <span className="rsub">{t("uninstall.bundle.codexKeepNote")}</span> : null}
       </p>
-    <p><strong>{t(purgeCcswitchData ? "uninstall.bundle.ccswitchErase" : "uninstall.bundle.ccswitchKeep")}</strong>
+      <p>
+        <strong>{t("uninstall.bundle.ccswitchErase")}</strong>
         <span className="rsub mono path" style={DATA_PATH_STYLE}>{CCSWITCH_DATA_PATHS}</span>
       </p>
-      <p><strong>{t(forceManagerCleanup ? "uninstall.bundle.purgeManager" : "uninstall.bundle.managerKeep")}</strong></p>
+      <p><strong>{t("uninstall.bundle.purgeManager")}</strong></p>
       <p>{t("uninstall.bundle.mediaKeep")}</p>
     </div>
   );
@@ -532,20 +509,6 @@ export function Uninstall({
                   </Tooltip>
                 </div>
               ) : null}
-              {!bundledWindows ? <div className="row">
-                <span className="rtext">
-                  <span className="rtitle" id={keepDataTitleId}>{t("uninstall.keepData")}</span>
-                  <span className="rsub">
-                    {t("uninstall.keepDataNote", { path: codexHome })}
-                  </span>
-                </span>
-                <Toggle
-                  ariaLabelledBy={keepDataTitleId}
-                  checked={keepData}
-                  onChange={setKeepData}
-                  disabled={busy || !canUninstall}
-                />
-              </div> : null}
             </div>
 
             {bundledWindows ? (
@@ -565,62 +528,17 @@ export function Uninstall({
             ) : null}
 
             {bundledWindows ? (
-              <details className="manual-existing-meta uninstall-advanced">
-                <summary>{t("uninstall.bundle.advanced")}</summary>
-                <p className="uninstall-detail-copy">{t("uninstall.bundle.sharedRisk")}</p>
-                <div className="list">
-                  <div className={`row data-path-row${purgeCodexData ? " danger" : ""}`}>
-                    <span className="rtext">
-                      <span className="rtitle" id={purgeCodexTitleId}>{t("uninstall.bundle.purgeCodex")}</span>
-                    </span>
-                    <Tooltip content={`${t("uninstall.bundle.codexRisk")}\n\n${CODEX_WINDOWS_DATA_PATHS}`}>
-                      <span className="tooltip-icon" aria-label={t("themes.details")}>
-                        <Icon name="info" />
-                      </span>
-                    </Tooltip>
-                    <Toggle ariaLabelledBy={purgeCodexTitleId} checked={purgeCodexData}
-                      onChange={setPurgeCodexData} disabled={busy || !canUninstall} />
-                  </div>
-                  <div className={`row data-path-row${purgeCcswitchData ? " danger" : ""}`}>
-                    <span className="rtext">
-                      <span className="rtitle" id={purgeCcswitchTitleId}>{t("uninstall.bundle.purgeCcswitch")}</span>
-                    </span>
-                    <Tooltip content={`${t("uninstall.bundle.ccswitchRisk")}\n\n${CCSWITCH_DATA_PATHS}`}>
-                      <span className="tooltip-icon" aria-label={t("themes.details")}>
-                        <Icon name="info" />
-                      </span>
-                    </Tooltip>
-                    <Toggle ariaLabelledBy={purgeCcswitchTitleId} checked={purgeCcswitchData}
-                      onChange={setPurgeCcswitchData} disabled={busy || !canUninstall} />
-                  </div>
-                  <div className={`row data-path-row${forceManagerCleanup ? " danger" : ""}`}>
-                    <span className="rtext">
-                      <span className="rtitle" id={purgeManagerTitleId}>{t("uninstall.bundle.purgeManager")}</span>
-                    </span>
-                    <Tooltip content={t("uninstall.bundle.managerRisk")}>
-                      <span className="tooltip-icon" aria-label={t("themes.details")}>
-                        <Icon name="info" />
-                      </span>
-                    </Tooltip>
-                    <Toggle
-                      ariaLabelledBy={purgeManagerTitleId}
-                      checked={forceManagerCleanup}
-                      onChange={setForceManagerCleanup}
-                      disabled={busy || !canUninstall}
-                    />
-                  </div>
-                </div>
-              </details>
+              <p className="uninstall-detail-copy">{t("uninstall.bundle.sharedRisk")}</p>
             ) : null}
 
             {probe === "managed" && !bundledWindows ? (
               <div className="list">
-                <div className={`row data-path-row${keepData ? "" : " danger"}`}>
+                <div className="row data-path-row danger">
                   <span className="rtext">
                     <span className="rtitle">
                       {t("uninstall.dataPath")}
                     </span>
-                    <span className="rsub mono path">{codexHome}</span>
+                    <span className="rsub mono path" style={win ? DATA_PATH_STYLE : undefined}>{dataPaths}</span>
                     <span className="rsub">
                       {t("uninstall.dataAffects")}
                     </span>
@@ -677,11 +595,7 @@ export function Uninstall({
           {t(bundledWindows ? "uninstall.bundle.confirm1.title" : "uninstall.confirm1.title")}
         </h3>
         <p id={confirm1BodyId}>
-          {bundledWindows
-            ? t("uninstall.bundle.confirm1.scope")
-            : keepData
-              ? t("uninstall.confirm1.bodyKeep", { path: codexHome })
-              : t("uninstall.confirm1.bodyPurge")}
+          {bundledWindows ? t("uninstall.bundle.confirm1.scope") : t("uninstall.confirm1.bodyPurge")}
         </p>
         {bundledWindows ? bundleSelection : null}
         <div className="row2 sheet-actions">
@@ -707,8 +621,8 @@ export function Uninstall({
         </h3>
         <p id={confirm2BodyId}>
           {bundledWindows
-            ? t(selectedSharedData ? "uninstall.bundle.confirm2.selected" : "uninstall.bundle.mediaKeep")
-            : t("uninstall.confirm2.body", { path: codexHome })}
+            ? t("uninstall.bundle.confirm2.selected")
+            : t("uninstall.confirm2.body", { path: dataPaths })}
         </p>
         {bundledWindows ? bundleSelection : null}
         <div className="row2 sheet-actions">

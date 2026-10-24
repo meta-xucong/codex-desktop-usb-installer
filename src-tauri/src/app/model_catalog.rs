@@ -36,12 +36,17 @@ const RESET_PENDING_FILE_NAME: &str = "codex-usb-native-model-catalog.reset-pend
 const RESET_PENDING_CONTENTS: &[u8] = b"404token-unified-api-internal:model-catalog-reset:v1\n";
 const CATALOG_IDENTITY: &str = "404token-unified-api-internal";
 pub(crate) const CATALOG_CLIENT_VERSION: &str = "codex-usb-gateway-2";
-pub(crate) const MODEL_BASE_INSTRUCTIONS: &str = "You are Codex, a coding agent. Help the user with software engineering tasks by inspecting the workspace, making focused changes, and verifying your work.";
+const LEGACY_MODEL_BASE_INSTRUCTIONS: &str = "You are Codex, a coding agent. Help the user with software engineering tasks by inspecting the workspace, making focused changes, and verifying your work.";
+const LEGACY_FALLBACK_MODEL_BASE_INSTRUCTIONS: &str = "You are Codex, a coding agent. Help users with software engineering tasks by inspecting the workspace, making focused changes, and verifying your work.";
+const LEGACY_MODEL_DESCRIPTION: &str = "Text model supplied by the configured gateway; only one text response was verified.";
+const MODEL_DESCRIPTION: &str = "Gateway model supplied by the configured provider; text response verified, image understanding not separately tested.";
+pub(crate) const MODEL_BASE_INSTRUCTIONS: &str = "You are Codex, a coding agent. Help with software engineering by inspecting the workspace, making focused changes, and verifying your work. Use only tools and capabilities available in this session. Claim image observations or successful actions only when supported by tool output. If image input or a tool is explicitly unsupported, report the limitation, do not invent results or repeat the same failing call, and continue only with supported work or ask for usable input. For external-provider delegation, prefer local sequential work; if a handoff is opaque or unconfirmed, do not decode or loop-retry it, and continue locally. On Windows, use the active shell syntax, configured USB Python runtime, and UTF-8 for text/JSON. State completion only from visible evidence.";
 const CONFIG_BEGIN: &str = "# BEGIN CODEX-USB-NATIVE-MODEL-CATALOG v1";
 const CONFIG_END: &str = "# END CODEX-USB-NATIVE-MODEL-CATALOG v1";
 static REFRESH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static CATALOG_MUTATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 pub(crate) static FILE_LOCK: Mutex<()> = Mutex::new(());
+static PREPARED_NATIVE_CATALOG: Mutex<Option<(PathBuf, Value)>> = Mutex::new(None);
 static RELOAD_MARKER_LOCK: Mutex<()> = Mutex::new(());
 const RUN_HISTORY_LIMIT: usize = 256;
 static RUNS: Mutex<RunRegistry> = Mutex::new(RunRegistry {
@@ -1068,7 +1073,7 @@ fn conservative_tested_model_entry(model_id: &str, owner: Option<&str>, priority
     json!({
         "slug": model_id,
         "display_name": display_name,
-        "description": "Text model supplied by the configured gateway; only one text response was verified.",
+        "description": MODEL_DESCRIPTION,
         "shell_type": "unified_exec",
         "visibility": "list",
         "supported_in_api": true,
@@ -1078,9 +1083,12 @@ fn conservative_tested_model_entry(model_id: &str, owner: Option<&str>, priority
         "service_tiers": [],
         "availability_nux": null,
         "upgrade": null,
-        "include_skills_usage_instructions": false,
-        "include_plugin_usage_instructions": false,
-        "include_apps_usage_instructions": false,
+        // These switches control whether Codex tells the model how to use
+        // capabilities supplied by the host. Do not suppress those
+        // instructions just because the gateway model has only been text-tested.
+        "include_skills_usage_instructions": true,
+        "include_plugin_usage_instructions": true,
+        "include_apps_usage_instructions": true,
         "default_verbosity": null,
         "apply_patch_tool_type": null,
         "truncation_policy": {"mode": "bytes", "limit": 10000},
@@ -1088,10 +1096,8 @@ fn conservative_tested_model_entry(model_id: &str, owner: Option<&str>, priority
         "supports_image_detail_original": false,
         "comp_hash": null,
         "experimental_supported_tools": [],
-        "input_modalities": ["text"],
         "supports_search_tool": false,
         "node_repl_auto_review_required": false,
-        "node_repl_disabled": true,
         "default_reasoning_level": null,
         "supported_reasoning_levels": []
     })
@@ -1264,6 +1270,51 @@ fn empty_native_catalog() -> Value {
     })
 }
 
+fn validate_catalog_for_add(
+    bytes: &[u8],
+    model_id: &str,
+    reasoning: &crate::app::gateway_model_probe::ReasoningEvidence,
+) -> Result<(), AppError> {
+    let value: Value = serde_json::from_slice(bytes)
+        .map_err(|_| engine("模型目录序列化结果无效；未写入"))?;
+    let ids = catalog_model_ids(&value)?;
+    if ids.iter().collect::<BTreeSet<_>>().len() != ids.len() {
+        return Err(engine("模型目录含重复标识；未写入"));
+    }
+    let entry = value
+        .get("models")
+        .and_then(Value::as_array)
+        .and_then(|models| {
+            models
+                .iter()
+                .find(|entry| entry.get("slug").and_then(Value::as_str) == Some(model_id))
+        })
+        .ok_or_else(|| engine("新模型未进入候选目录；未写入"))?;
+    if entry.get("default_reasoning_level").and_then(Value::as_str)
+        != Some(reasoning.default_effort.as_str())
+    {
+        return Err(engine("新模型默认思考档位与探测结果不一致；未写入"));
+    }
+    let levels = entry
+        .get("supported_reasoning_levels")
+        .and_then(Value::as_array)
+        .ok_or_else(|| engine("新模型缺少已验证的思考档位；未写入"))?;
+    let stored = levels
+        .iter()
+        .filter_map(|level| level.get("effort").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    let expected = crate::app::gateway_model_probe::canonical_reasoning_efforts(
+        model_id,
+        &reasoning.efforts,
+    );
+    if stored.len() != expected.len()
+        || !expected.iter().all(|effort| stored.contains(&effort.as_str()))
+    {
+        return Err(engine("新模型思考档位与探测结果不一致；未写入"));
+    }
+    Ok(())
+}
+
 fn validated_catalog_candidate<V>(
     bytes: &[u8],
     validate_catalog: &V,
@@ -1308,6 +1359,23 @@ fn normalize_legacy_model_entries(catalog: &mut Value) -> Result<bool, AppError>
         let entry = row
             .as_object_mut()
             .ok_or_else(|| engine("模型目录包含无效条目，已保留原文件"))?;
+
+        // Match before the schema repairs below can supply missing fields.
+        // Existing include_* switches may be deliberate user choices.
+        if entry.get("description").and_then(Value::as_str) == Some(LEGACY_MODEL_DESCRIPTION)
+            && entry.get("base_instructions").and_then(Value::as_str)
+                == Some(LEGACY_MODEL_BASE_INSTRUCTIONS)
+            && entry.get("input_modalities") == Some(&json!(["text"]))
+            && !entry.contains_key("model_messages")
+        {
+            entry.remove("input_modalities");
+            entry.insert("description".into(), Value::String(MODEL_DESCRIPTION.into()));
+            entry.insert(
+                "base_instructions".into(),
+                Value::String(MODEL_BASE_INSTRUCTIONS.into()),
+            );
+            changed = true;
+        }
 
         for key in [
             "default_reasoning_summary",
@@ -1359,7 +1427,7 @@ fn normalize_legacy_model_entries(catalog: &mut Value) -> Result<bool, AppError>
             }
             entry.insert(
                 "base_instructions".into(),
-                Value::String(MODEL_BASE_INSTRUCTIONS.into()),
+                Value::String(LEGACY_FALLBACK_MODEL_BASE_INSTRUCTIONS.into()),
             );
             changed = true;
         }
@@ -1502,76 +1570,186 @@ pub(crate) fn preflight_usb_catalog() -> Result<(), AppError> {
     Ok(())
 }
 
+/// Prepare all first-import-only local prerequisites before the UI sends any
+/// paid reasoning probes. The native catalog is cached in memory so Add never
+/// has to launch Codex after an upstream effort has already passed.
+fn prepare_model_add(
+    request_id: &str,
+    model_id: &str,
+) -> Result<NativeModelCatalogActionReport, AppError> {
+    if !safe_identifier(request_id) || !safe_identifier(model_id) {
+        return Err(engine("模型添加准备请求无效"));
+    }
+    let home = codex_home_dir().ok_or_else(|| engine("无法确定 Codex 用户目录"))?;
+    let _files = FILE_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _process_lock = model_selection_client::lock_configuration()
+        .map_err(|_| AppError::Busy("另一个 Codex 配置操作正在进行，请稍后重试模型添加".into()))?;
+    ensure_reset_not_pending(&home)?;
+
+    let config = config_path_for(&home);
+    let config_backup = atomic_file::backup_path(&config);
+    let catalog = catalog_path_for(&home);
+    let catalog_backup = atomic_file::backup_path(&catalog);
+    regular_or_absent(&config)?;
+    regular_or_absent(&config_backup)?;
+    regular_or_absent(&catalog)?;
+    regular_or_absent(&catalog_backup)?;
+    if catalog_backup.exists() && !owned_json(&catalog_backup, CATALOG_IDENTITY) {
+        return Err(engine("模型目录备份不归本管理器所有，未覆盖"));
+    }
+
+    let config_snapshot = read_optional(&config)?;
+    let config_backup_snapshot = read_optional(&config_backup)?;
+    let catalog_backup_snapshot = read_optional(&catalog_backup)?;
+    let config_text = config_snapshot
+        .as_deref()
+        .map(std::str::from_utf8)
+        .transpose()
+        .map_err(|_| engine("Codex 配置不是 UTF-8，未发送思考档位探测"))?
+        .unwrap_or("");
+    let (cleaned_config, managed) = cleaned_config_without_external_catalog(config_text, &config)?;
+
+    let catalog_bytes = read_optional(&catalog)?;
+    let needs_seed = match catalog_bytes.as_deref() {
+        Some(bytes) => {
+            if bytes.len() > BODY_LIMIT {
+                return Err(engine("本地模型目录超过大小限制；未发送思考档位探测"));
+            }
+            let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+            let mut value: Value = serde_json::from_slice(bytes)
+                .map_err(|_| engine("本地模型目录格式无效；请先复位模型目录"))?;
+            if value.get("identity").and_then(Value::as_str) != Some(CATALOG_IDENTITY) {
+                return Err(engine("模型目录不归本管理器所有；未发送思考档位探测"));
+            }
+            normalize_legacy_model_entries(&mut value).map_err(|error| {
+                engine(format!("模型目录需要先修复，未发送思考档位探测：{error}"))
+            })?;
+            let ids = catalog_model_ids(&value)?;
+            if ids.iter().collect::<BTreeSet<_>>().len() != ids.len() {
+                return Err(engine("模型目录包含重复模型标识；请先复位模型目录"));
+            }
+            if ids.iter().any(|id| id == model_id) {
+                if managed {
+                    return Ok(action_report("already_added", ids, "该模型已在 Codex 目录中"));
+                }
+                reattach_detached_catalog(
+                    &config,
+                    &catalog,
+                    &cleaned_config,
+                    config_snapshot.as_deref(),
+                    config_backup_snapshot.as_deref(),
+                    catalog_bytes.as_deref(),
+                    catalog_backup_snapshot.as_deref(),
+                    || Ok(()),
+                )?;
+                let mut report = action_report(
+                    "applied_restart_pending",
+                    ids,
+                    "已重新启用现有模型目录；重启 Codex 后生效",
+                );
+                if mark_restart_required().is_err() {
+                    report.message = "现有模型目录已重新启用，但重载标记写入失败；请手动重启 Codex".into();
+                }
+                return Ok(report);
+            }
+            if !ids.is_empty() {
+                return Ok(action_report("ready", ids, "模型目录已就绪"));
+            }
+            if managed {
+                return Err(engine("当前启用的管理器模型目录为空；请先恢复默认模型后再添加"));
+            }
+            true
+        }
+        None if managed => {
+            return Err(engine("Codex 已引用管理器模型目录但目录文件缺失；请先恢复默认模型"));
+        }
+        None => true,
+    };
+
+    if !needs_seed {
+        return Ok(action_report("ready", Vec::new(), "模型目录已就绪"));
+    }
+    if let Some((prepared_home, _)) = PREPARED_NATIVE_CATALOG
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .as_ref()
+    {
+        if prepared_home == &home {
+            return Ok(action_report("ready", Vec::new(), "Codex 默认模型目录已准备"));
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        // Do not hold the shared Codex configuration locks while the bundled
+        // CLI extracts and prints its native model catalogue.
+        drop(_process_lock);
+        drop(_files);
+        let cancelled = AtomicBool::new(false);
+        let deadline = Instant::now() + Duration::from_secs(10 * 60);
+        let seed = model_native_probe::native_default_catalog(request_id, &cancelled, deadline)
+            .map_err(|error| engine(format!("准备 Codex 默认模型目录失败（{}）", error.code())))?;
+        let ids = catalog_model_ids(&seed)?;
+        if ids.is_empty() || ids.iter().collect::<BTreeSet<_>>().len() != ids.len() {
+            return Err(engine("Codex 默认模型目录为空或含重复标识；未发送思考档位探测"));
+        }
+        let _files = FILE_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _process_lock = model_selection_client::lock_configuration()
+            .map_err(|_| AppError::Busy("Codex 配置操作正在进行；未发送思考档位探测".into()))?;
+        ensure_reset_not_pending(&home)?;
+        if read_optional(&config)? != config_snapshot
+            || read_optional(&config_backup)? != config_backup_snapshot
+            || read_optional(&catalog)? != catalog_bytes
+            || read_optional(&catalog_backup)? != catalog_backup_snapshot
+        {
+            return Err(engine("Codex 配置在准备期间发生变化；未发送思考档位探测，请重试"));
+        }
+        *PREPARED_NATIVE_CATALOG
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some((home, seed));
+        return Ok(action_report("ready", ids, "Codex 默认模型目录已准备"));
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = request_id;
+        Err(engine("当前平台无法准备 Codex 默认模型目录；未发送思考档位探测"))
+    }
+}
+
+fn prepared_native_catalog(home: &Path) -> Result<Value, AppError> {
+    PREPARED_NATIVE_CATALOG
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .as_ref()
+        .filter(|(prepared_home, _)| prepared_home == home)
+        .map(|(_, catalog)| catalog.clone())
+        .ok_or_else(|| engine("本地目录未在上游探测前准备；未执行添加"))
+}
+
 pub(crate) fn add_tested_model_to_catalog(
     request_id: &str,
     model_id: &str,
     owner: Option<&str>,
-    expected_binding: &codex_usb_license::UsbAccountBinding,
     cancelled: &AtomicBool,
     reasoning: &crate::app::gateway_model_probe::ReasoningEvidence,
-    deadline: Instant,
     consume_proof: impl FnOnce() -> Result<(), AppError>,
     stage: &std::sync::atomic::AtomicU8,
 ) -> Result<NativeModelCatalogActionReport, AppError> {
     let home = codex_home_dir().ok_or_else(|| engine("无法确定 Codex 用户目录"))?;
-    let expected_home = home.clone();
     add_tested_model_files_with_reasoning(
         &home,
         model_id,
         owner,
         reasoning,
         cancelled,
-        || match usb_guard::authorized_account_binding() {
-            Ok(binding) => {
-                let current = binding.as_ref() == Some(expected_binding)
-                    && codex_home_dir().as_deref() == Some(expected_home.as_path());
-                if !current {
-                    stage.store(5, AtomicOrdering::Release);
-                }
-                Ok(current)
-            }
-            Err(error) => {
-                stage.store(5, AtomicOrdering::Release);
-                Err(error)
-            }
-        },
+        || Ok(true),
         || {
             stage.store(1, AtomicOrdering::Release);
-            #[cfg(windows)]
-            {
-                let result =
-                    model_native_probe::native_default_catalog(request_id, cancelled, deadline);
-                result.map_err(|error| {
-                    engine(format!(
-                        "读取随包 Codex 默认模型清单失败（{}）；未写入模型",
-                        error.code()
-                    ))
-                })
-            }
-            #[cfg(not(windows))]
-            {
-                Err(engine("当前平台无法读取 Codex 原生模型目录；未写入模型"))
-            }
+            prepared_native_catalog(&home)
         },
         |bytes| {
             stage.store(2, AtomicOrdering::Release);
-            #[cfg(windows)]
-            {
-                let result = model_native_probe::validate_final_catalog(
-                    request_id, bytes, cancelled, deadline,
-                );
-                result.map_err(|error| {
-                    engine(format!(
-                        "当前 Codex 不接受此模型目录（{}）；未写入配置",
-                        error.code()
-                    ))
-                })
-            }
-            #[cfg(not(windows))]
-            {
-                let _ = bytes;
-                Ok(())
-            }
+            validate_catalog_for_add(bytes, model_id, reasoning)
         },
         consume_proof,
         || crate::app::gateway_model_probe::mark_catalog_commit_started(request_id),
@@ -1708,26 +1886,6 @@ where
         .transpose()
         .map_err(|_| engine("Codex 配置不是 UTF-8，模型未添加"))?
         .unwrap_or("");
-    let parsed_config: toml::Value = toml::from_str(config_text)
-        .map_err(|_| engine("Codex 配置无法安全读取；保留原配置，未写入模型"))?;
-    if let Some(global_effort) = parsed_config
-        .get("model_reasoning_effort")
-        .and_then(toml::Value::as_str)
-    {
-        if !reasoning
-            .efforts
-            .iter()
-            .any(|effort| effort == global_effort)
-        {
-            return Err(engine(format!(
-                "全局思考档位“{global_effort}”不在此模型当前路由接受的档位中。安装器保留了全局设置；请在 Codex 设置中调整后重新测试。"
-            )));
-        }
-    } else if parsed_config.get("model_reasoning_effort").is_some() {
-        return Err(engine(
-            "全局思考档位设置格式无法识别；保留原配置，未写入模型",
-        ));
-    }
     let (cleaned_config, managed) = cleaned_config_without_external_catalog(config_text, &config)?;
     let catalog_snapshot = read_optional(&catalog)?;
     let mut catalog_value = match catalog_snapshot.as_deref() {
@@ -1780,29 +1938,58 @@ where
     .iter()
     .map(|effort| json!({"effort":effort,"description":format!("{effort} reasoning effort")}))
     .collect::<Vec<_>>();
-    let already_added = if let Some(existing) = models
-        .iter_mut()
-        .find(|entry| entry.get("slug").and_then(Value::as_str) == Some(model_id))
+    if models
+        .iter()
+        .any(|entry| entry.get("slug").and_then(Value::as_str) == Some(model_id))
     {
-        if existing
-            .get("default_reasoning_level")
-            .and_then(Value::as_str)
-            == Some(reasoning.default_effort.as_str())
-            && existing.get("supported_reasoning_levels") == Some(&json!(supported))
-        {
-            true
-        } else {
-            existing["default_reasoning_level"] = json!(reasoning.default_effort);
-            existing["supported_reasoning_levels"] = json!(supported);
-            false
+        if managed {
+            consume_proof()?;
+            return Ok(action_report(
+                "already_added",
+                existing_ids,
+                "该模型已在 Codex 目录中",
+            ));
         }
-    } else {
-        let mut entry = conservative_tested_model_entry(model_id, owner, models.len() + 1);
-        entry["default_reasoning_level"] = json!(reasoning.default_effort);
-        entry["supported_reasoning_levels"] = json!(supported);
-        models.push(entry);
-        false
-    };
+        if !is_current()?
+            || read_optional(&config)? != config_snapshot
+            || read_optional(&config_backup)? != config_backup_snapshot
+            || read_optional(&catalog)? != catalog_snapshot
+            || read_optional(&catalog_backup)? != catalog_backup_snapshot
+            || cancelled.load(AtomicOrdering::Acquire)
+        {
+            return Err(AppError::Busy(
+                "配置或账户在写入前已变化；未覆盖其他修改".into(),
+            ));
+        }
+        reattach_detached_catalog(
+            &config,
+            &catalog,
+            &cleaned_config,
+            config_snapshot.as_deref(),
+            config_backup_snapshot.as_deref(),
+            catalog_snapshot.as_deref(),
+            catalog_backup_snapshot.as_deref(),
+            || {
+                consume_proof()?;
+                mark_commit();
+                Ok(())
+            },
+        )?;
+        let message = if mark_restart().is_err() {
+            "现有模型目录已重新启用，但重载标记写入失败；请手动重启 Codex"
+        } else {
+            "现有模型目录已重新启用；重启 Codex 后生效"
+        };
+        return Ok(action_report(
+            "applied_restart_pending",
+            existing_ids,
+            message,
+        ));
+    }
+    let mut entry = conservative_tested_model_entry(model_id, owner, models.len() + 1);
+    entry["default_reasoning_level"] = json!(reasoning.default_effort);
+    entry["supported_reasoning_levels"] = json!(supported);
+    models.push(entry);
     let resulting_ids = catalog_model_ids(&catalog_value)?;
     let catalog_bytes =
         serde_json::to_vec_pretty(&catalog_value).map_err(|_| engine("模型目录序列化失败"))?;
@@ -1837,13 +2024,6 @@ where
     // the first atomic write. Precommit failures therefore leave the proof
     // available for a bounded retry.
     consume_proof()?;
-    if already_added {
-        return Ok(action_report(
-            "already_added",
-            existing_ids,
-            "该模型已在 Codex 目录中",
-        ));
-    }
     mark_commit();
     atomic_file::write_atomic(&catalog, &catalog_bytes).map_err(|error| {
         log::warn!("model catalog atomic write failed: {error}");
@@ -1910,25 +2090,6 @@ where
     {
         log::warn!("could not refresh validated model catalog recovery point: {error}");
     }
-    let readback_catalog = read_optional(&catalog)?
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .and_then(|value| catalog_model_ids(&value).ok());
-    let expected_config_active = if managed {
-        true
-    } else {
-        read_optional(&config)?
-            .as_deref()
-            .and_then(|bytes| std::str::from_utf8(bytes).ok())
-            .and_then(|text| validate_managed_catalog_reference(text, &config).ok())
-            .unwrap_or(false)
-    };
-    if readback_catalog.as_deref() != Some(resulting_ids.as_slice()) || !expected_config_active {
-        return Ok(action_report(
-            "outcome_unconfirmed",
-            readback_catalog.unwrap_or_default(),
-            "目录写入后的回读与预期不一致；请重新打开管理器确认实际状态",
-        ));
-    }
     if mark_restart().is_err() {
         return Ok(action_report(
             "applied_restart_pending",
@@ -1971,6 +2132,9 @@ fn ensure_reset_not_pending(home: &Path) -> Result<(), AppError> {
 }
 
 fn reset_owned_catalog() -> Result<NativeModelCatalogActionReport, AppError> {
+    *PREPARED_NATIVE_CATALOG
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = None;
     activation::invalidate_live();
     let home = codex_home_dir().ok_or_else(|| engine("无法确定 Codex 用户目录"))?;
     reset_owned_catalog_at(&home, mark_restart_required)
@@ -2221,6 +2385,20 @@ pub async fn manage_native_model_catalog(
 ) -> Result<NativeModelCatalogActionReport, AppError> {
     match request.operation.as_str() {
         "state" => catalog_state(),
+        "prepare" => {
+            let request_id = request
+                .request_id
+                .as_deref()
+                .ok_or_else(|| engine("模型添加准备请求缺少 requestId"))?;
+            let model_id = request
+                .model_id
+                .as_deref()
+                .ok_or_else(|| engine("模型添加准备请求缺少 modelId"))?;
+            with_catalog_mutation_lock(&CATALOG_MUTATION_LOCK, async {
+                prepare_model_add(request_id, model_id)
+            })
+            .await
+        }
         "add" => {
             let request_id = request
                 .request_id
@@ -2269,6 +2447,37 @@ fn merged_config(text: &str, catalog: &Path) -> Result<String, AppError> {
         return Ok(format!("{block}\n"));
     }
     Ok(format!("{block}\n\n{body}\n"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reattach_detached_catalog<F>(
+    config: &Path,
+    catalog: &Path,
+    cleaned_config: &str,
+    config_snapshot: Option<&[u8]>,
+    config_backup_snapshot: Option<&[u8]>,
+    catalog_snapshot: Option<&[u8]>,
+    catalog_backup_snapshot: Option<&[u8]>,
+    before_write: F,
+) -> Result<(), AppError>
+where
+    F: FnOnce() -> Result<(), AppError>,
+{
+    let config_backup = atomic_file::backup_path(config);
+    let catalog_backup = atomic_file::backup_path(catalog);
+    if read_optional(config)?.as_deref() != config_snapshot
+        || read_optional(&config_backup)?.as_deref() != config_backup_snapshot
+        || read_optional(catalog)?.as_deref() != catalog_snapshot
+        || read_optional(&catalog_backup)?.as_deref() != catalog_backup_snapshot
+    {
+        return Err(AppError::Busy(
+            "配置或模型目录在重新启用前已变化；未覆盖其他修改".into(),
+        ));
+    }
+    let merged = merged_config(cleaned_config, catalog)?;
+    before_write()?;
+    atomic_file::write_atomic_preserving_backup(config, merged.as_bytes())
+        .map_err(|_| engine("重新启用现有模型目录失败；原配置已保留"))
 }
 
 struct ActiveRun {
@@ -3455,10 +3664,12 @@ mod tests {
     }
 
     #[test]
-    fn tested_catalog_entry_preserves_exact_id_and_claims_only_text_input() {
+    fn tested_catalog_entry_preserves_exact_id_and_inherits_native_input_modalities() {
         let entry = conservative_tested_model_entry("vendor/model-latest", Some("vendor"), 3);
         assert_eq!(entry["slug"], "vendor/model-latest");
-        assert_eq!(entry["input_modalities"], json!(["text"]));
+        assert!(entry.get("input_modalities").is_none());
+        assert_eq!(entry["description"], "Gateway model supplied by the configured provider; text response verified, image understanding not separately tested.");
+        assert_eq!(entry["base_instructions"], MODEL_BASE_INSTRUCTIONS);
         assert_eq!(entry["supports_search_tool"], false);
         assert_eq!(entry["supported_reasoning_levels"], json!([]));
         assert!(entry.get("default_reasoning_summary").is_none());
@@ -3473,13 +3684,78 @@ mod tests {
         assert!(entry.get("effective_context_window_percent").is_none());
         assert!(entry.get("context_window").is_none());
         assert!(entry.get("tool_mode").is_none());
-        assert!(!entry.to_string().contains("image\""));
+        assert_eq!(entry["include_skills_usage_instructions"], true);
+        assert_eq!(entry["include_plugin_usage_instructions"], true);
+        assert_eq!(entry["include_apps_usage_instructions"], true);
+        // Codex's ModelInfo defaults node_repl_disabled to false. Leave this
+        // field absent so gateway models retain the host's native default.
+        assert!(entry.get("node_repl_disabled").is_none());
         let bytes = serde_json::to_vec_pretty(&json!({
             "identity": CATALOG_IDENTITY,
             "models": [entry]
         }))
         .unwrap();
         assert!(!bytes.starts_with(&[0xEF, 0xBB, 0xBF]));
+    }
+
+    #[test]
+    fn adding_a_model_preserves_existing_media_mcp_registration() {
+        let existing = format!(
+            "{CONFIG_BEGIN}\nmodel_catalog_json = \"C:/old/catalog.json\"\n{CONFIG_END}\n\n[mcp_servers.media_generation]\ncommand = \"media-mcp\"\nenabled = true\n"
+        );
+        let merged = merged_config(
+            &existing,
+            Path::new("C:/codex/codex-usb-native-model-catalog.json"),
+        )
+        .unwrap();
+
+        assert!(!merged.contains("C:/old/catalog.json"));
+        assert!(merged.contains("[mcp_servers.media_generation]"));
+        assert!(merged.contains("command = \"media-mcp\""));
+        assert!(merged.contains("enabled = true"));
+        assert!(merged
+            .contains("model_catalog_json = \"C:/codex/codex-usb-native-model-catalog.json\""));
+    }
+
+    #[test]
+    fn reattaching_detached_catalog_preserves_media_mcp_and_user_config() {
+        let home = CatalogTempHome::new();
+        let config = config_path_for(home.path());
+        let catalog = catalog_path_for(home.path());
+        let config_backup = atomic_file::backup_path(&config);
+        let catalog_backup = atomic_file::backup_path(&catalog);
+        let original_config = b"model = \"keep-me\"\n\n[mcp_servers.media_generation]\ncommand = \"media-mcp\"\nenabled = true\n";
+        let original_catalog = serde_json::to_vec(&json!({
+            "identity": CATALOG_IDENTITY,
+            "models": [conservative_tested_model_entry("vendor/model", None, 1)]
+        }))
+        .unwrap();
+        std::fs::write(&config, original_config).unwrap();
+        std::fs::write(&catalog, &original_catalog).unwrap();
+
+        reattach_detached_catalog(
+            &config,
+            &catalog,
+            std::str::from_utf8(original_config).unwrap(),
+            Some(original_config),
+            None,
+            Some(&original_catalog),
+            None,
+            || Ok(()),
+        )
+        .unwrap();
+
+        let reattached = std::fs::read_to_string(&config).unwrap();
+        assert!(reattached.contains("model = \"keep-me\""));
+        assert!(reattached.contains("[mcp_servers.media_generation]"));
+        assert!(reattached.contains("command = \"media-mcp\""));
+        assert!(reattached.contains("enabled = true"));
+        assert!(reattached.contains(CONFIG_BEGIN));
+        let catalog_reference = toml_string(&catalog);
+        assert!(reattached.contains(catalog_reference.as_str()));
+        assert_eq!(std::fs::read(&catalog).unwrap(), original_catalog);
+        assert!(!config_backup.exists());
+        assert!(!catalog_backup.exists());
     }
 
     #[test]
@@ -3507,7 +3783,7 @@ mod tests {
             model["truncation_policy"],
             json!({"mode":"bytes","limit":10000})
         );
-        assert_eq!(model["base_instructions"], MODEL_BASE_INSTRUCTIONS);
+        assert_eq!(model["base_instructions"], LEGACY_FALLBACK_MODEL_BASE_INSTRUCTIONS);
         assert!(!normalize_legacy_model_entries(&mut catalog).unwrap());
     }
 
@@ -3542,6 +3818,214 @@ mod tests {
         }
     }
 
+    fn legacy_capability_entry(model_id: &str) -> Value {
+        json!({
+            "slug": model_id,
+            "display_name": "Keep this display name",
+            "description": "Text model supplied by the configured gateway; only one text response was verified.",
+            "base_instructions": "You are Codex, a coding agent. Help the user with software engineering tasks by inspecting the workspace, making focused changes, and verifying your work.",
+            "input_modalities": ["text"],
+            "truncation_policy": {"mode": "tokens", "limit": 12345},
+            "default_reasoning_level": "high",
+            "supported_reasoning_levels": [{"effort": "high", "description": "Keep reasoning"}],
+            "priority": 7,
+            "unknown_user_field": {"keep": [1, "value", null]}
+        })
+    }
+
+    #[test]
+    fn legacy_capability_template_migrates_only_three_fields_and_is_idempotent() {
+        let original = legacy_capability_entry("vendor/legacy");
+        let mut catalog = json!({"models": [original.clone()]});
+        assert!(normalize_legacy_model_entries(&mut catalog).unwrap());
+
+        let migrated = &catalog["models"][0];
+        assert!(migrated.get("input_modalities").is_none());
+        assert_eq!(migrated["description"], MODEL_DESCRIPTION);
+        assert_eq!(migrated["base_instructions"], MODEL_BASE_INSTRUCTIONS);
+        let mut restored = migrated.clone();
+        for key in ["description", "base_instructions", "input_modalities"] {
+            restored[key] = original[key].clone();
+        }
+        assert_eq!(restored, original);
+        let once = catalog.clone();
+        assert!(!normalize_legacy_model_entries(&mut catalog).unwrap());
+        assert_eq!(catalog, once);
+    }
+
+    #[test]
+    fn legacy_capability_migration_skips_each_mismatched_signature_field() {
+        for (key, value) in [
+            ("description", json!("User description")),
+            ("description", Value::Null),
+            ("description", json!(42)),
+            ("base_instructions", json!("User instructions")),
+            ("input_modalities", json!(["text", "image"])),
+            ("input_modalities", json!([])),
+            ("input_modalities", json!(["text", "text"])),
+            ("input_modalities", json!("text")),
+            ("input_modalities", Value::Null),
+        ] {
+            let mut entry = legacy_capability_entry("vendor/edited");
+            entry[key] = value;
+            let mut catalog = json!({"models": [entry]});
+            let before = catalog.clone();
+            assert!(
+                !normalize_legacy_model_entries(&mut catalog).unwrap(),
+                "{key}"
+            );
+            assert_eq!(catalog, before, "{key}");
+        }
+
+        for key in ["description", "input_modalities"] {
+            let mut entry = legacy_capability_entry("vendor/missing");
+            entry.as_object_mut().unwrap().remove(key);
+            let mut catalog = json!({"models": [entry]});
+            let before = catalog.clone();
+            assert!(
+                !normalize_legacy_model_entries(&mut catalog).unwrap(),
+                "{key}"
+            );
+            assert_eq!(catalog, before, "{key}");
+        }
+
+        // Missing instructions still receive the original JSON shape repair,
+        // but must not make the capability signature match in this or a later run.
+        let mut entry = legacy_capability_entry("vendor/missing-instructions");
+        entry.as_object_mut().unwrap().remove("base_instructions");
+        let mut catalog = json!({"models": [entry.clone()]});
+        assert!(normalize_legacy_model_entries(&mut catalog).unwrap());
+        entry["base_instructions"] = json!(LEGACY_FALLBACK_MODEL_BASE_INSTRUCTIONS);
+        assert_eq!(catalog["models"][0], entry);
+        assert!(!normalize_legacy_model_entries(&mut catalog).unwrap());
+
+        for value in [Value::Null, json!(42), json!([])] {
+            let mut entry = legacy_capability_entry("vendor/invalid-instructions");
+            entry["base_instructions"] = value;
+            let mut catalog = json!({"models": [entry]});
+            let before = catalog.clone();
+            assert!(normalize_legacy_model_entries(&mut catalog).is_err());
+            assert_eq!(catalog, before);
+        }
+    }
+
+    #[test]
+    fn legacy_capability_migration_skips_any_present_model_messages() {
+        for messages in [
+            json!({"instructions_template": "Native template"}),
+            json!({}),
+            Value::Null,
+            json!("opaque"),
+        ] {
+            let mut entry = legacy_capability_entry("vendor/native-instructions");
+            entry["model_messages"] = messages;
+            let mut catalog = json!({"models": [entry]});
+            let before = catalog.clone();
+            assert!(!normalize_legacy_model_entries(&mut catalog).unwrap());
+            assert_eq!(catalog, before);
+        }
+    }
+
+    #[test]
+    fn legacy_capability_migration_preserves_all_existing_usage_switch_combinations() {
+        let keys = [
+            "include_skills_usage_instructions",
+            "include_plugin_usage_instructions",
+            "include_apps_usage_instructions",
+        ];
+        // All false, all true, mixed and every partially/fully absent combination.
+        for combination in 0..27 {
+            let mut entry = legacy_capability_entry("vendor/switches");
+            let mut remaining = combination;
+            for key in keys {
+                match remaining % 3 {
+                    1 => {
+                        entry[key] = json!(false);
+                    }
+                    2 => {
+                        entry[key] = json!(true);
+                    }
+                    _ => {}
+                }
+                remaining /= 3;
+            }
+            for matches_signature in [true, false] {
+                let mut original = entry.clone();
+                if !matches_signature {
+                    original["description"] = json!("User description");
+                }
+                let mut catalog = json!({"models": [original.clone()]});
+                assert_eq!(
+                    normalize_legacy_model_entries(&mut catalog).unwrap(),
+                    matches_signature
+                );
+                for key in keys {
+                    assert_eq!(
+                        catalog["models"][0].get(key),
+                        original.get(key),
+                        "{combination}: {key}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_capability_migration_changes_only_matching_entries_in_a_mixed_catalog() {
+        let mut edited = legacy_capability_entry("vendor/edited");
+        edited["base_instructions"] = json!("User instructions");
+        let native = conservative_tested_model_entry("vendor/current", None, 2);
+        let mut messages = legacy_capability_entry("vendor/messages");
+        messages["model_messages"] = json!({});
+        let mut catalog = json!({"models": [
+            edited.clone(), legacy_capability_entry("vendor/target"),
+            native.clone(), messages.clone()
+        ]});
+        assert!(normalize_legacy_model_entries(&mut catalog).unwrap());
+        assert_eq!(catalog["models"][0], edited);
+        assert_eq!(catalog["models"][1]["slug"], "vendor/target");
+        assert!(catalog["models"][1].get("input_modalities").is_none());
+        assert_eq!(catalog["models"][2], native);
+        assert_eq!(catalog["models"][3], messages);
+    }
+
+    #[test]
+    fn legacy_capability_preflight_preserves_config_mcp_bytes_and_does_not_rotate_backup_twice() {
+        let home = CatalogTempHome::new();
+        let config = config_path_for(home.path());
+        let catalog = catalog_path_for(home.path());
+        let backup = atomic_file::backup_path(&catalog);
+        let config_backup = atomic_file::backup_path(&config);
+        let mut config_bytes = managed_catalog_config(home.path());
+        config_bytes.extend_from_slice(b"\r\n# Preserve whitespace\r\n[mcp_servers.media_generation]\r\ncommand = \"media-mcp\"\r\nenabled = true\r\n");
+        let legacy_bytes = serde_json::to_vec_pretty(&json!({
+            "identity": CATALOG_IDENTITY,
+            "models": [legacy_capability_entry("vendor/legacy")]
+        }))
+        .unwrap();
+        std::fs::write(&config, &config_bytes).unwrap();
+        std::fs::write(&config_backup, b"user config backup").unwrap();
+        std::fs::write(&catalog, &legacy_bytes).unwrap();
+
+        assert!(preflight_managed_catalog_at_home(home.path(), |_| Ok(())).unwrap());
+        let migrated_bytes = std::fs::read(&catalog).unwrap();
+        let migrated: Value = serde_json::from_slice(&migrated_bytes).unwrap();
+        assert!(migrated["models"][0].get("input_modalities").is_none());
+        assert_eq!(migrated["models"][0]["description"], MODEL_DESCRIPTION);
+        assert_eq!(std::fs::read(&backup).unwrap(), legacy_bytes);
+        let modified = std::fs::metadata(&catalog).unwrap().modified().unwrap();
+
+        assert!(preflight_managed_catalog_at_home(home.path(), |_| Ok(())).unwrap());
+        assert_eq!(std::fs::read(&catalog).unwrap(), migrated_bytes);
+        assert_eq!(
+            std::fs::metadata(&catalog).unwrap().modified().unwrap(),
+            modified
+        );
+        assert_eq!(std::fs::read(&backup).unwrap(), legacy_bytes);
+        assert_eq!(std::fs::read(&config).unwrap(), config_bytes);
+        assert_eq!(std::fs::read(&config_backup).unwrap(), b"user config backup");
+    }
+
     fn managed_catalog_config(home: &Path) -> Vec<u8> {
         let config = config_path_for(home);
         format!(
@@ -3569,7 +4053,7 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_recheck_updates_only_owned_entry_and_preserves_other_fields_and_order() {
+    fn duplicate_add_is_noop_and_preserves_existing_entry_and_order() {
         let home = CatalogTempHome::new();
         let config = config_path_for(home.path());
         let catalog = catalog_path_for(home.path());
@@ -3577,19 +4061,17 @@ mod tests {
         let mut custom = conservative_tested_model_entry("vendor/existing", None, 1);
         custom["description"] = json!("keep this user-visible description");
         let second = conservative_tested_model_entry("vendor/other", None, 2);
-        std::fs::write(
-            &catalog,
-            serde_json::to_vec_pretty(&json!({
-                "identity": CATALOG_IDENTITY,
-                "models": [custom, second]
-            }))
-            .unwrap(),
-        )
-        .unwrap();
         let reasoning = crate::app::gateway_model_probe::ReasoningEvidence {
             efforts: vec!["low".into(), "high".into()],
             default_effort: "high".into(),
         };
+
+        let original_catalog = serde_json::to_vec_pretty(&json!({
+            "identity": CATALOG_IDENTITY,
+            "models": [custom, second]
+        }))
+        .unwrap();
+        std::fs::write(&catalog, &original_catalog).unwrap();
 
         let result = add_tested_model_files_with_reasoning(
             home.path(),
@@ -3606,27 +4088,59 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(result.status, "applied_restart_pending");
+        assert_eq!(result.status, "already_added");
         let saved: Value = serde_json::from_slice(&std::fs::read(&catalog).unwrap()).unwrap();
-        assert_eq!(saved["models"][0]["slug"], "vendor/existing");
-        assert_eq!(
-            saved["models"][0]["description"],
-            "keep this user-visible description"
-        );
-        assert_eq!(saved["models"][0]["default_reasoning_level"], "high");
-        assert_eq!(
-            saved["models"][0]["supported_reasoning_levels"][0]["effort"],
-            "low"
-        );
-        assert_eq!(
-            saved["models"][0]["supported_reasoning_levels"][1]["effort"],
-            "high"
-        );
-        assert_eq!(saved["models"][1]["slug"], "vendor/other");
+        let original: Value = serde_json::from_slice(&original_catalog).unwrap();
+        assert_eq!(saved, original);
     }
 
     #[test]
-    fn incompatible_global_reasoning_effort_blocks_add_without_rewriting_config() {
+    fn duplicate_add_does_not_persist_legacy_capability_migration() {
+        let home = CatalogTempHome::new();
+        let config = config_path_for(home.path());
+        let catalog = catalog_path_for(home.path());
+        let config_backup = atomic_file::backup_path(&config);
+        let catalog_backup = atomic_file::backup_path(&catalog);
+        let mut config_bytes = managed_catalog_config(home.path());
+        config_bytes.extend_from_slice(b"\n[mcp_servers.media_generation]\ncommand = \"media-mcp\"\nenabled = true\n");
+        let original = serde_json::to_vec(&json!({
+            "identity": CATALOG_IDENTITY,
+            "models": [legacy_capability_entry("vendor/existing")]
+        }))
+        .unwrap();
+        std::fs::write(&config, &config_bytes).unwrap();
+        std::fs::write(&catalog, &original).unwrap();
+        std::fs::write(&config_backup, b"keep config backup").unwrap();
+        std::fs::write(&catalog_backup, &original).unwrap();
+        let reasoning = crate::app::gateway_model_probe::ReasoningEvidence {
+            efforts: vec!["high".into()],
+            default_effort: "high".into(),
+        };
+
+        let result = add_tested_model_files_with_reasoning(
+            home.path(),
+            "vendor/existing",
+            None,
+            &reasoning,
+            &AtomicBool::new(false),
+            || Ok(true),
+            || panic!("duplicate Add must not load a native catalog"),
+            |_| panic!("duplicate Add must not validate with the CLI"),
+            || Ok(()),
+            || panic!("duplicate Add must not commit"),
+            || panic!("duplicate Add must not mark a restart"),
+        )
+        .unwrap();
+
+        assert_eq!(result.status, "already_added");
+        assert_eq!(std::fs::read(&catalog).unwrap(), original);
+        assert_eq!(std::fs::read(&config).unwrap(), config_bytes);
+        assert_eq!(std::fs::read(&catalog_backup).unwrap(), original);
+        assert_eq!(std::fs::read(&config_backup).unwrap(), b"keep config backup");
+    }
+
+    #[test]
+    fn incompatible_global_reasoning_effort_is_preserved_when_activating_catalog() {
         let home = CatalogTempHome::new();
         let config = config_path_for(home.path());
         let original = b"model_reasoning_effort = \"none\"\n";
@@ -3650,9 +4164,16 @@ mod tests {
             || Ok(()),
         );
 
-        assert!(result.unwrap_err().to_string().contains("全局思考档位"));
-        assert_eq!(std::fs::read(&config).unwrap(), original);
-        assert!(!catalog_path_for(home.path()).exists());
+        assert_eq!(result.unwrap().status, "applied_restart_pending");
+        let saved_config = std::fs::read_to_string(&config).unwrap();
+        assert!(saved_config.contains("model_reasoning_effort = \"none\""));
+        assert!(saved_config.contains(CONFIG_BEGIN));
+        assert!(saved_config.contains(CONFIG_END));
+        let saved: Value = serde_json::from_slice(
+            &std::fs::read(catalog_path_for(home.path())).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved["models"][0]["slug"], "vendor/model");
     }
 
     #[test]
@@ -3703,7 +4224,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_global_reasoning_effort_blocks_add_without_rewriting_config() {
+    fn non_string_global_reasoning_effort_is_preserved_when_activating_catalog() {
         let home = CatalogTempHome::new();
         let config = config_path_for(home.path());
         let original = b"model_reasoning_effort = 3\n";
@@ -3727,9 +4248,16 @@ mod tests {
             || Ok(()),
         );
 
-        assert!(result.unwrap_err().to_string().contains("格式无法识别"));
-        assert_eq!(std::fs::read(&config).unwrap(), original);
-        assert!(!catalog_path_for(home.path()).exists());
+        assert_eq!(result.unwrap().status, "applied_restart_pending");
+        let saved_config = std::fs::read_to_string(&config).unwrap();
+        assert!(saved_config.contains("model_reasoning_effort = 3"));
+        assert!(saved_config.contains(CONFIG_BEGIN));
+        assert!(saved_config.contains(CONFIG_END));
+        let saved: Value = serde_json::from_slice(
+            &std::fs::read(catalog_path_for(home.path())).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved["models"][0]["slug"], "vendor/model");
     }
 
     #[test]
@@ -3901,6 +4429,55 @@ mod tests {
     }
 
     #[test]
+    fn detached_duplicate_is_reattached_without_rewriting_catalog() {
+        let home = CatalogTempHome::new();
+        let config = config_path_for(home.path());
+        let catalog = catalog_path_for(home.path());
+        let original_config = b"model = \"keep-me\"\n\n[mcp_servers.media_generation]\ncommand = \"media-mcp\"\nenabled = true\n";
+        let original_catalog = serde_json::to_vec(&json!({
+            "identity": CATALOG_IDENTITY,
+            "models": [conservative_tested_model_entry("vendor/existing", None, 1)]
+        }))
+        .unwrap();
+        std::fs::write(&config, original_config).unwrap();
+        std::fs::write(&catalog, &original_catalog).unwrap();
+        let consumed = AtomicBool::new(false);
+        let commit_started = AtomicBool::new(false);
+        let reasoning = crate::app::gateway_model_probe::ReasoningEvidence {
+            efforts: vec!["medium".into()],
+            default_effort: "medium".into(),
+        };
+
+        let report = add_tested_model_files_with_reasoning(
+            home.path(),
+            "vendor/existing",
+            None,
+            &reasoning,
+            &AtomicBool::new(false),
+            || Ok(true),
+            || panic!("a valid detached catalog must not be reseeded"),
+            |_| Ok(()),
+            || {
+                consumed.store(true, AtomicOrdering::Release);
+                Ok(())
+            },
+            || commit_started.store(true, AtomicOrdering::Release),
+            || Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(report.status, "applied_restart_pending");
+        assert!(consumed.load(AtomicOrdering::Acquire));
+        assert!(commit_started.load(AtomicOrdering::Acquire));
+        let reattached = std::fs::read_to_string(&config).unwrap();
+        assert!(reattached.contains("model = \"keep-me\""));
+        assert!(reattached.contains("[mcp_servers.media_generation]"));
+        assert!(reattached.contains("enabled = true"));
+        assert!(reattached.contains(CONFIG_BEGIN));
+        assert_eq!(std::fs::read(&catalog).unwrap(), original_catalog);
+    }
+
+    #[test]
     fn startup_catalog_gate_rejects_wrong_identity_duplicate_and_invalid_model_ids() {
         let cases = [
             json!({"identity":"some-other-tool", "models":[{"slug":"vendor/model"}]}),
@@ -3969,7 +4546,7 @@ mod tests {
         );
         assert_eq!(
             migrated["models"][0]["base_instructions"],
-            MODEL_BASE_INSTRUCTIONS
+            LEGACY_FALLBACK_MODEL_BASE_INSTRUCTIONS
         );
         assert!(migrated["models"][0]
             .get("default_reasoning_summary")

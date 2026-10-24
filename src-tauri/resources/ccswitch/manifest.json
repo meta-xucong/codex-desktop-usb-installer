@@ -5,9 +5,11 @@
   "sourceRepository": "https://github.com/farion1231/cc-switch",
   "sourceCommit": "1d44b1ba41987cddeb8096fadba8190fab465cbb",
   "sourceVersion": "3.14.1",
+  "sourcePatch": "source-patches/ccswitch-usb-product-1d44b1ba.patch",
+  "sourcePatchSha256": "E4F8DB42FD646FFBAA6A63DA294C58CBE1727BC197609CB3719E7D5DFFF3423E",
   "artifact": {
     "file": "CodexSwitch.exe",
-    "sha256": "04607C8E8E8122E3D7A7FA3B0C360FA7144556D72772BE4A761AA4989BC36DB2",
+    "sha256": "BFB08F381EF476D6E6907F9B74D7A637E736CEC76EF3AF48F224D312A2AF7E08",
     "kind": "portable-executable",
     "installerBundle": false
   },
@@ -17,6 +19,8 @@
     "404TOKEN is a third-party Sub2API relay, not an OpenAI official endpoint.",
     "A verified USB license injects one device API key for the unified-api-internal group at runtime.",
     "CCSwitch saves the USB key to its normal private provider database, switches the provider, and returns a nonce-bound acknowledgement only after local readback succeeds.",
+    "Codex provider handoff preserves unmanaged active mcp_servers entries while database-managed MCP enablement and definitions remain authoritative.",
+    "USB product source changes are captured in sourcePatch and must be applied to sourceCommit before building.",
     "The USB manager reports injection success only after validating that acknowledgement; on failure it keeps the CCSwitch window visible and shows an error on its home page.",
     "Model discovery does not gate normal provider activation or Codex launch.",
     "The device key is never included in this static resource bundle or providers.json.",

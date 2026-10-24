@@ -1048,7 +1048,6 @@ pub fn run() {
             commands::capability_pack_status,
             commands::install_capability_pack,
             commands::skill_repo_check_update,
-            commands::skill_repo_product_design_status,
             commands::skill_repo_apply_update,
             commands::skill_repo_rollback,
             commands::win_perform_update,

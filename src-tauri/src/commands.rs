@@ -204,7 +204,7 @@ fn win_network_config_for_settings() -> Result<codex_win_engine::NetworkConfig, 
 async fn require_usb_install_network() -> Result<(), AppError> {
     let network = win_network_config_for_settings()?;
     tauri::async_runtime::spawn_blocking(move || {
-        codex_win_engine::fetch_text_with_network("https://404token.xyz/", &network)
+        codex_win_engine::probe_https_reachable_with_network("https://404token.xyz/", &network)
             .map(|_| ())
             .map_err(|error| {
                 AppError::Engine(format!(
@@ -3588,21 +3588,6 @@ pub async fn skill_repo_check_update(
     reject_uninstall_handoff(&state)?;
     let operations = state.operations.clone();
     check_skill_repo_update(&app, &operations).await
-}
-
-/// Read the installed Product Design plugin state from the isolated USB
-/// CODEX_HOME without performing network access or modifying files.
-#[tauri::command]
-pub async fn skill_repo_product_design_status(
-    state: State<'_, ManagerState>,
-) -> Result<Option<u32>, CommandError> {
-    reject_uninstall_handoff(&state)?;
-    tauri::async_runtime::spawn_blocking(
-        crate::app::capability_pack::product_design_plugin_status,
-    )
-    .await
-    .map_err(|error| AppError::Internal(format!("join: {error}")))
-    .map_err(CommandError::from)
 }
 
 /// Apply the exact identity returned by a preceding Skill Hub check.

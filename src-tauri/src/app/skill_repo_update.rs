@@ -42,6 +42,7 @@ const NETWORK_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const NETWORK_METADATA_TIMEOUT: Duration = Duration::from_secs(8);
 const NETWORK_ARCHIVE_TIMEOUT: Duration = Duration::from_secs(20);
 const NETWORK_OPERATION_TIMEOUT: Duration = Duration::from_secs(45);
+const NETWORK_RETRY_BACKOFF: Duration = Duration::from_millis(250);
 const BASE_MANIFEST_SHA256: &str =
     "6effd655adbfc6f3be80b1c8348c2da2c428ef9a3d1b77b0c9da05da055e9953";
 
@@ -190,7 +191,6 @@ pub struct SkillRepoUpdateInfo {
     pub installable_count: u32,
     pub conflict_count: u32,
     pub skipped_count: u32,
-    pub product_design_skill_count: Option<u32>,
     pub attempts: Vec<SkillRepoSourceAttempt>,
     pub warning: Option<String>,
 }
@@ -2043,6 +2043,34 @@ fn phase_timeout(phase: SkillRepoAttemptPhase) -> Duration {
     }
 }
 
+fn retryable_get_error(error: &HotError, phase: SkillRepoAttemptPhase) -> bool {
+    if error.code == "SKILL_REPO_TIMEOUT" {
+        // Metadata and verification responses are small; an archive timeout
+        // should immediately yield the remaining deadline to source fallback.
+        return phase != SkillRepoAttemptPhase::Archive;
+    }
+
+    if error.code != "SKILL_REPO_SOURCE_UNAVAILABLE" {
+        return false;
+    }
+
+    let Some(detail) = error.detail.as_deref() else {
+        return false;
+    };
+    if detail.contains("reason=transport") {
+        return true;
+    }
+
+    let Some(status) = detail
+        .strip_prefix("http_status=")
+        .and_then(|value| value.parse::<u16>().ok())
+    else {
+        return false;
+    };
+
+    matches!(status, 408 | 425 | 429) || (500..=599).contains(&status)
+}
+
 fn static_source_url(source: &SkillHubSourceEntry, file: &str) -> Result<String, HotError> {
     source
         .base
@@ -2060,111 +2088,10 @@ async fn get_bytes(
     deadline: tokio::time::Instant,
     attempts: &mut Vec<SkillRepoSourceAttempt>,
 ) -> Result<Vec<u8>, HotError> {
-    let started = Instant::now();
-    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-    if remaining.is_zero() {
-        record_attempt(
-            attempts,
-            source,
-            phase,
-            SkillRepoAttemptResult::Timeout,
-            None,
-            started,
-        );
-        return Err(network_timeout());
-    }
-    let budget = remaining.min(phase_timeout(phase));
-    let result = tokio::time::timeout(budget, async {
-        let response = client.get(url).send().await.map_err(|error| {
-            if error.is_timeout() {
-                HotError::new("SKILL_REPO_TIMEOUT", "Skill Hub 网络请求超时").with_detail(format!(
-                    "stage=network-request; source_id={}; reason=timeout",
-                    source.id
-                ))
-            } else {
-                HotError::new("SKILL_REPO_SOURCE_UNAVAILABLE", "Skill Hub 来源不可用").with_detail(
-                    format!(
-                        "stage=network-request; source_id={}; reason=transport",
-                        source.id
-                    ),
-                )
-            }
-        })?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(HotError::new(
-                "SKILL_REPO_SOURCE_UNAVAILABLE",
-                "Skill Hub 来源返回 HTTP 错误",
-            )
-            .with_detail(format!("http_status={}", status.as_u16())));
-        }
-        if source.kind != SourceKind::Github && response.url().as_str() != url {
-            return Err(
-                source_invalid("静态 Skill Hub 来源禁止重定向").with_detail(format!(
-                    "stage=network-response; source_id={}; reason=redirect",
-                    source.id
-                )),
-            );
-        }
-        if source.kind == SourceKind::Github
-            && !matches!(
-                response.url().host_str(),
-                Some("api.github.com") | Some("github.com") | Some("codeload.github.com")
-            )
-        {
-            return Err(source_invalid("GitHub 重定向目标不允许")
-                .with_detail("stage=network-response; source_id=github; reason=redirect-host"));
-        }
-        if response
-            .content_length()
-            .is_some_and(|length| length > max as u64)
-        {
-            return Err(invalid("远端响应超限"));
-        }
-        let bytes = response.bytes().await.map_err(|error| {
-            if error.is_timeout() {
-                HotError::new("SKILL_REPO_TIMEOUT", "Skill Hub 响应读取超时").with_detail(format!(
-                    "stage=network-response; source_id={}; reason=timeout",
-                    source.id
-                ))
-            } else {
-                HotError::new("SKILL_REPO_SOURCE_UNAVAILABLE", "Skill Hub 响应读取失败")
-                    .with_detail(format!(
-                        "stage=network-response; source_id={}; reason=transport",
-                        source.id
-                    ))
-            }
-        })?;
-        if bytes.len() > max {
-            return Err(invalid("远端响应超限"));
-        }
-        Ok((bytes.to_vec(), Some(status.as_u16())))
-    })
-    .await;
-
-    match result {
-        Ok(Ok((bytes, status))) => {
-            record_attempt(
-                attempts,
-                source,
-                phase,
-                SkillRepoAttemptResult::Ok,
-                status,
-                started,
-            );
-            Ok(bytes)
-        }
-        Ok(Err(error)) => {
-            let result = attempt_result_for_error(&error);
-            let http_status = error
-                .detail
-                .as_deref()
-                .and_then(|detail| detail.strip_prefix("http_status="))
-                .and_then(|status| status.parse::<u16>().ok());
-            record_attempt(attempts, source, phase, result, http_status, started);
-            Err(error)
-        }
-        Err(_) => {
+    for request_index in 0..2 {
+        let started = Instant::now();
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
             record_attempt(
                 attempts,
                 source,
@@ -2173,9 +2100,132 @@ async fn get_bytes(
                 None,
                 started,
             );
-            Err(network_timeout())
+            return Err(network_timeout());
         }
+        let budget = remaining.min(phase_timeout(phase));
+        let result = tokio::time::timeout(budget, async {
+            let response = client.get(url).send().await.map_err(|error| {
+                if error.is_timeout() {
+                    HotError::new("SKILL_REPO_TIMEOUT", "Skill Hub 网络请求超时").with_detail(
+                        format!(
+                            "stage=network-request; source_id={}; reason=timeout",
+                            source.id
+                        ),
+                    )
+                } else if error.is_redirect() {
+                    source_invalid("Skill Hub 来源重定向失败").with_detail(format!(
+                        "stage=network-request; source_id={}; reason=redirect",
+                        source.id
+                    ))
+                } else {
+                    HotError::new("SKILL_REPO_SOURCE_UNAVAILABLE", "Skill Hub 来源不可用")
+                        .with_detail(format!(
+                            "stage=network-request; source_id={}; reason=transport",
+                            source.id
+                        ))
+                }
+            })?;
+            if source.kind != SourceKind::Github && response.url().as_str() != url {
+                return Err(
+                    source_invalid("静态 Skill Hub 来源禁止重定向").with_detail(format!(
+                        "stage=network-response; source_id={}; reason=redirect",
+                        source.id
+                    )),
+                );
+            }
+            if source.kind == SourceKind::Github
+                && !matches!(
+                    response.url().host_str(),
+                    Some("api.github.com") | Some("github.com") | Some("codeload.github.com")
+                )
+            {
+                return Err(source_invalid("GitHub 重定向目标不允许").with_detail(
+                    "stage=network-response; source_id=github; reason=redirect-host",
+                ));
+            }
+            let status = response.status();
+            if !status.is_success() {
+                return Err(HotError::new(
+                    "SKILL_REPO_SOURCE_UNAVAILABLE",
+                    "Skill Hub 来源返回 HTTP 错误",
+                )
+                .with_detail(format!("http_status={}", status.as_u16())));
+            }
+            if response
+                .content_length()
+                .is_some_and(|length| length > max as u64)
+            {
+                return Err(invalid("远端响应超限"));
+            }
+            let bytes = response.bytes().await.map_err(|error| {
+                if error.is_timeout() {
+                    HotError::new("SKILL_REPO_TIMEOUT", "Skill Hub 响应读取超时").with_detail(
+                        format!(
+                            "stage=network-response; source_id={}; reason=timeout",
+                            source.id
+                        ),
+                    )
+                } else {
+                    HotError::new("SKILL_REPO_SOURCE_UNAVAILABLE", "Skill Hub 响应读取失败")
+                        .with_detail(format!(
+                            "stage=network-response; source_id={}; reason=transport",
+                            source.id
+                        ))
+                }
+            })?;
+            if bytes.len() > max {
+                return Err(invalid("远端响应超限"));
+            }
+            Ok((bytes.to_vec(), Some(status.as_u16())))
+        })
+        .await;
+
+        let error = match result {
+            Ok(Ok((bytes, status))) => {
+                record_attempt(
+                    attempts,
+                    source,
+                    phase,
+                    SkillRepoAttemptResult::Ok,
+                    status,
+                    started,
+                );
+                return Ok(bytes);
+            }
+            Ok(Err(error)) => {
+                let result = attempt_result_for_error(&error);
+                let http_status = error
+                    .detail
+                    .as_deref()
+                    .and_then(|detail| detail.strip_prefix("http_status="))
+                    .and_then(|status| status.parse::<u16>().ok());
+                record_attempt(attempts, source, phase, result, http_status, started);
+                error
+            }
+            Err(_) => {
+                record_attempt(
+                    attempts,
+                    source,
+                    phase,
+                    SkillRepoAttemptResult::Timeout,
+                    None,
+                    started,
+                );
+                network_timeout()
+            }
+        };
+
+        if request_index == 0
+            && retryable_get_error(&error, phase)
+            && deadline.saturating_duration_since(tokio::time::Instant::now())
+                > NETWORK_RETRY_BACKOFF
+        {
+            tokio::time::sleep(NETWORK_RETRY_BACKOFF).await;
+            continue;
+        }
+        return Err(error);
     }
+    unreachable!("bounded GET loop always returns after at most two requests")
 }
 
 fn expected_from_meta(
@@ -4607,7 +4657,6 @@ pub async fn check_update(
             installable_count: installable,
             conflict_count: conflicts,
             skipped_count: 0,
-            product_design_skill_count: crate::app::capability_pack::product_design_plugin_status(),
             attempts,
             // Skill Hub is an intentionally independent capability overlay. It
             // does not change the signed Codex bundle or USB authorization, so
@@ -4833,6 +4882,97 @@ pub async fn rollback(
 mod tests {
     use super::*;
 
+    fn retry_fixture_server(
+        statuses: Vec<u16>,
+        body: Vec<u8>,
+        redirect_path: Option<&str>,
+    ) -> (
+        String,
+        std::thread::JoinHandle<()>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind retry fixture");
+        listener
+            .set_nonblocking(true)
+            .expect("set retry fixture nonblocking");
+        let address = listener.local_addr().expect("retry fixture address");
+        let redirect_url = format!(
+            "http://{address}{}",
+            redirect_path.unwrap_or("/latest.json")
+        );
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let server_request_count = Arc::clone(&request_count);
+        let worker = std::thread::spawn(move || {
+            let mut next_status = 0usize;
+            let mut last_request_at = None;
+            while next_status < statuses.len() {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        last_request_at = Some(Instant::now());
+                        server_request_count.fetch_add(1, Ordering::SeqCst);
+                        let mut request = Vec::new();
+                        let mut chunk = [0u8; 1024];
+                        loop {
+                            let Ok(read) = stream.read(&mut chunk) else {
+                                break;
+                            };
+                            if read == 0 {
+                                break;
+                            }
+                            request.extend_from_slice(&chunk[..read]);
+                            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        let status = statuses[next_status];
+                        next_status += 1;
+                        let reason = match status {
+                            200 => "OK",
+                            302 => "Found",
+                            404 => "Not Found",
+                            503 => "Service Unavailable",
+                            _ => "Fixture Status",
+                        };
+                        let redirect = if status == 302 {
+                            format!("Location: {redirect_url}\r\n")
+                        } else {
+                            String::new()
+                        };
+                        let response = format!(
+                            "HTTP/1.1 {status} {reason}\r\n{redirect}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len(),
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.write_all(&body);
+                        let _ = stream.flush();
+                        if next_status == statuses.len() {
+                            break;
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if last_request_at
+                            .is_some_and(|last| last.elapsed() >= Duration::from_secs(2))
+                        {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (
+            format!("http://{address}/latest.json"),
+            worker,
+            request_count,
+        )
+    }
+
     fn skill_hub_fixture_server(
         request_count: usize,
         metadata: Vec<u8>,
@@ -4872,7 +5012,12 @@ mod tests {
                     let request_line = String::from_utf8_lossy(&request);
                     let path = request_line.split_whitespace().nth(1).unwrap_or_default();
                     if path == delayed_archive_path {
-                        std::thread::sleep(Duration::from_millis(180));
+                        // Keep this far above the fixture client timeout so the
+                        // primary source's archive reliably times out even under
+                        // parallel `cargo test` load; the relay path answers
+                        // immediately. 180ms sat too close to the old 60ms client
+                        // timeout and made the relay-fallback test flaky.
+                        std::thread::sleep(Duration::from_millis(900));
                     }
                     let (content_type, body) = if path.ends_with("latest.json") {
                         ("application/json", metadata.as_slice())
@@ -5333,7 +5478,11 @@ mod tests {
         };
         let client = reqwest::Client::builder()
             .no_proxy()
-            .timeout(Duration::from_millis(60))
+            // 300ms leaves a wide margin over the immediate relay responses
+            // (observed peak ~74ms under full-suite parallel load) while staying
+            // far below the 900ms delayed primary-archive fixture, so the timeout
+            // that drives the relay fallback remains deterministic.
+            .timeout(Duration::from_millis(300))
             .build()
             .expect("short-timeout fixture client");
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -5357,6 +5506,18 @@ mod tests {
         assert!(downloaded.attempts.iter().any(|attempt| {
             attempt.source_id == "ph-relay" && attempt.result == SkillRepoAttemptResult::Ok
         }));
+        assert_eq!(
+            downloaded
+                .attempts
+                .iter()
+                .filter(|attempt| {
+                    attempt.source_id == "cn-mirror-1"
+                        && attempt.phase == SkillRepoAttemptPhase::Archive
+                })
+                .count(),
+            1,
+            "an archive timeout must yield directly to the existing fallback source"
+        );
     }
 
     #[test]
@@ -5444,6 +5605,229 @@ mod tests {
             attempt_result_for_error(&transport),
             SkillRepoAttemptResult::Unavailable
         );
+    }
+
+    #[test]
+    fn get_retries_transient_http_once_and_records_each_request() {
+        use std::sync::atomic::Ordering;
+
+        let (url, server, request_count) =
+            retry_fixture_server(vec![503, 200], b"metadata-ok".to_vec(), None);
+        let source = source_entry("cn-mirror-1", SourceKind::Domestic, None, 1, true, true);
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .expect("fixture client");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("fixture runtime");
+        let mut attempts = Vec::new();
+        let result = runtime.block_on(get_bytes(
+            &client,
+            &source,
+            &url,
+            64 * 1024,
+            SkillRepoAttemptPhase::Metadata,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            &mut attempts,
+        ));
+        server.join().expect("fixture server thread");
+
+        assert_eq!(
+            result.expect("second request should recover"),
+            b"metadata-ok"
+        );
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].result, SkillRepoAttemptResult::Http);
+        assert_eq!(attempts[0].http_status, Some(503));
+        assert_eq!(attempts[1].result, SkillRepoAttemptResult::Ok);
+        assert_eq!(attempts[1].http_status, Some(200));
+    }
+
+    #[test]
+    fn get_does_not_retry_permanent_http_or_archive_timeout() {
+        use std::sync::atomic::Ordering;
+
+        let (url, server, request_count) =
+            retry_fixture_server(vec![404], b"must-not-be-used".to_vec(), None);
+        let source = source_entry("cn-mirror-1", SourceKind::Domestic, None, 1, true, true);
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .expect("fixture client");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("fixture runtime");
+        let mut attempts = Vec::new();
+        let result = runtime.block_on(get_bytes(
+            &client,
+            &source,
+            &url,
+            64 * 1024,
+            SkillRepoAttemptPhase::Metadata,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            &mut attempts,
+        ));
+        server.join().expect("fixture server thread");
+
+        assert!(result.is_err());
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].result, SkillRepoAttemptResult::Http);
+        assert_eq!(attempts[0].http_status, Some(404));
+
+        let timeout = network_timeout();
+        assert!(retryable_get_error(
+            &timeout,
+            SkillRepoAttemptPhase::Metadata
+        ));
+        assert!(!retryable_get_error(
+            &timeout,
+            SkillRepoAttemptPhase::Archive
+        ));
+        for status in [408, 425, 429, 500, 503, 599] {
+            let error = HotError::new("SKILL_REPO_SOURCE_UNAVAILABLE", "HTTP error")
+                .with_detail(format!("http_status={status}"));
+            assert!(retryable_get_error(&error, SkillRepoAttemptPhase::Metadata));
+        }
+        for status in [400, 401, 403, 404] {
+            let error = HotError::new("SKILL_REPO_SOURCE_UNAVAILABLE", "HTTP error")
+                .with_detail(format!("http_status={status}"));
+            assert!(!retryable_get_error(
+                &error,
+                SkillRepoAttemptPhase::Metadata
+            ));
+        }
+    }
+
+    #[test]
+    fn get_does_not_retry_a_reqwest_redirect_failure() {
+        use std::sync::atomic::Ordering;
+
+        let (url, server, request_count) = retry_fixture_server(vec![302, 302], Vec::new(), None);
+        let source = source_entry("cn-mirror-1", SourceKind::Domestic, None, 1, true, true);
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::limited(1))
+            .timeout(Duration::from_secs(3))
+            .build()
+            .expect("fixture client");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("fixture runtime");
+        let mut attempts = Vec::new();
+        let result = runtime.block_on(get_bytes(
+            &client,
+            &source,
+            &url,
+            64 * 1024,
+            SkillRepoAttemptPhase::Metadata,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            &mut attempts,
+        ));
+        server.join().expect("fixture server thread");
+
+        let error = result.expect_err("redirect loop must be rejected");
+        assert_eq!(error.code, "SKILL_REPO_SOURCE_INVALID");
+        assert!(error
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("reason=redirect")));
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            attempts.len(),
+            1,
+            "redirect failure must not trigger a second logical GET"
+        );
+        assert_eq!(attempts[0].result, SkillRepoAttemptResult::Invalid);
+    }
+
+    #[test]
+    fn static_source_redirect_is_rejected_before_retryable_target_status() {
+        use std::sync::atomic::Ordering;
+
+        let (url, server, request_count) = retry_fixture_server(
+            vec![302, 503],
+            b"temporary target failure".to_vec(),
+            Some("/elsewhere.json"),
+        );
+        let source = source_entry("cn-mirror-1", SourceKind::Domestic, None, 1, true, true);
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .expect("fixture client");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("fixture runtime");
+        let mut attempts = Vec::new();
+        let result = runtime.block_on(get_bytes(
+            &client,
+            &source,
+            &url,
+            64 * 1024,
+            SkillRepoAttemptPhase::Metadata,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            &mut attempts,
+        ));
+        server.join().expect("fixture server thread");
+
+        let error = result.expect_err("static source redirect must be rejected");
+        assert_eq!(error.code, "SKILL_REPO_SOURCE_INVALID");
+        assert!(error.detail.as_deref().is_some_and(|detail| {
+            detail.contains("stage=network-response") && detail.contains("reason=redirect")
+        }));
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            attempts.len(),
+            1,
+            "redirected 503 must not trigger another logical GET"
+        );
+        assert_eq!(attempts[0].result, SkillRepoAttemptResult::Invalid);
+        assert_eq!(attempts[0].http_status, None);
+    }
+
+    #[test]
+    fn one_logical_get_never_sends_more_than_one_retry() {
+        use std::sync::atomic::Ordering;
+
+        let (url, server, request_count) =
+            retry_fixture_server(vec![503, 503], b"temporary".to_vec(), None);
+        let source = source_entry("cn-mirror-1", SourceKind::Domestic, None, 1, true, true);
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .expect("fixture client");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("fixture runtime");
+        let mut attempts = Vec::new();
+        let result = runtime.block_on(get_bytes(
+            &client,
+            &source,
+            &url,
+            64 * 1024,
+            SkillRepoAttemptPhase::Metadata,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            &mut attempts,
+        ));
+        server.join().expect("fixture server thread");
+
+        assert!(result.is_err());
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        assert_eq!(attempts.len(), 2);
+        assert!(attempts
+            .iter()
+            .all(|attempt| attempt.http_status == Some(503)));
     }
 
     #[test]

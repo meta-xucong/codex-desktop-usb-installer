@@ -39,10 +39,21 @@ Assert-Condition ($manifest.secretsIncluded -eq $false) "发布物不应包含�
 
 $sha256 = (Get-FileHash -LiteralPath $exePath -Algorithm SHA256).Hash.ToUpperInvariant()
 Assert-Condition ($sha256 -eq ([string]$manifest.artifact.sha256).ToUpperInvariant()) "EXE SHA256 与 manifest 不一致"
+$sourcePatchRelative = [string]$manifest.sourcePatch
+Assert-Condition (-not [string]::IsNullOrWhiteSpace($sourcePatchRelative)) "manifest 缺少固定产品源码补丁路径"
+Assert-Condition (-not [System.IO.Path]::IsPathRooted($sourcePatchRelative)) "产品源码补丁路径必须是相对路径"
+$sourcePatchSegments = $sourcePatchRelative -split '[\\/]'
+Assert-Condition ($sourcePatchSegments -notcontains '..') "产品源码补丁路径不能包含父目录跳转"
+$sourcePatchPath = Join-Path $ArtifactDir $sourcePatchRelative
+Assert-Condition (Test-Path -LiteralPath $sourcePatchPath -PathType Leaf) "缺少固定产品源码补丁：$sourcePatchPath"
+$sourcePatchHash = (Get-FileHash -LiteralPath $sourcePatchPath -Algorithm SHA256).Hash.ToUpperInvariant()
+Assert-Condition ($sourcePatchHash -eq ([string]$manifest.sourcePatchSha256).ToUpperInvariant()) "产品源码补丁 SHA256 与 manifest 不一致"
 
 $binaryText = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($exePath))
 Assert-Condition ($binaryText.Contains("404token.xyz/v1")) "EXE 未包含 404TOKEN 端点"
 Assert-Condition ($binaryText.Contains("CODEX_USB_404TOKEN_HANDOFF_V1")) "EXE 不支持管理器确认式 API Key 注入；请使用包含持久化回读确认协议的 CCSwitch 源码重新构建"
+Assert-Condition ($binaryText.Contains("CODEX_USB_MCP_PRESERVATION_V1")) "EXE 缺少 USB Codex MCP 保留实现；拒绝发布可能覆盖 config.toml 的旧版 CCSwitch"
+Assert-Condition ($binaryText.Contains("CODEX_USB_MCP_SYNC_FAILURE_RECOVERY_V1")) "EXE 缺少 Codex MCP 同步失败恢复实现；拒绝发布可能复活已禁用 MCP 的 CCSwitch"
 Assert-Condition (-not $binaryText.Contains("127.0.0.1:8080")) "EXE 不应包含旧本地代理地址"
 # A release binary built without Tauri's custom-protocol feature falls back to
 # devUrl (localhost:3000) on a blank machine.  The compiled renderer asset

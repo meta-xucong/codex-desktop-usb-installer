@@ -13,6 +13,7 @@ TARGETS = {
     "install-wizard.ps1": ROOT / "installer-pack" / "install-wizard.ps1",
     "install-all.ps1": ROOT / "installer-pack" / "install-all.ps1",
     "provision-runtime.ps1": ROOT / "installer-pack" / "runtime" / "provision-runtime.ps1",
+    "capability_pack.rs": ROOT / "src-tauri" / "src" / "app" / "capability_pack.rs",
 }
 BATCH_LAUNCHER = ROOT / "installer-pack" / "Install-Codex-Starter.cmd"
 
@@ -131,6 +132,30 @@ class InstallerChainWindowStaticTests(unittest.TestCase):
             source,
             r"(?s)if\s*\(\$EnableFullAccess\)\s*\{\s*\$arguments\s*\+=\s*'-EnableFullAccess'\s*\}",
             "the wrapper must pass full-access only when the trusted USB caller requested it",
+        )
+
+    def test_usb_caller_forwards_full_access_to_install_all(self):
+        source = self.read_target("capability_pack.rs")
+        self.assertRegex(
+            source,
+            r'(?s)if\s+let\s+Some\(usb_codex_home\).*?command\.arg\("-EnableFullAccess"\)',
+            "USB capability installer must enable full access for its isolated Codex home",
+        )
+
+    def test_install_to_codex_forwards_full_access_to_configure(self):
+        source = self.read_target("install-to-codex.ps1")
+        self.assertRegex(
+            source,
+            r"(?s)\$configArguments\s*=\s*@\{.*?if\s*\(\$EnableFullAccess\)\s*\{\s*\$configArguments\.EnableFullAccess\s*=\s*\$true\s*\}.*?&\s*\$configMerger\s+@configArguments",
+            "install-to-codex must forward full access to configure-codex only when enabled",
+        )
+
+    def test_media_readiness_tracks_enabled_rendered_and_merged_config(self):
+        source = self.read_target("install-to-codex.ps1")
+        self.assertRegex(
+            source,
+            r"(?s)\$mediaRegistrationVerified\s*=\s*\[regex\]::IsMatch\(\$mergedConfig.*?\$mediaRegistered\s*=\s*\[bool\]\(\$mediaGenerationEnabled\s*-and\s*\$renderStatus\.mediaGenerationEnabled\s*-and\s*\$configStatus\.merged\s*-and\s*\$mediaRegistrationVerified\).*?registered\s*=\s*\$mediaRegistered.*?enabled\s*=\s*\$mediaRegistered",
+            "readiness must confirm the merged Codex config contains enabled media MCP",
         )
 
     def test_hidden_window_options_are_limited_to_nested_install_processes(self):

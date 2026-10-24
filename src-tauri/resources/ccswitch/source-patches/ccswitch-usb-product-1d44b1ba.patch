@@ -1,0 +1,4542 @@
+diff --git a/package.json b/package.json
+index 7e7acd3d..9b6712ff 100644
+--- a/package.json
++++ b/package.json
+@@ -12,7 +12,7 @@
+     "typecheck": "tsc --noEmit",
+     "format": "prettier --write \"src/**/*.{js,jsx,ts,tsx,css,json}\"",
+     "format:check": "prettier --check \"src/**/*.{js,jsx,ts,tsx,css,json}\"",
+-    "test:unit": "vitest run",
++    "test:unit": "vitest run --no-file-parallelism",
+     "test:unit:watch": "vitest watch"
+   },
+   "keywords": [],
+diff --git a/pnpm-workspace.yaml b/pnpm-workspace.yaml
+index fab9eb3b..43daaa85 100644
+--- a/pnpm-workspace.yaml
++++ b/pnpm-workspace.yaml
+@@ -1,4 +1,8 @@
+ packages: []
+ 
++allowBuilds:
++  esbuild: set this to true or false
++  msw: set this to true or false
++
+ onlyBuiltDependencies:
+   - '@tailwindcss/oxide'
+diff --git a/src-tauri/src/codex_config.rs b/src-tauri/src/codex_config.rs
+index af02c1b3..23fba0d7 100644
+--- a/src-tauri/src/codex_config.rs
++++ b/src-tauri/src/codex_config.rs
+@@ -13,6 +13,14 @@ use toml_edit::DocumentMut;
+ 
+ pub const CC_SWITCH_CODEX_MODEL_PROVIDER_ID: &str = "ccswitch";
+ 
++fn usb_codex_home_for_mode(mode: Option<&str>, home: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
++    if mode != Some("usb") {
++        return None;
++    }
++    let path = PathBuf::from(home?);
++    path.is_absolute().then_some(path)
++}
++
+ /// Reserved built-in provider IDs from OpenAI Codex's config/model-provider
+ /// catalog. Keep in sync with Codex `RESERVED_MODEL_PROVIDER_IDS` and legacy
+ /// removed provider aliases.
+@@ -27,6 +35,16 @@ const CODEX_RESERVED_MODEL_PROVIDER_IDS: &[&str] = &[
+ 
+ /// 获取 Codex 配置目录路径
+ pub fn get_codex_config_dir() -> PathBuf {
++    // The USB manager runs Codex with a dedicated CODEX_HOME outside the
++    // removable drive. Its CCSwitch child must target that same directory,
++    // not the user's unrelated ~/.codex profile. The value is supplied only
++    // by the signed USB manager and is scoped to this child process.
++    if let Some(home) = usb_codex_home_for_mode(
++        std::env::var("CODEX_USB_CCSWITCH_MODE").ok().as_deref(),
++        std::env::var_os("CCSWITCH_USB_CODEX_HOME").as_deref(),
++    ) {
++        return home;
++    }
+     if let Some(custom) = crate::settings::get_codex_override_dir() {
+         return custom;
+     }
+@@ -79,6 +97,7 @@ pub fn write_codex_live_atomic(
+     auth: &Value,
+     config_text_opt: Option<&str>,
+ ) -> Result<(), AppError> {
++    let _codex_guard = crate::usb_model_selection::acquire_codex_guard()?;
+     let auth_path = get_codex_auth_path();
+     let config_path = get_codex_config_path();
+ 
+@@ -530,6 +549,21 @@ pub fn remove_codex_toml_base_url_if(toml_str: &str, predicate: impl Fn(&str) ->
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn usb_mode_uses_the_usb_managers_isolated_codex_home() {
++        let home = std::ffi::OsStr::new(r"C:\Users\Test\AppData\Local\CodexAppManager\usb-codex-home");
++        assert_eq!(
++            usb_codex_home_for_mode(Some("usb"), Some(home)),
++            Some(PathBuf::from(home))
++        );
++        assert_eq!(usb_codex_home_for_mode(Some("local"), Some(home)), None);
++        assert_eq!(usb_codex_home_for_mode(Some("usb"), None), None);
++        assert_eq!(
++            usb_codex_home_for_mode(Some("usb"), Some(std::ffi::OsStr::new("relative-home"))),
++            None
++        );
++    }
++
+     #[test]
+     fn normalize_live_config_preserves_current_custom_model_provider_id() {
+         let current = r#"model_provider = "rightcode"
+diff --git a/src-tauri/src/config.rs b/src-tauri/src/config.rs
+index 0ad7a0d4..cdf37bb0 100644
+--- a/src-tauri/src/config.rs
++++ b/src-tauri/src/config.rs
+@@ -238,10 +238,9 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> Result<(), AppError> {
+ 
+     #[cfg(windows)]
+     {
+-        // Windows 上 rename 目标存在会失败，先移除再重命名（尽量接近原子性）
+-        if path.exists() {
+-            let _ = fs::remove_file(path);
+-        }
++        // std::fs::rename replaces an existing file on Windows. Keep the
++        // destination in place until the replacement succeeds; deleting it
++        // first can lose the last valid config if the rename then fails.
+         fs::rename(&tmp, path).map_err(|e| AppError::IoContext {
+             context: format!("原子替换失败: {} -> {}", tmp.display(), path.display()),
+             source: e,
+@@ -262,6 +261,21 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> Result<(), AppError> {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn atomic_write_replaces_existing_file_without_predeleting_it() {
++        let dir = tempfile::tempdir_in(std::env::current_dir().expect("working directory"))
++            .expect("create workspace atomic-write fixture");
++        let path = dir.path().join("config.toml");
++        fs::write(&path, "old-valid-config").expect("write existing config");
++
++        atomic_write(&path, b"new-valid-config").expect("replace existing config");
++
++        assert_eq!(
++            fs::read(&path).expect("read replaced config"),
++            b"new-valid-config"
++        );
++    }
++
+     #[test]
+     fn derive_mcp_path_from_override_preserves_folder_name() {
+         let override_dir = PathBuf::from("/tmp/profile/.claude");
+diff --git a/src-tauri/src/database/dao/providers.rs b/src-tauri/src/database/dao/providers.rs
+index 69b4cc3d..f210decf 100644
+--- a/src-tauri/src/database/dao/providers.rs
++++ b/src-tauri/src/database/dao/providers.rs
+@@ -177,7 +177,71 @@ impl Database {
+         }
+     }
+ 
++    /// Prepare the USB Codex record without replacing user-owned configuration.
++    /// Existing records change only the credential; the transaction also
++    /// prevents a concurrent provider edit from being lost between read/write.
++    pub(crate) fn prepare_usb_codex_provider(&self, provider: &Provider) -> Result<(), AppError> {
++        let _codex_guard = crate::usb_model_selection::acquire_codex_guard()?;
++        use rusqlite::OptionalExtension;
++        let failure = || AppError::Database("USB provider preparation failed".into());
++        // This is deliberately not a replacement for the general save API.
++        if provider.id != crate::services::provider::USB_404TOKEN_PROVIDER_ID
++            || provider.in_failover_queue || provider.meta.as_ref()
++            .is_some_and(|meta| !meta.custom_endpoints.is_empty()) {
++            return Err(AppError::Config("USB bootstrap requires initial DB-only provider input".into()));
++        }
++        let key = provider.settings_config.get("auth")
++            .and_then(|auth| auth.get("OPENAI_API_KEY"))
++            .and_then(serde_json::Value::as_str).filter(|key| !key.trim().is_empty())
++            .ok_or_else(failure)?;
++        let configured_base = |value: &serde_json::Value| -> Option<String> {
++            let document: toml::Value = value.get("config")?.as_str()?.parse().ok()?;
++            let provider = document.get("model_provider")?.as_str()?;
++            document.get("model_providers")?.get(provider)?.get("base_url")?
++                .as_str().map(|url| url.trim_end_matches('/').to_owned())
++        };
++        let expected_base = configured_base(&provider.settings_config).ok_or_else(failure)?;
++        if expected_base != crate::services::provider::USB_404TOKEN_BASE_URL {
++            return Err(AppError::Config("USB bootstrap endpoint is not the bound endpoint".into()));
++        }
++        let mut conn = lock_conn!(self.conn);
++        let tx = conn.transaction().map_err(|_| failure())?;
++        let existing: Option<String> = tx.query_row(
++            "SELECT settings_config FROM providers WHERE id = ?1 AND app_type = 'codex'",
++            params![provider.id], |row| row.get(0)).optional().map_err(|_| failure())?;
++        if let Some(existing) = existing {
++            let mut settings: serde_json::Value = serde_json::from_str(&existing).map_err(|_| failure())?;
++            // Never inject the signed USB credential into a customized remote endpoint.
++            // Keep that record intact and require explicit conflict resolution instead.
++            if configured_base(&settings).as_deref() != Some(expected_base.as_str()) {
++                return Err(AppError::Config("USB provider endpoint differs from its binding; existing settings were retained".into()));
++            }
++            let object = settings.as_object_mut().ok_or_else(failure)?;
++            let auth = object.entry("auth").or_insert_with(|| serde_json::json!({}));
++            let auth = auth.as_object_mut().ok_or_else(failure)?;
++            auth.insert("OPENAI_API_KEY".into(), serde_json::Value::String(key.into()));
++            let serialized = serde_json::to_string(&settings).map_err(|_| failure())?;
++            tx.execute("UPDATE providers SET settings_config = ?1 WHERE id = ?2 AND app_type = 'codex'",
++                params![serialized, provider.id]).map_err(|_| failure())?;
++        } else {
++            let settings = serde_json::to_string(&provider.settings_config).map_err(|_| failure())?;
++            let meta = serde_json::to_string(&provider.meta.clone().unwrap_or_default()).map_err(|_| failure())?;
++            tx.execute("INSERT INTO providers (id, app_type, name, settings_config, website_url, category,
++                created_at, sort_index, notes, icon, icon_color, meta, is_current, in_failover_queue)
++                VALUES (?1, 'codex', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, 0)",
++                params![provider.id, provider.name, settings, provider.website_url, provider.category,
++                    provider.created_at, provider.sort_index, provider.notes, provider.icon,
++                    provider.icon_color, meta]).map_err(|_| failure())?;
++        }
++        tx.commit().map_err(|_| failure())
++    }
++
+     pub fn save_provider(&self, app_type: &str, provider: &Provider) -> Result<(), AppError> {
++        let _codex_guard = if app_type == "codex" {
++            Some(crate::usb_model_selection::acquire_codex_guard()?)
++        } else {
++            None
++        };
+         let mut conn = lock_conn!(self.conn);
+         let tx = conn
+             .transaction()
+@@ -287,6 +351,44 @@ impl Database {
+         Ok(())
+     }
+ 
++    /// Narrow Codex USB transaction. The callback may write only the already
++    /// validated local files/settings; it must not re-enter this DB connection.
++    pub(crate) fn apply_usb_model_selection_transaction<F>(
++        &self, before: &serde_json::Value, after: &serde_json::Value,
++        expected_current: Option<&str>, write_live: F,
++    ) -> Result<(), AppError>
++    where F: FnOnce() -> Result<(), AppError> {
++        const ID: &str = "404token-sub2api";
++        let _codex_guard = crate::usb_model_selection::acquire_codex_guard()?;
++        if expected_current.is_some_and(|id| id != ID) {
++            return Err(AppError::Config("USB selection would replace a different provider".into()));
++        }
++        let mut conn = lock_conn!(self.conn);
++        let tx = conn.transaction().map_err(|_| AppError::Database("USB selection transaction failed".into()))?;
++        let stored: String = tx.query_row(
++            "SELECT settings_config FROM providers WHERE app_type = 'codex' AND id = ?1",
++            params![ID], |row| row.get(0),
++        ).map_err(|_| AppError::Database("USB provider is unavailable".into()))?;
++        let value: serde_json::Value = serde_json::from_str(&stored)
++            .map_err(|_| AppError::Config("USB provider settings are invalid".into()))?;
++        if &value != before { return Err(AppError::Config("USB provider revision changed".into())); }
++        let ids: Vec<String> = {
++            let mut statement = tx.prepare("SELECT id FROM providers WHERE app_type = 'codex' AND is_current = 1")
++                .map_err(|_| AppError::Database("USB selection snapshot failed".into()))?;
++            let values = statement.query_map([], |row| row.get::<_,String>(0))
++                .map_err(|_| AppError::Database("USB selection snapshot failed".into()))?;
++            values.collect::<Result<Vec<_>,_>>()
++                .map_err(|_| AppError::Database("USB selection snapshot failed".into()))?
++        };
++        let expected = expected_current.into_iter().map(str::to_owned).collect::<Vec<_>>();
++        if ids != expected { return Err(AppError::Config("USB current provider revision changed".into())); }
++        let encoded = serde_json::to_string(after).map_err(|_| AppError::Config("USB settings serialization failed".into()))?;
++        tx.execute("UPDATE providers SET settings_config = ?1, is_current = 1 WHERE app_type = 'codex' AND id = ?2",
++            params![encoded,ID]).map_err(|_| AppError::Database("USB selection staging failed".into()))?;
++        write_live()?;
++        tx.commit().map_err(|_| AppError::Database("USB selection commit failed".into()))
++    }
++
+     pub fn set_current_provider(&self, app_type: &str, id: &str) -> Result<(), AppError> {
+         let mut conn = lock_conn!(self.conn);
+         let tx = conn
+@@ -309,12 +411,27 @@ impl Database {
+         Ok(())
+     }
+ 
++    pub fn clear_current_provider(&self, app_type: &str) -> Result<(), AppError> {
++        let conn = lock_conn!(self.conn);
++        conn.execute(
++            "UPDATE providers SET is_current = 0 WHERE app_type = ?1",
++            params![app_type],
++        )
++        .map_err(|e| AppError::Database(e.to_string()))?;
++        Ok(())
++    }
++
+     pub fn update_provider_settings_config(
+         &self,
+         app_type: &str,
+         provider_id: &str,
+         settings_config: &serde_json::Value,
+     ) -> Result<(), AppError> {
++        let _codex_guard = if app_type == "codex" {
++            Some(crate::usb_model_selection::acquire_codex_guard()?)
++        } else {
++            None
++        };
+         let conn = lock_conn!(self.conn);
+         conn.execute(
+             "UPDATE providers SET settings_config = ?1 WHERE id = ?2 AND app_type = ?3",
+@@ -634,3 +751,118 @@ impl Database {
+         Ok(inserted)
+     }
+ }
++
++#[cfg(test)]
++mod usb_preparation_tests {
++    use super::*;
++    use serde_json::json;
++
++    fn pending() -> Provider {
++        Provider::with_id(crate::services::provider::USB_404TOKEN_PROVIDER_ID.into(), "USB fixture".into(),
++            json!({"auth":{"OPENAI_API_KEY":"fixture-new"},"config":format!(
++                r#"model_provider = "fixture"
++[model_providers.fixture]
++base_url = "{}"
++"#,
++                crate::services::provider::USB_404TOKEN_BASE_URL)}), None)
++    }
++
++    #[test]
++    fn bootstrap_rejects_non_usb_identity_and_unbound_initial_endpoint() {
++        let db = Database::memory().unwrap();
++        let mut wrong_id = pending();
++        wrong_id.id = "different-provider".into();
++        assert!(db.prepare_usb_codex_provider(&wrong_id).is_err());
++        assert!(db.get_provider_by_id(&wrong_id.id, "codex").unwrap().is_none());
++        let mut wrong_endpoint = pending();
++        wrong_endpoint.settings_config["config"] = json!(r#"model_provider = "fixture"
++[model_providers.fixture]
++base_url = "https://unbound.invalid/v1"
++"#);
++        assert!(db.prepare_usb_codex_provider(&wrong_endpoint).is_err());
++        assert!(db.get_provider_by_id(&wrong_endpoint.id, "codex").unwrap().is_none());
++        assert_eq!(db.get_current_provider("codex").unwrap(), None);
++    }
++
++    #[test]
++    fn scoped_selection_rolls_back_settings_and_current_flag_on_callback_failure() {
++        let db = Database::memory().unwrap();
++        let mut provider = pending(); provider.id = "404token-sub2api".into();
++        provider.notes = Some("user-owned-note".into());
++        db.save_provider("codex", &provider).unwrap();
++        let before = provider.settings_config.clone();
++        let mut after = before.clone(); after["config"] = json!("model = \"arbitrary/verified-model\"\n");
++        let outcome = db.apply_usb_model_selection_transaction(&before, &after, None,
++            || Err(AppError::Config("synthetic write failure".into())));
++        assert!(outcome.is_err());
++        let stored = db.get_provider_by_id(&provider.id, "codex").unwrap().unwrap();
++        assert_eq!(stored.settings_config, before);
++        assert_eq!(stored.notes, provider.notes);
++        assert_eq!(db.get_current_provider("codex").unwrap(), None);
++    }
++
++    #[test]
++    fn scoped_selection_preserves_metadata_and_rejects_stale_or_other_current_provider() {
++        let db = Database::memory().unwrap();
++        let mut provider = pending(); provider.id = "404token-sub2api".into();
++        provider.notes = Some("user-owned-note".into());
++        db.save_provider("codex", &provider).unwrap();
++        let before = provider.settings_config.clone();
++        let mut after = before.clone(); after["config"] = json!("model = \"arbitrary/verified-model\"\n");
++        assert!(db.apply_usb_model_selection_transaction(&json!({}), &after, None, || Ok(())).is_err());
++        assert!(db.apply_usb_model_selection_transaction(&before, &after, Some("different-provider"), || Ok(())).is_err());
++        db.apply_usb_model_selection_transaction(&before, &after, None, || Ok(())).unwrap();
++        let stored = db.get_provider_by_id(&provider.id, "codex").unwrap().unwrap();
++        assert_eq!(stored.settings_config, after);
++        assert_eq!(stored.notes, provider.notes);
++        assert_eq!(db.get_current_provider("codex").unwrap().as_deref(), Some(provider.id.as_str()));
++    }
++
++    #[test]
++    fn existing_usb_record_keeps_config_and_metadata_when_credential_changes() {
++        let db = Database::memory().unwrap();
++        let mut existing = pending();
++        existing.name = "User name".into();
++        existing.notes = Some("User notes".into());
++        existing.sort_index = Some(17);
++        existing.settings_config = json!({"auth":{"OPENAI_API_KEY":"fixture-old","extra":"kept"},
++            "config":format!("model = \"user-selected\"\n{}", pending().settings_config["config"].as_str().unwrap()), "custom":{"keep":true}});
++        db.save_provider("codex", &existing).unwrap();
++        db.set_current_provider("codex", &existing.id).unwrap();
++        let before = db.get_provider_by_id(&existing.id, "codex").unwrap().unwrap();
++        db.prepare_usb_codex_provider(&pending()).unwrap();
++        let after = db.get_provider_by_id(&existing.id, "codex").unwrap().unwrap();
++        let mut expected = serde_json::to_value(before).unwrap();
++        expected["settingsConfig"]["auth"]["OPENAI_API_KEY"] = json!("fixture-new");
++        assert_eq!(serde_json::to_value(after).unwrap(), expected);
++        assert_eq!(db.get_current_provider("codex").unwrap().as_deref(), Some(existing.id.as_str()));
++    }
++
++    #[test]
++    fn customized_endpoint_never_receives_the_usb_credential() {
++        let db = Database::memory().unwrap();
++        let incoming = pending();
++        let mut existing = incoming.clone();
++        existing.settings_config["config"] = json!(
++            "model_provider = \"fixture\"\n[model_providers.fixture]\nbase_url = \"https://different.invalid/v1\"\n");
++        existing.settings_config["auth"]["OPENAI_API_KEY"] = json!("fixture-original");
++        db.save_provider("codex", &existing).unwrap();
++        assert!(db.prepare_usb_codex_provider(&incoming).is_err());
++        let after = db.get_provider_by_id(&existing.id, "codex").unwrap().unwrap();
++        assert_eq!(after.settings_config, existing.settings_config);
++    }
++
++    #[test]
++    fn new_usb_record_is_not_current_and_corrupt_auth_is_not_overwritten() {
++        let db = Database::memory().unwrap();
++        let provider = pending();
++        db.prepare_usb_codex_provider(&provider).unwrap();
++        assert_eq!(db.get_current_provider("codex").unwrap(), None);
++        let mut broken = provider.clone();
++        broken.settings_config["auth"] = json!("invalid-auth-object");
++        db.save_provider("codex", &broken).unwrap();
++        assert!(db.prepare_usb_codex_provider(&provider).is_err());
++        let current = db.get_provider_by_id(&provider.id, "codex").unwrap().unwrap();
++        assert_eq!(current.settings_config, broken.settings_config);
++    }
++}
+diff --git a/src-tauri/src/database/dao/usage_rollup.rs b/src-tauri/src/database/dao/usage_rollup.rs
+index fc5fdb37..f5c1481c 100644
+--- a/src-tauri/src/database/dao/usage_rollup.rs
++++ b/src-tauri/src/database/dao/usage_rollup.rs
+@@ -337,10 +337,11 @@ mod tests {
+ 
+         {
+             let conn = crate::database::lock_conn!(db.conn);
+-            let date_str = chrono::DateTime::from_timestamp(old_ts, 0)
+-                .unwrap()
+-                .format("%Y-%m-%d")
+-                .to_string();
++            let date_str: String = conn.query_row(
++                "SELECT date(?1, 'unixepoch', 'localtime')",
++                [old_ts],
++                |row| row.get(0),
++            )?;
+             conn.execute(
+                 "INSERT INTO usage_daily_rollups
+                     (date, app_type, provider_id, model, request_count, success_count,
+diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
+index e5d2e599..a22e5e1c 100644
+--- a/src-tauri/src/lib.rs
++++ b/src-tauri/src/lib.rs
+@@ -29,6 +29,7 @@ mod services;
+ mod session_manager;
+ mod settings;
+ mod store;
++mod usb_model_selection;
+ 
+ mod tray;
+ mod usage_script;
+@@ -55,6 +56,7 @@ pub use services::{
+ };
+ pub use settings::{update_settings, AppSettings};
+ pub use store::AppState;
++pub use usb_model_selection::try_usb_model_selection_cli;
+ use tauri_plugin_deep_link::DeepLinkExt;
+ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+ 
+@@ -521,6 +523,22 @@ pub fn run() {
+                 Err(e) => log::warn!("✗ Failed to seed official providers: {e}"),
+             }
+ 
++            // USB mode supplies a per-device 404TOKEN key in the child
++            // environment. Bootstrap activates the bound provider endpoint,
++            // but intentionally leaves model selection unset until the model
++            // manager verifies a compatible model.
++            match crate::services::ProviderService::bootstrap_usb_404token_from_environment(
++                &app_state,
++            ) {
++                Ok(true) => log::info!(
++                    "USB provider activated and verified; model selection awaits Code Agent verification"
++                ),
++                Ok(false) => {}
++                Err(_) => log::warn!(
++                    "USB provider preparation failed; retry or manual configuration remains available"
++                ),
++            }
++
+             // 老用户 / 已确认的路径由 `fresh_install_at_startup` 自行拦截，这里不做写入。
+             // 字段只由前端在用户点击"我知道了"时 save_settings 回写，语义是"用户显式确认过"。
+             if !first_run_already_confirmed && fresh_install_at_startup {
+@@ -848,7 +866,35 @@ pub fn run() {
+             // 初始化全局出站代理 HTTP 客户端
+             {
+                 let db = &app.state::<AppState>().db;
+-                let proxy_url = db.get_global_proxy_url().ok().flatten();
++                // Resolve the configured listener before initializing the
++                // outbound client.  This lets startup recognize a stale
++                // global proxy value that points back to this very process,
++                // including installations that changed the listen port.
++                let listen_port = tauri::async_runtime::block_on(db.get_proxy_config())
++                    .map(|config| config.listen_port)
++                    .unwrap_or(15721);
++                crate::proxy::http_client::set_proxy_port(listen_port);
++                let saved_proxy_url = db.get_global_proxy_url().ok().flatten();
++                let proxy_url = if saved_proxy_url
++                    .as_deref()
++                    .is_some_and(crate::proxy::http_client::is_self_proxy_url)
++                {
++                    log::warn!(
++                        "[GlobalProxy] Clearing stale self-proxy configuration: {}",
++                        saved_proxy_url
++                            .as_deref()
++                            .map(crate::proxy::http_client::mask_url)
++                            .unwrap_or_default()
++                    );
++                    if let Err(clear_err) = db.set_global_proxy_url(None) {
++                        log::error!(
++                            "[GlobalProxy] Failed to clear stale self-proxy configuration: {clear_err}"
++                        );
++                    }
++                    None
++                } else {
++                    saved_proxy_url
++                };
+ 
+                 if let Err(e) = crate::proxy::http_client::init(proxy_url.as_deref()) {
+                     log::error!(
+@@ -1003,14 +1049,19 @@ pub fn run() {
+                 // 仅 Linux 生效：解决 Wayland 下系统窗口按钮不可用的问题
+                 #[cfg(target_os = "linux")]
+                 let _ = window.set_decorations(!settings.use_app_window_controls);
+-                if settings.silent_startup {
++                let usb_background_start = std::env::var("CODEX_USB_CCSWITCH_BACKGROUND")
++                    .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
++                    .unwrap_or(false);
++                if settings.silent_startup || usb_background_start {
+                     // 静默启动模式：保持窗口隐藏
+                     let _ = window.hide();
+                     #[cfg(target_os = "windows")]
+                     let _ = window.set_skip_taskbar(true);
+                     #[cfg(target_os = "macos")]
+                     tray::apply_tray_policy(app.handle(), false);
+-                    log::info!("静默启动模式：主窗口已隐藏");
++                    log::info!(
++                        "静默启动模式：主窗口已隐藏（usb_background_start={usb_background_start}）"
++                    );
+                 } else {
+                     // 正常启动模式：显示窗口
+                     let _ = window.show();
+diff --git a/src-tauri/src/main.rs b/src-tauri/src/main.rs
+index 9d81b848..03b31f43 100644
+--- a/src-tauri/src/main.rs
++++ b/src-tauri/src/main.rs
+@@ -2,6 +2,10 @@
+ #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+ 
+ fn main() {
++    if let Some(exit_code) = cc_switch_lib::try_usb_model_selection_cli() {
++        std::process::exit(exit_code);
++    }
++
+     // 在 Linux 上设置 WebKit 环境变量以解决 DMA-BUF 渲染问题
+     // 某些 Linux 系统（如 Debian 13.2、Nvidia GPU）上 WebKitGTK 的 DMA-BUF 渲染器可能导致白屏/黑屏
+     // 参考: https://github.com/tauri-apps/tauri/issues/9394
+diff --git a/src-tauri/src/mcp/codex.rs b/src-tauri/src/mcp/codex.rs
+index 7ab7eef8..f248daf7 100644
+--- a/src-tauri/src/mcp/codex.rs
++++ b/src-tauri/src/mcp/codex.rs
+@@ -559,7 +559,7 @@ fn json_value_to_toml_item(value: &Value, field_name: &str) -> Option<toml_edit:
+ /// 1. 核心字段（type, command, args, url, headers, env, cwd）使用强类型处理
+ /// 2. 扩展字段（timeout、retry 等）通过白名单列表自动转换
+ /// 3. 其他未知字段使用通用转换器尝试转换
+-fn json_server_to_toml_table(spec: &Value) -> Result<toml_edit::Table, AppError> {
++pub(super) fn json_server_to_toml_table(spec: &Value) -> Result<toml_edit::Table, AppError> {
+     use toml_edit::{Array, Item, Table};
+ 
+     let mut t = Table::new();
+diff --git a/src-tauri/src/mcp/mod.rs b/src-tauri/src/mcp/mod.rs
+index c411ac46..e6f82aaa 100644
+--- a/src-tauri/src/mcp/mod.rs
++++ b/src-tauri/src/mcp/mod.rs
+@@ -26,6 +26,12 @@ pub use claude::{
+ pub use codex::{
+     import_from_codex, remove_server_from_codex, sync_enabled_to_codex, sync_single_server_to_codex,
+ };
++
++pub(crate) fn codex_server_to_toml_table(
++    server: &serde_json::Value,
++) -> Result<toml_edit::Table, crate::error::AppError> {
++    codex::json_server_to_toml_table(server)
++}
+ pub use gemini::{
+     import_from_gemini, remove_server_from_gemini, sync_enabled_to_gemini,
+     sync_single_server_to_gemini,
+diff --git a/src-tauri/src/provider.rs b/src-tauri/src/provider.rs
+index 60c591fe..26b387f4 100644
+--- a/src-tauri/src/provider.rs
++++ b/src-tauri/src/provider.rs
+@@ -527,12 +527,16 @@ impl UniversalProvider {
+         }
+ 
+         let models = self.models.codex.as_ref();
+-        let model = models
+-            .and_then(|m| m.model.clone())
+-            .unwrap_or_else(|| "gpt-4o".to_string());
+-        let reasoning_effort = models
+-            .and_then(|m| m.reasoning_effort.clone())
+-            .unwrap_or_else(|| "high".to_string());
++        // The universal-provider path must not reintroduce a static Codex
++        // fallback. An explicit user selection is not a readiness certificate.
++        let model = models.and_then(|m| m.model.as_deref()).map(str::trim)
++            .filter(|model| !model.is_empty() && model.len() <= 256 && !model.chars().any(char::is_control))?;
++        let model_literal = serde_json::to_string(model).ok()?;
++        let reasoning_line = match models.and_then(|m| m.reasoning_effort.as_deref())
++            .map(str::trim).filter(|effort| !effort.is_empty()) {
++            Some(effort) => format!("model_reasoning_effort = {}\n", serde_json::to_string(effort).ok()?),
++            None => String::new(),
++        };
+ 
+         // Codex/OpenAI 的 base_url 既可能是纯 origin（需要补 /v1），也可能包含自定义前缀（不应强行补版本）
+         let base_trimmed = self.base_url.trim_end_matches('/');
+@@ -549,15 +553,15 @@ impl UniversalProvider {
+         };
+ 
+         // 生成 Codex 的 config.toml 内容
++        let base_literal = serde_json::to_string(&codex_base_url).ok()?;
+         let config_toml = format!(
+             r#"model_provider = "newapi"
+-model = "{model}"
+-model_reasoning_effort = "{reasoning_effort}"
+-disable_response_storage = true
++model = {model_literal}
++{reasoning_line}disable_response_storage = true
+ 
+ [model_providers.newapi]
+ name = "NewAPI"
+-base_url = "{codex_base_url}"
++base_url = {base_literal}
+ wire_api = "responses"
+ requires_openai_auth = true"#
+         );
+@@ -898,6 +902,7 @@ mod tests {
+             "api-key".to_string(),
+         );
+         universal.apps.codex = true;
++        universal.models.codex = Some(CodexModelConfig { model: Some("fixture-explicit".into()), reasoning_effort: None });
+ 
+         let provider = universal.to_codex_provider().expect("codex provider");
+         let config = provider
+@@ -909,6 +914,21 @@ mod tests {
+         assert!(config.contains("base_url = \"https://api.example.com/v1\""));
+     }
+ 
++    #[test]
++    fn universal_codex_has_no_implicit_model_or_reasoning() {
++        let mut universal = UniversalProvider::new("fixture".into(), "Fixture".into(), "newapi".into(),
++            "https://fixture.invalid/v1".into(), "fixture-key".into());
++        universal.apps.codex = true;
++        assert!(universal.to_codex_provider().is_none());
++        universal.models.codex = Some(CodexModelConfig { model: Some(" ".into()), reasoning_effort: None });
++        assert!(universal.to_codex_provider().is_none());
++        universal.models.codex = Some(CodexModelConfig { model: Some("vendor/explicit".into()), reasoning_effort: None });
++        let provider = universal.to_codex_provider().unwrap();
++        let config = provider.settings_config["config"].as_str().unwrap();
++        assert!(config.contains("vendor/explicit"));
++        assert!(!config.contains("model_reasoning_effort"));
++    }
++
+     #[test]
+     fn universal_provider_to_codex_provider_disabled_returns_none() {
+         let universal = UniversalProvider::new(
+@@ -991,6 +1011,7 @@ mod tests {
+             "sk-test".to_string(),
+         );
+         p.apps.codex = true;
++        p.models.codex = Some(CodexModelConfig { model: Some("fixture-explicit".into()), reasoning_effort: None });
+ 
+         let provider = p.to_codex_provider().expect("should build codex provider");
+         let toml = provider
+@@ -1012,6 +1033,7 @@ mod tests {
+             "sk-test".to_string(),
+         );
+         p.apps.codex = true;
++        p.models.codex = Some(CodexModelConfig { model: Some("fixture-explicit".into()), reasoning_effort: None });
+ 
+         let provider = p.to_codex_provider().expect("should build codex provider");
+         let toml = provider
+diff --git a/src-tauri/src/proxy/http_client.rs b/src-tauri/src/proxy/http_client.rs
+index 1d3ddb2c..5044e27c 100644
+--- a/src-tauri/src/proxy/http_client.rs
++++ b/src-tauri/src/proxy/http_client.rs
+@@ -51,7 +51,24 @@ fn get_proxy_port() -> u16 {
+ /// * `proxy_url` - 代理 URL，如 `http://127.0.0.1:7890` 或 `socks5://127.0.0.1:1080`
+ ///   传入 None 或空字符串表示直连
+ pub fn init(proxy_url: Option<&str>) -> Result<(), String> {
+-    let effective_url = proxy_url.filter(|s| !s.trim().is_empty());
++    let requested_url = proxy_url.filter(|s| !s.trim().is_empty());
++    // A saved global proxy must never point back at CC Switch's own listener.
++    // Doing so is easy to create accidentally when a previous session exposed
++    // the local proxy address as an upstream value; once the listener starts,
++    // every outbound request recursively enters the same proxy.  Treat this
++    // one exact loopback/port combination as direct mode during startup.  The
++    // caller also clears the persisted value so the repair is one-time.
++    let effective_url = requested_url.filter(|url| {
++        if is_self_proxy_url(url) {
++            log::warn!(
++                "[GlobalProxy] Saved proxy points to CC Switch listener ({}); using direct connection",
++                mask_url(url)
++            );
++            false
++        } else {
++            true
++        }
++    });
+     let client = build_client(effective_url)?;
+ 
+     // 尝试初始化全局客户端，如果已存在则记录警告并使用 apply_proxy 更新
+@@ -63,7 +80,7 @@ pub fn init(proxy_url: Option<&str>) -> Result<(), String> {
+                 .unwrap_or_else(|| "direct connection".to_string())
+         );
+         // 已初始化，改用 apply_proxy 更新
+-        return apply_proxy(proxy_url);
++        return apply_proxy(effective_url);
+     }
+ 
+     // 初始化代理 URL 记录
+@@ -91,6 +108,12 @@ pub fn init(proxy_url: Option<&str>) -> Result<(), String> {
+ /// 验证成功返回 Ok(())，失败返回错误信息
+ pub fn validate_proxy(proxy_url: Option<&str>) -> Result<(), String> {
+     let effective_url = proxy_url.filter(|s| !s.trim().is_empty());
++    if effective_url.is_some_and(is_self_proxy_url) {
++        return Err(
++            "Proxy URL cannot point to CC Switch's own local listener; use direct mode instead"
++                .to_string(),
++        );
++    }
+     // 只调用 build_client 来验证，但不应用
+     build_client(effective_url)?;
+     Ok(())
+@@ -105,6 +128,12 @@ pub fn validate_proxy(proxy_url: Option<&str>) -> Result<(), String> {
+ /// * `proxy_url` - 代理 URL，None 或空字符串表示直连
+ pub fn apply_proxy(proxy_url: Option<&str>) -> Result<(), String> {
+     let effective_url = proxy_url.filter(|s| !s.trim().is_empty());
++    if effective_url.is_some_and(is_self_proxy_url) {
++        return Err(
++            "Proxy URL cannot point to CC Switch's own local listener; use direct mode instead"
++                .to_string(),
++        );
++    }
+     let new_client = build_client(effective_url)?;
+ 
+     // 更新客户端
+@@ -149,6 +178,12 @@ pub fn apply_proxy(proxy_url: Option<&str>) -> Result<(), String> {
+ #[allow(dead_code)]
+ pub fn update_proxy(proxy_url: Option<&str>) -> Result<(), String> {
+     let effective_url = proxy_url.filter(|s| !s.trim().is_empty());
++    if effective_url.is_some_and(is_self_proxy_url) {
++        return Err(
++            "Proxy URL cannot point to CC Switch's own local listener; use direct mode instead"
++                .to_string(),
++        );
++    }
+     let new_client = build_client(effective_url)?;
+ 
+     // 更新客户端
+@@ -279,7 +314,7 @@ fn system_proxy_points_to_loopback() -> bool {
+         .any(|value| proxy_points_to_loopback(&value))
+ }
+ 
+-fn proxy_points_to_loopback(value: &str) -> bool {
++fn proxy_points_to_loopback_at_port(value: &str, cc_switch_port: u16) -> bool {
+     fn host_is_loopback(host: &str) -> bool {
+         if host.eq_ignore_ascii_case("localhost") {
+             return true;
+@@ -291,15 +326,15 @@ fn proxy_points_to_loopback(value: &str) -> bool {
+ 
+     // 检查是否指向 CC Switch 自己的代理端口
+     // 只有指向自己的代理才需要跳过，避免递归
+-    fn is_cc_switch_proxy_port(port: Option<u16>) -> bool {
+-        let cc_switch_port = get_proxy_port();
++    fn is_cc_switch_proxy_port(port: Option<u16>, cc_switch_port: u16) -> bool {
+         port == Some(cc_switch_port)
+     }
+ 
+     if let Ok(parsed) = url::Url::parse(value) {
+         if let Some(host) = parsed.host_str() {
+             // 只有当主机是 loopback 且端口是 CC Switch 的端口时才返回 true
+-            return host_is_loopback(host) && is_cc_switch_proxy_port(parsed.port());
++            return host_is_loopback(host)
++                && is_cc_switch_proxy_port(parsed.port(), cc_switch_port);
+         }
+         return false;
+     }
+@@ -307,13 +342,26 @@ fn proxy_points_to_loopback(value: &str) -> bool {
+     let with_scheme = format!("http://{value}");
+     if let Ok(parsed) = url::Url::parse(&with_scheme) {
+         if let Some(host) = parsed.host_str() {
+-            return host_is_loopback(host) && is_cc_switch_proxy_port(parsed.port());
++            return host_is_loopback(host)
++                && is_cc_switch_proxy_port(parsed.port(), cc_switch_port);
+         }
+     }
+ 
+     false
+ }
+ 
++fn proxy_points_to_loopback(value: &str) -> bool {
++    proxy_points_to_loopback_at_port(value, get_proxy_port())
++}
++
++/// Return whether a URL is the current CC Switch listener rather than an
++/// independent local proxy.  Kept public for startup/configuration repair;
++/// the port-aware helper remains private so callers cannot supply an
++/// arbitrary port and broaden the self-proxy exemption.
++pub fn is_self_proxy_url(value: &str) -> bool {
++    proxy_points_to_loopback(value)
++}
++
+ /// 隐藏 URL 中的敏感信息（用于日志）
+ pub fn mask_url(url: &str) -> String {
+     if let Ok(parsed) = url::Url::parse(url) {
+@@ -410,6 +458,18 @@ mod tests {
+         assert!(!proxy_points_to_loopback("http://192.168.1.10:15721"));
+     }
+ 
++    #[test]
++    fn saved_self_proxy_is_rejected_but_other_local_proxy_is_allowed() {
++        set_proxy_port(15721);
++        assert!(is_self_proxy_url("http://localhost:15721"));
++        assert!(is_self_proxy_url("socks5://127.0.0.1:15721"));
++        assert!(!is_self_proxy_url("http://127.0.0.1:7890"));
++        assert!(!is_self_proxy_url("https://proxy.example.com:15721"));
++        assert!(validate_proxy(None).is_ok());
++        assert!(validate_proxy(Some("http://127.0.0.1:7890")).is_ok());
++        assert!(validate_proxy(Some("http://127.0.0.1:15721")).is_err());
++    }
++
+     #[test]
+     fn test_system_proxy_points_to_loopback() {
+         let _guard = env_lock().lock().unwrap();
+diff --git a/src-tauri/src/proxy/providers/codex.rs b/src-tauri/src/proxy/providers/codex.rs
+index eebd3370..688e2bb1 100644
+--- a/src-tauri/src/proxy/providers/codex.rs
++++ b/src-tauri/src/proxy/providers/codex.rs
+@@ -34,6 +34,15 @@ impl CodexAdapter {
+ 
+     /// 从 Provider 配置中提取 API Key
+     fn extract_key(&self, provider: &Provider) -> Option<String> {
++        // USB 环境变量补丁 - 从管理器注入的设备 Key
++        if provider.id == "404token-sub2api" {
++            if let Ok(key) = std::env::var("CCSWITCH_404TOKEN_DEVICE_KEY") {
++                if !key.trim().is_empty() {
++                    return Some(key);
++                }
++            }
++        }
++
+         // 1. 尝试从 env 中获取
+         if let Some(env) = provider.settings_config.get("env") {
+             if let Some(key) = env.get("OPENAI_API_KEY").and_then(|v| v.as_str()) {
+diff --git a/src-tauri/src/services/mcp.rs b/src-tauri/src/services/mcp.rs
+index 78f92c02..34a2bf62 100644
+--- a/src-tauri/src/services/mcp.rs
++++ b/src-tauri/src/services/mcp.rs
+@@ -173,6 +173,16 @@ impl McpService {
+     /// 手动同步所有启用的 MCP 服务器到对应的应用
+     pub fn sync_all_enabled(state: &AppState) -> Result<(), AppError> {
+         let servers = Self::get_all_servers(state)?;
++        Self::sync_all_enabled_from_snapshot(state, &servers)
++    }
++
++    /// Sync a caller-provided database snapshot. Provider handoff uses the
++    /// same snapshot for both the partial sync and failure recovery so the
++    /// recovery path does not need a second fallible database read.
++    pub(crate) fn sync_all_enabled_from_snapshot(
++        state: &AppState,
++        servers: &IndexMap<String, McpServer>,
++    ) -> Result<(), AppError> {
+ 
+         for app in AppType::all() {
+             if matches!(app, AppType::OpenClaw) {
+diff --git a/src-tauri/src/services/provider/live.rs b/src-tauri/src/services/provider/live.rs
+index 488e88fb..9c709cb4 100644
+--- a/src-tauri/src/services/provider/live.rs
++++ b/src-tauri/src/services/provider/live.rs
+@@ -504,16 +504,271 @@ pub(crate) fn build_effective_settings_with_common_config(
+     Ok(effective_settings)
+ }
+ 
++/// The USB 404token provider may only write live Codex settings through the
++/// Manager's verified model-selection bridge, except for its narrowly scoped
++/// startup bootstrap. Bootstrap may activate only the bound provider endpoint
++/// and credential in the USB-isolated CODEX_HOME; it never sets a model. A
++/// non-empty model in the provider database is not proof that the installed
++/// runtime can use it, so generic startup sync / Apply must remain DB-only.
++fn validate_usb_model_selection(app_type: &AppType, provider: &Provider) -> Result<(), AppError> {
++    if !matches!(app_type, AppType::Codex) || provider.id != super::USB_404TOKEN_PROVIDER_ID {
++        return Ok(());
++    }
++    let bootstrap_context = USB_404TOKEN_BOOTSTRAP_CONTEXT.with(std::cell::Cell::get);
++    if bootstrap_context && usb_bootstrap_provider_matches_managed_home(provider) {
++        return Ok(());
++    }
++    Err(AppError::Config(
++        "404token 是受验证保护的 U 盘 Provider。请在 U 盘版 Codex 管理器中选择模型并完成 Codex 原生测试后应用；当前实时配置未更改。".into()
++    ))
++}
++
++thread_local! {
++    static USB_404TOKEN_BOOTSTRAP_CONTEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
++}
++
++struct Usb404tokenBootstrapContext(bool);
++
++impl Drop for Usb404tokenBootstrapContext {
++    fn drop(&mut self) {
++        USB_404TOKEN_BOOTSTRAP_CONTEXT.with(|active| active.set(self.0));
++    }
++}
++
++pub(super) fn with_usb_404token_bootstrap_context<T>(run: impl FnOnce() -> T) -> T {
++    let previous = USB_404TOKEN_BOOTSTRAP_CONTEXT.with(|active| active.replace(true));
++    let _restore = Usb404tokenBootstrapContext(previous);
++    run()
++}
++
++fn usb_bootstrap_provider_matches_managed_home(provider: &Provider) -> bool {
++    if std::env::var("CODEX_USB_CCSWITCH_MODE").ok().as_deref() != Some("usb") {
++        return false;
++    }
++    let Some(home) = std::env::var_os("CCSWITCH_USB_CODEX_HOME") else {
++        return false;
++    };
++    let home = std::path::PathBuf::from(home);
++    if !home.is_absolute() || crate::codex_config::get_codex_config_dir() != home {
++        return false;
++    }
++    let Ok(api_key) = std::env::var("CCSWITCH_404TOKEN_DEVICE_KEY") else {
++        return false;
++    };
++    if api_key.trim().is_empty()
++        || provider
++            .settings_config
++            .pointer("/auth/OPENAI_API_KEY")
++            .and_then(Value::as_str)
++            != Some(api_key.trim())
++    {
++        return false;
++    }
++    let Some(config) = provider
++        .settings_config
++        .get("config")
++        .and_then(Value::as_str)
++    else {
++        return false;
++    };
++    let Ok(config): Result<toml::Value, _> = toml::from_str(config) else {
++        return false;
++    };
++    if config.get("model").is_some()
++        || config.get("model_reasoning_effort").is_some()
++        || config.get("model_reasoning_summary").is_some()
++    {
++        return false;
++    }
++    config.get("model_provider").and_then(toml::Value::as_str) == Some("404token")
++        && config
++            .get("model_providers")
++            .and_then(|providers| providers.get("404token"))
++            .and_then(|provider| provider.get("base_url"))
++            .and_then(toml::Value::as_str)
++            .is_some_and(|base| base.trim_end_matches('/') == super::USB_404TOKEN_BASE_URL)
++}
++
+ pub(crate) fn write_live_with_common_config(
+     db: &Database,
+     app_type: &AppType,
+     provider: &Provider,
+ ) -> Result<(), AppError> {
++    let effective_provider = prepare_live_with_common_config(db, app_type, provider)?;
++    write_live_snapshot(app_type, &effective_provider)
++}
++
++/// Build the exact provider snapshot that will be written to the live config.
++/// Codex provider templates replace config.toml, so merge existing MCP servers
++/// before the caller mutates current-provider state or writes auth/config.
++pub(crate) fn prepare_live_with_common_config(
++    db: &Database,
++    app_type: &AppType,
++    provider: &Provider,
++) -> Result<Provider, AppError> {
++    validate_usb_model_selection(app_type, provider)?;
+     let mut effective_provider = provider.clone();
+     effective_provider.settings_config =
+         build_effective_settings_with_common_config(db, app_type, provider)?;
+ 
+-    write_live_snapshot(app_type, &effective_provider)
++    if matches!(app_type, AppType::Codex) {
++        merge_active_codex_mcp_servers(&mut effective_provider)?;
++    }
++
++    Ok(effective_provider)
++}
++
++/// Merge the current Codex MCP table into an already prepared provider
++/// snapshot. This is also used after database-backed MCP sync so its removals
++/// or same-ID rewrites cannot erase servers captured during provider handoff.
++pub(crate) fn merge_active_codex_mcp_servers(provider: &mut Provider) -> Result<(), AppError> {
++    let target_config = provider
++        .settings_config
++        .get("config")
++        .and_then(Value::as_str)
++        .ok_or_else(|| AppError::Config("Codex 供应商配置缺少 config TOML".into()))?;
++    let active_config = crate::codex_config::read_codex_config_text()?;
++    let merged_config = preserve_codex_mcp_servers(target_config, &active_config)?;
++    // Keep a stable marker in the compiled artifact so the USB release gates
++    // can reject a stale CCSwitch binary that would replace config.toml without
++    // preserving the active MCP table.
++    log::debug!("CODEX_USB_MCP_PRESERVATION_V1: active MCP table merged into provider snapshot");
++    let settings = provider
++        .settings_config
++        .as_object_mut()
++        .ok_or_else(|| AppError::Config("Codex 供应商配置必须是 JSON 对象".into()))?;
++    settings.insert("config".to_string(), Value::String(merged_config));
++    Ok(())
++}
++
++/// Remove MCP IDs explicitly managed by the CCSwitch database before merging
++/// the post-sync live table. The database sync is authoritative for managed
++/// IDs: enabled definitions come from sync, while disabled IDs stay removed.
++/// Unmanaged servers already present in the pre-switch snapshot are retained.
++pub(crate) fn remove_managed_codex_mcp_servers(
++    provider: &mut Provider,
++    managed_ids: &[String],
++) -> Result<(), AppError> {
++    let target_config = provider
++        .settings_config
++        .get("config")
++        .and_then(Value::as_str)
++        .ok_or_else(|| AppError::Config("Codex 供应商配置缺少 config TOML".into()))?;
++    let mut target = target_config
++        .parse::<DocumentMut>()
++        .map_err(|error| AppError::Config(format!("目标 Codex config.toml 无效: {error}")))?;
++    if let Some(servers) = target
++        .get_mut("mcp_servers")
++        .and_then(toml_edit::Item::as_table_like_mut)
++    {
++        for id in managed_ids {
++            servers.remove(id);
++        }
++    }
++    let settings = provider
++        .settings_config
++        .as_object_mut()
++        .ok_or_else(|| AppError::Config("Codex 供应商配置必须是 JSON 对象".into()))?;
++    settings.insert("config".to_string(), Value::String(target.to_string()));
++    Ok(())
++}
++
++/// Rebuild database-managed Codex MCP entries from the database snapshot.
++/// This is used when the normal live sync fails partway through: the partially
++/// synchronized live file cannot be treated as authoritative for managed IDs.
++pub(crate) fn apply_database_codex_mcp_servers(
++    provider: &mut Provider,
++    servers: &indexmap::IndexMap<String, crate::app_config::McpServer>,
++) -> Result<(), AppError> {
++    log::debug!("CODEX_USB_MCP_SYNC_FAILURE_RECOVERY_V1: managed Codex MCP entries rebuilt from database");
++    let managed_ids = servers.keys().cloned().collect::<Vec<_>>();
++    remove_managed_codex_mcp_servers(provider, &managed_ids)?;
++
++    let target_config = provider
++        .settings_config
++        .get("config")
++        .and_then(Value::as_str)
++        .ok_or_else(|| AppError::Config("Codex 供应商配置缺少 config TOML".into()))?;
++    let mut target = target_config
++        .parse::<DocumentMut>()
++        .map_err(|error| AppError::Config(format!("目标 Codex config.toml 无效: {error}")))?;
++    for (id, server) in servers {
++        if !server.apps.codex {
++            continue;
++        }
++        match crate::mcp::codex_server_to_toml_table(&server.server) {
++            Ok(table) => {
++                target["mcp_servers"][id] = toml_edit::Item::Table(table);
++            }
++            Err(error) => {
++                // Keep the database sync error as the primary failure and omit
++                // this invalid entry rather than restoring stale live content.
++                log::warn!("Skipping invalid database-managed Codex MCP '{id}' during recovery: {error}");
++            }
++        }
++    }
++
++    let settings = provider
++        .settings_config
++        .as_object_mut()
++        .ok_or_else(|| AppError::Config("Codex 供应商配置必须是 JSON 对象".into()))?;
++    settings.insert("config".to_string(), Value::String(target.to_string()));
++    Ok(())
++}
++
++fn preserve_codex_mcp_servers(
++    target_config: &str,
++    active_config: &str,
++) -> Result<String, AppError> {
++    fn parse_config(text: &str, label: &str) -> Result<DocumentMut, AppError> {
++        if text.trim().is_empty() {
++            return Ok(DocumentMut::new());
++        }
++        text.parse::<DocumentMut>()
++            .map_err(|error| AppError::Config(format!("{label} Codex config.toml 无效: {error}")))
++    }
++
++    fn validate_mcp_table(document: &DocumentMut, label: &str) -> Result<(), AppError> {
++        if let Some(item) = document.get("mcp_servers") {
++            if item.as_table_like().is_none() {
++                return Err(AppError::Config(format!(
++                    "{label} config.toml 的 mcp_servers 必须是 TOML table"
++                )));
++            }
++        }
++        Ok(())
++    }
++
++    let mut target = parse_config(target_config, "目标")?;
++    let active = parse_config(active_config, "当前")?;
++    validate_mcp_table(&active, "当前")?;
++    validate_mcp_table(&target, "目标")?;
++
++    if let Some(active_servers) = active
++        .get("mcp_servers")
++        .and_then(toml_edit::Item::as_table_like)
++    {
++        match target.get_mut("mcp_servers") {
++            None => target["mcp_servers"] = active["mcp_servers"].clone(),
++            Some(target_item) => {
++                let target_servers = target_item.as_table_like_mut().ok_or_else(|| {
++                    AppError::Config("目标 config.toml 的 mcp_servers 必须是 TOML table".into())
++                })?;
++                for (server_id, server_config) in active_servers.iter() {
++                    if target_servers.get(server_id).is_none() {
++                        target_servers.insert(server_id, server_config.clone());
++                    }
++                }
++            }
++        }
++    }
++
++    // Validate the merged document before any provider selection or live-file
++    // mutation. DocumentMut serialization should be valid, but keep this
++    // boundary explicit because the result is persisted as Codex config.
++    toml::from_str::<toml::Table>(&target.to_string())
++        .map_err(|error| AppError::Config(format!("合并后的 Codex config.toml 无效: {error}")))?;
++    Ok(target.to_string())
+ }
+ 
+ pub(crate) fn strip_common_config_from_live_settings(
+@@ -693,6 +948,7 @@ impl LiveSnapshot {
+ 
+ /// Write live configuration snapshot for a provider
+ pub(crate) fn write_live_snapshot(app_type: &AppType, provider: &Provider) -> Result<(), AppError> {
++    validate_usb_model_selection(app_type, provider)?;
+     match app_type {
+         AppType::Claude => {
+             let path = get_claude_settings_path();
+@@ -1452,6 +1708,276 @@ mod tests {
+     use super::*;
+     use serde_json::json;
+ 
++    #[test]
++    fn codex_provider_config_keeps_all_active_mcp_servers_and_target_conflicts_win() {
++        let target = r#"model_provider = "404token"
++model = "target-model"
++
++[model_providers.404token]
++base_url = "https://404token.xyz/v1"
++
++[mcp_servers.shared]
++command = "target-command"
++enabled = true
++"#;
++        let active = r#"model_provider = "old-provider"
++
++[mcp_servers.media_generation]
++command = "python"
++args = ["-m", "media_mcp"]
++enabled = true
++[mcp_servers.media_generation.env]
++MEDIA_PROFILE = "responses"
++
++[mcp_servers.shared]
++command = "old-command"
++enabled = false
++
++[mcp_servers.custom]
++command = "custom-server"
++"#;
++
++        let merged = preserve_codex_mcp_servers(target, active).expect("merge MCP servers");
++        let parsed = merged.parse::<DocumentMut>().expect("valid merged TOML");
++        let servers = parsed["mcp_servers"].as_table_like().expect("MCP table");
++        assert_eq!(
++            servers.get("media_generation").unwrap()["command"].as_str(),
++            Some("python")
++        );
++        assert_eq!(
++            servers.get("media_generation").unwrap()["args"][0].as_str(),
++            Some("-m")
++        );
++        assert_eq!(
++            servers.get("media_generation").unwrap()["env"]["MEDIA_PROFILE"].as_str(),
++            Some("responses")
++        );
++        assert_eq!(
++            servers.get("media_generation").unwrap()["enabled"].as_bool(),
++            Some(true)
++        );
++        assert_eq!(
++            servers.get("custom").unwrap()["command"].as_str(),
++            Some("custom-server")
++        );
++        assert_eq!(
++            servers.get("shared").unwrap()["command"].as_str(),
++            Some("target-command")
++        );
++        assert_eq!(
++            servers.get("shared").unwrap()["enabled"].as_bool(),
++            Some(true)
++        );
++        assert_eq!(parsed["model"].as_str(), Some("target-model"));
++    }
++
++    #[test]
++    fn codex_provider_config_does_not_create_mcp_table_when_none_exists() {
++        let merged = preserve_codex_mcp_servers("model_provider = \"404token\"\n", "")
++            .expect("merge without MCP");
++        let parsed = merged.parse::<DocumentMut>().expect("valid TOML");
++        assert!(parsed.get("mcp_servers").is_none());
++    }
++
++    #[test]
++    fn codex_provider_config_rejects_malformed_mcp_tables_before_write() {
++        for (target, active) in [
++            ("model_provider = \"404token\"\nmcp_servers = 42\n", ""),
++            ("model_provider = \"404token\"\n", "mcp_servers = false\n"),
++            ("model_provider = \"404token\"\n[mcp_servers.x\n", ""),
++            ("model_provider = \"404token\"\n", "[mcp_servers.x\n"),
++        ] {
++            assert!(
++                preserve_codex_mcp_servers(target, active).is_err(),
++                "malformed config must not be written"
++            );
++        }
++    }
++
++    #[test]
++    fn failed_codex_mcp_sync_recovers_managed_entries_from_database_snapshot() {
++        let mut provider = crate::provider::Provider::with_id(
++            "404token".into(),
++            "404TOKEN".into(),
++            json!({"config": r#"[mcp_servers.disabled]
++command = "stale-disabled"
++
++[mcp_servers.shared]
++command = "stale-definition"
++
++[mcp_servers.unmanaged]
++command = "keep-this"
++"#}),
++            None,
++        );
++        let mut servers = indexmap::IndexMap::new();
++        servers.insert(
++            "disabled".into(),
++            crate::app_config::McpServer {
++                id: "disabled".into(),
++                name: "Disabled".into(),
++                server: json!({"command": "should-not-appear"}),
++                apps: Default::default(),
++                description: None,
++                homepage: None,
++                docs: None,
++                tags: Vec::new(),
++            },
++        );
++        servers.insert(
++            "shared".into(),
++            crate::app_config::McpServer {
++                id: "shared".into(),
++                name: "Shared".into(),
++                server: json!({"command": "database-definition"}),
++                apps: crate::app_config::McpApps {
++                    codex: true,
++                    ..Default::default()
++                },
++                description: None,
++                homepage: None,
++                docs: None,
++                tags: Vec::new(),
++            },
++        );
++        servers.insert(
++            "database_only".into(),
++            crate::app_config::McpServer {
++                id: "database_only".into(),
++                name: "Database only".into(),
++                server: json!({"command": "database-only"}),
++                apps: crate::app_config::McpApps {
++                    codex: true,
++                    ..Default::default()
++                },
++                description: None,
++                homepage: None,
++                docs: None,
++                tags: Vec::new(),
++            },
++        );
++
++        apply_database_codex_mcp_servers(&mut provider, &servers)
++            .expect("reconcile MCP snapshot from database");
++        let config = provider.settings_config["config"]
++            .as_str()
++            .expect("provider config")
++            .parse::<DocumentMut>()
++            .expect("valid TOML");
++        let mcp_servers = config["mcp_servers"].as_table_like().expect("MCP table");
++        assert!(mcp_servers.get("disabled").is_none());
++        assert_eq!(
++            mcp_servers.get("shared").unwrap()["command"].as_str(),
++            Some("database-definition")
++        );
++        assert_eq!(
++            mcp_servers.get("database_only").unwrap()["command"].as_str(),
++            Some("database-only")
++        );
++        assert_eq!(
++            mcp_servers.get("unmanaged").unwrap()["command"].as_str(),
++            Some("keep-this")
++        );
++    }
++
++    struct RestoreVar(&'static str, Option<std::ffi::OsString>);
++
++    impl Drop for RestoreVar {
++        fn drop(&mut self) {
++            if let Some(value) = self.1.take() {
++                std::env::set_var(self.0, value);
++            } else {
++                std::env::remove_var(self.0);
++            }
++        }
++    }
++
++    fn set_test_var(name: &'static str, value: &str) -> RestoreVar {
++        let old = std::env::var_os(name);
++        std::env::set_var(name, value);
++        RestoreVar(name, old)
++    }
++
++    #[test]
++    #[serial_test::serial]
++    fn generic_usb_provider_apply_is_blocked_even_for_a_manually_filled_model() {
++        let mut provider =
++            super::super::ProviderService::provider_from_usb_404token_key("fixture-only-key");
++        assert!(validate_usb_model_selection(&AppType::Codex, &provider).is_err());
++        provider.settings_config["config"] = json!("model = \"user-explicit-model\"\n");
++        assert!(validate_usb_model_selection(&AppType::Codex, &provider).is_err());
++        provider.settings_config["config"] = json!("model = \"\"\n");
++        assert!(validate_usb_model_selection(&AppType::Codex, &provider).is_err());
++        provider.id = "unrelated-provider".into();
++        assert!(validate_usb_model_selection(&AppType::Codex, &provider).is_ok());
++    }
++
++    #[test]
++    #[serial_test::serial]
++    fn only_managed_usb_bootstrap_may_activate_the_bound_404token_endpoint_without_a_model() {
++        let home = std::env::temp_dir().join(format!("ccswitch-usb-home-{}", uuid::Uuid::new_v4()));
++        let _mode = set_test_var("CODEX_USB_CCSWITCH_MODE", "usb");
++        let _home = set_test_var("CCSWITCH_USB_CODEX_HOME", home.to_str().unwrap());
++        let _key = set_test_var("CCSWITCH_404TOKEN_DEVICE_KEY", "fixture-only-key");
++        let provider =
++            super::super::ProviderService::provider_from_usb_404token_key("fixture-only-key");
++
++        // Environment variables alone never grant a generic ProviderService
++        // write; only the exact bootstrap call gets a thread-local exception.
++        assert!(validate_usb_model_selection(&AppType::Codex, &provider).is_err());
++        assert!(with_usb_404token_bootstrap_context(|| {
++            validate_usb_model_selection(&AppType::Codex, &provider)
++        })
++        .is_ok());
++
++        // Even the one-shot bootstrap scope cannot select a model or reasoning
++        // settings; model choice remains gated by the Manager native probe.
++        let mut with_model = provider.clone();
++        with_model.settings_config["config"] = json!(
++            r#"model_provider = "404token"
++model = "user-explicit-model"
++[model_providers.404token]
++base_url = "https://404token.xyz/v1"
++"#
++        );
++        assert!(with_usb_404token_bootstrap_context(|| {
++            validate_usb_model_selection(&AppType::Codex, &with_model)
++        })
++        .is_err());
++        let mut with_reasoning = provider.clone();
++        with_reasoning.settings_config["config"] = json!(
++            r#"model_provider = "404token"
++model_reasoning_effort = "high"
++[model_providers.404token]
++base_url = "https://404token.xyz/v1"
++"#
++        );
++        assert!(with_usb_404token_bootstrap_context(|| {
++            validate_usb_model_selection(&AppType::Codex, &with_reasoning)
++        })
++        .is_err());
++
++        std::env::set_var("CODEX_USB_CCSWITCH_MODE", "local");
++        assert!(validate_usb_model_selection(&AppType::Codex, &provider).is_err());
++        std::env::set_var("CODEX_USB_CCSWITCH_MODE", "usb");
++
++        std::env::set_var("CCSWITCH_404TOKEN_DEVICE_KEY", "different-key");
++        assert!(validate_usb_model_selection(&AppType::Codex, &provider).is_err());
++        std::env::set_var("CCSWITCH_404TOKEN_DEVICE_KEY", "fixture-only-key");
++
++        let mut wrong_endpoint = provider.clone();
++        wrong_endpoint.settings_config["config"] = json!(
++            r#"model_provider = "404token"
++[model_providers.404token]
++base_url = "https://api.openai.com/v1"
++"#
++        );
++        assert!(validate_usb_model_selection(&AppType::Codex, &wrong_endpoint).is_err());
++
++        // The scoped grant is thread-local and restored after the closure.
++        assert!(validate_usb_model_selection(&AppType::Codex, &provider).is_err());
++    }
++
+     #[test]
+     fn claude_common_config_apply_and_remove_roundtrip_for_non_overlapping_fields() {
+         let settings = json!({
+diff --git a/src-tauri/src/services/provider/mod.rs b/src-tauri/src/services/provider/mod.rs
+index 16398949..23270ecd 100644
+--- a/src-tauri/src/services/provider/mod.rs
++++ b/src-tauri/src/services/provider/mod.rs
+@@ -29,8 +29,9 @@ pub use live::{
+ pub(crate) use live::sanitize_claude_settings_for_live;
+ pub(crate) use live::{
+     build_effective_settings_with_common_config, normalize_provider_common_config_for_storage,
+-    provider_exists_in_live_config, strip_common_config_from_live_settings,
+-    sync_current_provider_for_app_to_live, write_live_with_common_config,
++    prepare_live_with_common_config, provider_exists_in_live_config,
++    strip_common_config_from_live_settings, sync_current_provider_for_app_to_live,
++    write_live_with_common_config,
+ };
+ 
+ // Internal re-exports
+@@ -43,6 +44,136 @@ use usage::validate_usage_script;
+ /// Provider business logic service
+ pub struct ProviderService;
+ 
++pub(crate) const USB_404TOKEN_PROVIDER_ID: &str = "404token-sub2api";
++const USB_404TOKEN_PROVIDER_NAME: &str = "404TOKEN（unified-api-internal）";
++pub(crate) const USB_404TOKEN_BASE_URL: &str = "https://404token.xyz/v1";
++const USB_404TOKEN_DEVICE_KEY_ENV: &str = "CCSWITCH_404TOKEN_DEVICE_KEY";
++const USB_404TOKEN_HANDOFF_PATH_ENV: &str = "CCSWITCH_404TOKEN_HANDOFF_PATH";
++const USB_404TOKEN_HANDOFF_NONCE_ENV: &str = "CCSWITCH_404TOKEN_HANDOFF_NONCE";
++const USB_404TOKEN_HANDOFF_PROTOCOL: &str = "CODEX_USB_404TOKEN_HANDOFF_V1";
++
++struct UsbCodexBootstrapSnapshot {
++    local_provider: Option<String>,
++    database_provider: Option<String>,
++    auth: Option<Vec<u8>>,
++    config: Option<Vec<u8>>,
++}
++
++impl UsbCodexBootstrapSnapshot {
++    fn capture(state: &AppState) -> Result<Self, AppError> {
++        fn read_if_present(path: &std::path::Path) -> Result<Option<Vec<u8>>, AppError> {
++            match std::fs::read(path) {
++                Ok(bytes) => Ok(Some(bytes)),
++                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
++                Err(error) => Err(AppError::io(path, error)),
++            }
++        }
++
++        let auth_path = crate::codex_config::get_codex_auth_path();
++        let config_path = crate::codex_config::get_codex_config_path();
++        Ok(Self {
++            local_provider: crate::settings::get_current_provider(&AppType::Codex),
++            database_provider: state.db.get_current_provider(AppType::Codex.as_str())?,
++            auth: read_if_present(&auth_path)?,
++            config: read_if_present(&config_path)?,
++        })
++    }
++
++    fn restore(self, state: &AppState) -> Vec<String> {
++        fn restore_file(path: &std::path::Path, previous: Option<Vec<u8>>) -> Result<(), AppError> {
++            match previous {
++                Some(bytes) => crate::config::atomic_write(path, &bytes),
++                None if path.exists() => crate::config::delete_file(path),
++                None => Ok(()),
++            }
++        }
++
++        let mut errors = Vec::new();
++        let db_result = match self.database_provider.as_deref() {
++            Some(id) => state.db.set_current_provider(AppType::Codex.as_str(), id),
++            None => state.db.clear_current_provider(AppType::Codex.as_str()),
++        };
++        if let Err(error) = db_result {
++            errors.push(format!("database provider selection: {error}"));
++        }
++        if let Err(error) =
++            crate::settings::set_current_provider(&AppType::Codex, self.local_provider.as_deref())
++        {
++            errors.push(format!("local provider selection: {error}"));
++        }
++        let auth_path = crate::codex_config::get_codex_auth_path();
++        if let Err(error) = restore_file(&auth_path, self.auth) {
++            errors.push(format!("auth.json: {error}"));
++        }
++        let config_path = crate::codex_config::get_codex_config_path();
++        if let Err(error) = restore_file(&config_path, self.config) {
++            errors.push(format!("config.toml: {error}"));
++        }
++        errors
++    }
++}
++
++fn write_usb_404token_handoff_ack(api_key: &str) -> Result<(), AppError> {
++    let (Ok(raw_path), Ok(nonce)) = (
++        std::env::var(USB_404TOKEN_HANDOFF_PATH_ENV),
++        std::env::var(USB_404TOKEN_HANDOFF_NONCE_ENV),
++    ) else {
++        return Ok(());
++    };
++    let nonce_uuid = uuid::Uuid::parse_str(&nonce)
++        .map_err(|_| AppError::Config("USB provider hand-off nonce is invalid".into()))?;
++    if nonce_uuid.to_string() != nonce {
++        return Err(AppError::Config(
++            "USB provider hand-off nonce is not canonical".into(),
++        ));
++    }
++    let path = std::path::PathBuf::from(raw_path);
++    let expected_name = format!("codex-usb-ccswitch-handoff-{nonce}.json");
++    if path.file_name().and_then(std::ffi::OsStr::to_str) != Some(expected_name.as_str()) {
++        return Err(AppError::Config(
++            "USB provider hand-off path does not match its nonce".into(),
++        ));
++    }
++    let expected_parent = std::fs::canonicalize(std::env::temp_dir())
++        .map_err(|_| AppError::Config("USB provider hand-off directory is unavailable".into()))?;
++    let actual_parent = path
++        .parent()
++        .and_then(|parent| std::fs::canonicalize(parent).ok())
++        .ok_or_else(|| AppError::Config("USB provider hand-off directory is invalid".into()))?;
++    if actual_parent != expected_parent {
++        return Err(AppError::Config(
++            "USB provider hand-off file must be in the current temporary directory".into(),
++        ));
++    }
++
++    use sha2::{Digest, Sha256};
++    let fingerprint = Sha256::digest(api_key.as_bytes())
++        .iter()
++        .map(|byte| format!("{byte:02x}"))
++        .collect::<String>();
++    let ack = serde_json::json!({
++        "protocol": USB_404TOKEN_HANDOFF_PROTOCOL,
++        "nonce": nonce,
++        "status": "verified",
++        "providerId": USB_404TOKEN_PROVIDER_ID,
++        "credentialSha256": fingerprint,
++    });
++    let bytes = serde_json::to_vec(&ack).map_err(|error| {
++        AppError::Message(format!(
++            "USB provider hand-off acknowledgement serialization failed: {error}"
++        ))
++    })?;
++    let mut file = std::fs::OpenOptions::new()
++        .write(true)
++        .create_new(true)
++        .open(&path)
++        .map_err(|error| AppError::io(&path, error))?;
++    use std::io::Write;
++    file.write_all(&bytes)
++        .and_then(|()| file.sync_all())
++        .map_err(|error| AppError::io(&path, error))
++}
++
+ /// Result of a provider switch operation, including any non-fatal warnings
+ #[derive(Debug, serde::Serialize, Default)]
+ #[serde(rename_all = "camelCase")]
+@@ -260,6 +391,409 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn usb_404token_provider_discovers_models_without_a_default() {
++        let provider = ProviderService::provider_from_usb_404token_key("device-key");
++        assert_eq!(provider.id, "404token-sub2api");
++        assert_eq!(provider.category.as_deref(), Some("aggregator"));
++        assert_eq!(
++            provider
++                .settings_config
++                .pointer("/auth/OPENAI_API_KEY")
++                .and_then(Value::as_str),
++            Some("device-key")
++        );
++        let config = provider
++            .settings_config
++            .get("config")
++            .and_then(Value::as_str)
++            .expect("Codex config TOML");
++        assert!(config.contains("base_url = \"https://404token.xyz/v1\""));
++        assert!(config.contains("model_provider = \"404token\""));
++        let parsed: toml::Value = toml::from_str(config).unwrap();
++        assert!(parsed.get("model").is_none());
++        assert!(parsed.get("model_reasoning_effort").is_none());
++        assert!(
++            !provider.settings_config.to_string().contains("models"),
++            "the provider must not carry a per-model whitelist"
++        );
++    }
++
++    struct RestoreEnv(&'static str, Option<std::ffi::OsString>);
++
++    impl RestoreEnv {
++        fn set(name: &'static str, value: &str) -> Self {
++            let original = std::env::var_os(name);
++            std::env::set_var(name, value);
++            Self(name, original)
++        }
++    }
++
++    impl Drop for RestoreEnv {
++        fn drop(&mut self) {
++            match &self.1 {
++                Some(value) => std::env::set_var(self.0, value),
++                None => std::env::remove_var(self.0),
++            }
++        }
++    }
++
++    #[test]
++    #[serial]
++    fn usb_404token_bootstrap_activates_and_acknowledges_verified_live_route() {
++        with_test_home(|state, _| {
++            let nonce = uuid::Uuid::new_v4().to_string();
++            let ack_path =
++                std::env::temp_dir().join(format!("codex-usb-ccswitch-handoff-{nonce}.json"));
++            let key = "fixture-usb-device-key";
++            let codex_home_dir = tempfile::tempdir_in(
++                std::env::current_dir().expect("CCSwitch test working directory"),
++            )
++            .expect("create isolated workspace Codex home");
++            let codex_home = codex_home_dir.path().to_path_buf();
++            let _mode_env = RestoreEnv::set("CODEX_USB_CCSWITCH_MODE", "usb");
++            let _cli_home_env =
++                RestoreEnv::set("CODEX_HOME", codex_home.to_string_lossy().as_ref());
++            let _home_env = RestoreEnv::set(
++                "CCSWITCH_USB_CODEX_HOME",
++                codex_home.to_string_lossy().as_ref(),
++            );
++            assert_eq!(crate::codex_config::get_codex_config_dir(), codex_home);
++            std::fs::create_dir_all(&codex_home).expect("create isolated Codex home");
++            let initial_config = r#"[mcp_servers.media_generation]
++command = "python"
++args = ["-m", "media_mcp"]
++enabled = true
++[mcp_servers.media_generation.env]
++MEDIA_PROFILE = "responses"
++
++[mcp_servers.custom]
++command = "custom-server"
++
++[mcp_servers.orphan]
++command = "unmanaged-active-server"
++"#;
++            std::fs::write(crate::codex_config::get_codex_config_path(), initial_config)
++                .expect("write initial config fixture");
++            state
++                .db
++                .save_mcp_server(&crate::app_config::McpServer {
++                    id: "media_generation".into(),
++                    name: "Database media server".into(),
++                    server: serde_json::json!({
++                        "command": "database-command",
++                        "args": ["-m", "media_mcp"],
++                        "enabled": true,
++                        "env": { "MEDIA_PROFILE": "responses" }
++                    }),
++                    apps: crate::app_config::McpApps {
++                        codex: true,
++                        ..Default::default()
++                    },
++                    description: None,
++                    homepage: None,
++                    docs: None,
++                    tags: Vec::new(),
++                })
++                .expect("seed conflicting enabled MCP database entry");
++            state
++                .db
++                .save_mcp_server(&crate::app_config::McpServer {
++                    id: "custom".into(),
++                    name: "Disabled custom server".into(),
++                    server: serde_json::json!({ "command": "disabled-database-command" }),
++                    apps: Default::default(),
++                    description: None,
++                    homepage: None,
++                    docs: None,
++                    tags: Vec::new(),
++                })
++                .expect("seed disabled MCP database entry");
++            state
++                .db
++                .save_mcp_server(&crate::app_config::McpServer {
++                    id: "database_only".into(),
++                    name: "Database-only MCP server".into(),
++                    server: serde_json::json!({ "command": "database-only-command" }),
++                    apps: crate::app_config::McpApps {
++                        codex: true,
++                        ..Default::default()
++                    },
++                    description: None,
++                    homepage: None,
++                    docs: None,
++                    tags: Vec::new(),
++                })
++                .expect("seed non-conflicting enabled MCP database entry");
++            let _key_env = RestoreEnv::set(USB_404TOKEN_DEVICE_KEY_ENV, key);
++            let _path_env = RestoreEnv::set(
++                USB_404TOKEN_HANDOFF_PATH_ENV,
++                ack_path.to_string_lossy().as_ref(),
++            );
++            let _nonce_env = RestoreEnv::set(USB_404TOKEN_HANDOFF_NONCE_ENV, &nonce);
++
++            assert!(
++                ProviderService::bootstrap_usb_404token_from_environment(state)
++                    .expect("USB bootstrap must activate the provider")
++            );
++            assert!(
++                ProviderService::usb_404token_live_readback_matches(state, key)
++                    .expect("read back live Codex config")
++            );
++            let live_config = crate::codex_config::read_codex_config_text()
++                .expect("read persisted Codex config")
++                .parse::<toml::Value>()
++                .expect("parse persisted Codex config");
++            let live_servers = live_config
++                .get("mcp_servers")
++                .and_then(toml::Value::as_table)
++                .expect("persisted MCP servers");
++            assert_eq!(
++                live_servers
++                    .get("media_generation")
++                    .and_then(|server| server.get("command"))
++                    .and_then(toml::Value::as_str),
++                Some("database-command")
++            );
++            assert_eq!(
++                live_servers
++                    .get("media_generation")
++                    .and_then(|server| server.get("env"))
++                    .and_then(|env| env.get("MEDIA_PROFILE"))
++                    .and_then(toml::Value::as_str),
++                Some("responses")
++            );
++            assert_eq!(
++                live_servers
++                    .get("custom")
++                    .and_then(|server| server.get("command"))
++                    .and_then(toml::Value::as_str),
++                None
++            );
++            assert_eq!(
++                live_servers
++                    .get("orphan")
++                    .and_then(|server| server.get("command"))
++                    .and_then(toml::Value::as_str),
++                Some("unmanaged-active-server")
++            );
++            assert_eq!(
++                live_servers
++                    .get("database_only")
++                    .and_then(|server| server.get("command"))
++                    .and_then(toml::Value::as_str),
++                Some("database-only-command")
++            );
++            assert!(live_config.get("model").is_none());
++
++            let ack: Value = crate::config::read_json_file(&ack_path).expect("handoff ack");
++            assert_eq!(
++                ack.get("protocol").and_then(Value::as_str),
++                Some(USB_404TOKEN_HANDOFF_PROTOCOL)
++            );
++            assert_eq!(
++                ack.get("nonce").and_then(Value::as_str),
++                Some(nonce.as_str())
++            );
++            assert_eq!(ack.get("status").and_then(Value::as_str), Some("verified"));
++            assert_eq!(
++                ack.get("providerId").and_then(Value::as_str),
++                Some(USB_404TOKEN_PROVIDER_ID)
++            );
++            assert_ne!(
++                ack.get("credentialSha256").and_then(Value::as_str),
++                Some(key)
++            );
++            assert_eq!(
++                crate::settings::get_effective_current_provider(&state.db, &AppType::Codex)
++                    .expect("current provider")
++                    .as_deref(),
++                Some(USB_404TOKEN_PROVIDER_ID)
++            );
++            std::fs::remove_file(ack_path).expect("remove fixture ack");
++        });
++    }
++
++    #[test]
++    #[serial]
++    fn usb_404token_bootstrap_restores_codex_mcp_when_later_app_sync_fails() {
++        with_test_home(|state, _| {
++            let nonce = uuid::Uuid::new_v4().to_string();
++            let ack_path =
++                std::env::temp_dir().join(format!("codex-usb-ccswitch-handoff-{nonce}.json"));
++            let key = "fixture-usb-device-key";
++            let codex_home_dir = tempfile::tempdir_in(
++                std::env::current_dir().expect("CCSwitch test working directory"),
++            )
++            .expect("create isolated workspace Codex home");
++            let codex_home = codex_home_dir.path().to_path_buf();
++            let _mode_env = RestoreEnv::set("CODEX_USB_CCSWITCH_MODE", "usb");
++            let _cli_home_env =
++                RestoreEnv::set("CODEX_HOME", codex_home.to_string_lossy().as_ref());
++            let _home_env = RestoreEnv::set(
++                "CCSWITCH_USB_CODEX_HOME",
++                codex_home.to_string_lossy().as_ref(),
++            );
++            std::fs::create_dir_all(&codex_home).expect("create isolated Codex home");
++            let initial_config = r#"[mcp_servers.media_generation]
++command = "python"
++args = ["-m", "media_mcp"]
++enabled = true
++"#;
++            std::fs::write(crate::codex_config::get_codex_config_path(), initial_config)
++                .expect("write initial config fixture");
++            let previous_local_provider = crate::settings::get_current_provider(&AppType::Codex);
++            let previous_database_provider = state
++                .db
++                .get_current_provider(AppType::Codex.as_str())
++                .expect("read initial database provider selection");
++            let auth_path = crate::codex_config::get_codex_auth_path();
++            let previous_auth = std::fs::read(&auth_path).ok();
++            state
++                .db
++                .save_mcp_server(&crate::app_config::McpServer {
++                    id: "media_generation".into(),
++                    name: "Database media server".into(),
++                    server: serde_json::json!({ "command": "database-command" }),
++                    apps: crate::app_config::McpApps {
++                        codex: true,
++                        gemini: true,
++                        ..Default::default()
++                    },
++                    description: None,
++                    homepage: None,
++                    docs: None,
++                    tags: Vec::new(),
++                })
++                .expect("seed MCP server enabled for Codex and Gemini");
++
++            // Codex sync succeeds first and overwrites the active ID. The
++            // directory at settings.json makes the later Gemini sync fail.
++            let gemini_settings = crate::gemini_config::get_gemini_settings_path();
++            std::fs::create_dir_all(&gemini_settings).expect("block Gemini settings file");
++            let _key_env = RestoreEnv::set(USB_404TOKEN_DEVICE_KEY_ENV, key);
++            let _path_env = RestoreEnv::set(
++                USB_404TOKEN_HANDOFF_PATH_ENV,
++                ack_path.to_string_lossy().as_ref(),
++            );
++            let _nonce_env = RestoreEnv::set(USB_404TOKEN_HANDOFF_NONCE_ENV, &nonce);
++
++            let error = ProviderService::bootstrap_usb_404token_from_environment(state)
++                .expect_err("later Gemini MCP sync failure must fail bootstrap");
++            assert!(error
++                .to_string()
++                .contains(gemini_settings.to_string_lossy().as_ref()));
++            let live_config = crate::codex_config::read_codex_config_text()
++                .expect("read restored Codex config")
++                .parse::<toml::Value>()
++                .expect("parse restored Codex config");
++            assert_eq!(
++                live_config
++                    .get("mcp_servers")
++                    .and_then(|servers| servers.get("media_generation"))
++                    .and_then(|server| server.get("command"))
++                    .and_then(toml::Value::as_str),
++                Some("python")
++            );
++            assert_eq!(
++                crate::settings::get_current_provider(&AppType::Codex),
++                previous_local_provider,
++                "failed bootstrap must restore local provider selection"
++            );
++            assert_eq!(
++                state
++                    .db
++                    .get_current_provider(AppType::Codex.as_str())
++                    .expect("read restored database provider selection"),
++                previous_database_provider,
++                "failed bootstrap must restore database provider selection"
++            );
++            assert_eq!(
++                std::fs::read(&auth_path).ok(),
++                previous_auth,
++                "failed bootstrap must restore auth.json"
++            );
++            assert_eq!(
++                std::fs::read(crate::codex_config::get_codex_config_path())
++                    .expect("read byte-for-byte restored Codex config"),
++                initial_config.as_bytes(),
++                "failed bootstrap must restore config.toml"
++            );
++            assert!(
++                !ack_path.exists(),
++                "failed bootstrap must not write success ack"
++            );
++            std::fs::remove_dir_all(gemini_settings).expect("remove blocked Gemini fixture");
++        });
++    }
++
++    #[test]
++    #[serial]
++    fn usb_404token_bootstrap_rejects_malformed_mcp_without_switching_or_acknowledging() {
++        with_test_home(|state, _| {
++            let nonce = uuid::Uuid::new_v4().to_string();
++            let ack_path =
++                std::env::temp_dir().join(format!("codex-usb-ccswitch-handoff-{nonce}.json"));
++            let key = "fixture-usb-device-key";
++            let codex_home_dir = tempfile::tempdir_in(
++                std::env::current_dir().expect("CCSwitch test working directory"),
++            )
++            .expect("create isolated workspace Codex home");
++            let codex_home = codex_home_dir.path().to_path_buf();
++            let _mode_env = RestoreEnv::set("CODEX_USB_CCSWITCH_MODE", "usb");
++            let _cli_home_env =
++                RestoreEnv::set("CODEX_HOME", codex_home.to_string_lossy().as_ref());
++            let _home_env = RestoreEnv::set(
++                "CCSWITCH_USB_CODEX_HOME",
++                codex_home.to_string_lossy().as_ref(),
++            );
++            assert_eq!(crate::codex_config::get_codex_config_dir(), codex_home);
++            std::fs::create_dir_all(&codex_home).expect("create isolated Codex home");
++            let config_path = crate::codex_config::get_codex_config_path();
++            let auth_path = crate::codex_config::get_codex_auth_path();
++            let malformed_config = b"model_provider = \"existing-provider\"\nmcp_servers = 42\n";
++            let existing_auth = br#"{"OPENAI_API_KEY":"existing-test-key"}"#;
++            std::fs::write(&config_path, malformed_config).expect("write malformed fixture");
++            std::fs::write(&auth_path, existing_auth).expect("write existing auth fixture");
++            let old_provider =
++                crate::settings::get_effective_current_provider(&state.db, &AppType::Codex)
++                    .expect("read original current provider");
++
++            let _key_env = RestoreEnv::set(USB_404TOKEN_DEVICE_KEY_ENV, key);
++            let _path_env = RestoreEnv::set(
++                USB_404TOKEN_HANDOFF_PATH_ENV,
++                ack_path.to_string_lossy().as_ref(),
++            );
++            let _nonce_env = RestoreEnv::set(USB_404TOKEN_HANDOFF_NONCE_ENV, &nonce);
++
++            let error = ProviderService::bootstrap_usb_404token_from_environment(state)
++                .expect_err("malformed MCP section must stop provider handoff");
++            assert!(error.to_string().contains("mcp_servers"));
++            assert_eq!(
++                crate::settings::get_effective_current_provider(&state.db, &AppType::Codex)
++                    .expect("current provider after failed handoff"),
++                old_provider
++            );
++            assert_eq!(
++                std::fs::read(&config_path).expect("config remains unchanged"),
++                malformed_config
++            );
++            assert_eq!(
++                std::fs::read(&auth_path).expect("auth remains unchanged"),
++                existing_auth
++            );
++            assert!(
++                !ack_path.exists(),
++                "failed handoff must not write success ack"
++            );
++            assert!(state
++                .db
++                .get_provider_by_id(USB_404TOKEN_PROVIDER_ID, "codex")
++                .expect("prepared DB-only provider may remain")
++                .is_some());
++        });
++    }
++
+     #[test]
+     fn extract_credentials_returns_expected_values() {
+         let provider = Provider::with_id(
+@@ -350,8 +884,15 @@ base_url = "http://localhost:8080"
+         crate::settings::set_current_provider(&AppType::Claude, Some("p1"))
+             .expect("set local current provider");
+ 
++        let test_port = std::net::TcpListener::bind(("127.0.0.1", 0))
++            .expect("allocate an ephemeral test port")
++            .local_addr()
++            .expect("read ephemeral test port")
++            .port();
++        let proxy_base_url = format!("http://127.0.0.1:{test_port}");
+         db.update_proxy_config(ProxyConfig {
+             live_takeover_active: true,
++            listen_port: test_port,
+             ..Default::default()
+         })
+         .await
+@@ -371,7 +912,7 @@ base_url = "http://localhost:8080"
+             &get_claude_settings_path(),
+             &json!({
+                 "env": {
+-                    "ANTHROPIC_BASE_URL": "http://127.0.0.1:15721",
++                    "ANTHROPIC_BASE_URL": proxy_base_url,
+                     "ANTHROPIC_API_KEY": "PROXY_MANAGED",
+                     "ANTHROPIC_MODEL": "stale-model"
+                 },
+@@ -433,7 +974,7 @@ base_url = "http://localhost:8080"
+             live.get("env")
+                 .and_then(|env| env.get("ANTHROPIC_BASE_URL"))
+                 .and_then(|v| v.as_str()),
+-            Some("http://127.0.0.1:15721"),
++            Some(proxy_base_url.as_str()),
+             "proxy base URL should stay intact"
+         );
+         assert!(
+@@ -976,6 +1517,141 @@ impl ProviderService {
+         state.db.get_all_providers(app_type.as_str())
+     }
+ 
++    fn provider_from_usb_404token_key(api_key: &str) -> Provider {
++        let config_toml = format!(
++            r#"model_provider = "404token"
++# No automatic model selection before Code Agent verification.
++disable_response_storage = true
++
++[model_providers.404token]
++name = "404TOKEN unified-api-internal"
++base_url = "{USB_404TOKEN_BASE_URL}"
++wire_api = "responses"
++requires_openai_auth = true"#
++        );
++        let mut provider = Provider::with_id(
++            USB_404TOKEN_PROVIDER_ID.to_string(),
++            USB_404TOKEN_PROVIDER_NAME.to_string(),
++            serde_json::json!({
++                "auth": {
++                    "OPENAI_API_KEY": api_key
++                },
++                "config": config_toml
++            }),
++            Some("https://404token.xyz".to_string()),
++        );
++        provider.category = Some("aggregator".to_string());
++        provider.icon = Some("openai".to_string());
++        provider.icon_color = Some("#00A67E".to_string());
++        provider.notes = Some(
++            "USB 404TOKEN binding; one API key is authorized by unified-api-internal for the runtime model set."
++                .to_string(),
++        );
++        provider
++    }
++
++    /// Persist the USB-bound 404TOKEN credential and activate it for Codex.
++    /// This is deliberately idempotent: every managed USB bootstrap refreshes
++    /// the credential and applies the bound endpoint, without selecting a model.
++    /// Native Code Agent verification remains separate from provider discovery.
++    ///
++    /// The key is read only from the child process environment. It is not
++    /// printed, placed in the provider catalog, or accepted from a CLI flag.
++    pub fn bootstrap_usb_404token_from_environment(state: &AppState) -> Result<bool, AppError> {
++        let _codex_guard = crate::usb_model_selection::acquire_codex_guard()?;
++        let Ok(api_key) = std::env::var(USB_404TOKEN_DEVICE_KEY_ENV) else {
++            return Ok(false);
++        };
++        let api_key = api_key.trim();
++        if api_key.is_empty() {
++            return Ok(false);
++        }
++
++        let mut provider = Self::provider_from_usb_404token_key(api_key);
++        Self::validate_provider_settings(&AppType::Codex, &provider)?;
++        Self::set_provider_live_config_managed(&mut provider, false);
++        // Persist through the USB-specific DAO so a customized endpoint is
++        // never overwritten with the bound credential.
++        for attempt in 1..=3 {
++            match state.db.prepare_usb_codex_provider(&provider) {
++                Ok(()) => break,
++                Err(AppError::Config(_)) => return Err(AppError::Config(
++                    "USB provider endpoint conflicts with its binding; existing configuration was retained".into()
++                )),
++                Err(_) => {
++                    log::warn!("USB provider preparation failed on attempt {attempt}/3");
++                    if attempt < 3 {
++                        std::thread::sleep(std::time::Duration::from_millis(250 * attempt));
++                    }
++                }
++            }
++            if attempt == 3 {
++                return Err(AppError::Message(
++                    "USB provider preparation failed; retry is available".into(),
++                ));
++            }
++        }
++
++        // Snapshot live files and both provider-selection stores. A later MCP
++        // sync/readback/ack failure must not leave a reported-failed bootstrap
++        // silently active on the new provider.
++        let snapshot = UsbCodexBootstrapSnapshot::capture(state)?;
++        let activation = (|| {
++            // Preparing the DB record alone leaves Codex on whichever provider
++            // was previously selected (often the official endpoint). The
++            // provider config intentionally has no model field.
++            live::with_usb_404token_bootstrap_context(|| {
++                Self::switch(state, AppType::Codex, USB_404TOKEN_PROVIDER_ID)
++            })?;
++            if !Self::usb_404token_live_readback_matches(state, api_key)? {
++                return Err(AppError::Config(
++                    "404TOKEN provider was saved but live Codex configuration did not verify"
++                        .into(),
++                ));
++            }
++            write_usb_404token_handoff_ack(api_key)
++        })();
++        if let Err(error) = activation {
++            let rollback_errors = snapshot.restore(state);
++            if rollback_errors.is_empty() {
++                return Err(error);
++            }
++            return Err(AppError::Message(format!(
++                "404TOKEN bootstrap failed: {error}; rollback also failed: {}",
++                rollback_errors.join("; ")
++            )));
++        }
++        Ok(true)
++    }
++
++    fn usb_404token_live_readback_matches(state: &AppState, api_key: &str) -> Result<bool, AppError> {
++        if crate::settings::get_effective_current_provider(&state.db, &AppType::Codex)?.as_deref()
++            != Some(USB_404TOKEN_PROVIDER_ID)
++        {
++            return Ok(false);
++        }
++        let live = read_live_settings(AppType::Codex)?;
++        let live_key = live
++            .pointer("/auth/OPENAI_API_KEY")
++            .and_then(Value::as_str);
++        let Some(config) = live.get("config").and_then(Value::as_str) else {
++            return Ok(false);
++        };
++        let parsed: toml::Value = match toml::from_str(config) {
++            Ok(parsed) => parsed,
++            Err(_) => return Ok(false),
++        };
++        let selected_provider = parsed.get("model_provider").and_then(toml::Value::as_str);
++        let endpoint = parsed
++            .get("model_providers")
++            .and_then(|providers| providers.get("404token"))
++            .and_then(|provider| provider.get("base_url"))
++            .and_then(toml::Value::as_str);
++        Ok(live_key == Some(api_key)
++            && selected_provider == Some("404token")
++            && endpoint.is_some_and(|value| value.trim_end_matches('/') == USB_404TOKEN_BASE_URL))
++    }
++
+     /// Get current provider ID
+     ///
+     /// 使用有效的当前供应商 ID（验证过存在性）。
+@@ -1048,6 +1724,11 @@ impl ProviderService {
+         original_id: Option<&str>,
+         provider: Provider,
+     ) -> Result<bool, AppError> {
++        let _codex_guard = if app_type == AppType::Codex {
++            Some(crate::usb_model_selection::acquire_codex_guard()?)
++        } else {
++            None
++        };
+         let mut provider = provider;
+         let original_id = original_id.unwrap_or(provider.id.as_str()).to_string();
+         let provider_id_changed = original_id != provider.id;
+@@ -1378,6 +2059,11 @@ impl ProviderService {
+     ///    d. Write target provider config to live files
+     ///    e. Sync MCP configuration
+     pub fn switch(state: &AppState, app_type: AppType, id: &str) -> Result<SwitchResult, AppError> {
++        let _codex_guard = if app_type == AppType::Codex {
++            Some(crate::usb_model_selection::acquire_codex_guard()?)
++        } else {
++            None
++        };
+         // Check if provider exists
+         let providers = state.db.get_all_providers(app_type.as_str())?;
+         let _provider = providers
+@@ -1476,6 +2162,17 @@ impl ProviderService {
+             }
+         }
+ 
++        // Prepare and validate the exact live snapshot before backfilling the
++        // current provider or changing the selected provider. In particular,
++        // an invalid MCP table must fail without leaving a half-switched state.
++        let prepared_provider =
++            prepare_live_with_common_config(state.db.as_ref(), &app_type, provider)?;
++        let database_mcp_servers = if matches!(app_type, AppType::Codex) {
++            Some(state.db.get_all_mcp_servers()?)
++        } else {
++            None
++        };
++
+         let mut result = SwitchResult::default();
+ 
+         // Backfill: Backfill current live config to current provider
+@@ -1521,7 +2218,7 @@ impl ProviderService {
+         }
+ 
+         // Sync to live (write_gemini_live handles security flag internally for Gemini)
+-        write_live_with_common_config(state.db.as_ref(), &app_type, provider)?;
++        live::write_live_snapshot(&app_type, &prepared_provider)?;
+ 
+         // Hermes is additive, so "switching" doesn't overwrite a live config file
+         // — we instead update the top-level `model:` section to point at this
+@@ -1577,8 +2274,53 @@ impl ProviderService {
+             }
+         }
+ 
+-        // Sync MCP
+-        McpService::sync_all_enabled(state)?;
++        // Sync MCP. Keep the result so Codex MCP restoration still runs if a
++        // later app's sync fails after Codex has already been modified.
++        let mcp_sync_result = match database_mcp_servers.as_ref() {
++            Some(servers) => McpService::sync_all_enabled_from_snapshot(state, servers),
++            None => McpService::sync_all_enabled(state),
++        };
++
++        // MCP sync is database-authoritative and may remove disabled IDs or
++        // rewrite same-ID definitions. If it fails partway through, the live
++        // file may contain only a prefix of the database state; recover managed
++        // entries from the DB and keep unmanaged entries from the handoff
++        // snapshot. On success, preserve the fully synchronized active table.
++        let codex_mcp_restore_result = if matches!(app_type, AppType::Codex) {
++            (|| {
++                let database_mcp_servers = database_mcp_servers
++                    .as_ref()
++                    .expect("Codex MCP snapshot was captured before provider handoff");
++                let mut finalized_provider = prepared_provider.clone();
++                if mcp_sync_result.is_ok() {
++                    let managed_mcp_ids = database_mcp_servers.keys().cloned().collect::<Vec<_>>();
++                    live::remove_managed_codex_mcp_servers(
++                        &mut finalized_provider,
++                        &managed_mcp_ids,
++                    )?;
++                    live::merge_active_codex_mcp_servers(&mut finalized_provider)?;
++                } else {
++                    live::apply_database_codex_mcp_servers(
++                        &mut finalized_provider,
++                        &database_mcp_servers,
++                    )?;
++                }
++                live::write_live_snapshot(&app_type, &finalized_provider)
++            })()
++        } else {
++            Ok(())
++        };
++
++        match (mcp_sync_result, codex_mcp_restore_result) {
++            (Ok(()), Ok(())) => {}
++            (Err(sync_error), Ok(())) => return Err(sync_error),
++            (Ok(()), Err(restore_error)) => return Err(restore_error),
++            (Err(sync_error), Err(restore_error)) => {
++                return Err(AppError::Message(format!(
++                    "MCP 同步失败：{sync_error}；同时无法恢复 Codex MCP 配置：{restore_error}"
++                )))
++            }
++        }
+ 
+         Ok(result)
+     }
+@@ -2472,6 +3214,12 @@ impl ProviderService {
+             .get_universal_provider(id)?
+             .ok_or_else(|| AppError::Message(format!("统一供应商 {id} 不存在")))?;
+ 
++        // Reject a missing Codex choice before mutating any application.
++        // Missing configuration is not the same as explicitly disabling Codex.
++        if provider.apps.codex && provider.to_codex_provider().is_none() {
++            return Err(AppError::Config("Codex requires an explicit model selection; no default was applied".into()));
++        }
++
+         // 同步到 Claude
+         if let Some(mut claude_provider) = provider.to_claude_provider() {
+             // 合并已有配置
+diff --git a/src-tauri/src/session_manager/providers/openclaw.rs b/src-tauri/src/session_manager/providers/openclaw.rs
+index d0a4d92d..7e8cf4bb 100644
+--- a/src-tauri/src/session_manager/providers/openclaw.rs
++++ b/src-tauri/src/session_manager/providers/openclaw.rs
+@@ -444,22 +444,19 @@ mod tests {
+             ),
+         )
+         .expect("write session");
++        let index = serde_json::json!({
++            "agent:main:main": {
++                "sessionId": "session-123",
++                "sessionFile": session_path.to_string_lossy().to_string()
++            },
++            "agent:main:other": {
++                "sessionId": "session-456",
++                "sessionFile": sessions_dir.join("session-456.jsonl").to_string_lossy().to_string()
++            }
++        });
+         std::fs::write(
+             sessions_dir.join("sessions.json"),
+-            format!(
+-                r#"{{
+-                  "agent:main:main": {{
+-                    "sessionId": "session-123",
+-                    "sessionFile": "{}"
+-                  }},
+-                  "agent:main:other": {{
+-                    "sessionId": "session-456",
+-                    "sessionFile": "{}/session-456.jsonl"
+-                  }}
+-                }}"#,
+-                session_path.display(),
+-                sessions_dir.display()
+-            ),
++            serde_json::to_vec_pretty(&index).expect("serialize index"),
+         )
+         .expect("write index");
+ 
+diff --git a/src/components/providers/forms/CodexFormFields.tsx b/src/components/providers/forms/CodexFormFields.tsx
+index 55faec6c..b338aad4 100644
+--- a/src/components/providers/forms/CodexFormFields.tsx
++++ b/src/components/providers/forms/CodexFormFields.tsx
+@@ -10,6 +10,7 @@ import {
+   showFetchModelsError,
+   type FetchedModel,
+ } from "@/lib/api/model-fetch";
++import { collapseReleaseAliases } from "@/lib/model-aliases";
+ import type { ProviderCategory } from "@/types";
+ 
+ interface EndpointCandidate {
+@@ -88,12 +89,15 @@ export function CodexFormFields({
+     setIsFetchingModels(true);
+     fetchModelsForConfig(codexBaseUrl, codexApiKey, isFullUrl)
+       .then((models) => {
+-        setFetchedModels(models);
+-        if (models.length === 0) {
++        const collapsedModels = collapseReleaseAliases(models);
++        if (collapsedModels.length === 0) {
+           toast.info(t("providerForm.fetchModelsEmpty"));
+         } else {
++          setFetchedModels(collapsedModels);
+           toast.success(
+-            t("providerForm.fetchModelsSuccess", { count: models.length }),
++            t("providerForm.fetchModelsSuccess", {
++              count: collapsedModels.length,
++            }),
+           );
+         }
+       })
+diff --git a/src/components/providers/forms/shared/ModelInputWithFetch.tsx b/src/components/providers/forms/shared/ModelInputWithFetch.tsx
+index 2cba10d1..4c5d4b8c 100644
+--- a/src/components/providers/forms/shared/ModelInputWithFetch.tsx
++++ b/src/components/providers/forms/shared/ModelInputWithFetch.tsx
+@@ -74,7 +74,7 @@ export function ModelInputWithFetch({
+                     key={model.id}
+                     onSelect={() => onChange(model.id)}
+                   >
+-                    {model.id}
++                    {model.displayName ?? model.id}
+                   </DropdownMenuItem>
+                 ))}
+               </div>
+diff --git a/src/components/universal/UniversalProviderFormModal.tsx b/src/components/universal/UniversalProviderFormModal.tsx
+index e085797b..a7dd2844 100644
+--- a/src/components/universal/UniversalProviderFormModal.tsx
++++ b/src/components/universal/UniversalProviderFormModal.tsx
+@@ -48,7 +48,7 @@ export function UniversalProviderFormModal({
+ 
+   // 应用启用状态
+   const [claudeEnabled, setClaudeEnabled] = useState(true);
+-  const [codexEnabled, setCodexEnabled] = useState(true);
++  const [codexEnabled, setCodexEnabled] = useState(false);
+   const [geminiEnabled, setGeminiEnabled] = useState(true);
+ 
+   // 模型配置
+@@ -144,21 +144,22 @@ export function UniversalProviderFormModal({
+ 
+   // 计算 Codex 配置 JSON 预览
+   const codexConfigJson = useMemo(() => {
+-    if (!codexEnabled) return null;
+-    const model = models.codex?.model || "gpt-5.4";
+-    const reasoningEffort = models.codex?.reasoningEffort || "high";
++    const model = models.codex?.model?.trim();
++    if (!codexEnabled || !model) return null;
++    const reasoningEffort = models.codex?.reasoningEffort?.trim();
++    const reasoningLine = reasoningEffort
++      ? `model_reasoning_effort = ${JSON.stringify(reasoningEffort)}\n` : "";
+     // 确保 base_url 以 /v1 结尾（Codex 使用 OpenAI 兼容 API）
+     const codexBaseUrl = baseUrl.endsWith("/v1")
+       ? baseUrl
+       : `${baseUrl.replace(/\/+$/, "")}/v1`;
+     const configToml = `model_provider = "newapi"
+-model = "${model}"
+-model_reasoning_effort = "${reasoningEffort}"
+-disable_response_storage = true
++model = ${JSON.stringify(model)}
++${reasoningLine}disable_response_storage = true
+ 
+ [model_providers.newapi]
+ name = "NewAPI"
+-base_url = "${codexBaseUrl}"
++base_url = ${JSON.stringify(codexBaseUrl)}
+ wire_api = "responses"
+ requires_openai_auth = true`;
+     return {
+@@ -184,7 +185,7 @@ requires_openai_auth = true`;
+ 
+   // 提交表单
+   const handleSubmit = useCallback(() => {
+-    if (!name.trim() || !baseUrl.trim() || !apiKey.trim()) {
++    if (!name.trim() || !baseUrl.trim() || !apiKey.trim() || (codexEnabled && !models.codex?.model?.trim())) {
+       return;
+     }
+ 
+@@ -243,7 +244,7 @@ requires_openai_auth = true`;
+ 
+   // 构建 provider 对象的辅助函数
+   const buildProvider = useCallback((): UniversalProvider | null => {
+-    if (!name.trim() || !baseUrl.trim() || !apiKey.trim()) {
++    if (!name.trim() || !baseUrl.trim() || !apiKey.trim() || (codexEnabled && !models.codex?.model?.trim())) {
+       return null;
+     }
+ 
+@@ -324,7 +325,7 @@ requires_openai_auth = true`;
+       {isEditMode && onSaveAndSync ? (
+         <Button
+           onClick={handleSaveAndSyncClick}
+-          disabled={!name.trim() || !baseUrl.trim() || !apiKey.trim()}
++          disabled={!name.trim() || !baseUrl.trim() || !apiKey.trim() || (codexEnabled && !models.codex?.model?.trim())}
+         >
+           <RefreshCw className="mr-1.5 h-4 w-4" />
+           {t("universalProvider.saveAndSync", { defaultValue: "保存并同步" })}
+@@ -332,7 +333,7 @@ requires_openai_auth = true`;
+       ) : (
+         <Button
+           onClick={handleSubmit}
+-          disabled={!name.trim() || !baseUrl.trim() || !apiKey.trim()}
++          disabled={!name.trim() || !baseUrl.trim() || !apiKey.trim() || (codexEnabled && !models.codex?.model?.trim())}
+         >
+           {t("common.add", { defaultValue: "添加" })}
+         </Button>
+diff --git a/src/config/codexProviderPresets.ts b/src/config/codexProviderPresets.ts
+index bc926c4e..50ef53df 100644
+--- a/src/config/codexProviderPresets.ts
++++ b/src/config/codexProviderPresets.ts
+@@ -41,7 +41,7 @@ export function generateThirdPartyAuth(apiKey: string): Record<string, any> {
+ export function generateThirdPartyConfig(
+   providerName: string,
+   baseUrl: string,
+-  modelName = "gpt-5.4",
++  modelName?: string,
+ ): string {
+   // 清理供应商名称，确保符合TOML键名规范
+   const cleanProviderName =
+@@ -50,10 +50,12 @@ export function generateThirdPartyConfig(
+       .replace(/[^a-z0-9_]/g, "_")
+       .replace(/^_+|_+$/g, "") || "custom";
+ 
++  // Presets describe a connection, not model capability. Only an explicit
++  // caller selection is rendered; this function never certifies that choice.
++  const selection = modelName?.trim();
++  const modelLine = selection ? `model = ${JSON.stringify(selection)}\n` : "";
+   return `model_provider = "${cleanProviderName}"
+-model = "${modelName}"
+-model_reasoning_effort = "high"
+-disable_response_storage = true
++${modelLine}disable_response_storage = true
+ 
+ [model_providers.${cleanProviderName}]
+ name = "${cleanProviderName}"
+@@ -87,7 +89,6 @@ export const codexProviderPresets: CodexProviderPreset[] = [
+     config: generateThirdPartyConfig(
+       "shengsuanyun",
+       "https://router.shengsuanyun.com/api/v1",
+-      "gpt-5.4",
+     ),
+     category: "aggregator",
+     isPartner: true,
+@@ -102,8 +103,6 @@ export const codexProviderPresets: CodexProviderPreset[] = [
+     isOfficial: true,
+     auth: generateThirdPartyAuth(""),
+     config: `model_provider = "azure"
+-model = "gpt-5.4"
+-model_reasoning_effort = "high"
+ disable_response_storage = true
+ 
+ [model_providers.azure]
+@@ -130,7 +129,6 @@ requires_openai_auth = true`,
+     config: generateThirdPartyConfig(
+       "aihubmix",
+       "https://aihubmix.com/v1",
+-      "gpt-5.4",
+     ),
+     endpointCandidates: [
+       "https://aihubmix.com/v1",
+@@ -145,7 +143,6 @@ requires_openai_auth = true`,
+     config: generateThirdPartyConfig(
+       "dmxapi",
+       "https://www.dmxapi.cn/v1",
+-      "gpt-5.4",
+     ),
+     endpointCandidates: ["https://www.dmxapi.cn/v1"],
+     isPartner: true, // 合作伙伴
+@@ -160,7 +157,6 @@ requires_openai_auth = true`,
+     config: generateThirdPartyConfig(
+       "packycode",
+       "https://www.packyapi.com/v1",
+-      "gpt-5.4",
+     ),
+     endpointCandidates: [
+       "https://www.packyapi.com/v1",
+@@ -178,7 +174,6 @@ requires_openai_auth = true`,
+     config: generateThirdPartyConfig(
+       "cubence",
+       "https://api.cubence.com/v1",
+-      "gpt-5.4",
+     ),
+     endpointCandidates: [
+       "https://api.cubence.com/v1",
+@@ -201,7 +196,6 @@ requires_openai_auth = true`,
+     config: generateThirdPartyConfig(
+       "aigocode",
+       "https://api.aigocode.com",
+-      "gpt-5.4",
+     ),
+     endpointCandidates: ["https://api.aigocode.com"],
+     isPartner: true, // 合作伙伴
+@@ -217,7 +211,6 @@ requires_openai_auth = true`,
+     config: generateThirdPartyConfig(
+       "rightcode",
+       "https://right.codes/codex/v1",
+-      "gpt-5.4",
+     ),
+     category: "third_party",
+     isPartner: true,
+@@ -233,7 +226,6 @@ requires_openai_auth = true`,
+     config: generateThirdPartyConfig(
+       "aicodemirror",
+       "https://api.aicodemirror.com/api/codex/backend-api/codex",
+-      "gpt-5.4",
+     ),
+     endpointCandidates: [
+       "https://api.aicodemirror.com/api/codex/backend-api/codex",
+@@ -252,7 +244,6 @@ requires_openai_auth = true`,
+     config: generateThirdPartyConfig(
+       "aicoding",
+       "https://api.aicoding.sh",
+-      "gpt-5.4",
+     ),
+     endpointCandidates: ["https://api.aicoding.sh"],
+     isPartner: true,
+@@ -268,7 +259,6 @@ requires_openai_auth = true`,
+     config: generateThirdPartyConfig(
+       "crazyrouter",
+       "https://crazyrouter.com/v1",
+-      "gpt-5.4",
+     ),
+     endpointCandidates: ["https://crazyrouter.com/v1"],
+     isPartner: true,
+@@ -284,7 +274,6 @@ requires_openai_auth = true`,
+     config: generateThirdPartyConfig(
+       "sssaicode",
+       "https://node-hk.sssaicode.com/api/v1",
+-      "gpt-5.4",
+     ),
+     endpointCandidates: [
+       "https://node-hk.sssaicode.com/api/v1",
+@@ -307,7 +296,6 @@ requires_openai_auth = true`,
+     config: generateThirdPartyConfig(
+       "compshare",
+       "https://api.modelverse.cn/v1",
+-      "gpt-5.4",
+     ),
+     endpointCandidates: ["https://api.modelverse.cn/v1"],
+     category: "aggregator",
+@@ -326,7 +314,6 @@ requires_openai_auth = true`,
+     config: generateThirdPartyConfig(
+       "compshare_coding",
+       "https://cp.compshare.cn/v1",
+-      "gpt-5.4",
+     ),
+     endpointCandidates: ["https://cp.compshare.cn/v1"],
+     category: "aggregator",
+@@ -343,7 +330,6 @@ requires_openai_auth = true`,
+     config: generateThirdPartyConfig(
+       "micu",
+       "https://www.openclaudecode.cn/v1",
+-      "gpt-5.4",
+     ),
+     endpointCandidates: ["https://www.openclaudecode.cn/v1"],
+     category: "third_party",
+@@ -360,7 +346,6 @@ requires_openai_auth = true`,
+     config: generateThirdPartyConfig(
+       "ctok",
+       "https://api.ctok.ai/v1",
+-      "gpt-5.4",
+     ),
+     endpointCandidates: ["https://api.ctok.ai/v1"],
+     category: "third_party",
+@@ -376,7 +361,6 @@ requires_openai_auth = true`,
+     config: generateThirdPartyConfig(
+       "lionccapi",
+       "https://vibecodingapi.ai/v1",
+-      "gpt-5.4",
+     ),
+     category: "third_party",
+     isPartner: true,
+@@ -392,7 +376,6 @@ requires_openai_auth = true`,
+     config: generateThirdPartyConfig(
+       "ddshub",
+       "https://www.ddshub.cc",
+-      "gpt-5.4",
+     ),
+     endpointCandidates: ["https://www.ddshub.cc"],
+     isPartner: true,
+@@ -408,8 +391,6 @@ requires_openai_auth = true`,
+       OPENAI_API_KEY: "",
+     },
+     config: `model_provider = "e-flowcode"
+-model = "gpt-5.4"
+-model_reasoning_effort = "high"
+ disable_response_storage = true
+ personality = "pragmatic"
+ 
+@@ -417,9 +398,7 @@ personality = "pragmatic"
+ name = "e-flowcode"
+ base_url = "https://e-flowcode.cc/v1"
+ wire_api = "responses"
+-requires_openai_auth = true
+-model_context_window = 1000000
+-model_auto_compact_token_limit = 9000000`,
++requires_openai_auth = true`,
+     category: "third_party",
+     endpointCandidates: ["https://e-flowcode.cc/v1"],
+     icon: "eflowcode",
+@@ -434,7 +413,6 @@ model_auto_compact_token_limit = 9000000`,
+     config: generateThirdPartyConfig(
+       "lemondata",
+       "https://api.lemondata.cc/v1",
+-      "gpt-5.4",
+     ),
+     endpointCandidates: ["https://api.lemondata.cc/v1"],
+     isPartner: true,
+@@ -449,8 +427,6 @@ model_auto_compact_token_limit = 9000000`,
+       OPENAI_API_KEY: "",
+     },
+     config: `model_provider = "custom"
+-model = "gpt-5.4"
+-model_reasoning_effort = "medium"
+ disable_response_storage = true
+ 
+ [model_providers.custom]
+@@ -470,7 +446,6 @@ base_url = "https://cc-api.pipellm.ai/v1"`,
+     config: generateThirdPartyConfig(
+       "openrouter",
+       "https://openrouter.ai/api/v1",
+-      "gpt-5.4",
+     ),
+     category: "aggregator",
+     icon: "openrouter",
+@@ -484,7 +459,6 @@ base_url = "https://cc-api.pipellm.ai/v1"`,
+     config: generateThirdPartyConfig(
+       "therouter",
+       "https://api.therouter.ai/v1",
+-      "openai/gpt-5.3-codex",
+     ),
+     endpointCandidates: ["https://api.therouter.ai/v1"],
+     category: "aggregator",
+diff --git a/src/config/codexTemplates.ts b/src/config/codexTemplates.ts
+index b697c544..de1c1144 100644
+--- a/src/config/codexTemplates.ts
++++ b/src/config/codexTemplates.ts
+@@ -14,8 +14,7 @@ export interface CodexTemplate {
+  */
+ export function getCodexCustomTemplate(): CodexTemplate {
+   const config = `model_provider = "custom"
+-model = "gpt-5.4"
+-model_reasoning_effort = "high"
++# Select a verified model explicitly; discovery supplies no default.
+ disable_response_storage = true
+ 
+ [model_providers.custom]
+diff --git a/src/config/universalProviderPresets.ts b/src/config/universalProviderPresets.ts
+index e99e506f..993075c1 100644
+--- a/src/config/universalProviderPresets.ts
++++ b/src/config/universalProviderPresets.ts
+@@ -45,10 +45,7 @@ const NEWAPI_DEFAULT_MODELS: UniversalProviderModels = {
+     sonnetModel: "claude-sonnet-4-6",
+     opusModel: "claude-opus-4-7",
+   },
+-  codex: {
+-    model: "gpt-5.4",
+-    reasoningEffort: "high",
+-  },
++  codex: {}, // No implicit Codex model or reasoning capability.
+   gemini: {
+     model: "gemini-3.1-pro",
+   },
+@@ -63,7 +60,7 @@ export const universalProviderPresets: UniversalProviderPreset[] = [
+     providerType: "newapi",
+     defaultApps: {
+       claude: true,
+-      codex: true,
++      codex: false, // Enable only after an explicit model choice.
+       gemini: true,
+     },
+     defaultModels: NEWAPI_DEFAULT_MODELS,
+@@ -78,7 +75,7 @@ export const universalProviderPresets: UniversalProviderPreset[] = [
+     providerType: "custom_gateway",
+     defaultApps: {
+       claude: true,
+-      codex: true,
++      codex: false, // Enable only after an explicit model choice.
+       gemini: true,
+     },
+     defaultModels: NEWAPI_DEFAULT_MODELS,
+diff --git a/src/lib/api/model-fetch.ts b/src/lib/api/model-fetch.ts
+index 2b8cc1b7..f008c35c 100644
+--- a/src/lib/api/model-fetch.ts
++++ b/src/lib/api/model-fetch.ts
+@@ -5,6 +5,8 @@ import { toast } from "sonner";
+ export interface FetchedModel {
+   id: string;
+   ownedBy: string | null;
++  /** Optional menu label; requests must still use `id`. */
++  displayName?: string;
+ }
+ 
+ /**
+diff --git a/tests/config/therouterProviderPresets.test.ts b/tests/config/therouterProviderPresets.test.ts
+index 77a180e1..855349dd 100644
+--- a/tests/config/therouterProviderPresets.test.ts
++++ b/tests/config/therouterProviderPresets.test.ts
+@@ -41,7 +41,9 @@ describe("TheRouter provider presets", () => {
+     ]);
+     expect(preset?.auth).toEqual({ OPENAI_API_KEY: "" });
+     expect(preset?.config).toContain('model_provider = "therouter"');
+-    expect(preset?.config).toContain('model = "openai/gpt-5.3-codex"');
++    // Presets only describe provider connectivity; model selection requires an
++    // explicit user choice and must never be inferred from a provider preset.
++    expect(preset?.config).not.toMatch(/^model\s*=/m);
+     expect(preset?.config).toContain(
+       'base_url = "https://api.therouter.ai/v1"',
+     );
+diff --git a/src-tauri/src/usb_model_selection.rs b/src-tauri/src/usb_model_selection.rs
+new file mode 100644
+index 00000000..441f7d5c
+--- /dev/null
++++ b/src-tauri/src/usb_model_selection.rs
+@@ -0,0 +1,1408 @@
++//! Headless bridge for the USB-bound Codex model selection flow.
++//!
++//! This module is intentionally a narrow configuration bridge. It does not
++//! verify model compatibility, perform network requests, or accept provider
++//! configuration or credentials from the caller. The manager owns the
++//! verification result and any post-switch model catalog.
++
++use crate::app_config::AppType;
++use crate::codex_config::{get_codex_auth_path, get_codex_config_path};
++use crate::database::Database;
++use crate::error::AppError;
++use crate::provider::Provider;
++use crate::services::ProviderService;
++use crate::store::AppState;
++use serde::{Deserialize, Serialize};
++use serde_json::{json, Map, Value};
++use sha2::{Digest, Sha256};
++use std::fs;
++use std::io::{self, Read, Write};
++use std::sync::Arc;
++use std::time::{Duration, Instant};
++use toml_edit::{DocumentMut, TableLike};
++
++const USB_MODEL_SELECTION_FLAG: &str = "--usb-model-selection";
++const MANAGED_MODEL_CATALOG_KEY: &str = "model_catalog_json";
++const MAX_REQUEST_BYTES: usize = 16 * 1024;
++const MAX_RESPONSE_BYTES: usize = 8 * 1024;
++const MAX_CONFIG_BYTES: usize = 4 * 1024 * 1024;
++const MAX_REQUEST_ID_BYTES: usize = 64;
++const MAX_REVISION_BYTES: usize = 128;
++const MAX_MODEL_BYTES: usize = 256;
++const BRIDGE_MAX_LIFETIME: Duration = Duration::from_secs(15);
++
++#[derive(Debug, Deserialize)]
++#[serde(rename_all = "camelCase", deny_unknown_fields)]
++struct UsbModelSelectionRequest {
++    schema_version: u32,
++    request_id: String,
++    operation: String,
++    binding_fingerprint: String,
++    #[serde(default)]
++    expected_revision: Option<String>,
++    #[serde(default)]
++    model: Option<String>,
++    #[serde(default)]
++    catalog_path: Option<String>,
++    #[serde(default)]
++    catalog_sha256: Option<String>,
++}
++
++#[derive(Debug, Serialize)]
++#[serde(rename_all = "camelCase")]
++struct UsbModelSelectionResponse {
++    schema_version: u32,
++    request_id: String,
++    ok: bool,
++    code: &'static str,
++    revision: Option<String>,
++    selected_model: Option<String>,
++    config_sha256: Option<String>,
++    applied: bool,
++}
++
++struct BridgeSuccess {
++    revision: String,
++    selected_model: Option<String>,
++    config_sha256: Option<String>,
++    applied: bool,
++}
++
++#[derive(Debug)]
++struct BridgeFailure {
++    code: &'static str,
++    revision: Option<String>,
++    selected_model: Option<String>,
++    config_sha256: Option<String>,
++    applied: bool,
++}
++
++impl BridgeFailure {
++    fn new(code: &'static str) -> Self {
++        Self {
++            code,
++            revision: None,
++            selected_model: None,
++            config_sha256: None,
++            applied: false,
++        }
++    }
++
++    fn from_snapshot(snapshot: &UsbModelSelectionSnapshot, code: &'static str) -> Self {
++        Self {
++            code,
++            revision: Some(snapshot.revision.clone()),
++            selected_model: snapshot.selected_model.clone(),
++            config_sha256: snapshot.live.config_sha256.clone(),
++            applied: false,
++        }
++    }
++}
++
++struct BridgeDeadline {
++    deadline: Instant,
++}
++
++impl BridgeDeadline {
++    fn new() -> Self {
++        Self {
++            deadline: Instant::now() + BRIDGE_MAX_LIFETIME,
++        }
++    }
++
++    fn check(&self) -> Result<(), BridgeFailure> {
++        if Instant::now() > self.deadline {
++            Err(BridgeFailure::new("deadline-exceeded"))
++        } else {
++            Ok(())
++        }
++    }
++}
++
++struct LiveConfigSnapshot {
++    config_text: Option<String>,
++    config_sha256: Option<String>,
++    auth_sha256: Option<String>,
++}
++
++struct ConfigInspection {
++    model: Option<String>,
++}
++
++struct UsbModelSelectionSnapshot {
++    provider: Provider,
++    provider_model: Option<String>,
++    live_model: Option<String>,
++    selected_model: Option<String>,
++    live: LiveConfigSnapshot,
++    revision: String,
++    revision_basis: Value,
++}
++
++/// Acquire the cross-process Codex configuration guard.
++///
++/// On non-Windows this is deliberately a no-op: the headless bridge itself is
++/// unsupported there, while ordinary application behavior remains unchanged.
++pub(crate) struct CodexModelSelectionGuard {
++    #[cfg(target_os = "windows")]
++    handle: *mut std::ffi::c_void,
++}
++
++pub(crate) fn acquire_codex_guard() -> Result<CodexModelSelectionGuard, AppError> {
++    #[cfg(target_os = "windows")]
++    {
++        use std::os::windows::ffi::OsStrExt;
++        use std::ptr::null_mut;
++
++        const WAIT_OBJECT_0: u32 = 0x0000_0000;
++        const WAIT_ABANDONED: u32 = 0x0000_0080;
++        const WAIT_TIMEOUT: u32 = 0x0000_0102;
++        const WAIT_MS: u32 = 3_000;
++
++        let name: Vec<u16> = std::ffi::OsStr::new("Local\\CodexUsbModelSelection")
++            .encode_wide()
++            .chain(std::iter::once(0))
++            .collect();
++        let handle = unsafe { CreateMutexW(null_mut(), 0, name.as_ptr()) };
++        if handle.is_null() {
++            return Err(AppError::Lock("USB Codex mutex creation failed".into()));
++        }
++
++        let wait_result = unsafe { WaitForSingleObject(handle, WAIT_MS) };
++        if wait_result != WAIT_OBJECT_0 {
++            unsafe {
++                if wait_result == WAIT_ABANDONED {
++                    ReleaseMutex(handle);
++                }
++                CloseHandle(handle);
++            }
++            let message = if wait_result == WAIT_TIMEOUT {
++                "USB Codex mutex wait timed out"
++            } else {
++                "USB Codex mutex wait failed"
++            };
++            return Err(AppError::Lock(message.into()));
++        }
++
++        Ok(CodexModelSelectionGuard { handle })
++    }
++
++    #[cfg(not(target_os = "windows"))]
++    {
++        Ok(CodexModelSelectionGuard {})
++    }
++}
++
++impl Drop for CodexModelSelectionGuard {
++    fn drop(&mut self) {
++        #[cfg(target_os = "windows")]
++        if !self.handle.is_null() {
++            // A Windows mutex is recursive for the owning thread. Each
++            // nested service/DAO guard therefore releases exactly one level.
++            unsafe {
++                ReleaseMutex(self.handle);
++                CloseHandle(self.handle);
++            }
++        }
++    }
++}
++
++#[cfg(target_os = "windows")]
++#[link(name = "kernel32")]
++unsafe extern "system" {
++    fn CreateMutexW(
++        lp_mutex_attributes: *mut std::ffi::c_void,
++        b_initial_owner: i32,
++        lp_name: *const u16,
++    ) -> *mut std::ffi::c_void;
++    fn WaitForSingleObject(handle: *mut std::ffi::c_void, milliseconds: u32) -> u32;
++    fn ReleaseMutex(handle: *mut std::ffi::c_void) -> i32;
++    fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
++}
++
++/// Run the USB model-selection bridge when, and only when, the process was
++/// invoked with exactly --usb-model-selection.
++pub fn try_usb_model_selection_cli() -> Option<i32> {
++    if !is_usb_model_selection_invocation() {
++        return None;
++    }
++
++    let response = match read_request_bytes() {
++        Ok(bytes) => match parse_request(&bytes) {
++            Ok(request) => execute_request(&request),
++            Err(_) => response_for_failure("", BridgeFailure::new("invalid-request")),
++        },
++        Err(code) => response_for_failure("", BridgeFailure::new(code)),
++    };
++
++    let exit_code = if response.ok { 0 } else { 1 };
++    if write_response(&response) {
++        Some(exit_code)
++    } else {
++        Some(1)
++    }
++}
++
++fn is_usb_model_selection_invocation() -> bool {
++    let mut args = std::env::args_os();
++    let _program = args.next();
++    matches!(
++        (args.next(), args.next()),
++        (Some(flag), None) if flag == std::ffi::OsStr::new(USB_MODEL_SELECTION_FLAG)
++    )
++}
++
++fn read_request_bytes() -> Result<Vec<u8>, &'static str> {
++    let mut input = Vec::new();
++    io::stdin()
++        .lock()
++        .take((MAX_REQUEST_BYTES + 1) as u64)
++        .read_to_end(&mut input)
++        .map_err(|_| "stdin-read-failed")?;
++    if input.len() > MAX_REQUEST_BYTES {
++        return Err("request-too-large");
++    }
++    Ok(input)
++}
++
++fn parse_request(bytes: &[u8]) -> Result<UsbModelSelectionRequest, &'static str> {
++    let request: UsbModelSelectionRequest =
++        serde_json::from_slice(bytes).map_err(|_| "invalid-request")?;
++    if request.schema_version != 3
++        || !is_safe_request_id(&request.request_id)
++        || request.binding_fingerprint.len() != 64
++        || !request.binding_fingerprint.bytes().all(|b| b.is_ascii_hexdigit())
++        || !matches!(request.operation.as_str(), "snapshot" | "apply")
++    {
++        return Err("invalid-request");
++    }
++    if let Some(revision) = request.expected_revision.as_deref() {
++        validate_bounded_text(revision, MAX_REVISION_BYTES).map_err(|_| "invalid-request")?;
++    }
++    if let Some(model) = request.model.as_deref() {
++        validate_bounded_text(model, MAX_MODEL_BYTES).map_err(|_| "invalid-request")?;
++    }
++    if request.operation == "apply" {
++        let path = request.catalog_path.as_deref().ok_or("invalid-request")?;
++        validate_bounded_text(path, 4096).map_err(|_| "invalid-request")?;
++        let hash = request.catalog_sha256.as_deref().ok_or("invalid-request")?;
++        if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
++            return Err("invalid-request");
++        }
++    } else if request.catalog_path.is_some() || request.catalog_sha256.is_some() {
++        return Err("invalid-request");
++    }
++    Ok(request)
++}
++
++fn is_safe_request_id(request_id: &str) -> bool {
++    !request_id.is_empty()
++        && request_id.len() <= MAX_REQUEST_ID_BYTES
++        && request_id
++            .bytes()
++            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
++}
++
++fn validate_bounded_text(value: &str, max_bytes: usize) -> Result<(), ()> {
++    if value.is_empty() || value.len() > max_bytes || value.chars().any(char::is_control) {
++        Err(())
++    } else {
++        Ok(())
++    }
++}
++
++// Consistency metadata only: the signed-license/native readiness decision
++// belongs to the manager. This helper never issues capability certificates.
++fn selection_binding_fingerprint(provider: &str, account: &str, credential: &str, group: u64, user: u64)
++    -> Result<String, BridgeFailure> {
++    if provider != crate::services::provider::USB_404TOKEN_PROVIDER_ID || group == 0 || user == 0
++        || validate_bounded_text(account, 1024).is_err()
++        || validate_bounded_text(credential, 1024).is_err()
++        || !account.strip_prefix("USB-").is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())) {
++        return Err(BridgeFailure::new("binding-context-mismatch"));
++    }
++    let bytes = serde_json::to_vec(&(provider, account, credential, group, user))
++        .map_err(|_| BridgeFailure::new("binding-context-mismatch"))?;
++    Ok(sha256_hex(&bytes))
++}
++
++#[cfg(target_os = "windows")]
++fn environment_binding_fingerprint() -> Result<String, BridgeFailure> {
++    let required = |name| std::env::var(name).map_err(|_| BridgeFailure::new("binding-context-missing"));
++    let provider = required("CCSWITCH_404TOKEN_PROVIDER")?;
++    let account = required("CCSWITCH_404TOKEN_ACCOUNT")?;
++    let credential = required("CCSWITCH_404TOKEN_CREDENTIAL_ID")?;
++    let group = required("CCSWITCH_404TOKEN_GROUP_ID")?.parse::<u64>()
++        .map_err(|_| BridgeFailure::new("binding-context-mismatch"))?;
++    let user = required("CCSWITCH_404TOKEN_USER_ID")?.parse::<u64>()
++        .map_err(|_| BridgeFailure::new("binding-context-mismatch"))?;
++    selection_binding_fingerprint(&provider, &account, &credential, group, user)
++}
++
++fn execute_request(request: &UsbModelSelectionRequest) -> UsbModelSelectionResponse {
++    #[cfg(not(target_os = "windows"))]
++    {
++        return response_for_failure(
++            &request.request_id,
++            BridgeFailure::new("unsupported-platform"),
++        );
++    }
++
++    #[cfg(target_os = "windows")]
++    {
++        let result = execute_request_windows(request);
++        match result {
++            Ok(success) => UsbModelSelectionResponse {
++                schema_version: 3,
++                request_id: request.request_id.clone(),
++                ok: true,
++                code: "ok",
++                revision: Some(success.revision),
++                selected_model: success.selected_model,
++                config_sha256: success.config_sha256,
++                applied: success.applied,
++            },
++            Err(failure) => response_for_failure(&request.request_id, failure),
++        }
++    }
++}
++
++#[cfg(target_os = "windows")]
++fn execute_request_windows(
++    request: &UsbModelSelectionRequest,
++) -> Result<BridgeSuccess, BridgeFailure> {
++    let deadline = BridgeDeadline::new();
++    if environment_binding_fingerprint()? != request.binding_fingerprint {
++        return Err(BridgeFailure::new("binding-context-mismatch"));
++    }
++    let _bridge_guard = acquire_codex_guard().map_err(|_| BridgeFailure::new("lock-failed"))?;
++    deadline.check()?;
++    validate_expected_codex_home()?;
++
++    let db = Database::init().map_err(|_| BridgeFailure::new("database-init-failed"))?;
++    let state = AppState::new(Arc::new(db));
++    deadline.check()?;
++
++    let prepared = ProviderService::bootstrap_usb_404token_from_environment(&state)
++        .map_err(|_| BridgeFailure::new("bootstrap-failed"))?;
++    if !prepared {
++        return Err(BridgeFailure::new("device-key-missing"));
++    }
++    deadline.check()?;
++
++    match request.operation.as_str() {
++        "snapshot" => execute_snapshot(&state, &deadline),
++        "apply" => execute_apply(&state, request, &deadline),
++        _ => Err(BridgeFailure::new("invalid-request")),
++    }
++}
++
++#[cfg(target_os = "windows")]
++fn execute_snapshot(
++    state: &AppState,
++    deadline: &BridgeDeadline,
++) -> Result<BridgeSuccess, BridgeFailure> {
++    let snapshot = load_usb_snapshot(state)?;
++    deadline.check()?;
++    Ok(BridgeSuccess {
++        revision: snapshot.revision,
++        selected_model: snapshot.selected_model,
++        config_sha256: snapshot.live.config_sha256,
++        applied: false,
++    })
++}
++
++#[cfg(target_os = "windows")]
++fn restore_live_file(
++    path: &std::path::Path,
++    before: &Option<Vec<u8>>,
++    written: &Value,
++    is_auth: bool,
++) -> Result<(), BridgeFailure> {
++    let current = bounded_regular_bytes(path)?;
++    if &current == before {
++        return Ok(());
++    }
++    let ours = current.as_deref().is_some_and(|bytes| {
++        if is_auth {
++            serde_json::from_slice::<Value>(bytes).ok().as_ref() == Some(written)
++        } else {
++            std::str::from_utf8(bytes).ok() == written.as_str()
++        }
++    });
++    if !ours {
++        return Err(BridgeFailure::new("rollback-conflict"));
++    }
++    match before {
++        Some(bytes) => crate::config::atomic_write(path, bytes),
++        None => crate::config::delete_file(path),
++    }
++    .map_err(|_| BridgeFailure::new("rollback-incomplete"))
++}
++
++#[cfg(target_os = "windows")]
++fn requested_catalog(
++    request: &UsbModelSelectionRequest,
++    model: &str,
++) -> Result<String, BridgeFailure> {
++    let path = request
++        .catalog_path
++        .as_deref()
++        .ok_or_else(|| BridgeFailure::new("catalog-required"))?;
++    validate_owned_catalog(path)?;
++    let bytes = bounded_regular_bytes(std::path::Path::new(path))?
++        .ok_or_else(|| BridgeFailure::new("catalog-conflict"))?;
++    if request.catalog_sha256.as_deref() != Some(sha256_hex(&bytes).as_str()) {
++        return Err(BridgeFailure::new("catalog-revision-mismatch"));
++    }
++    let value: Value =
++        serde_json::from_slice(&bytes).map_err(|_| BridgeFailure::new("catalog-conflict"))?;
++    let models = value
++        .get("models")
++        .and_then(Value::as_array)
++        .ok_or_else(|| BridgeFailure::new("catalog-conflict"))?;
++    if models
++        .iter()
++        .filter(|m| m.get("slug").and_then(Value::as_str) == Some(model))
++        .count()
++        != 1
++    {
++        return Err(BridgeFailure::new("catalog-model-conflict"));
++    }
++    Ok(path.into())
++}
++
++#[cfg(target_os = "windows")]
++fn execute_apply(
++    state: &AppState,
++    request: &UsbModelSelectionRequest,
++    deadline: &BridgeDeadline,
++) -> Result<BridgeSuccess, BridgeFailure> {
++    let requested_model = request
++        .model
++        .as_deref()
++        .ok_or_else(|| BridgeFailure::new("model-required"))?
++        .trim()
++        .to_string();
++    validate_bounded_text(&requested_model, MAX_MODEL_BYTES)
++        .map_err(|_| BridgeFailure::new("model-invalid"))?;
++
++    let expected_revision = request
++        .expected_revision
++        .as_deref()
++        .ok_or_else(|| BridgeFailure::new("revision-required"))?;
++    let snapshot = load_usb_snapshot(state)?;
++    if expected_revision != snapshot.revision {
++        return Err(BridgeFailure::from_snapshot(&snapshot, "revision-mismatch"));
++    }
++
++    if snapshot
++        .provider_model
++        .as_deref()
++        .is_some_and(|model| model != requested_model.as_str())
++        || snapshot
++            .live_model
++            .as_deref()
++            .is_some_and(|model| model != requested_model.as_str())
++    {
++        return Err(BridgeFailure::from_snapshot(
++            &snapshot,
++            "user-model-conflict",
++        ));
++    }
++
++    validate_common_config_for_model(state, &snapshot.provider, &requested_model)?;
++    reject_proxy_takeover(state)?;
++    deadline.check()?;
++
++    let current_snapshot = load_usb_snapshot(state)?;
++    if current_snapshot.revision != snapshot.revision {
++        return Err(BridgeFailure::from_snapshot(
++            &current_snapshot,
++            "revision-mismatch",
++        ));
++    }
++    let live_config = current_snapshot
++        .live
++        .config_text
++        .as_deref()
++        .filter(|config| !config.trim().is_empty());
++    let updated_provider =
++        provider_with_selected_model(&current_snapshot.provider, live_config, &requested_model)?;
++    let effective_settings =
++        crate::services::provider::build_effective_settings_with_common_config(
++            &state.db,
++            &AppType::Codex,
++            &updated_provider,
++        )
++        .map_err(|_| BridgeFailure::new("common-config-conflict"))?;
++    let mut effective_provider = updated_provider.clone();
++    effective_provider.settings_config = effective_settings;
++    let effective = inspect_provider(&effective_provider)?;
++    if effective.model.as_deref() != Some(requested_model.as_str()) {
++        return Err(BridgeFailure::new("common-config-conflict"));
++    }
++    let catalog_path = requested_catalog(request, &requested_model)?;
++    let intended_auth = effective_provider
++        .settings_config
++        .get("auth")
++        .filter(|value| value.is_object())
++        .cloned()
++        .ok_or_else(|| BridgeFailure::new("provider-auth-conflict"))?;
++    if intended_auth.get("OPENAI_API_KEY")
++        != current_snapshot
++            .provider
++            .settings_config
++            .get("auth")
++            .and_then(|v| v.get("OPENAI_API_KEY"))
++    {
++        return Err(BridgeFailure::new("common-auth-conflict"));
++    }
++    let intended_base = effective_provider
++        .settings_config
++        .get("config")
++        .and_then(Value::as_str)
++        .ok_or_else(|| BridgeFailure::new("provider-config-invalid"))?;
++    let quoted_path =
++        serde_json::to_string(&catalog_path).map_err(|_| BridgeFailure::new("catalog-conflict"))?;
++    let intended_config = format!(
++        "# BEGIN CODEX-USB-NATIVE-MODEL-CATALOG v1\nmodel_catalog_json = {quoted_path}\n# END CODEX-USB-NATIVE-MODEL-CATALOG v1\n\n{}",
++        intended_base.trim_start_matches('\u{feff}'));
++    validate_catalog_keys(
++        &intended_config
++            .parse::<DocumentMut>()
++            .map_err(|_| BridgeFailure::new("provider-config-invalid"))?,
++        true,
++    )?;
++    let db_current = current_snapshot
++        .revision_basis
++        .get("databaseCurrentProvider")
++        .and_then(Value::as_str);
++    let settings_current = crate::settings::get_current_provider(&AppType::Codex);
++    if db_current.is_some_and(|id| id != crate::services::provider::USB_404TOKEN_PROVIDER_ID)
++        || settings_current
++            .as_deref()
++            .is_some_and(|id| id != crate::services::provider::USB_404TOKEN_PROVIDER_ID)
++    {
++        return Err(BridgeFailure::new("user-provider-conflict"));
++    }
++    let config_path = get_codex_config_path();
++    let auth_path = get_codex_auth_path();
++    let before_config = bounded_regular_bytes(&config_path)?;
++    let before_auth = bounded_regular_bytes(&auth_path)?;
++    if before_config.as_ref().map(|v| sha256_hex(v)) != current_snapshot.live.config_sha256
++        || before_auth.as_ref().map(|v| sha256_hex(v)) != current_snapshot.live.auth_sha256
++    {
++        return Err(BridgeFailure::new("revision-mismatch"));
++    }
++    // A fresh USB provider must not replace an unrelated official login.
++    if db_current.is_none()
++        && settings_current.is_none()
++        && before_auth.as_deref().is_some_and(|bytes| {
++            serde_json::from_slice::<Value>(bytes)
++                .ok()
++                .is_none_or(|auth| auth != intended_auth)
++        })
++    {
++        return Err(BridgeFailure::new("user-auth-conflict"));
++    }
++    let mut written_hashes = None;
++    let transaction = state.db.apply_usb_model_selection_transaction(
++        &current_snapshot.provider.settings_config,
++        &updated_provider.settings_config,
++        db_current,
++        || {
++            let safe = || AppError::Config("USB selection live configuration changed".into());
++            deadline.check().map_err(|_| safe())?;
++            if bounded_regular_bytes(&config_path).map_err(|_| safe())? != before_config
++                || bounded_regular_bytes(&auth_path).map_err(|_| safe())? != before_auth
++                || crate::settings::get_current_provider(&AppType::Codex) != settings_current
++            {
++                return Err(safe());
++            }
++            crate::codex_config::write_codex_live_atomic(&intended_auth, Some(&intended_config))?;
++            let actual_config = bounded_regular_bytes(&config_path)
++                .map_err(|_| safe())?
++                .ok_or_else(safe)?;
++            let actual_auth = bounded_regular_bytes(&auth_path)
++                .map_err(|_| safe())?
++                .ok_or_else(safe)?;
++            if actual_config != intended_config.as_bytes()
++                || serde_json::from_slice::<Value>(&actual_auth).ok().as_ref()
++                    != Some(&intended_auth)
++                || crate::settings::get_current_provider(&AppType::Codex) != settings_current
++            {
++                return Err(safe());
++            }
++            deadline.check().map_err(|_| safe())?;
++            written_hashes = Some((sha256_hex(&actual_config), sha256_hex(&actual_auth)));
++            Ok(())
++        },
++    );
++    if transaction.is_err() {
++        let config_restore = restore_live_file(
++            &config_path,
++            &before_config,
++            &Value::String(intended_config),
++            false,
++        );
++        let auth_restore = restore_live_file(&auth_path, &before_auth, &intended_auth, true);
++        if config_restore.is_err() || auth_restore.is_err() {
++            return Err(BridgeFailure::new("rollback-incomplete"));
++        }
++        return Err(BridgeFailure::from_snapshot(
++            &current_snapshot,
++            "apply-rolled-back",
++        ));
++    }
++    let (config_hash, auth_hash) =
++        written_hashes.ok_or_else(|| BridgeFailure::new("postcondition-unconfirmed"))?;
++    // No fallible DB reads after commit. Reconstruct the same snapshot digest
++    // from transaction-confirmed values; the caller still rechecks file hashes.
++    let mut revision = current_snapshot.revision_basis.clone();
++    let mut saved_provider = current_snapshot.provider.clone();
++    saved_provider.settings_config = updated_provider.settings_config;
++    revision["provider"] = canonicalize_json(
++        &serde_json::to_value(saved_provider)
++            .map_err(|_| BridgeFailure::new("postcondition-unconfirmed"))?,
++    );
++    revision["databaseCurrentProvider"] =
++        json!(crate::services::provider::USB_404TOKEN_PROVIDER_ID);
++    revision["liveConfigSha256"] = json!(config_hash);
++    revision["liveAuthSha256"] = json!(auth_hash);
++    let revision_bytes = serde_json::to_vec(&canonicalize_json(&revision))
++        .map_err(|_| BridgeFailure::new("postcondition-unconfirmed"))?;
++    Ok(BridgeSuccess {
++        revision: sha256_hex(&revision_bytes),
++        selected_model: Some(requested_model),
++        config_sha256: Some(config_hash),
++        applied: true,
++    })
++}
++
++#[cfg(target_os = "windows")]
++fn load_usb_snapshot(state: &AppState) -> Result<UsbModelSelectionSnapshot, BridgeFailure> {
++    let provider = state
++        .db
++        .get_provider_by_id(
++            crate::services::provider::USB_404TOKEN_PROVIDER_ID,
++            AppType::Codex.as_str(),
++        )
++        .map_err(|_| BridgeFailure::new("provider-read-failed"))?
++        .ok_or_else(|| BridgeFailure::new("provider-missing"))?;
++
++    let provider_inspection = inspect_provider(&provider)?;
++    let live = read_live_config_snapshot()?;
++    let live_inspection = match live.config_text.as_deref() {
++        Some(config) if !config.trim().is_empty() => Some(inspect_live_usb_config(config)?),
++        _ => None,
++    };
++
++    let live_model = live_inspection
++        .as_ref()
++        .and_then(|inspection| inspection.model.clone());
++    if provider_inspection.model.is_some()
++        && live_model.is_some()
++        && provider_inspection.model != live_model
++    {
++        return Err(BridgeFailure::new("state-conflict"));
++    }
++    let selected_model = live_model
++        .clone()
++        .or_else(|| provider_inspection.model.clone());
++    let key = provider
++        .settings_config
++        .get("auth")
++        .and_then(|v| v.get("OPENAI_API_KEY"))
++        .and_then(Value::as_str)
++        .unwrap_or_default();
++    if selected_model
++        .as_deref()
++        .is_some_and(|m| !key.is_empty() && m.contains(key))
++    {
++        return Err(BridgeFailure::new("provider-config-invalid"));
++    }
++    let db_current = state
++        .db
++        .get_current_provider(AppType::Codex.as_str())
++        .map_err(|_| BridgeFailure::new("provider-read-failed"))?;
++    let settings_current = crate::settings::get_current_provider(&AppType::Codex);
++    let common_config = state
++        .db
++        .get_config_snippet(AppType::Codex.as_str())
++        .map_err(|_| BridgeFailure::new("provider-read-failed"))?;
++    let provider_value =
++        serde_json::to_value(&provider).map_err(|_| BridgeFailure::new("revision-failed"))?;
++    let revision_payload = json!({
++        "schemaVersion": 3,
++        "bindingFingerprint": environment_binding_fingerprint()?,
++        "provider": canonicalize_json(&provider_value),
++        "databaseCurrentProvider": db_current,
++        "settingsCurrentProvider": settings_current,
++        "commonConfig": common_config,
++        "codexConfigPath": get_codex_config_path().to_string_lossy(),
++        "codexAuthPath": get_codex_auth_path().to_string_lossy(),
++        "liveConfigSha256": live.config_sha256.clone(),
++        "liveAuthSha256": live.auth_sha256.clone(),
++    });
++    let revision_bytes = serde_json::to_vec(&canonicalize_json(&revision_payload))
++        .map_err(|_| BridgeFailure::new("revision-failed"))?;
++
++    Ok(UsbModelSelectionSnapshot {
++        provider,
++        provider_model: provider_inspection.model,
++        live_model,
++        selected_model,
++        live,
++        revision: sha256_hex(&revision_bytes),
++        revision_basis: revision_payload,
++    })
++}
++
++#[cfg(target_os = "windows")]
++fn inspect_provider(provider: &Provider) -> Result<ConfigInspection, BridgeFailure> {
++    if provider.id != crate::services::provider::USB_404TOKEN_PROVIDER_ID {
++        return Err(BridgeFailure::new("provider-mismatch"));
++    }
++    let settings = provider
++        .settings_config
++        .as_object()
++        .ok_or_else(|| BridgeFailure::new("provider-config-invalid"))?;
++    let has_device_key = settings
++        .get("auth")
++        .and_then(|auth| auth.get("OPENAI_API_KEY"))
++        .and_then(Value::as_str)
++        .is_some_and(|key| !key.trim().is_empty());
++    if !has_device_key {
++        return Err(BridgeFailure::new("device-key-missing"));
++    }
++    validate_settings_catalog_keys(settings)?;
++    let config = settings
++        .get("config")
++        .and_then(Value::as_str)
++        .ok_or_else(|| BridgeFailure::new("provider-config-invalid"))?;
++    inspect_usb_config(config, true)
++}
++
++#[cfg(target_os = "windows")]
++fn inspect_live_usb_config(config: &str) -> Result<ConfigInspection, BridgeFailure> {
++    let document = config
++        .parse::<DocumentMut>()
++        .map_err(|_| BridgeFailure::new("provider-config-invalid"))?;
++    validate_catalog_keys(&document, true)?;
++    if document.get("model_provider").is_none() {
++        // A fresh Codex home may contain general preferences but no provider.
++        // Preserve those preferences; a distinct explicit model remains a conflict.
++        return Ok(ConfigInspection {
++            model: explicit_model(&document)?,
++        });
++    }
++    inspect_usb_config(config, true)
++}
++
++#[cfg(target_os = "windows")]
++fn inspect_usb_config(
++    config: &str,
++    allow_managed_catalog: bool,
++) -> Result<ConfigInspection, BridgeFailure> {
++    let document = config
++        .parse::<DocumentMut>()
++        .map_err(|_| BridgeFailure::new("provider-config-invalid"))?;
++    validate_catalog_keys(&document, allow_managed_catalog)?;
++    if [
++        "profile",
++        "model_reasoning_effort",
++        "model_reasoning_summary",
++        "service_tier",
++    ]
++    .iter()
++    .any(|key| document.get(key).is_some())
++    {
++        return Err(BridgeFailure::new("unverified-model-options"));
++    }
++
++    let model_provider = document
++        .get("model_provider")
++        .and_then(|item| item.as_str())
++        .map(str::trim)
++        .filter(|id| !id.is_empty())
++        .ok_or_else(|| BridgeFailure::new("endpoint-mismatch"))?;
++    let provider_table = document
++        .get("model_providers")
++        .and_then(|item| item.as_table_like())
++        .and_then(|table| table.get(model_provider))
++        .and_then(|item| item.as_table_like())
++        .ok_or_else(|| BridgeFailure::new("endpoint-mismatch"))?;
++    let base_url = provider_table
++        .get("base_url")
++        .and_then(|item| item.as_str())
++        .map(str::trim)
++        .map(|url| url.trim_end_matches('/'))
++        .filter(|url| !url.is_empty())
++        .ok_or_else(|| BridgeFailure::new("endpoint-mismatch"))?;
++    if base_url != crate::services::provider::USB_404TOKEN_BASE_URL
++        || provider_table.get("wire_api").and_then(|v| v.as_str()) != Some("responses")
++        || provider_table
++            .get("requires_openai_auth")
++            .and_then(|v| v.as_bool())
++            != Some(true)
++        || [
++            "env_key",
++            "http_headers",
++            "env_http_headers",
++            "experimental_bearer_token",
++        ]
++        .iter()
++        .any(|key| provider_table.get(key).is_some())
++    {
++        return Err(BridgeFailure::new("endpoint-mismatch"));
++    }
++
++    let model = explicit_model(&document)?;
++    Ok(ConfigInspection { model })
++}
++
++#[cfg(target_os = "windows")]
++fn explicit_model(document: &DocumentMut) -> Result<Option<String>, BridgeFailure> {
++    let Some(item) = document.get("model") else {
++        return Ok(None);
++    };
++    let model = item
++        .as_str()
++        .ok_or_else(|| BridgeFailure::new("provider-config-invalid"))?
++        .trim();
++    if model.is_empty() {
++        return Ok(None);
++    }
++    validate_bounded_text(model, MAX_MODEL_BYTES)
++        .map_err(|_| BridgeFailure::new("provider-config-invalid"))?;
++    Ok(Some(model.to_string()))
++}
++
++#[cfg(target_os = "windows")]
++fn validate_expected_codex_home() -> Result<std::path::PathBuf, BridgeFailure> {
++    let expected = std::env::var_os("CODEX_USB_EXPECTED_CODEX_HOME")
++        .map(std::path::PathBuf::from)
++        .filter(|p| p.is_absolute())
++        .ok_or_else(|| BridgeFailure::new("codex-home-conflict"))?;
++    reject_reparse_ancestors(&expected)?;
++    let expected =
++        fs::canonicalize(&expected).map_err(|_| BridgeFailure::new("codex-home-conflict"))?;
++    for path in [get_codex_config_path(), get_codex_auth_path()] {
++        let parent = path
++            .parent()
++            .ok_or_else(|| BridgeFailure::new("codex-home-conflict"))?;
++        reject_reparse_ancestors(parent)?;
++        if fs::canonicalize(parent).ok().as_ref() != Some(&expected) {
++            return Err(BridgeFailure::new("codex-home-conflict"));
++        }
++    }
++    Ok(expected)
++}
++
++#[cfg(target_os = "windows")]
++fn reject_reparse_ancestors(path: &std::path::Path) -> Result<(), BridgeFailure> {
++    use std::os::windows::fs::MetadataExt;
++    for ancestor in path.ancestors() {
++        match fs::symlink_metadata(ancestor) {
++            Ok(meta) if meta.file_attributes() & 0x400 != 0 => {
++                return Err(BridgeFailure::new("config-path-unsafe"))
++            }
++            Ok(_) => {}
++            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
++            Err(_) => return Err(BridgeFailure::new("live-read-failed")),
++        }
++    }
++    Ok(())
++}
++
++#[cfg(target_os = "windows")]
++fn bounded_regular_bytes(path: &std::path::Path) -> Result<Option<Vec<u8>>, BridgeFailure> {
++    reject_reparse_ancestors(path)?;
++    let meta = match fs::symlink_metadata(path) {
++        Ok(meta) => meta,
++        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
++        Err(_) => return Err(BridgeFailure::new("live-read-failed")),
++    };
++    if !meta.is_file() || meta.len() > MAX_CONFIG_BYTES as u64 {
++        return Err(BridgeFailure::new("live-config-too-large"));
++    }
++    let mut bytes = Vec::new();
++    fs::File::open(path)
++        .map_err(|_| BridgeFailure::new("live-read-failed"))?
++        .take((MAX_CONFIG_BYTES + 1) as u64)
++        .read_to_end(&mut bytes)
++        .map_err(|_| BridgeFailure::new("live-read-failed"))?;
++    if bytes.len() > MAX_CONFIG_BYTES {
++        return Err(BridgeFailure::new("live-config-too-large"));
++    }
++    Ok(Some(bytes))
++}
++
++#[cfg(target_os = "windows")]
++fn validate_owned_catalog(value: &str) -> Result<(), BridgeFailure> {
++    let home = validate_expected_codex_home()?;
++    let expected = home.join("codex-usb-native-model-catalog.json");
++    let actual = std::path::PathBuf::from(value);
++    if !actual.is_absolute() || actual.file_name() != expected.file_name() {
++        return Err(BridgeFailure::new("catalog-conflict"));
++    }
++    reject_reparse_ancestors(&actual)?;
++    if fs::canonicalize(&actual).ok() != fs::canonicalize(&expected).ok() || !expected.exists() {
++        return Err(BridgeFailure::new("catalog-conflict"));
++    }
++    let bytes =
++        bounded_regular_bytes(&actual)?.ok_or_else(|| BridgeFailure::new("catalog-conflict"))?;
++    let catalog: Value =
++        serde_json::from_slice(&bytes).map_err(|_| BridgeFailure::new("catalog-conflict"))?;
++    if catalog.get("identity").and_then(Value::as_str) != Some("404token-unified-api-internal") {
++        return Err(BridgeFailure::new("catalog-conflict"));
++    }
++    Ok(())
++}
++
++#[cfg(target_os = "windows")]
++fn read_live_config_snapshot() -> Result<LiveConfigSnapshot, BridgeFailure> {
++    validate_expected_codex_home()?;
++    let config_path = get_codex_config_path();
++    let (config_text, config_sha256) = if let Some(bytes) = bounded_regular_bytes(&config_path)? {
++        if bytes.len() > MAX_CONFIG_BYTES {
++            return Err(BridgeFailure::new("live-config-too-large"));
++        }
++        let text = String::from_utf8(bytes.clone())
++            .map_err(|_| BridgeFailure::new("live-config-invalid"))?;
++        (Some(text), Some(sha256_hex(&bytes)))
++    } else {
++        (None, None)
++    };
++
++    let auth_path = get_codex_auth_path();
++    let auth_sha256 = if let Some(bytes) = bounded_regular_bytes(&auth_path)? {
++        if bytes.len() > MAX_CONFIG_BYTES {
++            return Err(BridgeFailure::new("live-auth-too-large"));
++        }
++        Some(sha256_hex(&bytes))
++    } else {
++        None
++    };
++
++    Ok(LiveConfigSnapshot {
++        config_text,
++        config_sha256,
++        auth_sha256,
++    })
++}
++
++#[cfg(target_os = "windows")]
++fn merge_preserving_preferences(
++    target: &mut dyn TableLike,
++    source: &dyn TableLike,
++) -> Result<(), BridgeFailure> {
++    for (key, value) in source.iter() {
++        if key == MANAGED_MODEL_CATALOG_KEY {
++            continue;
++        }
++        match target.get_mut(key) {
++            None => {
++                target.insert(key, value.clone());
++            }
++            Some(existing) => {
++                if let (Some(dst), Some(src)) =
++                    (existing.as_table_like_mut(), value.as_table_like())
++                {
++                    merge_preserving_preferences(dst, src)?;
++                } else {
++                    // Serialize semantic values independently of comments/formatting.
++                    let left = format!("value = {}", existing);
++                    let right = format!("value = {}", value);
++                    let same = match (
++                        toml::from_str::<toml::Value>(&left),
++                        toml::from_str::<toml::Value>(&right),
++                    ) {
++                        (Ok(left), Ok(right)) => left == right,
++                        _ => existing.to_string().trim() == value.to_string().trim(),
++                    };
++                    if !same {
++                        return Err(BridgeFailure::new("provider-config-conflict"));
++                    }
++                }
++            }
++        }
++    }
++    Ok(())
++}
++
++#[cfg(target_os = "windows")]
++fn provider_with_selected_model(
++    provider: &Provider,
++    source_config: Option<&str>,
++    requested_model: &str,
++) -> Result<Provider, BridgeFailure> {
++    let mut updated = provider.clone();
++    let settings = updated
++        .settings_config
++        .as_object_mut()
++        .ok_or_else(|| BridgeFailure::new("provider-config-invalid"))?;
++    let provider_config = settings
++        .get("config")
++        .and_then(Value::as_str)
++        .map(str::to_owned)
++        .ok_or_else(|| BridgeFailure::new("provider-config-invalid"))?;
++    let config = source_config.unwrap_or(provider_config.as_str());
++    let mut document = config
++        .parse::<DocumentMut>()
++        .map_err(|_| BridgeFailure::new("provider-config-invalid"))?;
++    validate_catalog_keys(&document, true)?;
++    let mut normalized_provider_settings = provider.settings_config.clone();
++    crate::codex_config::normalize_codex_settings_config_model_provider(
++        &mut normalized_provider_settings,
++        source_config,
++    )
++    .map_err(|_| BridgeFailure::new("provider-config-invalid"))?;
++    let normalized_provider_config = normalized_provider_settings
++        .get("config")
++        .and_then(Value::as_str)
++        .ok_or_else(|| BridgeFailure::new("provider-config-invalid"))?;
++    let provider_document = normalized_provider_config
++        .parse::<DocumentMut>()
++        .map_err(|_| BridgeFailure::new("provider-config-invalid"))?;
++    validate_catalog_keys(&provider_document, true)?;
++    document.as_table_mut().remove(MANAGED_MODEL_CATALOG_KEY);
++    merge_preserving_preferences(document.as_table_mut(), provider_document.as_table())?;
++    let current_model = explicit_model(&document)?;
++    if current_model
++        .as_deref()
++        .is_some_and(|model| model != requested_model)
++    {
++        return Err(BridgeFailure::new("user-model-conflict"));
++    }
++    document["model"] = toml_edit::value(requested_model);
++    let config_text = document.to_string();
++    // The removed owned pointer must not leave an empty legacy marker block.
++    let config_text = config_text
++        .split_inclusive('\n')
++        .filter(|line| {
++            !matches!(
++                line.trim(),
++                "# BEGIN CODEX-USB-NATIVE-MODEL-CATALOG v1"
++                    | "# END CODEX-USB-NATIVE-MODEL-CATALOG v1"
++            )
++        })
++        .collect::<String>();
++    settings.insert("config".to_string(), Value::String(config_text));
++    // The manager-owned root must never become a provider DB field, even if
++    // an older record stored it outside the TOML string.
++    settings.remove(MANAGED_MODEL_CATALOG_KEY);
++    Ok(updated)
++}
++
++#[cfg(target_os = "windows")]
++fn validate_settings_catalog_keys(settings: &Map<String, Value>) -> Result<(), BridgeFailure> {
++    for (key, value) in settings {
++        if key == MANAGED_MODEL_CATALOG_KEY {
++            let path = value
++                .as_str()
++                .ok_or_else(|| BridgeFailure::new("catalog-conflict"))?;
++            validate_owned_catalog(path)?;
++            continue;
++        }
++        if is_unrelated_catalog_key(key) {
++            return Err(BridgeFailure::new("catalog-conflict"));
++        }
++    }
++    Ok(())
++}
++
++#[cfg(target_os = "windows")]
++fn validate_catalog_keys(
++    document: &DocumentMut,
++    allow_managed_catalog: bool,
++) -> Result<(), BridgeFailure> {
++    for (key, item) in document.as_table().iter() {
++        let key = key.to_string();
++        if key == MANAGED_MODEL_CATALOG_KEY {
++            if !allow_managed_catalog {
++                return Err(BridgeFailure::new("catalog-conflict"));
++            }
++            let path = item
++                .as_str()
++                .ok_or_else(|| BridgeFailure::new("catalog-conflict"))?;
++            validate_owned_catalog(path)?;
++            continue;
++        }
++        if is_unrelated_catalog_key(&key) {
++            return Err(BridgeFailure::new("catalog-conflict"));
++        }
++    }
++    Ok(())
++}
++
++fn is_unrelated_catalog_key(key: &str) -> bool {
++    let normalized = key.to_ascii_lowercase();
++    normalized == "catalog"
++        || normalized == "models"
++        || normalized == "modelcatalog"
++        || normalized == "model_catalog"
++        || normalized == "modelaliases"
++        || normalized == "model_aliases"
++        || (normalized.contains("catalog") && normalized != MANAGED_MODEL_CATALOG_KEY)
++}
++
++#[cfg(target_os = "windows")]
++fn validate_common_config_for_model(
++    state: &AppState,
++    provider: &Provider,
++    requested_model: &str,
++) -> Result<(), BridgeFailure> {
++    let Some(snippet) = state
++        .db
++        .get_config_snippet(AppType::Codex.as_str())
++        .map_err(|_| BridgeFailure::new("common-config-failed"))?
++    else {
++        return Ok(());
++    };
++    if snippet.trim().is_empty() {
++        return Ok(());
++    }
++    let document = snippet
++        .parse::<DocumentMut>()
++        .map_err(|_| BridgeFailure::new("common-config-failed"))?;
++    validate_catalog_keys(&document, true)?;
++    if provider
++        .meta
++        .as_ref()
++        .and_then(|meta| meta.common_config_enabled)
++        == Some(true)
++        && document.get("model").is_some()
++    {
++        return Err(BridgeFailure::new("common-config-conflict"));
++    }
++    if let Some(model) = explicit_model(&document)? {
++        if model.as_str() != requested_model {
++            return Err(BridgeFailure::new("common-config-conflict"));
++        }
++    }
++    if let Some(model_provider) = document
++        .get("model_provider")
++        .and_then(|item| item.as_str())
++        .map(str::trim)
++        .filter(|id| !id.is_empty())
++    {
++        let base_url = document
++            .get("model_providers")
++            .and_then(|item| item.as_table_like())
++            .and_then(|table| table.get(model_provider))
++            .and_then(|item| item.as_table_like())
++            .and_then(|table| table.get("base_url"))
++            .and_then(|item| item.as_str())
++            .map(str::trim)
++            .map(|url| url.trim_end_matches('/'));
++        if base_url != Some(crate::services::provider::USB_404TOKEN_BASE_URL) {
++            return Err(BridgeFailure::new("endpoint-mismatch"));
++        }
++    }
++    Ok(())
++}
++
++#[cfg(target_os = "windows")]
++fn reject_proxy_takeover(state: &AppState) -> Result<(), BridgeFailure> {
++    let has_backup = futures::executor::block_on(state.db.get_live_backup(AppType::Codex.as_str()))
++        .map_err(|_| BridgeFailure::new("proxy-state-failed"))?
++        .is_some();
++    let live_taken_over = state
++        .proxy_service
++        .detect_takeover_in_live_config_for_app(&AppType::Codex);
++    if has_backup || live_taken_over {
++        return Err(BridgeFailure::new("proxy-takeover-unsupported"));
++    }
++    Ok(())
++}
++
++fn canonicalize_json(value: &Value) -> Value {
++    match value {
++        Value::Object(object) => {
++            let mut keys: Vec<&String> = object.keys().collect();
++            keys.sort_unstable();
++            let mut sorted = Map::new();
++            for key in keys {
++                if let Some(value) = object.get(key) {
++                    sorted.insert(key.clone(), canonicalize_json(value));
++                }
++            }
++            Value::Object(sorted)
++        }
++        Value::Array(values) => Value::Array(values.iter().map(canonicalize_json).collect()),
++        other => other.clone(),
++    }
++}
++
++fn sha256_hex(bytes: &[u8]) -> String {
++    let mut digest = Sha256::new();
++    digest.update(bytes);
++    digest
++        .finalize()
++        .iter()
++        .map(|byte| format!("{byte:02x}"))
++        .collect()
++}
++
++fn response_for_failure(request_id: &str, failure: BridgeFailure) -> UsbModelSelectionResponse {
++    UsbModelSelectionResponse {
++        schema_version: 3,
++        request_id: request_id.to_string(),
++        ok: false,
++        code: failure.code,
++        revision: failure.revision,
++        selected_model: failure.selected_model,
++        config_sha256: failure.config_sha256,
++        applied: failure.applied,
++    }
++}
++
++fn write_response(response: &UsbModelSelectionResponse) -> bool {
++    let serialized = serde_json::to_vec(response).unwrap_or_else(|_| {
++        br#"{"schemaVersion":3,"requestId":"","ok":false,"code":"response-serialization-failed","revision":null,"selectedModel":null,"configSha256":null,"applied":false}"#.to_vec()
++    });
++    let body = if serialized.len() <= MAX_RESPONSE_BYTES {
++        serialized
++    } else {
++        br#"{"schemaVersion":3,"requestId":"","ok":false,"code":"response-too-large","revision":null,"selectedModel":null,"configSha256":null,"applied":false}"#.to_vec()
++    };
++    let mut stdout = io::stdout().lock();
++    stdout.write_all(&body).and_then(|_| stdout.flush()).is_ok()
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[cfg(target_os = "windows")]
++    #[test]
++    fn preference_merge_preserves_disjoint_keys_and_rejects_conflicts() {
++        let mut live = "theme = \"light\"\n[mcp_servers.keep]\ncommand = \"keep\"\n"
++            .parse::<DocumentMut>()
++            .unwrap();
++        let provider = "model_provider = \"404token\"\n[model_providers.404token]\nbase_url = \"https://404token.xyz/v1\"\nwire_api = \"responses\"\n".parse::<DocumentMut>().unwrap();
++        merge_preserving_preferences(live.as_table_mut(), provider.as_table()).unwrap();
++        assert_eq!(live["theme"].as_str(), Some("light"));
++        assert_eq!(
++            live["mcp_servers"]["keep"]["command"].as_str(),
++            Some("keep")
++        );
++        assert_eq!(live["model_provider"].as_str(), Some("404token"));
++        let conflict = "theme = \"dark\"\n".parse::<DocumentMut>().unwrap();
++        assert!(merge_preserving_preferences(live.as_table_mut(), conflict.as_table()).is_err());
++        assert_eq!(live["theme"].as_str(), Some("light"));
++    }
++
++    #[cfg(target_os = "windows")]
++    #[test]
++    fn activation_rejects_custom_auth_or_non_responses_routes() {
++        for extra in [
++            "wire_api = \"chat\"",
++            "wire_api = \"responses\"\nenv_key = \"OTHER_KEY\"",
++            "wire_api = \"responses\"\nhttp_headers = { X = \"fixture\" }",
++        ] {
++            let config = format!("model_provider = \"404token\"\n[model_providers.404token]\nbase_url = \"https://404token.xyz/v1\"\n{extra}\n");
++            assert!(inspect_usb_config(&config, true).is_err());
++        }
++        assert!(inspect_live_usb_config("theme = \"light\"\n").is_ok());
++        assert!(inspect_usb_config("theme = \"light\"\n", true).is_err());
++        assert!(inspect_live_usb_config("model_catalog_json = \"foreign.json\"\n").is_err());
++    }
++
++    #[test]
++    fn apply_protocol_requires_candidate_path_and_hash_without_capability_claims() {
++        let mut value = json!({"schemaVersion":3,"requestId":"fixture","operation":"apply",
++            "expectedRevision":"fixture-revision","model":"arbitrary/vendor-model"});
++        assert!(parse_request(&serde_json::to_vec(&value).unwrap()).is_err());
++        value["catalogPath"] = json!("C:/fixture/codex-usb-native-model-catalog.json");
++        value["catalogSha256"] = json!("a".repeat(64));
++        assert!(parse_request(&serde_json::to_vec(&value).unwrap()).is_err());
++        value["bindingFingerprint"] = json!("b".repeat(64));
++        assert!(parse_request(&serde_json::to_vec(&value).unwrap()).is_ok());
++        value["ready"] = json!(true);
++        assert!(parse_request(&serde_json::to_vec(&value).unwrap()).is_err());
++    }
++
++    #[test]
++    fn request_parser_rejects_ready_flags_unknown_fields_and_old_protocol() {
++        let valid = json!({"schemaVersion":3,"requestId":"r1","operation":"snapshot","bindingFingerprint":"a".repeat(64)});
++        assert!(parse_request(&serde_json::to_vec(&valid).unwrap()).is_ok());
++        for key in ["ready", "apiKey"] {
++            let mut value = valid.clone(); value[key] = json!("fixture-only");
++            assert!(parse_request(&serde_json::to_vec(&value).unwrap()).is_err());
++        }
++        let mut old = valid.clone(); old["schemaVersion"] = json!(2);
++        assert!(parse_request(&serde_json::to_vec(&old).unwrap()).is_err());
++        for value in [json!(""), json!(true), json!("z".repeat(64))] {
++            let mut bad = valid.clone(); bad["bindingFingerprint"] = value;
++            assert!(parse_request(&serde_json::to_vec(&bad).unwrap()).is_err());
++        }
++    }
++
++    #[test]
++    fn selection_context_binds_each_nonsecret_identity_field() {
++        let provider = crate::services::provider::USB_404TOKEN_PROVIDER_ID;
++        let expected = selection_binding_fingerprint(provider, "USB-0001", "credential-fixture", 1, 2).unwrap();
++        assert_eq!(expected.len(), 64);
++        for actual in [
++            selection_binding_fingerprint(provider, "USB-0002", "credential-fixture", 1, 2).unwrap(),
++            selection_binding_fingerprint(provider, "USB-0001", "credential-new", 1, 2).unwrap(),
++            selection_binding_fingerprint(provider, "USB-0001", "credential-fixture", 2, 2).unwrap(),
++            selection_binding_fingerprint(provider, "USB-0001", "credential-fixture", 1, 3).unwrap(),
++        ] { assert_ne!(expected, actual); }
++        assert!(selection_binding_fingerprint("other-provider", "USB-0001", "credential-fixture", 1, 2).is_err());
++        assert!(selection_binding_fingerprint(provider, "USB-0001", "credential-fixture", 0, 2).is_err());
++        assert!(selection_binding_fingerprint(provider, "USB-0001", "credential-fixture", 1, 0).is_err());
++        assert!(selection_binding_fingerprint(provider, "", "credential-fixture", 1, 2).is_err());
++    }
++
++    #[test]
++    fn revision_json_is_deterministic_for_object_order() {
++        let first = json!({"b": 2, "a": {"d": 4, "c": 3}});
++        let second = json!({"a": {"c": 3, "d": 4}, "b": 2});
++        let first_bytes = serde_json::to_vec(&canonicalize_json(&first)).unwrap();
++        let second_bytes = serde_json::to_vec(&canonicalize_json(&second)).unwrap();
++        assert_eq!(sha256_hex(&first_bytes), sha256_hex(&second_bytes));
++    }
++
++    #[cfg(target_os = "windows")]
++    #[test]
++    fn model_update_preserves_settings_without_unowned_catalog() {
++        let provider = Provider::with_id(
++            crate::services::provider::USB_404TOKEN_PROVIDER_ID.into(),
++            "USB".into(),
++            json!({
++                "auth": {"OPENAI_API_KEY": "fixture"},
++                "config": "model_provider = \"404token\"\n\n[mcp_servers.keep]\ncommand = \"keep\"\n\n[model_providers.404token]\nbase_url = \"https://404token.xyz/v1\"\n"
++            }),
++            None,
++        );
++        let updated = provider_with_selected_model(&provider, None, "new").unwrap();
++        let config = updated.settings_config["config"].as_str().unwrap();
++        assert!(config.contains("model = \"new\""));
++        assert!(config.contains("[mcp_servers.keep]"));
++        assert!(!config.contains("model_catalog_json"));
++    }
++
++    #[cfg(target_os = "windows")]
++    #[test]
++    fn model_update_rejects_a_different_explicit_model() {
++        let provider = Provider::with_id(
++            crate::services::provider::USB_404TOKEN_PROVIDER_ID.into(),
++            "USB".into(),
++            json!({
++                "auth": {"OPENAI_API_KEY": "fixture"},
++                "config": "model_provider = \"404token\"\nmodel = \"user-model\"\n[model_providers.404token]\nbase_url = \"https://404token.xyz/v1\"\n"
++            }),
++            None,
++        );
++        assert_eq!(
++            provider_with_selected_model(&provider, None, "manager-model")
++                .unwrap_err()
++                .code,
++            "user-model-conflict"
++        );
++    }
++}
+diff --git a/src/lib/model-aliases.ts b/src/lib/model-aliases.ts
+new file mode 100644
+index 00000000..e2967130
+--- /dev/null
++++ b/src/lib/model-aliases.ts
+@@ -0,0 +1,186 @@
++import type { FetchedModel } from "./api/model-fetch";
++
++export type CollapsedModel = FetchedModel & {
++  /** Text shown in the menu; `id` remains the real upstream request value. */
++  displayName: string;
++};
++
++interface AliasCandidate {
++  id: string;
++  displayName: string;
++  ownedBy: string | null;
++  aliasRank: number;
++  dateValue: number;
++}
++
++function isLeapYear(year: number): boolean {
++  return year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
++}
++
++function isValidDate(year: number, month: number, day: number): boolean {
++  if (month < 1 || month > 12 || day < 1) return false;
++  const daysInMonth = [
++    31,
++    isLeapYear(year) ? 29 : 28,
++    31,
++    30,
++    31,
++    30,
++    31,
++    31,
++    30,
++    31,
++    30,
++    31,
++  ];
++  return day <= daysInMonth[month - 1];
++}
++
++type Suffix = { base: string; rank: number; dateValue: number };
++
++function stripReleaseSuffix(id: string): Suffix | null {
++  const lower = id.toLowerCase();
++  if (lower.endsWith("-latest")) {
++    return { base: id.slice(0, -"-latest".length), rank: 2, dateValue: 0 };
++  }
++  if (lower.endsWith("-stable")) {
++    return { base: id.slice(0, -"-stable".length), rank: 1, dateValue: 0 };
++  }
++
++  const isoMatch = id.match(/-(\d{4})-(\d{2})-(\d{2})$/);
++  if (isoMatch) {
++    const year = Number(isoMatch[1]);
++    const month = Number(isoMatch[2]);
++    const day = Number(isoMatch[3]);
++    if (isValidDate(year, month, day)) {
++      return {
++        base: id.slice(0, -isoMatch[0].length),
++        rank: 3,
++        dateValue: year * 10000 + month * 100 + day,
++      };
++    }
++  }
++
++  const compactMatch = id.match(/-(\d{8})$/);
++  if (compactMatch) {
++    const digits = compactMatch[1];
++    const year = Number(digits.slice(0, 4));
++    const month = Number(digits.slice(4, 6));
++    const day = Number(digits.slice(6, 8));
++    if (isValidDate(year, month, day)) {
++      return {
++        base: id.slice(0, -compactMatch[0].length),
++        rank: 3,
++        dateValue: year * 10000 + month * 100 + day,
++      };
++    }
++  }
++  return null;
++}
++
++/** Remove only the explicitly supported release-alias suffixes. */
++export function canonicalModelId(rawId: string): string {
++  let current = rawId.trim();
++  while (true) {
++    const suffix = stripReleaseSuffix(current);
++    if (!suffix || suffix.base.length === 0) return current;
++    current = suffix.base;
++  }
++}
++
++function aliasPreference(rawId: string, displayName: string): Suffix {
++  if (rawId === displayName) {
++    return { base: displayName, rank: 0, dateValue: 0 };
++  }
++  let current = rawId;
++  let best: Suffix | null = null;
++  while (current !== displayName) {
++    const suffix = stripReleaseSuffix(current);
++    if (!suffix) break;
++    if (
++      !best ||
++      suffix.rank < best.rank ||
++      (suffix.rank === best.rank && suffix.dateValue > best.dateValue)
++    ) {
++      best = suffix;
++    }
++    current = suffix.base;
++  }
++  return best ?? { base: displayName, rank: 4, dateValue: 0 };
++}
++
++function compareText(left: string, right: string): number {
++  const a = left.toLowerCase();
++  const b = right.toLowerCase();
++  if (a < b) return -1;
++  if (a > b) return 1;
++  if (left < right) return -1;
++  if (left > right) return 1;
++  return 0;
++}
++
++function compareCandidates(
++  left: AliasCandidate,
++  right: AliasCandidate,
++): number {
++  if (left.aliasRank !== right.aliasRank) {
++    return left.aliasRank - right.aliasRank;
++  }
++  if (left.dateValue !== right.dateValue) {
++    return right.dateValue - left.dateValue;
++  }
++  return compareText(left.id, right.id);
++}
++
++/**
++ * Collapse only release aliases within the same vendor namespace. No vendor
++ * allow-list is used, so newly published GPT, DeepSeek, GLM, Qwen and other
++ * families remain visible; semantically distinct suffixes remain separate.
++ */
++export function collapseReleaseAliases(
++  models: FetchedModel[],
++): CollapsedModel[] {
++  const groups = new Map<string, AliasCandidate[]>();
++
++  for (const model of models) {
++    const id = model.id.trim();
++    if (!id) continue;
++    const ownedBy = model.ownedBy?.trim() || null;
++    const displayName = canonicalModelId(id);
++    const ownerKey = (ownedBy || "Other").toLowerCase();
++    const groupKey = `${ownerKey}\u001f${displayName.toLowerCase()}`;
++    const suffix = aliasPreference(id, displayName);
++    const candidate: AliasCandidate = {
++      id,
++      displayName,
++      ownedBy,
++      aliasRank: suffix.rank,
++      dateValue: suffix.dateValue,
++    };
++    const group = groups.get(groupKey);
++    if (group) group.push(candidate);
++    else groups.set(groupKey, [candidate]);
++  }
++
++  return Array.from(groups.values())
++    .map((candidates) => {
++      candidates.sort(compareCandidates);
++      const selected = candidates[0];
++      return {
++        id: selected.id,
++        displayName: selected.displayName,
++        ownedBy: selected.ownedBy,
++      };
++    })
++    .sort((left, right) => {
++      const owner = compareText(
++        left.ownedBy || "Other",
++        right.ownedBy || "Other",
++      );
++      return (
++        owner ||
++        compareText(left.displayName, right.displayName) ||
++        compareText(left.id, right.id)
++      );
++    });
++}
+diff --git a/tests/components/ModelInputWithFetch.test.tsx b/tests/components/ModelInputWithFetch.test.tsx
+new file mode 100644
+index 00000000..bbd6599b
+--- /dev/null
++++ b/tests/components/ModelInputWithFetch.test.tsx
+@@ -0,0 +1,35 @@
++import { render, screen, waitFor } from "@testing-library/react";
++import userEvent from "@testing-library/user-event";
++import { describe, expect, it, vi } from "vitest";
++import { ModelInputWithFetch } from "@/components/providers/forms/shared/ModelInputWithFetch";
++
++describe("ModelInputWithFetch", () => {
++  it("shows the collapsed display name but writes the selected upstream ID", async () => {
++    const onChange = vi.fn();
++    const user = userEvent.setup();
++
++    render(
++      <ModelInputWithFetch
++        id="model"
++        value=""
++        onChange={onChange}
++        fetchedModels={[
++          {
++            id: "gpt-6-2026-09-20",
++            displayName: "gpt-6",
++            ownedBy: "openai",
++          },
++        ]}
++        isLoading={false}
++      />,
++    );
++
++    await user.click(screen.getByRole("button"));
++    const option = await screen.findByRole("menuitem", { name: "gpt-6" });
++    await user.click(option);
++
++    await waitFor(() =>
++      expect(onChange).toHaveBeenCalledWith("gpt-6-2026-09-20"),
++    );
++  });
++});
+diff --git a/tests/utils/codexTemplates.compatibility.test.ts b/tests/utils/codexTemplates.compatibility.test.ts
+new file mode 100644
+index 00000000..8b67254a
+--- /dev/null
++++ b/tests/utils/codexTemplates.compatibility.test.ts
+@@ -0,0 +1,47 @@
++import { describe, expect, it } from "vitest";
++import { getCodexCustomTemplate } from "../../src/config/codexTemplates";
++import { codexProviderPresets, generateThirdPartyConfig } from "../../src/config/codexProviderPresets";
++import { universalProviderPresets, createUniversalProviderFromPreset } from "../../src/config/universalProviderPresets";
++
++describe("custom Codex discovery template", () => {
++  it("does not fabricate a default model or reasoning effort", () => {
++    const { config, auth } = getCodexCustomTemplate();
++    expect(config).not.toMatch(/^model\s*=/m);
++    expect(config).not.toMatch(/^model_reasoning_effort\s*=/m);
++    expect(config).toContain('wire_api = "responses"');
++    expect(auth.OPENAI_API_KEY).toBe("");
++  });
++});
++
++
++describe("Codex provider presets do not select unverified defaults", () => {
++  it("keeps model, reasoning and context decisions out of every preset", () => {
++    for (const preset of codexProviderPresets) {
++      expect(preset.config).not.toMatch(/^model\s*=/m);
++      expect(preset.config).not.toMatch(/^model_reasoning_effort\s*=/m);
++      expect(preset.config).not.toMatch(/^model_context_window\s*=/m);
++      expect(preset.config).not.toMatch(/^model_auto_compact_token_limit\s*=/m);
++    }
++  });
++  it("omits absent/blank choices and renders only an explicit caller choice", () => {
++    expect(generateThirdPartyConfig("fixture", "https://fixture.invalid/v1")).not.toMatch(/^model\s*=/m);
++    expect(generateThirdPartyConfig("fixture", "https://fixture.invalid/v1", "  ")).not.toMatch(/^model\s*=/m);
++    const explicit = generateThirdPartyConfig("fixture", "https://fixture.invalid/v1", "vendor/model-selected");
++    expect(explicit).toContain('model = "vendor/model-selected"');
++    expect(explicit).not.toMatch(/^model_reasoning_effort\s*=/m);
++  });
++});
++
++
++describe("universal-provider Codex defaults", () => {
++  it("does not preselect a Codex model or enable its synchronization", () => {
++    for (const preset of universalProviderPresets) {
++      const provider = createUniversalProviderFromPreset(preset, "fixture", "https://fixture.invalid", "fixture-key");
++      expect(provider.apps.codex).toBe(false);
++      expect(provider.models.codex?.model).toBeUndefined();
++      expect(provider.models.codex?.reasoningEffort).toBeUndefined();
++      expect(provider.apps.claude).toBe(preset.defaultApps.claude);
++      expect(provider.apps.gemini).toBe(preset.defaultApps.gemini);
++    }
++  });
++});
+diff --git a/tests/utils/modelAliases.test.ts b/tests/utils/modelAliases.test.ts
+new file mode 100644
+index 00000000..91985335
+--- /dev/null
++++ b/tests/utils/modelAliases.test.ts
+@@ -0,0 +1,97 @@
++import { describe, expect, it } from "vitest";
++import {
++  canonicalModelId,
++  collapseReleaseAliases,
++} from "@/lib/model-aliases";
++import type { FetchedModel } from "@/lib/api/model-fetch";
++
++function model(id: string, ownedBy?: string): FetchedModel {
++  return { id, ownedBy: ownedBy ?? null };
++}
++
++describe("model release alias collapsing", () => {
++  it("canonicalizes only supported release suffixes", () => {
++    expect(canonicalModelId("gpt-6-latest")).toBe("gpt-6");
++    expect(canonicalModelId("deepseek-v4-2026-09-20")).toBe("deepseek-v4");
++    expect(canonicalModelId("glm-5-20260920")).toBe("glm-5");
++    expect(canonicalModelId("vendor-model-2028-02-29")).toBe(
++      "vendor-model",
++    );
++    expect(canonicalModelId("vendor-model-2025-02-29")).toBe(
++      "vendor-model-2025-02-29",
++    );
++    expect(canonicalModelId("qwen-embedding")).toBe("qwen-embedding");
++  });
++
++  it("keeps all vendors while choosing one representative per release family", () => {
++    const result = collapseReleaseAliases([
++      model("gpt-6-2026-09-20", "openai"),
++      model("gpt-6-latest", "openai"),
++      model("gpt-6", "openai"),
++      model("deepseek-v4-20260920", "deepseek"),
++      model("deepseek-v4-stable", "deepseek"),
++      model("glm-5-20260920", "zhipu"),
++    ]);
++
++    expect(result).toEqual([
++      { id: "deepseek-v4-stable", displayName: "deepseek-v4", ownedBy: "deepseek" },
++      { id: "gpt-6", displayName: "gpt-6", ownedBy: "openai" },
++      { id: "glm-5-20260920", displayName: "glm-5", ownedBy: "zhipu" },
++    ]);
++  });
++
++  it("prefers stable over latest and latest over dated aliases when the base is absent", () => {
++    const result = collapseReleaseAliases([
++      model("model-2026-09-19", "vendor"),
++      model("model-latest", "vendor"),
++      model("model-stable", "vendor"),
++    ]);
++
++    expect(result).toEqual([
++      { id: "model-stable", displayName: "model", ownedBy: "vendor" },
++    ]);
++  });
++
++  it("chooses the newest valid date if no base or semantic alias exists", () => {
++    const result = collapseReleaseAliases([
++      model("model-2026-01-01", "vendor"),
++      model("model-2026-09-20", "vendor"),
++      model("model-20260919", "vendor"),
++    ]);
++
++    expect(result).toEqual([
++      { id: "model-2026-09-20", displayName: "model", ownedBy: "vendor" },
++    ]);
++  });
++
++  it("does not merge semantically different names or different vendor namespaces", () => {
++    const result = collapseReleaseAliases([
++      model("model-mini", "vendor"),
++      model("model-pro", "vendor"),
++      model("model", "other-vendor"),
++      model("model-latest", "vendor"),
++    ]);
++
++    expect(result).toEqual([
++      { id: "model", displayName: "model", ownedBy: "other-vendor" },
++      { id: "model-latest", displayName: "model", ownedBy: "vendor" },
++      { id: "model-mini", displayName: "model-mini", ownedBy: "vendor" },
++      { id: "model-pro", displayName: "model-pro", ownedBy: "vendor" },
++    ]);
++  });
++
++  it("is deterministic and ignores blank IDs", () => {
++    const first = collapseReleaseAliases([
++      model(" "),
++      model("foo-latest", "vendor"),
++      model("foo", "vendor"),
++    ]);
++    const second = collapseReleaseAliases([
++      model("foo", "vendor"),
++      model("foo-latest", "vendor"),
++      model("\t"),
++    ]);
++
++    expect(first).toEqual(second);
++  });
++});

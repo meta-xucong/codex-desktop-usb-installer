@@ -38,6 +38,7 @@ const MAX_STREAM_BYTES: usize = 256 * 1024;
 const MAX_CATALOG_BYTES: usize = crate::app::model_probe::BODY_LIMIT;
 const MAX_VERSION_BYTES: usize = 16 * 1024;
 const MAX_EXECUTABLE_BYTES: u64 = 1024 * 1024 * 1024;
+const TEMP_AREA_OWNER_MARKER: &str = ".codex-native-probe-owner";
 
 pub(crate) struct NativeProbeInput {
     pub executable: std::path::PathBuf,
@@ -254,10 +255,18 @@ pub(crate) fn native_default_catalog(
         );
         return Err(error);
     }
-    area.cleanup().map_err(|error| {
-        log_native_add_failure(request_id, "native-default-cleanup", error, started);
-        error
-    })?;
+    match area.cleanup_after_catalog_capture() {
+        Ok(true) => log::warn!(
+            "native model catalog captured request_id={} stage=native-default-cleanup code=native-cleanup-pending elapsed_ms={}",
+            safe_identifier(request_id).then_some(request_id).unwrap_or("invalid"),
+            started.elapsed().as_millis()
+        ),
+        Ok(false) => {}
+        Err(error) => {
+            log_native_add_failure(request_id, "native-default-cleanup-validation", error, started);
+            return Err(error);
+        }
+    }
     Ok(catalog)
 }
 
@@ -516,10 +525,11 @@ fn catalog_output_matches(bytes: &[u8], expected: &Value) -> bool {
 }
 
 /// `codex debug models` prints only its normalized `models` array, not the
-/// input catalog wrapper. It also materializes known runtime defaults and
+/// input catalog wrapper. It also materializes runtime defaults and
 /// `model_messages` from `base_instructions`. Match every submitted field,
-/// allowing the two verified null fields to be omitted, documented runtime
-/// defaults, and false-only legacy flags that this runtime ignores.
+/// allowing documented normalizations and only the known runtime-derived
+/// output fields. The latter are not written back; the committed catalog
+/// remains the candidate that was validated.
 fn catalog_model_entry_matches(actual: &Value, expected: &Value) -> bool {
     let (Some(actual), Some(expected)) = (actual.as_object(), expected.as_object()) else {
         return false;
@@ -546,6 +556,7 @@ fn catalog_model_entry_matches(actual: &Value, expected: &Value) -> bool {
             continue;
         }
         let known_normalization = match key.as_str() {
+            "model_messages" => model_messages_match(actual_value, expected_value),
             "default_reasoning_summary" => {
                 expected_value.is_null() && actual_value.as_str() == Some("auto")
             }
@@ -561,40 +572,57 @@ fn catalog_model_entry_matches(actual: &Value, expected: &Value) -> bool {
             return false;
         }
     }
-    for (key, actual_value) in actual {
-        if expected.contains_key(key) {
-            continue;
-        }
-        let runtime_default = match key.as_str() {
-            "model_messages" => {
-                let instructions = expected
-                    .get("base_instructions")
-                    .cloned()
-                    .unwrap_or(Value::Null);
-                actual_value
-                    == &json!({
-                        "instructions_template": instructions,
-                        "instructions_variables": null,
-                        "approvals": null,
-                        "collaboration_modes": null,
-                        "auto_review": null,
-                        "permissions": null,
-                        "multi_agent": null
-                    })
+    // Permit only the output-only fields observed from the bundled Codex CLI.
+    // Unknown model fields must fail closed just like unknown root fields.
+    actual.iter().all(|(key, value)| {
+        expected.contains_key(key) || known_runtime_output_field(key, value, expected)
+    })
+}
+
+fn known_runtime_output_field(
+    key: &str,
+    value: &Value,
+    expected: &serde_json::Map<String, Value>,
+) -> bool {
+    match key {
+        "model_messages" => {
+            let Some(base_instructions) = expected.get("base_instructions") else {
+                return false;
+            };
+            let mut generated = serde_json::Map::new();
+            generated.insert("instructions_template".into(), base_instructions.clone());
+            for field in [
+                "approvals",
+                "collaboration_modes",
+                "auto_review",
+                "permissions",
+                "multi_agent",
+            ] {
+                generated.insert(field.into(), Value::Null);
             }
-            "default_reasoning_summary" => actual_value.as_str() == Some("auto"),
-            "web_search_tool_type" => actual_value.as_str() == Some("text"),
-            "effective_context_window_percent" => actual_value.as_u64() == Some(95),
-            "supports_experimental_context"
-            | "use_responses_lite"
-            | "supports_reasoning_effort_updates" => actual_value.as_bool() == Some(false),
-            _ => false,
-        };
-        if !runtime_default {
-            return false;
+            model_messages_match(value, &Value::Object(generated))
         }
+        "default_reasoning_summary" => value.as_str() == Some("auto"),
+        "supports_reasoning_effort_updates"
+        | "supports_experimental_context"
+        | "use_responses_lite" => value.as_bool() == Some(false),
+        "web_search_tool_type" => value.as_str() == Some("text"),
+        "effective_context_window_percent" => value.as_u64() == Some(95),
+        _ => false,
     }
-    true
+}
+
+fn model_messages_match(actual: &Value, expected: &Value) -> bool {
+    let (Some(actual), Some(expected)) = (actual.as_object(), expected.as_object()) else {
+        return false;
+    };
+    expected
+        .iter()
+        .all(|(key, expected_value)| match actual.get(key) {
+            Some(actual_value) => actual_value == expected_value,
+            None => key == "instructions_variables" && expected_value.is_null(),
+        })
+        && actual.keys().all(|key| expected.contains_key(key))
 }
 
 fn within_catalog_limit(length: usize) -> bool {
@@ -878,6 +906,19 @@ impl TemporaryArea {
             let _ = std::fs::remove_dir_all(&root);
             return Err(NativeProbeError::TemporaryStorage);
         }
+        let owner_name = canonical_root
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or(NativeProbeError::TemporaryStorage)?;
+        if std::fs::write(
+            canonical_root.join(TEMP_AREA_OWNER_MARKER),
+            owner_name.as_bytes(),
+        )
+        .is_err()
+        {
+            let _ = std::fs::remove_dir_all(&canonical_root);
+            return Err(NativeProbeError::TemporaryStorage);
+        }
         Ok(Self {
             root: canonical_root,
             home,
@@ -903,23 +944,89 @@ impl TemporaryArea {
         if self.cleaned {
             return Ok(());
         }
-        let root =
-            std::fs::canonicalize(&self.root).map_err(|_| NativeProbeError::CleanupFailed)?;
-        let parent = root.parent().ok_or(NativeProbeError::CleanupFailed)?;
-        if !root
-            .file_name()
-            .and_then(|value| value.to_str())
-            .is_some_and(|value| value.starts_with("codex-native-probe-"))
-            || std::fs::canonicalize(std::env::temp_dir())
-                .ok()
-                .is_none_or(|base| parent != base)
-        {
-            return Err(NativeProbeError::CleanupFailed);
-        }
+        let root = self.validated_cleanup_root()?;
         std::fs::remove_dir_all(&root).map_err(|_| NativeProbeError::CleanupFailed)?;
         self.cleaned = true;
         Ok(())
     }
+
+    fn validated_cleanup_root(&self) -> Result<PathBuf, NativeProbeError> {
+        let root = std::fs::canonicalize(&self.root).map_err(|_| NativeProbeError::CleanupFailed)?;
+        let base = std::fs::canonicalize(std::env::temp_dir())
+            .map_err(|_| NativeProbeError::CleanupFailed)?;
+        validate_cleanup_root_paths(&root, &self.root, &base)?;
+        validate_cleanup_owner_marker(&root)?;
+        Ok(root)
+    }
+
+    fn cleanup_after_catalog_capture(&mut self) -> Result<bool, NativeProbeError> {
+        self.cleanup_after_catalog_capture_with(|path| std::fs::remove_dir_all(path))
+    }
+
+    fn cleanup_after_catalog_capture_with<R>(
+        &mut self,
+        remove_dir: R,
+    ) -> Result<bool, NativeProbeError>
+    where
+        R: FnOnce(&Path) -> std::io::Result<()>,
+    {
+        if self.cleaned {
+            return Ok(false);
+        }
+        let cleanup_pending = cleanup_captured_temp_area(
+            || self.validated_cleanup_root(),
+            remove_dir,
+        )?;
+        if !cleanup_pending {
+            self.cleaned = true;
+        }
+        Ok(cleanup_pending)
+    }
+}
+
+fn validate_cleanup_root_paths(
+    canonical_root: &Path,
+    expected_root: &Path,
+    canonical_temp_root: &Path,
+) -> Result<(), NativeProbeError> {
+    let parent = canonical_root
+        .parent()
+        .ok_or(NativeProbeError::CleanupFailed)?;
+    if canonical_root != expected_root
+        || !canonical_root
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.starts_with("codex-native-probe-"))
+        || parent != canonical_temp_root
+    {
+        return Err(NativeProbeError::CleanupFailed);
+    }
+    Ok(())
+}
+
+fn validate_cleanup_owner_marker(root: &Path) -> Result<(), NativeProbeError> {
+    let expected = root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or(NativeProbeError::CleanupFailed)?;
+    let marker = std::fs::read_to_string(root.join(TEMP_AREA_OWNER_MARKER))
+        .map_err(|_| NativeProbeError::CleanupFailed)?;
+    if marker != expected {
+        return Err(NativeProbeError::CleanupFailed);
+    }
+    Ok(())
+}
+
+fn cleanup_captured_temp_area<V, R>(
+    validate_root: V,
+    remove_dir: R,
+) -> Result<bool, NativeProbeError>
+where
+    V: FnOnce() -> Result<PathBuf, NativeProbeError>,
+    R: FnOnce(&Path) -> std::io::Result<()>,
+{
+    let root = validate_root()?;
+    Ok(remove_dir(&root).is_err())
 }
 
 #[cfg(windows)]
@@ -3138,6 +3245,111 @@ fn probe_windows(input: NativeProbeInput) -> Result<NativeProbeResult, NativePro
 mod tests {
     use super::*;
 
+    #[test]
+    fn cleanup_rejects_a_canonical_path_replaced_by_another_temp_directory() {
+        let temp = PathBuf::from("isolated-temp-root");
+        let expected = temp.join("codex-native-probe-original");
+        let replacement = temp.join("codex-native-probe-replacement");
+        assert_eq!(
+            validate_cleanup_root_paths(&expected, &expected, &temp),
+            Ok(())
+        );
+        assert_eq!(
+            validate_cleanup_root_paths(&replacement, &expected, &temp),
+            Err(NativeProbeError::CleanupFailed)
+        );
+    }
+
+    #[test]
+    fn cleanup_rejects_same_path_recreated_without_owner_marker() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-native-probe-replaced-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let owner_name = root.file_name().unwrap().to_str().unwrap();
+        std::fs::write(root.join(TEMP_AREA_OWNER_MARKER), owner_name).unwrap();
+        assert!(validate_cleanup_owner_marker(&root).is_ok());
+
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        assert_eq!(
+            validate_cleanup_owner_marker(&root),
+            Err(NativeProbeError::CleanupFailed)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn captured_catalog_cleanup_keeps_unsafe_path_validation_fatal() {
+        let removed = std::sync::atomic::AtomicBool::new(false);
+        let result = cleanup_captured_temp_area(
+            || Err(NativeProbeError::CleanupFailed),
+            |_| {
+                removed.store(true, Ordering::Release);
+                Ok(())
+            },
+        );
+        assert_eq!(result, Err(NativeProbeError::CleanupFailed));
+        assert!(!removed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn captured_catalog_cleanup_treats_only_delete_failure_as_pending() {
+        let root = PathBuf::from("verified-temp-root");
+        let pending = cleanup_captured_temp_area(
+            || Ok(root.clone()),
+            |path| {
+                assert_eq!(path, root);
+                Err(std::io::Error::other("injected remove failure"))
+            },
+        )
+        .unwrap();
+        assert!(pending);
+
+        let removed = cleanup_captured_temp_area(
+            || Ok(root.clone()),
+            |path| {
+                assert_eq!(path, root);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(!removed);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn temporary_area_drop_retries_catalog_cleanup_after_remove_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-native-probe-drop-retry-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let owner_name = root.file_name().unwrap().to_str().unwrap();
+        std::fs::write(root.join(TEMP_AREA_OWNER_MARKER), owner_name).unwrap();
+        let mut area = TemporaryArea {
+            home: root.join("home"),
+            workspace: root.join("workspace"),
+            appdata: root.join("appdata"),
+            localappdata: root.join("localappdata"),
+            root: root.clone(),
+            cleaned: false,
+        };
+        assert!(area
+            .cleanup_after_catalog_capture_with(|_| {
+                Err(std::io::Error::other("injected remove failure"))
+            })
+            .unwrap());
+        assert!(root.exists());
+
+        drop(area);
+        assert!(!root.exists());
+    }
+
     #[cfg(windows)]
     #[test]
     fn process_failure_diagnostic_uses_transport_when_source_is_ambiguous() {
@@ -3383,14 +3595,18 @@ mod tests {
 
     #[test]
     fn native_catalog_admission_matches_the_codex_debug_models_output() {
-        let entry = json!({"slug":"arbitrary/model","shell_type":"unified_exec"});
+        let entry = json!({
+            "slug":"arbitrary/model",
+            "shell_type":"unified_exec",
+            "base_instructions":"Use the model for code tasks."
+        });
         let expected = neutral_catalog_root(&entry, "fixture-runtime");
         let normalized = json!({
             "slug":"arbitrary/model",
             "shell_type":"unified_exec",
+            "base_instructions":"Use the model for code tasks.",
             "model_messages": {
-                "instructions_template":null,
-                "instructions_variables":null,
+                "instructions_template":"Use the model for code tasks.",
                 "approvals":null,
                 "collaboration_modes":null,
                 "auto_review":null,
@@ -3413,6 +3629,18 @@ mod tests {
             &serde_json::to_vec(&runtime_output).unwrap(),
             &expected
         ));
+        let mut newer_runtime_output = runtime_output.clone();
+        newer_runtime_output["models"][0]["future_runtime_default"] = json!({"enabled":true});
+        assert!(!catalog_output_matches(
+            &serde_json::to_vec(&newer_runtime_output).unwrap(),
+            &expected
+        ));
+        let mut unexpected_nested_output = runtime_output.clone();
+        unexpected_nested_output["models"][0]["model_messages"]["unexpected"] = json!(true);
+        assert!(!catalog_output_matches(
+            &serde_json::to_vec(&unexpected_nested_output).unwrap(),
+            &expected
+        ));
         let mut changed = runtime_output.clone();
         changed["models"][0]["shell_type"] = json!("other");
         assert!(!catalog_output_matches(
@@ -3423,6 +3651,12 @@ mod tests {
         added["models"][0]["use_responses_lite"] = json!(true);
         assert!(!catalog_output_matches(
             &serde_json::to_vec(&added).unwrap(),
+            &expected
+        ));
+        let mut changed_submitted_field = runtime_output.clone();
+        changed_submitted_field["models"][0]["shell_type"] = json!("future-value");
+        assert!(!catalog_output_matches(
+            &serde_json::to_vec(&changed_submitted_field).unwrap(),
             &expected
         ));
         let mut duplicate = runtime_output.clone();
@@ -3507,7 +3741,6 @@ mod tests {
             .remove("default_reasoning_level");
         normalized["model_messages"] = json!({
             "instructions_template":"Use this model for the current conversation.",
-            "instructions_variables":null,
             "approvals":null,
             "collaboration_modes":null,
             "auto_review":null,
@@ -3524,6 +3757,32 @@ mod tests {
         let output_bytes = serde_json::to_vec(&output).unwrap();
 
         assert!(catalog_output_matches(&output_bytes, &expected));
+
+        let expected_messages = json!({
+            "instructions_template":"Use this model for the current conversation.",
+            "instructions_variables":null,
+            "approvals":null,
+            "collaboration_modes":null,
+            "auto_review":null,
+            "permissions":null,
+            "multi_agent":null
+        });
+        assert!(model_messages_match(
+            &output["models"][0]["model_messages"],
+            &expected_messages
+        ));
+        let mut non_null_variables = expected_messages.clone();
+        non_null_variables["instructions_variables"] = json!({"name":"required"});
+        assert!(!model_messages_match(
+            &output["models"][0]["model_messages"],
+            &non_null_variables
+        ));
+        let mut changed_instructions = output["models"][0]["model_messages"].clone();
+        changed_instructions["instructions_template"] = json!("changed instructions");
+        assert!(!model_messages_match(
+            &changed_instructions,
+            &expected_messages
+        ));
 
         let mut missing_required = output.clone();
         missing_required["models"][0]

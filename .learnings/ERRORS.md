@@ -139,7 +139,7 @@ not claimed by source-level tests.
 
 **Logged**: 2026-09-15
 **Priority**: critical
-**Status**: in_progress
+**Status**: pending target interactive desktop sign/readback/verify acceptance; static pair check alone is insufficient
 **Area**: usb-signing / release-configuration
 
 ### Summary
@@ -1204,3 +1204,306 @@ Tauri `resource_dir()`。便携入口在部分机器上得到的是本机安装/
 便携功能不能只依赖 Tauri `resource_dir()`，每个发行资源都必须有同级 EXE 候选和编译内置/明确缺失策略。
 发布门禁必须检查最终输出目录，而不是只检查仓库或中间构建目录。`SKILL_REPO_LEDGER_INVALID`
 只用于热更新账本语义错误；发行资源错误必须使用独立稳定错误码。
+
+---
+
+## [ERR-20261023-RUST-TOOLCHAIN-PATH] direct Cargo invocation could not find rustc
+
+**Logged**: 2026-10-23T04:59:08+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: local Rust verification
+
+### Summary
+
+Running the toolchain's `cargo.exe` by absolute path failed because its sibling `rustc.exe` directory was not on `PATH`.
+
+### Error
+
+`embed-resource` failed with `couldn't get rustc version: CouldNotExecuteCommand(... program not found)`.
+
+### Context
+
+The focused test and build wrapper used `C:\Users\T14S\.rustup\toolchains\1.95-x86_64-pc-windows-msvc\bin\cargo.exe` while the active shell had no Cargo/Rust tools on `PATH`. The first test call was corrected with a process-local PATH; the release wrapper also requires that PATH to be present in its child process.
+
+### Suggested Fix
+
+Add the selected toolchain `bin` directory to the process-local `PATH` and set `RUSTC` to its sibling `rustc.exe` before invoking Cargo.
+
+### Metadata
+
+- Reproducible: yes
+- Related Files: src-tauri/Cargo.toml
+
+---
+
+## [ERR-20261023-PARALLEL-SKILLHUB-TEST] transient failure in full parallel Rust suite
+
+**Logged**: 2026-10-23T05:10:01+08:00
+**Priority**: medium
+**Status**: resolved after serial full-suite verification
+**Area**: Rust tests / Skill Hub retry
+
+### Summary
+
+The release script's parallel Rust suite had one transient failure in an unrelated Skill Hub retry test.
+
+### Error
+
+`app::skill_repo_update::tests::one_logical_get_never_sends_more_than_one_retry` failed the assertion that every recorded attempt had HTTP status 503.
+
+### Context
+
+- The first full run reported 774 passed, 1 failed, 6 ignored.
+- The failing test passed when run alone with one test thread.
+- The full Rust suite then passed serially: 775 passed, 0 failed, 6 ignored.
+- The release script stopped before packaging on the first failure.
+
+### Suggested Fix
+
+Keep the serial full-suite result as the verification receipt for this build. Investigate the test's shared-state or loopback timing only if the failure recurs.
+
+### Metadata
+
+- Reproducible: no in isolated rerun
+- Related Files: src-tauri/src/app/skill_repo_update.rs
+
+---
+
+## [ERR-20261023-CODEX-MIRROR-DOWNLOAD] PowerShell interrupted large MSIX transfer
+
+**Logged**: 2026-10-23T19:48:17+08:00
+**Priority**: medium
+**Status**: resolved with a resumable mirror transfer; payload size, SHA-256 and Authenticode verified
+**Area**: release / download
+
+### Summary
+
+Invoke-WebRequest received an unexpected EOF while downloading the 26.1016.62342 Windows MSIX from the latest mirror endpoint.
+
+### Error
+
+`Received an unexpected EOF or 0 bytes from the transport stream.`
+
+### Context
+
+- The mirror advertises a 968,540,851-byte x64 MSIX and a published SHA-256.
+- The PowerShell request ended before the file was created.
+- Completed with a single resumable transfer from the matching versioned mirror asset; final size was 968,540,851 bytes, SHA-256 was `9085cf2e2eb5081f894a2cf334e1f36dbb9438ecb409d20195aa2fe1ecfcb4c8`, and Windows Authenticode status was `Valid`.
+
+### Suggested Fix
+
+Use curl's `--continue-at -` against the immutable versioned GitHub Release asset, then compare the final SHA-256 and size with the published manifest before using the payload.
+
+### Metadata
+
+- Reproducible: unknown
+- Related Files: release/usb-oneclick-v0.5.24-20261023-media-mcp-register-r1/manifest.json
+
+---
+
+## [ERR-20261023-VITEST-TEMP-ACL] Vitest temp writes blocked outside workspace
+
+**Logged**: 2026-10-23T20:01:12+08:00
+**Priority**: medium
+**Status**: focused model-add test passes (38/38); full frontend suite remains unverified
+**Area**: tests / environment
+
+### Summary
+
+Vitest could not atomically rename its worker cache under the sandboxed Windows AppData Temp directory.
+
+### Error
+
+`EPERM: operation not permitted, rename ...\AppData\Local\Packages\sandbox...\Temp\...\client\.tmp-* -> ...\client\36ad2e5af63eb63f926e8de03c80bc7f9790e8c5`
+
+### Context
+
+- TypeScript and ESLint completed successfully.
+- The frontend test command found 37 suites but every suite failed during worker setup before running tests.
+- The process TEMP directory resolves to a sandbox AppData path outside the writable workspace.
+
+### Resolution / Remaining Evidence
+
+The focused `UpstreamModelManagerSheet.test.tsx` suite passed 38/38 with workspace-local temp paths. A later full-suite attempt still produced no output for more than two minutes and was stopped, so the complete frontend suite is not certified by this release.
+
+### Suggested Fix
+
+Use a dedicated writable workspace-local directory for TEMP, TMP, and TMPDIR, run serially, and record the full suite as passed only after the command exits successfully with all suites accounted for.
+
+### Metadata
+
+- Reproducible: yes
+- Related Files: package.json
+
+---
+
+## [ERR-20261023-BUILD-OUTPUT-OUTSIDE-RELEASE] Installer build rejected output path
+
+**Logged**: 2026-10-23T20:15:00+08:00
+**Priority**: low
+**Status**: fixed by using a versioned directory under `release/`
+**Area**: release build / command invocation
+
+### Summary
+
+`build-installer.ps1` only accepts explicit release output directories inside the repository's `release/` tree.
+
+### Error
+
+The first invocation passed `setup-v0.5.25-...` as a repository-relative path, which resolved outside `release/` and was rejected before creating output.
+
+### Suggested Fix
+
+Pass `release\setup-v<version>-<release-id>` as the output path. The script then validates the destination is within the release root and refuses to overwrite an existing directory.
+
+### Metadata
+
+- Reproducible: yes
+- Related Files: tools/build-installer.ps1
+
+---
+
+## [ERR-20261023-CODEX-RANGE-PROXY] Parallel MSIX ranges stalled behind local proxy
+
+**Logged**: 2026-10-23T20:43:00+08:00
+**Priority**: medium
+**Status**: resolved using one resumable mirror transfer; exact size, SHA-256 and Authenticode verified
+**Area**: release download / network proxy
+
+### Summary
+
+Four concurrent HTTP Range requests to the Codex mirror stalled or reset while using the local HTTPS proxy; some requests reported Schannel closing without `close_notify`.
+
+### Suggested Fix
+
+Resume the single contiguous MSIX file with `curl --continue-at -` against the confirmed mirror. Accept the payload only when its published byte length, SHA-256 and Authenticode signature all match.
+
+### Metadata
+
+- Reproducible: unknown
+- Related Files: release/usb-oneclick-v0.5.24-20261023-media-mcp-register-r1/manifest.json
+
+## [ERR-20261024-CCSWITCH-VERIFY-ENV] CCSwitch validation command used unavailable host tools
+
+**Logged**: 2026-10-24T00:00:00+08:00
+**Priority**: low
+**Status**: unresolved in this session
+**Area**: local validation environment
+
+### Summary
+
+The task shell could not resolve `cargo`; a separate Windows PowerShell validation process also lacked `Get-FileHash` because it did not inherit the task shell's available runtime commands. The stale CCSwitch artifact rejection check was rerun successfully in the active PowerShell session. Rust tests and binary rebuilding remain dependent on locating a usable Rust toolchain.
+
+### Suggested Fix
+
+Run artifact verification in the current supported PowerShell runtime. Before Rust tests/builds, probe the actual `cargo.exe` path in this host rather than relying on PATH inherited from a different execution environment.
+
+### Metadata
+
+- Reproducible: yes
+- Related Files: tools/build-ccswitch-with-env-patch.ps1, src-tauri/resources/ccswitch/verify-product.ps1
+
+## [ERR-20261024-STALE-LASTEXITCODE] PowerShell script success checked with stale native exit code
+
+**Logged**: 2026-10-24T00:00:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: local validation harness
+
+### Summary
+
+A PowerShell product verifier completed successfully, but its caller then inspected the previous `$LASTEXITCODE` from an unrelated native command and incorrectly raised an error.
+
+### Suggested Fix
+
+For PowerShell scripts that signal failure by throwing, rely on terminating errors or capture an explicit process exit code only when launching a native process. Do not interpret inherited `$LASTEXITCODE` after an in-process script invocation.
+
+### Metadata
+
+- Reproducible: yes
+- Related Files: src-tauri/resources/ccswitch/verify-product.ps1
+
+## [ERR-20261024-PYTHON-PATH] Python executable absent from task PATH
+
+**Logged**: 2026-10-24T00:00:00+08:00
+**Priority**: low
+**Status**: resolved using bundled runtime
+**Area**: local tooling
+
+### Summary
+
+The task shell could not resolve `python` while inspecting the multi-agent notifier. The workspace's bundled Python runtime is available through the Codex dependency loader.
+
+### Suggested Fix
+
+Use the exact bundled Python executable returned by `load_workspace_dependencies` when system PATH does not include Python.
+
+### Metadata
+
+- Reproducible: yes
+- Related Files: multi-agent-dev-v2/scripts/notify_serverchan.py
+
+## [ERR-20261024-RUST-EXACT-FILTER] Rust test filter selected zero tests
+
+**Logged**: 2026-10-24T13:24:06+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: tests
+
+### Summary
+
+`cargo test` compiled successfully but ran zero tests because `--exact` was paired with a partial test name.
+
+### Error
+
+```text
+running 0 tests
+test result: ok. 0 passed; 0 failed; 1118 filtered out
+```
+
+### Context
+
+- A bootstrap test was invoked with its short suffix and `--exact`; Rust requires the fully qualified test path with `--exact`.
+- The zero-test result was noticed and the command was rerun without `--exact` using the `usb_404token_bootstrap_` prefix. Three tests ran and passed.
+
+### Suggested Fix
+
+When using `--exact`, pass the full module-qualified test name. For regression groups, use a distinctive prefix without `--exact`, and verify the reported `running N tests` / `N passed` count is nonzero and expected.
+
+### Resolution
+
+- **Resolved**: 2026-10-24T13:24:06+08:00
+- **Notes**: Re-ran bootstrap, MCP config, and file replacement filters; all 7 targeted tests passed.
+
+### Metadata
+
+- Reproducible: yes
+- Related Files: `CCSwitch/CCSwitch/src-tauri/src/services/provider/mod.rs`, `tools/build-ccswitch-with-env-patch.ps1`
+- See Also: `ERR-20261024-CCSWITCH-VERIFY-ENV`
+
+## [ERR-20261025-NPM-FIXTURE-JSON-ESCAPING] Offline npm lifecycle fixture JSON was invalid
+
+**Logged**: 2026-10-25
+**Priority**: low
+**Status**: resolved
+**Area**: tests
+
+### Summary
+
+The first offline npm lifecycle check failed while parsing its generated fixture `package.json`; the test had not reached Node PATH lookup.
+
+### Context
+
+- The PowerShell-embedded JSON string used incorrect escaping for the `postinstall` JavaScript command.
+- The temporary test directory was removed by a path-checked `finally` block.
+- The corrected fixture was rerun using the bundled Node 22 archive; only a successful lifecycle assertion counts as PATH evidence.
+
+### Suggested Fix
+
+For PowerShell-created JSON fixtures, construct the value as an object and serialize with `ConvertTo-Json -Compress` rather than manually escaping nested JavaScript inside a JSON string.
+
+### Metadata
+
+- Reproducible: yes
+- Related Files: `installer-pack/runtime/provision-runtime.ps1`

@@ -314,21 +314,36 @@ describe("OfflineComponentsSheet", () => {
     });
   }, 30_000);
 
-  it("does not submit media enabled when the upstream has no supported media routes", async () => {
+  it("registers media MCP when the upstream has no supported routes", async () => {
     const user = userEvent.setup();
     api.mediaModelCatalog.mockResolvedValueOnce({ models: ["gpt-4o", "claude-opus-4-8"] });
     renderSheet();
 
     await waitFor(() => expect(api.mediaModelCatalog).toHaveBeenCalledTimes(1));
-    expect(screen.getByRole("checkbox", { name: "图片与视频生成（本地 MCP）" })).not.toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "图片与视频生成（本地 MCP）" })).toBeChecked();
     await user.click(screen.getByRole("button", { name: "保存并应用连接" }));
     await waitFor(() => expect(api.installCapabilityPack).toHaveBeenCalledTimes(1));
     expect(api.installCapabilityPack.mock.calls[0]?.[0]).toMatchObject({
-      enableMediaGeneration: false,
+      enableMediaGeneration: true,
       image2Model: "",
       grokImageModel: "",
       grokVideoModel: "",
       seedanceModel: "",
+    });
+  }, 30_000);
+
+  it("keeps media MCP registration available when catalog lookup fails", async () => {
+    const user = userEvent.setup();
+    api.mediaModelCatalog.mockRejectedValueOnce(new Error("offline"));
+    renderSheet();
+
+    await waitFor(() => expect(api.mediaModelCatalog).toHaveBeenCalledTimes(1));
+    await user.click(screen.getByRole("button", { name: "保存并应用连接" }));
+    await waitFor(() => expect(api.installCapabilityPack).toHaveBeenCalledTimes(1));
+    expect(api.installCapabilityPack.mock.calls[0]?.[0]).toMatchObject({
+      enableMediaGeneration: true,
+      image2Model: "gpt-image-2.5",
+      mediaGatewayCatalogStatus: "failed",
     });
   }, 30_000);
 

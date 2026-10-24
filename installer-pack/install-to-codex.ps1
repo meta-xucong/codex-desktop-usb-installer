@@ -700,12 +700,21 @@ $codexRunning = @(Get-Process -Name 'Codex','codex' -ErrorAction SilentlyContinu
 $localMcpsEnabled = @()
 if ($feishuEnabled) { $localMcpsEnabled += 'feishu' }
 if ($mediaGenerationEnabled) { $localMcpsEnabled += 'media-generation' }
+$mediaConfigPath = Join-Path $codexHome 'config.toml'
+$mediaRegistrationVerified = $false
+if ($mediaGenerationEnabled -and $renderStatus.mediaGenerationEnabled -and $configStatus.merged -and (Test-Path -LiteralPath $mediaConfigPath -PathType Leaf)) {
+    $mergedConfig = Get-Content -LiteralPath $mediaConfigPath -Raw -Encoding UTF8
+    $mediaRegistrationVerified = [regex]::IsMatch($mergedConfig, '(?m)^\[mcp_servers\.media_generation\][ \t]*\r?\nenabled[ \t]*=[ \t]*true[ \t]*(?:#.*)?\r?$')
+}
+$mediaRegistered = [bool]($mediaGenerationEnabled -and $renderStatus.mediaGenerationEnabled -and $configStatus.merged -and $mediaRegistrationVerified)
 $connectionStatus = [ordered]@{
     schemaVersion = 1
     feishu = if ($feishuEnabled) { 'enabled-awaiting-tenant-health' } else { 'disabled-awaiting-credentials' }
     mediaGeneration = [ordered]@{
         runtime = [string]$mediaHealthStatus.runtime
         protocol = [string]$mediaHealthStatus.protocol
+        registered = $mediaRegistered
+        enabled = $mediaRegistered
         gatewayCatalog = [string]$mediaHealthStatus.gatewayCatalog
         generationCapability = [string]$mediaHealthStatus.generationCapability
         serverVersion = [string]$mediaHealthStatus.serverVersion

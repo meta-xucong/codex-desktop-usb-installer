@@ -9,6 +9,11 @@ CodexSwitch 验证版来源说明
 - 源码 commit：1d44b1ba41987cddeb8096fadba8190fab465cbb
 - 许可证：见同目录 LICENSE
 
-本验证版只做了 Codex 产品化改造：默认仅展示 Codex、预置 404TOKEN（Sub2API）
-供应商、关闭上游更新源，并保留用户运行时输入 API Key 的配置流程。404TOKEN
-不是 OpenAI 官方服务；本验证包不包含任何 API Key、Cookie 或其他用户凭据。
+本验证版除产品化改造外，还包含 U 盘专用的 404TOKEN handoff、经验证的模型选择
+保护和 Codex `mcp_servers` 保留逻辑。`sourceCommit` 是上游基线；完整产品源码差异
+随本资源目录保存在 `source-patches/ccswitch-usb-product-1d44b1ba.patch`，SHA-256 为：
+`E4F8DB42FD646FFBAA6A63DA294C58CBE1727BC197609CB3719E7D5DFFF3423E`。
+构建器会在固定基线上校验并应用该补丁，之后运行功能回归测试。仅检出上游 commit
+而不应用该补丁，不能重现本 EXE。
+
+404TOKEN 不是 OpenAI 官方服务；本验证包不包含任何 API Key、Cookie 或其他用户凭据。

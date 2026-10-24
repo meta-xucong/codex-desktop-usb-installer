@@ -854,3 +854,61 @@ Python health passed、命令壳 63/70 字节）均通过。以后若只看到�
 
 - Related Files: src-tauri/src/app/skill_repo_update.rs, src/app/errorCopy.ts, src/shared/types.ts, docs/SKILL-HUB-BASE-MANIFEST-PORTABLE-RESOURCE-G35-DEVELOPMENT.md
 - Tags: windows, ntfs, FlushFileBuffers, skill-hub, local-io, release-pairing, powershell-encoding
+
+---
+
+## [LRN-20261023-MODEL-TOOLS] do not rule out model-catalog tool filtering without a runtime probe
+
+**Logged**: 2026-10-23T04:59:08+08:00
+**Priority**: high
+**Status**: pending
+**Category**: correction
+**Area**: model catalog / Codex tool registration
+**Source**: user correction and local runtime investigation
+
+### Summary
+
+Earlier analysis concluded too strongly that adding a third-party model was unrelated to missing MCP and host tools. Treat model selection as a live hypothesis until the same Codex Desktop build is compared with native and added models.
+
+### Details
+
+The new test machine still lacked MCP after adding a model and repairing the capability pack. Source inspection also found generated model entries explicitly disabled Skills, plugin, App instructions, and Node REPL. Isolated CLI checks do not reproduce Desktop's host bridge, so they cannot disprove the user's Desktop report. A separate loopback CLI comparison found that the Node REPL flag alone did not change the captured base tool list, and Code Mode tests were confounded by a missing host executable.
+
+### Suggested Action
+
+Keep instruction-inclusion switches separate from actual capability switches. Restore relevant host usage instructions where applicable, but retain conservative tool-disable flags until that specific capability is tested. Validate the actual Desktop app-server tool list, config path, and MCP invocation on a test machine before closing the root-cause investigation.
+
+### Metadata
+
+- Related Files: src-tauri/src/app/model_catalog.rs, docs/MODEL-CATALOG-HOST-TOOLS-AND-MCP-20261023.md
+- Tags: model-catalog, mcp, tools, desktop-runtime
+
+---
+
+## [LRN-20261025-CAPABILITY-MANIFEST-CANONICAL-BYTES] Validate pack metadata with the repository canonicalizer
+
+**Logged**: 2026-10-25
+**Priority**: medium
+**Status**: resolved
+**Category**: best_practice
+**Area**: packaging / integrity metadata
+**Source**: error
+
+### Summary
+
+The capability-pack manifest records canonical text byte lengths, not physical Windows file sizes.
+
+### Details
+
+- A manual audit initially compared `entry.bytes` to the on-disk byte count and incorrectly reported two text files as mismatched because their line endings were CRLF.
+- The repository refresh tool normalizes CRLF and CR to LF before hashing and counting text files.
+- After changing a packaged file, update metadata with `tools/refresh-capability-pack-metadata.py` and validate with its `--check` mode instead of comparing raw file sizes.
+
+### Suggested Action
+
+Use the repository canonicalizer for capability-pack hashes and lengths; report only mismatches from the official `--check` result.
+
+### Metadata
+
+- Related Files: `tools/refresh-capability-pack-metadata.py`, `installer-pack/file-manifest.json`, `installer-pack/checksums.sha256`
+- Tags: package-integrity, line-endings, canonical-hash

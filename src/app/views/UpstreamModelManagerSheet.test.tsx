@@ -4,7 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { managerApi } from "../../services/managerApi";
-import type { NativeModelCatalogActionReport } from "../../shared/types";
+import type { GatewayModelProbeReport, GatewayReasoningEffortResult } from "../../shared/types";
 import { I18nProvider } from "../i18n";
 import { ThemeProvider } from "../theme";
 import { UpstreamModelManagerSheet } from "./UpstreamModelManagerSheet";
@@ -34,1079 +34,289 @@ const listing = {
   generatedRequests: 0,
   errorCode: null,
 };
-
-const catalogState = {
-  status: "ok", modelIds: [], restartRequired: false, message: "state loaded",
-  connectionFingerprint: "binding-fixture", credentialFingerprint: "sha256:fixture",
+const ready = {
+  status: "ready",
+  modelIds: ["gpt-5"],
+  restartRequired: false,
+  message: "ready",
+  connectionFingerprint: "binding-fixture",
+  credentialFingerprint: "sha256:fixture",
+};
+const added = {
+  ...ready,
+  status: "applied_restart_pending",
+  modelIds: ["gpt-5", "vendor/model-latest"],
+  restartRequired: true,
+  message: "added",
 };
 
-function Harness({ onDismiss }: { onDismiss?: () => void }) {
+function passedProbe(
+  results: GatewayReasoningEffortResult[] = [
+    { effort: "low", status: "accepted_by_route", errorCode: null },
+    { effort: "medium", status: "accepted_by_route", errorCode: null },
+  ],
+  modelId = "vendor/model-latest",
+): GatewayModelProbeReport {
+  return {
+    ...listing,
+    status: "passed" as const,
+    generatedRequests: 4,
+    reasoningModelId: modelId,
+    reasoningProofId: "proof-single-click",
+    connectivityProofId: "proof-single-click",
+    reasoningResults: results,
+    checkedAt: Math.floor(Date.now() / 1000),
+    connectivityProofExpiresAt: Math.floor(Date.now() / 1000) + 300,
+  };
+}
+
+function Harness() {
   const [open, setOpen] = useState(true);
   return (
     <>
       {!open ? <button type="button" onClick={() => setOpen(true)}>重新打开</button> : null}
-      <UpstreamModelManagerSheet open={open} onDismiss={() => { setOpen(false); onDismiss?.(); }} />
+      <UpstreamModelManagerSheet open={open} onDismiss={() => setOpen(false)} />
     </>
   );
 }
 
-function renderSheet(onDismiss?: () => void) {
+function renderSheet() {
   return render(
     <ThemeProvider>
       <I18nProvider>
-        <Harness onDismiss={onDismiss} />
+        <Harness />
       </I18nProvider>
     </ThemeProvider>,
   );
 }
 
-async function runReasoningProbe(user: ReturnType<typeof userEvent.setup>) {
-  vi.spyOn(window, "confirm").mockReturnValue(true);
-  await user.click(screen.getByRole("button", { name: /自动检测|重新检测/ }));
+async function clickProbeAndAdd(user: ReturnType<typeof userEvent.setup>) {
+  await user.click(await screen.findByRole("button", { name: "探测并添加" }));
 }
 
-async function confirmAddModel(user: ReturnType<typeof userEvent.setup>) {
-  await user.click(await screen.findByRole("button", { name: "确认添加到 Codex" }));
-}
-
-describe("UpstreamModelManagerSheet", () => {
+describe("UpstreamModelManagerSheet direct add flow", () => {
   beforeEach(() => {
     vi.resetAllMocks();
     vi.spyOn(window, "confirm").mockReturnValue(true);
     localStorage.setItem("cam.lang", "zh-CN");
     localStorage.removeItem("codex-manager.upstream-model-probe.v1");
-    api.manageNativeModelCatalog.mockResolvedValue(catalogState);
+    api.manageNativeModelCatalog.mockImplementation(async (request) => {
+      if (request.operation === "prepare") return ready;
+      if (request.operation === "add") return added;
+      return {
+        status: "ok",
+        modelIds: [],
+        restartRequired: false,
+        message: "state loaded",
+        connectionFingerprint: "binding-fixture",
+        credentialFingerprint: "sha256:fixture",
+      };
+    });
     api.gatewayModelProbe.mockResolvedValue(listing);
     api.cancelGatewayModelProbe.mockResolvedValue(true);
   });
 
-  it("shows clear return and refresh controls, and refreshes the model list on demand", async () => {
-    const user = userEvent.setup();
-    const onDismiss = vi.fn();
-    renderSheet(onDismiss);
-
-    await screen.findByText("vendor/model-latest");
-    const refresh = screen.getByRole("button", { name: "刷新模型列表" });
-    await waitFor(() => expect(refresh).toBeEnabled());
-    await user.click(refresh);
-    await waitFor(() => expect(api.gatewayModelProbe).toHaveBeenCalledTimes(2));
-    expect(api.gatewayModelProbe.mock.calls[1]?.[0]).toMatchObject({
-      selectedModelIds: [], costConsent: false,
-    });
-
-    await user.click(screen.getByRole("button", { name: "返回首页" }));
-    expect(onDismiss).toHaveBeenCalledTimes(1);
-  });
-
-  it("shows one model action and automatically checks settings without asking users to choose", async () => {
-    const user = userEvent.setup();
-    const confirmSpy = vi.spyOn(window, "confirm");
-    api.gatewayModelProbe
-      .mockResolvedValueOnce(listing)
-      .mockResolvedValueOnce({
-        ...listing,
-        status: "passed",
-        generatedRequests: 4,
-        reasoningModelId: "vendor/model-latest",
-        reasoningProofId: "proof-single-click",
-        connectivityProofId: "proof-single-click",
-        reasoningResults: [{ effort: "medium", status: "accepted_by_route", errorCode: null }],
-        checkedAt: Math.floor(Date.now() / 1000),
-        connectivityProofExpiresAt: Math.floor(Date.now() / 1000) + 300,
-      });
-    const view = renderSheet();
-    const row = await screen.findByTestId("upstream-model-vendor/model-latest");
-    expect(view.container.querySelector(".upstream-model-manager-add-panel")).toBeNull();
-    expect(within(row).getByRole("button", { name: "自动检测" })).toBeInTheDocument();
-    expect(within(row).getAllByRole("button")).toHaveLength(1);
-    expect(within(row).queryByText(/自动检测最多发送|可能产生费用/)).not.toBeInTheDocument();
-    expect(within(row).queryByRole("button", { name: "检查设置" })).not.toBeInTheDocument();
-    expect(within(row).queryByRole("button", { name: "添加到 Codex" })).not.toBeInTheDocument();
-    expect(within(row).queryByRole("button", { name: /测档位|Check efforts/ })).not.toBeInTheDocument();
-    expect(within(row).queryByRole("checkbox")).not.toBeInTheDocument();
-
-    await user.click(within(row).getByRole("button", { name: "自动检测" }));
-    expect(await within(row).findByRole("button", { name: "确认添加到 Codex" })).toBeEnabled();
-    expect(within(row).getByText("查看检查结果")).toBeInTheDocument();
-    expect(row.querySelector(".upstream-model-manager-add-panel")).toBeNull();
-    expect(within(row).getAllByRole("button")).toHaveLength(1);
-    expect(within(row).queryByText(/本轮已发送|可能产生费用/)).not.toBeInTheDocument();
-    expect(api.gatewayModelProbe).toHaveBeenCalledTimes(2);
-    expect(api.gatewayModelProbe.mock.calls[1]?.[0].reasoningModelId).toBe("vendor/model-latest");
-    expect(confirmSpy).not.toHaveBeenCalled();
-    expect(within(row).queryByRole("checkbox")).not.toBeInTheDocument();
-  });
-
-  it("does not use a native confirmation bridge for a per-model probe", async () => {
-    const user = userEvent.setup();
-    const confirmSpy = vi.spyOn(window, "confirm").mockImplementation(() => { throw new Error("dialog ACL denied"); });
-    api.gatewayModelProbe
-      .mockResolvedValueOnce(listing)
-      .mockResolvedValueOnce({
-        ...listing,
-        status: "passed",
-        reasoningModelId: "vendor/model-latest",
-        reasoningProofId: "proof-no-native-confirm",
-        connectivityProofId: "proof-no-native-confirm",
-        reasoningResults: [{ effort: "medium", status: "accepted_by_route", errorCode: null }],
-        checkedAt: Math.floor(Date.now() / 1000),
-        connectivityProofExpiresAt: Math.floor(Date.now() / 1000) + 300,
-      });
+  it("discovers models without probing or adding one", async () => {
     renderSheet();
     const row = await screen.findByTestId("upstream-model-vendor/model-latest");
-    await user.click(within(row).getByRole("button", { name: "自动检测" }));
-    expect(await within(row).findByRole("button", { name: "确认添加到 Codex" })).toBeEnabled();
-    expect(api.gatewayModelProbe).toHaveBeenCalledTimes(2);
-    expect(confirmSpy).not.toHaveBeenCalled();
-  });
-
-  it("allows adding the accepted subset while showing unknown effort results as unconfirmed", async () => {
-    const user = userEvent.setup();
-    api.gatewayModelProbe
-      .mockResolvedValueOnce(listing)
-      .mockResolvedValueOnce({
-        ...listing,
-        status: "passed",
-        generatedRequests: 2,
-        reasoningModelId: "vendor/model-latest",
-        reasoningProofId: "proof-accepted-subset",
-        connectivityProofId: "proof-accepted-subset",
-        reasoningResults: [
-          { effort: "medium", status: "accepted_by_route", errorCode: null },
-          { effort: "high", status: "unknown", errorCode: "upstream-unavailable" },
-        ],
-        checkedAt: Math.floor(Date.now() / 1000),
-        connectivityProofExpiresAt: Math.floor(Date.now() / 1000) + 300,
-      });
-    renderSheet();
-    const row = await screen.findByTestId("upstream-model-vendor/model-latest");
-    await user.click(within(row).getByRole("button", { name: "自动检测" }));
-    expect(await within(row).findByRole("button", { name: "确认添加到 Codex" })).toBeEnabled();
-    await user.click(within(row).getByText("查看检查结果"));
-    expect(within(row).getByText("未确认，已跳过")).toBeInTheDocument();
-    await confirmAddModel(user);
-    await waitFor(() => expect(api.manageNativeModelCatalog).toHaveBeenCalledWith(
-      expect.objectContaining({
-        operation: "add",
-        modelId: "vendor/model-latest",
-        connectivityProofId: "proof-accepted-subset",
-      }),
-    ));
-  });
-
-  it.each([
-    ["precommit_retryable", "测试凭证仍然有效，可重试添加。"],
-    ["precommit_revalidate", "暂时无法核对模型列表，测试凭证保留；重试会先重新核对。"],
-  ])("keeps the proof and retries Add without repeating paid probes (%s)", async (status, message) => {
-    const user = userEvent.setup();
-    const passedProbe = {
-      ...listing,
-      status: "passed" as const,
-      generatedRequests: 4,
-      connectivityModelId: "vendor/model-latest",
-      connectivityProofId: "proof-reusable",
-      reasoningModelId: "vendor/model-latest",
-      reasoningProofId: "proof-reusable",
-      reasoningResults: [{ effort: "medium", status: "accepted_by_route" as const, errorCode: null }],
-      checkedAt: Math.floor(Date.now() / 1000),
-      connectivityProofExpiresAt: Math.floor(Date.now() / 1000) + 300,
-    };
-    api.gatewayModelProbe.mockResolvedValueOnce(listing).mockResolvedValueOnce(passedProbe);
-    api.manageNativeModelCatalog
-      .mockResolvedValueOnce(catalogState)
-      .mockResolvedValueOnce(catalogState)
-      .mockResolvedValueOnce({
-        status,
-        modelIds: [],
-        restartRequired: false,
-        message,
-        errorCode: status === "precommit_retryable" ? "native-defaults-rejected" : "upstream-unavailable",
-        commitState: "not_started",
-        proofState: status === "precommit_retryable" ? "valid" : "pending_validation",
-        retryable: status === "precommit_retryable",
-      })
-      .mockResolvedValueOnce({
-        status: "applied_restart_pending",
-        modelIds: ["vendor/model-latest"],
-        restartRequired: true,
-        message: "added",
-        commitState: "started",
-        proofState: "consumed",
-      })
-      .mockResolvedValueOnce({ ...catalogState, modelIds: ["vendor/model-latest"] });
-
-    renderSheet();
-    const row = await screen.findByTestId("upstream-model-vendor/model-latest");
-    await user.click(within(row).getByRole("button", { name: "自动检测" }));
-    const add = await within(row).findByRole("button", { name: "确认添加到 Codex" });
-    await user.click(add);
-    expect(await screen.findByRole("alert")).toHaveTextContent(message);
-    const retry = within(row).getByRole("button", {
-      name: status === "precommit_retryable" ? "重试添加" : "重新核对并重试",
-    });
-    expect(retry).toBeEnabled();
-    expect(api.cancelGatewayModelProbe).not.toHaveBeenCalled();
-
-    await user.click(retry);
-    expect(await screen.findByText("已添加到 Codex。重启 Codex 后即可使用。")).toBeInTheDocument();
-    expect(api.gatewayModelProbe).toHaveBeenCalledTimes(2);
-    expect(api.manageNativeModelCatalog.mock.calls.filter(([request]) => request.operation === "add")).toHaveLength(2);
-    expect(api.cancelGatewayModelProbe).toHaveBeenCalledWith(api.gatewayModelProbe.mock.calls[1]?.[0].requestId);
-  });
-
-  it("retries a failed first model check with a fresh request and unlocks confirmation after success", async () => {
-    const user = userEvent.setup();
-    api.gatewayModelProbe
-      .mockResolvedValueOnce(listing)
-      .mockResolvedValueOnce({
-        ...listing,
-        status: "failed",
-        errorCode: "upstream-unavailable",
-        reasoningModelId: "vendor/model-latest",
-        reasoningResults: [{ effort: "medium", status: "unknown", errorCode: "upstream-unavailable" }],
-        checkedAt: Math.floor(Date.now() / 1000),
-      })
-      .mockResolvedValueOnce({
-        ...listing,
-        status: "passed",
-        connectivityModelId: "vendor/model-latest",
-        connectivityProofId: "proof-after-retry",
-        reasoningModelId: "vendor/model-latest",
-        reasoningProofId: "proof-after-retry",
-        reasoningResults: [{ effort: "medium", status: "accepted_by_route", errorCode: null }],
-        checkedAt: Math.floor(Date.now() / 1000),
-        connectivityProofExpiresAt: Math.floor(Date.now() / 1000) + 300,
-        results: [{ modelId: "vendor/model-latest", passed: true, generatedRequests: 1,
-          checks: [{ name: "text", passed: true }], errorCode: null }],
-      });
-
-    renderSheet();
-    await screen.findByText("vendor/model-latest");
-    const row = screen.getByTestId("upstream-model-vendor/model-latest");
-    await user.click(within(row).getByRole("button", { name: "自动检测" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent("无法连接到上游");
-    expect(within(row).getByRole("button", { name: "重新检测" })).toBeEnabled();
-    expect(within(row).queryByRole("button", { name: "确认添加到 Codex" })).not.toBeInTheDocument();
-
-    await user.click(within(row).getByRole("button", { name: "重新检测" }));
-    expect(await screen.findByRole("button", { name: "确认添加到 Codex" })).toBeEnabled();
-    expect(api.gatewayModelProbe).toHaveBeenCalledTimes(3);
-    expect(api.gatewayModelProbe.mock.calls[1]?.[0].requestId)
-      .not.toBe(api.gatewayModelProbe.mock.calls[2]?.[0].requestId);
-  });
-
-  it("adopts a changed binding as the retry baseline instead of repeating the stale-cache warning", async () => {
-    const user = userEvent.setup();
-    const currentBinding = {
-      connectionFingerprint: "binding-current",
-      credentialFingerprint: "sha256:current",
-      endpoint: "https://new-404token.xyz/v1",
-    };
-    const passedProbe = {
-      ...listing,
-      ...currentBinding,
-      status: "passed" as const,
-      generatedRequests: 1,
-      connectivityModelId: "vendor/model-latest",
-      connectivityProofId: "proof-current-binding",
-      reasoningModelId: "vendor/model-latest",
-      reasoningProofId: "proof-current-binding",
-      reasoningResults: [{ effort: "medium", status: "accepted_by_route" as const, errorCode: null }],
-      checkedAt: Math.floor(Date.now() / 1000),
-      connectivityProofExpiresAt: Math.floor(Date.now() / 1000) + 300,
-      results: [{ modelId: "vendor/model-latest", passed: true, generatedRequests: 1,
-        checks: [{ name: "text", passed: true }], errorCode: null }],
-    };
-    api.manageNativeModelCatalog.mockResolvedValue({
-      ...catalogState,
-      connectionFingerprint: currentBinding.connectionFingerprint,
-      credentialFingerprint: currentBinding.credentialFingerprint,
-    });
-    api.gatewayModelProbe
-      .mockResolvedValueOnce(listing)
-      .mockResolvedValueOnce(passedProbe)
-      .mockResolvedValueOnce(passedProbe);
-
-    renderSheet();
-    const row = await screen.findByTestId("upstream-model-vendor/model-latest");
-    await user.click(within(row).getByRole("button", { name: "自动检测" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent("账号或服务设置已变化");
-
-    const cachedAfterMismatch = JSON.parse(localStorage.getItem("codex-manager.upstream-model-probe.v1") ?? "null");
-    expect(cachedAfterMismatch.report).toMatchObject(currentBinding);
-    expect(cachedAfterMismatch.failureCodeById["vendor/model-latest"]).toBe("binding-changed");
-
-    const retryButtons = within(row).getAllByRole("button", { name: "重新检测" });
-    const retryButton = retryButtons[retryButtons.length - 1]!;
-    await waitFor(() => expect(retryButton).toBeEnabled());
-    await user.click(retryButton);
-    await waitFor(() => expect(api.gatewayModelProbe).toHaveBeenCalledTimes(3));
-    expect(await screen.findByRole("button", { name: "确认添加到 Codex" })).toBeEnabled();
-    expect(api.gatewayModelProbe.mock.calls[1]?.[0].requestId)
-      .not.toBe(api.gatewayModelProbe.mock.calls[2]?.[0].requestId);
-  });
-
-  it.each([
-    ["upstream-auth", "账号或网关授权未通过"],
-    ["upstream-http", "仅凭此诊断码无法确定具体原因"],
-    ["upstream-http-400", "HTTP 400"],
-    ["upstream-store-unsupported", "不接受 Responses 的 store 参数"],
-    ["effort-rejected", "明确不接受所选设置"],
-    ["upstream-connect-failed", "无法连接到上游"],
-    ["upstream-unavailable", "无法连接到上游"],
-    ["probe-timeout", "上游响应超时"],
-    ["upstream-response", "上游已响应，但返回格式"],
-    ["response-too-large", "超过探测上限"],
-  ])("explains model test failure category %s and retains its safe code", async (errorCode, expectedReason) => {
-    const user = userEvent.setup();
-    api.gatewayModelProbe
-      .mockResolvedValueOnce(listing)
-      .mockResolvedValueOnce({
-        ...listing,
-        status: "failed",
-        errorCode,
-        connectivityModelId: "vendor/model-latest",
-        results: [{ modelId: "vendor/model-latest", passed: false, generatedRequests: 1,
-          checks: [{ name: "text", passed: false }], errorCode }],
-      });
-
-    renderSheet();
-    await screen.findByText("vendor/model-latest");
-    await user.click(screen.getByRole("button", { name: "自动检测" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent(expectedReason);
-    expect(screen.getByRole("alert")).toHaveTextContent(errorCode);
-    const cached = JSON.parse(localStorage.getItem("codex-manager.upstream-model-probe.v1") ?? "null");
-    expect(cached.failureCodeById["vendor/model-latest"]).toBe(errorCode);
-  });
-
-  it("reports local invocation failures without exposing the raw error text", async () => {
-    const user = userEvent.setup();
-    api.gatewayModelProbe
-      .mockResolvedValueOnce(listing)
-      .mockRejectedValueOnce(new Error("engine_error: private fixture diagnostic with secret"));
-
-    renderSheet();
-    await screen.findByText("vendor/model-latest");
-    await user.click(screen.getByRole("button", { name: "自动检测" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent("安装器未能完成本地测试流程");
-    expect(screen.getByRole("alert")).toHaveTextContent("engine_error");
-    expect(screen.getByRole("alert")).not.toHaveTextContent("private fixture");
-    expect(screen.getByRole("alert")).not.toHaveTextContent("secret");
-  });
-
-  it("preserves bulk HTTP failure codes across reopening and keeps the wording neutral", async () => {
-    const user = userEvent.setup();
-    const confirmSpy = vi.spyOn(window, "confirm");
-    api.gatewayModelProbe
-      .mockResolvedValueOnce(listing)
-      .mockResolvedValueOnce({
-        ...listing,
-        status: "failed",
-        errorCode: "upstream-http",
-        connectivityModelId: "vendor/model-latest",
-        results: [{ modelId: "vendor/model-latest", passed: false, generatedRequests: 1,
-          checks: [{ name: "text", passed: false }], errorCode: "upstream-http" }],
-      });
-
-    const view = renderSheet();
-    await screen.findByText("vendor/model-latest");
-    await user.click(screen.getByRole("button", { name: "测所有模型可用性" }));
-    expect(screen.getByRole("alertdialog")).toBeInTheDocument();
-    expect(screen.getByText("将测试 1 个模型，预计发送 1–1 次请求，可能产生费用。测试不会自动添加模型。是否继续？")).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "开始测试" }));
-    expect(confirmSpy).not.toHaveBeenCalled();
-    expect(await screen.findByText("HTTP错误")).toBeInTheDocument();
-    expect(screen.getByText("检测完成：0 个可用，1 个未通过。")).toBeInTheDocument();
-    const cached = JSON.parse(localStorage.getItem("codex-manager.upstream-model-probe.v1") ?? "null");
-    expect(cached.failureCodeById["vendor/model-latest"]).toBe("upstream-http");
-
-    view.unmount();
-    renderSheet();
-    expect(await screen.findByText("HTTP错误")).toBeInTheDocument();
-    const row = screen.getByTestId("upstream-model-vendor/model-latest");
-    expect(within(row).getByText("HTTP错误")).toHaveAttribute(
-      "title",
-      expect.stringContaining("仅凭此诊断码无法确定具体原因"),
-    );
-  });
-
-  it("keeps full-probe results across leaving and reopening, and replaces them only after manual refresh", async () => {
-    const user = userEvent.setup();
-    api.gatewayModelProbe
-      .mockResolvedValueOnce(listing)
-      .mockResolvedValueOnce({
-        ...listing,
-        status: "passed",
-        generatedRequests: 1,
-        connectivityModelId: "vendor/model-latest",
-        results: [{
-          modelId: "vendor/model-latest", passed: true, generatedRequests: 1,
-          checks: [{ name: "text", passed: true }], errorCode: null,
-        }],
-      })
-      .mockResolvedValueOnce(listing);
-
-    const view = renderSheet();
-    await screen.findByText("vendor/model-latest");
-    await user.click(screen.getByRole("button", { name: "测所有模型可用性" }));
-    await user.click(screen.getByRole("button", { name: "开始测试" }));
-    expect(await screen.findByText("文字测试可用")).toBeInTheDocument();
-    await waitFor(() => expect(api.gatewayModelProbe).toHaveBeenCalledTimes(2));
-
-    const cached = JSON.parse(localStorage.getItem("codex-manager.upstream-model-probe.v1") ?? "null");
-    cached.updatedAtMs = Date.now() - 49 * 60 * 60 * 1000;
-    localStorage.setItem("codex-manager.upstream-model-probe.v1", JSON.stringify(cached));
-    view.unmount();
-
-    renderSheet();
-    expect(await screen.findByText("文字测试可用")).toBeInTheDocument();
-    expect(screen.getByTestId("upstream-model-cache-notice")).toHaveTextContent("保留 48 小时");
-    expect(api.gatewayModelProbe).toHaveBeenCalledTimes(2);
-
-    await user.click(screen.getByRole("button", { name: "刷新模型列表" }));
-    await waitFor(() => expect(api.gatewayModelProbe).toHaveBeenCalledTimes(3));
-    await waitFor(() => expect(screen.getByText("还没测试")).toBeInTheDocument());
-  });
-
-  it("keeps locally configured models missing from the current directory in a collapsed section", async () => {
-    const localOnlyModel = "legacy/claude-3-5-haiku";
-    api.manageNativeModelCatalog.mockResolvedValue({ ...catalogState, modelIds: [localOnlyModel] });
-
-    renderSheet();
-    await screen.findByText("vendor/model-latest");
-
-    const candidates = screen.getByTestId("upstream-model-candidate-list");
-    expect(within(candidates).getByText("vendor/model-latest")).toBeInTheDocument();
-    expect(within(candidates).queryByText(localOnlyModel)).not.toBeInTheDocument();
-
-    const sectionTitle = screen.getByText("本机已配置，但本次上游目录未返回");
-    const section = sectionTitle.closest("details");
-    expect(section).not.toHaveAttribute("open");
-    expect(within(section!).getByText(localOnlyModel)).toBeInTheDocument();
-    expect(within(section!).getByText(/本机记录不代表上游当前支持/)).toBeInTheDocument();
-    expect(within(section!).queryByRole("button")).not.toBeInTheDocument();
-  });
-
-  it("discovers read-only and only offers Add after the exact model's reasoning efforts pass", async () => {
-    const user = userEvent.setup();
-    api.gatewayModelProbe
-      .mockResolvedValueOnce(listing)
-      .mockResolvedValueOnce({
-        ...listing,
-        status: "passed",
-        generatedRequests: 1,
-        connectivityModelId: "vendor/model-latest",
-        connectivityProofId: "proof-fixture",
-        reasoningModelId: "vendor/model-latest",
-        reasoningProofId: "proof-fixture",
-        reasoningResults: [{ effort: "medium", status: "accepted_by_route", errorCode: null }],
-        checkedAt: Math.floor(Date.now() / 1000),
-        connectivityProofExpiresAt: Math.floor(Date.now() / 1000) + 300,
-        results: [{
-          modelId: "vendor/model-latest", passed: true, generatedRequests: 1,
-          checks: [{ name: "text", passed: true }], errorCode: null,
-        }],
-      });
-    api.manageNativeModelCatalog
-      .mockResolvedValueOnce(catalogState)
-      .mockResolvedValueOnce(catalogState)
-      .mockResolvedValueOnce({ status: "applied_restart_pending", modelIds: ["vendor/model-latest"], restartRequired: true, message: "added" })
-      .mockResolvedValueOnce({ ...catalogState, modelIds: ["vendor/model-latest"] });
-
-    renderSheet();
-    expect(await screen.findByText("vendor/model-latest")).toBeInTheDocument();
-    expect(screen.getByText("还没测试")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "添加到 Codex" })).not.toBeInTheDocument();
+    expect(within(row).getByRole("button", { name: "探测并添加" })).toBeInTheDocument();
     expect(api.gatewayModelProbe).toHaveBeenCalledTimes(1);
-    expect(api.gatewayModelProbe.mock.calls[0]?.[0]).toMatchObject({
-      selectedModelIds: [], costConsent: false,
-    });
+    expect(api.manageNativeModelCatalog).toHaveBeenCalledWith(expect.objectContaining({ operation: "state" }));
+    expect(api.manageNativeModelCatalog).not.toHaveBeenCalledWith(expect.objectContaining({ operation: "add" }));
+  });
 
-    await runReasoningProbe(user);
-    await screen.findByRole("button", { name: "确认添加到 Codex" });
-    const row = screen.getByTestId("upstream-model-vendor/model-latest");
-    expect(within(row).queryByRole("button", { name: "添加到 Codex" })).not.toBeInTheDocument();
-    expect(screen.getAllByRole("button", { name: "确认添加到 Codex" })).toHaveLength(1);
-    expect(within(row).getByText("测试通过")).toBeInTheDocument();
-    const modelRow = screen.getByTestId("upstream-model-vendor/model-latest");
-    await user.click(within(modelRow).getByText("查看检查结果"));
-    expect(within(modelRow).getByText("可用")).toBeInTheDocument();
-    expect(within(modelRow).getByRole("list", { name: "查看检查结果" })).toBeInTheDocument();
+  it("probes the full supported effort set and automatically adds after any accepted result", async () => {
+    const user = userEvent.setup();
+    const confirmSpy = vi.spyOn(window, "confirm");
+    api.gatewayModelProbe
+      .mockResolvedValueOnce(listing)
+      .mockResolvedValueOnce(passedProbe());
+    renderSheet();
+
+    await clickProbeAndAdd(user);
+
+    await waitFor(() => expect(api.manageNativeModelCatalog).toHaveBeenCalledWith(expect.objectContaining({
+      operation: "add",
+      modelId: "vendor/model-latest",
+      connectivityProofId: "proof-single-click",
+    })));
+    expect(api.manageNativeModelCatalog.mock.invocationCallOrder[1])
+      .toBeLessThan(api.gatewayModelProbe.mock.invocationCallOrder[1]!);
     expect(api.gatewayModelProbe.mock.calls[1]?.[0]).toMatchObject({
-      selectedModelIds: [], reasoningModelId: "vendor/model-latest",
-      reasoningEfforts: ["none", "minimal", "low", "medium", "high", "xhigh", "max"], reasoningCostConsent: true,
+      reasoningModelId: "vendor/model-latest",
+      reasoningEfforts: ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+      reasoningCostConsent: true,
     });
+    expect(confirmSpy).not.toHaveBeenCalled();
+    expect(await screen.findByText("已添加到 Codex")).toBeInTheDocument();
+    expect(screen.getByTestId("upstream-model-vendor/model-latest")).toBeInTheDocument();
+  });
 
-    await confirmAddModel(user);
-    await waitFor(() => expect(api.manageNativeModelCatalog).toHaveBeenCalledTimes(4));
-    expect(api.manageNativeModelCatalog.mock.calls[2]?.[0]).toMatchObject({
-      operation: "add", modelId: "vendor/model-latest", connectivityProofId: "proof-fixture",
+  it("keeps the accepted subset when later effort results are unknown and still adds", async () => {
+    const user = userEvent.setup();
+    api.gatewayModelProbe
+      .mockResolvedValueOnce(listing)
+      .mockResolvedValueOnce(passedProbe([
+        { effort: "low", status: "accepted_by_route", errorCode: null },
+        { effort: "medium", status: "unknown", errorCode: "upstream-timeout" },
+      ]));
+    renderSheet();
+
+    await clickProbeAndAdd(user);
+
+    await waitFor(() => expect(api.manageNativeModelCatalog).toHaveBeenCalledWith(expect.objectContaining({ operation: "add" })));
+    expect(await screen.findByText("已添加到 Codex")).toBeInTheDocument();
+  });
+
+  it("omits none for Claude Opus 5.5 before sending the reasoning probe", async () => {
+    const user = userEvent.setup();
+    const opus = { id: "claude-opus-5-5", ownedBy: "fixture", selectable: true };
+    api.gatewayModelProbe
+      .mockResolvedValueOnce({ ...listing, models: [opus] })
+      .mockResolvedValueOnce(passedProbe(undefined, opus.id));
+    renderSheet();
+
+    await user.click(await screen.findByRole("button", { name: "探测并添加" }));
+
+    await waitFor(() => expect(api.gatewayModelProbe).toHaveBeenCalledTimes(2));
+    expect(api.gatewayModelProbe.mock.calls[1]?.[0]).toMatchObject({
+      reasoningModelId: opus.id,
+      reasoningEfforts: ["minimal", "low", "medium", "high", "xhigh", "max"],
     });
-    expect(api.manageNativeModelCatalog.mock.calls[2]?.[0].requestId)
-      .not.toBe(api.gatewayModelProbe.mock.calls[1]?.[0].requestId);
-    expect(await screen.findByText("已添加到 Codex。重启 Codex 后即可使用。")).toBeInTheDocument();
-    expect(within(screen.getByTestId("upstream-model-vendor/model-latest"))
-      .getByText("已添加到 Codex")).toBeInTheDocument();
-    expect(within(screen.getByTestId("upstream-model-vendor/model-latest"))
-      .queryByRole("button", { name: "添加到 Codex" })).not.toBeInTheDocument();
+    await waitFor(() => expect(api.manageNativeModelCatalog).toHaveBeenCalledWith(expect.objectContaining({ operation: "add" })));
   });
 
-  it("automatically checks settings and shows accepted, rejected, and unknown results only on demand", async () => {
+  it("preserves the tested proof after bounded Add retries and reuses it on the next click", async () => {
     const user = userEvent.setup();
+    let addAttempts = 0;
     api.gatewayModelProbe
       .mockResolvedValueOnce(listing)
-      .mockResolvedValueOnce({
-        ...listing,
-        status: "passed",
-        reasoningModelId: "vendor/model-latest",
-        reasoningProofId: "proof-efforts",
-        connectivityProofId: "proof-efforts",
-        reasoningResults: [
-          { effort: "low", status: "accepted_by_route", errorCode: null },
-          { effort: "medium", status: "rejected_by_route", errorCode: "unsupported_effort" },
-          { effort: "high", status: "unknown", errorCode: "network_error" },
-          { effort: "xhigh", status: "unknown", errorCode: "effort-probe-incomplete" },
-        ],
-        checkedAt: Math.floor(Date.now() / 1000),
-        connectivityProofExpiresAt: Math.floor(Date.now() / 1000) + 300,
-      });
-
-    renderSheet();
-    await screen.findByText("vendor/model-latest");
-    await runReasoningProbe(user);
-    expect(api.gatewayModelProbe.mock.calls[1]?.[0].reasoningEfforts).toEqual([
-      "none", "minimal", "low", "medium", "high", "xhigh", "max",
-    ]);
-    const row = screen.getByTestId("upstream-model-vendor/model-latest");
-    expect(within(row).getByText("查看检查结果").closest("details")).not.toHaveAttribute("open");
-    await user.click(within(row).getByText("查看检查结果"));
-    expect(within(row).getByText("可用")).toBeInTheDocument();
-    expect(within(row).getByText("上游不接受")).toBeInTheDocument();
-    expect(within(row).getAllByText("未确认，已跳过")).toHaveLength(2);
-    expect(within(row).getAllByText("未确认，已跳过").some((node) =>
-      node.closest("span")?.getAttribute("title") === "在输出上限内未完成，不能判断该档位是否受支持。",
-    )).toBe(true);
-  });
-
-  it("skips a model automatically when none of its settings pass", async () => {
-    const user = userEvent.setup();
-    api.gatewayModelProbe
-      .mockResolvedValueOnce(listing)
-      .mockResolvedValueOnce({
-        ...listing,
-        status: "failed",
-        errorCode: "no-effort-accepted",
-        reasoningModelId: "vendor/model-latest",
-        reasoningResults: [{ effort: "medium", status: "rejected_by_route", errorCode: "unsupported_effort" }],
-        checkedAt: Math.floor(Date.now() / 1000),
-        results: [],
-      });
-
-    renderSheet();
-    await screen.findByText("vendor/model-latest");
-    await runReasoningProbe(user);
-
-    expect(await screen.findByRole("alert")).toHaveTextContent("当前线路没有可添加的设置，这个模型未添加");
-    const row = screen.getByTestId("upstream-model-vendor/model-latest");
-    expect(within(row).queryByRole("button", { name: "添加到 Codex" })).not.toBeInTheDocument();
-    expect(within(row).getByText("查看检查结果")).toBeInTheDocument();
-    expect(api.manageNativeModelCatalog.mock.calls.some(([request]) => request.operation === "add")).toBe(false);
-  });
-
-  it("does not report Add as successful when the post-write catalog reread omits the model", async () => {
-    const user = userEvent.setup();
-    api.gatewayModelProbe
-      .mockResolvedValueOnce(listing)
-      .mockResolvedValueOnce({
-        ...listing,
-        status: "passed",
-        generatedRequests: 1,
-        connectivityModelId: "vendor/model-latest",
-        connectivityProofId: "proof-reread-mismatch",
-        reasoningProofId: "proof-reread-mismatch",
-        reasoningResults: [{ effort: "medium", status: "accepted_by_route", errorCode: null }],
-        checkedAt: Math.floor(Date.now() / 1000),
-        connectivityProofExpiresAt: Math.floor(Date.now() / 1000) + 300,
-        results: [{ modelId: "vendor/model-latest", passed: true, generatedRequests: 1,
-          checks: [{ name: "text", passed: true }], errorCode: null }],
-      });
-    api.manageNativeModelCatalog
-      .mockResolvedValueOnce(catalogState)
-      .mockResolvedValueOnce(catalogState)
-      .mockResolvedValueOnce({
-        status: "applied_restart_pending", modelIds: ["vendor/model-latest"],
-        restartRequired: true, message: "added",
-      })
-      .mockResolvedValueOnce(catalogState);
-
-    renderSheet();
-    await screen.findByText("vendor/model-latest");
-    await runReasoningProbe(user);
-    await confirmAddModel(user);
-
-    expect(await screen.findByRole("alert")).toHaveTextContent("还不能确认这个模型是否添加成功。请刷新列表查看状态。");
-    expect(screen.queryByText("已添加到 Codex。重启 Codex 后即可使用。")).not.toBeInTheDocument();
-    const row = screen.getByTestId("upstream-model-vendor/model-latest");
-    expect(within(row).queryByText("已添加到 Codex")).not.toBeInTheDocument();
-    expect(within(row).queryByText("文字测试可用")).not.toBeInTheDocument();
-    expect(within(row).getByRole("button", { name: "自动检测" })).toBeInTheDocument();
-  });
-
-  it("clears the old availability badge when Add outcome is unconfirmed and state reread fails", async () => {
-    const user = userEvent.setup();
-    api.gatewayModelProbe
-      .mockResolvedValueOnce(listing)
-      .mockResolvedValueOnce({
-        ...listing,
-        status: "passed",
-        generatedRequests: 1,
-        connectivityModelId: "vendor/model-latest",
-        connectivityProofId: "proof-state-read-fails",
-        reasoningProofId: "proof-state-read-fails",
-        reasoningResults: [{ effort: "medium", status: "accepted_by_route", errorCode: null }],
-        checkedAt: Math.floor(Date.now() / 1000),
-        connectivityProofExpiresAt: Math.floor(Date.now() / 1000) + 300,
-        results: [{ modelId: "vendor/model-latest", passed: true, generatedRequests: 1,
-          checks: [{ name: "text", passed: true }], errorCode: null }],
-      });
-    let addStarted = false;
-    api.manageNativeModelCatalog.mockImplementation(({ operation }) => {
-      if (operation === "add") {
-        addStarted = true;
-        return Promise.resolve({
-          status: "outcome_unconfirmed", modelIds: [], restartRequired: true,
-          message: "unconfirmed",
-        });
+      .mockResolvedValueOnce(passedProbe());
+    api.manageNativeModelCatalog.mockImplementation(async (request) => {
+      if (request.operation === "prepare") return ready;
+      if (request.operation === "add") {
+        addAttempts += 1;
+        return addAttempts <= 3 ? { ...ready, status: "precommit_retryable", retryable: true } : added;
       }
-      if (addStarted) return Promise.reject(new Error("state read failed"));
-      return Promise.resolve(catalogState);
+      return { ...ready, status: "ok", modelIds: [] };
     });
-
     renderSheet();
-    await screen.findByText("vendor/model-latest");
-    await runReasoningProbe(user);
-    await confirmAddModel(user);
 
-    expect(await screen.findByText("模型设置暂不可用。请刷新列表，或恢复 Codex 默认模型后再试。"))
-      .toBeInTheDocument();
-    const row = screen.getByTestId("upstream-model-vendor/model-latest");
-    expect(within(row).getByText("还没测试")).toBeInTheDocument();
-    expect(within(row).queryByText("文字测试可用")).not.toBeInTheDocument();
-    expect(within(row).queryByText("已添加到 Codex")).not.toBeInTheDocument();
-  });
+    await clickProbeAndAdd(user);
 
-  it("never offers Add after a failed quick test and revokes a passed ticket on close", async () => {
-    const user = userEvent.setup();
-    api.gatewayModelProbe
-      .mockResolvedValueOnce(listing)
-      .mockResolvedValueOnce({
-        ...listing,
-        status: "failed",
-        generatedRequests: 1,
-        connectivityModelId: "vendor/model-latest",
-        results: [{
-          modelId: "vendor/model-latest", passed: false, generatedRequests: 1,
-          checks: [{ name: "text", passed: false }], errorCode: "upstream-http",
-        }],
-        errorCode: "upstream-http",
-      })
-      .mockResolvedValueOnce({
-        ...listing,
-        status: "passed",
-        generatedRequests: 1,
-        connectivityModelId: "vendor/model-latest",
-        connectivityProofId: "proof-close",
-        reasoningProofId: "proof-close",
-        reasoningResults: [{ effort: "medium", status: "accepted_by_route", errorCode: null }],
-        checkedAt: Math.floor(Date.now() / 1000),
-        connectivityProofExpiresAt: Math.floor(Date.now() / 1000) + 300,
-        results: [{
-          modelId: "vendor/model-latest", passed: true, generatedRequests: 1,
-          checks: [{ name: "text", passed: true }], errorCode: null,
-        }],
-      });
-    renderSheet();
-    await screen.findByText("vendor/model-latest");
-    await user.click(screen.getByRole("button", { name: "自动检测" }));
-    await screen.findByRole("alert");
-    expect(screen.queryByRole("button", { name: "添加到 Codex" })).not.toBeInTheDocument();
-
-    await runReasoningProbe(user);
-    await screen.findByRole("button", { name: "确认添加到 Codex" });
-    const successfulRequestId = api.gatewayModelProbe.mock.calls[2]?.[0].requestId;
-    await user.click(screen.getByRole("button", { name: "关闭" }));
-    await waitFor(() => expect(api.cancelGatewayModelProbe).toHaveBeenCalledWith(successfulRequestId));
-  });
-
-  it("cancels outstanding tickets before resetting to the native catalog", async () => {
-    const user = userEvent.setup();
-    api.gatewayModelProbe
-      .mockResolvedValueOnce(listing)
-      .mockResolvedValueOnce({
-        ...listing,
-        status: "passed",
-        generatedRequests: 1,
-        connectivityModelId: "vendor/model-latest",
-        connectivityProofId: "proof-reset",
-        reasoningProofId: "proof-reset",
-        reasoningResults: [{ effort: "medium", status: "accepted_by_route", errorCode: null }],
-        checkedAt: Math.floor(Date.now() / 1000),
-        connectivityProofExpiresAt: Math.floor(Date.now() / 1000) + 300,
-        results: [{
-          modelId: "vendor/model-latest", passed: true, generatedRequests: 1,
-          checks: [{ name: "text", passed: true }], errorCode: null,
-        }],
-      });
-    api.manageNativeModelCatalog
-      .mockResolvedValueOnce(catalogState)
-      .mockResolvedValueOnce(catalogState)
-      .mockResolvedValueOnce({ status: "applied_restart_pending", modelIds: [], restartRequired: true, message: "native restored" })
-      .mockResolvedValueOnce(catalogState);
-
-    renderSheet();
-    await screen.findByText("vendor/model-latest");
-    await runReasoningProbe(user);
-    await screen.findByRole("button", { name: "确认添加到 Codex" });
-    const testedRequestId = api.gatewayModelProbe.mock.calls[1]?.[0].requestId;
-    await user.click(screen.getByRole("button", { name: "恢复 Codex 默认模型" }));
-
-    await waitFor(() => expect(api.manageNativeModelCatalog).toHaveBeenCalledTimes(4));
-    expect(api.cancelGatewayModelProbe).toHaveBeenCalledWith(testedRequestId);
-    expect(api.manageNativeModelCatalog.mock.calls[2]?.[0]).toEqual({ operation: "reset" });
-    expect(await screen.findByText("已恢复 Codex 默认模型。重启 Codex 后生效。")).toBeInTheDocument();
-  });
-
-  it("keeps Refresh and Restore disabled while Add is pending", async () => {
-    const user = userEvent.setup();
-    let resolveAdd!: (result: NativeModelCatalogActionReport) => void;
-    const pendingAdd = new Promise<NativeModelCatalogActionReport>((resolve) => {
-      resolveAdd = resolve;
-    });
-    api.gatewayModelProbe
-      .mockResolvedValueOnce(listing)
-      .mockResolvedValueOnce({
-        ...listing,
-        status: "passed",
-        generatedRequests: 1,
-        connectivityModelId: "vendor/model-latest",
-        connectivityProofId: "proof-pending-add",
-        reasoningProofId: "proof-pending-add",
-        reasoningResults: [{ effort: "medium", status: "accepted_by_route", errorCode: null }],
-        checkedAt: Math.floor(Date.now() / 1000),
-        connectivityProofExpiresAt: Math.floor(Date.now() / 1000) + 300,
-        results: [{ modelId: "vendor/model-latest", passed: true, generatedRequests: 1,
-          checks: [{ name: "text", passed: true }], errorCode: null }],
-      });
-    api.manageNativeModelCatalog.mockImplementation(({ operation }) => (
-      operation === "add" ? pendingAdd : Promise.resolve(catalogState)
-    ));
-
-    renderSheet();
-    await screen.findByText("vendor/model-latest");
-    await runReasoningProbe(user);
-    await screen.findByRole("button", { name: "确认添加到 Codex" });
-
-    const reset = screen.getByRole("button", { name: "恢复 Codex 默认模型" });
-    expect(reset).toBeEnabled();
-    await confirmAddModel(user);
-    await waitFor(() => expect(api.manageNativeModelCatalog).toHaveBeenCalledWith(
-      expect.objectContaining({ operation: "add", modelId: "vendor/model-latest" }),
-    ));
-
-    const refresh = screen.getByRole("button", { name: "刷新模型列表" });
-    expect(refresh).toBeDisabled();
-    expect(reset).toBeDisabled();
-    await user.click(refresh);
-    await user.click(reset);
-    expect(api.gatewayModelProbe).toHaveBeenCalledTimes(2);
-    expect(api.manageNativeModelCatalog.mock.calls.filter(([request]) => request.operation === "reset")).toHaveLength(0);
+    const retryButton = await screen.findByRole("button", { name: "重试添加" });
+    expect(addAttempts).toBe(3);
     expect(api.cancelGatewayModelProbe).not.toHaveBeenCalled();
-    expect(screen.getAllByText("正在添加…")).toHaveLength(2);
+    await user.click(retryButton);
 
-    resolveAdd({
-      status: "applied_restart_pending",
-      modelIds: ["vendor/model-latest"],
-      restartRequired: true,
-      message: "added",
-    });
-    api.manageNativeModelCatalog.mockResolvedValueOnce({
-      ...catalogState,
-      modelIds: ["vendor/model-latest"],
-      restartRequired: true,
-    });
-    expect(await screen.findByText("已添加到 Codex。重启 Codex 后即可使用。")).toBeInTheDocument();
-  });
-
-  it("keeps a pending Add alive across close and reopen, then refreshes its result", async () => {
-    const user = userEvent.setup();
-    let resolveAdd!: (result: NativeModelCatalogActionReport) => void;
-    let currentCatalogState: NativeModelCatalogActionReport = catalogState;
-    const pendingAdd = new Promise<NativeModelCatalogActionReport>((resolve) => {
-      resolveAdd = resolve;
-    });
-    api.gatewayModelProbe
-      .mockResolvedValueOnce(listing)
-      .mockResolvedValueOnce({
-        ...listing,
-        status: "passed",
-        generatedRequests: 1,
-        connectivityModelId: "vendor/model-latest",
-        connectivityProofId: "proof-close-pending-add",
-        reasoningProofId: "proof-close-pending-add",
-        reasoningResults: [{ effort: "medium", status: "accepted_by_route", errorCode: null }],
-        checkedAt: Math.floor(Date.now() / 1000),
-        connectivityProofExpiresAt: Math.floor(Date.now() / 1000) + 300,
-        results: [{ modelId: "vendor/model-latest", passed: true, generatedRequests: 1,
-          checks: [{ name: "text", passed: true }], errorCode: null }],
-      });
-    api.manageNativeModelCatalog.mockImplementation(({ operation }) => {
-      if (operation === "add") return pendingAdd;
-      return Promise.resolve(currentCatalogState);
-    });
-
-    renderSheet();
-    await screen.findByText("vendor/model-latest");
-    await runReasoningProbe(user);
-    await screen.findByRole("button", { name: "确认添加到 Codex" });
-    await confirmAddModel(user);
-    await waitFor(() => expect(api.manageNativeModelCatalog).toHaveBeenCalledWith(
-      expect.objectContaining({ operation: "add", modelId: "vendor/model-latest" }),
-    ));
-    const addRequestId = api.manageNativeModelCatalog.mock.calls.find(
-      ([request]) => request.operation === "add",
-    )?.[0].requestId;
-    expect(addRequestId).toBeTruthy();
-
-    await user.click(screen.getByRole("button", { name: "返回首页" }));
-    await user.click(await screen.findByRole("button", { name: "重新打开" }));
-
-    const refresh = screen.getByRole("button", { name: "刷新模型列表" });
-    const reset = screen.getByRole("button", { name: "恢复 Codex 默认模型" });
-    expect(refresh).toBeDisabled();
-    expect(reset).toBeDisabled();
+    await waitFor(() => expect(addAttempts).toBe(4));
     expect(api.gatewayModelProbe).toHaveBeenCalledTimes(2);
-    expect(api.manageNativeModelCatalog.mock.calls.filter(([request]) => request.operation === "reset")).toHaveLength(0);
-    expect(api.cancelGatewayModelProbe).not.toHaveBeenCalledWith(addRequestId);
-
-    currentCatalogState = { ...catalogState, modelIds: ["vendor/model-latest"] };
-    resolveAdd({
-      status: "applied_restart_pending",
-      modelIds: ["vendor/model-latest"],
-      restartRequired: true,
-      message: "added",
-    });
-
-    expect(await screen.findByText("已添加到 Codex。重启 Codex 后即可使用。")).toBeInTheDocument();
-    expect(screen.queryByText("共找到 1 个模型，已添加 1 个")).not.toBeInTheDocument();
-    await waitFor(() => {
-      expect(refresh).toBeEnabled();
-      expect(reset).toBeEnabled();
-    });
-    expect(api.cancelGatewayModelProbe).not.toHaveBeenCalledWith(addRequestId);
+    expect(api.manageNativeModelCatalog).toHaveBeenCalledTimes(6);
+    expect(await screen.findByText("已添加到 Codex")).toBeInTheDocument();
   });
 
-  it("clears the Add ticket when the account or key fingerprint changes", async () => {
+  it("does not add when no effort was explicitly accepted", async () => {
     const user = userEvent.setup();
     api.gatewayModelProbe
       .mockResolvedValueOnce(listing)
-      .mockResolvedValueOnce({
-        ...listing,
-        status: "passed",
-        generatedRequests: 1,
-        connectivityModelId: "vendor/model-latest",
-        connectivityProofId: "proof-stale-binding",
-        reasoningProofId: "proof-stale-binding",
-        reasoningResults: [{ effort: "medium", status: "accepted_by_route", errorCode: null }],
-        checkedAt: Math.floor(Date.now() / 1000),
-        connectivityProofExpiresAt: Math.floor(Date.now() / 1000) + 300,
-        results: [{ modelId: "vendor/model-latest", passed: true, generatedRequests: 1,
-          checks: [{ name: "text", passed: true }], errorCode: null }],
-      });
-    api.manageNativeModelCatalog
-      .mockResolvedValueOnce(catalogState)
-      .mockResolvedValueOnce({ ...catalogState, connectionFingerprint: "changed-binding" });
-
+      .mockResolvedValueOnce({ ...listing, status: "failed", errorCode: "no-effort-accepted", reasoningResults: [] });
     renderSheet();
-    await screen.findByText("vendor/model-latest");
-    await runReasoningProbe(user);
-    await waitFor(() => expect(screen.queryByRole("button", { name: "添加到 Codex" })).not.toBeInTheDocument());
-    expect(await screen.findByText(/账号或服务设置已变化/)).toBeInTheDocument();
+
+    await clickProbeAndAdd(user);
+
+    await waitFor(() => expect(api.gatewayModelProbe).toHaveBeenCalledTimes(2));
+    expect(api.manageNativeModelCatalog).not.toHaveBeenCalledWith(expect.objectContaining({ operation: "add" }));
   });
 
-  it("removes Add when the short-lived proof expires", async () => {
+  it("stops before paid probes when local preparation reports a duplicate", async () => {
     const user = userEvent.setup();
-    api.gatewayModelProbe
-      .mockResolvedValueOnce(listing)
-      .mockResolvedValueOnce({
-        ...listing,
-        status: "passed",
-        generatedRequests: 1,
-        connectivityModelId: "vendor/model-latest",
-        connectivityProofId: "proof-expiring",
-        reasoningProofId: "proof-expiring",
-        reasoningResults: [{ effort: "medium", status: "accepted_by_route", errorCode: null }],
-        checkedAt: Math.floor(Date.now() / 1000),
-        connectivityProofExpiresAt: Math.floor(Date.now() / 1000) + 1,
-        results: [{ modelId: "vendor/model-latest", passed: true, generatedRequests: 1,
-          checks: [{ name: "text", passed: true }], errorCode: null }],
-      });
-
+    api.manageNativeModelCatalog.mockImplementation(async (request) => request.operation === "prepare"
+      ? { ...ready, status: "already_added", modelIds: ["gpt-5", "vendor/model-latest"] }
+      : request.operation === "add" ? added : { ...ready, status: "ok", modelIds: [] });
     renderSheet();
-    await screen.findByText("vendor/model-latest");
-    await runReasoningProbe(user);
-    await screen.findByRole("button", { name: "确认添加到 Codex" }, { timeout: 800 });
-    await waitFor(() => expect(screen.queryByRole("button", { name: "添加到 Codex" })).not.toBeInTheDocument(), { timeout: 2500 });
+
+    await clickProbeAndAdd(user);
+
+    expect(api.gatewayModelProbe).toHaveBeenCalledTimes(1);
+    expect(api.manageNativeModelCatalog).not.toHaveBeenCalledWith(expect.objectContaining({ operation: "add" }));
   });
 
-  it("blocks discovery actions while an orphaned catalog needs reset", async () => {
-    api.manageNativeModelCatalog.mockResolvedValue({
-      ...catalogState, status: "orphaned", message: "reset required", modelIds: [],
+  it("treats a detached existing catalog that was reattached during prepare as active", async () => {
+    const user = userEvent.setup();
+    api.manageNativeModelCatalog.mockImplementation(async (request) => request.operation === "prepare"
+      ? { ...ready, status: "applied_restart_pending", modelIds: ["gpt-5", "vendor/model-latest"] }
+      : { ...ready, status: "ok", modelIds: [] });
+    renderSheet();
+
+    await clickProbeAndAdd(user);
+
+    expect(api.gatewayModelProbe).toHaveBeenCalledTimes(1);
+    expect(api.manageNativeModelCatalog).not.toHaveBeenCalledWith(expect.objectContaining({ operation: "add" }));
+    expect(await screen.findByText("已添加到 Codex")).toBeInTheDocument();
+  });
+
+  it("does not begin paid probes if local prerequisites fail", async () => {
+    const user = userEvent.setup();
+    api.manageNativeModelCatalog.mockImplementation(async (request) => {
+      if (request.operation === "prepare") throw new Error("local catalog conflict");
+      return { ...ready, status: "ok", modelIds: [] };
     });
+    api.gatewayModelProbe.mockResolvedValue(listing);
     renderSheet();
-    await screen.findByRole("alert");
-    const row = screen.getByTestId("upstream-model-vendor/model-latest");
-    const testButton = within(row).getByRole("button", { name: "自动检测" });
-    expect(testButton).toBeDisabled();
-    expect(testButton).toHaveAttribute("aria-describedby");
-    expect(screen.getByText("发现未完成的模型设置。请先恢复 Codex 默认模型，再继续。")).toHaveAttribute(
-      "id",
-      testButton.getAttribute("aria-describedby"),
-    );
-    expect(screen.getByRole("button", { name: "恢复 Codex 默认模型" })).toBeInTheDocument();
+
+    await clickProbeAndAdd(user);
+
+    expect(api.gatewayModelProbe).toHaveBeenCalledTimes(1);
+    expect(api.manageNativeModelCatalog).not.toHaveBeenCalledWith(expect.objectContaining({ operation: "add" }));
+    expect(await screen.findByText("local catalog conflict")).toBeInTheDocument();
   });
 
-  it("shows why a non-selectable model cannot be tested", async () => {
-    api.gatewayModelProbe.mockResolvedValue({
-      ...listing,
-      models: [{ id: "vendor/model-latest", ownedBy: "fixture", selectable: false }],
+  it("reports commit errors instead of claiming an uncommitted model was added", async () => {
+    const user = userEvent.setup();
+    api.manageNativeModelCatalog.mockImplementation(async (request) => {
+      if (request.operation === "prepare") return ready;
+      if (request.operation === "state") return { ...ready, status: "ok", modelIds: ["gpt-5"] };
+      if (request.operation === "add") return { ...ready, status: "failed", modelIds: [], message: "write blocked" };
+      return { ...ready, status: "ok", modelIds: [] };
     });
-
-    renderSheet();
-    const row = await screen.findByTestId("upstream-model-vendor/model-latest");
-    const testButton = await within(row).findByRole("button", { name: "自动检测" });
-    expect(testButton).toBeDisabled();
-    const reasonId = testButton.getAttribute("aria-describedby");
-    expect(reasonId).toBeTruthy();
-    expect(document.getElementById(reasonId!)).toHaveTextContent("模型重复，不能添加");
-  });
-
-  it("refreshes state after resetting an orphaned catalog and enables model testing", async () => {
-    const user = userEvent.setup();
-    api.manageNativeModelCatalog
-      .mockResolvedValueOnce({ ...catalogState, status: "orphaned", message: "reset required" })
-      .mockResolvedValueOnce({ status: "applied_restart_pending", modelIds: [], restartRequired: true, message: "native restored" })
-      .mockResolvedValueOnce(catalogState);
-
-    renderSheet();
-    await screen.findByRole("alert");
-    await user.click(screen.getByRole("button", { name: "恢复 Codex 默认模型" }));
-
-    expect(await screen.findByRole("button", { name: "自动检测" })).toBeInTheDocument();
-    expect(api.manageNativeModelCatalog.mock.calls[2]?.[0]).toEqual({ operation: "state" });
-  });
-
-  it("revokes the original proof request and rereads state after Add fails", async () => {
-    const user = userEvent.setup();
     api.gatewayModelProbe
       .mockResolvedValueOnce(listing)
-      .mockResolvedValueOnce({
-        ...listing,
-        status: "passed",
-        generatedRequests: 1,
-        connectivityModelId: "vendor/model-latest",
-        connectivityProofId: "proof-failed-add",
-        reasoningProofId: "proof-failed-add",
-        reasoningResults: [{ effort: "medium", status: "accepted_by_route", errorCode: null }],
-        checkedAt: Math.floor(Date.now() / 1000),
-        connectivityProofExpiresAt: Math.floor(Date.now() / 1000) + 300,
-        results: [{ modelId: "vendor/model-latest", passed: true, generatedRequests: 1,
-          checks: [{ name: "text", passed: true }], errorCode: null }],
-      });
-    api.manageNativeModelCatalog
-      .mockResolvedValueOnce(catalogState)
-      .mockResolvedValueOnce(catalogState)
-      .mockRejectedValueOnce(new Error("upstream recheck failed"))
-      .mockResolvedValueOnce({ ...catalogState, status: "orphaned", message: "reset required" });
-
+      .mockResolvedValueOnce(passedProbe());
     renderSheet();
-    await screen.findByText("vendor/model-latest");
-    await runReasoningProbe(user);
-    await confirmAddModel(user);
 
-    const testedRequestId = api.gatewayModelProbe.mock.calls[1]?.[0].requestId;
-    await waitFor(() => expect(api.cancelGatewayModelProbe).toHaveBeenCalledWith(testedRequestId));
-    expect(api.manageNativeModelCatalog.mock.calls[3]?.[0]).toEqual({ operation: "state" });
-    expect(screen.getByRole("button", { name: "自动检测" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "恢复 Codex 默认模型" })).toBeInTheDocument();
-    const row = screen.getByTestId("upstream-model-vendor/model-latest");
-    expect(within(row).getByText("还没测试")).toBeInTheDocument();
-    expect(within(row).queryByText("文字测试可用")).not.toBeInTheDocument();
+    await clickProbeAndAdd(user);
+
+    expect(await screen.findByText("write blocked")).toBeInTheDocument();
+    expect(screen.queryByText("已添加到 Codex")).not.toBeInTheDocument();
+    expect(screen.getByTestId("upstream-model-configured-only-gpt-5")).toBeInTheDocument();
   });
 
-  it("keeps Test and Add disabled when a partial Reset rereads as orphaned", async () => {
+  it("refreshes the catalog after Add throws so a committed model is not shown as missing", async () => {
     const user = userEvent.setup();
-    api.manageNativeModelCatalog
-      .mockResolvedValueOnce(catalogState)
-      .mockResolvedValueOnce({
-        status: "cleanup_pending", modelIds: [], restartRequired: true,
-        message: "Codex native catalog restored; cleanup pending",
-      })
-      .mockResolvedValueOnce({
-        ...catalogState, status: "orphaned", modelIds: [], message: "reset required",
-      });
-
-    renderSheet();
-    await screen.findByText("vendor/model-latest");
-    await user.click(screen.getByRole("button", { name: "恢复 Codex 默认模型" }));
-
-    await screen.findByRole("alert");
-    expect(screen.getByRole("button", { name: "自动检测" })).toBeDisabled();
-    expect(screen.queryByRole("button", { name: "添加到 Codex" })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "恢复 Codex 默认模型" })).toBeInTheDocument();
-    const row = screen.getByTestId("upstream-model-vendor/model-latest");
-    expect(within(row).getByText("还没测试")).toBeInTheDocument();
-    expect(within(row).queryByText("文字测试可用")).not.toBeInTheDocument();
-  });
-
-  it("keeps only Reset when a partial Add rereads as orphaned", async () => {
-    const user = userEvent.setup();
+    let stateReads = 0;
+    api.manageNativeModelCatalog.mockImplementation(async (request) => {
+      if (request.operation === "prepare") return ready;
+      if (request.operation === "state") {
+        stateReads += 1;
+        return {
+          ...ready,
+          status: "ok",
+          modelIds: stateReads > 1 ? ["gpt-5", "vendor/model-latest"] : ["gpt-5"],
+        };
+      }
+      if (request.operation === "add") throw new Error("connection lost after write");
+      return { ...ready, status: "ok", modelIds: ["gpt-5"] };
+    });
     api.gatewayModelProbe
       .mockResolvedValueOnce(listing)
-      .mockResolvedValueOnce({
-        ...listing,
-        status: "passed",
-        generatedRequests: 1,
-        connectivityModelId: "vendor/model-latest",
-        connectivityProofId: "proof-add-cleanup-pending",
-        reasoningProofId: "proof-add-cleanup-pending",
-        reasoningResults: [{ effort: "medium", status: "accepted_by_route", errorCode: null }],
-        checkedAt: Math.floor(Date.now() / 1000),
-        connectivityProofExpiresAt: Math.floor(Date.now() / 1000) + 300,
-        results: [{ modelId: "vendor/model-latest", passed: true, generatedRequests: 1,
-          checks: [{ name: "text", passed: true }], errorCode: null }],
-      });
-    api.manageNativeModelCatalog
-      .mockResolvedValueOnce(catalogState)
-      .mockResolvedValueOnce(catalogState)
-      .mockResolvedValueOnce({
-        status: "cleanup_pending", modelIds: [], restartRequired: true,
-        message: "Add cleanup pending",
-      })
-      .mockResolvedValueOnce({
-        ...catalogState, status: "orphaned", modelIds: [], message: "reset required",
-      });
-
+      .mockResolvedValueOnce(passedProbe());
     renderSheet();
-    await screen.findByText("vendor/model-latest");
-    await runReasoningProbe(user);
-    await confirmAddModel(user);
 
-    await screen.findByText("发现未完成的模型设置。请先恢复 Codex 默认模型，再继续。");
-    expect(screen.getByRole("button", { name: "自动检测" })).toBeDisabled();
-    expect(screen.queryByRole("button", { name: "添加到 Codex" })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "恢复 Codex 默认模型" })).toBeInTheDocument();
-    const row = screen.getByTestId("upstream-model-vendor/model-latest");
-    expect(within(row).getByText("还没测试")).toBeInTheDocument();
-    expect(within(row).queryByText("文字测试可用")).not.toBeInTheDocument();
+    await clickProbeAndAdd(user);
+
+    expect(await screen.findByText("connection lost after write")).toBeInTheDocument();
+    await waitFor(() => expect(stateReads).toBe(2));
+    const modelRow = screen.getByTestId("upstream-model-vendor/model-latest");
+    expect(within(modelRow).getByText("已添加到 Codex")).toBeInTheDocument();
   });
 });

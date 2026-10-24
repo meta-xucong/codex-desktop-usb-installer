@@ -37,6 +37,10 @@ impl NetworkConfig {
         }
     }
 
+    pub(crate) fn uses_system_proxy(&self) -> bool {
+        matches!(self.proxy_mode, ProxyMode::System)
+    }
+
     pub(crate) fn curl_args(&self) -> Vec<String> {
         match &self.proxy_mode {
             ProxyMode::System => Vec::new(),

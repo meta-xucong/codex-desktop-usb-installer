@@ -805,7 +805,7 @@ export function OfflineHome({
             ([name, model]) => name !== "mediaGenerationAgentId" && Boolean(model),
           );
         } catch {
-          console.warn("[media-mcp] model catalog lookup failed; media MCP will remain disabled");
+          console.warn("[media-mcp] model catalog lookup failed; MCP registration will continue with saved or default settings");
           try {
             const saved = await managerApi.mediaModelSettings();
             mediaModels = {
@@ -833,7 +833,9 @@ export function OfflineHome({
           // media models are stale. Preserve those user slots for retry.
           persistConnections: mediaCatalogStatus === "verified",
           ...mediaModels,
-          enableMediaGeneration: mediaModelsAvailable,
+          // Register the local MCP regardless of upstream catalog availability.
+          // The installer supplies its default image route when no model is selected.
+          enableMediaGeneration: true,
           mediaGatewayCatalogStatus: mediaCatalogStatus,
           mediaGatewayModelCount,
           mediaGatewayCatalogVerifiedAt,
@@ -865,9 +867,9 @@ export function OfflineHome({
       } else if (!mediaModelsAvailable) {
         const mediaMessage = mediaCatalogStatus === "failed"
           ? "无法读取上游模型目录"
-          : "上游暂未返回可用的图片或视频模型";
+          : "上游暂未返回可识别的图片或视频模型";
         setInstallationDetail(
-          `${result.message}\n${mediaMessage}，媒体 MCP 未启用；其余能力包已继续安装。可在“连接与扩展”重新检测后启用。`,
+          `${result.message}\n${mediaMessage}，媒体 MCP 已注册；可在“连接与扩展”重新检测模型。`,
         );
       } else if (mediaCatalogStatus === "failed") {
         setInstallationDetail(
@@ -904,8 +906,8 @@ export function OfflineHome({
       if (!mediaModelsAvailable) {
         notices.push(
           mediaCatalogStatus === "failed"
-            ? "媒体生成暂未启用：无法读取上游模型目录，可在“连接与扩展”重试。"
-            : "媒体生成暂未启用：未发现可用模型，可在“连接与扩展”重新检测。",
+            ? "媒体 MCP 已注册：当前无法读取上游模型目录，可在“连接与扩展”重试检测。"
+            : "媒体 MCP 已注册：当前未发现可识别模型，可在“连接与扩展”重新检测。",
         );
       } else if (mediaCatalogStatus === "failed") {
         notices.push("上游模型目录暂不可读，本次继续使用已有媒体模型设置。");

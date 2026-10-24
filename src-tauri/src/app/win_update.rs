@@ -743,6 +743,25 @@ fn is_current_usb_portable(installed: &InstalledWindowsCodex) -> bool {
     })
 }
 
+/// A local provenance record does not travel with a USB drive. Only the
+/// confirmed bundle-uninstall route may substitute live signed USB ownership
+/// for that missing record. The resolver must verify the bundle, lease and
+/// non-reparse destination; a renderer path or cached status is not authority.
+fn authorize_portable_bundle_uninstall<F>(
+    installed: &InstalledWindowsCodex,
+    bundle_uninstall: bool,
+    authorize: F,
+) -> Result<bool, AppError>
+where
+    F: FnOnce() -> Result<Option<PathBuf>, AppError>,
+{
+    if !bundle_uninstall || installed.source != "portable" {
+        return Ok(false);
+    }
+    Ok(authorize()?
+        .is_some_and(|root| codex_win_engine::same_windows_path(Path::new(&installed.path), &root)))
+}
+
 fn validate_usb_launch_target(
     installed: &InstalledWindowsCodex,
     authorized_codex_root: &Path,
@@ -875,6 +894,29 @@ pub(crate) fn complete_usb_model_catalog_launch(reload_marker: Option<&[u8]>) {
             log::warn!("could not clear applied model catalog reload marker: {error}");
         }
     }
+}
+
+/// Make the USB-managed runtime wrappers the first commands resolved by the
+/// Codex process and its shell children. This is process-local: it does not
+/// change the user's persistent PATH or affect ordinary Codex launches.
+fn usb_runtime_environment(codex_home: &Path) -> Vec<(String, String)> {
+    let mut environment = vec![
+        ("PYTHONUTF8".to_string(), "1".to_string()),
+        ("PYTHONIOENCODING".to_string(), "utf-8".to_string()),
+    ];
+
+    let runtime_bin = codex_home.join("codex-agent-kit").join("bin");
+    if runtime_bin.is_dir() {
+        let current_path = std::env::var_os("PATH").unwrap_or_default();
+        let paths = std::iter::once(runtime_bin)
+            .chain(std::env::split_paths(&current_path))
+            .collect::<Vec<_>>();
+        if let Ok(path) = std::env::join_paths(paths) {
+            environment.push(("PATH".to_string(), path.to_string_lossy().into_owned()));
+        }
+    }
+
+    environment
 }
 
 pub fn plan_windows_update(
@@ -3191,11 +3233,17 @@ pub fn launch_codex(settings: &AppSettings, codex_locale: Option<&str>) -> Resul
     let direct_entry_required = usb_authorization
         .as_ref()
         .is_some_and(|authorization| authorization.direct_entry_required);
-    let media_environment = if usb_mode {
-        crate::app::media_generation::usb_launch_environment()
+    let mut launch_environment = if usb_mode {
+        codex_home
+            .as_deref()
+            .map(usb_runtime_environment)
+            .unwrap_or_default()
     } else {
         Vec::new()
     };
+    if usb_mode {
+        launch_environment.extend(crate::app::media_generation::usb_launch_environment());
+    }
     let report = codex_win_engine::launch_codex_with_options(
         &installed,
         codex_win_engine::LaunchOptions {
@@ -3203,7 +3251,7 @@ pub fn launch_codex(settings: &AppSettings, codex_locale: Option<&str>) -> Resul
             // place. Scope this to the launched child instead of changing the
             // user's global setting for an unrelated official installation.
             disable_codex_self_updates: settings.disable_codex_self_updates || usb_mode,
-            environment: media_environment,
+            environment: launch_environment,
             usb_integrity_transaction: usb_mode,
             require_usb_entry_overlay: direct_entry_required,
             remote_debugging_port: None,
@@ -3665,19 +3713,28 @@ fn uninstall_windows_codex_impl(
         });
     };
 
-    // Boundary (matching the macOS uninstall): the normal manager refuses to
-    // delete anything that isn't an install we manage at this exact build.
-    // The USB bundle is the one explicit, user-confirmed exception: when the
-    // current-user package is an OpenAI.Codex MSIX but its provenance record is
-    // missing, it may remove that registration because an earlier installer
-    // can have failed before persisting provenance. Path-only matching could
-    // otherwise delete a path-reused external install or one left by a stale
-    // record — more likely now that the install root is user-configurable.
+    // Keep exact-build provenance for ordinary installs. A confirmed USB
+    // uninstall also accepts this drive's portable tree after LIVE signed
+    // authorization: another computer has no local provenance for that tree.
+    // The existing current-user MSIX exception remains unchanged.
     let managed_build = store.is_managed_build(
         &installed_before.path,
         version_key(&installed_before.version),
     );
-    if !(managed_build || allow_external_msix && installed_before.source == "msix") {
+    let current_usb_portable = !managed_build
+        && authorize_portable_bundle_uninstall(&installed_before, allow_external_msix, || {
+            if !is_current_usb_portable(&installed_before) {
+                return Ok(None);
+            }
+            Ok(
+                usb_guard::require_signed_codex_bundle("codex-uninstall-destination")?
+                    .map(|authorization| authorization.codex_root),
+            )
+        })?;
+    if !(managed_build
+        || current_usb_portable
+        || allow_external_msix && installed_before.source == "msix")
+    {
         log::warn!("Windows uninstall rejected external install");
         return Ok(WinUninstallReport {
             success: false,
@@ -3696,7 +3753,13 @@ fn uninstall_windows_codex_impl(
             ),
         });
     }
-    if !managed_build {
+    if current_usb_portable {
+        log::info!(
+            "USB bundle uninstall authorized current portable without local provenance path={} version={}",
+            installed_before.path,
+            installed_before.version
+        );
+    } else if !managed_build {
         log::warn!(
             "USB bundle uninstall explicitly removing current-user external MSIX path={} version={}",
             installed_before.path,
@@ -4009,6 +4072,37 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn usb_runtime_environment_prefers_managed_bin_and_enables_utf8_python() {
+        let root = temp_test_dir("usb-runtime-environment");
+        let codex_home = root.join("codex-home");
+        let runtime_bin = codex_home.join("codex-agent-kit").join("bin");
+        std::fs::create_dir_all(&runtime_bin).unwrap();
+        let original_path = std::env::var_os("PATH").unwrap_or_default();
+
+        let environment = super::usb_runtime_environment(&codex_home);
+        let configured_path = environment
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("PATH"))
+            .map(|(_, value)| value)
+            .expect("USB launch should include managed runtime PATH");
+        let path_entries = std::env::split_paths(std::ffi::OsStr::new(configured_path))
+            .collect::<Vec<_>>();
+        assert_eq!(path_entries.first(), Some(&runtime_bin));
+        assert_eq!(
+            &path_entries[1..],
+            std::env::split_paths(&original_path).collect::<Vec<_>>()
+        );
+        assert!(environment
+            .iter()
+            .any(|(name, value)| { name == "PYTHONUTF8" && value == "1" }));
+        assert!(environment
+            .iter()
+            .any(|(name, value)| { name == "PYTHONIOENCODING" && value == "utf-8" }));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn model_catalog_reload_skips_process_inspection_when_no_marker_is_pending() {
         let inspected = std::cell::Cell::new(false);
@@ -4494,6 +4588,113 @@ mod tests {
             ),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn cross_machine_usb_uninstall_accepts_live_bundle_without_local_record() {
+        let root = temp_test_dir("cross-machine-usb-uninstall");
+        write_fake_portable_install(&root, "26.1002.7124.0");
+        let installed = detect_existing_windows_install_at_path(&root).unwrap();
+        let store = ProvenanceStore::default();
+        assert!(!store.is_managed_build(
+            &installed.path,
+            codex_win_engine::version_key(&installed.version)
+        ));
+        assert!(
+            super::authorize_portable_bundle_uninstall(&installed, true, || {
+                Ok(Some(root.clone()))
+            })
+            .unwrap()
+        );
+        // Authorization alone performs no uninstall and creates no provenance.
+        assert!(root.join("Codex.exe").is_file());
+        assert!(store.managed.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cross_machine_usb_uninstall_requires_exact_current_root_after_drive_change() {
+        let installed = InstalledWindowsCodex {
+            path: r"G:\kit\apps\Codex".into(),
+            version: "26.1002.7124.0".into(),
+            arch: Some("x64".into()),
+            source: "portable".into(),
+            package_family_name: None,
+            package_volume: None,
+            installed_at: None,
+        };
+        for (root, accepted) in [
+            (r"g:\kit\apps\codex", true),
+            (r"F:\kit\apps\Codex", false),
+            (r"G:\other-kit\apps\Codex", false),
+            (r"G:\kit\apps\Codex-old", false),
+            (r"G:\kit\apps", false),
+        ] {
+            assert_eq!(
+                super::authorize_portable_bundle_uninstall(&installed, true, || {
+                    Ok(Some(PathBuf::from(root)))
+                })
+                .unwrap(),
+                accepted,
+                "root={root}"
+            );
+        }
+    }
+
+    #[test]
+    fn cross_machine_usb_uninstall_does_not_broaden_normal_manager_or_msix() {
+        let mut installed = InstalledWindowsCodex {
+            path: r"F:\kit\apps\Codex".into(),
+            version: "26.1002.7124.0".into(),
+            arch: Some("x64".into()),
+            source: "portable".into(),
+            package_family_name: None,
+            package_volume: None,
+            installed_at: None,
+        };
+        assert!(
+            !super::authorize_portable_bundle_uninstall(&installed, false, || {
+                panic!("ordinary manager must not use USB exception")
+            })
+            .unwrap()
+        );
+        for source in ["msix", "unknown"] {
+            installed.source = source.into();
+            assert!(
+                !super::authorize_portable_bundle_uninstall(&installed, true, || {
+                    panic!("non-portable installs must retain their own policy")
+                })
+                .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn cross_machine_usb_uninstall_rejects_missing_or_failed_live_authorization() {
+        let installed = InstalledWindowsCodex {
+            path: r"F:\kit\apps\Codex".into(),
+            version: "26.1002.7124.0".into(),
+            arch: Some("x64".into()),
+            source: "portable".into(),
+            package_family_name: None,
+            package_volume: None,
+            installed_at: None,
+        };
+        assert!(
+            !super::authorize_portable_bundle_uninstall(&installed, true, || Ok(None)).unwrap()
+        );
+        for reason in [
+            "license invalid",
+            "watchdog stopped",
+            "USB removed",
+            "reparse point",
+        ] {
+            let error = super::authorize_portable_bundle_uninstall(&installed, true, || {
+                Err(crate::errors::AppError::Engine(reason.into()))
+            })
+            .unwrap_err();
+            assert!(error.to_string().contains(reason));
+        }
     }
 
     #[test]

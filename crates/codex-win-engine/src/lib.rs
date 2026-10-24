@@ -70,11 +70,12 @@ pub use portable::{
 pub use sys::{
     close_msix_codex_processes, detect_installed_codex, detect_portable_install, fetch_text,
     fetch_text_with_network, fetch_text_with_network_no_redirect, launch_codex,
-    launch_codex_with_options, probe_capabilities, probe_msix_machine_state,
-    registered_msix_package_full_name, remove_exact_msix_machine_orphan_with_volume,
-    remove_msix_package, remove_msix_package_with_options, remove_msix_package_with_volume,
-    CodexLaunchReport, InstalledWindowsCodex, LaunchOptions, MsixMachineStateReport,
-    MsixRemoveReport, PortableLaunchPolicy,
+    launch_codex_with_options, probe_capabilities, probe_https_reachable_with_network,
+    probe_msix_machine_state, registered_msix_package_full_name,
+    remove_exact_msix_machine_orphan_with_volume, remove_msix_package,
+    remove_msix_package_with_options, remove_msix_package_with_volume, CodexLaunchReport,
+    InstalledWindowsCodex, LaunchOptions, MsixMachineStateReport, MsixRemoveReport,
+    PortableLaunchPolicy,
 };
 pub use sys::{
     install_msix_sideload, install_msix_sideload_with_observer,

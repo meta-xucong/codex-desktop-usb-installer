@@ -713,7 +713,7 @@ class MediaGenerationMcpTests(unittest.TestCase):
         with adapter_environment(self.env):
             capabilities = self.module._configured()
             self.assertFalse(capabilities["providers"]["minimax-video"]["configured"])
-            with self.assertRaisesRegex(self.module.MediaError, "尚未配置 MiniMax 视频模型"):
+            with self.assertRaisesRegex(self.module.MediaError, "MiniMax 视频 provider 当前不可用"):
                 self.module.media_prepare({"provider": "minimax-video", "prompt": "No fallback"})
 
         env = dict(
@@ -723,15 +723,10 @@ class MediaGenerationMcpTests(unittest.TestCase):
             MEDIA_MINIMAX_VIDEO_MODEL="upstream-minimax-video",
         )
         with adapter_environment(env):
-            prepared = self.module.media_prepare({"provider": "minimax-video", "prompt": "Use the configured shared-upstream model"})
-            self.assertEqual(prepared["model"], "upstream-minimax-video")
-            record = self.module._load_json(self.data_dir / "confirmations" / f"{prepared['confirmation_id']}.json")
-            path, payload = self.module._request_payload(record["request"])
-            self.assertEqual(path, "/v1/videos")
-            self.assertEqual(payload["model"], "upstream-minimax-video")
-            self.assertEqual(self.module._query_path("minimax-video", "minimax-task"), "/v1/videos/minimax-task")
-            with self.assertRaisesRegex(self.module.MediaError, "明确配置"):
-                self.module.media_prepare({"provider": "minimax-video", "model": "unconfigured-model", "prompt": "No model override"})
+            capabilities = self.module._configured()
+            self.assertFalse(capabilities["providers"]["minimax-video"]["configured"])
+            with self.assertRaisesRegex(self.module.MediaError, "MiniMax 视频 provider 当前不可用"):
+                self.module.media_prepare({"provider": "minimax-video", "prompt": "Configured model must not imply an adapter"})
 
     def test_provider_payloads_and_mcp_stdio_contract(self):
         with adapter_environment(self.env):
@@ -906,9 +901,17 @@ class MediaGenerationMcpTests(unittest.TestCase):
             self.assertIsNone(requests[2].get_header("Authorization"))
 
     def test_completed_task_can_be_saved_after_local_reference_is_deleted(self):
+        def png_chunk(name, body):
+            return struct.pack(">I", len(body)) + name + body + struct.pack(">I", zlib.crc32(name + body) & 0xFFFFFFFF)
+
         source = self.data_dir / "reference.png"
         source.parent.mkdir(parents=True, exist_ok=True)
-        source.write_bytes(b"test-image-bytes")
+        source.write_bytes(
+            b"\x89PNG\r\n\x1a\n"
+            + png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+            + png_chunk(b"IDAT", zlib.compress(b"\x00\xff\x00\x00"))
+            + png_chunk(b"IEND", b"")
+        )
         with adapter_environment(self.env):
             prepared = self.module.media_prepare({"provider": "image-2", "prompt": "reference recovery", "reference_media": [{"kind": "image", "local_path": str(source)}]})
             path = self.module._confirmation_path(prepared["confirmation_id"])
@@ -1087,10 +1090,13 @@ class RuntimeProvisioningContractTests(unittest.TestCase):
 
     def test_installer_runs_runtime_provisioner_without_a_hidden_powershell_child(self):
         installer = (SCRIPT_ROOT / "install-to-codex.ps1").read_text(encoding="utf-8")
-        self.assertIn("(& $runtimeScript -PackRoot $PackRoot -TargetUserProfile $userProfile -EnableFeishu:$feishuEnabled | Out-String)", installer)
+        self.assertIn("& $runtimeScript @runtimeArguments | Out-String", installer)
+        self.assertIn("if ($feishuEnabled) { $runtimeArguments.EnableFeishu = $true }", installer)
         self.assertIn("& $renderScriptPath @renderArguments", installer)
         self.assertIn("& $configMerger @configArguments", installer)
         self.assertIn("& $modelSyncScript @modelSyncArguments", installer)
+        self.assertIn("$mediaRegistrationVerified = [regex]::IsMatch($mergedConfig", installer)
+        self.assertIn("-and $mediaRegistrationVerified)", installer)
         self.assertNotIn("$powershellCommand.Source @runtimeArguments", installer)
         self.assertNotIn("$powershellCommand.Source @renderArguments", installer)
         self.assertNotIn("$powershellCommand.Source @configArguments", installer)

@@ -384,6 +384,245 @@ pub fn fetch_text_with_network(url: &str, network: &NetworkConfig) -> Result<Str
     fetch_text_with_network_headers(url, network, &[])
 }
 
+/// Check whether an HTTPS request reaches an HTTP server. Any HTTP status,
+/// including 404/5xx, proves network reachability; only transport/TLS failure
+/// is considered offline. The Windows system-proxy path uses WinHTTP so the
+/// current user's proxy and PAC settings are honored.
+pub fn probe_https_reachable_with_network(
+    url: &str,
+    network: &NetworkConfig,
+) -> Result<(), EngineError> {
+    if network.uses_system_proxy() && !has_proxy_environment_override() {
+        #[cfg(windows)]
+        {
+            return probe_https_with_winhttp(url);
+        }
+    }
+
+    let mut command = hidden_command(curl_exe());
+    network
+        .apply_to_command_with_schannel_revocation(&mut command, SchannelRevocationCheck::Strict);
+    command.args([
+        "--silent",
+        "--show-error",
+        "--proto",
+        "=https",
+        "--connect-timeout",
+        "10",
+        "--max-time",
+        "15",
+        "--output",
+        "NUL",
+        "--write-out",
+        "%{http_code}",
+        url,
+    ]);
+    let output = run_capturing(
+        command,
+        RunLimits::total(std::time::Duration::from_secs(20)),
+        None,
+    )
+    .map_err(|e| EngineError::Io(format!("curl network probe: {}", e.message())))?;
+    if !output.status.success() {
+        return Err(EngineError::Io(curl_failure_message(
+            url,
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stderr),
+        )));
+    }
+    let status = String::from_utf8_lossy(&output.stdout);
+    let status = status.trim().parse::<u16>().map_err(|_| {
+        EngineError::Io(format!(
+            "HTTPS request to {} completed without an HTTP status",
+            url_host(url)
+        ))
+    })?;
+    if !is_http_reachable_status(status) {
+        return Err(EngineError::Io(format!(
+            "HTTPS request to {} did not reach the origin (HTTP {status})",
+            url_host(url),
+        )));
+    }
+    Ok(())
+}
+
+fn has_proxy_environment_override() -> bool {
+    ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]
+        .iter()
+        .any(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty()))
+}
+
+fn is_http_reachable_status(status: u16) -> bool {
+    (200..=599).contains(&status) && status != 407
+}
+
+#[cfg(windows)]
+fn probe_https_with_winhttp(url: &str) -> Result<(), EngineError> {
+    use std::{ffi::c_void, ptr};
+    use windows_sys::Win32::Foundation::GetLastError;
+    use windows_sys::Win32::Networking::WinHttp::{
+        WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest, WinHttpQueryHeaders,
+        WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetOption, WinHttpSetTimeouts,
+        ERROR_WINHTTP_LOGIN_FAILURE, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE,
+        WINHTTP_OPTION_REDIRECT_POLICY, WINHTTP_OPTION_REDIRECT_POLICY_NEVER,
+        WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE,
+    };
+
+    fn wide(value: &str) -> Vec<u16> {
+        value.encode_utf16().chain(Some(0)).collect()
+    }
+    struct InternetHandle(*mut c_void);
+    impl Drop for InternetHandle {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { WinHttpCloseHandle(self.0) };
+            }
+        }
+    }
+    fn error(stage: &str, code: u32) -> EngineError {
+        EngineError::Io(format!(
+            "Windows system-proxy HTTPS probe failed at {stage} (WinHTTP error {code})"
+        ))
+    }
+
+    let rest = url
+        .strip_prefix("https://")
+        .ok_or_else(|| EngineError::Io("network probe requires an HTTPS URL".into()))?;
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if authority.is_empty() || authority.contains('@') {
+        return Err(EngineError::Io(
+            "network probe URL has an invalid authority".into(),
+        ));
+    }
+    let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
+        let close = bracketed
+            .find(']')
+            .ok_or_else(|| EngineError::Io("network probe URL has an invalid IPv6 host".into()))?;
+        let host = &bracketed[..close];
+        let suffix = &bracketed[close + 1..];
+        let port = if suffix.is_empty() {
+            443
+        } else {
+            suffix
+                .strip_prefix(':')
+                .ok_or_else(|| EngineError::Io("network probe URL has an invalid port".into()))?
+                .parse::<u16>()
+                .map_err(|_| EngineError::Io("network probe URL has an invalid port".into()))?
+        };
+        (host, port)
+    } else if let Some((host, port)) = authority.rsplit_once(':') {
+        if host.contains(':') {
+            return Err(EngineError::Io(
+                "network probe URL has an invalid IPv6 host".into(),
+            ));
+        }
+        (
+            host,
+            port.parse::<u16>()
+                .map_err(|_| EngineError::Io("network probe URL has an invalid port".into()))?,
+        )
+    } else {
+        (authority, 443)
+    };
+    if host.is_empty() || port == 0 {
+        return Err(EngineError::Io(
+            "network probe URL has an invalid host or port".into(),
+        ));
+    }
+    let path = if authority_end == rest.len() {
+        "/"
+    } else if rest[authority_end..].starts_with('/') {
+        &rest[authority_end..]
+    } else {
+        "/"
+    };
+    let host_w = wide(host);
+    let path_w = wide(path);
+    let agent_w = wide("Codex-App-Manager network preflight");
+    let get_w = wide("GET");
+
+    unsafe {
+        let session = InternetHandle(WinHttpOpen(
+            agent_w.as_ptr(),
+            WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+            ptr::null(),
+            ptr::null(),
+            0,
+        ));
+        if session.0.is_null() {
+            return Err(error("session creation", GetLastError()));
+        }
+        if WinHttpSetTimeouts(session.0, 5000, 10000, 10000, 10000) == 0 {
+            return Err(error("timeout setup", GetLastError()));
+        }
+        let connection = InternetHandle(WinHttpConnect(session.0, host_w.as_ptr(), port, 0));
+        if connection.0.is_null() {
+            return Err(error("connection creation", GetLastError()));
+        }
+        let request = InternetHandle(WinHttpOpenRequest(
+            connection.0,
+            get_w.as_ptr(),
+            path_w.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            WINHTTP_FLAG_SECURE,
+        ));
+        if request.0.is_null() {
+            return Err(error("request creation", GetLastError()));
+        }
+        let redirect_policy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
+        if WinHttpSetOption(
+            request.0,
+            WINHTTP_OPTION_REDIRECT_POLICY,
+            (&redirect_policy as *const u32).cast(),
+            std::mem::size_of_val(&redirect_policy) as u32,
+        ) == 0
+        {
+            return Err(error("redirect policy setup", GetLastError()));
+        }
+        if WinHttpSendRequest(request.0, ptr::null(), 0, ptr::null(), 0, 0, 0) == 0 {
+            let code = GetLastError();
+            if code == ERROR_WINHTTP_LOGIN_FAILURE {
+                return Err(EngineError::Io(
+                    "Windows system proxy authentication failed".into(),
+                ));
+            }
+            return Err(error("request transfer", code));
+        }
+        if WinHttpReceiveResponse(request.0, ptr::null_mut()) == 0 {
+            let code = GetLastError();
+            if code == ERROR_WINHTTP_LOGIN_FAILURE {
+                return Err(EngineError::Io(
+                    "Windows system proxy authentication failed".into(),
+                ));
+            }
+            return Err(error("request transfer", code));
+        }
+        let mut status = 0u32;
+        let mut bytes = std::mem::size_of::<u32>() as u32;
+        if WinHttpQueryHeaders(
+            request.0,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            ptr::null(),
+            (&mut status as *mut u32).cast(),
+            &mut bytes,
+            ptr::null_mut(),
+        ) == 0
+            || !is_http_reachable_status(status as u16)
+        {
+            if status == 407 {
+                return Err(EngineError::Io(
+                    "Windows system proxy requires authentication (HTTP 407)".into(),
+                ));
+            }
+            return Err(error("HTTP status read", GetLastError()));
+        }
+    }
+    Ok(())
+}
+
 /// Fetch a small HTTPS text resource without following redirects. Relay
 /// metadata is served from a fixed same-origin path, so accepting a redirect
 /// would allow an otherwise valid relay configuration to move the request to
@@ -5805,8 +6044,27 @@ mod tests {
     #[cfg(windows)]
     use super::*;
     use super::{
-        parse_registered_msix_package_full_name, registered_msix_aumid, remote_debugging_arguments,
+        is_http_reachable_status, parse_registered_msix_package_full_name, registered_msix_aumid,
+        remote_debugging_arguments,
     };
+
+    #[test]
+    fn any_origin_http_response_proves_reachability_except_proxy_auth_challenge() {
+        for status in [200, 301, 404, 405, 429, 500, 503] {
+            assert!(is_http_reachable_status(status), "HTTP {status}");
+        }
+        assert!(!is_http_reachable_status(407));
+        assert!(!is_http_reachable_status(0));
+        assert!(!is_http_reachable_status(600));
+    }
+
+    #[test]
+    #[ignore = "live network smoke test; run explicitly on a Windows host"]
+    #[cfg(windows)]
+    fn live_404token_network_probe_uses_windows_proxy_configuration() {
+        probe_https_reachable_with_network("https://404token.xyz/", &NetworkConfig::system())
+            .expect("404token should return an HTTP response on a connected Windows host");
+    }
 
     #[cfg(windows)]
     const TEST_AUTHORIZED_SHA256: &str =

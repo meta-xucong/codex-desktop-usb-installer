@@ -4780,8 +4780,8 @@ pub fn install_portable_from_msix_with_observer_options_and_progress(
 /// Return the user-profile paths that belong to the Codex desktop/CLI
 /// installation. The first entries (`~/.codex` and `~/.agents/skills`) are
 /// shared with Codex CLI/agent tooling; the other entries are desktop/AppX
-/// caches. They are only used when the user explicitly turns off "keep my
-/// data". In particular, this list never walks a broad `%LOCALAPPDATA%` tree
+/// caches. They are only used after the user explicitly confirms a full
+/// uninstall. In particular, this list never walks a broad `%LOCALAPPDATA%` tree
 /// or follows an arbitrary glob.
 fn codex_user_data_paths() -> Result<Vec<PathBuf>, EngineError> {
     let mut paths = Vec::new();
@@ -4799,6 +4799,10 @@ fn codex_user_data_paths() -> Result<Vec<PathBuf>, EngineError> {
 
     if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
         let local = PathBuf::from(local_app_data);
+        // USB manager builds keep the active Codex profile outside the normal
+        // user home so it survives app updates. Include that exact CODEX_HOME
+        // in full uninstall and verify it is gone before reporting success.
+        paths.push(local.join("CodexAppManager").join("usb-codex-home"));
         // Windows can retain the per-user AppX data directory after
         // Remove-AppxPackage, especially when a package was moved between
         // volumes.  Only direct children with the exact OpenAI.Codex family

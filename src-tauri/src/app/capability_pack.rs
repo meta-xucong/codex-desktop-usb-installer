@@ -870,71 +870,6 @@ pub fn install_product_design_plugin(app: &AppHandle) -> Result<u32, AppError> {
         .unwrap_or_default() as u32)
 }
 
-/// Return the Product Design skill count only when the USB Codex Home has a
-/// verified, enabled offline installation. This is read-only and is used by
-/// Skill Hub status so the plugin remains visible after navigating away from
-/// the one-time apply result.
-pub fn product_design_plugin_status() -> Option<u32> {
-    if !cfg!(target_os = "windows") || !crate::app::usb_guard::guard_required() {
-        return None;
-    }
-    let codex_home = crate::app::usb_guard::local_data_paths().ok()?.codex_home;
-    let config_text = fs::read_to_string(codex_home.join("config.toml")).ok()?;
-    let config: toml::Value = toml::from_str(&config_text).ok()?;
-    let marketplace_name = "usb-product-design-offline";
-    let plugin_name = "product-design";
-    let plugin_id = format!("{plugin_name}@{marketplace_name}");
-    if config
-        .get("plugins")?
-        .get(&plugin_id)?
-        .get("enabled")?
-        .as_bool()
-        != Some(true)
-    {
-        return None;
-    }
-    let marketplace_root = codex_home
-        .join("plugins")
-        .join("marketplaces")
-        .join(marketplace_name);
-    let marketplace_source = config
-        .get("marketplaces")?
-        .get(marketplace_name)?
-        .get("source")?
-        .as_str()?;
-    if PathBuf::from(marketplace_source) != marketplace_root {
-        return None;
-    }
-    let cache_plugin = codex_home
-        .join("plugins")
-        .join("cache")
-        .join(marketplace_name)
-        .join(plugin_name);
-    let manifest_path = cache_plugin.join(".codex-plugin").join("plugin.json");
-    let manifest: serde_json::Value = serde_json::from_slice(&fs::read(manifest_path).ok()?).ok()?;
-    let version = manifest.get("version")?.as_str()?;
-    if manifest.get("name")?.as_str()? != plugin_name || !cache_plugin.is_dir() {
-        return None;
-    }
-    let skill_count = fs::read_dir(cache_plugin.join("skills"))
-        .ok()?
-        .filter_map(Result::ok)
-        .filter(|entry| entry.path().is_dir() && entry.path().join("SKILL.md").is_file())
-        .count() as u32;
-    if skill_count != 10 {
-        return None;
-    }
-    let runtime_root = codex_home.join("product-design-runtime");
-    let runtime_ready = fs::read_dir(runtime_root).ok()?.filter_map(Result::ok).any(|entry| {
-        let marker = entry.path().join(".installed-manifest.json");
-        let Ok(bytes) = fs::read(marker) else { return false };
-        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return false };
-        value.get("pluginVersion").and_then(serde_json::Value::as_str) == Some(version)
-            && value.get("platform").and_then(serde_json::Value::as_str) == Some("win32-x64")
-    });
-    runtime_ready.then_some(skill_count)
-}
-
 pub fn status(app: &AppHandle) -> Result<CapabilityPackReport, AppError> {
     if !cfg!(target_os = "windows") {
         return Ok(report_missing("当前平台不支持 Windows 能力包安装"));
@@ -1643,7 +1578,7 @@ pub fn install(
             codex_home.join(KIT_HOME_RELATIVE).display()
         );
         return Err(AppError::Engine(format!(
-            "统一媒体 MCP 未完成安装：部署文件、Codex 注册或协议自检未通过；请查看 {} 并从组件修复入口重试",
+            "核心能力包已安装，但统一媒体 MCP 未就绪：部署文件、Codex 注册或协议自检未通过；请查看 {} 并从组件修复入口重试",
             readiness
                 .diagnostics_path
                 .as_deref()

@@ -712,6 +712,14 @@ impl CleanupRoots {
         if purge_codex {
             targets.extend([
                 self.home.join(".codex"),
+                // USB manager builds set CODEX_HOME to this product-owned
+                // local profile so sessions/config survive app updates. A
+                // full uninstall must remove it alongside the standard
+                // per-user .codex directory; keep the target scoped to this
+                // exact leaf under LocalAppData.
+                self.local
+                    .join("CodexAppManager")
+                    .join("usb-codex-home"),
                 // The offline capability pack installs Codex Skills in the
                 // user-scoped Codex discovery root outside ~/.codex. It is
                 // part of the explicit shared-Codex purge, but never part of

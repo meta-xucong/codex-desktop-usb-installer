@@ -17,19 +17,9 @@ const TARGET_PROVIDER_ID: &str = "404token-sub2api";
 const MAX_MODELS: usize = 3;
 const MAX_CATALOG_MODELS: usize = 512;
 const MODEL_MATRIX_BUDGET: Duration = Duration::from_secs(10 * 60);
-// Adding a model repeats local trust checks against the signed MSIX. On slower
-// USB/antivirus combinations, decompressing and hashing the embedded CLI can
-// take longer than the former three-minute action budget. Keep this below the
-// short-lived connectivity proof TTL while leaving time for the trusted check.
-// Add revalidates the gateway and then validates the native catalog against
-// the staged, signed MSIX. Slow removable drives need more than the previous
-// 180-second combined window. Its deadline is capped by the proof's actual
-// remaining lifetime, with a 10-second reserve for commit.
-const MODEL_ADD_BUDGET: Duration = Duration::from_secs(270);
-const MODEL_ADD_CATALOG_TIMEOUT: Duration = Duration::from_secs(30);
-const MODEL_ADD_PROOF_COMMIT_MARGIN: Duration = Duration::from_secs(10);
-const MODEL_ADD_MIN_PROOF_REMAINING: Duration = Duration::from_secs(190);
-const PROOF_TTL: Duration = Duration::from_secs(5 * 60);
+const MODEL_CATALOG_TIMEOUT: Duration = Duration::from_secs(30);
+const MODEL_CATALOG_MAX_ATTEMPTS: u32 = 3;
+const PROOF_TTL: Duration = Duration::from_secs(20 * 60);
 const PROOF_LIMIT: usize = 128;
 const RUN_HISTORY_LIMIT: usize = 256;
 const CODEX_EFFORTS: [&str; 7] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
@@ -241,7 +231,7 @@ fn mock_add_commit_boundary(
         base,
         binding,
         api_key,
-        digest,
+        Some(digest),
     )
     .is_err()
     {
@@ -284,6 +274,7 @@ struct ConnectivityProof {
     binding_digest: String,
     credential_digest: String,
     catalog_digest: String,
+    owned_by: Option<String>,
     epoch: u64,
     expires_at: u64,
     reasoning: Option<ReasoningEvidence>,
@@ -416,12 +407,32 @@ fn issue_proof(
             binding_digest: binding_digest(binding, base),
             credential_digest: digest_hex(api_key.as_bytes()),
             catalog_digest,
+            owned_by: None,
             epoch: expected_epoch,
             expires_at,
             reasoning,
         },
     );
     Ok((id, expires_at))
+}
+
+fn set_connectivity_proof_owner(proof_id: &str, owned_by: Option<String>) -> Result<(), AppError> {
+    let mut state = proofs().lock().unwrap_or_else(|error| error.into_inner());
+    let ticket = state
+        .tickets
+        .get_mut(proof_id)
+        .ok_or_else(|| engine("测试凭证已失效；请重新检测模型"))?;
+    ticket.owned_by = owned_by;
+    Ok(())
+}
+
+fn connectivity_proof_owner(proof_id: &str) -> Option<String> {
+    proofs()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .tickets
+        .get(proof_id)
+        .and_then(|ticket| ticket.owned_by.clone())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -433,7 +444,7 @@ pub(crate) fn consume_connectivity_proof(
     base: &str,
     binding: &codex_usb_license::UsbAccountBinding,
     api_key: &str,
-    catalog_digest: &str,
+    catalog_digest: Option<&str>,
 ) -> Result<Option<ReasoningEvidence>, AppError> {
     let mut state = proofs().lock().unwrap_or_else(|error| error.into_inner());
     let Some(ticket) = state.tickets.get(proof_id).cloned() else {
@@ -448,9 +459,9 @@ pub(crate) fn consume_connectivity_proof(
         && ticket.base == base
         && ticket.binding_digest == binding_digest(binding, base)
         && ticket.credential_digest == digest_hex(api_key.as_bytes())
-        && ticket.catalog_digest == catalog_digest;
+        && catalog_digest.map_or(true, |digest| ticket.catalog_digest == digest);
     if !valid {
-        return Err(engine("上游目录、账户或测试状态已变化；请重新测试"));
+        return Err(engine("账户绑定或测试凭证已变化；请重新测试"));
     }
     state.tickets.remove(proof_id);
     Ok(ticket.reasoning)
@@ -498,16 +509,44 @@ pub(crate) fn validate_connectivity_proof(
         .ok_or(ProofValidationError::Invalid)
 }
 
-fn model_add_budget_for_proof_remaining(remaining: Duration) -> Option<Duration> {
-    let usable = remaining.checked_sub(MODEL_ADD_PROOF_COMMIT_MARGIN)?;
-    (usable > Duration::ZERO).then_some(usable.min(MODEL_ADD_BUDGET))
+fn retryable_model_catalog_error(error: ProbeError) -> bool {
+    matches!(
+        error,
+        ProbeError::Connect | ProbeError::Network | ProbeError::Timeout | ProbeError::Http
+    )
 }
 
-fn connectivity_proof_remaining(proof_id: &str) -> Option<Duration> {
-    let state = proofs().lock().unwrap_or_else(|error| error.into_inner());
-    let ticket = state.tickets.get(proof_id)?;
-    let remaining = ticket.expires_at.saturating_sub(unix_seconds());
-    (remaining > 0).then(|| Duration::from_secs(remaining))
+fn model_catalog_retry_delay(attempt: u32, error: ProbeError) -> Option<Duration> {
+    (attempt < MODEL_CATALOG_MAX_ATTEMPTS && retryable_model_catalog_error(error))
+        .then(|| Duration::from_millis(250 * u64::from(attempt)))
+}
+
+/// `/models` is an idempotent GET. Retry brief transport/server failures only;
+/// never repeat a generation request or hide auth/input/response errors.
+async fn fetch_model_catalog_with_retry(client: &ProbeClient<'_>) -> Result<Value, ProbeError> {
+    for attempt in 1..=MODEL_CATALOG_MAX_ATTEMPTS {
+        match client.models().await {
+            Ok(payload) => return Ok(payload),
+            Err(error) => {
+                let Some(delay) = model_catalog_retry_delay(attempt, error) else {
+                    return Err(error);
+                };
+                log::warn!(
+                    "codex_gateway_catalog_retry attempt={} code={}",
+                    attempt,
+                    error.code()
+                );
+                client.check()?;
+                tokio::time::sleep(delay).await;
+                client.check()?;
+            }
+        }
+    }
+    Err(ProbeError::BudgetExhausted)
+}
+
+fn request_needs_model_catalog(request: &GatewayModelProbeRequest) -> bool {
+    request.reasoning_model_id.is_none()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -599,9 +638,7 @@ fn validate_request(request: &GatewayModelProbeRequest) -> Result<(), AppError> 
         if request.cost_consent {
             return Err(engine("思考档位测试费用确认不能与完整协议矩阵授权混用"));
         }
-        if request.reasoning_efforts.is_empty()
-            || request.reasoning_efforts.len() > CODEX_EFFORTS.len()
-        {
+        if request.reasoning_efforts.is_empty() || request.reasoning_efforts.len() > CODEX_EFFORTS.len() {
             return Err(engine("请明确选择要检测的思考档位"));
         }
         let allowed = reasoning_candidates(id);
@@ -612,6 +649,9 @@ fn validate_request(request: &GatewayModelProbeRequest) -> Result<(), AppError> 
             .any(|effort| !allowed.contains(&effort.as_str()) || !unique.insert(effort))
         {
             return Err(engine("思考档位无效、重复或不适用于该精确型号"));
+        }
+        if canonical_reasoning_efforts(id, &request.reasoning_efforts) != request.reasoning_efforts {
+            return Err(engine("思考档位必须按 Codex 顺序提交"));
         }
     } else if request.reasoning_cost_consent {
         return Err(engine("没有思考档位测试时不能提交费用确认"));
@@ -753,23 +793,32 @@ pub async fn run(request: GatewayModelProbeRequest) -> Result<GatewayModelProbeR
         return Err(engine("签名 U 盘绑定缺少设备凭证"));
     }
     let base = crate::app::model_catalog::provider_base(&binding.ccswitch.provider_id)?;
-    let catalog_client = ProbeClient::new(
+    let catalog_client = ProbeClient::with_timeouts(
         &base,
         api_key,
         active.cancelled.clone(),
         Instant::now() + REFRESH_BUDGET,
+        crate::app::model_probe::ProbeTimeouts::new(
+            MODEL_CATALOG_TIMEOUT,
+            crate::app::model_probe::GENERATION_REQUEST_TIMEOUT,
+        ),
     )
     .map_err(|_| engine("无法初始化安全的 404token 探测客户端"))?
     .with_run_id(&request.request_id);
 
-    // Both UI modes use exactly one authenticated /v1/models request. The
-    // lightweight mode returns here and cannot emit a Responses generation.
-    let catalog_payload = catalog_client
-        .models()
-        .await
-        .map_err(|error| engine(format!("404token 模型目录请求失败：{}", error.code())))?;
-    let models = parse_model_catalog(&catalog_payload, api_key)
-        .map_err(|error| engine(format!("404token 模型目录无效：{}", error.code())))?;
+    // Discovery and bulk checks need a fresh model catalog. A single-model
+    // reasoning probe already carries the selected ID from discovery; the
+    // exact generation request is the connectivity check, so don't gate it on
+    // a second `/models` round trip.
+    let models = if !request_needs_model_catalog(&request) {
+        Vec::new()
+    } else {
+        let catalog_payload = fetch_model_catalog_with_retry(&catalog_client)
+            .await
+            .map_err(|error| engine(format!("404token 模型目录请求失败：{}", error.code())))?;
+        parse_model_catalog(&catalog_payload, api_key)
+            .map_err(|error| engine(format!("404token 模型目录无效：{}", error.code())))?
+    };
     let mut report = GatewayModelProbeReport {
         status: "connected".into(),
         endpoint: base.clone(),
@@ -842,6 +891,12 @@ pub async fn run(request: GatewayModelProbeRequest) -> Result<GatewayModelProbeR
             &active.cancelled,
             None,
         )?;
+        let owner = report
+            .models
+            .iter()
+            .find(|candidate| candidate.id == model_id)
+            .and_then(|candidate| candidate.owned_by.clone());
+        set_connectivity_proof_owner(&proof_id, owner)?;
         report.status = "passed".into();
         report.connectivity_proof_id = Some(proof_id);
         report.connectivity_proof_expires_at = Some(proof_expires_at);
@@ -849,7 +904,6 @@ pub async fn run(request: GatewayModelProbeRequest) -> Result<GatewayModelProbeR
     }
 
     if let Some(model_id) = request.reasoning_model_id.as_deref() {
-        resolve_selected_models(&report.models, &[model_id.to_owned()])?;
         let client = ProbeClient::new(
             &base,
             api_key,
@@ -858,8 +912,11 @@ pub async fn run(request: GatewayModelProbeRequest) -> Result<GatewayModelProbeR
         )
         .map_err(|_| engine("无法初始化安全的 404token 探测客户端"))?
         .with_run_id(&request.request_id);
-        let efforts = canonical_reasoning_efforts(model_id, &request.reasoning_efforts);
+        // Probe the complete bounded candidate set. A successful level must
+        // not hide other levels that the route may also accept.
+        let efforts = request.reasoning_efforts.clone();
         let mut results = Vec::with_capacity(efforts.len());
+        let mut terminal_error = None;
         for effort in &efforts {
             if active.is_cancelled() {
                 report.status = "cancelled".into();
@@ -878,16 +935,23 @@ pub async fn run(request: GatewayModelProbeRequest) -> Result<GatewayModelProbeR
                         error_code: None,
                     });
                 }
-                Err(error) => results.push(GatewayReasoningEffortResult {
-                    effort: effort.clone(),
-                    status: if error == ProbeError::UnsupportedEffort {
-                        "rejected_by_route"
-                    } else {
-                        "unknown"
+                Err(error) => {
+                    let unsupported = error == ProbeError::UnsupportedEffort;
+                    results.push(GatewayReasoningEffortResult {
+                        effort: effort.clone(),
+                        status: if unsupported {
+                            "rejected_by_route"
+                        } else {
+                            "unknown"
+                        }
+                        .into(),
+                        error_code: Some(error.code().into()),
+                    });
+                    if !unsupported {
+                        terminal_error = Some(error);
+                        break;
                     }
-                    .into(),
-                    error_code: Some(error.code().into()),
-                }),
+                }
             }
         }
         report.generated_requests = client.requests_started();
@@ -897,7 +961,8 @@ pub async fn run(request: GatewayModelProbeRequest) -> Result<GatewayModelProbeR
         if !accepted.is_empty() && !active.is_cancelled() {
             let default_effort = accepted
                 .iter()
-                .find(|value| value.as_str() == "medium")
+                .find(|effort| effort.as_str() == "medium")
+                .or_else(|| accepted.iter().find(|effort| effort.as_str() == "low"))
                 .cloned()
                 .unwrap_or_else(|| accepted[0].clone());
             let (proof_id, proof_expires_at) = issue_proof(
@@ -915,6 +980,12 @@ pub async fn run(request: GatewayModelProbeRequest) -> Result<GatewayModelProbeR
                     default_effort,
                 }),
             )?;
+            let owner = report
+                .models
+                .iter()
+                .find(|candidate| candidate.id == model_id)
+                .and_then(|candidate| candidate.owned_by.clone());
+            set_connectivity_proof_owner(&proof_id, owner)?;
             report.status = "passed".into();
             report.connectivity_model_id = Some(model_id.to_owned());
             report.connectivity_proof_id = Some(proof_id.clone());
@@ -922,7 +993,12 @@ pub async fn run(request: GatewayModelProbeRequest) -> Result<GatewayModelProbeR
             report.reasoning_proof_id = Some(proof_id);
         } else if report.status != "cancelled" {
             report.status = "failed".into();
-            report.error_code = Some("no-effort-accepted".into());
+            report.error_code = Some(
+                terminal_error
+                    .map(|error| error.code())
+                    .unwrap_or("no-effort-accepted")
+                    .into(),
+            );
         }
         return Ok(report);
     }
@@ -1035,7 +1111,7 @@ pub(crate) async fn add_tested_model(
         &binding,
         api_key,
         None,
-        MODEL_ADD_MIN_PROOF_REMAINING,
+        Duration::ZERO,
     ) {
         Ok(evidence) => evidence,
         Err(ProofValidationError::Expired) => {
@@ -1054,22 +1130,13 @@ pub(crate) async fn add_tested_model(
             ));
         }
     };
-    let Some(add_budget) =
-        connectivity_proof_remaining(proof_id).and_then(model_add_budget_for_proof_remaining)
-    else {
-        let _ = revoke_proof(proof_id);
-        let mut report = add_failure("proof_invalid", "proof-expired", "测试已过期，请重新检测");
-        report.proof_state = "expired".into();
-        return Ok(report);
-    };
-    let deadline = Instant::now() + add_budget;
+    let owned_by = connectivity_proof_owner(proof_id);
     let active = match begin_management_run_detailed(request_id) {
         Ok(active) => active,
         Err(ManagementRunStartError::Busy) => {
             // A real catalogue operation is busy; retain the proof only while
-            // its static binding and expiry remain valid. A fresh digest is
-            // still required before retrying Add.
-            return Ok(pending_revalidation_report(
+            // its static binding and expiry remain valid.
+            return Ok(pending_retryable_report(
                 proof_id,
                 request_id,
                 model_id,
@@ -1078,7 +1145,7 @@ pub(crate) async fn add_tested_model(
                 &binding,
                 api_key,
                 "catalog-busy",
-                "模型管理正在处理另一项操作；测试凭证保留，稍后重试时会重新核对模型列表",
+                "模型管理正在处理另一项操作；测试凭证保留，稍后可直接重试添加",
             ));
         }
         Err(error) => {
@@ -1100,71 +1167,6 @@ pub(crate) async fn add_tested_model(
             return Ok(report);
         }
     };
-    let client = match ProbeClient::with_timeouts(
-        &base,
-        api_key,
-        active.cancellation_flag(),
-        deadline,
-        crate::app::model_probe::ProbeTimeouts::new(
-            MODEL_ADD_CATALOG_TIMEOUT,
-            crate::app::model_probe::GENERATION_REQUEST_TIMEOUT,
-        ),
-    ) {
-        Ok(client) => client.with_run_id(request_id),
-        Err(_) => {
-            return Ok(pending_revalidation_report(
-                proof_id,
-                request_id,
-                model_id,
-                &binding.ccswitch.provider_id,
-                &base,
-                &binding,
-                api_key,
-                "probe-client-unavailable",
-                "暂时无法初始化安全的 404token 检查；稍后可重试添加",
-            ));
-        }
-    };
-    let payload = match client.models().await {
-        Ok(payload) => payload,
-        Err(error) => {
-            return Ok(pending_revalidation_report(
-                proof_id,
-                request_id,
-                model_id,
-                &binding.ccswitch.provider_id,
-                &base,
-                &binding,
-                api_key,
-                error.code(),
-                "暂时无法重新核对模型列表；稍后可重试添加",
-            ));
-        }
-    };
-    let models = match parse_model_catalog(&payload, api_key) {
-        Ok(models) => models,
-        Err(error) => {
-            return Ok(pending_revalidation_report(
-                proof_id,
-                request_id,
-                model_id,
-                &binding.ccswitch.provider_id,
-                &base,
-                &binding,
-                api_key,
-                error.code(),
-                "模型列表暂时无法验证；稍后可重试添加",
-            ));
-        }
-    };
-    if resolve_selected_models(&models, &[model_id.to_owned()]).is_err() {
-        let _ = revoke_proof(proof_id);
-        return Ok(add_failure(
-            "proof_invalid",
-            "binding-changed",
-            "上游模型列表已变化，请重新检测",
-        ));
-    }
     if active.is_cancelled() {
         let _ = revoke_proof(proof_id);
         return Ok(add_failure(
@@ -1173,32 +1175,10 @@ pub(crate) async fn add_tested_model(
             "模型添加已取消；请重新检测",
         ));
     }
-    let catalog_digest = catalog_digest(&models);
-    let evidence = match revalidate_connectivity_proof(
-        proof_id,
-        request_id,
-        model_id,
-        &binding.ccswitch.provider_id,
-        &base,
-        &binding,
-        api_key,
-        &catalog_digest,
-    ) {
-        Ok(evidence)
-            if evidence.efforts == early_evidence.efforts
-                && evidence.default_effort == early_evidence.default_effort =>
-        {
-            evidence
-        }
-        Ok(_) | Err(_) => {
-            let _ = revoke_proof(proof_id);
-            return Ok(add_failure(
-                "proof_invalid",
-                "binding-changed",
-                "上游目录或测试状态已变化，请重新检测",
-            ));
-        }
-    };
+    // The detected model and its reasoning evidence are covered by the
+    // one-time proof. Add performs local compatibility and atomic-write checks
+    // without refetching the upstream catalogue.
+    let evidence = early_evidence;
     let proof_id = proof_id.to_owned();
     let proof_id_for_consume = proof_id.clone();
     let request_id_for_consume = request_id.to_owned();
@@ -1207,21 +1187,14 @@ pub(crate) async fn add_tested_model(
     let base_for_consume = base.clone();
     let binding_for_consume = binding.clone();
     let api_key_for_consume = api_key.to_owned();
-    let digest_for_consume = catalog_digest.clone();
-    let digest_for_failure = catalog_digest.clone();
     let stage = std::sync::atomic::AtomicU8::new(0);
     let stage_ref = &stage;
     let added = crate::app::model_catalog::add_tested_model_to_catalog(
         request_id,
         model_id,
-        models
-            .iter()
-            .find(|candidate| candidate.id == model_id)
-            .and_then(|candidate| candidate.owned_by.as_deref()),
-        &binding,
+        owned_by.as_deref(),
         &active.cancelled,
         &evidence,
-        deadline,
         move || {
             stage_ref.store(3, Ordering::Release);
             consume_connectivity_proof(
@@ -1232,7 +1205,7 @@ pub(crate) async fn add_tested_model(
                 &base_for_consume,
                 &binding_for_consume,
                 &api_key_for_consume,
-                &digest_for_consume,
+                None,
             )
             .map(|_| {
                 stage_ref.store(4, Ordering::Release);
@@ -1303,7 +1276,7 @@ pub(crate) async fn add_tested_model(
                 &base,
                 &binding,
                 api_key,
-                Some(&digest_for_failure),
+                None,
                 Duration::ZERO,
             ) {
                 Ok(_) => {
@@ -1334,7 +1307,7 @@ pub(crate) async fn add_tested_model(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn pending_revalidation_report(
+fn pending_retryable_report(
     proof_id: &str,
     request_id: &str,
     model_id: &str,
@@ -1357,8 +1330,9 @@ fn pending_revalidation_report(
         Duration::ZERO,
     ) {
         Ok(_) => {
-            let mut report = add_failure("precommit_revalidate", error_code, message);
-            report.proof_state = "pending_validation".into();
+            let mut report = add_failure("precommit_retryable", error_code, message);
+            report.proof_state = "valid".into();
+            report.retryable = true;
             report
         }
         Err(ProofValidationError::Expired) => {
@@ -1379,6 +1353,7 @@ fn pending_revalidation_report(
     }
 }
 
+#[cfg(test)]
 fn revalidate_connectivity_proof(
     proof_id: &str,
     request_id: &str,
@@ -1464,25 +1439,91 @@ mod tests {
     use super::*;
 
     #[test]
-    fn local_model_add_budget_fits_connectivity_proof_lifetime() {
-        assert!(MODEL_ADD_PROOF_COMMIT_MARGIN < MODEL_ADD_MIN_PROOF_REMAINING);
-        assert!(MODEL_ADD_MIN_PROOF_REMAINING < PROOF_TTL);
-        assert_eq!(MODEL_ADD_BUDGET, Duration::from_secs(270));
-        assert_eq!(MODEL_ADD_MIN_PROOF_REMAINING, Duration::from_secs(190));
+    fn model_add_has_no_extra_proof_remaining_budget() {
+        assert_eq!(PROOF_TTL, Duration::from_secs(1200));
+        assert_eq!(MODEL_CATALOG_TIMEOUT, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn model_catalog_retry_is_limited_to_transient_safe_get_failures() {
+        assert!(retryable_model_catalog_error(ProbeError::Connect));
+        assert!(retryable_model_catalog_error(ProbeError::Network));
+        assert!(retryable_model_catalog_error(ProbeError::Timeout));
+        assert!(retryable_model_catalog_error(ProbeError::Http));
+        assert!(!retryable_model_catalog_error(ProbeError::Unauthorized));
+        assert!(!retryable_model_catalog_error(ProbeError::Http400));
+        assert!(!retryable_model_catalog_error(ProbeError::InvalidResponse));
+        assert!(!retryable_model_catalog_error(ProbeError::Cancelled));
+        assert_eq!(MODEL_CATALOG_MAX_ATTEMPTS, 3);
         assert_eq!(
-            model_add_budget_for_proof_remaining(MODEL_ADD_MIN_PROOF_REMAINING),
-            Some(Duration::from_secs(180))
+            model_catalog_retry_delay(1, ProbeError::Connect),
+            Some(Duration::from_millis(250))
         );
         assert_eq!(
-            model_add_budget_for_proof_remaining(Duration::from_secs(280)),
-            Some(MODEL_ADD_BUDGET)
+            model_catalog_retry_delay(2, ProbeError::Timeout),
+            Some(Duration::from_millis(500))
         );
-        assert_eq!(
-            model_add_budget_for_proof_remaining(MODEL_ADD_PROOF_COMMIT_MARGIN),
-            None
-        );
-        assert!(MODEL_ADD_CATALOG_TIMEOUT < MODEL_ADD_BUDGET);
-        assert_eq!(MODEL_ADD_CATALOG_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(model_catalog_retry_delay(3, ProbeError::Connect), None);
+        assert_eq!(model_catalog_retry_delay(1, ProbeError::Unauthorized), None);
+    }
+
+    #[tokio::test]
+    async fn model_catalog_get_retries_after_transient_server_failure() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut statuses = Vec::new();
+            for (status, body) in [
+                ("503 Service Unavailable", "".to_owned()),
+                ("200 OK", r#"{"data":[{"id":"vendor/model"}]}"#.to_owned()),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 1024];
+                loop {
+                    let read = stream.read(&mut chunk).unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                statuses.push(String::from_utf8_lossy(&request).to_string());
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                stream.write_all(body.as_bytes()).unwrap();
+            }
+            statuses
+        });
+
+        let client = ProbeClient::with_timeouts(
+            &format!("http://{address}/v1/"),
+            "fixture-key",
+            Arc::new(AtomicBool::new(false)),
+            Instant::now() + Duration::from_secs(5),
+            crate::app::model_probe::ProbeTimeouts::new(
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            ),
+        )
+        .unwrap();
+        let payload = fetch_model_catalog_with_retry(&client).await.unwrap();
+        assert_eq!(payload["data"][0]["id"], "vendor/model");
+        assert_eq!(client.requests_started(), 2);
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests
+            .iter()
+            .all(|request| request.starts_with("GET /v1/models HTTP/1.1")));
     }
 
     #[test]
@@ -1570,7 +1611,9 @@ mod tests {
     #[test]
     fn quick_test_mode_is_single_model_and_separate_from_matrix_consent() {
         let mut quick = request(Vec::new(), false);
+        assert!(request_needs_model_catalog(&quick));
         quick.connectivity_model_id = Some("vendor/model-latest".into());
+        assert!(request_needs_model_catalog(&quick));
         assert!(validate_request(&quick).is_ok());
 
         quick.selected_model_ids = vec!["vendor/model-latest".into()];
@@ -1588,10 +1631,25 @@ mod tests {
     fn reasoning_effort_probe_requires_explicit_cost_consent_and_exact_model_candidates() {
         let mut request = request(Vec::new(), false);
         request.reasoning_model_id = Some("claude-opus-5-5".into());
+        assert!(!request_needs_model_catalog(&request));
         request.reasoning_efforts = vec!["medium".into(), "high".into()];
         assert!(validate_request(&request).is_err());
         request.reasoning_cost_consent = true;
+        request.reasoning_efforts = vec!["medium".into(), "low".into()];
+        assert!(validate_request(&request).is_err());
+        request.reasoning_efforts = vec!["low".into(), "medium".into()];
         assert!(validate_request(&request).is_ok());
+        request.reasoning_efforts = reasoning_candidates("claude-opus-5-5")
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(request.reasoning_efforts.len(), 6);
+        assert!(validate_request(&request).is_ok());
+        request.reasoning_efforts = vec!["low".into()];
+        assert!(validate_request(&request).is_ok());
+        request.reasoning_efforts = vec!["medium".into()];
+        assert!(validate_request(&request).is_ok());
+        request.reasoning_efforts = vec!["medium".into(), "low".into()];
         request.reasoning_efforts.push("none".into());
         assert!(validate_request(&request).is_err());
         request.reasoning_efforts = vec!["medium".into(), "medium".into()];
@@ -1600,6 +1658,14 @@ mod tests {
         assert!(validate_request(&request).is_err());
         assert!(!reasoning_candidates("claude-opus-5-5").contains(&"none"));
         assert!(reasoning_candidates("vendor/model-latest").contains(&"none"));
+        request.reasoning_model_id = Some("vendor/model-latest".into());
+        assert!(!request_needs_model_catalog(&request));
+        request.reasoning_efforts = reasoning_candidates("vendor/model-latest")
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(request.reasoning_efforts.len(), 7);
+        assert!(validate_request(&request).is_ok());
     }
 
     #[test]
@@ -1716,7 +1782,7 @@ mod tests {
             base,
             &binding,
             "fixture-key-never-serialized",
-            &catalog,
+            Some(&catalog),
         )
         .unwrap();
         assert!(consume_connectivity_proof(
@@ -1727,7 +1793,7 @@ mod tests {
             base,
             &binding,
             "fixture-key-never-serialized",
-            &catalog,
+            Some(&catalog),
         )
         .is_err());
     }
@@ -1775,7 +1841,7 @@ mod tests {
                 &binding,
                 api_key,
                 None,
-                Duration::from_secs(190),
+                Duration::ZERO,
             )
             .unwrap();
             assert_eq!(validated.efforts, reasoning.efforts);
@@ -1791,7 +1857,7 @@ mod tests {
                 &binding,
                 api_key,
                 None,
-                Duration::from_secs(301),
+                PROOF_TTL + Duration::from_secs(1),
             ),
             Err(ProofValidationError::Expired)
         ));
@@ -1799,7 +1865,7 @@ mod tests {
     }
 
     #[test]
-    fn precommit_revalidation_keeps_proof_until_fresh_digest_is_compared() {
+    fn optional_catalog_snapshot_check_is_non_consuming_and_add_busy_is_retryable() {
         let _serial = PROOF_TEST_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
@@ -1830,10 +1896,9 @@ mod tests {
             reasoning.clone(),
         )
         .unwrap();
-        // A failed /models refresh has no fresh digest: production returns a
-        // pending-validation report and keeps the proof only if it is still
-        // bound and unexpired. A later matching digest permits retry.
-        let pending = pending_revalidation_report(
+        // Add busy remains retryable without a second upstream read. This
+        // test-only helper retains coverage for explicit snapshot comparisons.
+        let pending = pending_retryable_report(
             &matching_proof,
             "add-run-revalidate",
             "vendor/model-latest",
@@ -1844,8 +1909,8 @@ mod tests {
             "upstream-unavailable",
             "temporarily unavailable",
         );
-        assert_eq!(pending.status, "precommit_revalidate");
-        assert_eq!(pending.proof_state, "pending_validation");
+        assert_eq!(pending.status, "precommit_retryable");
+        assert_eq!(pending.proof_state, "valid");
         assert!(proofs()
             .lock()
             .unwrap()
@@ -1945,7 +2010,7 @@ mod tests {
             .unwrap()
             .expires_at = unix_seconds().saturating_sub(1);
 
-        let report = pending_revalidation_report(
+        let report = pending_retryable_report(
             &proof_id,
             "expired-add-request",
             "vendor/model-latest",
@@ -2022,7 +2087,7 @@ mod tests {
                     base,
                     &binding,
                     api_key,
-                    "fixture-catalog-digest",
+                    Some("fixture-catalog-digest"),
                 )
                 .is_ok()
             }));
@@ -2271,7 +2336,7 @@ mod tests {
             base,
             &binding,
             api_key,
-            &catalog,
+            None,
         );
         finish_catalog_reset();
 

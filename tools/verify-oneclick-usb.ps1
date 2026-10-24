@@ -308,9 +308,10 @@ function Assert-CompiledCcswitchHandoff([string]$Path, [string]$Label) {
         "CODEX_USB_404TOKEN_HANDOFF_V1",
         "CCSWITCH_404TOKEN_HANDOFF_PATH",
         "CCSWITCH_404TOKEN_HANDOFF_NONCE",
-        "CCSWITCH_404TOKEN_DEVICE_KEY"
+        "CCSWITCH_404TOKEN_DEVICE_KEY",
+        "CODEX_USB_MCP_PRESERVATION_V1"
     )) {
-        Assert-Condition ($ascii.IndexOf($marker, [System.StringComparison]::Ordinal) -ge 0) "$Label CCSwitch 缺少确认式 404token API Key 注入协议标记：$marker"
+        Assert-Condition ($ascii.IndexOf($marker, [System.StringComparison]::Ordinal) -ge 0) "$Label CCSwitch 缺少必需的 404token handoff / MCP 保留协议标记：$marker"
     }
 }
 
@@ -340,6 +341,12 @@ Assert-Condition ($updateCapability.backupPolicy -eq "single-msix-listed-in-SHA2
 Assert-Condition ($updateCapability.successState -eq "clean") "update capability 未声明成功状态清理策略"
 Assert-Condition ($usbManifest.product -eq "codex-usb-oneclick") "不是 Codex 一键安装包"
 Assert-Condition ($usbManifest.status -eq "oneclick") "联合清单状态不是 oneclick"
+Assert-Condition (-not [string]::IsNullOrWhiteSpace([string]$usbManifest.releaseVersion)) "联合清单缺少 releaseVersion"
+$bundleReadmePath = Join-Path $root "README.txt"
+Assert-Condition (Test-Path -LiteralPath $bundleReadmePath -PathType Leaf) "缺少 U 盘根目录使用说明 README.txt"
+$bundleReadme = Get-Content -LiteralPath $bundleReadmePath -Raw -Encoding UTF8
+$expectedReadmeVersion = "Codex U 盘版 v$([string]$usbManifest.releaseVersion)"
+Assert-Condition ($bundleReadme.Contains($expectedReadmeVersion)) "README.txt 版本与联合清单 releaseVersion 不一致：期望 $expectedReadmeVersion"
 Assert-Condition ($usbManifest.secretsIncluded -eq $false) "U 盘包不应包含 API Key"
 Assert-Condition ($usbManifest.automaticPostInstallLaunch -eq $true) "未声明安装后自动启动 CCSwitch"
 $signingBinding = $usbManifest.usbGuard.signing

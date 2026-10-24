@@ -152,29 +152,31 @@ export function OfflineComponentsSheet({
         mediaGatewayCatalogVerifiedAt: new Date().toISOString(),
         mediaGenerationAgentId: selected.mediaGenerationAgentId,
       }));
-      const hasSupportedRoute = Boolean(
-        selected.image2Model ||
-        selected.grokImageModel ||
-        selected.grokVideoModel ||
-        (selected.seedanceModel && selected.mediaGenerationAgentId),
-      );
-      if (!hasSupportedRoute) {
-        setEnabled((current) => ({ ...current, "media-generation": false }));
-      }
     } catch (cause) {
       if (mediaCatalogRequestRef.current !== requestId) return;
-      setForm((current) => ({
-        ...current,
-        image2Model: "",
-        grokImageModel: "",
-        grokVideoModel: "",
-        seedanceModel: "",
-        minimaxVideoModel: "",
-        mediaGenerationAgentId: "",
-        mediaGatewayCatalogStatus: "failed",
-        mediaGatewayModelCount: 0,
-        mediaGatewayCatalogVerifiedAt: null,
-      }));
+      const saved = await managerApi.mediaModelSettings().catch(() => null);
+      if (mediaCatalogRequestRef.current !== requestId) return;
+      if (saved) {
+        setForm((current) => ({
+          ...current,
+          mediaGenerationAgentId: saved.mediaGenerationAgentId,
+          image2Model: saved.image2Model,
+          grokImageModel: saved.grokImageModel,
+          grokVideoModel: saved.grokVideoModel,
+          seedanceModel: saved.seedanceModel,
+          minimaxVideoModel: saved.minimaxVideoModel,
+          mediaGatewayCatalogStatus: "failed",
+          mediaGatewayModelCount: 0,
+          mediaGatewayCatalogVerifiedAt: null,
+        }));
+      } else {
+        setForm((current) => ({
+          ...current,
+          mediaGatewayCatalogStatus: "failed",
+          mediaGatewayModelCount: 0,
+          mediaGatewayCatalogVerifiedAt: null,
+        }));
+      }
       setMediaCatalogError(errorMessage(cause));
     } finally {
       if (mediaCatalogRequestRef.current === requestId) setMediaCatalogLoading(false);
@@ -268,19 +270,8 @@ export function OfflineComponentsSheet({
       return t("offline.components.validationDashscope");
     }
     if (enabled["media-generation"]) {
-      if (mediaCatalogError) {
-        return t("offline.components.mediaModelsRetryBeforeSave");
-      }
       if (mediaNeedsRouteId && !form.mediaGenerationAgentId.trim()) {
         return t("offline.components.validationMediaRoute");
-      }
-      if (
-        !form.image2Model.trim() &&
-        !form.grokImageModel.trim() &&
-        !form.grokVideoModel.trim() &&
-        !(form.seedanceModel.trim() && form.mediaGenerationAgentId.trim())
-      ) {
-        return t("offline.components.validationMedia");
       }
     }
     return null;

@@ -1711,8 +1711,8 @@ export const managerApi = {
     return invoke<void>("set_autostart", { enabled });
   },
 
-  // Destructive: remove the Codex app. keepCodexHome defaults to true so the
-  // user's ~/.codex (sign-in, sessions, config) survives unless they opt out.
+  // Destructive: remove the Codex app and its per-user data. The uninstall UI
+  // always passes false so ~/.codex is purged after an explicit confirmation.
   async macUninstall(keepCodexHome: boolean): Promise<MacUninstallReport> {
     if (!hasTauriRuntime()) {
       return Promise.resolve({
@@ -2142,11 +2142,6 @@ export const managerApi = {
       ...info,
       attempts: sanitizeSkillRepoAttempts(info.attempts),
     }));
-  },
-  /** Read the local offline Product Design plugin state without network access. */
-  skillRepoProductDesignStatus(): Promise<number | null> {
-    if (!hasTauriRuntime()) return Promise.resolve(null);
-    return invoke<number | null>("skill_repo_product_design_status");
   },
   /** Apply the exact identity returned by skillRepoCheckUpdate. */
   skillRepoApplyUpdate(expected: SkillRepoExpected): Promise<SkillRepoApplyReport> {

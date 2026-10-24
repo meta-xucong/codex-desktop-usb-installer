@@ -11,6 +11,16 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$productSourcePatchPath = Join-Path $repoRoot "src-tauri\resources\ccswitch\source-patches\ccswitch-usb-product-1d44b1ba.patch"
+$sourceManifestPath = Join-Path $repoRoot "src-tauri\resources\ccswitch\manifest.json"
+if (-not (Test-Path -LiteralPath $productSourcePatchPath -PathType Leaf)) {
+    throw "缺少固定 CCSwitch 产品源码补丁：$productSourcePatchPath"
+}
+$sourceManifest = Get-Content -LiteralPath $sourceManifestPath -Raw | ConvertFrom-Json
+$actualSourcePatchHash = (Get-FileHash -LiteralPath $productSourcePatchPath -Algorithm SHA256).Hash
+if ($actualSourcePatchHash -ne ([string]$sourceManifest.sourcePatchSha256).ToUpperInvariant()) {
+    throw "CCSwitch 产品源码补丁 SHA256 与 manifest 不匹配：$actualSourcePatchHash"
+}
 
 # 默认源码目录和输出目录
 if ([string]::IsNullOrWhiteSpace($SourceDir)) {
@@ -66,6 +76,97 @@ if (-not $SkipClone) {
         throw "源码目录不存在: $SourceDir"
     }
     Write-Host ""
+}
+
+# Clean upstream clones need the complete USB product source overlay. A
+# pre-patched worktree is accepted only when it is exactly the pinned commit
+# plus this patch; marker/callsite checks alone do not prove source identity.
+$providerLiveSource = Join-Path $SourceDir "src-tauri\src\services\provider\live.rs"
+$providerModSource = Join-Path $SourceDir "src-tauri\src\services\provider\mod.rs"
+$sourceHead = (& git -C $SourceDir rev-parse HEAD 2>$null | Out-String).Trim()
+if ($LASTEXITCODE -ne 0 -or $sourceHead -ne "1d44b1ba41987cddeb8096fadba8190fab465cbb") {
+    throw "CCSwitch 源码不是固定基线 1d44b1ba41987cddeb8096fadba8190fab465cbb：$SourceDir"
+}
+$indexFlags = @(& git -C $SourceDir ls-files -v)
+if ($LASTEXITCODE -ne 0) { throw "无法读取 CCSwitch Git index flags" }
+$assumeUnchanged = @($indexFlags | Where-Object { ([string]$_).Length -gt 2 -and ([string]$_)[0] -cmatch '[a-z]' })
+$skipWorktree = @(& git -C $SourceDir ls-files -t | Where-Object { ([string]$_).StartsWith("S ") })
+if ($LASTEXITCODE -ne 0) { throw "无法读取 CCSwitch skip-worktree flags" }
+if ($assumeUnchanged.Count -gt 0 -or $skipWorktree.Count -gt 0) {
+    throw "CCSwitch Git index 含 assume-unchanged 或 skip-worktree 路径；拒绝构建可能隐藏源码改动的工作树"
+}
+$sourceStatus = @(& git -C $SourceDir status --porcelain)
+$ignoredStatus = @(& git -C $SourceDir status --ignored --porcelain --untracked-files=normal)
+if ($LASTEXITCODE -ne 0) { throw "无法检查 CCSwitch 被忽略的文件" }
+$allowedIgnoredPaths = @("node_modules", "dist", "release", "src-tauri/gen", "src-tauri/target")
+$unexpectedIgnoredPaths = @($ignoredStatus | ForEach-Object {
+    $line = [string]$_
+    if ($line.StartsWith("!! ")) { $line.Substring(3).TrimEnd('/') -replace '\\', '/' }
+} | Where-Object {
+    $path = [string]$_
+    if ([string]::IsNullOrWhiteSpace($path)) { return $false }
+    if ($allowedIgnoredPaths -contains $path) { return $false }
+    if ($path -match '^(\.claude|\.codex|\.gemini|\.vscode)(/|$)' -or
+        $path -match '^(CLAUDE\.md|GEMINI\.md|\.DS_Store|vitest-report\.json)$' -or
+        $path -match '\.(log|tsbuildinfo)$') { return $false }
+    return $true
+})
+if ($unexpectedIgnoredPaths.Count -gt 0) {
+    throw "CCSwitch 构建树含未审计的 Git 忽略输入：$($unexpectedIgnoredPaths -join ', ')"
+}
+if ($sourceStatus.Count -eq 0) {
+    & git -C $SourceDir apply --check $productSourcePatchPath
+    if ($LASTEXITCODE -ne 0) { throw "固定 CCSwitch 产品源码补丁无法应用：$productSourcePatchPath" }
+    & git -C $SourceDir apply $productSourcePatchPath
+    if ($LASTEXITCODE -ne 0) { throw "应用固定 CCSwitch 产品源码补丁失败：$productSourcePatchPath" }
+    Write-Host "✓ 已在固定上游基线上应用 USB 产品源码补丁" -ForegroundColor Green
+} else {
+    & git -C $SourceDir apply --reverse --check $productSourcePatchPath
+    if ($LASTEXITCODE -ne 0) {
+        throw "源码虽有产品标记，但不能完整反向匹配固定产品补丁；拒绝构建混合源码：$SourceDir"
+    }
+    $expectedPatchPaths = @(& git apply --numstat $productSourcePatchPath | ForEach-Object {
+        $parts = $_ -split "`t"
+        if ($parts.Count -ge 3) { $parts[2] }
+    } | Sort-Object -Unique)
+    $dirtyPaths = @(& git -C $SourceDir status --porcelain | ForEach-Object {
+        $line = [string]$_
+        if ($line.Length -ge 4) { $line.Substring(3).Trim('"') }
+    } | Sort-Object -Unique)
+    $expectedSorted = @($expectedPatchPaths | Sort-Object -Unique)
+    if (($dirtyPaths -join "`n") -ne ($expectedSorted -join "`n")) {
+        throw "预打补丁源码包含补丁之外的文件变更；请使用干净固定基线重建。源码：$SourceDir"
+    }
+    $validationRoot = Join-Path $repoRoot (".tmp-ccswitch-source-audit-" + [guid]::NewGuid().ToString("N"))
+    $archivePath = "$validationRoot.tar"
+    New-Item -ItemType Directory -Path $validationRoot -Force | Out-Null
+    try {
+        & git -C $SourceDir archive --format=tar --output=$archivePath HEAD
+        if ($LASTEXITCODE -ne 0) { throw "无法导出固定 CCSwitch 基线用于源码核对" }
+        & tar -xf $archivePath -C $validationRoot
+        if ($LASTEXITCODE -ne 0) { throw "无法展开固定 CCSwitch 基线用于源码核对" }
+        & git -C $validationRoot init --quiet
+        if ($LASTEXITCODE -ne 0) { throw "无法初始化临时源码核对目录" }
+        & git -C $validationRoot apply $productSourcePatchPath
+        if ($LASTEXITCODE -ne 0) { throw "固定产品补丁无法应用到临时固定基线" }
+        foreach ($relativePath in $expectedSorted) {
+            $actualFile = Join-Path $SourceDir $relativePath
+            $expectedFile = Join-Path $validationRoot $relativePath
+            if (-not (Test-Path -LiteralPath $actualFile -PathType Leaf) -or
+                -not (Test-Path -LiteralPath $expectedFile -PathType Leaf)) {
+                throw "预打补丁源码文件缺失或与固定产品补丁不一致：$relativePath"
+            }
+            $actualHash = (Get-FileHash -LiteralPath $actualFile -Algorithm SHA256).Hash
+            $expectedHash = (Get-FileHash -LiteralPath $expectedFile -Algorithm SHA256).Hash
+            if ($actualHash -ne $expectedHash) {
+                throw "预打补丁源码与固定产品补丁内容不一致：$relativePath"
+            }
+        }
+    } finally {
+        Remove-Item -LiteralPath $validationRoot -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $archivePath -Force -ErrorAction SilentlyContinue
+    }
+    Write-Host "✓ 预打补丁源码的 dirty path 集合与固定产品补丁一致" -ForegroundColor Green
 }
 
 $cargoProjectDir = if (Test-Path -LiteralPath (Join-Path $SourceDir "Cargo.toml") -PathType Leaf) {
@@ -151,6 +252,28 @@ $providerServiceText = [System.IO.File]::ReadAllText($providerServicePath)
 if (-not $providerServiceText.Contains("CODEX_USB_404TOKEN_HANDOFF_V1")) {
     throw "CCSwitch 源码缺少确认式 API Key 持久化与回读协议；拒绝构建旧版自动注入实现"
 }
+$providerLivePath = Join-Path $cargoProjectDir "src\services\provider\live.rs"
+if (-not (Test-Path -LiteralPath $providerLivePath -PathType Leaf) -or
+    -not ([System.IO.File]::ReadAllText($providerLivePath).Contains("CODEX_USB_MCP_PRESERVATION_V1"))) {
+    throw "CCSwitch 源码缺少 USB Codex MCP 保留实现；拒绝构建可能覆盖 MCP 配置的版本"
+}
+if (-not ([System.IO.File]::ReadAllText($providerLivePath).Contains("preserve_codex_mcp_servers")) -or
+    -not ([System.IO.File]::ReadAllText($providerLivePath).Contains("remove_managed_codex_mcp_servers"))) {
+    throw "CCSwitch MCP 标记存在但源码没有对应保留实现；拒绝仅凭标记构建"
+}
+$providerModPath = Join-Path $cargoProjectDir "src\services\provider\mod.rs"
+$providerModText = [System.IO.File]::ReadAllText($providerModPath)
+if ($providerModText -notmatch 'remove_managed_codex_mcp_servers\s*\(\s*&mut finalized_provider' -or
+    $providerModText -notmatch 'merge_active_codex_mcp_servers\s*\(\s*&mut finalized_provider') {
+    throw "CCSwitch provider switch 缺少 MCP 恢复调用点；拒绝仅凭二进制标记构建"
+}
+if ($providerModText -notmatch 'apply_database_codex_mcp_servers\s*\(\s*&mut finalized_provider') {
+    throw "CCSwitch provider switch 缺少 MCP 同步失败后的数据库重建路径；拒绝构建"
+}
+$providerLiveText = [System.IO.File]::ReadAllText($providerLivePath)
+if (-not $providerLiveText.Contains("CODEX_USB_MCP_SYNC_FAILURE_RECOVERY_V1")) {
+    throw "CCSwitch 源码缺少 MCP 同步失败恢复标记；拒绝构建"
+}
 
 # A release CCSwitch must contain the production renderer.  Running only
 # `cargo build --release` can reuse a stale `dist` directory (or, in a copied
@@ -183,6 +306,22 @@ Write-Host "[步骤 4/6] 验证编译..." -ForegroundColor Green
 
 Push-Location $cargoProjectDir
 try {
+    $requiredTests = @(
+        @{ Filter = "usb_404token_bootstrap_"; Count = 3 },
+        @{ Filter = "codex_provider_config_"; Count = 3 },
+        @{ Filter = "failed_codex_mcp_sync_recovers_managed_entries_from_database_snapshot"; Count = 1 },
+        @{ Filter = "atomic_write_replaces_existing_file_without_predeleting_it"; Count = 1 }
+    )
+    foreach ($test in $requiredTests) {
+        $testOutput = & cargo test --locked --lib $test.Filter 2>&1
+        $testExitCode = $LASTEXITCODE
+        $testText = $testOutput | Out-String
+        Write-Host $testText
+        if ($testExitCode -ne 0 -or $testText -notmatch "test result: ok\.\s+$($test.Count) passed; 0 failed") {
+            throw "CCSwitch MCP/handoff 回归测试未按预期通过：$($test.Filter)，期望 $($test.Count) 项"
+        }
+    }
+
     cargo check --locked
     if ($LASTEXITCODE -ne 0) {
         throw "cargo check 失败,请检查代码"
@@ -233,8 +372,10 @@ if ([string]::IsNullOrWhiteSpace([string]$builtExePath)) {
 }
 $binaryText = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($builtExePath))
 if (-not $binaryText.Contains("CODEX_USB_404TOKEN_HANDOFF_V1") -or
-    -not $binaryText.Contains("CCSWITCH_404TOKEN_DEVICE_KEY")) {
-    throw "构建产物缺少 404token 确认式注入协议标记；可能选中了旧缓存 EXE：$builtExePath"
+    -not $binaryText.Contains("CCSWITCH_404TOKEN_DEVICE_KEY") -or
+    -not $binaryText.Contains("CODEX_USB_MCP_PRESERVATION_V1") -or
+    -not $binaryText.Contains("CODEX_USB_MCP_SYNC_FAILURE_RECOVERY_V1")) {
+    throw "构建产物缺少 404token handoff 或 Codex MCP 保留协议标记；可能选中了旧缓存 EXE：$builtExePath"
 }
 
 # 计算 SHA256
@@ -261,6 +402,8 @@ foreach ($fileName in @("LICENSE", "SOURCE-NOTICE.txt", "verify-product.ps1")) {
         Write-Host "✓ $fileName 已复制" -ForegroundColor Green
     }
 }
+New-Item -ItemType Directory -Force -Path (Join-Path $OutputDir "source-patches") | Out-Null
+Copy-Item -LiteralPath $productSourcePatchPath -Destination (Join-Path $OutputDir "source-patches\ccswitch-usb-product-1d44b1ba.patch") -Force
 
 # 复制或更新 manifest.json
 $currentManifestPath = Join-Path $repoRoot "src-tauri\resources\ccswitch\manifest.json"
@@ -273,6 +416,8 @@ if (Test-Path -LiteralPath $currentManifestPath) {
         "404TOKEN is a third-party Sub2API relay, not an OpenAI official endpoint.",
         "A verified USB license injects one device API key for the unified-api-internal group at runtime.",
         "CCSwitch saves the USB key to its normal private provider database, switches the provider, and returns a nonce-bound acknowledgement only after local readback succeeds.",
+        "Codex provider handoff preserves unmanaged active mcp_servers entries while database-managed MCP enablement and definitions remain authoritative.",
+        "USB product source changes are captured in sourcePatch and must be applied to sourceCommit before building.",
         "The USB manager reports injection success only after validating that acknowledgement; on failure it keeps the CCSwitch window visible and shows an error on its home page.",
         "Model discovery does not gate normal provider activation or Codex launch.",
         "The device key is never included in this static resource bundle or providers.json.",

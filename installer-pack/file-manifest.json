@@ -151,8 +151,8 @@
     {
       "owned": true,
       "path": "install-all.ps1",
-      "sha256": "ad5b3f61e3d899961bfd76a5d29b617c901e782d29930105446479e81f6b0af2",
-      "bytes": 2869
+      "sha256": "db51351f7106642875af4b6f68cee641c503a0f6df9e02411796c6a30728e5d3",
+      "bytes": 2961
     },
     {
       "owned": true,
@@ -169,8 +169,8 @@
     {
       "owned": true,
       "path": "install-to-codex.ps1",
-      "sha256": "eeedbbd8d04418637d416a0876b1dfeae0fb045bf6c7bd104ee76accfa72a489",
-      "bytes": 55008
+      "sha256": "df696be61c4b21fd19ef77ed7327c35cc5f00d2a46d2832a07aaca10f2047132",
+      "bytes": 55727
     },
     {
       "owned": true,
@@ -319,7 +319,7 @@
     {
       "owned": true,
       "path": "pack.json",
-      "sha256": "0c95988c5c3692e38a31cfe999f62a19064332442e29d2138d31381bad9872d9",
+      "sha256": "4f448f0a49a6e3daaf45a845da05cc2a40d89ab0b8f3f5b58a1f850aac21f520",
       "bytes": 4063
     },
     {
@@ -3217,8 +3217,8 @@
     {
       "owned": true,
       "path": "test-adapter-contracts.py",
-      "sha256": "69fa84dcc6c6e858bb2cab2b9cfd98275f5299262926b737d92b42ce169faea2",
-      "bytes": 92942
+      "sha256": "857ba7539d872aa0d289437827331f0a5b76d2ce28ffb9f09aff865364be633b",
+      "bytes": 93036
     },
     {
       "owned": true,
