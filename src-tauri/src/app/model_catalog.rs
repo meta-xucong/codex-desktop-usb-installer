@@ -1369,6 +1369,13 @@ fn normalize_legacy_model_entries(catalog: &mut Value) -> Result<bool, AppError>
             && !entry.contains_key("model_messages")
         {
             entry.remove("input_modalities");
+            // Earlier manager-generated gateway entries explicitly disabled
+            // node_repl. The Codex model metadata default is enabled, so
+            // remove only this known legacy value and preserve any explicit
+            // user choice on entries outside the exact legacy signature.
+            if entry.get("node_repl_disabled").and_then(Value::as_bool) == Some(true) {
+                entry.remove("node_repl_disabled");
+            }
             entry.insert("description".into(), Value::String(MODEL_DESCRIPTION.into()));
             entry.insert(
                 "base_instructions".into(),
@@ -3825,6 +3832,7 @@ mod tests {
             "description": "Text model supplied by the configured gateway; only one text response was verified.",
             "base_instructions": "You are Codex, a coding agent. Help the user with software engineering tasks by inspecting the workspace, making focused changes, and verifying your work.",
             "input_modalities": ["text"],
+            "node_repl_disabled": true,
             "truncation_policy": {"mode": "tokens", "limit": 12345},
             "default_reasoning_level": "high",
             "supported_reasoning_levels": [{"effort": "high", "description": "Keep reasoning"}],
@@ -3834,17 +3842,23 @@ mod tests {
     }
 
     #[test]
-    fn legacy_capability_template_migrates_only_three_fields_and_is_idempotent() {
+    fn legacy_capability_template_migrates_known_fields_and_is_idempotent() {
         let original = legacy_capability_entry("vendor/legacy");
         let mut catalog = json!({"models": [original.clone()]});
         assert!(normalize_legacy_model_entries(&mut catalog).unwrap());
 
         let migrated = &catalog["models"][0];
         assert!(migrated.get("input_modalities").is_none());
+        assert!(migrated.get("node_repl_disabled").is_none());
         assert_eq!(migrated["description"], MODEL_DESCRIPTION);
         assert_eq!(migrated["base_instructions"], MODEL_BASE_INSTRUCTIONS);
         let mut restored = migrated.clone();
-        for key in ["description", "base_instructions", "input_modalities"] {
+        for key in [
+            "description",
+            "base_instructions",
+            "input_modalities",
+            "node_repl_disabled",
+        ] {
             restored[key] = original[key].clone();
         }
         assert_eq!(restored, original);

@@ -70,6 +70,26 @@
 - 将 `usb_runtime_environment` 仅接入 USB Codex 启动选项，保留现有媒体 MCP 环境变量合并。
 - 新增启动环境单测；运行结果和审计结论在本节补录。
 
+### 旧模型目录 Node REPL 禁用标记迁移
+
+测试机原始报告指出，旧版管理器写入的 `claude-sonnet-5-5` 条目显式含有 `node_repl_disabled=true`。此前仅修正了新条目模板；已存在的管理器目录仍会携带旧字段，因此旧模型切换后仍可能被 Codex 按元数据禁用 Node REPL。
+
+修复限制在 `normalize_legacy_model_entries` 已有的精确旧模板签名内：描述、基础指令、`input_modalities=["text"]` 必须都匹配旧版生成值，且不得包含 `model_messages`。只有命中此签名时才删除 `node_repl_disabled=true`，并沿用既有迁移清除旧 text-only 标记；签名不匹配的条目和显式 `false` 值保留。此迁移不写 Codex `config.toml`，不改 Browser 插件缓存、MCP 注册、线程路由或认证。
+
+回归测试应验证：命中旧签名后删除 `node_repl_disabled=true`、新目录再次规范化时保持幂等；任何一个签名字段被用户更改时，整条旧标记保持不动。Node REPL 真正进入当前会话仍依赖 Codex Desktop 的 Browser 插件注册和工具注入，模型目录迁移不构成端到端 Browser 修复证明。
+
+审计限制：旧目录格式没有字段来源记录。如果用户在一条仍保留完整旧模板签名的模型上主动设置 `node_repl_disabled=true`，迁移无法区分该选择与旧版管理器写入的默认值，会清除此字段。为修复已确认的旧版 Sonnet 禁用问题，本次按旧模板签名迁移；不能声称覆盖此类人工定制时无影响。新目录不再写入该禁用字段。
+
+### 本轮验证结果（2026-10-25）
+
+- `cargo test --locked --manifest-path src-tauri/Cargo.toml --lib`：790 通过、0 失败、6 忽略；首次并行运行有一个 Windows 临时文件锁失败，独立重跑通过，随后完整重跑全部通过。
+- 两个旧模型迁移针对性 Rust 测试通过；包含模型目录归一化、MCP 配置保留的相关 Rust 覆盖也包含在上述全量库测试中。
+- `npm run build`、`npm run lint`：通过。
+- `npm test -- --reporter=dot`：39 个测试文件通过、2 个失败；480 项中 450 通过、29 失败、1 跳过。将 UI 测试单线程重跑后，`OfflineHome` 49 项通过，`Uninstall` 仍有 27 项失败，涉及当前卸载页文案/多路径展示与测试断言不一致。该失败未由本轮模型目录改动引入，但全量前端测试不能视为通过。
+- `installer-pack/test-adapter-contracts.py`：58 项通过；`tools/test-installer-chain-window-static.py`：10 项通过；`docs/audit-capability-pack.py installer-pack`：无结构、清单、校验和差异。
+- 只读独立审计确认补丁只改模型目录迁移和本文档，没有改写 `config.toml`、MCP 注册、Browser 缓存或会话路由；但上述旧目录用户定制歧义仍是已知边界。
+- 本机没有 USB 测试机运行的 Codex Desktop 会话和设备工具桥接，不能做真实 Browser/Node 工具注入、跨会话调用或媒体生成端到端验证。必须在测试机验证新旧模型切换、MCP 生图、Browser 和跨会话工具是否实际注入。
+
 ### 代码审计补充：图像输入默认值
 
 Codex 0.157.1 对缺省 `input_modalities` 的兼容默认值是 `text + image`。本项目的新网关模型模板没有序列化该字段，所以模型目录并没有像部分测试报告所述那样明确标记成 text-only；它沿用 Codex 的旧目录兼容默认。当前没有测试证据证明这一定造成问题，也没有证据证明所有 404token 模型都不接受图片。本轮保留原生缺省，避免仅凭未测试而全局关闭用户可能可用的图像能力；测试机应确认 UI 允许图片时，上游是否真正能理解。
