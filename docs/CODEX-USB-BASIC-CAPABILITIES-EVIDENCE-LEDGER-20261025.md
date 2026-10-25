@@ -71,7 +71,20 @@
 | `npm test` | 沙箱内 41 suite 在收集测试前 EPERM；获批沙箱外完整运行 41 文件、477 passed、1 skipped | 所有 41 个 suite 在沙箱内无法创建/rename Vitest 临时缓存；沙箱外前端和 `scripts/release-workflow.test.mjs`、`scripts/mirror-release.test.mjs` 随全套运行通过。 |
 | `npm run build` | 通过 | Vite/renderer-entry 检查通过；有 App bundle chunk 大于 500 KiB 的非阻断提醒。 |
 
-未运行 `cargo clippy`、Rust 格式命令或 GitHub release workflow；未打包、签名、发布或做真实 USB/安装/卸载操作。`npm test` 已包含仓库 release 定向测试文件，因此没有重复运行 `npm run test:release`。
+首次全量运行记录后，按失败域复核了三个沙箱权限敏感的独立 fixture：原子文件硬链接、临时 HKCU 注册表键、loopback HTTP 重试均在获批环境各 1/1 通过；结果支持这些代表失败与受限 runner 相符，不足以把先前全部失败归结为同一原因。另运行 `npm run test:release -- --reporter=verbose`，mirror-release 与 release-workflow 两文件合计 56/56 通过，其中 release-workflow 为 13 项。完整前端 verbose 日志确定唯一跳过项是 `tools/skill-hub-relay-sync.test.mjs` 的 Python 语法执行；日志明确记录当前 runner 无 `python`，静态断言仍运行，非 release 测试。
+
+## 2026-10-25 获批环境复核
+
+以下命令在本地提交 `c0a04c9bfc75ade9735f30727e9e1e318a28e804` 后运行，保存了完整 Rust 和 Vitest 输出。运行时工作区仍有本任务之外的未提交源码改动；没有 dirty-tree 完整指纹或独立干净 worktree，所以这是当前混合工作区回归，不声称等同于只含该提交的干净构建，也不绑定最终发行包。
+
+| 命令 | 结果 | 日志与解释 |
+|---|---|---|
+| `cargo test --manifest-path src-tauri/Cargo.toml --workspace --quiet` | 808 项：802 passed、0 failed、6 ignored | `.test-tmp/minimal-repair-final-20261025/rust-workspace-final-elevated.log`。获批环境下全量通过；先前受限运行的失败记录保留作 runner 对照，不抹除。 |
+| `npm test -- --reporter=verbose` | 41 文件通过；477 passed、1 skipped | `.test-tmp/minimal-repair-final-20261025/vitest-final-elevated.log`。唯一跳过为 Skill Hub 测试中需本机 `python` 的语法验证；运行环境未安装该命令，静态断言通过。 |
+| `npm run test:release -- --reporter=verbose` | 56 passed、0 failed、0 skipped | 独立覆盖 `scripts/mirror-release.test.mjs` 与 `scripts/release-workflow.test.mjs`；后者 13 项均通过。全量 Vitest 同时也收录这两个文件。 |
+| 权限敏感代表 fixture（3 条独立 cargo test 命令） | 原子硬链接 1/1；临时 HKCU 注册表键 1/1；loopback HTTP 重试 1/1 | 获批环境下均通过，与先前受限运行中 `os error 5`、注册表拒绝和 loopback `Connect`/`10013` 失败相对照。只证明这三项环境差异，不能据此替其余失败逐项断因。 |
+
+未运行 `cargo clippy`、未单独运行 Rust 格式检查、未执行 GitHub release workflow；未打包、签名或发布产品，未做真实 USB/安装/卸载操作。GitHub 最终修复提交推送被自动审批拒绝，故远端仍只包含上面的 docs-only 检查点。
 
 补充版本边界：`CODEX-USB-CODE-MODE-HOST-AUDIT-HANDOFF-20261025.md` 和整改文档另记录本机已安装包 `26.1016.8622.0` 的 host 签名检查；上表仓库内参考 MSIX 文件名是 `26.1002.7124.0`。两者是不同包证据，不能交叉绑定；本台账未独立复核前述签名验证过程，也没有证明任一包等于测试机 USB payload。
 
