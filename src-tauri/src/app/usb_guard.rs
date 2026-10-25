@@ -5533,7 +5533,19 @@ mod tests {
         let _ = target.wait();
         let _ = unrelated.wait();
         let _ = manager.wait();
-        fs::remove_dir_all(&temp).unwrap();
+        let cleanup_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match fs::remove_dir_all(&temp) {
+                Ok(()) => break,
+                Err(error)
+                    if error.raw_os_error() == Some(32)
+                        && std::time::Instant::now() < cleanup_deadline =>
+                {
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Err(error) => panic!("remove process fixture directory: {error}"),
+            }
+        }
 
         fn spawn_guard_core_fixture(
             executable: &Path,

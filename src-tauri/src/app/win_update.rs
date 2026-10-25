@@ -919,6 +919,21 @@ fn usb_runtime_environment(codex_home: &Path) -> Vec<(String, String)> {
     environment
 }
 
+/// Build the process-local environment shared by every USB Codex entry point.
+/// Non-USB launches intentionally receive no USB runtime or media overrides.
+pub(crate) fn codex_launch_environment(
+    usb_mode: bool,
+    codex_home: Option<&Path>,
+) -> Vec<(String, String)> {
+    if !usb_mode {
+        return Vec::new();
+    }
+
+    let mut environment = codex_home.map(usb_runtime_environment).unwrap_or_default();
+    environment.extend(crate::app::media_generation::usb_launch_environment());
+    environment
+}
+
 pub fn plan_windows_update(
     endpoints: &MirrorEndpoints,
     settings: &AppSettings,
@@ -3233,17 +3248,7 @@ pub fn launch_codex(settings: &AppSettings, codex_locale: Option<&str>) -> Resul
     let direct_entry_required = usb_authorization
         .as_ref()
         .is_some_and(|authorization| authorization.direct_entry_required);
-    let mut launch_environment = if usb_mode {
-        codex_home
-            .as_deref()
-            .map(usb_runtime_environment)
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    if usb_mode {
-        launch_environment.extend(crate::app::media_generation::usb_launch_environment());
-    }
+    let launch_environment = codex_launch_environment(usb_mode, codex_home.as_deref());
     let report = codex_win_engine::launch_codex_with_options(
         &installed,
         codex_win_engine::LaunchOptions {
@@ -4086,8 +4091,8 @@ mod tests {
             .find(|(name, _)| name.eq_ignore_ascii_case("PATH"))
             .map(|(_, value)| value)
             .expect("USB launch should include managed runtime PATH");
-        let path_entries = std::env::split_paths(std::ffi::OsStr::new(configured_path))
-            .collect::<Vec<_>>();
+        let path_entries =
+            std::env::split_paths(std::ffi::OsStr::new(configured_path)).collect::<Vec<_>>();
         assert_eq!(path_entries.first(), Some(&runtime_bin));
         assert_eq!(
             &path_entries[1..],
@@ -4101,6 +4106,63 @@ mod tests {
             .any(|(name, value)| { name == "PYTHONIOENCODING" && value == "utf-8" }));
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shared_codex_launch_environment_keeps_usb_runtime_and_media_overrides_together() {
+        let root = temp_test_dir("shared-codex-launch-environment");
+        let codex_home = root.join("codex-home");
+        let runtime_bin = codex_home.join("codex-agent-kit").join("bin");
+        std::fs::create_dir_all(&runtime_bin).unwrap();
+
+        let environment = super::codex_launch_environment(true, Some(&codex_home));
+        let path = environment
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("PATH"))
+            .map(|(_, value)| value)
+            .expect("USB launch should include the managed runtime PATH");
+        assert_eq!(
+            std::env::split_paths(std::ffi::OsStr::new(path)).next(),
+            Some(runtime_bin)
+        );
+        assert!(environment
+            .iter()
+            .any(|(name, value)| name == "PYTHONUTF8" && value == "1"));
+        assert!(environment
+            .iter()
+            .any(|(name, value)| name == "PYTHONIOENCODING" && value == "utf-8"));
+        for (name, value) in crate::app::media_generation::usb_launch_environment() {
+            assert!(environment.iter().any(|(actual_name, actual_value)| {
+                actual_name == &name && actual_value == &value
+            }));
+        }
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shared_codex_launch_environment_omits_managed_path_when_runtime_is_missing() {
+        let root = temp_test_dir("shared-codex-launch-environment-no-runtime");
+        let codex_home = root.join("codex-home");
+        std::fs::create_dir_all(&codex_home).unwrap();
+
+        let environment = super::codex_launch_environment(true, Some(&codex_home));
+        assert!(!environment
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("PATH")));
+        assert!(environment
+            .iter()
+            .any(|(name, value)| name == "PYTHONUTF8" && value == "1"));
+        assert!(environment
+            .iter()
+            .any(|(name, value)| name == "PYTHONIOENCODING" && value == "utf-8"));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shared_codex_launch_environment_does_not_change_non_usb_launches() {
+        assert!(super::codex_launch_environment(false, None).is_empty());
     }
 
     #[test]

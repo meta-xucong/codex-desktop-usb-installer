@@ -36,7 +36,7 @@
 | 2 | 模型基础指令和 Node 默认迁移 | 已移除一条管理器顺序执行偏好；运行时影响待验证 | `src-tauri/src/app/model_catalog.rs`、模型 preflight/写回调用链 |
 | 3 | App Tools MCP 启动和跨会话 | launcher 不变；同版证据待取得 | `crates/codex-win-engine/src/portable.rs`、实际 `.mcp.json` 与 server 日志 |
 | 4 | 普通/主题/事务启动环境一致性 | CDP 预检接线已实现；实机待验，其余路径待核对 | `win_update.rs`、`codex_theme.rs`、`commands.rs`、启动和重载入口 |
-| 5 | PE/签名/隐藏窗口/恢复边界 | host 不再被重写；旧 payload 和运行时待验 | `portable.rs`、`sys.rs`、`windows_process.rs`、同版原包 |
+| 5 | PE/签名/隐藏窗口边界 | 新构建 host 不再被重写；运行时待验；不处理旧 USB payload | `portable.rs`、`sys.rs`、`windows_process.rs`、新候选包 |
 | 6 | Browser、搜索、媒体、会话、Skill Hub、标题及范围边界 | 待执行 | 分项代码入口与测试机证据 |
 | 7 | 分章回归、审计、构建与交付门槛 | 待执行 | 当前源码、测试结果、release manifest/checksum、测试机记录 |
 
@@ -165,20 +165,20 @@
 
 ## 第5章：官方二进制、PE、签名和窗口行为
 
-**前置决策：**对照同版本原始 PE 文件、签名验证结果、文件哈希和便携文件哈希；当前本机历史 MSIX 样本不是测试机包的替代品。
+**前置决策：**以本轮源码构建的候选和实际官方对照样本为对象；本机历史 MSIX 不等于新候选或测试机包。本轮不恢复、迁移或测试旧 USB payload。
 
 **涉及文件：**`portable.rs` PE 清单/偏移检查/USB overlay 与事务 hash；`sys.rs` 子进程创建和 stdio；`windows_process.rs` 窗口 watcher、一次性前台激活；打包 manifest/checksum。
 
 **执行与交付：**
 
-1. **未来变更**和**既有 payload 恢复**分开。评估每个 sidecar 的真实父进程、创建标志、控制台和继承句柄；PE subsystem 单独不是 stdio 故障的充分条件。未来只停止有证据显示不需要且产生副作用的修改，不做全名单批量回退。
-2. 旧 payload 中发现 GUI host 时不得按名字推定旧管理器改过。只允许从版本、架构、发布者相同且签名/哈希经核验的可信完整原文件恢复；不允许仅 `2→3`、重写 PE 子系统或用不同版本文件替换。
+1. 仅审查新构建的源码启动兼容规则。评估每个 sidecar 的真实父进程、创建标志、控制台和继承句柄；PE subsystem 单独不是 stdio 故障的充分条件。只停止有证据显示不需要且产生副作用的修改，不做全名单批量回退。
+2. 不检查或恢复旧 USB payload，不按名字、Subsystem 或版本猜测其来源；测试目标是从当前源码重新构建的新候选。
 3. 若宿主未来官方版本本身为 GUI 子系统，保留该官方文件，不强制改成 CUI。对签名文件做任何字节改写均须重新评估签名有效性、manifest/checksum、USB overlay/事务 hash 和包来源；不得把源码 fixture 结果称为包签名验证。
 4. 找出实际控制子进程可见性的父级；窗口可见性轮询和一次用户显式激活不等同持续抢焦点。改动窗口逻辑前先保留启动可见性与显式“打开窗口”行为。
 
 **正例：**A/B 单项比较中用同一原文件和同一 profile，记录 parent PID、spawn flags、stdin/stdout/stderr 句柄和窗口事件。**反例：**仅因 subsystem=2 判断损坏；把管理器控制所有后代当既定事实；把恢复标准输出效果或所有工具故障根因写成已证明。
 
-**回退范围：**未来 PE 改写只回退对应文件/清单规则；既有二进制恢复使用完整同版备份且先确认目标哈希。源码回退不能自动修复已部署 payload，文档不得承诺两者相互替代。
+**回退范围：**只回退本轮对应源码/新候选清单规则；不触碰旧 USB 介质或其中二进制。用户自行打包新 EXE 后按该新候选身份验收。
 
 **接受标准：**原包来源和哈希明确；签名验证结果留档；目标文件与候选版本匹配；每项二进制改动有必要性和相邻 app-server/工具回归证据。未匹配的 USB payload 标 `NOT_RUN`。
 
@@ -265,5 +265,5 @@
 
 本记录只关闭本组开发文档的编排缺口，不代表任一功能代码已实施或验收。章节编号明确为阅读/文档顺序；实际依赖仅在“阅读顺序与执行依赖”和章节前置条件中列出。第3章 launcher 决策依赖第5章 Node PE/父进程/stdio 证据；第2章 prompt 修改必须保持 Node 迁移 legacy 匹配签名独立且稳定。普通 USB、持久主题、独立主题/CDP、事务重启已逐路径列在第4章和矩阵 R-02/R-03。
 
-本轮文档复核关闭项：命令从 `package.json`、`.github/workflows/ci.yml` 核对；格式命令未核实则保留为执行前确认项；工作区身份包含 tracked 与 untracked 且明确新 worktree 不继承 dirty 状态；每项测试/实机/授权边界与 `NOT_RUN`/`ENV_BLOCKED` 的局部阻断规则已写明；旧版 payload、重试/幂等、断开恢复、配置字节不变和同版可信完整二进制约束已纳入执行合同。复核仅确认文档相互一致和仓库入口存在，未运行测试、服务、打包或目标机操作。
+本轮文档复核关闭项：命令从 `package.json`、`.github/workflows/ci.yml` 核对；格式命令未核实则保留为执行前确认项；工作区身份包含 tracked 与 untracked 且明确新 worktree 不继承 dirty 状态；每项测试/实机/授权边界与 `NOT_RUN`/`ENV_BLOCKED` 的局部阻断规则已写明；新候选重试/幂等、断开恢复、配置字节不变和源码 PE 规则约束已纳入执行合同。旧 USB payload 恢复/迁移已由用户取消。复核仅确认文档相互一致和仓库入口存在，未运行测试、服务、打包或目标机操作。
 

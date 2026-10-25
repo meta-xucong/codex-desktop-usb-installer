@@ -1,5 +1,7 @@
 # U 盘版 Codex 基础能力回归审计与修复契约（2026-10-25）
 
+> **后续候选衔接：**本文保留当时的审计结论与测试记录。其历史 Rust/前端通过数字不自动覆盖后续 Node 迁移或当前候选；后续逐章实施和测试状态以[基础能力修复开发规范](CODEX-USB-BASIC-CAPABILITIES-REPAIR-PLAN-20261025.md)及其证据台账为准。本文关于精确旧模板 Node 字段迁移的历史说明继续保留；当前执行不得回到更早“匹配条目保留 `true`”的结论。
+
 ## 目标与范围
 
 目标是恢复 U 盘版 Codex 的基础能力一致性：工具是否由 Codex 注册并注入、模型目录是否无依据地收窄原生能力、U 盘运行环境是否能被 Codex 子进程正确解析。单个 skill、HyperFrames 和孤立测试用例不属于修复目标。
@@ -74,11 +76,11 @@
 
 测试机原始报告指出，旧版管理器写入的 `claude-sonnet-5-5` 条目显式含有 `node_repl_disabled=true`。此前仅修正了新条目模板；已存在的管理器目录仍会携带旧字段，因此旧模型切换后仍可能被 Codex 按元数据禁用 Node REPL。
 
-修复限制在 `normalize_legacy_model_entries` 已有的精确旧模板签名内：描述、基础指令、`input_modalities=["text"]` 必须都匹配旧版生成值，且不得包含 `model_messages`。只有命中此签名时才删除 `node_repl_disabled=true`，并沿用既有迁移清除旧 text-only 标记；签名不匹配的条目和显式 `false` 值保留。此迁移不写 Codex `config.toml`，不改 Browser 插件缓存、MCP 注册、线程路由或认证。
+迁移仅处理精确匹配旧版管理器模板的条目：描述、基础指令、`input_modalities=["text"]` 必须匹配，且不得包含 `model_messages`。命中后移除旧 text-only 字段，并仅在 `node_repl_disabled` 严格为布尔 `true` 时移除该字段；`false`、缺失值及模板不匹配条目保持该字段原状。此迁移不写 Codex `config.toml`，不改 Browser 插件缓存、MCP 注册、线程路由或认证。
 
-回归测试应验证：命中旧签名后删除 `node_repl_disabled=true`、新目录再次规范化时保持幂等；任何一个签名字段被用户更改时，整条旧标记保持不动。Node REPL 真正进入当前会话仍依赖 Codex Desktop 的 Browser 插件注册和工具注入，模型目录迁移不构成端到端 Browser 修复证明。
+回归测试验证：命中旧签名时清除 `node_repl_disabled=true`，保留 `false` 与缺失值，并保证迁移幂等；签名字段不匹配时不执行这项迁移。由于目录没有字段来源记录，完全匹配旧模板的用户手动 `true` 也会被清除，无法与旧版管理器写入值区分。新建模型继续省略该字段并继承 Codex 缺省值。Node REPL 真正进入当前会话仍依赖 Codex Desktop 的 Browser 插件注册和工具注入，模型目录迁移不构成端到端 Browser 修复证明。
 
-审计限制：旧目录格式没有字段来源记录。如果用户在一条仍保留完整旧模板签名的模型上主动设置 `node_repl_disabled=true`，迁移无法区分该选择与旧版管理器写入的默认值，会清除此字段。为修复已确认的旧版 Sonnet 禁用问题，本次按旧模板签名迁移；不能声称覆盖此类人工定制时无影响。新目录不再写入该禁用字段。
+审计结论：本迁移按旧模板签名清除旧版管理器生成的 `true`，以恢复其当时默认禁用 Node 的旧条目；精确匹配模板的人工 `true` 也会被清除，这是目录缺少字段来源记录带来的已知边界。此目录元数据迁移本身不证明 Node 工具已注入当前会话。
 
 ### 本轮验证结果（2026-10-25）
 
@@ -105,4 +107,12 @@ Codex 0.157.1 对缺省 `input_modalities` 的兼容默认值是 `text + image`�
 - 独立只读审计：代码边界 PASS；指出的两处文档描述已收窄。当前执行环境的 `LOCALAPPDATA` 是 Codex sandbox 私有路径；没有实际 USB profile 或受管 Python runtime，因此无法在本机做真实 Codex 启动/浏览器端到端验收。需在测试机确认默认 `python`、中文 stdout/文件读回、Browser 工具注入，以及三类会话能力。
 
 审计结论：**代码安全审计通过；USB runtime 环境变量的注入逻辑与顺序已由单测验证。** PATH 注入为 U 盘子进程优先解析受管运行时提供了条件，但真实 `python --version` 解析和 Python 编码表现仍待 USB 测试机确认。本次没有证明 Browser 插件、跨会话 host tools、ChatGPT durable/workspace 路由或模型图像理解已恢复。HyperFrames 未纳入本次实现。
+
+### Dot 复核后续（2026-10-25）
+
+后续只读复核发现 CDP/theme 启动此前没有复用 USB Python 环境。当前代码已将普通 USB 与 CDP/theme 启动统一到 `win_update::codex_launch_environment`；非 USB 分支继续使用空环境覆盖，USB 媒体环境变量合并行为保留。对应定向 Rust 测试当前为 55/55 通过。
+
+旧模型目录迁移按精确旧模板签名清除布尔 `true`，保留 `false` 与缺失值；模板匹配的手动 `true` 也会被清除，因为目录没有字段来源记录。此前撤销该迁移的结论已由当前实现恢复。新建模型仍省略该字段。模型目录定向 Rust 测试当前为 74/74 通过。
+
+卸载 UI 的既定产品行为是两步确认后完整清理本机 Codex、CCSwitch 与受管能力包数据，并保留 U 盘安装介质；对应页面代码已符合此行为。本轮同步修正文档和卸载测试。卸载 UI 30/30 通过；完整前端测试中除沙箱下 Git/MSYS 本地 fixture 拒绝外，其余 476 项通过、1 项跳过；该 fixture 独立在沙箱外 13/13 通过。真实 U 盘启动与数据清理未在开发机执行。
 

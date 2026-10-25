@@ -4,9 +4,9 @@
 
 ## 1. 用户目标与边界
 
-用户选择明确清理时，本机的 Codex、CCSwitch、能力包 Skills/Agents、能力包运行时与相关配置应进入同一次清理契约；未选择清理时仍保留共享用户数据。
+当前卸载 UI 的产品契约是：用户完成两步确认后，清理本机 Codex、CCSwitch、能力包 Skills/Agents、能力包运行时与相关配置。UI 不提供保留共享数据的选项；USB 安装介质始终保留。后端命令仍保留 purge 参数以兼容其他调用方，但卸载 UI 在最终确认后传入完整清理参数。
 
-U 盘发行目录是独立边界。`removeUsbMedia=false` 时，清理计划不得包含 U 盘路径；因此 `content/codex-starter-kit`、`content/skills`、`content/mcp` 和安装包本身不会被本机数据清理触碰。只有用户另行开启“删除当前 U 盘安装包”并通过卷身份、发行清单、许可证和文件类型复核时，才允许进入 U 盘清理分支。
+U 盘发行目录是独立边界，当前 UI 与后端始终保留 USB 安装介质。清理计划不得包含 U 盘路径；`removeUsbMedia=true` 会被后端拒绝。因此 `content/codex-starter-kit`、`content/skills`、`content/mcp` 和安装包本身不会被本机数据清理触碰。
 
 ## 2. 报告诊断
 
@@ -63,21 +63,21 @@ G15 的 ChatGPT.lnk 不是 U 盘程序仍在运行，而是旧版便携流程创
 - 管理器启动时会做一次轻量死链扫描：只移除已证明属于本产品且目标已不存在的链接，并通知 Windows Shell 刷新目录；有效链接和无法证明归属的链接不动；
 - 新的卸载报告统一写入 %LOCALAPPDATA%\CodexAppManager\logs（不可写时回退到 %TEMP%\CodexAppManager\logs），不再写到桌面；新版本会在本地清理中回收旧版本桌面上的 Codex-Uninstall-Report-*.json 精确文件。
 
-显式勾选 Codex 数据清理时，新增纳入：
+完整卸载确认中的 Codex 数据清理范围包括：
 
 - `%USERPROFILE%\\.agents\\skills`：离线能力包实际安装的本机 Skills 根目录；
 - `.codex` 下的 Agents、能力包运行时、MCP wrapper、readiness、诊断和配置片段仍由已有 `.codex` 精确目标覆盖；
 - 能力包登记过的当前用户环境变量（例如 API Key、端点和模型名）会先从 `.codex\\codex-agent-kit\\connection-ownership.json` 读取名称，再只删除这些已登记名称的 `HKCU\\Environment` 值；不会扫描或清空其他环境变量；
 - Codex AppX 数据、桌面运行时缓存、Roaming 数据和精确恢复备份仍按原白名单处理。
 
-显式勾选 CCSwitch 数据清理时，继续清理 `.cc-switch`、Local/Roaming `com.ccswitch.desktop`。普通卸载仍不删除这些共享用户数据。
+完整卸载确认中的 CCSwitch 数据清理继续覆盖 `.cc-switch`、Local/Roaming `com.ccswitch.desktop`。
 
 空的 `.agents` 容器只在 Codex 数据清理分支中做非递归移除；含有其他内容时保留，不扩大到整个 `.agents`。
 
 ## 4. 安全验收
 
-- 默认清理目标不包含 `.codex`、`.agents\\skills`、CCSwitch 用户数据或任何 U 盘路径。
-- Codex 数据清理目标包含 `.codex` 和 `.agents\\skills`；CCSwitch 数据清理目标与 Codex 目标保持独立。
+- 卸载 UI 必须在两步确认完成前不发起卸载；最终调用清理 Codex 与 CCSwitch 的本机用户数据。
+- USB 安装介质不属于本机数据清理目标；卸载 UI 固定保留 USB 内容。
 - 收尾报告的 `removed` 证据可覆盖握手标记被错过的时序；`pending/finalizing` 不会被当成成功。
 - 缺少或损坏连接所有权记录时，不会猜测 API Key 所在变量；报告会保留失败项，避免把用户自己的环境变量误删。
 - 快捷方式清理失败会保留 Start Menu shortcut cleanup failed 证据并提供重试；未证明归属的同名链接会被记录为保留，而不是误删。
@@ -86,4 +86,4 @@ G15 的 ChatGPT.lnk 不是 U 盘程序仍在运行，而是旧版便携流程创
 
 ## 5. 发布前仍需验证
 
-在测试机上运行正式卸载前，应确认 UI 的“高级数据清理”二次确认明确列出 `.agents\\skills` 和能力包登记的当前用户环境变量，并在 `removeUsbMedia=false` 下对 U 盘做前后哈希对照。若选择 U 盘介质删除，则必须另行记录该选择，不得把它与本机数据清理混为默认行为。
+测试机验收正式卸载时，应确认两步确认明确说明本机 Codex、CCSwitch 与能力包数据会被清理，并确认 USB 安装介质的文件清单与哈希前后不变。当前卸载 UI 不提供删除 USB 介质的选项。

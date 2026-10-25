@@ -581,14 +581,16 @@ export function OfflineComponentsSheet({
                 : t("offline.components.notReady")}
             </strong>
             <span>{packReport.message}</span>
-            {packReport.codexRestartRequired ? (
+            {packReport.codexRestartRequired ||
+            packReport.mediaProtocolStatus !== "not-checked" ||
+            packReport.mediaGatewayCatalogStatus !== "not-checked" ? (
               <small role="status">
                 {t("offline.components.mediaReadiness", {
                   protocol: t(packReport.mediaProtocolStatus === "passed" ? "offline.components.statusPassed" : "offline.components.statusNotChecked"),
                   catalog: t(packReport.mediaGatewayCatalogStatus === "verified" ? "offline.components.statusPassed" : packReport.mediaGatewayCatalogStatus === "failed" ? "offline.components.statusFailed" : "offline.components.statusNotChecked"),
-                  restart: packReport.codexRunning
+                  restart: packReport.codexRestartRequired && packReport.codexRunning
                     ? t("offline.components.restartRunning")
-                    : t("offline.components.restartRequired"),
+                    : "",
                 })}
               </small>
             ) : null}

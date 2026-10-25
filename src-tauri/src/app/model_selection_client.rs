@@ -349,30 +349,79 @@ impl Drop for ConfigurationLock {
 }
 #[cfg(windows)]
 pub(crate) fn lock_configuration() -> Result<ConfigurationLock, &'static str> {
-    let name: Vec<u16> = "Local\\CodexUsbModelSelection"
-        .encode_utf16()
-        .chain(Some(0))
-        .collect();
+    lock_configuration_with_poll("Local\\CodexUsbModelSelection", 10_000, 10_000, || {})
+}
+#[cfg(windows)]
+#[cfg(test)]
+pub(crate) fn lock_configuration_observing_wait<F>(
+    mutex_name: &str,
+    on_wait: F,
+) -> Result<ConfigurationLock, &'static str>
+where
+    F: FnMut(),
+{
+    // Short waits let the concurrency test signal only after Windows has
+    // confirmed that another process still owns the mutex.
+    lock_configuration_with_poll(mutex_name, 25, 10_000, on_wait)
+}
+#[cfg(windows)]
+#[cfg(test)]
+pub(crate) fn lock_configuration_with_name_for_test(
+    mutex_name: &str,
+) -> Result<ConfigurationLock, &'static str> {
+    lock_configuration_with_poll(mutex_name, 10_000, 10_000, || {})
+}
+#[cfg(windows)]
+fn lock_configuration_with_poll<F>(
+    mutex_name: &str,
+    poll_interval_ms: u32,
+    timeout_ms: u32,
+    mut on_wait: F,
+) -> Result<ConfigurationLock, &'static str>
+where
+    F: FnMut(),
+{
+    let name: Vec<u16> = mutex_name.encode_utf16().chain(Some(0)).collect();
     let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
     if handle.is_null() {
         return Err("selection-lock-unavailable");
     }
-    let status = unsafe { WaitForSingleObject(handle, 10_000) };
-    if status != 0 {
-        if status == 0x80 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
+    loop {
+        let remaining_ms = deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .as_millis()
+            .min(u32::MAX as u128) as u32;
+        if remaining_ms == 0 {
             unsafe {
-                ReleaseMutex(handle);
+                CloseHandle(handle);
+            }
+            return Err("selection-lock-unavailable");
+        }
+        let status = unsafe { WaitForSingleObject(handle, poll_interval_ms.min(remaining_ms)) };
+        match status {
+            0 => {
+                return Ok(ConfigurationLock {
+                    handle,
+                    _thread: std::marker::PhantomData,
+                });
+            }
+            0x80 => {
+                unsafe {
+                    ReleaseMutex(handle);
+                    CloseHandle(handle);
+                }
+                return Err("selection-lock-unavailable");
+            }
+            0x102 => on_wait(),
+            _ => {
+                unsafe {
+                    CloseHandle(handle);
+                }
+                return Err("selection-lock-unavailable");
             }
         }
-        unsafe {
-            CloseHandle(handle);
-        }
-        return Err("selection-lock-unavailable");
     }
-    Ok(ConfigurationLock {
-        handle,
-        _thread: std::marker::PhantomData,
-    })
 }
 
 #[cfg(not(windows))]

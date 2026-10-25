@@ -2759,6 +2759,13 @@ fn cleanup_portable_work_dir(work_dir: &Path) -> Result<(), EngineError> {
 // other failures still return immediately.
 const WINDOWS_FS_RETRY_DELAYS_MS: [u64; 8] = [50, 100, 200, 400, 800, 1_600, 2_500, 5_000];
 
+// Uninstall may race a scanner that keeps portable payload files open for
+// longer than directory replacement normally does. Give only uninstall a
+// bounded ~30 second retry window before surfacing the lock.
+const WINDOWS_UNINSTALL_RETRY_DELAYS_MS: [u64; 12] = [
+    50, 100, 200, 400, 800, 1_600, 2_500, 5_000, 5_000, 5_000, 5_000, 5_000,
+];
+
 fn is_transient_windows_fs_error(err: &io::Error) -> bool {
     // ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION.
     #[cfg(any(windows, test))]
@@ -2902,7 +2909,7 @@ where
     S: FnMut(Duration),
 {
     let mut recovered_processes = false;
-    for attempt in 0..=WINDOWS_FS_RETRY_DELAYS_MS.len() {
+    for attempt in 0..=WINDOWS_UNINSTALL_RETRY_DELAYS_MS.len() {
         match action() {
             Ok(()) => return Ok(()),
             Err(error) if is_transient_windows_fs_error(&error) => {
@@ -2918,13 +2925,13 @@ where
                     })?;
                     recovered_processes = true;
                 }
-                let Some(delay_ms) = WINDOWS_FS_RETRY_DELAYS_MS.get(attempt).copied() else {
+                let Some(delay_ms) = WINDOWS_UNINSTALL_RETRY_DELAYS_MS.get(attempt).copied() else {
                     return Err(error);
                 };
                 log::warn!(
                     "portable uninstall transient filesystem error attempt={} retry_budget={} raw_os_error={:?} retrying_in_ms={delay_ms}",
                     attempt + 1,
-                    WINDOWS_FS_RETRY_DELAYS_MS.len(),
+                    WINDOWS_UNINSTALL_RETRY_DELAYS_MS.len(),
                     error.raw_os_error()
                 );
                 sleep(Duration::from_millis(delay_ms));
@@ -2958,8 +2965,17 @@ fn remove_install_path_with_process_recovery(path: &Path) -> io::Result<bool> {
             let running = crate::windows_process::processes_running_for_root(path)
                 .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
             if running {
+                log::warn!(
+                    "portable uninstall sharing violation found managed processes under install root; requesting close path={}",
+                    path.display()
+                );
                 crate::windows_process::close_processes_for_root(2, path)
                     .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+            } else {
+                log::warn!(
+                    "portable uninstall sharing violation has no matching managed process; retrying filesystem cleanup path={}",
+                    path.display()
+                );
             }
             Ok(())
         },
@@ -7019,6 +7035,61 @@ mod tests {
     }
 
     #[test]
+    fn uninstall_sharing_violation_retries_locks_that_outlive_original_window() {
+        let attempts = Cell::new(0usize);
+        let recoveries = Cell::new(0usize);
+        let sleeps = Cell::new(0usize);
+        sharing_violation_retry(
+            || {
+                let attempt = attempts.get() + 1;
+                attempts.set(attempt);
+                if attempt <= 10 {
+                    Err(io::Error::from_raw_os_error(32))
+                } else {
+                    Ok(())
+                }
+            },
+            || {
+                recoveries.set(recoveries.get() + 1);
+                Ok(())
+            },
+            |_| sleeps.set(sleeps.get() + 1),
+        )
+        .expect("temporary lock should clear within the extended bounded window");
+
+        assert_eq!(attempts.get(), 11);
+        assert_eq!(recoveries.get(), 1);
+        assert_eq!(sleeps.get(), 10);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn uninstall_removes_install_after_a_real_file_lock_outlives_old_retry_window() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let root = temp_test_dir("uninstall-delayed-file-lock");
+        fs::create_dir_all(&root).unwrap();
+        let locked_file_path = root.join("locked-payload.bin");
+        fs::write(&locked_file_path, b"temporary lock fixture").unwrap();
+        let locked_file = fs::OpenOptions::new()
+            .read(true)
+            // FILE_SHARE_READ | FILE_SHARE_WRITE, deliberately omitting
+            // FILE_SHARE_DELETE so remove_dir_all receives ERROR_SHARING_VIOLATION.
+            .share_mode(0x0000_0003)
+            .open(&locked_file_path)
+            .unwrap();
+        let release_thread = thread::spawn(move || {
+            thread::sleep(Duration::from_secs(12));
+            drop(locked_file);
+        });
+
+        let result = remove_install_path_with_process_recovery(&root);
+        release_thread.join().unwrap();
+        assert!(result.expect("removal should retry until the file handle is released"));
+        assert!(!root.exists());
+    }
+
+    #[test]
     fn uninstall_sharing_violation_has_a_finite_budget_and_surfaces_failure() {
         let recoveries = Cell::new(0usize);
         let attempts = Cell::new(0usize);
@@ -7037,8 +7108,8 @@ mod tests {
         .expect_err("exhausted lock retries must be reported");
         assert_eq!(error.raw_os_error(), Some(32));
         assert_eq!(recoveries.get(), 1);
-        assert_eq!(attempts.get(), WINDOWS_FS_RETRY_DELAYS_MS.len() + 1);
-        assert_eq!(sleeps.get(), WINDOWS_FS_RETRY_DELAYS_MS.len());
+        assert_eq!(attempts.get(), WINDOWS_UNINSTALL_RETRY_DELAYS_MS.len() + 1);
+        assert_eq!(sleeps.get(), WINDOWS_UNINSTALL_RETRY_DELAYS_MS.len());
     }
 
     #[test]
@@ -7089,8 +7160,8 @@ mod tests {
             )
             .expect_err("retry exhaustion must surface the OS error");
             assert_eq!(error.raw_os_error(), Some(code));
-            assert_eq!(attempts.get(), WINDOWS_FS_RETRY_DELAYS_MS.len() + 1);
-            assert_eq!(sleeps.get(), WINDOWS_FS_RETRY_DELAYS_MS.len());
+            assert_eq!(attempts.get(), WINDOWS_UNINSTALL_RETRY_DELAYS_MS.len() + 1);
+            assert_eq!(sleeps.get(), WINDOWS_UNINSTALL_RETRY_DELAYS_MS.len());
             assert_eq!(recoveries.get(), 0, "raw error {code}");
         }
     }

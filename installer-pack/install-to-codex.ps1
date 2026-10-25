@@ -608,6 +608,9 @@ if ($mediaGenerationEnabled) {
         throw "Bundled Python media MCP is not ready: $mediaHealthOutput"
     }
 }
+# This is a point-in-time process snapshot before config write; it does not
+# establish whether the current conversation has loaded the MCP tools.
+$codexRunning = @(Get-Process -Name 'Codex','codex' -ErrorAction SilentlyContinue).Count -gt 0
 $rendererTarget = Join-Path $ownershipRoot 'bin\render-codex-config.ps1'
 $generatedConfig = Join-Path $ownershipRoot 'config\codex-starter.generated.toml'
 $feishuPackageCacheForRender = [string]$runtimeState.feishu.packageRoot
@@ -696,7 +699,6 @@ foreach ($modelOwnedPath in @((Join-Path $ownershipRoot 'model-catalog.json'), (
     }
 }
 $connectionStatusPath = Join-Path $ownershipRoot 'connection-status.json'
-$codexRunning = @(Get-Process -Name 'Codex','codex' -ErrorAction SilentlyContinue).Count -gt 0
 $localMcpsEnabled = @()
 if ($feishuEnabled) { $localMcpsEnabled += 'feishu' }
 if ($mediaGenerationEnabled) { $localMcpsEnabled += 'media-generation' }
@@ -721,7 +723,7 @@ $connectionStatus = [ordered]@{
         gatewayCatalogVerifiedAt = $mediaHealthStatus.catalogVerifiedAt
         gatewayModelCount = [int]$mediaHealthStatus.modelCount
     }
-    codex = [ordered]@{ restartRequired = [bool]$mediaGenerationEnabled; running = [bool]$codexRunning }
+    codex = [ordered]@{ restartRequired = [bool]($mediaGenerationEnabled -and $codexRunning); running = [bool]$codexRunning }
     codexConfig = [string]$configStatus.status
     apiServices = [ordered]@{
         templatesInstalled = $true
@@ -816,7 +818,7 @@ $readiness = [ordered]@{
     overallStatus = $overallStatus
     diagnostics = $diagnostics
     connections = $connectionStatus
-    codex = [ordered]@{ restartRequired = [bool]$mediaGenerationEnabled; running = [bool]$codexRunning }
+    codex = [ordered]@{ restartRequired = [bool]($mediaGenerationEnabled -and $codexRunning); running = [bool]$codexRunning }
     secretsStored = $false
 }
 $readinessTemp = Join-Path ([IO.Path]::GetTempPath()) ('codex-starter-readiness-' + [guid]::NewGuid().ToString('N') + '.json')

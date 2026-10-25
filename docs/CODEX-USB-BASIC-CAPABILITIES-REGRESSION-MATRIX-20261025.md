@@ -41,11 +41,10 @@
 | R-16 | Skill Hub 首次/重试 | 在隔离缓存环境测首次刷新失败和后续重试，记录真实 HTTP、DNS、超时、解包、校验、落盘阶段。 | UI 分类对应实际失败阶段；fixture 改动不算生产下载逻辑修复；重试不留下半成品。 | 脱敏请求状态/HTTP、阶段日志、缓存/临时目录清单和重试结果。 | 自动化 fixture + 真实网络测试机；若网络被挡记 ENV_BLOCKED。 | NOT_RUN |
 | R-17 | 自动标题 | 新建适用会话，记录是否发起标题生成、会话类型、失败/空结果后状态和最终标题。 | 按该会话类型现有产品合同生成/保留标题；标题生成失败不破坏会话身份/内容。 | 调用日志、session type/ID、标题变更前后。 | 自动化合同 + USB 实机。 | NOT_RUN |
 | R-18 | 启动与新 payload | 在隔离目标上用同版新包做干净解包/安装；检查 compatibility 首次和重复调用，再执行普通 USB 启动。 | patch 前置条件、overlay/hash 和事务校验吻合；重复调用不产生非预期增量。 | 原包和 payload manifest/hash、PE/MCP 文件差异、两次调用前后 hash、启动日志。 | 自动化 + 专用 Windows 测试机；非用户安装。 | NOT_RUN |
-| R-19 | PE/Code Mode host | 同版原包与测试 payload 核验文件 hash、Subsystem、签名验证；针对 compatibility PE patch 调两次；触发实际 host stdio/文件命令/工具握手。 | 只经同版完整原文件恢复；原生值/签名状态相符；第二次 patch no-op；host 工具真实返回可复核。 | 签名验证输出、文件 hash、PE 头、字节 diff、父子 PID/句柄、host 请求返回。 | 自动化 parser + USB 实机；恢复真实文件须单独批准并留可恢复副本。 | NOT_RUN |
+| R-19 | 新候选 PE/Code Mode host | 检查用户生成的新候选的 PE 规则；针对 compatibility patch 调两次；触发 host stdio/文件命令/工具握手。 | host 不被改写；其他 sidecar 按现有规则；第二次 patch no-op；host 工具真实返回可复核。旧 payload 不恢复、不迁移。 | 候选 SHA/manifest、PE 头、字节 diff、父子 PID/句柄、host 请求返回。 | 自动化 parser + USB 新候选实测。 | NOT_RUN |
 | R-20 | 卸载与保留 USB | 先做 UI/路径静态断言；真实清理由专用可恢复测试 profile 做两步确认，核对本机目标移除与 USB 介质保留。 | 按现行合同清理本机 Codex/CCSwitch/受管数据，保留 USB 安装介质；路径外不删。 | 展示步骤、清理计划、隔离前后目录清单、USB hash/可再启动检查。 | 自动化静态；真实删除要求专用环境和另行授权。 | NOT_RUN |
 | R-21 | Git / WSL / HyperFrames 边界 | 检查是否存在明确产品承诺或目标问题相关性；避免默默纳入依赖。 | Git 只按明确可选工作流合同评估；WSL 不扩范围；HyperFrames 本计划排除。 | 范围决定及引用，不需声称功能运行通过。 | 文档/静态；无需实机。 | NOT_RUN |
 | R-22 | USB 断开/重接/恢复 | 在专用介质与可恢复 profile 下记录正常退出/断开、重新接入、冷启动、热重启；覆盖一次未完成事务的安全恢复 fixture。 | 不残留错误锁/半完成 overlay；校验通过后才启动；身份/路径复核；非 USB 环境仍不受影响。 | 断开/重接时间线、事务/marker 状态、manifest/hash、进程关闭与重启结果。 | 自动化 fixture + 专用 Windows 测试机；不得拔除正在写入的用户介质。 | NOT_RUN |
-| R-23 | 旧 payload 升级 | 在专用可恢复 fixture 上，从已有旧 manager/旧便携 payload 身份开始执行升级前检查和兼容性 preflight；与 R-18 新包干净解包分别记录；不恢复真实 PE 文件。 | 对旧文件的处理有同版来源/哈希依据；缺文件/版本错配应停止而非按名称猜修；USB overlay/manifest 与事务一致。 | 升级前后逐文件版本/hash、来源清单、兼容性日志和可恢复副本位置。 | 自动化 fixture + 专用 Windows 测试机；替换已安装文件需另行授权。 | NOT_RUN |
 
 ## 填写规则
 

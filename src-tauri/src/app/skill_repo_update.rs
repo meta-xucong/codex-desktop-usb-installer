@@ -4891,6 +4891,44 @@ mod tests {
         std::thread::JoinHandle<()>,
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) {
+        retry_fixture_server_with_startup_timeout(
+            statuses,
+            body,
+            redirect_path,
+            Duration::from_secs(10),
+        )
+    }
+
+    fn retry_fixture_server_with_startup_timeout(
+        statuses: Vec<u16>,
+        body: Vec<u8>,
+        redirect_path: Option<&str>,
+        first_request_timeout: Duration,
+    ) -> (
+        String,
+        std::thread::JoinHandle<()>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        retry_fixture_server_with_timeouts(
+            statuses,
+            body,
+            redirect_path,
+            first_request_timeout,
+            Duration::from_secs(5),
+        )
+    }
+
+    fn retry_fixture_server_with_timeouts(
+        statuses: Vec<u16>,
+        body: Vec<u8>,
+        redirect_path: Option<&str>,
+        first_request_timeout: Duration,
+        request_timeout: Duration,
+    ) -> (
+        String,
+        std::thread::JoinHandle<()>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
         use std::io::{Read, Write};
         use std::net::TcpListener;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4908,16 +4946,29 @@ mod tests {
         let request_count = Arc::new(AtomicUsize::new(0));
         let server_request_count = Arc::clone(&request_count);
         let worker = std::thread::spawn(move || {
+            let started_at = Instant::now();
             let mut next_status = 0usize;
             let mut last_request_at = None;
             while next_status < statuses.len() {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        stream
+                            .set_nonblocking(false)
+                            .expect("set retry fixture stream blocking");
                         last_request_at = Some(Instant::now());
                         server_request_count.fetch_add(1, Ordering::SeqCst);
                         let mut request = Vec::new();
                         let mut chunk = [0u8; 1024];
+                        let request_deadline = Instant::now() + request_timeout;
                         loop {
+                            let remaining =
+                                request_deadline.saturating_duration_since(Instant::now());
+                            if remaining.is_zero() {
+                                break;
+                            }
+                            stream
+                                .set_read_timeout(Some(remaining))
+                                .expect("set retry fixture request deadline");
                             let Ok(read) = stream.read(&mut chunk) else {
                                 break;
                             };
@@ -4955,9 +5006,11 @@ mod tests {
                         }
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        if last_request_at
-                            .is_some_and(|last| last.elapsed() >= Duration::from_secs(2))
-                        {
+                        let idle_timeout_reached = match last_request_at {
+                            Some(last) => last.elapsed() >= Duration::from_secs(2),
+                            None => started_at.elapsed() >= first_request_timeout,
+                        };
+                        if idle_timeout_reached {
                             break;
                         }
                         std::thread::sleep(Duration::from_millis(10));
@@ -4971,6 +5024,50 @@ mod tests {
             worker,
             request_count,
         )
+    }
+
+    #[test]
+    fn retry_fixture_server_stops_when_no_first_request_arrives() {
+        let (_, worker, request_count) =
+            retry_fixture_server_with_startup_timeout(vec![200], Vec::new(), None, Duration::ZERO);
+
+        worker
+            .join()
+            .expect("fixture server should stop without a request");
+        assert_eq!(request_count.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn retry_fixture_server_bounds_incomplete_request_headers() {
+        use std::io::Write;
+
+        let (base, worker, request_count) = retry_fixture_server_with_timeouts(
+            vec![200],
+            Vec::new(),
+            None,
+            Duration::from_secs(1),
+            Duration::from_millis(25),
+        );
+        let address = base
+            .strip_prefix("http://")
+            .and_then(|url| url.split('/').next())
+            .expect("fixture server URL should have an address");
+        let mut client = std::net::TcpStream::connect(address).expect("connect fixture server");
+        client
+            .write_all(b"GET /latest.json HTTP/1.1\r\n")
+            .expect("send incomplete fixture request");
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = finished_tx.send(worker.join().is_ok());
+        });
+
+        assert!(
+            finished_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("fixture server should stop reading an incomplete header"),
+            "fixture server thread should not panic"
+        );
+        assert_eq!(request_count.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     fn skill_hub_fixture_server(

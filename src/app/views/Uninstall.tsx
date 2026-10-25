@@ -116,9 +116,8 @@ export function Uninstall({
   const [probe, setProbe] = useState<InstallProbeState>("loading");
   const [partialOutcome, setPartialOutcome] = useState<OperationOutcome | null>(null);
   const [retryBusy, setRetryBusy] = useState(false);
-  // Confirmation gate: 0 = none, 1 = first confirm, 2 = data-purge confirm
-  // (only reached when the user opted out of keeping data — a 3rd tap total).
-  // 3 = post-uninstall purge_user_data ancillary retry confirm (destructive).
+  // Confirmation gate: 0 = none, 1 = scope confirmation, 2 = final full-data
+  // purge confirmation. 3 = post-uninstall purge_user_data retry confirmation.
   const [confirmStep, setConfirmStep] = useState<0 | 1 | 2 | 3>(0);
   const confirm1TitleId = useId();
   const confirm1BodyId = useId();

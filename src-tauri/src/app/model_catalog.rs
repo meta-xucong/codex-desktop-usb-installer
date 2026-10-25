@@ -38,7 +38,8 @@ const CATALOG_IDENTITY: &str = "404token-unified-api-internal";
 pub(crate) const CATALOG_CLIENT_VERSION: &str = "codex-usb-gateway-2";
 const LEGACY_MODEL_BASE_INSTRUCTIONS: &str = "You are Codex, a coding agent. Help the user with software engineering tasks by inspecting the workspace, making focused changes, and verifying your work.";
 const LEGACY_FALLBACK_MODEL_BASE_INSTRUCTIONS: &str = "You are Codex, a coding agent. Help users with software engineering tasks by inspecting the workspace, making focused changes, and verifying your work.";
-const LEGACY_MODEL_DESCRIPTION: &str = "Text model supplied by the configured gateway; only one text response was verified.";
+const LEGACY_MODEL_DESCRIPTION: &str =
+    "Text model supplied by the configured gateway; only one text response was verified.";
 const MODEL_DESCRIPTION: &str = "Gateway model supplied by the configured provider; text response verified, image understanding not separately tested.";
 pub(crate) const MODEL_BASE_INSTRUCTIONS: &str = "You are Codex, a coding agent. Help with software engineering by inspecting the workspace, making focused changes, and verifying your work. Use only tools and capabilities available in this session. Claim image observations or successful actions only when supported by tool output. If image input or a tool is explicitly unsupported, report the limitation, do not invent results or repeat the same failing call, and continue only with supported work or ask for usable input. For external-provider delegation, if a handoff is opaque or unconfirmed, do not decode or loop-retry it, and continue locally. On Windows, use the active shell syntax, configured USB Python runtime, and UTF-8 for text/JSON. State completion only from visible evidence.";
 const CONFIG_BEGIN: &str = "# BEGIN CODEX-USB-NATIVE-MODEL-CATALOG v1";
@@ -1096,6 +1097,9 @@ fn conservative_tested_model_entry(model_id: &str, owner: Option<&str>, priority
         "supports_image_detail_original": false,
         "comp_hash": null,
         "experimental_supported_tools": [],
+        // Codex uses this to decide whether MCP tools are deferred to
+        // tool_search. False is the native default and keeps MCP tools direct;
+        // hosted web search is controlled by separate provider metadata.
         "supports_search_tool": false,
         "node_repl_auto_review_required": false,
         "default_reasoning_level": null,
@@ -1275,8 +1279,8 @@ fn validate_catalog_for_add(
     model_id: &str,
     reasoning: &crate::app::gateway_model_probe::ReasoningEvidence,
 ) -> Result<(), AppError> {
-    let value: Value = serde_json::from_slice(bytes)
-        .map_err(|_| engine("模型目录序列化结果无效；未写入"))?;
+    let value: Value =
+        serde_json::from_slice(bytes).map_err(|_| engine("模型目录序列化结果无效；未写入"))?;
     let ids = catalog_model_ids(&value)?;
     if ids.iter().collect::<BTreeSet<_>>().len() != ids.len() {
         return Err(engine("模型目录含重复标识；未写入"));
@@ -1303,12 +1307,12 @@ fn validate_catalog_for_add(
         .iter()
         .filter_map(|level| level.get("effort").and_then(Value::as_str))
         .collect::<Vec<_>>();
-    let expected = crate::app::gateway_model_probe::canonical_reasoning_efforts(
-        model_id,
-        &reasoning.efforts,
-    );
+    let expected =
+        crate::app::gateway_model_probe::canonical_reasoning_efforts(model_id, &reasoning.efforts);
     if stored.len() != expected.len()
-        || !expected.iter().all(|effort| stored.contains(&effort.as_str()))
+        || !expected
+            .iter()
+            .all(|effort| stored.contains(&effort.as_str()))
     {
         return Err(engine("新模型思考档位与探测结果不一致；未写入"));
     }
@@ -1369,14 +1373,16 @@ fn normalize_legacy_model_entries(catalog: &mut Value) -> Result<bool, AppError>
             && !entry.contains_key("model_messages")
         {
             entry.remove("input_modalities");
-            // Earlier manager-generated gateway entries explicitly disabled
-            // node_repl. The Codex model metadata default is enabled, so
-            // remove only this known legacy value and preserve any explicit
-            // user choice on entries outside the exact legacy signature.
+            // Earlier manager-generated entries explicitly disabled Node REPL.
+            // Codex defaults this field to false; remove only that known value
+            // from the exact legacy template matched above.
             if entry.get("node_repl_disabled").and_then(Value::as_bool) == Some(true) {
                 entry.remove("node_repl_disabled");
             }
-            entry.insert("description".into(), Value::String(MODEL_DESCRIPTION.into()));
+            entry.insert(
+                "description".into(),
+                Value::String(MODEL_DESCRIPTION.into()),
+            );
             entry.insert(
                 "base_instructions".into(),
                 Value::String(MODEL_BASE_INSTRUCTIONS.into()),
@@ -1488,7 +1494,40 @@ fn preflight_managed_catalog_at_home<V>(home: &Path, validate_catalog: V) -> Res
 where
     V: Fn(&[u8]) -> Result<(), AppError>,
 {
+    preflight_managed_catalog_at_home_with_reload(home, validate_catalog, || Ok(()))
+}
+
+fn preflight_managed_catalog_at_home_with_reload<V, M>(
+    home: &Path,
+    validate_catalog: V,
+    mark_reload: M,
+) -> Result<bool, AppError>
+where
+    V: Fn(&[u8]) -> Result<(), AppError>,
+    M: Fn() -> Result<(), AppError>,
+{
+    preflight_managed_catalog_at_home_with_reload_and_lock(
+        home,
+        validate_catalog,
+        mark_reload,
+        model_selection_client::lock_configuration,
+    )
+}
+
+fn preflight_managed_catalog_at_home_with_reload_and_lock<V, M, L>(
+    home: &Path,
+    validate_catalog: V,
+    mark_reload: M,
+    acquire_configuration_lock: L,
+) -> Result<bool, AppError>
+where
+    V: Fn(&[u8]) -> Result<(), AppError>,
+    M: Fn() -> Result<(), AppError>,
+    L: FnOnce() -> Result<model_selection_client::ConfigurationLock, &'static str>,
+{
     let _files = FILE_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _process_lock = acquire_configuration_lock()
+        .map_err(|_| AppError::Busy("另一个 Codex 配置操作正在进行，请稍后重试启动".into()))?;
     let config = config_path_for(home);
     let catalog = catalog_path_for(home);
     let Some(config_bytes) = read_optional(&config)? else {
@@ -1523,6 +1562,7 @@ where
             if read_optional(&catalog_backup)? != backup_snapshot {
                 return Err(engine("模型目录备份在校验期间发生变化；请重新点击启动"));
             }
+            mark_reload()?;
             let write = if backup_snapshot
                 .as_deref()
                 .is_some_and(|bytes| !owned_json_bytes(bytes, CATALOG_IDENTITY))
@@ -1533,11 +1573,11 @@ where
             } else {
                 atomic_file::write_atomic(&catalog, &normalized)
             };
-            write.map_err(|_| engine("模型目录 BOM 修复未完成；原目录已保留在备份中"))?;
+            write.map_err(|_| engine("模型目录迁移未完成；原目录已保留在备份中"))?;
             if read_optional(&catalog)?.as_deref() != Some(normalized.as_slice()) {
-                return Err(engine("模型目录 BOM 修复回读不一致；请重试启动"));
+                return Err(engine("模型目录迁移回读不一致；请重试启动"));
             }
-            log::info!("removed UTF-8 BOM from validated manager-owned model catalog");
+            log::info!("normalized validated manager-owned model catalog before USB launch");
         }
         return Ok(true);
     }
@@ -1557,6 +1597,7 @@ where
         return Err(engine("模型目录在恢复前发生变化；请重新点击启动"));
     }
     ensure_managed_config_unchanged(&config, &config_snapshot)?;
+    mark_reload()?;
     // Preserve the known-good .bak while atomically replacing the rejected
     // current file. `write_atomic` would rotate/delete the backup source.
     atomic_file::write_atomic_preserving_backup(&catalog, &normalized_backup)
@@ -1573,7 +1614,7 @@ pub(crate) fn preflight_usb_catalog() -> Result<(), AppError> {
     // Startup validation is intentionally local and bounded. Launching the
     // Codex runtime here made every USB start spawn a second heavyweight
     // process, and the CLI's debug output is not a stable import contract.
-    preflight_managed_catalog_at_home(&home, |_| Ok(()))?;
+    preflight_managed_catalog_at_home_with_reload(&home, |_| Ok(()), mark_restart_required)?;
     Ok(())
 }
 
@@ -1637,7 +1678,11 @@ fn prepare_model_add(
             }
             if ids.iter().any(|id| id == model_id) {
                 if managed {
-                    return Ok(action_report("already_added", ids, "该模型已在 Codex 目录中"));
+                    return Ok(action_report(
+                        "already_added",
+                        ids,
+                        "该模型已在 Codex 目录中",
+                    ));
                 }
                 reattach_detached_catalog(
                     &config,
@@ -1655,7 +1700,8 @@ fn prepare_model_add(
                     "已重新启用现有模型目录；重启 Codex 后生效",
                 );
                 if mark_restart_required().is_err() {
-                    report.message = "现有模型目录已重新启用，但重载标记写入失败；请手动重启 Codex".into();
+                    report.message =
+                        "现有模型目录已重新启用，但重载标记写入失败；请手动重启 Codex".into();
                 }
                 return Ok(report);
             }
@@ -1663,12 +1709,16 @@ fn prepare_model_add(
                 return Ok(action_report("ready", ids, "模型目录已就绪"));
             }
             if managed {
-                return Err(engine("当前启用的管理器模型目录为空；请先恢复默认模型后再添加"));
+                return Err(engine(
+                    "当前启用的管理器模型目录为空；请先恢复默认模型后再添加",
+                ));
             }
             true
         }
         None if managed => {
-            return Err(engine("Codex 已引用管理器模型目录但目录文件缺失；请先恢复默认模型"));
+            return Err(engine(
+                "Codex 已引用管理器模型目录但目录文件缺失；请先恢复默认模型",
+            ));
         }
         None => true,
     };
@@ -1682,7 +1732,11 @@ fn prepare_model_add(
         .as_ref()
     {
         if prepared_home == &home {
-            return Ok(action_report("ready", Vec::new(), "Codex 默认模型目录已准备"));
+            return Ok(action_report(
+                "ready",
+                Vec::new(),
+                "Codex 默认模型目录已准备",
+            ));
         }
     }
 
@@ -1698,7 +1752,9 @@ fn prepare_model_add(
             .map_err(|error| engine(format!("准备 Codex 默认模型目录失败（{}）", error.code())))?;
         let ids = catalog_model_ids(&seed)?;
         if ids.is_empty() || ids.iter().collect::<BTreeSet<_>>().len() != ids.len() {
-            return Err(engine("Codex 默认模型目录为空或含重复标识；未发送思考档位探测"));
+            return Err(engine(
+                "Codex 默认模型目录为空或含重复标识；未发送思考档位探测",
+            ));
         }
         let _files = FILE_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let _process_lock = model_selection_client::lock_configuration()
@@ -1709,7 +1765,9 @@ fn prepare_model_add(
             || read_optional(&catalog)? != catalog_bytes
             || read_optional(&catalog_backup)? != catalog_backup_snapshot
         {
-            return Err(engine("Codex 配置在准备期间发生变化；未发送思考档位探测，请重试"));
+            return Err(engine(
+                "Codex 配置在准备期间发生变化；未发送思考档位探测，请重试",
+            ));
         }
         *PREPARED_NATIVE_CATALOG
             .lock()
@@ -1719,7 +1777,9 @@ fn prepare_model_add(
     #[cfg(not(windows))]
     {
         let _ = request_id;
-        Err(engine("当前平台无法准备 Codex 默认模型目录；未发送思考档位探测"))
+        Err(engine(
+            "当前平台无法准备 Codex 默认模型目录；未发送思考档位探测",
+        ))
     }
 }
 
@@ -3679,6 +3739,7 @@ mod tests {
         assert_eq!(entry["base_instructions"], MODEL_BASE_INSTRUCTIONS);
         assert!(!MODEL_BASE_INSTRUCTIONS.contains("prefer local sequential work"));
         assert_eq!(entry["supports_search_tool"], false);
+        assert!(entry.get("node_repl_disabled").is_none());
         assert_eq!(entry["supported_reasoning_levels"], json!([]));
         assert!(entry.get("default_reasoning_summary").is_none());
         assert!(entry.get("web_search_tool_type").is_none());
@@ -3791,7 +3852,10 @@ mod tests {
             model["truncation_policy"],
             json!({"mode":"bytes","limit":10000})
         );
-        assert_eq!(model["base_instructions"], LEGACY_FALLBACK_MODEL_BASE_INSTRUCTIONS);
+        assert_eq!(
+            model["base_instructions"],
+            LEGACY_FALLBACK_MODEL_BASE_INSTRUCTIONS
+        );
         assert!(!normalize_legacy_model_entries(&mut catalog).unwrap());
     }
 
@@ -3866,6 +3930,33 @@ mod tests {
         let once = catalog.clone();
         assert!(!normalize_legacy_model_entries(&mut catalog).unwrap());
         assert_eq!(catalog, once);
+    }
+
+    #[test]
+    fn legacy_capability_migration_restores_node_default_only_for_legacy_true() {
+        for setting in [Some(json!(true)), Some(json!(false)), None] {
+            let mut entry = legacy_capability_entry("vendor/legacy-node-setting");
+            let expected_setting = match setting.as_ref() {
+                Some(value) if value.as_bool() == Some(true) => None,
+                _ => setting.clone(),
+            };
+            match setting {
+                Some(value) => entry["node_repl_disabled"] = value,
+                None => {
+                    entry.as_object_mut().unwrap().remove("node_repl_disabled");
+                }
+            }
+            let mut catalog = json!({"models": [entry]});
+
+            assert!(normalize_legacy_model_entries(&mut catalog).unwrap());
+            assert_eq!(
+                catalog["models"][0].get("node_repl_disabled").cloned(),
+                expected_setting
+            );
+            let once = catalog.clone();
+            assert!(!normalize_legacy_model_entries(&mut catalog).unwrap());
+            assert_eq!(catalog, once);
+        }
     }
 
     #[test]
@@ -4005,7 +4096,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_capability_preflight_preserves_config_mcp_bytes_and_does_not_rotate_backup_twice() {
+    fn legacy_capability_preflight_restores_default_before_reload_and_preserves_mcp_config() {
         let home = CatalogTempHome::new();
         let config = config_path_for(home.path());
         let catalog = catalog_path_for(home.path());
@@ -4021,16 +4112,32 @@ mod tests {
         std::fs::write(&config, &config_bytes).unwrap();
         std::fs::write(&config_backup, b"user config backup").unwrap();
         std::fs::write(&catalog, &legacy_bytes).unwrap();
+        let reload_requested = AtomicBool::new(false);
 
-        assert!(preflight_managed_catalog_at_home(home.path(), |_| Ok(())).unwrap());
+        assert!(preflight_managed_catalog_at_home_with_reload(
+            home.path(),
+            |_| Ok(()),
+            || {
+                reload_requested.store(true, AtomicOrdering::Release);
+                Ok(())
+            },
+        )
+        .unwrap());
+        assert!(reload_requested.load(AtomicOrdering::Acquire));
         let migrated_bytes = std::fs::read(&catalog).unwrap();
         let migrated: Value = serde_json::from_slice(&migrated_bytes).unwrap();
         assert!(migrated["models"][0].get("input_modalities").is_none());
+        assert!(migrated["models"][0].get("node_repl_disabled").is_none());
         assert_eq!(migrated["models"][0]["description"], MODEL_DESCRIPTION);
         assert_eq!(std::fs::read(&backup).unwrap(), legacy_bytes);
         let modified = std::fs::metadata(&catalog).unwrap().modified().unwrap();
 
-        assert!(preflight_managed_catalog_at_home(home.path(), |_| Ok(())).unwrap());
+        assert!(preflight_managed_catalog_at_home_with_reload(
+            home.path(),
+            |_| Ok(()),
+            || panic!("an idempotent preflight must not request another reload"),
+        )
+        .unwrap());
         assert_eq!(std::fs::read(&catalog).unwrap(), migrated_bytes);
         assert_eq!(
             std::fs::metadata(&catalog).unwrap().modified().unwrap(),
@@ -4038,7 +4145,180 @@ mod tests {
         );
         assert_eq!(std::fs::read(&backup).unwrap(), legacy_bytes);
         assert_eq!(std::fs::read(&config).unwrap(), config_bytes);
-        assert_eq!(std::fs::read(&config_backup).unwrap(), b"user config backup");
+        assert_eq!(
+            std::fs::read(&config_backup).unwrap(),
+            b"user config backup"
+        );
+    }
+
+    #[test]
+    fn legacy_migration_does_not_write_catalog_when_reload_marker_cannot_be_created() {
+        let home = CatalogTempHome::new();
+        let config = config_path_for(home.path());
+        let catalog = catalog_path_for(home.path());
+        let mut config_bytes = managed_catalog_config(home.path());
+        config_bytes.extend_from_slice(
+            b"\n[mcp_servers.media_generation]\ncommand = \"media-mcp\"\nenabled = true\n",
+        );
+        let original_catalog = serde_json::to_vec(&json!({
+            "identity": CATALOG_IDENTITY,
+            "models": [legacy_capability_entry("vendor/legacy")]
+        }))
+        .unwrap();
+        std::fs::write(&config, &config_bytes).unwrap();
+        std::fs::write(&catalog, &original_catalog).unwrap();
+
+        let result = preflight_managed_catalog_at_home_with_reload(
+            home.path(),
+            |_| Ok(()),
+            || Err(engine("fixture reload marker failure")),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&catalog).unwrap(), original_catalog);
+        assert_eq!(std::fs::read(&config).unwrap(), config_bytes);
+        assert!(!atomic_file::backup_path(&catalog).exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn startup_preflight_waits_for_configuration_writer_in_another_process() {
+        use std::process::{Command, Stdio};
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        use std::time::{Duration, Instant};
+
+        let home = CatalogTempHome::new();
+        let config = config_path_for(home.path());
+        let catalog = catalog_path_for(home.path());
+        std::fs::write(&config, managed_catalog_config(home.path())).unwrap();
+        std::fs::write(
+            &catalog,
+            serde_json::to_vec(&json!({
+                "identity": CATALOG_IDENTITY,
+                "models": [legacy_capability_entry("vendor/legacy")]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let locked_path = home.path().join("writer-locked");
+        let waiting_path = home.path().join("preflight-waiting");
+        let release_path = home.path().join("writer-release");
+        let mutex_name = format!(
+            "Local\\CodexUsbModelSelectionTest-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let executable = std::env::current_exe().unwrap();
+        let mut writer = Command::new(executable)
+            .arg("--exact")
+            .arg("app::model_catalog::tests::configuration_lock_writer_child_process")
+            .arg("--nocapture")
+            .env("CODEX_USB_MODEL_CATALOG_LOCK_CHILD", "writer")
+            .env("CODEX_USB_MODEL_CATALOG_LOCK_HOME", home.path())
+            .env("CODEX_USB_MODEL_CATALOG_MUTEX_NAME", &mutex_name)
+            .env("CODEX_USB_MODEL_CATALOG_LOCKED_PATH", &locked_path)
+            .env("CODEX_USB_MODEL_CATALOG_RELEASE_PATH", &release_path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let lock_deadline = Instant::now() + Duration::from_secs(8);
+        while !locked_path.exists() && Instant::now() < lock_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if !locked_path.exists() {
+            let _ = writer.kill();
+            let _ = writer.wait();
+            panic!("child manager did not acquire the shared configuration mutex");
+        }
+
+        let wait_observed = Arc::new(AtomicBool::new(false));
+        let preflight_finished = Arc::new(AtomicBool::new(false));
+        let waiting_for_release = waiting_path.clone();
+        let release_for_thread = release_path.clone();
+        let finished_for_release = Arc::clone(&preflight_finished);
+        let release_thread = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !waiting_for_release.exists()
+                && !finished_for_release.load(Ordering::Acquire)
+                && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            std::fs::write(release_for_thread, b"release").unwrap();
+        });
+
+        let waiting_for_lock = waiting_path.clone();
+        let observed_by_lock = Arc::clone(&wait_observed);
+        let mutex_for_lock = mutex_name.clone();
+        let result = preflight_managed_catalog_at_home_with_reload_and_lock(
+            home.path(),
+            |_| Ok(()),
+            || Ok(()),
+            move || {
+                model_selection_client::lock_configuration_observing_wait(&mutex_for_lock, || {
+                    if !observed_by_lock.swap(true, Ordering::AcqRel) {
+                        std::fs::write(&waiting_for_lock, b"waiting").unwrap();
+                    }
+                })
+            },
+        );
+        preflight_finished.store(true, Ordering::Release);
+        assert!(result.unwrap());
+        assert!(wait_observed.load(Ordering::Acquire));
+        release_thread.join().unwrap();
+        assert!(writer.wait().unwrap().success());
+
+        let migrated: Value = serde_json::from_slice(&std::fs::read(&catalog).unwrap()).unwrap();
+        assert_eq!(
+            catalog_model_ids(&migrated).unwrap(),
+            ["vendor/legacy", "vendor/concurrent-add"]
+        );
+        assert!(migrated["models"][0].get("node_repl_disabled").is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn configuration_lock_writer_child_process() {
+        let Some(home) = std::env::var_os("CODEX_USB_MODEL_CATALOG_LOCK_HOME") else {
+            return;
+        };
+        if std::env::var_os("CODEX_USB_MODEL_CATALOG_LOCK_CHILD").as_deref()
+            != Some(std::ffi::OsStr::new("writer"))
+        {
+            return;
+        }
+        use std::time::{Duration, Instant};
+
+        let home = PathBuf::from(home);
+        let locked_path =
+            PathBuf::from(std::env::var_os("CODEX_USB_MODEL_CATALOG_LOCKED_PATH").unwrap());
+        let release_path =
+            PathBuf::from(std::env::var_os("CODEX_USB_MODEL_CATALOG_RELEASE_PATH").unwrap());
+        let mutex_name = std::env::var("CODEX_USB_MODEL_CATALOG_MUTEX_NAME").unwrap();
+        let _writer_lock =
+            model_selection_client::lock_configuration_with_name_for_test(&mutex_name).unwrap();
+        std::fs::write(locked_path, b"locked").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !release_path.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(release_path.exists(), "parent did not release child mutex");
+
+        let catalog = catalog_path_for(&home);
+        let concurrent_catalog = json!({
+            "identity": CATALOG_IDENTITY,
+            "models": [
+                legacy_capability_entry("vendor/legacy"),
+                conservative_tested_model_entry("vendor/concurrent-add", None, 2)
+            ]
+        });
+        std::fs::write(&catalog, serde_json::to_vec(&concurrent_catalog).unwrap()).unwrap();
     }
 
     fn managed_catalog_config(home: &Path) -> Vec<u8> {
@@ -4117,7 +4397,9 @@ mod tests {
         let config_backup = atomic_file::backup_path(&config);
         let catalog_backup = atomic_file::backup_path(&catalog);
         let mut config_bytes = managed_catalog_config(home.path());
-        config_bytes.extend_from_slice(b"\n[mcp_servers.media_generation]\ncommand = \"media-mcp\"\nenabled = true\n");
+        config_bytes.extend_from_slice(
+            b"\n[mcp_servers.media_generation]\ncommand = \"media-mcp\"\nenabled = true\n",
+        );
         let original = serde_json::to_vec(&json!({
             "identity": CATALOG_IDENTITY,
             "models": [legacy_capability_entry("vendor/existing")]
@@ -4151,7 +4433,10 @@ mod tests {
         assert_eq!(std::fs::read(&catalog).unwrap(), original);
         assert_eq!(std::fs::read(&config).unwrap(), config_bytes);
         assert_eq!(std::fs::read(&catalog_backup).unwrap(), original);
-        assert_eq!(std::fs::read(&config_backup).unwrap(), b"keep config backup");
+        assert_eq!(
+            std::fs::read(&config_backup).unwrap(),
+            b"keep config backup"
+        );
     }
 
     #[test]
@@ -4184,10 +4469,8 @@ mod tests {
         assert!(saved_config.contains("model_reasoning_effort = \"none\""));
         assert!(saved_config.contains(CONFIG_BEGIN));
         assert!(saved_config.contains(CONFIG_END));
-        let saved: Value = serde_json::from_slice(
-            &std::fs::read(catalog_path_for(home.path())).unwrap(),
-        )
-        .unwrap();
+        let saved: Value =
+            serde_json::from_slice(&std::fs::read(catalog_path_for(home.path())).unwrap()).unwrap();
         assert_eq!(saved["models"][0]["slug"], "vendor/model");
     }
 
@@ -4268,10 +4551,8 @@ mod tests {
         assert!(saved_config.contains("model_reasoning_effort = 3"));
         assert!(saved_config.contains(CONFIG_BEGIN));
         assert!(saved_config.contains(CONFIG_END));
-        let saved: Value = serde_json::from_slice(
-            &std::fs::read(catalog_path_for(home.path())).unwrap(),
-        )
-        .unwrap();
+        let saved: Value =
+            serde_json::from_slice(&std::fs::read(catalog_path_for(home.path())).unwrap()).unwrap();
         assert_eq!(saved["models"][0]["slug"], "vendor/model");
     }
 

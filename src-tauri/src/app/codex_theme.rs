@@ -1692,53 +1692,79 @@ fn launch_codex_with_cdp(
             "codex-theme-launch-target",
         )?;
         let usb_mode = usb_authorization.is_some();
-        if disable_self_updates {
-            crate::app::codex_self_update::sync_setting(true)?;
-        }
-        log::info!(
-            "launching Windows Codex with CDP port={port} path={}",
-            installed.display()
-        );
-        let launch_policy = if usb_mode {
-            if crate::app::win_update::usb_no_sandbox_compatibility_known(&detected.version) {
-                codex_win_engine::PortableLaunchPolicy::UsbCompatibleNoSandbox
-            } else {
-                codex_win_engine::PortableLaunchPolicy::UsbCompatible
-            }
-        } else {
-            codex_win_engine::PortableLaunchPolicy::Standard
-        };
-        let direct_entry_required = usb_authorization
-            .as_ref()
-            .is_some_and(|authorization| authorization.direct_entry_required);
-        let media_environment = if usb_mode {
-            crate::app::media_generation::usb_launch_environment()
-        } else {
-            Vec::new()
-        };
-        let report = codex_win_engine::launch_codex_with_options(
-            &detected,
-            codex_win_engine::LaunchOptions {
-                disable_codex_self_updates: disable_self_updates || usb_mode,
-                environment: media_environment,
-                usb_integrity_transaction: usb_mode,
-                require_usb_entry_overlay: direct_entry_required,
-                remote_debugging_port: Some(port),
-                codex_home: if usb_mode {
+        let settings = windows_domain_settings();
+        launch_with_catalog_reload_preflight(
+            || crate::app::win_update::prepare_usb_model_catalog_for_theme_launch(&settings),
+            || {
+                if disable_self_updates {
+                    crate::app::codex_self_update::sync_setting(true)?;
+                }
+                log::info!(
+                    "launching Windows Codex with CDP port={port} path={}",
+                    installed.display()
+                );
+                let launch_policy = if usb_mode {
+                    if crate::app::win_update::usb_no_sandbox_compatibility_known(&detected.version)
+                    {
+                        codex_win_engine::PortableLaunchPolicy::UsbCompatibleNoSandbox
+                    } else {
+                        codex_win_engine::PortableLaunchPolicy::UsbCompatible
+                    }
+                } else {
+                    codex_win_engine::PortableLaunchPolicy::Standard
+                };
+                let direct_entry_required = usb_authorization
+                    .as_ref()
+                    .is_some_and(|authorization| authorization.direct_entry_required);
+                let codex_home = if usb_mode {
                     Some(crate::app::usb_guard::local_data_paths()?.codex_home)
                 } else {
                     None
-                },
-                locale_override: codex_locale.map(str::to_string),
-                portable_launch_policy: launch_policy,
+                };
+                let launch_environment = crate::app::win_update::codex_launch_environment(
+                    usb_mode,
+                    codex_home.as_deref(),
+                );
+                let report = codex_win_engine::launch_codex_with_options(
+                    &detected,
+                    codex_win_engine::LaunchOptions {
+                        disable_codex_self_updates: disable_self_updates || usb_mode,
+                        environment: launch_environment,
+                        usb_integrity_transaction: usb_mode,
+                        require_usb_entry_overlay: direct_entry_required,
+                        remote_debugging_port: Some(port),
+                        codex_home,
+                        locale_override: codex_locale.map(str::to_string),
+                        portable_launch_policy: launch_policy,
+                    },
+                )
+                .map_err(|e| AppError::Engine(format!("以调试模式打开 Codex 失败: {e}")))?;
+                if usb_mode && report.no_sandbox {
+                    crate::app::win_update::remember_usb_no_sandbox_compatibility(
+                        &detected.version,
+                    );
+                }
+                Ok(())
             },
+            crate::app::win_update::complete_usb_model_catalog_launch,
         )
-        .map_err(|e| AppError::Engine(format!("以调试模式打开 Codex 失败: {e}")))?;
-        if usb_mode && report.no_sandbox {
-            crate::app::win_update::remember_usb_no_sandbox_compatibility(&detected.version);
-        }
-        Ok(())
     })
+}
+
+fn launch_with_catalog_reload_preflight<T, P, L, C>(
+    prepare: P,
+    launch: L,
+    complete: C,
+) -> Result<T, AppError>
+where
+    P: FnOnce() -> Result<Option<Vec<u8>>, AppError>,
+    L: FnOnce() -> Result<T, AppError>,
+    C: FnOnce(Option<&[u8]>),
+{
+    let reload_marker = prepare()?;
+    let result = launch()?;
+    complete(reload_marker.as_deref());
+    Ok(result)
 }
 
 #[cfg(target_os = "windows")]
@@ -1856,9 +1882,11 @@ mod catalog_network_tests {
 
 #[cfg(test)]
 mod usb_theme_launch_gate_tests {
-    use super::{run_after_usb_target_gate, run_gated_theme_relaunch};
+    use super::{
+        launch_with_catalog_reload_preflight, run_after_usb_target_gate, run_gated_theme_relaunch,
+    };
     use crate::errors::AppError;
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
 
     #[test]
     fn signed_revocation_blocks_every_theme_relaunch_route_before_spawn() {
@@ -1882,6 +1910,59 @@ mod usb_theme_launch_gate_tests {
             assert!(result.is_err(), "route={route}");
             assert!(!launched.get(), "route={route} must not spawn Codex");
         }
+    }
+
+    #[test]
+    fn usb_theme_launch_preflights_catalog_before_spawn_and_clears_marker_after_success() {
+        let events = RefCell::new(Vec::new());
+        let result: Result<(), AppError> = launch_with_catalog_reload_preflight(
+            || {
+                events.borrow_mut().push("preflight");
+                Ok(Some(b"pending".to_vec()))
+            },
+            || {
+                events.borrow_mut().push("launch");
+                Ok(())
+            },
+            |marker| {
+                assert_eq!(marker, Some(b"pending".as_slice()));
+                events.borrow_mut().push("complete");
+            },
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(*events.borrow(), ["preflight", "launch", "complete"]);
+    }
+
+    #[test]
+    fn usb_theme_launch_failure_keeps_catalog_reload_marker_pending() {
+        let completed = Cell::new(false);
+        let result: Result<(), AppError> = launch_with_catalog_reload_preflight(
+            || Ok(Some(b"pending".to_vec())),
+            || Err(AppError::Engine("launch failed".to_string())),
+            |_| completed.set(true),
+        );
+
+        assert!(result.is_err());
+        assert!(!completed.get());
+    }
+
+    #[test]
+    fn usb_theme_catalog_preflight_failure_blocks_launch() {
+        let launched = Cell::new(false);
+        let completed = Cell::new(false);
+        let result: Result<(), AppError> = launch_with_catalog_reload_preflight(
+            || Err(AppError::Engine("catalog preflight failed".to_string())),
+            || {
+                launched.set(true);
+                Ok(())
+            },
+            |_| completed.set(true),
+        );
+
+        assert!(result.is_err());
+        assert!(!launched.get());
+        assert!(!completed.get());
     }
 
     #[tokio::test]

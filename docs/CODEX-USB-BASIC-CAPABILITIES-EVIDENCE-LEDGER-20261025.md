@@ -23,7 +23,7 @@
 | E-01 | 模型基础指令 | `model_catalog.rs` 定义长 `MODEL_BASE_INSTRUCTIONS` 并在新条目写入 `base_instructions`；旧精确模板迁移可替换整段指令。 | `STATIC`：自定义指令确实注入；其中委派措辞可能影响模型行为。 | 同版本省略字段真实 fallback、最终模型提示词、工具表及委派收件回执；不能证明抑制原生多代理是根因。 | 待执行 |
 | E-02 | Node 旧目录迁移 | 当前用户策略：仅精确匹配旧模板的布尔 `true` 删除；`false`、缺失、其他类型和不匹配不删；新模型省略字段。 | `USER_REPORT` + 源码待实施者重核：匹配模板手工 `true` 也删，是用户知情接受的不可区分边界。 | 当前候选源码/测试需绑定；不可沿用更早“保留 true”判断。 | 待执行 |
 | E-03 | App Tools `.mcp.json` | 上一轮只读检查找到仓库内 `release/upstream/codex-app-26.1002.52244/OpenAI.Codex_26.1002.7124.0_x64__2p2nqsd0c76g0.Msix`；其中 `codex_app` 使用 `cmd.exe` 调脚本，cwd 为 `.`；脚本含多候选 Node 回退。当前源码 patch 直接选相对 bundled Node。 | `PACKAGE`：样本配置/脚本与源码改写有差异；改写保留 cwd 和其他配置字段。此包未证明与测试 USB payload 同版。 | 对照正式候选内 launcher、环境/argv、真实 initialize、工具表、调用和跨会话回执。 | 待执行 |
-| E-04 | PE 子系统 | 上一轮在该本地 MSIX 条目中只读解析 Code Mode host、`node.exe`、`node_repl.exe`、Chrome extension-host：PE32+、Subsystem 3；四个 security directory 均非零。源码清单不再包含 host，仍改写若干其他 sidecar。 | `PACKAGE` + `STATIC`：参考包字段和源码规则已观察。证书表非零不是签名链验证，也不是测试 payload 对照。 | 同版本可信包、签名/哈希核验、实际父进程/std handles、USB 文件哈希与 overlay 记录。不能推断 CUI/GUI 是工具故障根因。 | 待执行 |
+| E-04 | PE 子系统 | 远端候选源码已将 Code Mode host 移出子系统改写清单；仍改写若干 Node、Browser 和其他 sidecar。 | `STATIC`：只说明新构建遵守源码清单，不证明 stdio 根因或其他 sidecar 无副作用。旧 USB payload 不在本轮范围。 | 用户生成的新候选版本/hash、实际父进程/std handles 和 host 工具调用。不能推断 CUI/GUI 是工具故障根因。 | 新候选待验 |
 | E-05 | Windows 环境 | 历史审计记录普通 USB/CDP 共享环境 builder、受管 Python PATH 优先和 UTF-8，曾报告定向测试 55/55。 | `LOG` 尚需绑定具体源码；不是当前测试机 E2E。 | 按四种入口核实实际调用与子进程环境。 | 待执行 |
 | E-06 | Browser/focus | 历史报告包含 `reason=focus`；用户补充 issue 48522 作者把 focus 因果写为 hypothesis。 | `USER_REPORT`/`HYPOTHESIS`：只作线索；主窗口一次性激活不等于 Browser 插件 reconcile gate。 | 目标版本日志、工具表、插件缓存、焦点/PID 时间线。 | 待执行 |
 | E-07 | Search/tool_search | 历史源码审计中模板 `supports_search_tool=false`；用户补充目标 Codex 版本区分 DIRECT 与 DEFERRED，tool_search 仅按支持与可搜索 deferred 工具条件出现。issue 44984 是 Bedrock delayed dynamic tools 线索。 | 版本/provider 相关，不可外推至所有 MCP/404token。 | 候选安装版本、provider/model、请求/响应与该回合工具表。 | 待执行 |
@@ -32,7 +32,7 @@
 | E-10 | 卸载 | 已有产品决定：两步确认后清理本机 Codex/CCSwitch/受管数据，保留 USB 安装介质。 | 产品契约已确定，不重提“改为可选清理”。 | 只做静态路径和专用恢复测试环境验收；真实用户数据删除另行授权。 | 待执行 |
 | E-11 | CDP 主题模型目录预检 | 当前 `codex_theme.rs` 的 `launch_codex_with_cdp` 调用 `launch_with_catalog_reload_preflight`；该 helper 先 prepare，再 launch，二者均成功后才调用 complete。`.test-tmp/dot-theme-preflight-20261025/theme-focused-final.log` 记录 5/5；`catalog-reload-focused.log` 记录 7/7；`rust-lib-final.log` 记录 802 passed、0 failed、6 ignored。 | `STATIC` + 本机日志：代码行为和相关定向用例可核对；全量日志存在较早失败尝试，见下表。所有日志均缺可复核的命令行及源码/二进制指纹，属于当前工作区证据，不能绑定发行候选。 | 四类启动路径全矩阵及 USB 测试机验证；检查最终源码是否与这些日志编译时相同。 | 代码已实现；USB 实机待验 |
 | E-12 | 委派指令最小收敛 | `model_catalog.rs::MODEL_BASE_INSTRUCTIONS` 只删除 `prefer local sequential work;`，其余安全/不确定 handoff 措辞保留；旧精确签名 `LEGACY_MODEL_BASE_INSTRUCTIONS`、迁移条件、用户自定义条目写入逻辑未改。关联目录测试 1/1 通过。 | `STATIC` + 定向测试：变更确实只影响管理器提供的模板；没有实际 host delegation 回执，不能确认原故障根因或“恢复原生委派”。 | 同版本/provider/model 的实际工具表、最终回合委派调用/回执；真实 USB 候选待绑定。 | 代码已改；运行时待验 |
-| E-13 | Code Mode host PE 子系统 | 当前便携清单移除 `codex-code-mode-host.exe`；CUI fixture 和未知 GUI fixture 相关测试通过。AppTools launcher/PE Node 耦合保持不变。 | `STATIC` + 定向测试：阻止未来启动预检再改写该 host；不证明 host stdio 工具已恢复，也不修复已改写的 USB payload。 | 同版本 USB payload hash/签名状态、实际 host stdout/stdin/文件和命令工具调用。 | 代码在工作树；USB 实机待验 |
+| E-13 | Code Mode host PE 子系统 | 远端源码清单移除 `codex-code-mode-host.exe`；CUI fixture 和未知 GUI fixture 定向测试通过。AppTools launcher/PE Node 耦合保持不变。 | `STATIC` + 定向测试：约束新构建；不证明 host stdio 工具已恢复。旧 USB payload 恢复/迁移已由用户取消。 | 用户生成的新候选及实际 host stdout/stdin/文件和命令工具调用。 | 新候选待验 |
 
 ## 历史测试结果：不得套用当前候选
 

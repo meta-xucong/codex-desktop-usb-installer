@@ -1014,8 +1014,15 @@ fn run_powershell_json_with_limits(
     limits: RunLimits,
 ) -> Result<String, PowerShellRunError> {
     let mut command = hidden_command(powershell_exe());
+    // Windows PowerShell 5.1 inherits the active ANSI/OEM code page for
+    // redirected stdout. The caller decodes the JSON response as UTF-8, so
+    // set the console output encoding consistently for both inline and file
+    // transported scripts (including Unicode paths in test fixtures).
+    let script = format!(
+        "try {{ [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 }} catch {{ [Console]::Error.WriteLine('Failed to set PowerShell stdout encoding to UTF-8'); exit 1 }}\n{script}"
+    );
     let script_path = if script.chars().count() > MAX_INLINE_POWERSHELL_CHARS {
-        Some(write_temporary_powershell_script(script).map_err(PowerShellRunError::Other)?)
+        Some(write_temporary_powershell_script(&script).map_err(PowerShellRunError::Other)?)
     } else {
         None
     };
@@ -1029,7 +1036,8 @@ fn run_powershell_json_with_limits(
         ]);
         command.arg(path);
     } else {
-        command.args(["-NoProfile", "-NonInteractive", "-Command", script]);
+        command.args(["-NoProfile", "-NonInteractive", "-Command"]);
+        command.arg(&script);
     }
     let output = run_capturing(command, limits, None);
     if let Some(path) = script_path {
@@ -9120,6 +9128,65 @@ $report = & {{ {production} }} | ConvertFrom-Json
         assert_eq!(value["path"], path);
         assert_eq!(value["fragment"], "");
         assert_eq!(value["isFile"], true);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_json_runner_uses_utf8_temp_script_and_cleans_it() {
+        let path = r"C:\安装 100% #长脚本\Codex.msix";
+        let script = format!(
+            "#{}\n$uri = [Uri]::new({}, [UriKind]::Absolute); @{{ path = $uri.LocalPath; scriptPath = $PSCommandPath; isFile = $uri.IsFile }} | ConvertTo-Json -Compress",
+            "x".repeat(MAX_INLINE_POWERSHELL_CHARS),
+            ps_quote(path)
+        );
+        assert!(script.chars().count() > MAX_INLINE_POWERSHELL_CHARS);
+
+        let output = run_powershell_json(&script).expect("run long UTF-8 PowerShell script");
+        let value: serde_json::Value = serde_json::from_str(&output).expect("parse JSON output");
+        assert_eq!(value["path"], path);
+        assert_eq!(value["isFile"], true);
+
+        let script_path = value["scriptPath"]
+            .as_str()
+            .expect("file transport should expose its script path");
+        assert!(script_path.ends_with(".ps1"));
+        assert!(
+            !Path::new(script_path).exists(),
+            "temporary script should be removed after success"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_timeout_cleans_temporary_script() {
+        let marker_path = std::env::temp_dir().join(format!(
+            "codex-win-engine-timeout-marker-{}.txt",
+            uuid::Uuid::new_v4()
+        ));
+        let script = format!(
+            "#{}\n[System.IO.File]::WriteAllText({}, $PSCommandPath); Start-Sleep -Seconds 30; @{{ reachedEnd = $true }} | ConvertTo-Json -Compress",
+            "x".repeat(MAX_INLINE_POWERSHELL_CHARS),
+            ps_quote(&marker_path.to_string_lossy())
+        );
+        assert!(script.chars().count() > MAX_INLINE_POWERSHELL_CHARS);
+
+        let result = run_powershell_json_with_limits(
+            &script,
+            RunLimits::total(std::time::Duration::from_secs(5)),
+        );
+        let script_path = std::fs::read_to_string(&marker_path);
+        let _ = std::fs::remove_file(&marker_path);
+
+        let timed_out = matches!(result, Err(PowerShellRunError::Timeout(TimeoutKind::Total)));
+        assert!(
+            timed_out,
+            "long-running PowerShell should hit its total deadline"
+        );
+        let script_path = script_path.expect("timed-out script should have started");
+        assert!(
+            !Path::new(script_path.trim()).exists(),
+            "temporary script should be removed after timeout"
+        );
     }
 
     #[cfg(windows)]
