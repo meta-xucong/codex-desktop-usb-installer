@@ -1,6 +1,6 @@
 # U 盘版 Codex 基础能力修复开发规范（2026-10-25）
 
-**实施状态：**第4章 CDP 主题目录预检接线已在当前工作区实现；定向/库测试日志有通过记录，但缺候选源码指纹和 USB 实机证据，不能称端到端验收。其余章节按后续队列待执行/待定位。各矩阵运行项仍按证据独立标注。章节证据和历史结果见[证据台账](CODEX-USB-BASIC-CAPABILITIES-EVIDENCE-LEDGER-20261025.md)、[回归矩阵](CODEX-USB-BASIC-CAPABILITIES-REGRESSION-MATRIX-20261025.md)和[测试机验收手册](CODEX-USB-BASIC-CAPABILITIES-TEST-MACHINE-20261025.md)。
+**实施状态：**本轮工作树已最小移除一条“优先本地顺序执行”的模型模板措辞，并把 `codex-code-mode-host.exe` 排除在 GUI 子系统改写名单外；对应定向测试通过。完整 Rust 测试在沙箱内受文件系统权限阻断，前端全量测试在获批的临时 fixture 环境通过。以上源码候选尚未打包、无 USB 实机证据；App Tools launcher 因缺同版原包对照保持不变。章节和测试证据见[证据台账](CODEX-USB-BASIC-CAPABILITIES-EVIDENCE-LEDGER-20261025.md)、[回归矩阵](CODEX-USB-BASIC-CAPABILITIES-REGRESSION-MATRIX-20261025.md)和[测试机验收手册](CODEX-USB-BASIC-CAPABILITIES-TEST-MACHINE-20261025.md)。
 
 **当前授权与范围：**用户已授权本轮窄幅源码实施、独立审计、自动化测试，以及只向专用 GitHub 任务分支提交/推送本轮相关内容。本授权不包含实际打包发布、覆盖已安装/USB 程序、真实安装/卸载、修改用户真实配置、登录/读取凭证、对外发消息或可能计费的生成；这些仍须单独授权。执行遵循最小变更原则，不增加功能、额外校验层、通用框架或 UI 开关。
 
@@ -33,10 +33,10 @@
 |---|---|---|---|
 | 0 | 基线、来源、profile、授权边界 | 待执行 | Git 状态、包 manifest、签名与哈希记录 |
 | 1 | 故障分层与定位顺序 | 待执行 | 启动日志、MCP/app-server、回合工具表、请求与结果 |
-| 2 | 模型基础指令和 Node 默认迁移 | 待执行 | `src-tauri/src/app/model_catalog.rs`、模型 preflight/写回调用链 |
-| 3 | App Tools MCP 启动和跨会话 | 待执行 | `crates/codex-win-engine/src/portable.rs`、实际 `.mcp.json` 与 server 日志 |
+| 2 | 模型基础指令和 Node 默认迁移 | 已移除一条管理器顺序执行偏好；运行时影响待验证 | `src-tauri/src/app/model_catalog.rs`、模型 preflight/写回调用链 |
+| 3 | App Tools MCP 启动和跨会话 | launcher 不变；同版证据待取得 | `crates/codex-win-engine/src/portable.rs`、实际 `.mcp.json` 与 server 日志 |
 | 4 | 普通/主题/事务启动环境一致性 | CDP 预检接线已实现；实机待验，其余路径待核对 | `win_update.rs`、`codex_theme.rs`、`commands.rs`、启动和重载入口 |
-| 5 | PE/签名/隐藏窗口/恢复边界 | 待执行 | `portable.rs`、`sys.rs`、`windows_process.rs`、同版原包 |
+| 5 | PE/签名/隐藏窗口/恢复边界 | host 不再被重写；旧 payload 和运行时待验 | `portable.rs`、`sys.rs`、`windows_process.rs`、同版原包 |
 | 6 | Browser、搜索、媒体、会话、Skill Hub、标题及范围边界 | 待执行 | 分项代码入口与测试机证据 |
 | 7 | 分章回归、审计、构建与交付门槛 | 待执行 | 当前源码、测试结果、release manifest/checksum、测试机记录 |
 
@@ -103,6 +103,8 @@
 
 **接受标准：**自动化覆盖命中/不命中、类型边界、幂等和 MCP 字节不变；测试机证实省略字段 fallback、实际工具表和委派回执。只完成前者时运行时状态仍为 `NOT_RUN`。
 
+**本轮最小变更：**仅从新/精确匹配旧模板共用的 `MODEL_BASE_INSTRUCTIONS` 删除“prefer local sequential work”偏好；不删 `base_instructions` 字段、不改变旧签名常量或迁移谓词、不重写用户自定义条目。新增/扩展的定向断言通过，但这只能证明模板字符串变更，不证明它是原委派故障根因或恢复了宿主委派能力。
+
 若 fallback 验证被 `ENV_BLOCKED`，可继续与 prompt 假设独立的旧模板迁移/幂等自动化；不得上线“删除 base 字段”的生产变更或声称原生委派恢复。
 
 ## 第3章：App Tools MCP 启动与跨会话
@@ -125,6 +127,10 @@
 **回退范围：**仅恢复此 MCP server 的 `command/args` 或相应 launcher 选择，不改其他 `mcpServers`、批准模式、凭据、线程数据或标准 Codex profile。恢复官方配置也必须先留存当前便携配置和观察到的控制台/Node 行为。
 
 **接受标准：**命令、cwd/env/argv/超时/退出行为与设计相符；握手、工具表、调用与跨会话收件/回复均有独立证据。配置保留测试不替代运行时验收。
+
+**本轮 App Tools 决策：**目前本地只读到 Codex `26.1002.7124.0` MSIX 样本；不能证明它与当前 USB 候选同版。该样本的 `.cmd` wrapper 有多个 Node 路径候选、系统 `node` fallback 和明确缺失 Node 错误；当前直接 bundled Node 改写保留 `cwd` 及其他 MCP JSON 字段，但会收窄候选/fallback 路径。现有证据不能证明该差异对目标 USB 版本构成缺陷，也没有同版握手/stdio 对照，因此本轮不改 launcher、不触发真实 MCP；先完成有明确源码证据的 Code Mode host 变更，缺少同版证据时将 App Tools 留作实机/同版候选验证。
+
+**本轮 host 子项：**`codex-code-mode-host.exe` 已从 GUI subsystem sidecar 名单移除；代码现在保留该文件自身 subsystem，已有 CUI/GUI fixture 定向测试验证不改写和重复调用幂等。该代码改动消除一项不必要 PE 修改，但没有直接跑 host stdio/文件工具，因此不宣称已恢复工具运行，也不自动修复旧 USB payload。
 
 若测试机 MCP 被 `ENV_BLOCKED`，可先完成官方包/当前源码的差异梳理、JSON 字段保真、Node PE 前置条件及旧/新 payload patch 幂等自动化；这些通过不代表 initialize、工具注入或跨会话已通过。
 

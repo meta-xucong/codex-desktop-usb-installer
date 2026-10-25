@@ -40,7 +40,7 @@ const LEGACY_MODEL_BASE_INSTRUCTIONS: &str = "You are Codex, a coding agent. Hel
 const LEGACY_FALLBACK_MODEL_BASE_INSTRUCTIONS: &str = "You are Codex, a coding agent. Help users with software engineering tasks by inspecting the workspace, making focused changes, and verifying your work.";
 const LEGACY_MODEL_DESCRIPTION: &str = "Text model supplied by the configured gateway; only one text response was verified.";
 const MODEL_DESCRIPTION: &str = "Gateway model supplied by the configured provider; text response verified, image understanding not separately tested.";
-pub(crate) const MODEL_BASE_INSTRUCTIONS: &str = "You are Codex, a coding agent. Help with software engineering by inspecting the workspace, making focused changes, and verifying your work. Use only tools and capabilities available in this session. Claim image observations or successful actions only when supported by tool output. If image input or a tool is explicitly unsupported, report the limitation, do not invent results or repeat the same failing call, and continue only with supported work or ask for usable input. For external-provider delegation, prefer local sequential work; if a handoff is opaque or unconfirmed, do not decode or loop-retry it, and continue locally. On Windows, use the active shell syntax, configured USB Python runtime, and UTF-8 for text/JSON. State completion only from visible evidence.";
+pub(crate) const MODEL_BASE_INSTRUCTIONS: &str = "You are Codex, a coding agent. Help with software engineering by inspecting the workspace, making focused changes, and verifying your work. Use only tools and capabilities available in this session. Claim image observations or successful actions only when supported by tool output. If image input or a tool is explicitly unsupported, report the limitation, do not invent results or repeat the same failing call, and continue only with supported work or ask for usable input. For external-provider delegation, if a handoff is opaque or unconfirmed, do not decode or loop-retry it, and continue locally. On Windows, use the active shell syntax, configured USB Python runtime, and UTF-8 for text/JSON. State completion only from visible evidence.";
 const CONFIG_BEGIN: &str = "# BEGIN CODEX-USB-NATIVE-MODEL-CATALOG v1";
 const CONFIG_END: &str = "# END CODEX-USB-NATIVE-MODEL-CATALOG v1";
 static REFRESH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -3677,6 +3677,7 @@ mod tests {
         assert!(entry.get("input_modalities").is_none());
         assert_eq!(entry["description"], "Gateway model supplied by the configured provider; text response verified, image understanding not separately tested.");
         assert_eq!(entry["base_instructions"], MODEL_BASE_INSTRUCTIONS);
+        assert!(!MODEL_BASE_INSTRUCTIONS.contains("prefer local sequential work"));
         assert_eq!(entry["supports_search_tool"], false);
         assert_eq!(entry["supported_reasoning_levels"], json!([]));
         assert!(entry.get("default_reasoning_summary").is_none());

@@ -31,6 +31,8 @@
 | E-09 | Skill Hub / 自动标题 / Kimi | 用户提供的范围说明：Hub 曾调整测试服务器 fixture；自动标题未修；Kimi 和跨模型视觉工具未整体解决。 | `USER_REPORT`：不能把 fixture 变化当生产修复，也不能把历史任务状态未知当失败/成功。 | 生产代码入口、原始首次请求阶段、任务 ID 状态、当前会话标题请求与结果。 | 待执行 |
 | E-10 | 卸载 | 已有产品决定：两步确认后清理本机 Codex/CCSwitch/受管数据，保留 USB 安装介质。 | 产品契约已确定，不重提“改为可选清理”。 | 只做静态路径和专用恢复测试环境验收；真实用户数据删除另行授权。 | 待执行 |
 | E-11 | CDP 主题模型目录预检 | 当前 `codex_theme.rs` 的 `launch_codex_with_cdp` 调用 `launch_with_catalog_reload_preflight`；该 helper 先 prepare，再 launch，二者均成功后才调用 complete。`.test-tmp/dot-theme-preflight-20261025/theme-focused-final.log` 记录 5/5；`catalog-reload-focused.log` 记录 7/7；`rust-lib-final.log` 记录 802 passed、0 failed、6 ignored。 | `STATIC` + 本机日志：代码行为和相关定向用例可核对；全量日志存在较早失败尝试，见下表。所有日志均缺可复核的命令行及源码/二进制指纹，属于当前工作区证据，不能绑定发行候选。 | 四类启动路径全矩阵及 USB 测试机验证；检查最终源码是否与这些日志编译时相同。 | 代码已实现；USB 实机待验 |
+| E-12 | 委派指令最小收敛 | `model_catalog.rs::MODEL_BASE_INSTRUCTIONS` 只删除 `prefer local sequential work;`，其余安全/不确定 handoff 措辞保留；旧精确签名 `LEGACY_MODEL_BASE_INSTRUCTIONS`、迁移条件、用户自定义条目写入逻辑未改。关联目录测试 1/1 通过。 | `STATIC` + 定向测试：变更确实只影响管理器提供的模板；没有实际 host delegation 回执，不能确认原故障根因或“恢复原生委派”。 | 同版本/provider/model 的实际工具表、最终回合委派调用/回执；真实 USB 候选待绑定。 | 代码已改；运行时待验 |
+| E-13 | Code Mode host PE 子系统 | 当前便携清单移除 `codex-code-mode-host.exe`；CUI fixture 和未知 GUI fixture 相关测试通过。AppTools launcher/PE Node 耦合保持不变。 | `STATIC` + 定向测试：阻止未来启动预检再改写该 host；不证明 host stdio 工具已恢复，也不修复已改写的 USB payload。 | 同版本 USB payload hash/签名状态、实际 host stdout/stdin/文件和命令工具调用。 | 代码在工作树；USB 实机待验 |
 
 ## 历史测试结果：不得套用当前候选
 
@@ -52,6 +54,24 @@
 | `.test-tmp/dot-theme-preflight-20261025/rustfmt.log` | 文件为空（0 行）。 | 单凭空日志不能证明 rustfmt 命令或成功状态；该结果仍是用户报告。 |
 
 该轮日志没有记录外部模型/推理来源，也没有 USB CODEX_HOME 桌面启动或介质验收。不要寻找通知密钥或据缺少 ServerChan 通知将修复判为阻断；这类通知不在本修复验收范围。
+
+## 2026-10-25 最小实现与最终回归记录
+
+以下为当前工作区命令输出；测试时 HEAD 为 docs-only checkpoint `00521fd65706b699942615b4ea87bcb12fbce4de`，Rust/应用源码仍包含已有未提交修改。没有完整 dirty source diff hash 与测试二进制 hash，因此结果不能绑定最终远端源码候选。
+
+| 命令 | 结果 | 证据解释 |
+|---|---|---|
+| `cargo test --manifest-path src-tauri/Cargo.toml --lib tested_catalog_entry_preserves_exact_id_and_inherits_native_input_modalities -- --nocapture` | 1 passed | 覆盖模板变更的关联目录断言。 |
+| `cargo test --manifest-path crates/codex-win-engine/Cargo.toml --lib code_mode_host -- --nocapture` | 1 passed | 未知 GUI host fixture 保持不改。 |
+| `cargo test --manifest-path crates/codex-win-engine/Cargo.toml --lib portable_console_subsystem_patch_is_fixed_width_and_idempotent -- --nocapture` | 1 passed | sidecar 修改宽度和幂等；fixture 中 host 保持 CUI。 |
+| `cargo test --manifest-path crates/codex-win-engine/Cargo.toml --lib codex_app_tools_mcp -- --nocapture` | 沙箱内 1 passed、1 failed；获批沙箱外仅重跑失败项后 1 passed | 失败是唯一临时 fixture 的 `MoveFileExW` 返回 `os error 5`；同一单测沙箱外通过。 |
+| `cargo test --manifest-path src-tauri/Cargo.toml --workspace --quiet` | 702 passed、100 failed、6 ignored | Windows 沙箱运行；可见失败跨多个无关模块，含临时文件 `os error 5`、reparse/AppX/WpSystem fixture 路径、网络 fixture 等。输出截断，未逐项核实全部失败归因；不将其全部归为同一种原因或归因到本轮字符串变更。 |
+| `cargo test --manifest-path crates/codex-win-engine/Cargo.toml --all-targets --quiet` | 211 passed、39 failed、3 ignored | Windows 沙箱运行；失败集中在临时目录原子替换 `os error 5`、junction/reparse 和 WpSystem/AppX 测试路径拒绝。目标 host/PE 定向测试单独通过；不对整个 crate 标 PASS。 |
+| `npm run check` / `npm run lint` | 均通过 | 当前工作区前端类型与 lint。 |
+| `npm test` | 沙箱内 41 suite 在收集测试前 EPERM；获批沙箱外完整运行 41 文件、477 passed、1 skipped | 所有 41 个 suite 在沙箱内无法创建/rename Vitest 临时缓存；沙箱外前端和 `scripts/release-workflow.test.mjs`、`scripts/mirror-release.test.mjs` 随全套运行通过。 |
+| `npm run build` | 通过 | Vite/renderer-entry 检查通过；有 App bundle chunk 大于 500 KiB 的非阻断提醒。 |
+
+未运行 `cargo clippy`、Rust 格式命令或 GitHub release workflow；未打包、签名、发布或做真实 USB/安装/卸载操作。`npm test` 已包含仓库 release 定向测试文件，因此没有重复运行 `npm run test:release`。
 
 补充版本边界：`CODEX-USB-CODE-MODE-HOST-AUDIT-HANDOFF-20261025.md` 和整改文档另记录本机已安装包 `26.1016.8622.0` 的 host 签名检查；上表仓库内参考 MSIX 文件名是 `26.1002.7124.0`。两者是不同包证据，不能交叉绑定；本台账未独立复核前述签名验证过程，也没有证明任一包等于测试机 USB payload。
 

@@ -228,9 +228,10 @@ const CODEX_ASAR_GENERIC_SPAWN_SENTINEL: &[u8] =
 // following known sidecars can be made GUI-subsystem at install/launch
 // time.  The edit changes only the two-byte PE OptionalHeader.Subsystem field,
 // preserves file length and is idempotent.
+// Keep codex-code-mode-host.exe out of this list: it is Codex's stdio-based
+// local tool host, so preserve its upstream console subsystem and handles.
 const CODEX_CONSOLE_SUBSYSTEM_EXECUTABLES: &[&str] = &[
     "codex.exe",
-    "codex-code-mode-host.exe",
     "codex-windows-sandbox-service.exe",
     "codex-windows-sandbox-setup.exe",
     "rg.exe",
@@ -2188,8 +2189,9 @@ fn patch_console_subsystem_executable(path: &Path) -> Result<(bool, Option<u16>)
         .unwrap_or(0);
     let optional_offset = nt_offset.saturating_add(24);
     let subsystem_offset = optional_offset.saturating_add(68);
-    if optional_size < 70
-        || read_u16_le(&bytes, optional_offset).is_none()
+    let optional_magic = read_u16_le(&bytes, optional_offset);
+    if !matches!(optional_magic, Some(0x10b | 0x20b))
+        || optional_size < 70
         || subsystem_offset.saturating_add(2) > bytes.len()
         || subsystem_offset.saturating_add(2) > optional_offset.saturating_add(optional_size)
     {
@@ -6249,6 +6251,8 @@ mod tests {
             fs::create_dir_all(path.parent().expect("sidecar parent")).unwrap();
             fs::write(path, &original).unwrap();
         }
+        let code_mode_host = resources.join("codex-code-mode-host.exe");
+        fs::write(&code_mode_host, &original).unwrap();
 
         assert!(ensure_portable_codex_startup_compatibility(&root).unwrap());
         for name in CODEX_CONSOLE_SUBSYSTEM_EXECUTABLES {
@@ -6256,6 +6260,68 @@ mod tests {
             assert_eq!(patched.len(), original.len());
             assert_eq!(read_u16_le(&patched, subsystem_offset), Some(2));
         }
+        let unchanged_code_mode_host = fs::read(&code_mode_host).unwrap();
+        assert_eq!(unchanged_code_mode_host, original);
+        assert_eq!(
+            read_u16_le(&unchanged_code_mode_host, subsystem_offset),
+            Some(3),
+            "Code Mode host must not be rewritten by the sidecar compatibility patch"
+        );
+        assert!(!ensure_portable_codex_startup_compatibility(&root).unwrap());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn portable_startup_does_not_rewrite_unverified_gui_code_mode_host() {
+        let root = temp_test_dir("preserve-unverified-gui-code-mode-host");
+        let resources = root.join("resources");
+        fs::create_dir_all(&resources).unwrap();
+        let host_path = resources.join("codex-code-mode-host.exe");
+        let gui_host = fake_pe_image(2);
+        fs::write(&host_path, &gui_host).unwrap();
+
+        assert!(!ensure_portable_codex_startup_compatibility(&root).unwrap());
+        assert_eq!(fs::read(&host_path).unwrap(), gui_host);
+        assert!(!ensure_portable_codex_startup_compatibility(&root).unwrap());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pe_subsystem_patch_rejects_unknown_optional_header_magic() {
+        let root = temp_test_dir("unknown-pe-optional-magic");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("sidecar.exe");
+        let mut image = fake_pe_image(3);
+        image[0x80 + 24..0x80 + 26].copy_from_slice(&0x9999_u16.to_le_bytes());
+        fs::write(&path, &image).unwrap();
+
+        assert_eq!(
+            patch_console_subsystem_executable(&path).unwrap(),
+            (false, None)
+        );
+        assert_eq!(fs::read(&path).unwrap(), image);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pe_subsystem_patch_accepts_pe32_optional_header_magic() {
+        let root = temp_test_dir("pe32-optional-magic");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("sidecar.exe");
+        let mut image = fake_pe_image(3);
+        image[0x80 + 24..0x80 + 26].copy_from_slice(&0x10b_u16.to_le_bytes());
+        fs::write(&path, &image).unwrap();
+
+        assert_eq!(
+            patch_console_subsystem_executable(&path).unwrap(),
+            (true, Some(2))
+        );
+        let patched = fs::read(&path).unwrap();
+        assert_eq!(patched.len(), image.len());
+        assert_eq!(read_u16_le(&patched, 0x80 + 24 + 68), Some(2));
         assert!(!ensure_portable_codex_startup_compatibility(&root).unwrap());
 
         let _ = fs::remove_dir_all(root);

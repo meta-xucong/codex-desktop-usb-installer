@@ -1,5 +1,7 @@
 # Codex 自定义模型能力适配修复（2026-10-24）
 
+> **当前诊断策略衔接（2026-10-25）：**本文保留当时采用自定义 `base_instructions` 的实施合同和历史记录。针对后续“原生委派是否被自定义基础指令影响”的问题，实施任何 prompt 代码调整前，先按[基础能力修复开发规范](CODEX-USB-BASIC-CAPABILITIES-REPAIR-PLAN-20261025.md)第 2 章在同版本/同 provider/model 下验证省略字段的真实 fallback，并做单变量对照。该诊断优先于本文当时“继续使用短而通用自定义指令”的策略，但不自动授权程序修改，也不覆盖本文其他模型目录安全规则。
+
 ## 1. 目标与判定
 
 恢复 USB 版为自定义 Provider 模型写入目录时对 Codex 原生宿主能力的兼容，不改 Product Design。修复应让模型在 Codex 声明的默认输入模态下使用宿主提供的工具，同时通过简短、通用的模型说明降低外部 Provider 的协作和 Windows 运行时误用；另修复本地模型目录准备时“数据已成功取得，却因临时目录删除失败而中断”的错误门。
@@ -60,13 +62,13 @@
 
 - 只使用 Codex 当前会话实际提供的工具和能力；工具不存在、拒绝或无结果时，不得声称操作成功，也不得编造图像观察或文件内容。
 - 需要观察图像时使用宿主提供的图像能力；若 `view_image` 明确报告模型不支持图像输入，说明当前模型/目录能力阻断，停止猜测视觉内容，继续完成不依赖视觉的部分或请用户切换模型。
-- 外部 Provider 的子代理/协作消息若表现为不透明编码内容、无法确认子任务收到或返回结果，不尝试解码、不循环重派；默认优先在当前会话顺序完成，确有必要时最多尝试一次并在失败后本地继续。
+- 外部 Provider 的子代理/协作按当前宿主实际提供的能力调用；若回执不透明或无法确认目标收件/返回结果，不尝试解码或重放未知请求，说明证据边界并继续可支持的工作。此规则不偏好串行执行，也不保证宿主提供委派能力。
 - Windows 环境使用当前会话实际 shell 的语法；运行 Python 优先使用已配置的便携运行时路径（如 `CODEX_PYTHON` 或 USB 包装器提供的解释器）；文本/JSON 按 UTF-8 读写，不混用 Bash heredoc 与 PowerShell 语法。
 - 只依据命令/工具的可见结果汇报完成状态；证据不足时明确说明未验证。
 
 新指令如下，约 100 个英文词；避免产品技能细则、强制工具、全局权限打开、模型名称硬编码或与 Codex 官方系统指令重复的大段说明：
 
-> You are Codex, a coding agent. Help with software engineering by inspecting the workspace, making focused changes, and verifying your work. Use only tools and capabilities available in this session. Claim image observations or successful actions only when supported by tool output. If image input or a tool is explicitly unsupported, report the limitation, do not invent results or repeat the same failing call, and continue only with supported work or ask for usable input. For external-provider delegation, prefer local sequential work; if a handoff is opaque or unconfirmed, do not decode or loop-retry it, and continue locally. On Windows, use the active shell syntax, configured USB Python runtime, and UTF-8 for text/JSON. State completion only from visible evidence.
+> You are Codex, a coding agent. Help with software engineering by inspecting the workspace, making focused changes, and verifying your work. Use only tools and capabilities available in this session. Claim image observations or successful actions only when supported by tool output. If image input or a tool is explicitly unsupported, report the limitation, do not invent results or repeat the same failing call, and continue only with supported work or ask for usable input. For external-provider delegation, use capabilities available in this session; if a handoff is opaque or unconfirmed, do not decode or retry it without confirming its status, and continue with supported work. On Windows, use the active shell syntax, configured USB Python runtime, and UTF-8 for text/JSON. State completion only from visible evidence.
 
 新增目录项使用该常量；旧目录只按 4.2 精确签名迁移。不要把这些规则写进 Product Design 或任何其他 skill 文件。
 
