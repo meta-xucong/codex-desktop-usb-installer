@@ -876,9 +876,9 @@ fn codex_home_dir() -> Option<PathBuf> {
     // cannot receive a false "refreshed" result written to a directory that
     // the launched Codex never reads.
     if usb_guard::guard_required() {
-        if let Ok(paths) = usb_guard::local_data_paths() {
-            return Some(paths.codex_home);
-        }
+        return usb_guard::local_data_paths()
+            .ok()
+            .map(|paths| paths.codex_home);
     }
     if let Some(value) = env::var_os("CODEX_HOME").filter(|value| !value.is_empty()) {
         let path = PathBuf::from(value);

@@ -7,7 +7,7 @@
 //! target, regardless of filename, while a separate ChatGPT product remains
 //! out of scope because its executable lives outside that root.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::EngineError;
 
@@ -23,6 +23,17 @@ pub struct UsableWindowReport {
     /// policy.  The window is still restored and moved to the top of the normal
     /// z-order, so this flag is diagnostic rather than a success condition.
     pub foreground_accepted: bool,
+}
+
+/// Profile paths from the interactive desktop user's Windows environment.
+/// `user_profile` is optional because Codex launch needs APPDATA and
+/// LOCALAPPDATA, while only some manager operations need USERPROFILE.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesktopUserEnvironmentPaths {
+    pub app_data: PathBuf,
+    pub local_app_data: PathBuf,
+    pub user_profile: Option<PathBuf>,
+    pub user_sid: String,
 }
 
 #[cfg(any(windows, test))]
@@ -113,6 +124,198 @@ pub fn same_windows_path(left: &Path, right: &Path) -> bool {
 }
 
 #[cfg(any(windows, test))]
+fn windows_environment_key(entry: &[u16]) -> Option<&[u16]> {
+    let separator_start = if entry.first() == Some(&(b'=' as u16)) {
+        1
+    } else {
+        0
+    };
+    let separator = entry
+        .iter()
+        .enumerate()
+        .skip(separator_start)
+        .find_map(|(index, unit)| (*unit == b'=' as u16).then_some(index))?;
+    (separator > separator_start).then_some(&entry[..separator])
+}
+
+#[cfg(any(windows, test))]
+fn windows_environment_keys_equal(left: &[u16], right: &[u16]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            fold_ascii_environment_unit(*left) == fold_ascii_environment_unit(*right)
+        })
+}
+
+#[cfg(any(windows, test))]
+fn windows_environment_value<'a>(entry: &'a [u16], requested_key: &[u16]) -> Option<&'a [u16]> {
+    let separator_start = if entry.first() == Some(&(b'=' as u16)) {
+        1
+    } else {
+        0
+    };
+    let separator = entry
+        .iter()
+        .enumerate()
+        .skip(separator_start)
+        .find_map(|(index, unit)| (*unit == b'=' as u16).then_some(index))?;
+    windows_environment_keys_equal(&entry[..separator], requested_key)
+        .then_some(&entry[separator + 1..])
+}
+
+#[cfg(any(windows, test))]
+fn desktop_profile_values(
+    entries: &[Vec<u16>],
+) -> std::io::Result<(Vec<u16>, Vec<u16>, Option<Vec<u16>>)> {
+    let value_for = |name: &str| {
+        let key = name.encode_utf16().collect::<Vec<_>>();
+        entries
+            .iter()
+            .find_map(|entry| windows_environment_value(entry, &key))
+            .filter(|value| !value.is_empty())
+            .map(<[u16]>::to_vec)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("desktop user environment is missing {name}"),
+                )
+            })
+    };
+    let user_profile = entries
+        .iter()
+        .find_map(|entry| {
+            windows_environment_value(entry, &"USERPROFILE".encode_utf16().collect::<Vec<_>>())
+        })
+        .filter(|value| !value.is_empty())
+        .map(<[u16]>::to_vec);
+    Ok((
+        value_for("APPDATA")?,
+        value_for("LOCALAPPDATA")?,
+        user_profile,
+    ))
+}
+
+#[cfg(any(windows, test))]
+fn path_with_prefix(prefix: &[u16], existing: Option<&[u16]>) -> Vec<u16> {
+    let mut path = prefix.to_vec();
+    if let Some(existing) = existing.filter(|value| !value.is_empty()) {
+        if !path.is_empty() {
+            path.push(b';' as u16);
+        }
+        path.extend_from_slice(existing);
+    }
+    path
+}
+
+#[cfg(any(windows, test))]
+fn fold_ascii_environment_unit(unit: u16) -> u16 {
+    if (b'a' as u16..=b'z' as u16).contains(&unit) {
+        unit - 32
+    } else {
+        unit
+    }
+}
+
+#[cfg(any(windows, test))]
+fn merge_windows_environment_entries(
+    mut entries: Vec<Vec<u16>>,
+    overrides: &[(Vec<u16>, Vec<u16>)],
+) -> std::io::Result<Vec<u16>> {
+    for entry in &entries {
+        if windows_environment_key(entry).is_none() || entry.contains(&0) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "desktop user environment contains an invalid entry",
+            ));
+        }
+    }
+    for (key, value) in overrides {
+        if key.is_empty() || key.contains(&(b'=' as u16)) || key.contains(&0) || value.contains(&0)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Codex launch environment override has an invalid name or value",
+            ));
+        }
+        entries.retain(|entry| {
+            !windows_environment_key(entry)
+                .is_some_and(|existing| windows_environment_keys_equal(existing, key))
+        });
+        let mut entry = Vec::with_capacity(key.len() + value.len() + 1);
+        entry.extend_from_slice(key);
+        entry.push(b'=' as u16);
+        entry.extend_from_slice(value);
+        entries.push(entry);
+    }
+    entries.sort_by(|left, right| {
+        let left = windows_environment_key(left).expect("validated environment entry");
+        let right = windows_environment_key(right).expect("validated environment entry");
+        left.iter()
+            .map(|unit| fold_ascii_environment_unit(*unit))
+            .cmp(right.iter().map(|unit| fold_ascii_environment_unit(*unit)))
+    });
+    let total_units = entries.iter().map(|entry| entry.len() + 1).sum::<usize>() + 1;
+    let mut block = Vec::with_capacity(total_units.max(2));
+    for entry in entries {
+        block.extend(entry);
+        block.push(0);
+    }
+    block.push(0);
+    if block.len() == 1 {
+        block.push(0);
+    }
+    Ok(block)
+}
+
+#[cfg(any(windows, test))]
+fn quote_windows_argument(argument: &[u16]) -> std::io::Result<Vec<u16>> {
+    if argument.contains(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Windows process arguments cannot contain NUL",
+        ));
+    }
+    let mut quoted = Vec::with_capacity(argument.len() + 2);
+    quoted.push(b'"' as u16);
+    let mut backslashes = 0_usize;
+    for unit in argument {
+        if *unit == b'\\' as u16 {
+            backslashes += 1;
+            continue;
+        }
+        if *unit == b'"' as u16 {
+            quoted.extend(std::iter::repeat_n(b'\\' as u16, backslashes * 2 + 1));
+            quoted.push(*unit);
+        } else {
+            quoted.extend(std::iter::repeat_n(b'\\' as u16, backslashes));
+            quoted.push(*unit);
+        }
+        backslashes = 0;
+    }
+    quoted.extend(std::iter::repeat_n(b'\\' as u16, backslashes * 2));
+    quoted.push(b'"' as u16);
+    Ok(quoted)
+}
+
+#[cfg(any(windows, test))]
+fn build_windows_command_line(arguments: &[Vec<u16>]) -> std::io::Result<Vec<u16>> {
+    let mut command_line = Vec::new();
+    for argument in arguments {
+        if !command_line.is_empty() {
+            command_line.push(b' ' as u16);
+        }
+        command_line.extend(quote_windows_argument(argument)?);
+    }
+    if command_line.len() >= 32_767 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Windows process command line exceeds 32766 UTF-16 units",
+        ));
+    }
+    command_line.push(0);
+    Ok(command_line)
+}
+
+#[cfg(any(windows, test))]
 fn path_is_within_root(candidate: &Path, root: &Path) -> bool {
     let candidate = normalized_windows_path(candidate);
     let root = normalized_windows_path(root);
@@ -128,9 +331,9 @@ fn path_is_within_root(candidate: &Path, root: &Path) -> bool {
 #[cfg(windows)]
 mod imp {
     use std::collections::{HashMap, HashSet};
-    use std::ffi::OsString;
+    use std::ffi::{c_void, OsString};
     use std::mem::size_of;
-    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::path::{Path, PathBuf};
     use std::sync::{mpsc, Mutex, OnceLock};
     use std::thread;
@@ -144,13 +347,25 @@ mod imp {
     use windows_sys::Win32::Graphics::Gdi::{
         GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
     };
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TokenElevation, TokenElevationType, TokenElevationTypeDefault,
+        TokenElevationTypeFull, TokenLinkedToken, TokenUser, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
+        TOKEN_ELEVATION, TOKEN_ELEVATION_TYPE, TOKEN_QUERY, TOKEN_USER,
+    };
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
         TH32CS_SNAPPROCESS,
     };
+    use windows_sys::Win32::System::Environment::{
+        CreateEnvironmentBlock, DestroyEnvironmentBlock,
+    };
+    use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
     use windows_sys::Win32::System::Threading::{
-        GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW, TerminateProcess,
-        WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+        CreateProcessAsUserW, CreateProcessWithTokenW, GetCurrentProcess, GetCurrentProcessId,
+        GetCurrentThreadId, GetExitCodeProcess, OpenProcess, OpenProcessToken,
+        QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW,
+        CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+        PROCESS_TERMINATE, STARTUPINFOW,
     };
     use windows_sys::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -217,7 +432,9 @@ mod imp {
         if let Some(root) = root {
             if let Ok(hidden) = hide_console_windows_for_root(&root) {
                 if hidden > 0 {
-                    log::debug!("managed Codex console window suppression event={event} hidden_candidates={hidden}");
+                    log::debug!(
+                        "managed Codex console window suppression event={event} hidden_candidates={hidden}"
+                    );
                 }
             }
             if let Ok(hidden) = hide_codex_auxiliary_windows_for_root(&root) {
@@ -345,6 +562,10 @@ mod imp {
 
     struct OwnedHandle(HANDLE);
 
+    // Win32 process and token handles are process-wide kernel handles and can
+    // be closed from whichever thread owns this Rust value.
+    unsafe impl Send for OwnedHandle {}
+
     impl OwnedHandle {
         fn new(handle: HANDLE) -> Option<Self> {
             (!handle.is_null() && handle != INVALID_HANDLE_VALUE).then_some(Self(handle))
@@ -363,6 +584,538 @@ mod imp {
                 CloseHandle(self.0);
             }
         }
+    }
+
+    pub(crate) struct DesktopUserChild {
+        process: OwnedHandle,
+        pid: u32,
+    }
+
+    impl DesktopUserChild {
+        pub(crate) fn id(&self) -> u32 {
+            self.pid
+        }
+
+        pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<u32>> {
+            match unsafe { WaitForSingleObject(self.process.raw(), 0) } {
+                WAIT_TIMEOUT => Ok(None),
+                WAIT_OBJECT_0 => {
+                    let mut exit_code = 0_u32;
+                    if unsafe { GetExitCodeProcess(self.process.raw(), &mut exit_code) } == 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(Some(exit_code))
+                }
+                WAIT_FAILED => Err(std::io::Error::last_os_error()),
+                status => Err(std::io::Error::other(format!(
+                    "unexpected process wait status {status}"
+                ))),
+            }
+        }
+    }
+
+    unsafe impl Send for DesktopUserChild {}
+
+    struct EnvironmentBlock(*mut c_void);
+
+    impl Drop for EnvironmentBlock {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    DestroyEnvironmentBlock(self.0);
+                }
+            }
+        }
+    }
+
+    const MAX_ENVIRONMENT_BLOCK_UNITS: usize = 1_048_576;
+
+    unsafe fn copy_environment_entries(block: *const u16) -> std::io::Result<Vec<Vec<u16>>> {
+        if block.is_null() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "desktop user environment block is null",
+            ));
+        }
+        let mut entries = Vec::new();
+        let mut entry_start = 0_usize;
+        for index in 0..MAX_ENVIRONMENT_BLOCK_UNITS {
+            let unit = unsafe { *block.add(index) };
+            if unit != 0 {
+                continue;
+            }
+            if index == entry_start {
+                return Ok(entries);
+            }
+            entries.push(
+                unsafe { std::slice::from_raw_parts(block.add(entry_start), index - entry_start) }
+                    .to_vec(),
+            );
+            entry_start = index + 1;
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "desktop user environment block has no terminator",
+        ))
+    }
+
+    fn token_is_elevated(token: HANDLE) -> std::io::Result<bool> {
+        let mut elevation = TOKEN_ELEVATION::default();
+        let mut returned = 0_u32;
+        if unsafe {
+            GetTokenInformation(
+                token,
+                TokenElevation,
+                (&mut elevation as *mut TOKEN_ELEVATION).cast::<c_void>(),
+                size_of::<TOKEN_ELEVATION>() as u32,
+                &mut returned,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(elevation.TokenIsElevated != 0)
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ElevatedShellTokenSource {
+        Current,
+        Linked,
+    }
+
+    fn elevated_shell_token_source_from_type(
+        elevation_type: TOKEN_ELEVATION_TYPE,
+    ) -> std::io::Result<ElevatedShellTokenSource> {
+        if elevation_type == TokenElevationTypeDefault {
+            Ok(ElevatedShellTokenSource::Current)
+        } else if elevation_type == TokenElevationTypeFull {
+            Ok(ElevatedShellTokenSource::Linked)
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unexpected elevated desktop Shell token type {elevation_type}"),
+            ))
+        }
+    }
+
+    fn elevated_shell_token_source(token: HANDLE) -> std::io::Result<ElevatedShellTokenSource> {
+        let mut elevation_type: TOKEN_ELEVATION_TYPE = 0;
+        let mut returned = 0_u32;
+        if unsafe {
+            GetTokenInformation(
+                token,
+                TokenElevationType,
+                (&mut elevation_type as *mut TOKEN_ELEVATION_TYPE).cast::<c_void>(),
+                size_of::<TOKEN_ELEVATION_TYPE>() as u32,
+                &mut returned,
+            )
+        } == 0
+        {
+            return Err(contextual_win32_error(
+                "desktop token type discovery",
+                "GetTokenInformation(TokenElevationType)",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        elevated_shell_token_source_from_type(elevation_type)
+    }
+
+    fn token_user_sid(token: HANDLE) -> std::io::Result<String> {
+        use std::ffi::c_void;
+        use std::mem::size_of;
+        use windows_sys::Win32::Foundation::{
+            GetLastError, LocalFree, ERROR_INSUFFICIENT_BUFFER, HLOCAL,
+        };
+        use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+
+        let mut needed = 0_u32;
+        let probe =
+            unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed) };
+        if probe != 0
+            || unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER
+            || needed < size_of::<TOKEN_USER>() as u32
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "desktop user token SID length could not be read",
+            ));
+        }
+        let mut storage = vec![0_usize; (needed as usize).div_ceil(size_of::<usize>())];
+        let mut returned = 0_u32;
+        if unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                storage.as_mut_ptr().cast::<c_void>(),
+                needed,
+                &mut returned,
+            )
+        } == 0
+            || returned as usize > storage.len() * size_of::<usize>()
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: GetTokenInformation returned an aligned TOKEN_USER in storage.
+        let user = unsafe { &*storage.as_ptr().cast::<TOKEN_USER>() };
+        if user.User.Sid.is_null() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "desktop user token has no SID",
+            ));
+        }
+        let mut raw_sid = std::ptr::null_mut();
+        if unsafe { ConvertSidToStringSidW(user.User.Sid, &mut raw_sid) } == 0 || raw_sid.is_null()
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let sid = unsafe {
+            let mut length = 0_usize;
+            while *raw_sid.add(length) != 0 {
+                length += 1;
+            }
+            String::from_utf16_lossy(std::slice::from_raw_parts(raw_sid, length))
+        };
+        unsafe {
+            LocalFree(raw_sid as HLOCAL);
+        }
+        Ok(sid)
+    }
+
+    fn contextual_win32_error(stage: &str, api: &str, error: std::io::Error) -> std::io::Error {
+        let code = error
+            .raw_os_error()
+            .map(|code| format!("Win32 {code}"))
+            .unwrap_or_else(|| "no Win32 code".to_string());
+        std::io::Error::new(
+            error.kind(),
+            format!("{stage}: {api} failed ({code}): {error}"),
+        )
+    }
+
+    fn desktop_user_startup_info() -> STARTUPINFOW {
+        let mut startup = STARTUPINFOW::default();
+        startup.cb = size_of::<STARTUPINFOW>() as u32;
+        // NULL inherits the caller's interactive window station and desktop.
+        // An explicit desktop name adds a separate desktop ACL requirement.
+        startup.lpDesktop = std::ptr::null_mut();
+        startup
+    }
+
+    fn process_is_elevated() -> std::io::Result<bool> {
+        let mut token = std::ptr::null_mut();
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return Err(contextual_win32_error(
+                "elevation probe",
+                "OpenProcessToken(current process)",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        let token = OwnedHandle::new(token).ok_or_else(std::io::Error::last_os_error)?;
+        token_is_elevated(token.raw()).map_err(|error| {
+            contextual_win32_error(
+                "elevation probe",
+                "GetTokenInformation(TokenElevation)",
+                error,
+            )
+        })
+    }
+
+    pub(super) fn desktop_user_profile_paths_if_elevated(
+    ) -> std::io::Result<Option<super::DesktopUserEnvironmentPaths>> {
+        if !process_is_elevated()? {
+            return Ok(None);
+        }
+
+        let (token, _) = desktop_shell_token()?;
+        let user_sid = token_user_sid(token.raw())?;
+        let mut raw_environment = std::ptr::null_mut();
+        if unsafe { CreateEnvironmentBlock(&mut raw_environment, token.raw(), 0) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let environment = EnvironmentBlock(raw_environment);
+        let entries = unsafe { copy_environment_entries(environment.0.cast::<u16>()) }?;
+        let (appdata, local_appdata, user_profile) = super::desktop_profile_values(&entries)?;
+        Ok(Some(super::DesktopUserEnvironmentPaths {
+            app_data: PathBuf::from(OsString::from_wide(&appdata)),
+            local_app_data: PathBuf::from(OsString::from_wide(&local_appdata)),
+            user_profile: user_profile.map(|path| PathBuf::from(OsString::from_wide(&path))),
+            user_sid,
+        }))
+    }
+
+    fn desktop_shell_token() -> std::io::Result<(OwnedHandle, bool)> {
+        use windows_sys::Win32::UI::WindowsAndMessaging::GetShellWindow;
+
+        let mut manager_session = 0_u32;
+        if unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut manager_session) } == 0 {
+            return Err(contextual_win32_error(
+                "manager session discovery",
+                "ProcessIdToSessionId(manager)",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        let shell_window = unsafe { GetShellWindow() };
+        if shell_window.is_null() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "desktop Shell discovery: GetShellWindow returned NULL",
+            ));
+        }
+        let mut shell_pid = 0_u32;
+        if unsafe { GetWindowThreadProcessId(shell_window, &mut shell_pid) } == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "desktop Shell process discovery: GetWindowThreadProcessId returned 0",
+            ));
+        }
+        if shell_pid == 0 {
+            return Err(contextual_win32_error(
+                "desktop Shell process discovery",
+                "GetWindowThreadProcessId returned thread ID without process ID",
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "Shell process ID was zero"),
+            ));
+        }
+        let mut shell_session = 0_u32;
+        if unsafe { ProcessIdToSessionId(shell_pid, &mut shell_session) } == 0 {
+            return Err(contextual_win32_error(
+                "desktop Shell session discovery",
+                "ProcessIdToSessionId(Shell)",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        if shell_session != manager_session {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "desktop Shell belongs to a different Windows session",
+            ));
+        }
+        let shell_process = OwnedHandle::new(unsafe {
+            OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, shell_pid)
+        })
+        .ok_or_else(|| {
+            contextual_win32_error(
+                "desktop Shell process open",
+                "OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)",
+                std::io::Error::last_os_error(),
+            )
+        })?;
+        let mut token = std::ptr::null_mut();
+        if unsafe {
+            OpenProcessToken(
+                shell_process.raw(),
+                TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY,
+                &mut token,
+            )
+        } == 0
+        {
+            return Err(contextual_win32_error(
+                "desktop token acquisition",
+                "OpenProcessToken(Shell)",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        let token = OwnedHandle::new(token).ok_or_else(std::io::Error::last_os_error)?;
+        if token_is_elevated(token.raw()).map_err(|error| {
+            contextual_win32_error(
+                "desktop token validation",
+                "GetTokenInformation(TokenElevation)",
+                error,
+            )
+        })? {
+            match elevated_shell_token_source(token.raw())? {
+                ElevatedShellTokenSource::Current => {
+                    // Windows reports no linked token for this desktop
+                    // identity. Preserve native Shell behavior by using its
+                    // existing token; this may be elevated when UAC filtering
+                    // is disabled or the account has no split token.
+                    log::warn!(
+                        "desktop Shell has an elevated default token without a linked token; launching managed Codex with the existing desktop token"
+                    );
+                    return Ok((token, true));
+                }
+                ElevatedShellTokenSource::Linked => {}
+            }
+            let mut linked_token = std::ptr::null_mut();
+            let mut returned = 0_u32;
+            if unsafe {
+                GetTokenInformation(
+                    token.raw(),
+                    TokenLinkedToken,
+                    (&mut linked_token as *mut HANDLE).cast::<c_void>(),
+                    size_of::<HANDLE>() as u32,
+                    &mut returned,
+                )
+            } == 0
+            {
+                return Err(contextual_win32_error(
+                    "desktop token fallback",
+                    "GetTokenInformation(TokenLinkedToken)",
+                    std::io::Error::last_os_error(),
+                ));
+            }
+            let linked_token = OwnedHandle::new(linked_token).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "desktop Shell returned a null linked-token handle",
+                )
+            })?;
+            if token_is_elevated(linked_token.raw()).map_err(|error| {
+                contextual_win32_error(
+                    "linked desktop token validation",
+                    "GetTokenInformation(TokenElevation)",
+                    error,
+                )
+            })? {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "current desktop Shell and its linked token are elevated; refusing to launch managed Codex",
+                ));
+            }
+            return Ok((linked_token, false));
+        }
+        Ok((token, false))
+    }
+
+    pub(crate) fn spawn_as_desktop_user(
+        exe: &Path,
+        arguments: &[OsString],
+        environment_overrides: &[(OsString, OsString)],
+    ) -> std::io::Result<Option<DesktopUserChild>> {
+        if !process_is_elevated().map_err(|error| {
+            contextual_win32_error(
+                "desktop-token launch decision",
+                "process_is_elevated",
+                error,
+            )
+        })? {
+            return Ok(None);
+        }
+
+        let (token, use_create_process_as_user) = desktop_shell_token().map_err(|error| {
+            contextual_win32_error("desktop token acquisition", "desktop_shell_token", error)
+        })?;
+        let mut raw_environment = std::ptr::null_mut();
+        if unsafe { CreateEnvironmentBlock(&mut raw_environment, token.raw(), 0) } == 0 {
+            return Err(contextual_win32_error(
+                "desktop environment creation",
+                "CreateEnvironmentBlock",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        let raw_environment = EnvironmentBlock(raw_environment);
+        let base_entries = unsafe { copy_environment_entries(raw_environment.0.cast::<u16>()) }?;
+        let mut overrides = environment_overrides
+            .iter()
+            .map(|(key, value)| {
+                (
+                    key.encode_wide().collect::<Vec<u16>>(),
+                    value.encode_wide().collect::<Vec<u16>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let codex_home_key = "CODEX_HOME".encode_utf16().collect::<Vec<_>>();
+        let path_key = "PATH".encode_utf16().collect::<Vec<_>>();
+        if let Some(codex_home) = overrides.iter().find_map(|(key, value)| {
+            super::windows_environment_keys_equal(key, &codex_home_key).then_some(value)
+        }) {
+            // The generic USB environment was prepared by the elevated
+            // manager. Keep its managed runtime bin, but use the desktop
+            // user's PATH instead of replacing it with the administrator's.
+            let codex_home = PathBuf::from(OsString::from_wide(codex_home));
+            overrides.retain(|(key, _)| !super::windows_environment_keys_equal(key, &path_key));
+            let runtime_bin = codex_home.join("codex-agent-kit").join("bin");
+            if runtime_bin.is_dir() {
+                let desktop_path = base_entries
+                    .iter()
+                    .find_map(|entry| super::windows_environment_value(entry, &path_key));
+                overrides.push((
+                    path_key,
+                    super::path_with_prefix(
+                        &runtime_bin.as_os_str().encode_wide().collect::<Vec<_>>(),
+                        desktop_path,
+                    ),
+                ));
+            }
+        }
+        let environment = super::merge_windows_environment_entries(base_entries, &overrides)?;
+
+        let exe_wide = exe
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let mut command_arguments = Vec::with_capacity(arguments.len() + 1);
+        command_arguments.push(exe_wide[..exe_wide.len() - 1].to_vec());
+        command_arguments.extend(
+            arguments
+                .iter()
+                .map(|argument| argument.encode_wide().collect()),
+        );
+        let mut command_line = super::build_windows_command_line(&command_arguments)?;
+        // Inherit the manager's interactive desktop to avoid an unnecessary
+        // named-desktop ACL check in the elevated launch path.
+        let startup = desktop_user_startup_info();
+        let mut process_info = PROCESS_INFORMATION::default();
+        let launch_api = if use_create_process_as_user {
+            "CreateProcessAsUserW (desktop Shell token)"
+        } else {
+            "CreateProcessWithTokenW"
+        };
+        log::info!(
+            "launching managed Codex exe={} api={} command_line_utf16_units={}",
+            exe.display(),
+            launch_api,
+            command_line.len()
+        );
+        let created = unsafe {
+            if use_create_process_as_user {
+                CreateProcessAsUserW(
+                    token.raw(),
+                    exe_wide.as_ptr(),
+                    command_line.as_mut_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+                    environment.as_ptr().cast::<c_void>(),
+                    std::ptr::null(),
+                    &startup,
+                    &mut process_info,
+                )
+            } else {
+                CreateProcessWithTokenW(
+                    token.raw(),
+                    0,
+                    exe_wide.as_ptr(),
+                    command_line.as_mut_ptr(),
+                    CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+                    environment.as_ptr().cast::<c_void>(),
+                    std::ptr::null(),
+                    &startup,
+                    &mut process_info,
+                )
+            }
+        };
+        if created == 0 {
+            return Err(contextual_win32_error(
+                "desktop process creation",
+                launch_api,
+                std::io::Error::last_os_error(),
+            ));
+        }
+        let process = OwnedHandle::new(process_info.hProcess).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Windows created Codex without returning a process handle",
+            )
+        })?;
+        if let Some(thread) = OwnedHandle::new(process_info.hThread) {
+            drop(thread);
+        }
+        Ok(Some(DesktopUserChild {
+            process,
+            pid: process_info.dwProcessId,
+        }))
     }
 
     struct TargetProcess {
@@ -1206,19 +1959,19 @@ mod imp {
                     return Err(EngineError::Install(format!(
                         "cannot query image path for live process {pid}: {}",
                         std::io::Error::from_raw_os_error(code)
-                    )))
+                    )));
                 }
                 WAIT_FAILED => {
                     return Err(EngineError::Install(format!(
                         "cannot query image path or process state for pid {pid}: image error {}; wait error {}",
                         std::io::Error::from_raw_os_error(code),
                         std::io::Error::last_os_error()
-                    )))
+                    )));
                 }
                 status => {
                     return Err(EngineError::Install(format!(
                         "cannot query image path for process {pid}; unexpected wait status {status}"
-                    )))
+                    )));
                 }
             }
         }
@@ -1425,6 +2178,27 @@ mod imp {
         }
     }
 
+    /// Recover an unknown Codex instance without discarding user work. Match
+    /// the exact core image, not the root: the entry shim is itself waiting for
+    /// this launch request under that root and must never be closed here.
+    pub(crate) fn close_image_gracefully_for_launch(
+        timeout_secs: u64,
+        image: &Path,
+    ) -> Result<(), EngineError> {
+        let targets = target_processes_under_root(image)?;
+        request_graceful_close(&targets);
+        if wait_until_exited(&targets, Duration::from_secs(timeout_secs))
+            && target_processes_under_root(image)?.is_empty()
+        {
+            return Ok(());
+        }
+        // Deliberately no TerminateProcess fallback. WM_CLOSE can trigger a
+        // save/cancel prompt, and cancelling must preserve the existing work.
+        Err(EngineError::Io(
+            "已有 Codex 实例尚未关闭，无法切换到 U 盘受管配置。请保存工作并关闭该 Codex 窗口后重试；未强制结束进程。".into(),
+        ))
+    }
+
     pub fn close_processes_for_root(timeout_secs: u64, root: &Path) -> Result<(), EngineError> {
         let targets = target_processes_under_root(root)?;
         if targets.is_empty() {
@@ -1488,10 +2262,45 @@ mod imp {
     mod windows_tests {
         use std::process::Command;
 
+        use windows_sys::Win32::Security::TokenElevationTypeLimited;
+
         use super::*;
 
         const HELPER_ENV: &str = "CODEX_APP_MANAGER_PROCESS_HELPER";
         const STRICT_HELPER_ENV: &str = "CODEX_USB_REVOCATION_PROCESS_HELPER";
+
+        #[test]
+        fn elevated_desktop_launch_inherits_interactive_desktop() {
+            let startup = super::desktop_user_startup_info();
+            assert_eq!(startup.cb as usize, std::mem::size_of::<STARTUPINFOW>());
+            assert!(startup.lpDesktop.is_null());
+        }
+
+        #[test]
+        fn elevated_shell_token_type_uses_current_only_without_a_linked_token() {
+            assert_eq!(
+                elevated_shell_token_source_from_type(TokenElevationTypeDefault).unwrap(),
+                ElevatedShellTokenSource::Current
+            );
+            assert_eq!(
+                elevated_shell_token_source_from_type(TokenElevationTypeFull).unwrap(),
+                ElevatedShellTokenSource::Linked
+            );
+            assert!(elevated_shell_token_source_from_type(TokenElevationTypeLimited).is_err());
+        }
+
+        #[test]
+        fn launch_error_context_keeps_win32_code_and_api_stage() {
+            let error = super::contextual_win32_error(
+                "desktop process creation",
+                "CreateProcessWithTokenW",
+                std::io::Error::from_raw_os_error(5),
+            );
+            let message = error.to_string();
+            assert!(message.contains("desktop process creation"));
+            assert!(message.contains("CreateProcessWithTokenW"));
+            assert!(message.contains("Win32 5"));
+        }
 
         #[test]
         fn strict_probe_skips_only_known_system_pids_and_preserves_other_errors() {
@@ -1736,6 +2545,49 @@ mod imp {
         }
 
         #[test]
+        fn usb_launch_graceful_close_timeout_preserves_core_and_waiting_shim() {
+            let root = std::env::temp_dir()
+                .join(format!("codex-graceful-launch-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            let mut children = Vec::new();
+            for name in ["CodexCore.dat", "ChatGPT.exe"] {
+                let image = root.join(name);
+                std::fs::copy(std::env::current_exe().unwrap(), &image).unwrap();
+                children.push(
+                    Command::new(&image)
+                        .args([
+                            "--exact",
+                            "windows_process::imp::windows_tests::strict_probe_helper_child",
+                            "--nocapture",
+                        ])
+                        .env(STRICT_HELPER_ENV, "1")
+                        .spawn()
+                        .unwrap(),
+                );
+            }
+            // Test children deliberately have no closeable window. Timeout
+            // must not enter the installer's force-terminate fallback.
+            let result = close_image_gracefully_for_launch(0, &root.join("CodexCore.dat"));
+            let alive = children
+                .iter_mut()
+                .all(|child| child.try_wait().unwrap().is_none());
+            // An absent core is a no-op, even while the shim under this same
+            // directory is waiting for a manager response.
+            let absent = close_image_gracefully_for_launch(0, &root.join("OtherCore.dat"));
+            for child in &mut children {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            let _ = std::fs::remove_dir_all(root);
+            assert!(result.is_err());
+            assert!(
+                alive,
+                "launch recovery must never force-kill existing work or the shim"
+            );
+            assert!(absent.is_ok());
+        }
+
+        #[test]
         fn closes_unlisted_helper_process_without_powershell() {
             if std::env::var_os(HELPER_ENV).is_some() {
                 thread::sleep(Duration::from_secs(30));
@@ -1797,7 +2649,26 @@ pub use imp::{
 };
 
 #[cfg(windows)]
-pub(crate) use imp::{close_codex_processes_for_root, codex_processes_running_for_root};
+pub(crate) use imp::{
+    close_codex_processes_for_root, close_image_gracefully_for_launch,
+    codex_processes_running_for_root, spawn_as_desktop_user, DesktopUserChild,
+};
+
+/// Return the interactive desktop user's profile paths when this process is
+/// elevated. A non-elevated caller should keep using its own process
+/// environment. The elevated path intentionally has no fallback to the
+/// administrator process environment if the desktop identity cannot be read.
+#[cfg(windows)]
+pub fn desktop_user_profile_paths_if_elevated(
+) -> std::io::Result<Option<DesktopUserEnvironmentPaths>> {
+    imp::desktop_user_profile_paths_if_elevated()
+}
+
+#[cfg(not(windows))]
+pub fn desktop_user_profile_paths_if_elevated(
+) -> std::io::Result<Option<DesktopUserEnvironmentPaths>> {
+    Ok(None)
+}
 
 #[cfg(not(windows))]
 pub(crate) fn close_codex_processes_for_root(
@@ -1886,6 +2757,14 @@ pub fn wait_for_usable_window_for_root(
 mod tests {
     use super::*;
 
+    fn wide(value: &str) -> Vec<u16> {
+        value.encode_utf16().collect()
+    }
+
+    fn entry_text(entry: &[u16]) -> String {
+        String::from_utf16(entry).unwrap()
+    }
+
     #[test]
     fn matches_windows_paths_case_insensitively_and_on_component_boundaries() {
         let root = Path::new(r"C:\Users\Alice\Apps\Codex");
@@ -1961,5 +2840,122 @@ mod tests {
         assert!(is_lifecycle_window_class("Chrome_WidgetWin_0"));
         assert!(!is_lifecycle_window_class("Chrome_WidgetWin_1"));
         assert!(!is_lifecycle_window_class("Tauri Window"));
+    }
+
+    #[test]
+    fn desktop_environment_merge_preserves_user_values_and_overrides_case_insensitively() {
+        let base = vec![
+            wide("=C:=C:\\Users\\周"),
+            wide("Path=C:\\Windows\\System32"),
+            wide("USERPROFILE=C:\\Users\\周"),
+        ];
+        let overrides = vec![
+            (
+                wide("PATH"),
+                wide("E:\\USB\\runtime\\python;C:\\Windows\\System32"),
+            ),
+            (
+                wide("CODEX_HOME"),
+                wide("C:\\Users\\周\\AppData\\Local\\CodexAppManager\\usb-codex-home"),
+            ),
+        ];
+        let merged = merge_windows_environment_entries(base, &overrides).unwrap();
+        let mut entries = Vec::new();
+        let mut start = 0;
+        for (index, unit) in merged.iter().enumerate() {
+            if *unit == 0 {
+                if index == start {
+                    break;
+                }
+                entries.push(entry_text(&merged[start..index]));
+                start = index + 1;
+            }
+        }
+        assert!(entries.contains(&"=C:=C:\\Users\\周".to_string()));
+        assert!(
+            entries.contains(&"PATH=E:\\USB\\runtime\\python;C:\\Windows\\System32".to_string())
+        );
+        assert!(entries.contains(&"USERPROFILE=C:\\Users\\周".to_string()));
+        assert!(entries.contains(
+            &"CODEX_HOME=C:\\Users\\周\\AppData\\Local\\CodexAppManager\\usb-codex-home"
+                .to_string()
+        ));
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.to_ascii_uppercase().starts_with("PATH="))
+                .count(),
+            1
+        );
+        assert_eq!(
+            merged.iter().rev().take(2).copied().collect::<Vec<_>>(),
+            vec![0, 0]
+        );
+    }
+
+    #[test]
+    fn desktop_profile_paths_are_read_from_the_desktop_user_environment() {
+        let entries = vec![
+            wide(r"APPDATA=C:\Users\桌面用户\AppData\Roaming"),
+            wide(r"LOCALAPPDATA=C:\Users\桌面用户\AppData\Local"),
+            wide(r"USERPROFILE=C:\Users\桌面用户"),
+        ];
+        let (appdata, local_appdata, user_profile) = desktop_profile_values(&entries).unwrap();
+        assert_eq!(entry_text(&appdata), r"C:\Users\桌面用户\AppData\Roaming");
+        assert_eq!(
+            entry_text(&local_appdata),
+            r"C:\Users\桌面用户\AppData\Local"
+        );
+        assert_eq!(entry_text(&user_profile.unwrap()), r"C:\Users\桌面用户");
+        assert!(desktop_profile_values(&entries[..2]).unwrap().2.is_none());
+        assert!(desktop_profile_values(&entries[..1]).is_err());
+    }
+
+    #[test]
+    fn managed_runtime_path_keeps_the_desktop_users_path() {
+        assert_eq!(
+            entry_text(&path_with_prefix(
+                &wide(r"C:\Users\桌面用户\managed-bin"),
+                Some(&wide(r"C:\Windows\System32;C:\Users\桌面用户\tools")),
+            )),
+            r"C:\Users\桌面用户\managed-bin;C:\Windows\System32;C:\Users\桌面用户\tools"
+        );
+        assert_eq!(
+            entry_text(&path_with_prefix(&wide(r"C:\managed-bin"), None)),
+            r"C:\managed-bin"
+        );
+    }
+
+    #[test]
+    fn desktop_environment_merge_rejects_invalid_overrides() {
+        assert!(merge_windows_environment_entries(
+            Vec::new(),
+            &[(wide("BAD=NAME"), wide("value"))]
+        )
+        .is_err());
+        assert!(merge_windows_environment_entries(
+            Vec::new(),
+            &[(wide("NAME"), vec![b'x' as u16, 0, b'y' as u16])]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn windows_argument_quoting_handles_spaces_quotes_unicode_and_trailing_slashes() {
+        assert_eq!(
+            entry_text(
+                &quote_windows_argument(&wide(r"C:\Program Files\Codex\CodexCore.dat")).unwrap()
+            ),
+            r#""C:\Program Files\Codex\CodexCore.dat""#
+        );
+        assert_eq!(
+            entry_text(&quote_windows_argument(&wide("--note=中文 \"quoted\"")).unwrap()),
+            r#""--note=中文 \"quoted\"""#
+        );
+        assert_eq!(
+            entry_text(&quote_windows_argument(&wide(r"C:\folder with space\")).unwrap()),
+            r#""C:\folder with space\\""#
+        );
+        assert!(quote_windows_argument(&[b'a' as u16, 0, b'b' as u16]).is_err());
     }
 }

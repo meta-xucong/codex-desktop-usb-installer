@@ -3259,7 +3259,9 @@ pub fn launch_codex(settings: &AppSettings, codex_locale: Option<&str>) -> Resul
             environment: launch_environment,
             usb_integrity_transaction: usb_mode,
             require_usb_entry_overlay: direct_entry_required,
-            remote_debugging_port: None,
+            remote_debugging_port: codex_remote_debugging_port(cfg!(
+                feature = "usb-cdp-diagnostic"
+            )),
             codex_home,
             locale_override: codex_locale.map(str::to_string),
             portable_launch_policy: launch_policy,
@@ -3277,6 +3279,10 @@ pub fn launch_codex(settings: &AppSettings, codex_locale: Option<&str>) -> Resul
         report.no_sandbox
     );
     Ok(())
+}
+
+fn codex_remote_debugging_port(diagnostic_launch: bool) -> Option<u16> {
+    diagnostic_launch.then_some(9222)
 }
 
 pub fn uninstall_windows_codex(
@@ -4077,6 +4083,12 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn remote_debugging_is_only_enabled_for_an_explicit_diagnostic_codex_launch() {
+        assert_eq!(super::codex_remote_debugging_port(false), None);
+        assert_eq!(super::codex_remote_debugging_port(true), Some(9222));
+    }
+
     #[test]
     fn usb_runtime_environment_prefers_managed_bin_and_enables_utf8_python() {
         let root = temp_test_dir("usb-runtime-environment");

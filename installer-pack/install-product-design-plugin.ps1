@@ -4,6 +4,8 @@
 )
 
 $ErrorActionPreference = 'Stop'
+# The manager parses stdout as UTF-8 JSON, including non-ASCII user paths.
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 
 $packFull = [IO.Path]::GetFullPath($PackRoot)
 $codexHome = [IO.Path]::GetFullPath($TargetCodexHome)

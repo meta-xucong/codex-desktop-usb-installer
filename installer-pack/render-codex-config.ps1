@@ -23,6 +23,54 @@ function ConvertTo-TomlString([string]$Value) {
     return '"' + $Value.Replace('\', '\\').Replace('"', '\"') + '"'
 }
 
+function Test-BundledPluginConfigured([string]$ConfigText, [string]$PluginId) {
+    if ([string]::IsNullOrWhiteSpace($ConfigText)) { return $false }
+    $pluginKey = $PluginId + '@openai-bundled'
+    $doubleQuotedId = [regex]::Escape('"' + $pluginKey + '"')
+    $singleQuotedId = [regex]::Escape("'" + $pluginKey + "'")
+    $pattern = '(?m)^\s*\[plugins\.(?:' + $doubleQuotedId + '|' + $singleQuotedId + ')(?:\.[^\]]+)?\]\s*(?:#.*)?$'
+    return [regex]::IsMatch($ConfigText, $pattern)
+}
+
+function Get-ManagedPluginEnabledValue([string]$ConfigText, [string]$TableHeader) {
+    if ([string]::IsNullOrWhiteSpace($ConfigText)) { return $null }
+    $pattern = '(?ms)^[ \t]*' + [regex]::Escape($TableHeader) + '[ \t]*\r?\n(?<body>.*?)(?=^[ \t]*\[|\z)'
+    $table = [regex]::Match($ConfigText, $pattern)
+    if (-not $table.Success) { return $null }
+    $enabled = [regex]::Match($table.Groups['body'].Value, '(?im)^[ \t]*enabled[ \t]*=[ \t]*(true|false)[ \t]*(?:#.*)?\r?$')
+    if (-not $enabled.Success) { return $null }
+    return $enabled.Groups[1].Value.ToLowerInvariant()
+}
+
+function Add-BundledPluginDefault([string]$PluginId, [string[]]$SectionLines, [string]$ExistingConfig) {
+    if (Test-BundledPluginConfigured $ExistingConfig $PluginId) {
+        [void]$script:preservedBundledPluginSettings.Add($PluginId)
+        return
+    }
+    $linesToAdd = @($SectionLines)
+    $preservedManagedDisable = $false
+    for ($index = 0; $index -lt $linesToAdd.Count; $index++) {
+        if ($linesToAdd[$index] -notmatch '^\[') { continue }
+        $previousValue = Get-ManagedPluginEnabledValue $script:existingManagedPluginConfig $linesToAdd[$index]
+        if ($previousValue -ne 'false') { continue }
+        for ($valueIndex = $index + 1; $valueIndex -lt $linesToAdd.Count; $valueIndex++) {
+            if ($linesToAdd[$valueIndex] -match '^\[') { break }
+            if ($linesToAdd[$valueIndex] -match '^\s*enabled\s*=\s*true\s*(?:#.*)?$') {
+                $linesToAdd[$valueIndex] = 'enabled = false'
+                $preservedManagedDisable = $true
+                break
+            }
+        }
+    }
+    foreach ($line in $linesToAdd) { $script:lines.Add($line) }
+    $script:lines.Add('')
+    if ($preservedManagedDisable) {
+        [void]$script:preservedBundledPluginSettings.Add($PluginId)
+    } else {
+        [void]$script:enabledBundledPlugins.Add($PluginId)
+    }
+}
+
 $scriptContainer = $PSScriptRoot
 $candidateRoot = Split-Path -Parent $scriptContainer
 if (Test-Path -LiteralPath (Join-Path $scriptContainer 'pack.json') -PathType Leaf) {
@@ -70,6 +118,56 @@ foreach ($skill in $allSkills) {
     $lines.Add('path = ' + (ConvertTo-TomlString $skillFile))
     $lines.Add('enabled = ' + $(if ($enabledSkills -contains [string]$skill.id) { 'true' } else { 'false' }))
     $lines.Add('')
+}
+
+# These plugins ship in Codex's signed openai-bundled marketplace but are
+# optional-install entries. Enable all bundled plugins by default without
+# editing the signed MSIX. Existing plugin settings outside this managed block
+# are explicit user choices and win.
+$existingPluginConfigPath = Join-Path $TargetCodexHome 'config.toml'
+$existingPluginConfig = ''
+$script:existingManagedPluginConfig = ''
+if (Test-Path -LiteralPath $existingPluginConfigPath -PathType Leaf) {
+    $existingPluginConfig = Get-Content -LiteralPath $existingPluginConfigPath -Raw -Encoding UTF8
+    $managedPluginBlock = '(?ms)^# BEGIN CODEX-STARTER-KIT MANAGED CONFIG v1\r?\n.*?^# END CODEX-STARTER-KIT MANAGED CONFIG v1\r?\n?'
+    $existingManagedPluginMatch = [regex]::Match($existingPluginConfig, $managedPluginBlock)
+    if ($existingManagedPluginMatch.Success) {
+        $script:existingManagedPluginConfig = $existingManagedPluginMatch.Value
+    }
+    $existingPluginConfig = [regex]::Replace($existingPluginConfig, $managedPluginBlock, '')
+}
+$script:enabledBundledPlugins = [System.Collections.Generic.List[string]]::new()
+$script:preservedBundledPluginSettings = [System.Collections.Generic.List[string]]::new()
+Add-BundledPluginDefault 'codex-app-tools' @(
+    '[plugins."codex-app-tools@openai-bundled"]',
+    'enabled = true',
+    '',
+    '[plugins."codex-app-tools@openai-bundled".mcp_servers.codex_app]',
+    'enabled = true'
+) $existingPluginConfig
+Add-BundledPluginDefault 'browser' @(
+    '[plugins."browser@openai-bundled"]',
+    'enabled = true'
+) $existingPluginConfig
+Add-BundledPluginDefault 'unified-computer-use' @(
+    '[plugins."unified-computer-use@openai-bundled"]',
+    'enabled = true',
+    '',
+    '[plugins."unified-computer-use@openai-bundled".mcp_servers.cua_repl]',
+    'enabled = true'
+) $existingPluginConfig
+Add-BundledPluginDefault 'code-review' @(
+    '[plugins."code-review@openai-bundled"]',
+    'enabled = true',
+    '',
+    '[plugins."code-review@openai-bundled".mcp_servers.code-review]',
+    'enabled = true'
+) $existingPluginConfig
+foreach ($pluginId in @('chrome', 'computer-use', 'latex', 'deep-research', 'visualize', 'image-guided-assets')) {
+    Add-BundledPluginDefault $pluginId @(
+        ('[plugins."' + $pluginId + '@openai-bundled"]'),
+        'enabled = true'
+    ) $existingPluginConfig
 }
 
 if ($EnableFeishu) {
@@ -173,6 +271,8 @@ try {
     enabledSkills = @($enabledSkills)
     enabledSkillCount = $enabledSkills.Count
     disabledSkillCount = $allSkills.Count - $enabledSkills.Count
+    enabledBundledPlugins = @($script:enabledBundledPlugins)
+    preservedBundledPluginSettings = @($script:preservedBundledPluginSettings)
     feishuEnabled = [bool]$EnableFeishu
     mediaGenerationEnabled = [bool]$EnableMediaGeneration
     enabledRemoteMcps = @($requestedRemoteMcps)

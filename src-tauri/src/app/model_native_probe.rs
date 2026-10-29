@@ -951,7 +951,8 @@ impl TemporaryArea {
     }
 
     fn validated_cleanup_root(&self) -> Result<PathBuf, NativeProbeError> {
-        let root = std::fs::canonicalize(&self.root).map_err(|_| NativeProbeError::CleanupFailed)?;
+        let root =
+            std::fs::canonicalize(&self.root).map_err(|_| NativeProbeError::CleanupFailed)?;
         let base = std::fs::canonicalize(std::env::temp_dir())
             .map_err(|_| NativeProbeError::CleanupFailed)?;
         validate_cleanup_root_paths(&root, &self.root, &base)?;
@@ -973,10 +974,8 @@ impl TemporaryArea {
         if self.cleaned {
             return Ok(false);
         }
-        let cleanup_pending = cleanup_captured_temp_area(
-            || self.validated_cleanup_root(),
-            remove_dir,
-        )?;
+        let cleanup_pending =
+            cleanup_captured_temp_area(|| self.validated_cleanup_root(), remove_dir)?;
         if !cleanup_pending {
             self.cleaned = true;
         }

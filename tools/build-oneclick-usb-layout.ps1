@@ -8,6 +8,7 @@ param(
     [string]$CapabilityPackSource = "",
     [string]$UsbPolicy = "",
     [string]$UsbSigningProfilePath = "",
+    [switch]$UsbCdpDiagnostic,
     [switch]$InternalSigned,
     [switch]$SkipSignature
 )
@@ -30,6 +31,15 @@ if ([string]::IsNullOrWhiteSpace($ManagerPath)) { $ManagerPath = Join-Path $repo
 if ([string]::IsNullOrWhiteSpace($EntryShimPath)) { $EntryShimPath = Join-Path $repo "release\setup\CodexEntryShim.exe" }
 if ([string]::IsNullOrWhiteSpace($BundlePath)) { $BundlePath = Join-Path $repo "release\usb-final" }
 if ([string]::IsNullOrWhiteSpace($OutputPath)) { $OutputPath = Join-Path $repo "release\usb-oneclick" }
+if ($UsbCdpDiagnostic -and $OutputPath -notmatch '(?i)diagnostic') {
+    throw "CDP 诊断 bundle 必须使用名称含 diagnostic 的独立 OutputPath：$OutputPath"
+}
+if ($UsbCdpDiagnostic -and (Test-Path -LiteralPath $OutputPath)) {
+    throw "CDP 诊断 bundle 必须写入全新 OutputPath，不能复用或覆盖已有目录：$OutputPath"
+}
+if ($UsbCdpDiagnostic -and -not (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $ManagerPath) "USB-CDP-DIAGNOSTIC.txt") -PathType Leaf)) {
+    throw "CDP 诊断 bundle 必须使用 build-installer.ps1 生成的独立诊断 manager 目录"
+}
 if ([string]::IsNullOrWhiteSpace($CapabilityPackSource)) {
     $CapabilityPackSource = Join-Path $repo "installer-pack"
 }
@@ -284,31 +294,35 @@ function Assert-NoSuccessfulStateResidue([string]$RootPath) {
 # retain the exit code of a previous native command in the parent session.
 
 $output = (Resolve-Path -LiteralPath $OutputPath).Path
-# Keep the two packaged CCSwitch manifest copies aligned with the canonical
-# repository resource. The launcher-side resource directory can be an older
-# staging snapshot even when the executable and provider catalog are current.
-$canonicalCcswitchManifest = Join-Path $repo "src-tauri\resources\ccswitch\manifest.json"
-if (-not (Test-Path -LiteralPath $canonicalCcswitchManifest -PathType Leaf)) {
-    throw "缺少当前 CCSwitch 资源清单：$canonicalCcswitchManifest"
+# Verify the canonical product before propagating metadata. Never stamp a new
+# source manifest onto a stale EXE copied by an earlier launcher staging step.
+$canonicalCcswitchDir = Join-Path $repo "src-tauri\resources\ccswitch"
+$canonicalCcswitchManifest = Join-Path $canonicalCcswitchDir "manifest.json"
+$canonicalCcswitchVerifier = Join-Path $canonicalCcswitchDir "verify-product.ps1"
+& $canonicalCcswitchVerifier -ArtifactDir $canonicalCcswitchDir -SkipNetwork
+$canonicalProduct = [System.IO.File]::ReadAllText($canonicalCcswitchManifest, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+$canonicalPatchRelative = [string]$canonicalProduct.sourcePatch
+if ($canonicalPatchRelative -ne "source-patches/ccswitch-usb-product-85ad4969.patch") {
+    throw "CCSwitch 源码补丁路径不是固定 4.0.20 升级基线"
 }
-foreach ($relativeCcswitchManifest in @("resources\ccswitch\manifest.json", "ccswitch\manifest.json")) {
-    $destinationManifest = Join-Path $output $relativeCcswitchManifest
-    if (-not (Test-Path -LiteralPath (Split-Path -Parent $destinationManifest) -PathType Container)) {
-        throw "U 盘输出缺少 CCSwitch 清单目录：$destinationManifest"
+foreach ($relativeProductDir in @("resources\ccswitch", "ccswitch")) {
+    $destinationDir = Join-Path $output $relativeProductDir
+    $destinationExe = Join-Path $destinationDir "CodexSwitch.exe"
+    if (-not (Test-Path -LiteralPath $destinationExe -PathType Leaf) -or
+        (Get-FileHash -LiteralPath $destinationExe -Algorithm SHA256).Hash -ine $canonicalProduct.artifact.sha256) {
+        throw "U 盘包中的 CCSwitch EXE 与已验证资源不一致，拒绝覆盖清单掩盖旧产物：$relativeProductDir"
     }
-    Copy-Item -LiteralPath $canonicalCcswitchManifest -Destination $destinationManifest -Force
-    $manifestBytes = [System.IO.File]::ReadAllBytes($destinationManifest)
-    if ($manifestBytes.Length -ge 3 -and
-        $manifestBytes[0] -eq 0xEF -and
-        $manifestBytes[1] -eq 0xBB -and
-        $manifestBytes[2] -eq 0xBF) {
-        throw "CCSwitch manifest.json 必须使用无 BOM 的 UTF-8 编码：$destinationManifest"
+    foreach ($relativeFile in @("manifest.json", "verify-product.ps1", "SOURCE-NOTICE.txt", $canonicalPatchRelative)) {
+        $sourceFile = Join-Path $canonicalCcswitchDir $relativeFile
+        $destinationFile = Join-Path $destinationDir $relativeFile
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destinationFile) | Out-Null
+        Copy-Item -LiteralPath $sourceFile -Destination $destinationFile -Force
+        if ((Get-FileHash -LiteralPath $sourceFile -Algorithm SHA256).Hash -ine
+            (Get-FileHash -LiteralPath $destinationFile -Algorithm SHA256).Hash) {
+            throw "CCSwitch 完整产品元数据复制后不一致：$relativeProductDir/$relativeFile"
+        }
     }
-    $sourceHash = (Get-FileHash -LiteralPath $canonicalCcswitchManifest -Algorithm SHA256).Hash
-    $destinationHash = (Get-FileHash -LiteralPath $destinationManifest -Algorithm SHA256).Hash
-    if ($sourceHash -ine $destinationHash) {
-        throw "U 盘包中的 CCSwitch 清单与当前资源不一致：$relativeCcswitchManifest"
-    }
+    & (Join-Path $destinationDir "verify-product.ps1") -ArtifactDir $destinationDir -SkipNetwork
 }
 $manifestPath = Join-Path $output "manifest.json"
 $manifest = Read-JsonFile $manifestPath
@@ -488,6 +502,7 @@ if ($webView2Hash -ine "1F4638309F3D82C31A3028C3CF7D75998F58E4D1407380F5CB8A8E91
 $usbManifest = [ordered]@{
     schemaVersion = 3
     product = "codex-usb-oneclick"
+    diagnosticProfile = if ($UsbCdpDiagnostic) { "usb-cdp-diagnostic" } else { $null }
     releaseVersion = $releaseVersion
     status = "oneclick"
     updateCapability = [ordered]@{
@@ -564,8 +579,8 @@ $usbManifest = [ordered]@{
         installerTimeoutSeconds = 600
     }
     usbGuard = [ordered]@{
-        helper = "CodexUsbGuard.exe"
-        localDirectory = "%LOCALAPPDATA%/CodexUsbGuard"
+        helper = if ($UsbCdpDiagnostic) { "CodexUsbCdpGuard.exe" } else { "CodexUsbGuard.exe" }
+        localDirectory = if ($UsbCdpDiagnostic) { "%LOCALAPPDATA%/CodexUsbCdpDiagnosticGuard" } else { "%LOCALAPPDATA%/CodexUsbGuard" }
         licenseFile = "usb-license.json"
         binding = "removable-volume + volume-serial + anchor-sha256 + bundle-relative-path"
         signing = $signingBinding
@@ -652,7 +667,7 @@ $usbManifest = [ordered]@{
         "On first launch the manager passes the signed USB account binding to CCSwitch through the legacy startup environment. CCSwitch stores the 404TOKEN API key in its normal local provider database and activates the provider through its standard switch path; the manager does not wait for an acknowledgement file. After a usable window appears, CCSwitch is minimized once into the tray. Later use of the explicit Open CCSwitch button restores the window and does not minimize it again. A missing signed binding or launch failure is shown on the manager home page. The user can later switch providers and models in CCSwitch. Installation, Codex launch, and provider switching do not require a Manager model test. The Manager's Advanced gateway probe is optional and read-only: it does not apply a model or change configuration. A full matrix sends up to 12 generation requests per selected model (up to three models), may consume upstream quota, and requires separate user cost confirmation.",
         "If an older CCSwitch process already owns its single-instance localhost port, close that old process and use the manager retry entry; the manager reports the conflict instead of treating a refused localhost connection as a successful launch.",
         "In the CCSwitch Codex provider editor, Refresh models calls the current provider's /v1/models endpoint. It keeps every vendor, collapses only stable/latest/valid-date release aliases, and preserves the selected raw upstream model ID.",
-        "Codex is launched only by the authorized USB manager with CODEX_HOME fixed to %LOCALAPPDATA%/CodexAppManager/usb-codex-home, separate from the normal local Codex home. The USB profile defaults to approval_policy=never and sandbox_mode=danger-full-access. The effective USB runtime policy starts with normal hardware rendering (no --disable-gpu) and automatically retries the proven software-rendering/no-sandbox fallback only if no stable usable window appears. Removing the USB triggers the existing five-second guarded shutdown.",
+        $(if ($UsbCdpDiagnostic) { "Diagnostic only: before starting this manager, set CODEX_USB_CDP_DIAGNOSTIC_CODEX_HOME to an existing absolute Codex profile directory. The manager does not copy or create that directory; the launched Codex may write its normal startup state there. This profile is shared only when the user explicitly selects it." } else { "Codex is launched only by the authorized USB manager with CODEX_HOME fixed to %LOCALAPPDATA%/CodexAppManager/usb-codex-home, separate from the normal local Codex home. The USB profile defaults to approval_policy=never and sandbox_mode=danger-full-access. The effective USB runtime policy starts with normal hardware rendering (no --disable-gpu) and automatically retries the proven software-rendering/no-sandbox fallback only if no stable usable window appears. Removing the USB triggers the existing five-second guarded shutdown." }),
         "Ordinary uninstall removes <bundle>/apps/Codex and preserves local user data. Advanced purge remains a separate explicit confirmation. Source-media deletion is allowed only after the runtime tree has been removed, immutable release files still match SHA256SUMS.txt, and usb-license.json plus its atomic backup match the active lease fingerprint and handoff snapshot."
     )
     secretsIncluded = $false
@@ -671,6 +686,7 @@ $usbManifest = [ordered]@{
         "Unsigned development bundles auto-enroll on first run; strict anti-copy releases require a pre-provisioned signed usb-license.json."
     )
 }
+
 if ((Get-JsonInteger $usbManifest "schemaVersion") -ne 3 -or
     (Get-JsonInteger $usbManifest.updateCapability "schemaVersion") -ne 3 -or
     (Get-JsonInteger $usbManifest.updateCapability "anchorSchema") -ne 3 -or
@@ -680,7 +696,16 @@ if ((Get-JsonInteger $usbManifest "schemaVersion") -ne 3 -or
 [System.IO.File]::WriteAllText((Join-Path $output "usb-manifest.json"), ($usbManifest | ConvertTo-Json -Depth 8), $utf8NoBom)
 
 $readme = Get-Content -LiteralPath (Join-Path $repo "docs\USB-INSTALL-USER-GUIDE.txt") -Raw -Encoding UTF8
-[System.IO.File]::WriteAllText((Join-Path $output "README.txt"), $readme, $utf8NoBom)
+$readmePath = Join-Path $output "README.txt"
+if ($UsbCdpDiagnostic) {
+    $readme = "[USB CDP DIAGNOSTIC PACKAGE]`r`nThis is an isolated temporary diagnostic bundle. It is not the production USB manager package.`r`n`r`n" + $readme
+    Copy-Item -LiteralPath (Join-Path (Split-Path -Parent $manager) "USB-CDP-DIAGNOSTIC.txt") -Destination (Join-Path $output "USB-CDP-DIAGNOSTIC.txt") -Force
+    $collectorOutput = Join-Path $output "diagnostics\usb-cdp"
+    New-Item -ItemType Directory -Force -Path $collectorOutput | Out-Null
+    Copy-Item -LiteralPath (Join-Path $repo "diagnostics\usb-codex-cdp\collector.mjs") -Destination (Join-Path $collectorOutput "collector.mjs") -Force
+    Copy-Item -LiteralPath (Join-Path $repo "diagnostics\usb-codex-cdp\COLLECTOR-README.txt") -Destination (Join-Path $collectorOutput "README.txt") -Force
+}
+[System.IO.File]::WriteAllText($readmePath, $readme, $utf8NoBom)
 
 Assert-NoSuccessfulStateResidue $output
 

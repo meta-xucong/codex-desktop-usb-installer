@@ -638,7 +638,9 @@ fn validate_request(request: &GatewayModelProbeRequest) -> Result<(), AppError> 
         if request.cost_consent {
             return Err(engine("思考档位测试费用确认不能与完整协议矩阵授权混用"));
         }
-        if request.reasoning_efforts.is_empty() || request.reasoning_efforts.len() > CODEX_EFFORTS.len() {
+        if request.reasoning_efforts.is_empty()
+            || request.reasoning_efforts.len() > CODEX_EFFORTS.len()
+        {
             return Err(engine("请明确选择要检测的思考档位"));
         }
         let allowed = reasoning_candidates(id);
@@ -650,7 +652,8 @@ fn validate_request(request: &GatewayModelProbeRequest) -> Result<(), AppError> 
         {
             return Err(engine("思考档位无效、重复或不适用于该精确型号"));
         }
-        if canonical_reasoning_efforts(id, &request.reasoning_efforts) != request.reasoning_efforts {
+        if canonical_reasoning_efforts(id, &request.reasoning_efforts) != request.reasoning_efforts
+        {
             return Err(engine("思考档位必须按 Codex 顺序提交"));
         }
     } else if request.reasoning_cost_consent {

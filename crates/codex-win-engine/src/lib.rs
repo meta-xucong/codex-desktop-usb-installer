@@ -95,7 +95,9 @@ pub use windows_process::{
 // Failure-kind constants for structured MSIX health outcomes.
 pub use sys::msix_failure;
 pub use version::{compare_versions, version_key};
-pub use windows_process::same_windows_path;
+pub use windows_process::{
+    desktop_user_profile_paths_if_elevated, same_windows_path, DesktopUserEnvironmentPaths,
+};
 
 pub const OPENAI_PACKAGE_IDENTITY: &str = "OpenAI.Codex";
 

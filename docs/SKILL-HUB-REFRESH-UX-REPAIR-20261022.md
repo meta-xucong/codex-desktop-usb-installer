@@ -86,3 +86,43 @@
 - `npm run check`：通过（TypeScript `tsc --noEmit`）。
 - `git diff --check`：通过；未跟踪开发文档无尾随空格；Rust 文件 `rustfmt --check`：通过。
 - 未做正式打包、推送或实体 U 盘网络现场复现。独立只读审计由主控安排，本记录不代替审计结论。
+
+## 后续现场问题记录：Skill Hub 更新被离线插件报告解析中断（2026-10-26）
+
+### 现象
+
+测试机点击 Skill Hub 更新后失败，界面错误为：
+
+```text
+update engine error: 离线 Product Design 安装结果无效: invalid unicode code point at line 1 column 313
+```
+
+### 已确认的证据
+
+- 随附 `codex-app-manager.log` 中有三轮 Skill Hub 检查；三轮均通过 `ph-relay` 完成 metadata、archive 和 verify，选中的提交为 `351e3c0364e91130e57ae0aef8dfcc3529c4823b`。因此，这次失败没有证据指向 Skill Hub 检查阶段或远程归档下载。
+- `src-tauri/src/commands.rs` 的 `skill_repo_apply_update` 在 USB 模式下先调用 `install_product_design_plugin`，成功返回后才调用远程 `apply_skill_repo_update`。
+- `src-tauri/src/app/capability_pack.rs` 启动 `powershell.exe` 并捕获 stdout；子进程退出码成功后，Rust 直接将 stdout 当作 UTF-8 JSON 解析。解析失败会返回截图中的错误，因此远程 Skill Hub 应用步骤不会继续执行。
+- `installer-pack/install-product-design-plugin.ps1` 在输出 JSON 前会写入 Product Design 配置，并验证插件文件；结果 JSON 还包含 `runtimePath` 与 `installedPath`。安装脚本没有显式声明与 Rust 捕获端一致的 stdout UTF-8 编码契约。
+- 日志和截图未提供该次 PowerShell stdout 原始字节，无法据此证明文件复制、配置写入或 Product Design 插件安装最终状态；也不能把错误归因到某个具体字符的编码字节。
+
+### 当前判断与影响
+
+PowerShell stdout 与 Rust UTF-8 JSON 解析之间的编码不一致是一个待核实假设。测试机日志显示运行配置路径含非 ASCII 用户目录；脚本输出 JSON 又包含本机路径，这与 `invalid unicode code point` 相符，但由于原始 stdout 字节未留存，尚不能确认根因。
+
+该调用顺序还意味着：即使离线 Product Design 脚本已完成文件和配置写入，只要结果 JSON 解析失败，整个 `skill_repo_apply_update` 就会报错，远程 Skill Hub Skills 不会应用。现场应分别检查 Product Design 文件/配置与远程 Skill Hub 代际状态，不能只根据界面错误推断两者都未安装。
+
+### 后续诊断与修复门槛（本次仅登记，未实施）
+
+1. 先在发生故障的测试机上，对同一 PowerShell 版本、同一安装脚本和非 ASCII 临时目标路径捕获子进程 stdout 原始字节，并记录 PowerShell 版本、代码页、退出码及 JSON 解析结果。不得输出凭据或完整用户隐私路径。
+2. 只有在原始字节证实编码不一致后，才为 PowerShell stdout 与 Rust JSON 捕获建立明确、相同的 UTF-8 字节约定；若字节本身是合法 UTF-8，则继续检查 stdout 是否混入额外输出、脚本实际版本/内容及目标路径字符，不先改编码逻辑。
+3. 根因确认后增加非 ASCII `CODEX_HOME`/用户目录路径回归，并验证 Product Design 安装报告成功后远程 Skill Hub apply 会继续执行。
+4. 修复后检查失败重试是否幂等，并确认 MCP 配置及其他既有 `config.toml` 内容保持不变。
+
+### 本机补充探针（2026-10-26）
+
+- 使用本机 Windows PowerShell 子进程，通过管道原始字节流捕获与脚本相同形状的 `ConvertTo-Json` 输出；字段中包含非 ASCII（中文）Windows 路径。
+- 子进程退出码为 0；stdout 经严格 UTF-8 解码及 JSON 解析均通过。
+- 探针只在临时目录创建并随后清理脚本文件，未启动 CodexAppManager，未调用 Product Design 安装脚本，也未访问或修改真实 `CODEX_HOME`。
+- 该结果说明本机该 PowerShell/系统设置下没有复现编码错误，削弱了“默认 stdout 编码必然不兼容”的推断；不能代表测试机的 PowerShell 版本、区域设置或实际安装器输出，也不能排除现场字节损坏或额外 stdout 内容。测试机原始 stdout 仍是定位根因的关键证据。
+
+本节记录现场问题、诊断边界与本机探针结果；本次没有修改生产代码、运行 Product Design 安装器、改动测试或打包。

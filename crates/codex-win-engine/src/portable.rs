@@ -3761,7 +3761,7 @@ fn prepare_portable_payload(
     })
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn ps_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
@@ -3934,7 +3934,7 @@ fn register_uninstall_entry(
     Ok(false)
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn portable_metadata_ownership_script() -> &'static str {
     r#"
 $ErrorActionPreference = 'Stop'
@@ -4025,6 +4025,80 @@ function Test-PortableShortcutOwned($shortcutPath, $entry, $record) {
   return $false
 }
 "#
+}
+
+// Deliberately stricter than uninstall ownership: a user-created shortcut into
+// a managed tree is not permission to redirect it to a different USB bundle.
+#[cfg(any(windows, test))]
+fn usb_shortcut_repair_policy_script() -> &'static str {
+    r#"
+function Test-OwnedUsbShortcutForRepair($shortcutPath, $link, $record) {
+  if (-not [string]::IsNullOrWhiteSpace([string]$link.Arguments)) { return $false }
+  $target = Normalize-PortablePath ([string]$link.TargetPath)
+  if (-not $target -or $target -notmatch '\\apps\\Codex\\(CodexCore\.dat|ChatGPT\.exe|Codex\.exe)$') { return $false }
+  if ([string]$link.Description -eq 'codex-app-manager:managed-portable') { return $true }
+  if (-not $record) { return $false }
+  $path = Normalize-PortablePath $shortcutPath
+  $recordedPath = @($record.shortcutPaths | Where-Object { (Normalize-PortablePath ([string]$_)) -ieq $path }).Count -gt 0
+  if (-not $recordedPath) { return $false }
+  return @($record.installRoots | Where-Object { Test-PortablePathUnderRoot $target ([string]$_) }).Count -gt 0
+}
+"#
+}
+
+#[cfg(any(windows, test))]
+fn repair_owned_usb_shortcuts_script(install_root: &Path, shim: &Path) -> String {
+    format!(
+        r#"{ownership}
+{policy}
+$record = Get-PortableShellOwnership
+$repaired = $false
+foreach ($shortcutPath in @(Get-PortableShortcutCandidates)) {{
+  if (-not (Test-Path -LiteralPath $shortcutPath -PathType Leaf)) {{ continue }}
+  $link = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcutPath)
+  if (-not (Test-OwnedUsbShortcutForRepair $shortcutPath $link $record)) {{ continue }}
+  $target = Normalize-PortablePath ([string]$link.TargetPath)
+  # Keep live entries for other bundles. Also repair this bundle's old direct
+  # Core.dat link, which bypasses the entry shim even though its file exists.
+  if ((Test-Path -LiteralPath $target -PathType Leaf) -and $target -ine {core}) {{ continue }}
+  $link.TargetPath = {shim}
+  $link.WorkingDirectory = {workdir}
+  $link.IconLocation = {shim}
+  $link.Description = 'codex-app-manager:managed-portable'
+  $link.Save()
+  $repaired = $true
+}}
+if ($repaired) {{ 'repaired' }} else {{ 'unchanged' }}
+"#,
+        ownership = portable_metadata_ownership_script(),
+        policy = usb_shortcut_repair_policy_script(),
+        core = ps_quote(&install_root.join(USB_ENTRY_ORIGINAL_EXE).to_string_lossy()),
+        shim = ps_quote(&shim.to_string_lossy()),
+        workdir = ps_quote(&install_root.to_string_lossy()),
+    )
+}
+
+/// Repair existing, positively owned USB shortcuts after bundle authorization.
+/// Unknown provenance is intentionally left untouched; never create or delete
+/// a shell entry, and never point one at the manager-only Core.dat payload.
+#[cfg(all(windows, not(test)))]
+pub fn repair_owned_usb_shortcuts(install_root: &Path) -> Result<bool, EngineError> {
+    // This validates the existing overlay, including the bundle's trusted shim.
+    // Its return value is the private payload, NOT the shortcut destination.
+    installed_usb_codex_launch_exe(install_root)?;
+    let shim = installed_app_exe(install_root)
+        .ok_or_else(|| EngineError::Msix("USB shim entry is missing".to_string()))?;
+    let output = run_powershell(&repair_owned_usb_shortcuts_script(install_root, &shim))?;
+    let repaired = output.trim() == "repaired";
+    if repaired {
+        refresh_portable_shell_directories();
+    }
+    Ok(repaired)
+}
+
+#[cfg(any(not(windows), test))]
+pub fn repair_owned_usb_shortcuts(_install_root: &Path) -> Result<bool, EngineError> {
+    Ok(false)
 }
 
 #[cfg(windows)]
@@ -7352,6 +7426,63 @@ if ($null -ne (Get-OwnedPortableEntry)) {{ 'owned' }} else {{ 'missing' }}
         }
         let parsed = format!("{script}\n'parsed'");
         assert_eq!(run_powershell(&parsed).unwrap().trim(), "parsed");
+    }
+
+    #[test]
+    fn usb_shortcut_repair_targets_shim_without_creating_or_deleting_links() {
+        let root = Path::new("E:/usb-current/apps/Codex");
+        let shim = root.join("ChatGPT.exe");
+        let script = repair_owned_usb_shortcuts_script(root, &shim);
+        assert!(script.contains(&format!(
+            "$link.TargetPath = {}",
+            ps_quote(&shim.to_string_lossy())
+        )));
+        assert!(script.contains("Test-OwnedUsbShortcutForRepair $shortcutPath $link $record"));
+        assert!(script.contains("Test-Path -LiteralPath $shortcutPath -PathType Leaf"));
+        assert!(script.contains(&format!(
+            "$target -ine {}",
+            ps_quote(&root.join(USB_ENTRY_ORIGINAL_EXE).to_string_lossy())
+        )));
+        assert!(!script
+            .split("$record = Get-PortableShellOwnership")
+            .last()
+            .unwrap()
+            .contains("Remove-Item"));
+        assert!(!script.contains("$link.Arguments ="));
+        assert!(!script.contains(&format!(
+            "$link.TargetPath = {}",
+            ps_quote(&root.join(USB_ENTRY_ORIGINAL_EXE).to_string_lossy())
+        )));
+        #[cfg(windows)]
+        assert_powershell_parses(&script);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn usb_shortcut_repair_requires_positive_provenance_and_exact_legacy_target() {
+        let script = format!(
+            r#"{ownership}
+{policy}
+$path = 'C:\Users\Fixture\Desktop\ChatGPT.lnk'
+$link = [pscustomobject]@{{ TargetPath='E:\usb-oneclick-v0.5.24-20261023-model-host-tools-fix-r4\apps\Codex\CodexCore.dat'; Description='codex-app-manager:managed-portable'; Arguments='' }}
+if (-not (Test-OwnedUsbShortcutForRepair $path $link $null)) {{ throw 'owned old Core.dat was not repairable' }}
+$link.Description = ''
+if (Test-OwnedUsbShortcutForRepair $path $link $null) {{ throw 'unknown ownership must survive' }}
+$record = [pscustomobject]@{{ shortcutPaths=@($path); installRoots=@('E:\usb-oneclick-v0.5.24-20261023-model-host-tools-fix-r4\apps\Codex') }}
+if (-not (Test-OwnedUsbShortcutForRepair $path $link $record)) {{ throw 'recorded ownership was not repairable' }}
+if (Test-OwnedUsbShortcutForRepair 'C:\Users\Fixture\Desktop\User.lnk' $link $record) {{ throw 'root alone is not ownership' }}
+$link.Description = 'codex-app-manager:managed-portable'
+$link.TargetPath = 'C:\Program Files\WindowsApps\Official\ChatGPT.exe'
+if (Test-OwnedUsbShortcutForRepair $path $link $record) {{ throw 'official app must survive' }}
+$link.TargetPath = 'E:\usb-old\apps\Codex\ChatGPT.exe'
+$link.Arguments = '--user-custom-option'
+if (Test-OwnedUsbShortcutForRepair $path $link $record) {{ throw 'custom arguments must survive' }}
+'passed'
+"#,
+            ownership = portable_metadata_ownership_script(),
+            policy = usb_shortcut_repair_policy_script(),
+        );
+        assert_eq!(run_powershell(&script).unwrap().trim(), "passed");
     }
 
     #[cfg(windows)]

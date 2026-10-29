@@ -108,6 +108,15 @@ export default tseslint.config(
     languageOptions: { globals: { ...globals.node } },
   },
   {
+    // USB CDP diagnostics are standalone Node.js scripts, not renderer code.
+    files: [
+      "diagnostics/usb-codex-cdp/collector.mjs",
+      "diagnostics/usb-codex-cdp/collector.test.mjs",
+      "diagnostics/usb-codex-cdp/verify-asar-renderer.mjs",
+    ],
+    languageOptions: { globals: { ...globals.node } },
+  },
+  {
     // Test files run under Vitest globals-free (imports describe/it/expect), but
     // use jsdom + node timers; allow both realms.
     files: ["src/**/*.test.{ts,tsx}", "vitest.setup.ts"],

@@ -4412,9 +4412,9 @@ fn finish_bundle_uninstall_report(report: &mut WinBundleUninstallReport) {
 /// Windows USB build: remove the manager-owned Codex installation and the
 /// locally copied CCSwitch program in one guarded operation. Both operations
 /// are idempotent; if one side is already absent, the other side is still
-/// attempted. User data is retained unless the corresponding purge flag is
-/// explicitly enabled by the UI. The offline USB installation kit is always
-/// preserved so the drive remains reusable for a future reinstall.
+/// attempted. The uninstall UI explicitly enables both local-data purge flags
+/// after its two confirmation steps. The offline USB installation kit is
+/// always preserved so the drive remains reusable for a future reinstall.
 #[tauri::command]
 pub async fn win_uninstall_bundle(
     state: State<'_, ManagerState>,

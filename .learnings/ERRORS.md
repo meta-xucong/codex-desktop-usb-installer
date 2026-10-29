@@ -1507,3 +1507,151 @@ For PowerShell-created JSON fixtures, construct the value as an object and seria
 
 - Reproducible: yes
 - Related Files: `installer-pack/runtime/provision-runtime.ps1`
+
+## [ERR-20261025-POWERSHELL-HOST-VARIABLE] Read-only Codex package inspection used a reserved PowerShell variable
+
+**Logged**: 2026-10-25
+**Priority**: low
+**Status**: resolved
+**Area**: tests
+
+### Summary
+
+A read-only installed-package inspection command failed because `$Host` is a built-in read-only PowerShell variable.
+
+### Error
+
+```text
+Cannot overwrite variable Host because it is read-only or constant.
+```
+
+### Context
+
+- The variable name `$host` was used for a discovered `codex-code-mode-host.exe` path.
+- The failed command did not modify files or the installed application.
+- Renaming the variable to `$hostExeInfo` allowed the inspection to complete.
+
+### Suggested Fix
+
+Use task-specific variable names that avoid PowerShell automatic and read-only variables such as `$Host`.
+
+### Resolution
+
+- **Resolved**: 2026-10-25
+- **Notes**: Re-ran the read-only inspection; the signed Codex package host was verified as PE32+ CUI subsystem 3.
+
+### Metadata
+
+- Reproducible: yes
+- Related Files: `crates/codex-win-engine/src/portable.rs`
+
+## [ERR-20261026-POWERSHELL-HOME-VAR] Read-only USB profile check used a reserved PowerShell variable
+
+**Logged**: 2026-10-26
+**Priority**: low
+**Status**: resolved
+**Area**: config
+
+### Summary
+
+A read-only profile check assigned `$home`, which PowerShell treats as the read-only `$HOME` automatic variable, so the command listed the user directory instead of the intended USB profile.
+
+### Error
+
+```text
+Cannot overwrite variable HOME because it is read-only or constant.
+```
+
+### Context
+
+- The command did not read configuration contents or modify the profile.
+- The reported directory listing was not used as evidence about the USB profile.
+- Re-running with `$usbProfilePath` confirmed the expected T14S USB profile path does not exist on this machine.
+
+### Suggested Fix
+
+Use descriptive task-specific variable names such as `$usbProfilePath`; avoid PowerShell automatic and read-only variables, including `$HOME` and `$Host`.
+
+### Resolution
+
+- **Resolved**: 2026-10-26
+- **Notes**: Re-ran the profile existence check with a safe variable name; no active USB profile was present at the expected path.
+
+### Metadata
+
+- Reproducible: yes
+- Related Files: none
+
+`ERR-20261026-GIT-DIFF-OUTPUT-ARG` — A PowerShell expression passed as `git diff --output=(Join-Path ...)` was parsed as an empty output path and failed before exporting the local diff. No source tree was changed by that command. Use a precomputed path and a single quoted `--output=<path>` argument.
+
+## [ERR-20261027-PY-CARGO-ENTRYPOINT] Skill helper and crate test commands used unavailable/default entry points
+
+**Logged**: 2026-10-27
+**Priority**: low
+**Status**: resolved
+**Area**: tests
+
+### Summary
+
+Initial task setup and test invocations used launch paths that were not available from this worktree.
+
+### Error
+
+```text
+'py' launcher was unavailable.
+cargo test -p codex-win-engine --locked: could not find Cargo.toml at the worktree root.
+The first Windows compile surfaced mismatched String/OsString environment types, ExitStatus raw-code type, and STARTUPINFOW pointer mutability.
+The first argument-quoting test expected a missing final quote.
+```
+
+### Context
+
+- The Python 3.12 executable exists at `C:\Users\T14S\AppData\Local\Programs\Python\Python312\python.exe`; invoking it directly works.
+- This repository exposes the engine crate through `crates/codex-win-engine/Cargo.toml`, so Cargo commands must use `--manifest-path`.
+- No source or installed application was changed by the unavailable launcher or wrong-root test command.
+- The compile and test assertion issues were corrected before the successful focused run.
+
+### Suggested Fix
+
+Use the installed Python executable directly and pass the crate manifest path to Cargo when testing the engine crate.
+
+### Resolution
+
+- **Resolved**: 2026-10-27
+- **Notes**: The focused Windows unit tests passed after correcting types and expected quoting.
+
+### Metadata
+
+- Reproducible: yes
+- Related Files: `crates/codex-win-engine/Cargo.toml`, `crates/codex-win-engine/src/windows_process.rs`
+
+## [ERR-20261029-SIGNER-SUBCOMMAND-ORDER] License helper passed flags before the CLI subcommand
+
+**Logged**: 2026-10-29
+**Priority**: low
+**Status**: resolved
+**Area**: tests
+
+### Summary
+
+The local secure-input helper assembled `usb-license-signer.exe --drive ... sign ...`; the CLI requires the subcommand (`sign` or `verify`) as argv[1]. The attempt exited without writing the license.
+
+### Context
+
+- A read-only `inspect` after the attempt confirmed both license and registration were still missing.
+- The helper now puts `sign` or `verify` first and records non-secret output to a local test log while keeping the window open for review.
+- No account provisioning, preload, or Sub2API registration command was invoked.
+
+### Suggested Fix
+
+Build CLI arguments as `command + options`, and confirm a failed attempt left the bundle unchanged before retrying.
+
+### Resolution
+
+- **Resolved**: 2026-10-29
+- **Notes**: Reparsed the corrected helper; final sign and verify are still pending the user entering the existing vault password.
+
+### Metadata
+
+- Reproducible: yes
+- Related Files: `tools/usb-license-signer/src/command.rs`, `.test-tmp/sign-and-verify-cdp-diagnostic-f.ps1`

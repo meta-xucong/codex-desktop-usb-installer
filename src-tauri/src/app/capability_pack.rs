@@ -194,10 +194,41 @@ fn report_missing(message: impl Into<String>) -> CapabilityPackReport {
 }
 
 fn user_profile() -> Result<PathBuf, AppError> {
+    if crate::app::usb_guard::guard_required() {
+        let profile = crate::app::usb_guard::local_data_paths()?
+            .user_profile
+            .filter(|path| path.is_absolute())
+            .ok_or_else(|| AppError::Engine("无法确定当前桌面用户目录".to_string()))?;
+        return Ok(profile);
+    }
     std::env::var_os("USERPROFILE")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
         .ok_or_else(|| AppError::Engine("无法确定当前 Windows 用户目录".to_string()))
+}
+
+fn powershell_provider_path(path: &Path) -> std::ffi::OsString {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+        let wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        let verbatim_prefix = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+        let is_ascii_drive_letter = |value: u16| {
+            (b'A' as u16..=b'Z' as u16).contains(&value)
+                || (b'a' as u16..=b'z' as u16).contains(&value)
+        };
+        if wide.starts_with(&verbatim_prefix)
+            && wide.len() >= 7
+            && is_ascii_drive_letter(wide[4])
+            && wide[5] == b':' as u16
+            && wide[6] == b'\\' as u16
+        {
+            return std::ffi::OsString::from_wide(&wide[verbatim_prefix.len()..]);
+        }
+    }
+
+    path.as_os_str().to_owned()
 }
 
 fn is_reparse_point(path: &Path) -> bool {
@@ -452,13 +483,33 @@ fn readiness_summary(codex_home: &Path) -> ReadinessSummary {
 mod tests {
     use super::{
         core_ready_from_readiness, legacy_media_names_owned, media_install_ready,
-        media_install_switch, persist_connection_ownership, readiness_path, readiness_summary,
-        strip_utf8_bom, validate_options, write_media_authorization_status,
-        CapabilityPackInstallOptions, ConnectionOwnershipRecord, CONNECTION_OWNERSHIP_RELATIVE,
-        KIT_HOME_RELATIVE, PACK_ID,
+        media_install_switch, persist_connection_ownership, powershell_provider_path,
+        readiness_path, readiness_summary, strip_utf8_bom, validate_options,
+        write_media_authorization_status, CapabilityPackInstallOptions, ConnectionOwnershipRecord,
+        CONNECTION_OWNERSHIP_RELATIVE, KIT_HOME_RELATIVE, PACK_ID,
     };
     use serde_json::json;
     use std::fs;
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_provider_path_removes_only_verbatim_local_drive_prefix() {
+        use std::ffi::OsString;
+        use std::path::Path;
+
+        assert_eq!(
+            powershell_provider_path(Path::new(r"\\?\C:\Users\测试\usb-codex-home")),
+            OsString::from(r"C:\Users\测试\usb-codex-home")
+        );
+        assert_eq!(
+            powershell_provider_path(Path::new(r"C:\Users\测试\usb-codex-home")),
+            OsString::from(r"C:\Users\测试\usb-codex-home")
+        );
+        assert_eq!(
+            powershell_provider_path(Path::new(r"\\?\UNC\server\share\codex-home")),
+            OsString::from(r"\\?\UNC\server\share\codex-home")
+        );
+    }
 
     #[test]
     fn explicit_partial_readiness_is_not_upgraded_by_counts() {
@@ -834,7 +885,7 @@ pub fn install_product_design_plugin(app: &AppHandle) -> Result<u32, AppError> {
         .arg("-PackRoot")
         .arg(&pack_root)
         .arg("-TargetCodexHome")
-        .arg(&codex_home);
+        .arg(powershell_provider_path(&codex_home));
     #[cfg(target_os = "windows")]
     command.creation_flags(CREATE_NO_WINDOW);
     let output = command
@@ -1049,7 +1100,10 @@ fn validate_options(options: &CapabilityPackInstallOptions) -> Result<(), AppErr
 }
 
 #[cfg(target_os = "windows")]
-fn update_user_environment(values: &[(&str, &str)]) -> Result<(), AppError> {
+fn update_user_environment(
+    values: &[(&str, &str)],
+    target_user_sid: Option<&str>,
+) -> Result<(), AppError> {
     use windows_sys::Win32::System::Registry::*;
 
     struct Key(HKEY);
@@ -1061,11 +1115,36 @@ fn update_user_environment(values: &[(&str, &str)]) -> Result<(), AppError> {
         }
     }
 
+    let mut desktop_hive = std::ptr::null_mut();
+    let root = if let Some(user_sid) = target_user_sid {
+        let sid_key = user_sid
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let status = unsafe {
+            RegOpenKeyExW(
+                HKEY_USERS,
+                sid_key.as_ptr(),
+                0,
+                KEY_CREATE_SUB_KEY | KEY_QUERY_VALUE,
+                &mut desktop_hive,
+            )
+        };
+        if status != 0 || desktop_hive.is_null() {
+            return Err(AppError::Engine(format!(
+                "打开当前桌面用户注册表配置失败（Win32 {status}）"
+            )));
+        }
+        desktop_hive
+    } else {
+        HKEY_CURRENT_USER
+    };
+    let _desktop_hive = (!desktop_hive.is_null()).then_some(Key(desktop_hive));
     let subkey: Vec<u16> = "Environment\0".encode_utf16().collect();
     let mut handle = std::ptr::null_mut();
     let status = unsafe {
         RegCreateKeyExW(
-            HKEY_CURRENT_USER,
+            root,
             subkey.as_ptr(),
             0,
             std::ptr::null(),
@@ -1078,7 +1157,7 @@ fn update_user_environment(values: &[(&str, &str)]) -> Result<(), AppError> {
     };
     if status != 0 {
         return Err(AppError::Engine(format!(
-            "写入当前用户环境变量失败（Win32 {status}）"
+            "写入用户环境变量失败（Win32 {status}）"
         )));
     }
     let _key = Key(handle);
@@ -1115,12 +1194,18 @@ fn update_user_environment(values: &[(&str, &str)]) -> Result<(), AppError> {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn update_user_environment(_values: &[(&str, &str)]) -> Result<(), AppError> {
+fn update_user_environment(
+    _values: &[(&str, &str)],
+    _target_user_sid: Option<&str>,
+) -> Result<(), AppError> {
     Err(AppError::UnsupportedPlatform)
 }
 
 #[cfg(target_os = "windows")]
-fn remove_owned_user_environment(names: &[&str]) -> Result<(), AppError> {
+fn remove_owned_user_environment(
+    names: &[&str],
+    target_user_sid: Option<&str>,
+) -> Result<(), AppError> {
     use windows_sys::Win32::System::Registry::*;
     struct Key(HKEY);
     impl Drop for Key {
@@ -1128,17 +1213,35 @@ fn remove_owned_user_environment(names: &[&str]) -> Result<(), AppError> {
             unsafe { RegCloseKey(self.0) };
         }
     }
-    let subkey: Vec<u16> = "Environment\0".encode_utf16().collect();
-    let mut handle = std::ptr::null_mut();
-    let status = unsafe {
-        RegOpenKeyExW(
-            HKEY_CURRENT_USER,
-            subkey.as_ptr(),
-            0,
-            KEY_SET_VALUE,
-            &mut handle,
-        )
+    let mut desktop_hive = std::ptr::null_mut();
+    let (root, subkey_text) = match target_user_sid {
+        Some(user_sid) => {
+            let sid_key = user_sid
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect::<Vec<_>>();
+            let status = unsafe {
+                RegOpenKeyExW(
+                    HKEY_USERS,
+                    sid_key.as_ptr(),
+                    0,
+                    KEY_QUERY_VALUE,
+                    &mut desktop_hive,
+                )
+            };
+            if status != 0 || desktop_hive.is_null() {
+                return Err(AppError::Engine(format!(
+                    "打开当前桌面用户注册表配置失败（Win32 {status}）"
+                )));
+            }
+            (desktop_hive, "Environment\0".to_string())
+        }
+        None => (HKEY_CURRENT_USER, "Environment\0".to_string()),
     };
+    let _desktop_hive = (!desktop_hive.is_null()).then_some(Key(desktop_hive));
+    let subkey: Vec<u16> = subkey_text.encode_utf16().collect();
+    let mut handle = std::ptr::null_mut();
+    let status = unsafe { RegOpenKeyExW(root, subkey.as_ptr(), 0, KEY_SET_VALUE, &mut handle) };
     if status == 2 {
         return Ok(());
     }
@@ -1161,7 +1264,10 @@ fn remove_owned_user_environment(names: &[&str]) -> Result<(), AppError> {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn remove_owned_user_environment(_names: &[&str]) -> Result<(), AppError> {
+fn remove_owned_user_environment(
+    _names: &[&str],
+    _target_user_sid: Option<&str>,
+) -> Result<(), AppError> {
     Err(AppError::UnsupportedPlatform)
 }
 
@@ -1251,7 +1357,8 @@ fn migrate_legacy_media_environment(profile: &Path) -> Result<(), AppError> {
     if owned.is_empty() {
         return Ok(());
     }
-    remove_owned_user_environment(&owned)?;
+    let target_user_sid = crate::app::usb_guard::user_environment_registry_sid()?;
+    remove_owned_user_environment(&owned, target_user_sid.as_deref())?;
     for name in &owned {
         std::env::remove_var(name);
     }
@@ -1336,11 +1443,12 @@ fn persist_configured_environment(
         return Ok(());
     }
     let names = values.iter().map(|(name, _)| *name).collect::<Vec<_>>();
+    let target_user_sid = crate::app::usb_guard::user_environment_registry_sid()?;
     // Persist ownership before writing values.  If a registry write is
     // interrupted after a partial update, the later purge still has a safe,
     // exact allowlist to remove; the record never stores the secret values.
     persist_connection_ownership(profile, &names)?;
-    update_user_environment(&values)
+    update_user_environment(&values, target_user_sid.as_deref())
 }
 
 pub fn install(
@@ -1392,7 +1500,9 @@ pub fn install(
             non_empty(&options.feishu_domain).unwrap_or("https://open.feishu.cn"),
         ]);
     if let Some(usb_codex_home) = usb_codex_home.as_ref() {
-        command.arg("-TargetCodexHome").arg(usb_codex_home);
+        command
+            .arg("-TargetCodexHome")
+            .arg(powershell_provider_path(usb_codex_home));
         command.arg("-EnableFullAccess");
     }
     #[cfg(target_os = "windows")]

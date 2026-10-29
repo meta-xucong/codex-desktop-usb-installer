@@ -775,6 +775,16 @@ pub fn run() {
         crate::app::usb_guard::run_guard_cli();
         return;
     }
+    // The diagnostic binary is only valid as a manager inside a USB bundle.
+    // Never let the debug-enabled build fall through to the ordinary local
+    // manager path, where USB authorization would intentionally be absent.
+    #[cfg(all(target_os = "windows", feature = "usb-cdp-diagnostic"))]
+    if !crate::app::usb_guard::guard_required() {
+        let message = "CDP 诊断管理器必须从已签名的 USB 诊断包启动";
+        eprintln!("{message}");
+        crate::app::runtime::show_startup_error(message);
+        return;
+    }
     #[cfg(target_os = "windows")]
     match crate::app::win_elevation::maybe_relaunch_usb_manager() {
         Ok(crate::app::win_elevation::ElevationAction::Continue) => {}
@@ -1118,10 +1128,22 @@ pub fn run() {
                     return;
                 }
                 #[cfg(target_os = "windows")]
-                match codex_win_engine::cleanup_stale_portable_shortcuts() {
-                    Ok(true) => log::info!("removed stale manager-owned portable shortcuts"),
-                    Ok(false) => {}
-                    Err(error) => log::debug!("stale portable shortcut sweep skipped: {error}"),
+                if let Some(root) = crate::app::usb_guard::current_usb_codex_root() {
+                    // Authorization is established above. USB links are repaired
+                    // only with positive provenance, never swept by filename.
+                    if root.is_dir() {
+                        match codex_win_engine::portable::repair_owned_usb_shortcuts(&root) {
+                            Ok(true) => log::info!("repaired manager-owned USB shortcuts to guarded entry"),
+                            Ok(false) => {}
+                            Err(error) => log::warn!("USB shortcut repair skipped: {error}"),
+                        }
+                    }
+                } else {
+                    match codex_win_engine::cleanup_stale_portable_shortcuts() {
+                        Ok(true) => log::info!("removed stale manager-owned portable shortcuts"),
+                        Ok(false) => {}
+                        Err(error) => log::debug!("stale portable shortcut sweep skipped: {error}"),
+                    }
                 }
                 #[cfg(target_os = "windows")]
                 loop {
@@ -1301,7 +1323,16 @@ pub fn run() {
                 }
             }
         })
-        .build(tauri::generate_context!())
+        .build({
+            #[cfg(feature = "usb-cdp-diagnostic")]
+            {
+                tauri::generate_context!("tauri.diagnostic.conf.json")
+            }
+            #[cfg(not(feature = "usb-cdp-diagnostic"))]
+            {
+                tauri::generate_context!()
+            }
+        })
         .expect("failed to build Codex App Manager")
         // Cmd+Q (and any other app-level quit) lands as ExitRequested rather than
         // a window CloseRequested — gate it with the same phase-aware policy.

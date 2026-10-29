@@ -1,0 +1,141 @@
+﻿diff --git a/eslint.config.js b/eslint.config.js
+index c5593f2..6476220 100644
+--- a/eslint.config.js
++++ b/eslint.config.js
+@@ -107,6 +107,15 @@ export default tseslint.config(
+     files: ["tools/skill-hub-relay-sync.test.mjs"],
+     languageOptions: { globals: { ...globals.node } },
+   },
++  {
++    // USB CDP diagnostics are standalone Node.js scripts, not renderer code.
++    files: [
++      "diagnostics/usb-codex-cdp/collector.mjs",
++      "diagnostics/usb-codex-cdp/collector.test.mjs",
++      "diagnostics/usb-codex-cdp/verify-asar-renderer.mjs",
++    ],
++    languageOptions: { globals: { ...globals.node } },
++  },
+   {
+     // Test files run under Vitest globals-free (imports describe/it/expect), but
+     // use jsdom + node timers; allow both realms.
+
+diff --git a/diagnostics/usb-codex-cdp/collector.mjs b/diagnostics/usb-codex-cdp/collector.mjs
+index 5f47d91..5b906b0 100644
+--- a/diagnostics/usb-codex-cdp/collector.mjs
++++ b/diagnostics/usb-codex-cdp/collector.mjs
+@@ -6,7 +6,6 @@ import { setTimeout as delay } from 'node:timers/promises';
+ const DEFAULT_PORT = 9222;
+ const MAX_SECONDS = 300;
+ const TARGET_ASSET = 'app-initial-ad16eaadf81f.js';
+-const TARGET_URL_RE = '.*app-initial-ad16eaadf81f\\.js(?:\\?.*)?$';
+ const GUARD_EXPRESSION = 'f||_e.isLoading||ve.isLoading||!p&&ve.reason===`statsig-disabled`||ye.isLoading||Ee.isLoading||Oe.isLoading||U===`loading`||L.status===`loading`||Je.status===`loading`||Ye.status===`loading`||(Ei.dispatchMessage';
+ const IPC_EVENT = 'electron-desktop-features-changed';
+ const IPC_RETURN = '}),iu.info(`browser_use_availability_resolved`';
+@@ -103,7 +102,8 @@ class Cdp {
+         const pending = this.pending.get(message.id);
+         if (!pending) return;
+         this.pending.delete(message.id);
+-        message.error ? pending.reject(new Error('CDP command failed')) : pending.resolve(message.result ?? {});
++        if (message.error) pending.reject(new Error('CDP command failed'));
++        else pending.resolve(message.result ?? {});
+       } else {
+         for (const listener of this.listeners) void listener(message);
+       }
+@@ -114,7 +114,7 @@ class Cdp {
+       this.pending.clear();
+       onDisconnect();
+     });
+-    ws.addEventListener('error', () => {});
++    ws.addEventListener('error', () => { /* The close event performs disconnect cleanup. */ });
+   }
+   on(listener) { this.listeners.add(listener); return () => this.listeners.delete(listener); }
+   send(method, params = {}, sessionId) {
+@@ -138,8 +138,8 @@ const EVAL_GUARD = `(()=>{const v=f=>{try{return f()}catch{return null}};return
+   inAppBrowserLoading:v(()=>_e.isLoading), externalBrowserLoading:v(()=>ve.isLoading),
+   externalReason:v(()=>ve.reason), computerUseLoading:v(()=>ye.isLoading),
+   computerUseOtherLoading:v(()=>Ee.isLoading), skysightLoading:v(()=>Oe.isLoading),
+-  sitesAccessLoading:v(()=>U===\"loading\"), localAccessLoading:v(()=>L.status===\"loading\"),
+-  cloudAccessLoading:v(()=>Je.status===\"loading\"), workAccessLoading:v(()=>Ye.status===\"loading\")
++  sitesAccessLoading:v(()=>U==="loading"), localAccessLoading:v(()=>L.status==="loading"),
++  cloudAccessLoading:v(()=>Je.status==="loading"), workAccessLoading:v(()=>Ye.status==="loading")
+ }})()`;
+ 
+ async function instrumentTarget(cdp, targetId, sessionId, stream, state) {
+
+diff --git a/diagnostics/usb-codex-cdp/collector.test.mjs b/diagnostics/usb-codex-cdp/collector.test.mjs
+index c10bf23..9c4daca 100644
+--- a/diagnostics/usb-codex-cdp/collector.test.mjs
++++ b/diagnostics/usb-codex-cdp/collector.test.mjs
+@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
+ import http from 'node:http';
+ import crypto from 'node:crypto';
+ import fs from 'node:fs';
+-import { collect, guardLocation, ipcCallReturnLocation, isCodexRendererTarget, isLoopbackWebSocket, normalizeGuard, sameLocation, handlePausedEvent } from './collector.mjs';
++import { collect, guardLocation, ipcCallReturnLocation, isCodexRendererTarget, isLoopbackWebSocket, normalizeGuard, handlePausedEvent } from './collector.mjs';
+ 
+ const GUARD = 'f||_e.isLoading||ve.isLoading||!p&&ve.reason===`statsig-disabled`||ye.isLoading||Ee.isLoading||Oe.isLoading||U===`loading`||L.status===`loading`||Je.status===`loading`||Ye.status===`loading`||(Ei.dispatchMessage';
+ const SOURCE = `function nSu(){if(${GUARD})(Ei.dispatchMessage(\`electron-desktop-features-changed\`,{}),iu.info(\`browser_use_availability_resolved\`,{}));}`;
+@@ -109,7 +109,7 @@ test('only resumes pauses that match this collector’s breakpoint IDs', async (
+ });
+ 
+ test('real WebSocket CDP mock attaches only matching target, verifies locations, samples and resumes own pauses', async t=>{
+-  const mock=await startMockCdp();t.after(()=>mock.close());const output=tempOutput();t.after(()=>{try{fs.unlinkSync(output);}catch{}});
++  const mock=await startMockCdp();t.after(()=>mock.close());const output=tempOutput();t.after(()=>{try{fs.unlinkSync(output);}catch{ /* The file may not exist if collection fails. */ }});
+   await collect({port:mock.port,seconds:1,output});
+   const text=fs.readFileSync(output,'utf8');const rows=text.trim().split(/\r?\n/).map(JSON.parse);
+   assert.equal(mock.commands.includes('Target.setAutoAttach'),false);
+@@ -124,14 +124,14 @@ test('real WebSocket CDP mock attaches only matching target, verifies locations,
+ });
+ 
+ test('real WebSocket CDP mock disconnect is reported without claiming main acceptance', async t=>{
+-  const mock=await startMockCdp({mode:'disconnect'});t.after(()=>mock.close());const output=tempOutput();t.after(()=>{try{fs.unlinkSync(output);}catch{}});
++  const mock=await startMockCdp({mode:'disconnect'});t.after(()=>mock.close());const output=tempOutput();t.after(()=>{try{fs.unlinkSync(output);}catch{ /* The file may not exist if collection fails. */ }});
+   await collect({port:mock.port,seconds:1,output});
+   const rows=fs.readFileSync(output,'utf8').trim().split(/\r?\n/).map(JSON.parse);
+   assert.equal(rows.some(x=>x.event==='cdp-disconnected'),true);assert.equal(rows.at(-1).mainAcceptance,'not_observed');
+ });
+ 
+ test('real WebSocket CDP mock timeout reports not observed rather than false', async t=>{
+-  const mock=await startMockCdp({mode:'timeout'});t.after(()=>mock.close());const output=tempOutput();t.after(()=>{try{fs.unlinkSync(output);}catch{}});
++  const mock=await startMockCdp({mode:'timeout'});t.after(()=>mock.close());const output=tempOutput();t.after(()=>{try{fs.unlinkSync(output);}catch{ /* The file may not exist if collection fails. */ }});
+   await collect({port:mock.port,seconds:1,output});
+   const rows=fs.readFileSync(output,'utf8').trim().split(/\r?\n/).map(JSON.parse);const stopped=rows.at(-1);
+   assert.equal(stopped.reason,'duration-expired');assert.equal(stopped.mainAcceptance,'not_observed');
+@@ -142,7 +142,7 @@ test('real WebSocket CDP mock timeout reports not observed rather than false', a
+ 
+ 
+ test('real WebSocket CDP mock refuses unresolved/moved breakpoint locations', async t=>{
+-  const mock=await startMockCdp({mode:'mismatch'});t.after(()=>mock.close());const output=tempOutput();t.after(()=>{try{fs.unlinkSync(output);}catch{}});
++  const mock=await startMockCdp({mode:'mismatch'});t.after(()=>mock.close());const output=tempOutput();t.after(()=>{try{fs.unlinkSync(output);}catch{ /* The file may not exist if collection fails. */ }});
+   await collect({port:mock.port,seconds:1,output});
+   const rows=fs.readFileSync(output,'utf8').trim().split(/\r?\n/).map(JSON.parse);
+   assert.equal(rows.filter(x=>x.event==='breakpoint-location-mismatch').length,2);
+
+diff --git a/diagnostics/usb-codex-cdp/TEST_RESULTS.md b/diagnostics/usb-codex-cdp/TEST_RESULTS.md
+index ebede74..ea0356b 100644
+--- a/diagnostics/usb-codex-cdp/TEST_RESULTS.md
++++ b/diagnostics/usb-codex-cdp/TEST_RESULTS.md
+@@ -47,3 +47,22 @@ The normal target and diagnostic target checks passed. Diagnostic-filtered libra
+-Collector source is unchanged from its 8/8 approved local loopback mock run.
++Collector behavior remains unchanged from its 8/8 approved local loopback mock run. `cargo fmt` ran after the final Rust edits; the focused Rust tests and PowerShell parser checks passed.
+ 
+ Not performed: launching Codex, opening a real CDP port, attaching to MSI-15, observing runtime values, verifying live V8 `actualLocation`, confirming main-process acceptance, constructing/signing a diagnostic USB bundle, or accessing a signer vault/private key.
++
++## Lint repair verification (2026-10-28)
++
++The initial repository `npm run lint` produced 53 errors in the three diagnostic Node scripts. The following checks passed after the minimal lint repair:
++
++```powershell
++npm run check
++npm run lint
++node --check diagnostics\usb-codex-cdp\collector.mjs
++node --check diagnostics\usb-codex-cdp\collector.test.mjs
++node --check diagnostics\usb-codex-cdp\verify-asar-renderer.mjs
++node --test diagnostics\usb-codex-cdp\collector.test.mjs
++.\diagnostics\usb-codex-cdp\verify-msix-renderer.ps1 -MsixPath 'D:\AI\AGENT_U盘\.codex-browser-availability-diagnostic-20261025\release\browser-diagnostic-20261025-1554\payload\OpenAI.Codex_x64.msix'
++git diff --check
++```
++
++Collector mock results: 8 passed, 0 failed. Exact MSIX static verification passed for package SHA/version, internal app version, renderer SHA, unique guard and dispatch-return markers, and source positions. `git diff --check` passed.
++
++The lint fix only adds Node globals for the three standalone diagnostic `.mjs` files, removes an unused regex constant and test import, converts a no-op ternary into an explicit branch, removes unnecessary escapes from a template literal, and documents intentionally empty error/cleanup handlers. No collector protocol, target selection, whitelist, breakpoint, or cleanup behavior was changed. The EXE was not rebuilt; its SHA-256 remains `7DBEE4A5D6B4CD5D8426542F6385FC7F15575C970ECEA0DF206CD0FE4B6DEE89`.

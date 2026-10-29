@@ -242,6 +242,53 @@ struct CleanupRoots {
     roaming: PathBuf,
     temp: PathBuf,
     desktop: PathBuf,
+    #[serde(default)]
+    desktop_user_sid: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CleanupUserDataRoots {
+    home: PathBuf,
+    local: PathBuf,
+    roaming: PathBuf,
+}
+
+fn cleanup_user_data_roots(
+    usb_paths: Option<crate::app::usb_guard::UsbLocalDataPaths>,
+) -> Result<CleanupUserDataRoots, String> {
+    if let Some(paths) = usb_paths {
+        let home = paths
+            .user_profile
+            .filter(|path| path.is_absolute())
+            .ok_or("无法确定当前桌面用户目录")?;
+        return Ok(CleanupUserDataRoots {
+            home,
+            local: paths.local_app_data,
+            roaming: paths.roaming_app_data,
+        });
+    }
+
+    let base = directories::BaseDirs::new().ok_or("无法读取用户目录")?;
+    Ok(CleanupUserDataRoots {
+        home: base.home_dir().to_path_buf(),
+        local: base.data_local_dir().to_path_buf(),
+        roaming: base.data_dir().to_path_buf(),
+    })
+}
+
+#[cfg(windows)]
+fn cleanup_user_data_roots_from_desktop_profile(
+    paths: codex_win_engine::DesktopUserEnvironmentPaths,
+) -> Result<CleanupUserDataRoots, String> {
+    let home = paths.user_profile.ok_or("无法确定当前桌面用户目录")?;
+    if !home.is_absolute() || !paths.local_app_data.is_absolute() || !paths.app_data.is_absolute() {
+        return Err("桌面用户配置目录不是绝对路径".into());
+    }
+    Ok(CleanupUserDataRoots {
+        home,
+        local: paths.local_app_data,
+        roaming: paths.app_data,
+    })
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -572,7 +619,49 @@ fn same_or_child_path(child: &Path, parent: &Path) -> bool {
 
 impl CleanupRoots {
     fn discover() -> Result<Self, String> {
-        let base = directories::BaseDirs::new().ok_or("无法读取用户目录")?;
+        let usb_paths = crate::app::usb_guard::elevated_usb_local_data_paths()
+            .map_err(|error| format!("无法解析 USB 桌面用户卸载目录：{error}"))?;
+        let desktop_user_sid = usb_paths.as_ref().and_then(|paths| paths.user_sid.clone());
+        let data_roots = cleanup_user_data_roots(usb_paths)?;
+        Self::discover_with_user_data_roots(data_roots, desktop_user_sid)
+    }
+
+    /// The detached finalizer lives in TEMP rather than beside the USB
+    /// executable, so `guard_required()` no longer identifies the original
+    /// USB launch. The manager records the interactive desktop SID in its plan;
+    /// resolve that same SID again instead of guessing from the helper path.
+    fn discover_for_finalizer(expected: &Self) -> Result<Self, String> {
+        match expected.desktop_user_sid.as_deref() {
+            Some(expected_sid) => {
+                #[cfg(windows)]
+                {
+                    let desktop_paths = codex_win_engine::desktop_user_profile_paths_if_elevated()
+                        .map_err(|error| format!("无法解析卸载计划的桌面用户目录：{error}"))?
+                        .ok_or("卸载计划需要桌面用户令牌，但当前没有可用令牌")?;
+                    if desktop_paths.user_sid != expected_sid {
+                        return Err("卸载计划的桌面用户身份与当前交互用户不匹配".into());
+                    }
+                    let desktop_roots =
+                        cleanup_user_data_roots_from_desktop_profile(desktop_paths)?;
+                    Self::discover_with_user_data_roots(
+                        desktop_roots,
+                        Some(expected_sid.to_owned()),
+                    )
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = expected_sid;
+                    Err("当前平台无法恢复计划中的桌面用户身份".into())
+                }
+            }
+            None => Self::discover_with_user_data_roots(cleanup_user_data_roots(None)?, None),
+        }
+    }
+
+    fn discover_with_user_data_roots(
+        data_roots: CleanupUserDataRoots,
+        desktop_user_sid: Option<String>,
+    ) -> Result<Self, String> {
         // The finalizer runs after the manager data root has been removed.
         // Keep reports in a stable temp root that is never part of the
         // product cleanup targets. The old local-app-data candidate created
@@ -601,13 +690,14 @@ impl CleanupRoots {
             }
         }
         let roots = Self {
-            home: canonical_root(base.home_dir())?,
-            local: canonical_root(base.data_local_dir())?,
-            roaming: canonical_root(base.data_dir())?,
+            home: canonical_root(&data_roots.home)?,
+            local: canonical_root(&data_roots.local)?,
+            roaming: canonical_root(&data_roots.roaming)?,
             temp: canonical_root(&std::env::temp_dir())?,
             // Reports live outside every manager data target and remain
             // available after the helper deletes the application directory.
             desktop: report_dir.ok_or("无法安全创建卸载日志目录")?,
+            desktop_user_sid,
         };
         roots.ensure_report_root_safe()?;
         Ok(roots)
@@ -717,9 +807,7 @@ impl CleanupRoots {
                 // full uninstall must remove it alongside the standard
                 // per-user .codex directory; keep the target scoped to this
                 // exact leaf under LocalAppData.
-                self.local
-                    .join("CodexAppManager")
-                    .join("usb-codex-home"),
+                self.local.join("CodexAppManager").join("usb-codex-home"),
                 // The offline capability pack installs Codex Skills in the
                 // user-scoped Codex discovery root outside ~/.codex. It is
                 // part of the explicit shared-Codex purge, but never part of
@@ -2398,54 +2486,80 @@ fn read_owned_connection_env_names(roots: &CleanupRoots) -> Result<Option<Vec<St
 }
 
 #[cfg(windows)]
-fn cleanup_owned_connection_environment(names: &[String]) -> CleanupItem {
+fn cleanup_owned_connection_environment(
+    names: &[String],
+    target_user_sid: Option<&str>,
+) -> CleanupItem {
     use windows_sys::Win32::Foundation::{
         ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS,
     };
     use windows_sys::Win32::System::Registry::{
-        RegCloseKey, RegDeleteValueW, RegOpenKeyExW, HKEY_CURRENT_USER, KEY_SET_VALUE,
+        RegCloseKey, RegDeleteValueW, RegOpenKeyExW, HKEY, HKEY_CURRENT_USER, HKEY_USERS,
+        KEY_QUERY_VALUE, KEY_SET_VALUE,
     };
 
-    const REPORT_PATH: &str = "HKCU\\Environment (Codex capability pack)";
     if names.is_empty() {
         return CleanupItem {
-            path: REPORT_PATH.into(),
+            path: "HKCU\\Environment (Codex capability pack)".into(),
             status: "absent".into(),
             detail: "能力包没有登记需要清理的当前用户环境变量".into(),
         };
     }
-    let subkey = "Environment\0".encode_utf16().collect::<Vec<_>>();
-    let mut handle = std::ptr::null_mut();
-    let status = unsafe {
-        RegOpenKeyExW(
-            HKEY_CURRENT_USER,
-            subkey.as_ptr(),
-            0,
-            KEY_SET_VALUE,
-            &mut handle,
-        )
+    let report_path = target_user_sid
+        .map(|sid| format!("HKEY_USERS\\{sid}\\Environment (Codex capability pack)"))
+        .unwrap_or_else(|| "HKCU\\Environment (Codex capability pack)".into());
+    struct Key(HKEY);
+    impl Drop for Key {
+        fn drop(&mut self) {
+            unsafe { RegCloseKey(self.0) };
+        }
+    }
+    let mut desktop_hive = std::ptr::null_mut();
+    let (root, subkey_text) = match target_user_sid {
+        Some(user_sid) => {
+            let sid_key = user_sid
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect::<Vec<_>>();
+            let status = unsafe {
+                RegOpenKeyExW(
+                    HKEY_USERS,
+                    sid_key.as_ptr(),
+                    0,
+                    KEY_QUERY_VALUE,
+                    &mut desktop_hive,
+                )
+            };
+            if status != ERROR_SUCCESS || desktop_hive.is_null() {
+                return CleanupItem {
+                    path: report_path,
+                    status: "failed".into(),
+                    detail: format!("打开桌面用户注册表配置失败（Win32 {status}）"),
+                };
+            }
+            (desktop_hive, "Environment\0".to_string())
+        }
+        None => (HKEY_CURRENT_USER, "Environment\0".to_string()),
     };
+    let _desktop_hive = (!desktop_hive.is_null()).then_some(Key(desktop_hive));
+    let subkey = subkey_text.encode_utf16().collect::<Vec<_>>();
+    let mut handle = std::ptr::null_mut();
+    let status = unsafe { RegOpenKeyExW(root, subkey.as_ptr(), 0, KEY_SET_VALUE, &mut handle) };
     if status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND {
         return CleanupItem {
-            path: REPORT_PATH.into(),
+            path: report_path,
             status: "absent".into(),
             detail: "当前用户环境变量注册表项不存在".into(),
         };
     }
     if status != ERROR_SUCCESS || handle.is_null() {
         return CleanupItem {
-            path: REPORT_PATH.into(),
+            path: report_path,
             status: "failed".into(),
             detail: format!("打开当前用户环境变量注册表项失败（Win32 {status}）"),
         };
     }
 
-    struct Key(windows_sys::Win32::System::Registry::HKEY);
-    impl Drop for Key {
-        fn drop(&mut self) {
-            unsafe { RegCloseKey(self.0) };
-        }
-    }
     let _key = Key(handle);
     let mut removed = 0usize;
     let mut absent = 0usize;
@@ -2464,7 +2578,7 @@ fn cleanup_owned_connection_environment(names: &[String]) -> CleanupItem {
     }
     if !failures.is_empty() {
         return CleanupItem {
-            path: REPORT_PATH.into(),
+            path: report_path,
             status: "failed".into(),
             detail: format!(
                 "已删除 {removed} 个、原本不存在 {absent} 个；删除失败：{}",
@@ -2473,14 +2587,17 @@ fn cleanup_owned_connection_environment(names: &[String]) -> CleanupItem {
         };
     }
     CleanupItem {
-        path: REPORT_PATH.into(),
+        path: report_path,
         status: if removed == 0 { "absent" } else { "removed" }.into(),
         detail: format!("已删除 {removed} 个能力包登记的当前用户环境变量；原本不存在 {absent} 个"),
     }
 }
 
 #[cfg(not(windows))]
-fn cleanup_owned_connection_environment(_names: &[String]) -> CleanupItem {
+fn cleanup_owned_connection_environment(
+    _names: &[String],
+    _target_user_sid: Option<&str>,
+) -> CleanupItem {
     CleanupItem {
         path: "当前用户环境变量（Codex capability pack）".into(),
         status: "unsupported".into(),
@@ -3522,11 +3639,11 @@ fn run_helper(nonce_arg: &str) -> Result<(), String> {
         .map_err(|_| "无效清理批次")?
         .to_string();
     publish_helper_phase(&helper_dir, &nonce, "discoveringRoots")?;
-    let roots = CleanupRoots::discover()?;
     // Reject manual invocation outside the exact temporary helper layout BEFORE
     // opening an attacker-selected plan, showing UI, or creating files.
     if nonce != nonce_arg
-        || helper_dir != roots.temp.join(format!("{HELPER_PREFIX}{nonce}"))
+        || helper_dir
+            != canonical_root(&std::env::temp_dir())?.join(format!("{HELPER_PREFIX}{nonce}"))
         || current_exe.file_name().and_then(|name| name.to_str()) != Some(HELPER_EXE)
     {
         return Err("二阶段清理只能由安装器生成并启动".into());
@@ -3545,6 +3662,7 @@ fn run_helper(nonce_arg: &str) -> Result<(), String> {
         return Err("清理计划过大".into());
     }
     let plan: CleanupPlan = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    let roots = CleanupRoots::discover_for_finalizer(&plan.roots)?;
     validate_plan(&plan, &helper_dir, &current_exe, &roots)?;
     if plan.nonce != nonce {
         return Err("清理计划批次不匹配".into());
@@ -3595,9 +3713,9 @@ fn run_helper(nonce_arg: &str) -> Result<(), String> {
         // manager-owned log/cache tree.
         report.items.push(capture_latest_log_tail(&roots));
         // Read the ownership record before `.codex` is removed.  Only names
-        // explicitly recorded by this capability pack are eligible for HKCU
-        // environment cleanup; an absent or invalid record never broadens
-        // the deletion scope.
+        // explicitly recorded by this capability pack are eligible for the
+        // planned user's Environment cleanup; an absent or invalid record
+        // never broadens the deletion scope.
         let owned_connection_env_names = if plan.purge_user_data {
             Some(read_owned_connection_env_names(&roots))
         } else {
@@ -3609,9 +3727,10 @@ fn run_helper(nonce_arg: &str) -> Result<(), String> {
             .extend(clean_targets_with_recheck(&selected_targets, || {}));
         if let Some(result) = owned_connection_env_names {
             match result {
-                Ok(Some(names)) => report
-                    .items
-                    .push(cleanup_owned_connection_environment(&names)),
+                Ok(Some(names)) => report.items.push(cleanup_owned_connection_environment(
+                    &names,
+                    roots.desktop_user_sid.as_deref(),
+                )),
                 Ok(None) => report.items.push(CleanupItem {
                     path: roots
                         .home
@@ -4218,6 +4337,7 @@ mod tests {
             roaming: root.join("roaming"),
             temp: root.join("temp"),
             desktop: root.join("desktop"),
+            desktop_user_sid: None,
         };
         for dir in [
             &result.home,
@@ -4229,6 +4349,45 @@ mod tests {
             fs::create_dir(dir).unwrap();
         }
         result
+    }
+
+    #[test]
+    fn usb_cleanup_user_roots_follow_the_desktop_profile() {
+        let desktop = PathBuf::from(r"C:\Users\桌面用户");
+        let local = desktop.join(r"AppData\Local");
+        let roaming = desktop.join(r"AppData\Roaming");
+        let roots = cleanup_user_data_roots(Some(crate::app::usb_guard::UsbLocalDataPaths {
+            codex_home: local.join(r"CodexAppManager\usb-codex-home"),
+            local_app_data: local.clone(),
+            roaming_app_data: roaming.clone(),
+            user_profile: Some(desktop.clone()),
+            user_sid: Some("S-1-5-21-123-456-789-1001".into()),
+        }))
+        .unwrap();
+
+        assert_eq!(roots.home, desktop);
+        assert_eq!(roots.local, local);
+        assert_eq!(roots.roaming, roaming);
+    }
+
+    #[test]
+    fn non_usb_cleanup_user_roots_keep_process_base_dirs() {
+        let base = directories::BaseDirs::new().unwrap();
+        let roots = cleanup_user_data_roots(None).unwrap();
+
+        assert_eq!(roots.home, base.home_dir());
+        assert_eq!(roots.local, base.data_local_dir());
+        assert_eq!(roots.roaming, base.data_dir());
+    }
+
+    #[test]
+    fn cleanup_roots_preserve_desktop_user_sid_in_the_plan() {
+        let root = TempRoot::new();
+        let mut roots = fake_roots(&root.0);
+        roots.desktop_user_sid = Some("S-1-5-21-123-456-789-1001".into());
+        let encoded = serde_json::to_vec(&roots).unwrap();
+        let decoded: CleanupRoots = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, roots);
     }
 
     #[test]

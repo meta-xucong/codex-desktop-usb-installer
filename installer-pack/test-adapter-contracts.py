@@ -352,6 +352,225 @@ class SkillActivationContractTests(unittest.TestCase):
             self.assertEqual(sum(1 for entry in entries if entry["enabled"]), expected_enabled)
             self.assertEqual(sum(1 for entry in entries if not entry["enabled"]), len(expected_guided))
 
+    def render_codex_config(self, output: Path, profile: Path, codex_home: Path, media_wrapper: Path | None = None):
+        arguments = [
+                POWERSHELL,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(RENDER_SCRIPT),
+                "-OutputPath",
+                str(output),
+                "-SkillRoot",
+                str(ROOT / "skills"),
+                "-TargetUserProfile",
+                str(profile),
+                "-TargetCodexHome",
+                str(codex_home),
+                "-PythonExe",
+                sys.executable,
+                "-Overwrite",
+            ]
+        if media_wrapper is not None:
+            arguments.extend(["-EnableMediaGeneration", "-MediaMcpWrapperPath", str(media_wrapper)])
+        return subprocess.run(
+            arguments,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+
+    def merge_codex_config(self, fragment: Path, profile: Path, codex_home: Path, kit_home: Path):
+        return subprocess.run(
+            [
+                POWERSHELL,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(CONFIGURE_SCRIPT),
+                "-GeneratedFragment",
+                str(fragment),
+                "-TargetUserProfile",
+                str(profile),
+                "-TargetCodexHome",
+                str(codex_home),
+                "-KitHome",
+                str(kit_home),
+                "-PythonExe",
+                sys.executable,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+
+    def test_renderer_enables_all_bundled_plugins_and_servers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = root / "profile"
+            codex_home = root / "usb-codex-home"
+            kit_home = root / "kit"
+            output = root / "generated.toml"
+            completed = self.render_codex_config(output, profile, codex_home)
+            self.assertEqual(completed.returncode, 0, completed.stdout + "\n" + completed.stderr)
+
+            status = json.loads(completed.stdout.lstrip("\ufeff"))
+            expected = {
+                "codex-app-tools",
+                "browser",
+                "unified-computer-use",
+                "chrome",
+                "computer-use",
+                "code-review",
+                "latex",
+                "deep-research",
+                "visualize",
+                "image-guided-assets",
+            }
+            self.assertEqual(set(status["enabledBundledPlugins"]), expected)
+            self.assertEqual(status["preservedBundledPluginSettings"], [])
+            config = tomllib.loads(output.read_text(encoding="utf-8-sig"))
+            plugins = config["plugins"]
+            for plugin_id in expected:
+                self.assertTrue(plugins[f"{plugin_id}@openai-bundled"]["enabled"])
+            self.assertTrue(plugins["codex-app-tools@openai-bundled"]["mcp_servers"]["codex_app"]["enabled"])
+            self.assertTrue(plugins["unified-computer-use@openai-bundled"]["mcp_servers"]["cua_repl"]["enabled"])
+            self.assertTrue(plugins["code-review@openai-bundled"]["mcp_servers"]["code-review"]["enabled"])
+
+            merged = self.merge_codex_config(output, profile, codex_home, kit_home)
+            self.assertEqual(merged.returncode, 0, merged.stdout + "\n" + merged.stderr)
+            installed_config = tomllib.loads((codex_home / "config.toml").read_text(encoding="utf-8-sig"))
+            installed_plugins = installed_config["plugins"]
+            for plugin_id in expected:
+                self.assertTrue(installed_plugins[f"{plugin_id}@openai-bundled"]["enabled"])
+            self.assertTrue(installed_plugins["codex-app-tools@openai-bundled"]["mcp_servers"]["codex_app"]["enabled"])
+            self.assertTrue(installed_plugins["unified-computer-use@openai-bundled"]["mcp_servers"]["cua_repl"]["enabled"])
+            self.assertTrue(installed_plugins["code-review@openai-bundled"]["mcp_servers"]["code-review"]["enabled"])
+
+    def test_renderer_preserves_existing_plugin_choices_and_repeated_merge(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = root / "profile"
+            codex_home = root / "usb-codex-home"
+            kit_home = root / "kit"
+            codex_home.mkdir(parents=True)
+            config_path = codex_home / "config.toml"
+            config_path.write_text(
+                '[mcp_servers.custom_local]\nenabled = true\nurl = "https://example.invalid/mcp"\n\n'
+                "# BEGIN CODEX-STARTER-KIT MANAGED CONFIG v1\n"
+                '[mcp_servers.media_generation]\nenabled = true\ncommand = "old-media-mcp"\n'
+                "# END CODEX-STARTER-KIT MANAGED CONFIG v1\n\n"
+                '[plugins."browser@openai-bundled"]\nenabled = false\n\n'
+                '[plugins."codex-app-tools@openai-bundled"]\nenabled = false\n\n'
+                '[plugins."codex-app-tools@openai-bundled".mcp_servers.codex_app]\nenabled = false\n\n'
+                '[plugins."unified-computer-use@openai-bundled"]\nenabled = false\n\n'
+                '[plugins."unified-computer-use@openai-bundled".mcp_servers.cua_repl]\nenabled = false\n\n'
+                '[plugins."chrome@openai-bundled"]\nenabled = false\n\n'
+                '[plugins."computer-use@openai-bundled"]\nenabled = false\n\n'
+                '[plugins."code-review@openai-bundled"]\nenabled = false\n\n'
+                '[plugins."code-review@openai-bundled".mcp_servers.code-review]\nenabled = false\n',
+                encoding="utf-8",
+            )
+
+            media_wrapper = root / "media-health.cmd"
+            media_wrapper.write_text(
+                "@echo off\n"
+                'echo {"ready":true,"serverVersion":"1.3.11","healthScope":"local-runtime-protocol",'
+                '"runtimeStatus":"passed","protocolStatus":"passed","gatewayCatalogStatus":"not_checked",'
+                '"generationCapability":"not_tested","toolCount":6}\n'
+                "exit /b 0\n",
+                encoding="utf-8",
+            )
+
+            output = root / "generated.toml"
+            rendered = self.render_codex_config(output, profile, codex_home, media_wrapper)
+            self.assertEqual(rendered.returncode, 0, rendered.stdout + "\n" + rendered.stderr)
+            status = json.loads(rendered.stdout.lstrip("\ufeff"))
+            self.assertEqual(
+                set(status["enabledBundledPlugins"]),
+                {"latex", "deep-research", "visualize", "image-guided-assets"},
+            )
+            self.assertEqual(
+                set(status["preservedBundledPluginSettings"]),
+                {"browser", "codex-app-tools", "unified-computer-use", "chrome", "computer-use", "code-review"},
+            )
+
+            merged = self.merge_codex_config(output, profile, codex_home, kit_home)
+            self.assertEqual(merged.returncode, 0, merged.stdout + "\n" + merged.stderr)
+            first_content = config_path.read_text(encoding="utf-8-sig")
+            parsed = tomllib.loads(first_content)
+            self.assertTrue(parsed["mcp_servers"]["media_generation"]["enabled"])
+            self.assertTrue(parsed["mcp_servers"]["custom_local"]["enabled"])
+            self.assertFalse(parsed["plugins"]["browser@openai-bundled"]["enabled"])
+            self.assertFalse(parsed["plugins"]["codex-app-tools@openai-bundled"]["enabled"])
+            self.assertFalse(parsed["plugins"]["codex-app-tools@openai-bundled"]["mcp_servers"]["codex_app"]["enabled"])
+            self.assertFalse(parsed["plugins"]["unified-computer-use@openai-bundled"]["enabled"])
+            self.assertFalse(parsed["plugins"]["unified-computer-use@openai-bundled"]["mcp_servers"]["cua_repl"]["enabled"])
+            self.assertFalse(parsed["plugins"]["chrome@openai-bundled"]["enabled"])
+            self.assertFalse(parsed["plugins"]["computer-use@openai-bundled"]["enabled"])
+            self.assertFalse(parsed["plugins"]["code-review@openai-bundled"]["enabled"])
+            self.assertFalse(parsed["plugins"]["code-review@openai-bundled"]["mcp_servers"]["code-review"]["enabled"])
+
+            rendered_again = self.render_codex_config(output, profile, codex_home, media_wrapper)
+            self.assertEqual(rendered_again.returncode, 0, rendered_again.stdout + "\n" + rendered_again.stderr)
+            merged_again = self.merge_codex_config(output, profile, codex_home, kit_home)
+            self.assertEqual(merged_again.returncode, 0, merged_again.stdout + "\n" + merged_again.stderr)
+            self.assertEqual(config_path.read_text(encoding="utf-8-sig"), first_content)
+
+    def test_renderer_preserves_plugin_disables_inside_managed_block(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = root / "profile"
+            codex_home = root / "usb-codex-home"
+            kit_home = root / "kit"
+            codex_home.mkdir(parents=True)
+            config_path = codex_home / "config.toml"
+            config_path.write_text(
+                "# BEGIN CODEX-STARTER-KIT MANAGED CONFIG v1\n"
+                '[plugins."browser@openai-bundled"]\nenabled = false\n\n'
+                '[plugins."codex-app-tools@openai-bundled"]\nenabled = true\n\n'
+                '[plugins."codex-app-tools@openai-bundled".mcp_servers.codex_app]\nenabled = false\n'
+                "# END CODEX-STARTER-KIT MANAGED CONFIG v1\n",
+                encoding="utf-8",
+            )
+
+            media_wrapper = root / "media-health.cmd"
+            media_wrapper.write_text(
+                "@echo off\n"
+                'echo {"ready":true,"serverVersion":"1.3.11","healthScope":"local-runtime-protocol",'
+                '"runtimeStatus":"passed","protocolStatus":"passed","gatewayCatalogStatus":"not_checked",'
+                '"generationCapability":"not_tested","toolCount":6}\n'
+                "exit /b 0\n",
+                encoding="utf-8",
+            )
+
+            output = root / "generated.toml"
+            rendered = self.render_codex_config(output, profile, codex_home, media_wrapper)
+            self.assertEqual(rendered.returncode, 0, rendered.stdout + "\n" + rendered.stderr)
+            status = json.loads(rendered.stdout.lstrip("\ufeff"))
+            self.assertEqual(set(status["preservedBundledPluginSettings"]), {"browser", "codex-app-tools"})
+
+            merged = self.merge_codex_config(output, profile, codex_home, kit_home)
+            self.assertEqual(merged.returncode, 0, merged.stdout + "\n" + merged.stderr)
+            first_content = config_path.read_text(encoding="utf-8-sig")
+            plugins = tomllib.loads(first_content)["plugins"]
+            self.assertFalse(plugins["browser@openai-bundled"]["enabled"])
+            self.assertTrue(plugins["codex-app-tools@openai-bundled"]["enabled"])
+            self.assertFalse(plugins["codex-app-tools@openai-bundled"]["mcp_servers"]["codex_app"]["enabled"])
+            self.assertTrue(plugins["unified-computer-use@openai-bundled"]["enabled"])
+
+            rendered_again = self.render_codex_config(output, profile, codex_home, media_wrapper)
+            self.assertEqual(rendered_again.returncode, 0, rendered_again.stdout + "\n" + rendered_again.stderr)
+            merged_again = self.merge_codex_config(output, profile, codex_home, kit_home)
+            self.assertEqual(merged_again.returncode, 0, merged_again.stdout + "\n" + merged_again.stderr)
+            self.assertEqual(config_path.read_text(encoding="utf-8-sig"), first_content)
+
     @unittest.skipUnless(PDF_TOOL_SCRIPT.is_file(), "Bundled PDF helper is missing")
     def test_pdf_smoke_uses_read_extract_write_and_generate_paths(self):
         completed = subprocess.run(

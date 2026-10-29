@@ -6,6 +6,7 @@ param(
     [ValidateSet("SignedRequired", "DevelopmentAutoEnroll")]
     [string]$UsbPolicy = "SignedRequired",
     [string]$UsbSigningProfilePath = "",
+    [switch]$UsbCdpDiagnostic,
     [switch]$SkipNpmInstall,
     [switch]$SkipTests,
     [switch]$FullTests
@@ -15,7 +16,11 @@ $ErrorActionPreference = "Stop"
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $defaultSetupDir = [string]::IsNullOrWhiteSpace($OutputDir)
 if ($defaultSetupDir) {
-    $setupDirPath = Join-Path $repo "release\setup"
+    $setupDirPath = if ($UsbCdpDiagnostic) {
+        Join-Path $repo "release\setup-usb-cdp-diagnostic"
+    } else {
+        Join-Path $repo "release\setup"
+    }
 } else {
     $outputCandidate = if ([System.IO.Path]::IsPathRooted($OutputDir)) { $OutputDir } else { Join-Path $repo $OutputDir }
     $setupDirPath = [System.IO.Path]::GetFullPath($outputCandidate)
@@ -23,9 +28,15 @@ if ($defaultSetupDir) {
     if (-not $setupDirPath.StartsWith($releaseRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
         throw "OutputDir 必须位于仓库 release 目录内：$setupDirPath"
     }
+    if ($UsbCdpDiagnostic -and $setupDirPath -notmatch '(?i)diagnostic') {
+        throw "CDP 诊断构建必须使用名称含 diagnostic 的独立 OutputDir：$setupDirPath"
+    }
     if (Test-Path -LiteralPath $setupDirPath) {
         throw "版本化输出目录已存在，为避免覆盖产物而停止：$setupDirPath"
     }
+}
+if ($UsbCdpDiagnostic -and (Test-Path -LiteralPath $setupDirPath)) {
+    throw "CDP 诊断输出目录已存在，为避免覆盖正式或诊断产物而停止：$setupDirPath"
 }
 $previousUsbPolicy = $env:CODEX_USB_GUARD_POLICY
 $previousRevocationUrl = $env:CODEX_USB_REVOCATION_URL
@@ -72,6 +83,9 @@ try {
             throw "SignedRequired 构建的 USB 公钥必须是 32 字节"
         }
         Write-Output "USB 签名强制策略已启用（keyId=$publicKeyId；公钥内容不输出）"
+    }
+    if ($UsbCdpDiagnostic -and -not $signedRequired) {
+        throw "CDP 诊断管理器只能以 SignedRequired 策略构建"
     }
     $ccswitchArtifactExplicit = -not [string]::IsNullOrWhiteSpace($CcswitchArtifactDir)
     if ([string]::IsNullOrWhiteSpace($CcswitchArtifactDir)) {
@@ -136,14 +150,15 @@ try {
         "CODEX_USB_404TOKEN_HANDOFF_V1",
         "CCSWITCH_404TOKEN_HANDOFF_PATH",
         "CCSWITCH_404TOKEN_HANDOFF_NONCE",
-        "CCSWITCH_404TOKEN_DEVICE_KEY"
+        "CCSWITCH_404TOKEN_DEVICE_KEY",
+        "CODEX_USB_FULL_IMPORT_V1"
     )) {
         if (-not $ccswitchBinaryText.Contains($handoffMarker)) {
             throw "CCSwitch EXE 缺少确认式 404token API Key 注入协议标记 $handoffMarker；拒绝继续打包：$ccswitchSource"
         }
     }
-    if (-not $ccswitchBinaryText.Contains("CODEX_USB_MCP_PRESERVATION_V1")) {
-        throw "CCSwitch EXE 缺少 USB Codex MCP 保留实现标记；拒绝打包可能覆盖 config.toml 的旧版本：$ccswitchSource"
+    if (-not $ccswitchBinaryText.Contains("CODEX_USB_V4_FIELD_WRITE_V1")) {
+        throw "CCSwitch EXE 缺少 4.x 原生字段写入标记；拒绝打包旧版本：$ccswitchSource"
     }
     $ccswitchVerifier = Join-Path $CcswitchArtifactDir "verify-product.ps1"
     if (-not (Test-Path -LiteralPath $ccswitchVerifier -PathType Leaf)) {
@@ -165,6 +180,19 @@ try {
             }
         }
     }
+    # Copy the audited source patch together with the EXE and its manifest.
+    # An EXE-only staging operation would leave an old patch under new metadata.
+    $stagedManifest = [System.IO.File]::ReadAllText((Join-Path $ccswitchResourceDir "manifest.json"), [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+    $patchRelative = [string]$stagedManifest.sourcePatch
+    if ($patchRelative -ne "source-patches/ccswitch-usb-product-85ad4969.patch") { throw "CCSwitch 产品源码补丁路径不是固定升级基线" }
+    $sourcePatch = Join-Path $CcswitchArtifactDir $patchRelative
+    $destinationPatch = Join-Path $ccswitchResourceDir $patchRelative
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destinationPatch) | Out-Null
+    if ([System.IO.Path]::GetFullPath($sourcePatch) -ine [System.IO.Path]::GetFullPath($destinationPatch)) {
+        Copy-Item -LiteralPath $sourcePatch -Destination $destinationPatch -Force
+    }
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ccswitchResourceDir "verify-product.ps1") -ArtifactDir $ccswitchResourceDir -SkipNetwork
+    if ($LASTEXITCODE -ne 0) { throw "暂存后的 CCSwitch 产品载荷未通过验证" }
     Write-Output "CCSwitch 资源已暂存：$ccswitchResourceDir"
     if (-not $SkipNpmInstall) {
         & npm.cmd ci
@@ -204,8 +232,16 @@ try {
     $previousUsbManagerFlag = $env:CODEX_USB_MANAGER
     try {
         $env:CODEX_USB_MANAGER = "1"
-        $usbFeatures = if ($signedRequired) { "custom-protocol,signed-required" } else { "custom-protocol" }
-        & cargo.exe build --release --features $usbFeatures --manifest-path src-tauri\Cargo.toml --target $Target
+        $usbFeatures = if ($UsbCdpDiagnostic) {
+            "custom-protocol,signed-required,usb-cdp-diagnostic"
+        } elseif ($signedRequired) {
+            "custom-protocol,signed-required"
+        } else {
+            "custom-protocol"
+        }
+        $managerBuildArgs = @("build", "--release", "--features", $usbFeatures, "--manifest-path", "src-tauri\Cargo.toml", "--target", $Target)
+        if ($UsbCdpDiagnostic) { $managerBuildArgs += @("--bin", "codex-usb-cdp-diagnostic") }
+        & cargo.exe @managerBuildArgs
         if ($LASTEXITCODE -ne 0) { throw "Tauri USB 管理器构建失败" }
     } finally {
         if ($null -eq $previousUsbManagerFlag) {
@@ -215,7 +251,8 @@ try {
         }
     }
     $releaseDir = Join-Path $repo "src-tauri\target\$Target\release"
-    $binary = Join-Path $releaseDir "codex-app-manager.exe"
+    $binaryName = if ($UsbCdpDiagnostic) { "codex-usb-cdp-diagnostic.exe" } else { "codex-app-manager.exe" }
+    $binary = Join-Path $releaseDir $binaryName
     if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
         throw "未找到 Tauri 应用二进制：$binary"
     }
@@ -276,6 +313,13 @@ try {
     # cannot accidentally run AppX operations with a filtered token.
     $managerForUsb = Join-Path $setupDir "CodexAppManager.exe"
     Copy-Item -LiteralPath $binary -Destination $managerForUsb -Force
+    if ($UsbCdpDiagnostic) {
+        Set-Content -LiteralPath (Join-Path $setupDir "USB-CDP-DIAGNOSTIC.txt") -Encoding UTF8 -Value @(
+            "USB CDP Diagnostic build. This directory is separate from the production manager output."
+            "The internal bundle filename CodexAppManager.exe is required by the existing USB layout contract."
+            "Do not merge this output into a production USB bundle."
+        )
+    }
     $launcherVerifier = Join-Path $repo "tools\verify-usb-launcher.ps1"
     if (-not (Test-Path -LiteralPath $launcherVerifier -PathType Leaf)) {
         throw "缺少 USB 入口/管理器清单验证脚本：$launcherVerifier"

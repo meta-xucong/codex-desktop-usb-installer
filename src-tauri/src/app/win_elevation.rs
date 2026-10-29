@@ -19,7 +19,10 @@ use std::ffi::OsStr;
 pub const ELEVATED_ARG: &str = "--codex-usb-elevated";
 
 #[cfg(target_os = "windows")]
+#[cfg(not(feature = "usb-cdp-diagnostic"))]
 const USB_INSTANCE_MUTEX_NAME: &str = r"Local\CodexUsbInstaller.FullAdmin.v1";
+#[cfg(feature = "usb-cdp-diagnostic")]
+const USB_INSTANCE_MUTEX_NAME: &str = r"Local\CodexUsbCdpDiagnostic.FullAdmin.v1";
 
 /// Keep the Windows kernel object alive for the entire USB manager lifetime.
 /// The normal install/update operation also has an fs4 interprocess lock;

@@ -61,9 +61,15 @@ pub struct LocalMediaModelSettings {
 
 /// Read only the non-secret model routing values saved for this Windows user.
 pub fn local_model_settings() -> LocalMediaModelSettings {
-    let values = current_user_model_settings()
-        .into_iter()
-        .collect::<std::collections::HashMap<_, _>>();
+    let values = match current_user_model_settings() {
+        Ok(values) => values
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>(),
+        Err(error) => {
+            log::warn!("media model settings could not be read for the desktop user: {error}");
+            std::collections::HashMap::new()
+        }
+    };
     let setting = |name: &str| {
         values
             .get(name)
@@ -196,7 +202,12 @@ pub fn usb_launch_environment() -> Vec<(String, String)> {
             launch_environment(None)
         }
     };
-    values.extend(current_user_model_settings());
+    match current_user_model_settings() {
+        Ok(settings) => values.extend(settings),
+        Err(error) => {
+            log::error!("media model settings could not be read for the desktop user: {error}")
+        }
+    }
     values
 }
 
@@ -395,10 +406,10 @@ fn protect_for_current_user(_plain: &[u8]) -> Result<Vec<u8>, AppError> {
 }
 
 #[cfg(target_os = "windows")]
-fn current_user_model_settings() -> Vec<(String, String)> {
+fn current_user_model_settings() -> Result<Vec<(String, String)>, AppError> {
     use windows_sys::Win32::System::Registry::{
-        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE,
-        REG_SZ,
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, HKEY_USERS,
+        KEY_QUERY_VALUE, REG_SZ,
     };
 
     struct Key(HKEY);
@@ -408,72 +419,120 @@ fn current_user_model_settings() -> Vec<(String, String)> {
         }
     }
 
-    let subkey: Vec<u16> = "Environment\0".encode_utf16().collect();
+    let target_user_sid = usb_guard::user_environment_registry_sid()?;
+    let mut desktop_hive = std::ptr::null_mut();
+    let (root, subkey_text) = match target_user_sid.as_deref() {
+        Some(user_sid) => {
+            let sid_key = user_sid
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect::<Vec<_>>();
+            let status = unsafe {
+                RegOpenKeyExW(
+                    HKEY_USERS,
+                    sid_key.as_ptr(),
+                    0,
+                    KEY_QUERY_VALUE,
+                    &mut desktop_hive,
+                )
+            };
+            if status != 0 || desktop_hive.is_null() {
+                return Err(AppError::Engine(format!(
+                    "打开当前桌面用户注册表配置失败（Win32 {status}）"
+                )));
+            }
+            (desktop_hive, "Environment\0".to_string())
+        }
+        None => (HKEY_CURRENT_USER, "Environment\0".to_string()),
+    };
+    let _desktop_hive = (!desktop_hive.is_null()).then_some(Key(desktop_hive));
+    let subkey: Vec<u16> = subkey_text.encode_utf16().collect();
     let mut raw_key = std::ptr::null_mut();
-    if unsafe {
-        RegOpenKeyExW(
-            HKEY_CURRENT_USER,
-            subkey.as_ptr(),
-            0,
-            KEY_QUERY_VALUE,
-            &mut raw_key,
-        )
-    } != 0
-    {
-        return media_model_environment_names()
+    let status = unsafe { RegOpenKeyExW(root, subkey.as_ptr(), 0, KEY_QUERY_VALUE, &mut raw_key) };
+    if status == 2 || status == 3 {
+        if target_user_sid.is_some() {
+            return Err(AppError::Engine(format!(
+                "读取桌面用户媒体模型设置失败（Win32 {status}）"
+            )));
+        }
+        return Ok(media_model_environment_names()
             .into_iter()
             .map(|name| (name.to_owned(), String::new()))
-            .collect();
+            .collect());
+    }
+    if status != 0 || raw_key.is_null() {
+        return Err(AppError::Engine(format!(
+            "读取桌面用户媒体模型设置失败（Win32 {status}）"
+        )));
     }
     let key = Key(raw_key);
-    media_model_environment_names()
-        .into_iter()
-        .map(|name| {
-            let value_name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
-            let mut value_type = 0;
-            let mut byte_len = 0;
-            let status = unsafe {
-                RegQueryValueExW(
-                    key.0,
-                    value_name.as_ptr(),
-                    std::ptr::null(),
-                    &mut value_type,
-                    std::ptr::null_mut(),
-                    &mut byte_len,
-                )
-            };
-            if status != 0 || value_type != REG_SZ || byte_len < 2 || byte_len % 2 != 0 {
-                return (name.to_owned(), String::new());
-            }
-            let mut value = vec![0u16; byte_len as usize / 2];
-            let status = unsafe {
-                RegQueryValueExW(
-                    key.0,
-                    value_name.as_ptr(),
-                    std::ptr::null(),
-                    &mut value_type,
-                    value.as_mut_ptr().cast(),
-                    &mut byte_len,
-                )
-            };
-            if status != 0 || value_type != REG_SZ {
-                return (name.to_owned(), String::new());
-            }
-            let end = value
-                .iter()
-                .position(|unit| *unit == 0)
-                .unwrap_or(value.len());
-            (name.to_owned(), String::from_utf16_lossy(&value[..end]))
-        })
-        .collect()
+    let mut settings = Vec::new();
+    for name in media_model_environment_names() {
+        let value_name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut value_type = 0;
+        let mut byte_len = 0;
+        let status = unsafe {
+            RegQueryValueExW(
+                key.0,
+                value_name.as_ptr(),
+                std::ptr::null(),
+                &mut value_type,
+                std::ptr::null_mut(),
+                &mut byte_len,
+            )
+        };
+        if status == 2 {
+            settings.push((name.to_owned(), String::new()));
+            continue;
+        }
+        if status != 0 {
+            return Err(AppError::Engine(format!(
+                "读取桌面用户媒体设置 {name} 失败（Win32 {status}）"
+            )));
+        }
+        if value_type != REG_SZ || byte_len < 2 || byte_len % 2 != 0 {
+            settings.push((name.to_owned(), String::new()));
+            continue;
+        }
+        let mut value = vec![0u16; byte_len as usize / 2];
+        let status = unsafe {
+            RegQueryValueExW(
+                key.0,
+                value_name.as_ptr(),
+                std::ptr::null(),
+                &mut value_type,
+                value.as_mut_ptr().cast(),
+                &mut byte_len,
+            )
+        };
+        if status == 2 {
+            settings.push((name.to_owned(), String::new()));
+            continue;
+        }
+        if status != 0 {
+            return Err(AppError::Engine(format!(
+                "读取桌面用户媒体设置 {name} 失败（Win32 {status}）"
+            )));
+        }
+        if value_type != REG_SZ {
+            settings.push((name.to_owned(), String::new()));
+            continue;
+        }
+        let end = value
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(value.len());
+        settings.push((name.to_owned(), String::from_utf16_lossy(&value[..end])));
+    }
+    Ok(settings)
 }
 
 #[cfg(not(target_os = "windows"))]
-fn current_user_model_settings() -> Vec<(String, String)> {
-    media_model_environment_names()
+fn current_user_model_settings() -> Result<Vec<(String, String)>, AppError> {
+    Ok(media_model_environment_names()
         .into_iter()
         .map(|name| (name.to_owned(), String::new()))
-        .collect()
+        .collect())
 }
 
 fn media_model_environment_names() -> [&'static str; 6] {
