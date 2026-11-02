@@ -168,6 +168,151 @@ describe("useDownloadProgress", () => {
     expect(result.current.dl?.downloaded).toBe(80);
   });
 
+  it("keeps Windows download bytes separate from install phases and extraction", async () => {
+    const { result } = renderHook(
+      () =>
+        useDownloadProgress({
+          eventName: "win://download-progress",
+          pauseDownload: vi.fn(async () => true),
+          cancelDownload: vi.fn(async () => true),
+          getOperationSnapshot: vi.fn(async () => null),
+          onError: vi.fn(),
+        }),
+      { wrapper },
+    );
+
+    await act(async () => {
+      await result.current.startDlListen();
+    });
+
+    act(() => {
+      onProgress?.({
+        payload: {
+          downloaded: 100,
+          total: 100,
+          source: "mirror.test",
+          phase: "downloading",
+          operationId: "op-windows",
+        },
+      });
+    });
+    expect(result.current.downloadProgress).toMatchObject({ downloaded: 100, total: 100 });
+    expect(result.current.installProgress).toBeNull();
+
+    act(() => {
+      onProgress?.({
+        payload: {
+          downloaded: 100,
+          total: 100,
+          source: "mirror.test",
+          phase: "verifying",
+          operationId: "op-windows",
+        },
+      });
+    });
+    expect(result.current.downloadProgress).toMatchObject({ downloaded: 100, total: 100 });
+    expect(result.current.installProgress).toMatchObject({
+      downloaded: 0,
+      total: 0,
+      phase: "verifying",
+    });
+
+    act(() => {
+      onProgress?.({
+        payload: {
+          downloaded: 35,
+          total: 100,
+          source: "U盘文件解压",
+          phase: "applying",
+          operationId: "op-windows",
+        },
+      });
+    });
+    expect(result.current.installProgress).toMatchObject({
+      downloaded: 35,
+      total: 100,
+      source: "U盘文件解压",
+      phase: "applying",
+    });
+
+    act(() => {
+      onProgress?.({
+        payload: {
+          downloaded: 100,
+          total: 100,
+          source: "mirror.test",
+          phase: "committing",
+          operationId: "op-windows",
+        },
+      });
+    });
+    expect(result.current.downloadProgress).toMatchObject({ downloaded: 100, total: 100 });
+    expect(result.current.installProgress).toMatchObject({
+      downloaded: 0,
+      total: 0,
+      phase: "committing",
+    });
+
+    act(() => {
+      onProgress?.({
+        payload: {
+          downloaded: 100,
+          total: 100,
+          source: "mirror.test",
+          phase: "finishing",
+          operationId: "op-windows",
+        },
+      });
+    });
+    expect(result.current.installProgress).toMatchObject({
+      downloaded: 0,
+      total: 0,
+      phase: "finishing",
+    });
+
+    act(() => result.current.resetStop());
+    expect(result.current.downloadProgress).toBeNull();
+    expect(result.current.installProgress).toBeNull();
+  });
+
+  it("clears split progress on settlement before the next operation", async () => {
+    const { result } = renderHook(
+      () =>
+        useDownloadProgress({
+          eventName: "win://download-progress",
+          pauseDownload: vi.fn(async () => true),
+          cancelDownload: vi.fn(async () => true),
+          getOperationSnapshot: vi.fn(async () => null),
+          onError: vi.fn(),
+        }),
+      { wrapper },
+    );
+    await act(async () => result.current.startDlListen());
+    act(() => {
+      onProgress?.({
+        payload: {
+          downloaded: 50,
+          total: 100,
+          source: "U盘文件解压",
+          phase: "applying",
+          operationId: "op-settled",
+        },
+      });
+    });
+    expect(result.current.installProgress).not.toBeNull();
+
+    // OfflineHome invokes resetStop from the operation settlement cleanup for
+    // both resolved and rejected installs.
+    act(() => result.current.resetStop());
+    expect(result.current.dl).toBeNull();
+    expect(result.current.downloadProgress).toBeNull();
+    expect(result.current.installProgress).toBeNull();
+
+    await act(async () => result.current.startDlListen());
+    expect(result.current.downloadProgress).toBeNull();
+    expect(result.current.installProgress).toBeNull();
+  });
+
   it("resetStop clears the active operation id", async () => {
     const { result } = renderHook(
       () =>

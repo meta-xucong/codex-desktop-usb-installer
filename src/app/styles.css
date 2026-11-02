@@ -3198,6 +3198,14 @@ button.row.danger:hover {
   overflow: hidden;
   margin-top: var(--space-md);
 }
+.progress-tracks {
+  display: grid;
+  gap: var(--space-md);
+  width: 100%;
+}
+.progress-track {
+  min-width: 0;
+}
 .bar-fill {
   position: relative;
   overflow: hidden;

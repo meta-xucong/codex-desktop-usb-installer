@@ -387,6 +387,8 @@ export function OfflineHome({
 
   const {
     dl,
+    downloadProgress,
+    installProgress,
     dlPct,
     dlBytes,
     dlSpeed,
@@ -676,7 +678,6 @@ export function OfflineHome({
       }
       setUsbGuard(preflightGuard);
       stage = await managerApi.offlinePayloadStage();
-      setPhase("installing");
       const current = await managerApi.winStatus();
       const currentGuardResult = await managerApi.usbGuardStatus()
         .then((value) => ({ value, failed: false }))
@@ -703,6 +704,7 @@ export function OfflineHome({
       // Windows flow. Reset the previous event owner before the new operation
       // so a late packet from an earlier install cannot paint this one.
       resetStop();
+      setPhase("installing");
       const result = await managerApi.winInstallHistoricalRelease(
         selectionFromStage(stage),
         // Keep the shipped desktop build fixed for the USB edition. The backend
@@ -916,6 +918,8 @@ export function OfflineHome({
         setNotice("暂存文件已保留，便于查看日志和重试。");
       }
       return false;
+    } finally {
+      resetStop();
     }
   }, [resetStop, t, updateCcswitchInjectionIssue]);
 
@@ -1180,10 +1184,13 @@ export function OfflineHome({
         scopeRef={progressScopeRef}
         paused={null}
         dl={dl}
+        downloadProgress={downloadProgress}
+        installProgress={installProgress}
         dlPct={dlPct}
         dlBytes={dlBytes}
         dlSpeed={dlSpeed}
         installing
+        splitWindowsInstall
         downloadStop={downloadStop}
         downloadStopBusy={downloadStopBusy}
         failure={failure}

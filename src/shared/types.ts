@@ -131,6 +131,9 @@ export interface DownloadProgress {
   operationId?: string;
 }
 
+/** Backend source label for byte progress emitted while unpacking the Windows portable payload. */
+export const WINDOWS_PORTABLE_EXTRACTION_SOURCE = "U盘文件解压";
+
 export type HistoricalReleasePlatform = "macos" | "windows";
 export type HistoricalReleaseArchitecture = "arm64" | "x64";
 export type HistoricalPackageFormat = "dmg" | "zip" | "msix";
