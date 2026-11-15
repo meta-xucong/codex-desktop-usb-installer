@@ -37,13 +37,13 @@ This is source/resource consistency verification plus targeted regression. It do
 
 ## Distribution boundary
 
-The source checkout deliberately excludes these release inputs:
+The source checkout deliberately excludes these release inputs from Git. They are attached to the source-matched supplementary Release `usb-offline-20261116`:
 
 - `installer-pack/runtime/bundled/chrome-headless-shell-152.0.7977.30-win64.zip`
 - `installer-pack/runtime/bundled/ffmpeg-n9.0-latest-win64-gpl-shared-9.0.zip`
 - `installer-pack/runtime/bundled/hyperframes-0.8.134-win-x64-node-modules.zip`
 
-They remain in the full offline USB distribution. As with the existing signed MSIX/WebView2 inputs, restore the exact distribution artifacts before a full offline rebuild. Their existing manifests are unchanged. A Git clone by itself is not a complete offline release.
+Restore the exact names into `installer-pack/runtime/bundled` with the command in `OFFLINE-BUILD-INPUTS-20261116.md`. Their existing manifests are unchanged. Full USB assembly also needs its version-matched signed MSIX, Microsoft prerequisites and locally held formal signing configuration; those are separate from these three capability-pack assets.
 
 The standalone `codex-starter-kit` repository is the historical 1.5.4 line; the current USB-specific 1.5.12 code is this repository's `installer-pack/`. The inherited pack source-provenance fields are not a claim that the standalone builder contains these later USB fixes. Do not regenerate the current USB pack from that older builder.
 

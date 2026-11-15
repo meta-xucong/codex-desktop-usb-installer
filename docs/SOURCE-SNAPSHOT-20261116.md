@@ -10,13 +10,13 @@ The CCSwitch resource retains its pinned upstream source notice and complete pro
 
 ## Distribution inputs
 
-As with the existing signed MSIX and WebView2 distribution inputs, the following offline archives stay with the full USB distribution and are not regular Git source blobs:
+The following offline archives are supplementary GitHub Release assets for this source snapshot, rather than regular Git blobs:
 
 - `installer-pack/runtime/bundled/chrome-headless-shell-152.0.7977.30-win64.zip`
 - `installer-pack/runtime/bundled/ffmpeg-n9.0-latest-win64-gpl-shared-9.0.zip`
 - `installer-pack/runtime/bundled/hyperframes-0.8.134-win-x64-node-modules.zip`
 
-Their existing release manifests and deployment code are retained. Restore the exact distribution inputs before running full package verification or building an offline release; a source checkout alone is not the complete offline installer. This synchronization does not regenerate or weaken release integrity metadata.
+Their existing release manifests and deployment code are retained. Download and restore them using `docs/OFFLINE-BUILD-INPUTS-20261116.md` before running capability-pack verification or building an offline release. Other full USB assembly inputs and the local formal signing configuration remain separately controlled as described there. This synchronization does not regenerate or weaken release integrity metadata.
 
 Production signer executables with embedded credentials, signing vaults/private keys, account files, production databases, customer-specific diagnostic reports and transient test/release directories are not published.
 
