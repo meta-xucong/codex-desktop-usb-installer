@@ -419,29 +419,29 @@ index fc5fdb37..f5c1481c 100644
                  "INSERT INTO usage_daily_rollups
                      (date, app_type, provider_id, model, request_count, success_count,
 diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
-index e5d2e599..a22e5e1c 100644
 --- a/src-tauri/src/lib.rs
 +++ b/src-tauri/src/lib.rs
-@@ -29,6 +29,7 @@ mod services;
+@@ -29,6 +29,8 @@
  mod session_manager;
  mod settings;
  mod store;
 +mod usb_model_selection;
- 
++mod usb_host_account;
+
  mod tray;
  mod usage_script;
-@@ -55,6 +56,7 @@ pub use services::{
+@@ -55,6 +57,7 @@
  };
  pub use settings::{update_settings, AppSettings};
  pub use store::AppState;
 +pub use usb_model_selection::try_usb_model_selection_cli;
  use tauri_plugin_deep_link::DeepLinkExt;
  use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
- 
-@@ -521,6 +523,22 @@ pub fn run() {
+
+@@ -521,6 +524,22 @@
                  Err(e) => log::warn!("✗ Failed to seed official providers: {e}"),
              }
- 
+
 +            // USB mode supplies a per-device 404TOKEN key in the child
 +            // environment. Bootstrap activates the bound provider endpoint,
 +            // but intentionally leaves model selection unset until the model
@@ -461,7 +461,7 @@ index e5d2e599..a22e5e1c 100644
              // 老用户 / 已确认的路径由 `fresh_install_at_startup` 自行拦截，这里不做写入。
              // 字段只由前端在用户点击"我知道了"时 save_settings 回写，语义是"用户显式确认过"。
              if !first_run_already_confirmed && fresh_install_at_startup {
-@@ -848,7 +866,35 @@ pub fn run() {
+@@ -848,7 +867,35 @@
              // 初始化全局出站代理 HTTP 客户端
              {
                  let db = &app.state::<AppState>().db;
@@ -495,10 +495,10 @@ index e5d2e599..a22e5e1c 100644
 +                } else {
 +                    saved_proxy_url
 +                };
- 
+
                  if let Err(e) = crate::proxy::http_client::init(proxy_url.as_deref()) {
                      log::error!(
-@@ -1003,14 +1049,19 @@ pub fn run() {
+@@ -1003,14 +1050,19 @@
                  // 仅 Linux 生效：解决 Wayland 下系统窗口按钮不可用的问题
                  #[cfg(target_os = "linux")]
                  let _ = window.set_decorations(!settings.use_app_window_controls);
@@ -1415,10 +1415,9 @@ index 488e88fb..9c709cb4 100644
      fn claude_common_config_apply_and_remove_roundtrip_for_non_overlapping_fields() {
          let settings = json!({
 diff --git a/src-tauri/src/services/provider/mod.rs b/src-tauri/src/services/provider/mod.rs
-index 16398949..23270ecd 100644
 --- a/src-tauri/src/services/provider/mod.rs
 +++ b/src-tauri/src/services/provider/mod.rs
-@@ -29,8 +29,9 @@ pub use live::{
+@@ -29,8 +29,9 @@
  pub(crate) use live::sanitize_claude_settings_for_live;
  pub(crate) use live::{
      build_effective_settings_with_common_config, normalize_provider_common_config_for_storage,
@@ -1428,12 +1427,13 @@ index 16398949..23270ecd 100644
 +    strip_common_config_from_live_settings, sync_current_provider_for_app_to_live,
 +    write_live_with_common_config,
  };
- 
+
  // Internal re-exports
-@@ -43,6 +44,136 @@ use usage::validate_usage_script;
+@@ -42,6 +43,136 @@
+
  /// Provider business logic service
  pub struct ProviderService;
- 
++
 +pub(crate) const USB_404TOKEN_PROVIDER_ID: &str = "404token-sub2api";
 +const USB_404TOKEN_PROVIDER_NAME: &str = "404TOKEN（unified-api-internal）";
 +pub(crate) const USB_404TOKEN_BASE_URL: &str = "https://404token.xyz/v1";
@@ -1563,15 +1563,13 @@ index 16398949..23270ecd 100644
 +        .and_then(|()| file.sync_all())
 +        .map_err(|error| AppError::io(&path, error))
 +}
-+
+
  /// Result of a provider switch operation, including any non-fatal warnings
  #[derive(Debug, serde::Serialize, Default)]
- #[serde(rename_all = "camelCase")]
-@@ -260,6 +391,409 @@ mod tests {
-         );
+@@ -261,6 +392,413 @@
      }
- 
-+    #[test]
+
+     #[test]
 +    fn usb_404token_provider_discovers_models_without_a_default() {
 +        let provider = ProviderService::provider_from_usb_404token_key("device-key");
 +        assert_eq!(provider.id, "404token-sub2api");
@@ -1712,6 +1710,9 @@ index 16398949..23270ecd 100644
 +            );
 +            let _nonce_env = RestoreEnv::set(USB_404TOKEN_HANDOFF_NONCE_ENV, &nonce);
 +
++            let mut saved = ProviderService::provider_from_usb_404token_key(key);
++            saved.settings_config["config"] = Value::String(format!("model = \"unverified-database-model\"\n{}", saved.settings_config["config"].as_str().unwrap()));
++            state.db.save_provider("codex", &saved).unwrap();
 +            assert!(
 +                ProviderService::bootstrap_usb_404token_from_environment(state)
 +                    .expect("USB bootstrap must activate the provider")
@@ -1733,7 +1734,7 @@ index 16398949..23270ecd 100644
 +                    .get("media_generation")
 +                    .and_then(|server| server.get("command"))
 +                    .and_then(toml::Value::as_str),
-+                Some("database-command")
++                Some("python")
 +            );
 +            assert_eq!(
 +                live_servers
@@ -1748,7 +1749,7 @@ index 16398949..23270ecd 100644
 +                    .get("custom")
 +                    .and_then(|server| server.get("command"))
 +                    .and_then(toml::Value::as_str),
-+                None
++                Some("custom-server")
 +            );
 +            assert_eq!(
 +                live_servers
@@ -1762,7 +1763,7 @@ index 16398949..23270ecd 100644
 +                    .get("database_only")
 +                    .and_then(|server| server.get("command"))
 +                    .and_then(toml::Value::as_str),
-+                Some("database-only-command")
++                None
 +            );
 +            assert!(live_config.get("model").is_none());
 +
@@ -1796,7 +1797,7 @@ index 16398949..23270ecd 100644
 +
 +    #[test]
 +    #[serial]
-+    fn usb_404token_bootstrap_restores_codex_mcp_when_later_app_sync_fails() {
++    fn usb_404token_bootstrap_does_not_sync_other_apps_or_database_mcps() {
 +        with_test_home(|state, _| {
 +            let nonce = uuid::Uuid::new_v4().to_string();
 +            let ack_path =
@@ -1822,13 +1823,6 @@ index 16398949..23270ecd 100644
 +"#;
 +            std::fs::write(crate::codex_config::get_codex_config_path(), initial_config)
 +                .expect("write initial config fixture");
-+            let previous_local_provider = crate::settings::get_current_provider(&AppType::Codex);
-+            let previous_database_provider = state
-+                .db
-+                .get_current_provider(AppType::Codex.as_str())
-+                .expect("read initial database provider selection");
-+            let auth_path = crate::codex_config::get_codex_auth_path();
-+            let previous_auth = std::fs::read(&auth_path).ok();
 +            state
 +                .db
 +                .save_mcp_server(&crate::app_config::McpServer {
@@ -1847,8 +1841,8 @@ index 16398949..23270ecd 100644
 +                })
 +                .expect("seed MCP server enabled for Codex and Gemini");
 +
-+            // Codex sync succeeds first and overwrites the active ID. The
-+            // directory at settings.json makes the later Gemini sync fail.
++            // A generic provider switch would fail while syncing Gemini.
++            // Account-only USB initialization must not touch it.
 +            let gemini_settings = crate::gemini_config::get_gemini_settings_path();
 +            std::fs::create_dir_all(&gemini_settings).expect("block Gemini settings file");
 +            let _key_env = RestoreEnv::set(USB_404TOKEN_DEVICE_KEY_ENV, key);
@@ -1858,11 +1852,9 @@ index 16398949..23270ecd 100644
 +            );
 +            let _nonce_env = RestoreEnv::set(USB_404TOKEN_HANDOFF_NONCE_ENV, &nonce);
 +
-+            let error = ProviderService::bootstrap_usb_404token_from_environment(state)
-+                .expect_err("later Gemini MCP sync failure must fail bootstrap");
-+            assert!(error
-+                .to_string()
-+                .contains(gemini_settings.to_string_lossy().as_ref()));
++            assert!(ProviderService::bootstrap_usb_404token_from_environment(state)
++                .expect("account bootstrap must not sync unrelated apps"));
++            assert!(gemini_settings.is_dir());
 +            let live_config = crate::codex_config::read_codex_config_text()
 +                .expect("read restored Codex config")
 +                .parse::<toml::Value>()
@@ -1875,34 +1867,8 @@ index 16398949..23270ecd 100644
 +                    .and_then(toml::Value::as_str),
 +                Some("python")
 +            );
-+            assert_eq!(
-+                crate::settings::get_current_provider(&AppType::Codex),
-+                previous_local_provider,
-+                "failed bootstrap must restore local provider selection"
-+            );
-+            assert_eq!(
-+                state
-+                    .db
-+                    .get_current_provider(AppType::Codex.as_str())
-+                    .expect("read restored database provider selection"),
-+                previous_database_provider,
-+                "failed bootstrap must restore database provider selection"
-+            );
-+            assert_eq!(
-+                std::fs::read(&auth_path).ok(),
-+                previous_auth,
-+                "failed bootstrap must restore auth.json"
-+            );
-+            assert_eq!(
-+                std::fs::read(crate::codex_config::get_codex_config_path())
-+                    .expect("read byte-for-byte restored Codex config"),
-+                initial_config.as_bytes(),
-+                "failed bootstrap must restore config.toml"
-+            );
-+            assert!(
-+                !ack_path.exists(),
-+                "failed bootstrap must not write success ack"
-+            );
++            assert!(ProviderService::usb_404token_live_readback_matches(state, key).unwrap());
++            std::fs::remove_file(&ack_path).unwrap();
 +            std::fs::remove_dir_all(gemini_settings).expect("remove blocked Gemini fixture");
 +        });
 +    }
@@ -1969,18 +1935,55 @@ index 16398949..23270ecd 100644
 +            assert!(state
 +                .db
 +                .get_provider_by_id(USB_404TOKEN_PROVIDER_ID, "codex")
-+                .expect("prepared DB-only provider may remain")
-+                .is_some());
++                .expect("invalid configuration must not prepare a provider")
++                .is_none());
 +        });
 +    }
 +
-     #[test]
++    #[test]
++    #[serial]
++    fn usb_404token_bootstrap_ack_failure_restores_live_files_and_allows_retry() {
++        with_test_home(|state, _| {
++            let nonce = uuid::Uuid::new_v4().to_string();
++            let ack_path =
++                std::env::temp_dir().join(format!("codex-usb-ccswitch-handoff-{nonce}.json"));
++            let home = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
++            let _mode = RestoreEnv::set("CODEX_USB_CCSWITCH_MODE", "usb");
++            let _cli_home = RestoreEnv::set("CODEX_HOME", home.path().to_string_lossy().as_ref());
++            let _home = RestoreEnv::set("CCSWITCH_USB_CODEX_HOME", home.path().to_string_lossy().as_ref());
++            let _key = RestoreEnv::set(USB_404TOKEN_DEVICE_KEY_ENV, "fixture-key");
++            let _path = RestoreEnv::set(USB_404TOKEN_HANDOFF_PATH_ENV, ack_path.to_string_lossy().as_ref());
++            let _nonce = RestoreEnv::set(USB_404TOKEN_HANDOFF_NONCE_ENV, &nonce);
++            let config_path = crate::codex_config::get_codex_config_path();
++            let auth_path = crate::codex_config::get_codex_auth_path();
++            let original = b"model='kept-model'\n[mcp_servers.mine]\nenabled=false\ncommand='custom'\n";
++            std::fs::write(&config_path, original).unwrap();
++            let previous = crate::settings::get_effective_current_provider(&state.db, &AppType::Codex).unwrap();
++            // create_new must reject an already occupied acknowledgement path.
++            std::fs::write(&ack_path, b"fixture-existing-ack").unwrap();
++            assert!(ProviderService::bootstrap_usb_404token_from_environment(state).is_err());
++            assert_eq!(std::fs::read(&config_path).unwrap(), original);
++            assert!(!auth_path.exists());
++            assert_eq!(crate::settings::get_effective_current_provider(&state.db, &AppType::Codex).unwrap(), previous);
++            assert_eq!(std::fs::read(&ack_path).unwrap(), b"fixture-existing-ack");
++            std::fs::remove_file(&ack_path).unwrap();
++            assert!(ProviderService::bootstrap_usb_404token_from_environment(state).unwrap());
++            let config: toml::Value = crate::codex_config::read_codex_config_text().unwrap().parse().unwrap();
++            assert_eq!(config["model"].as_str(), Some("kept-model"));
++            assert_eq!(config["mcp_servers"]["mine"]["enabled"].as_bool(), Some(false));
++            assert!(ProviderService::usb_404token_live_readback_matches(state, "fixture-key").unwrap());
++            std::fs::remove_file(&ack_path).unwrap();
++        });
++    }
++
++    #[test]
      fn extract_credentials_returns_expected_values() {
          let provider = Provider::with_id(
-@@ -350,8 +884,15 @@ base_url = "http://localhost:8080"
+             "claude".into(),
+@@ -350,8 +888,15 @@
          crate::settings::set_current_provider(&AppType::Claude, Some("p1"))
              .expect("set local current provider");
- 
+
 +        let test_port = std::net::TcpListener::bind(("127.0.0.1", 0))
 +            .expect("allocate an ephemeral test port")
 +            .local_addr()
@@ -1993,7 +1996,7 @@ index 16398949..23270ecd 100644
              ..Default::default()
          })
          .await
-@@ -371,7 +912,7 @@ base_url = "http://localhost:8080"
+@@ -371,7 +916,7 @@
              &get_claude_settings_path(),
              &json!({
                  "env": {
@@ -2002,7 +2005,7 @@ index 16398949..23270ecd 100644
                      "ANTHROPIC_API_KEY": "PROXY_MANAGED",
                      "ANTHROPIC_MODEL": "stale-model"
                  },
-@@ -433,7 +974,7 @@ base_url = "http://localhost:8080"
+@@ -433,7 +978,7 @@
              live.get("env")
                  .and_then(|env| env.get("ANTHROPIC_BASE_URL"))
                  .and_then(|v| v.as_str()),
@@ -2011,10 +2014,10 @@ index 16398949..23270ecd 100644
              "proxy base URL should stay intact"
          );
          assert!(
-@@ -976,6 +1517,141 @@ impl ProviderService {
+@@ -976,6 +1521,138 @@
          state.db.get_all_providers(app_type.as_str())
      }
- 
+
 +    fn provider_from_usb_404token_key(api_key: &str) -> Provider {
 +        let config_toml = format!(
 +            r#"model_provider = "404token"
@@ -2065,6 +2068,22 @@ index 16398949..23270ecd 100644
 +            return Ok(false);
 +        }
 +
++        let managed_home = std::env::var_os("CCSWITCH_USB_CODEX_HOME").map(std::path::PathBuf::from);
++        if std::env::var("CODEX_USB_CCSWITCH_MODE").ok().as_deref() != Some("usb")
++            || !managed_home.as_ref().is_some_and(|home| home.is_absolute() && *home == crate::codex_config::get_codex_config_dir()) {
++            return Err(AppError::Config("USB account bootstrap requires the managed HOME".into()));
++        }
++        let current = crate::codex_config::read_codex_config_text()?;
++        let auth_path = crate::codex_config::get_codex_auth_path();
++        let auth: Value = if auth_path.exists() {
++            serde_json::from_slice(&std::fs::read(&auth_path).map_err(|e| AppError::io(&auth_path, e))?)
++                .map_err(|_| AppError::Config("USB account auth file is invalid".into()))?
++        } else { serde_json::json!({}) };
++        let account_already_ready = crate::usb_host_account::matches(&current, &auth, api_key);
++        let replace = std::env::var("CCSWITCH_USB_REPLACE_ACCOUNT").ok().as_deref() == Some("1");
++        let (config, auth) = crate::usb_host_account::prepare(&current, &auth, api_key, replace)
++            .map_err(|e| AppError::Config(e.into()))?;
++
 +        let mut provider = Self::provider_from_usb_404token_key(api_key);
 +        Self::validate_provider_settings(&AppType::Codex, &provider)?;
 +        Self::set_provider_live_config_managed(&mut provider, false);
@@ -2090,17 +2109,14 @@ index 16398949..23270ecd 100644
 +            }
 +        }
 +
-+        // Snapshot live files and both provider-selection stores. A later MCP
-+        // sync/readback/ack failure must not leave a reported-failed bootstrap
++        // Snapshot live files and both provider-selection stores. A later
++        // write/readback/ack failure must not leave a reported-failed bootstrap
 +        // silently active on the new provider.
 +        let snapshot = UsbCodexBootstrapSnapshot::capture(state)?;
 +        let activation = (|| {
-+            // Preparing the DB record alone leaves Codex on whichever provider
-+            // was previously selected (often the official endpoint). The
-+            // provider config intentionally has no model field.
-+            live::with_usb_404token_bootstrap_context(|| {
-+                Self::switch(state, AppType::Codex, USB_404TOKEN_PROVIDER_ID)
-+            })?;
++            if !account_already_ready { crate::codex_config::write_codex_live_atomic(&auth, Some(&config))?; }
++            crate::settings::set_current_provider(&AppType::Codex, Some(USB_404TOKEN_PROVIDER_ID))?;
++            state.db.set_current_provider(AppType::Codex.as_str(), USB_404TOKEN_PROVIDER_ID)?;
 +            if !Self::usb_404token_live_readback_matches(state, api_key)? {
 +                return Err(AppError::Config(
 +                    "404TOKEN provider was saved but live Codex configuration did not verify"
@@ -2129,31 +2145,15 @@ index 16398949..23270ecd 100644
 +            return Ok(false);
 +        }
 +        let live = read_live_settings(AppType::Codex)?;
-+        let live_key = live
-+            .pointer("/auth/OPENAI_API_KEY")
-+            .and_then(Value::as_str);
-+        let Some(config) = live.get("config").and_then(Value::as_str) else {
-+            return Ok(false);
-+        };
-+        let parsed: toml::Value = match toml::from_str(config) {
-+            Ok(parsed) => parsed,
-+            Err(_) => return Ok(false),
-+        };
-+        let selected_provider = parsed.get("model_provider").and_then(toml::Value::as_str);
-+        let endpoint = parsed
-+            .get("model_providers")
-+            .and_then(|providers| providers.get("404token"))
-+            .and_then(|provider| provider.get("base_url"))
-+            .and_then(toml::Value::as_str);
-+        Ok(live_key == Some(api_key)
-+            && selected_provider == Some("404token")
-+            && endpoint.is_some_and(|value| value.trim_end_matches('/') == USB_404TOKEN_BASE_URL))
++        let Some(config) = live.get("config").and_then(Value::as_str) else { return Ok(false) };
++        let Some(auth) = live.get("auth") else { return Ok(false) };
++        Ok(crate::usb_host_account::matches(config, auth, api_key))
 +    }
 +
      /// Get current provider ID
      ///
      /// 使用有效的当前供应商 ID（验证过存在性）。
-@@ -1048,6 +1724,11 @@ impl ProviderService {
+@@ -1048,6 +1725,11 @@
          original_id: Option<&str>,
          provider: Provider,
      ) -> Result<bool, AppError> {
@@ -2165,7 +2165,7 @@ index 16398949..23270ecd 100644
          let mut provider = provider;
          let original_id = original_id.unwrap_or(provider.id.as_str()).to_string();
          let provider_id_changed = original_id != provider.id;
-@@ -1378,6 +2059,11 @@ impl ProviderService {
+@@ -1378,6 +2060,11 @@
      ///    d. Write target provider config to live files
      ///    e. Sync MCP configuration
      pub fn switch(state: &AppState, app_type: AppType, id: &str) -> Result<SwitchResult, AppError> {
@@ -2177,10 +2177,11 @@ index 16398949..23270ecd 100644
          // Check if provider exists
          let providers = state.db.get_all_providers(app_type.as_str())?;
          let _provider = providers
-@@ -1476,6 +2162,17 @@ impl ProviderService {
+@@ -1475,6 +2162,17 @@
+                 return Ok(SwitchResult::default());
              }
          }
- 
++
 +        // Prepare and validate the exact live snapshot before backfilling the
 +        // current provider or changing the selected provider. In particular,
 +        // an invalid MCP table must fail without leaving a half-switched state.
@@ -2191,23 +2192,22 @@ index 16398949..23270ecd 100644
 +        } else {
 +            None
 +        };
-+
+
          let mut result = SwitchResult::default();
- 
-         // Backfill: Backfill current live config to current provider
-@@ -1521,7 +2218,7 @@ impl ProviderService {
+
+@@ -1521,7 +2219,7 @@
          }
- 
+
          // Sync to live (write_gemini_live handles security flag internally for Gemini)
 -        write_live_with_common_config(state.db.as_ref(), &app_type, provider)?;
 +        live::write_live_snapshot(&app_type, &prepared_provider)?;
- 
+
          // Hermes is additive, so "switching" doesn't overwrite a live config file
          // — we instead update the top-level `model:` section to point at this
-@@ -1577,8 +2274,53 @@ impl ProviderService {
+@@ -1577,8 +2275,53 @@
              }
          }
- 
+
 -        // Sync MCP
 -        McpService::sync_all_enabled(state)?;
 +        // Sync MCP. Keep the result so Codex MCP restoration still runs if a
@@ -2257,13 +2257,13 @@ index 16398949..23270ecd 100644
 +                )))
 +            }
 +        }
- 
+
          Ok(result)
      }
-@@ -2472,6 +3214,12 @@ impl ProviderService {
+@@ -2472,6 +3215,12 @@
              .get_universal_provider(id)?
              .ok_or_else(|| AppError::Message(format!("统一供应商 {id} 不存在")))?;
- 
+
 +        // Reject a missing Codex choice before mutating any application.
 +        // Missing configuration is not the same as explicitly disabling Codex.
 +        if provider.apps.codex && provider.to_codex_provider().is_none() {
@@ -4540,3 +4540,258 @@ index 00000000..91985335
 +    expect(first).toEqual(second);
 +  });
 +});
+diff --git a/src-tauri/src/usb_host_account.rs b/src-tauri/src/usb_host_account.rs
+new file mode 100644
+--- /dev/null
++++ b/src-tauri/src/usb_host_account.rs
+@@ -0,0 +1,250 @@
++//! Account-only USB bootstrap. Database model templates are never inputs.
++use serde_json::Value as Json;
++use toml::Value;
++use toml_edit::{DocumentMut, Item, Table};
++
++const BASE: &str = "https://404token.xyz/v1";
++const INVALID: &str = "USB account configuration is invalid; existing settings retained";
++const CONFLICT: &str =
++    "USB account conflicts with existing settings; explicit account replacement required";
++
++fn is_bound_endpoint(value: &str) -> bool {
++    let Ok(url) = url::Url::parse(value.trim()) else {
++        return false;
++    };
++    url.scheme() == "https"
++        && url.host_str() == Some("404token.xyz")
++        && url.port_or_known_default() == Some(443)
++        && url.path().trim_end_matches('/') == "/v1"
++        && url.username().is_empty()
++        && url.password().is_none()
++        && url.query().is_none()
++        && url.fragment().is_none()
++}
++
++fn profile(config: &Value) -> Result<Option<&str>, &'static str> {
++    config
++        .get("profile")
++        .map(|p| {
++            let name = p.as_str().filter(|p| !p.trim().is_empty()).ok_or(INVALID)?;
++            config
++                .get("profiles")
++                .and_then(|p| p.get(name))
++                .filter(|p| p.is_table())
++                .ok_or(INVALID)?;
++            Ok(name)
++        })
++        .transpose()
++}
++
++fn effective<'a>(config: &'a Value, name: Option<&str>, key: &str) -> Option<&'a Value> {
++    name.and_then(|p| config.get("profiles")?.get(p)?.get(key))
++        .or_else(|| config.get(key))
++}
++
++pub(crate) fn matches(config: &str, auth: &Json, key: &str) -> bool {
++    let Ok(config) = config.parse::<Value>() else {
++        return false;
++    };
++    let Ok(name) = profile(&config) else {
++        return false;
++    };
++    let provider = effective(&config, name, "model_provider")
++        .and_then(Value::as_str)
++        .and_then(|p| config.get("model_providers")?.get(p));
++    provider.is_some_and(|p| {
++        p.get("base_url")
++            .and_then(Value::as_str)
++            .is_some_and(|s| is_bound_endpoint(s))
++            && p.get("wire_api").and_then(Value::as_str) == Some("responses")
++            && p.get("requires_openai_auth").and_then(Value::as_bool) == Some(true)
++            && [
++                "env_key",
++                "experimental_bearer_token",
++                "http_headers",
++                "env_http_headers",
++            ]
++            .iter()
++            .all(|k| p.get(*k).is_none())
++    }) && auth.get("OPENAI_API_KEY").and_then(Json::as_str) == Some(key)
++        && auth.get("tokens").is_none_or(Json::is_null)
++        && auth
++            .get("auth_mode")
++            .and_then(Json::as_str)
++            .is_none_or(|v| v == "apikey")
++        && effective(&config, name, "forced_login_method").and_then(Value::as_str)
++            != Some("chatgpt")
++        && effective(&config, name, "cli_auth_credentials_store")
++            .and_then(Value::as_str)
++            .is_none_or(|v| v == "file")
++}
++
++pub(crate) fn prepare(
++    config: &str,
++    auth: &Json,
++    key: &str,
++    replace: bool,
++) -> Result<(String, Json), &'static str> {
++    let parsed = config.parse::<Value>().map_err(|_| INVALID)?;
++    let name = profile(&parsed)?;
++    if parsed.get("mcp_servers").is_some_and(|v| !v.is_table()) {
++        return Err("USB account mcp_servers is invalid; existing settings retained");
++    }
++    if parsed.get("model_providers").is_some_and(|v| !v.is_table()) {
++        return Err(INVALID);
++    }
++    let active = effective(&parsed, name, "model_provider").and_then(Value::as_str);
++    let current = active.and_then(|p| parsed.get("model_providers")?.get(p));
++    let same_endpoint = current
++        .and_then(|p| p.get("base_url"))
++        .and_then(Value::as_str)
++        .is_some_and(|v| is_bound_endpoint(v));
++    let has_override = current.is_some_and(|p| {
++        [
++            "env_key",
++            "experimental_bearer_token",
++            "http_headers",
++            "env_http_headers",
++        ]
++        .iter()
++        .any(|k| p.get(*k).is_some())
++    }) || effective(&parsed, name, "forced_login_method")
++        .and_then(Value::as_str)
++        == Some("chatgpt")
++        || effective(&parsed, name, "cli_auth_credentials_store")
++            .and_then(Value::as_str)
++            .is_some_and(|v| v != "file");
++    let reserved_conflict = !same_endpoint
++        && parsed
++            .get("model_providers")
++            .and_then(|p| p.get("404token"))
++            .is_some_and(|p| {
++                p.get("base_url")
++                    .and_then(Value::as_str)
++                    .is_some_and(|v| !is_bound_endpoint(v))
++            });
++    let conflict = (active.is_some() && !same_endpoint)
++        || has_override
++        || reserved_conflict
++        || auth
++            .get("OPENAI_API_KEY")
++            .and_then(Json::as_str)
++            .is_some_and(|v| !v.is_empty() && v != key)
++        || auth.get("tokens").is_some_and(|v| !v.is_null())
++        || auth
++            .get("auth_mode")
++            .and_then(Json::as_str)
++            .is_some_and(|v| v != "apikey");
++    if conflict && !replace {
++        return Err(CONFLICT);
++    }
++    let mut doc = config.parse::<DocumentMut>().map_err(|_| INVALID)?;
++    let selected = if same_endpoint {
++        active.unwrap()
++    } else {
++        "404token"
++    };
++    let scope = if let Some(name) = name {
++        &mut doc["profiles"][name]
++    } else {
++        // Root fields are inserted separately to retain unrelated tables/comments.
++        doc["model_provider"] = toml_edit::value(selected);
++        if has_override {
++            doc["forced_login_method"] = toml_edit::value("api");
++            doc["cli_auth_credentials_store"] = toml_edit::value("file");
++        }
++        &mut doc["model_provider"]
++    };
++    if name.is_some() {
++        scope["model_provider"] = toml_edit::value(selected);
++        if has_override {
++            scope["forced_login_method"] = toml_edit::value("api");
++            scope["cli_auth_credentials_store"] = toml_edit::value("file");
++        }
++    }
++    if doc.get("model_providers").is_none() {
++        doc["model_providers"] = Item::Table(Table::new());
++    }
++    if doc["model_providers"].get(selected).is_none() {
++        doc["model_providers"][selected] = Item::Table(Table::new());
++    }
++    let provider = doc["model_providers"][selected]
++        .as_table_like_mut()
++        .ok_or(INVALID)?;
++    if provider.get("name").is_none() {
++        provider.insert("name", toml_edit::value("404TOKEN unified-api-internal"));
++    }
++    for (k, v) in [
++        ("base_url", toml_edit::value(BASE)),
++        ("wire_api", toml_edit::value("responses")),
++        ("requires_openai_auth", toml_edit::value(true)),
++    ] {
++        provider.insert(k, v);
++    }
++    for k in [
++        "env_key",
++        "experimental_bearer_token",
++        "http_headers",
++        "env_http_headers",
++    ] {
++        provider.remove(k);
++    }
++    let mut auth = auth.as_object().cloned().ok_or(INVALID)?;
++    auth.insert("OPENAI_API_KEY".into(), Json::String(key.into()));
++    if replace {
++        auth.remove("tokens");
++        auth.remove("last_refresh");
++        auth.insert("auth_mode".into(), Json::String("apikey".into()));
++    }
++    let output = (doc.to_string(), Json::Object(auth));
++    if !matches(&output.0, &output.1, key) {
++        return Err(INVALID);
++    }
++    Ok(output)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn new_host_does_not_select_a_database_model() {
++        let (text, auth) = prepare("", &serde_json::json!({}), "fixture", false).unwrap();
++        assert!(matches(&text, &auth, "fixture"));
++        let config = text.parse::<Value>().unwrap();
++        assert!(config.get("model").is_none());
++        assert_eq!(
++            config["model_providers"]["404token"]["name"].as_str(),
++            Some("404TOKEN unified-api-internal")
++        );
++    }
++    #[test]
++    fn preserves_model_profile_mcp_and_managed_comments() {
++        let text = "profile='work'\nmodel='root-model'\n[profiles.work]\nmodel='chosen'\n# BEGIN CODEX-STARTER-KIT MANAGED CONFIG v1\n[mcp_servers.mine]\nenabled=false\ncommand='custom'\n# END CODEX-STARTER-KIT MANAGED CONFIG v1\n[desktop]\nconversationDetailMode='STEPS_COMMANDS'\n";
++        let (out, auth) = prepare(text, &serde_json::json!({}), "fixture", false).unwrap();
++        let original: Value = text.parse().unwrap();
++        let result: Value = out.parse().unwrap();
++        for k in ["model", "profile", "mcp_servers", "desktop"] {
++            assert_eq!(original[k], result[k]);
++        }
++        assert_eq!(result["profiles"]["work"]["model"].as_str(), Some("chosen"));
++        assert!(out.contains("# BEGIN CODEX-STARTER-KIT MANAGED CONFIG v1"));
++        assert!(out.contains("# END CODEX-STARTER-KIT MANAGED CONFIG v1"));
++        assert!(matches(&out, &auth, "fixture"));
++    }
++    #[test]
++    fn replacement_is_explicit_and_targets_selected_profile() {
++        let text = "profile='work'\nmodel_provider='404token'\n[profiles.work]\nmodel_provider='openai'\nmodel='kept'\n";
++        let auth = serde_json::json!({"tokens":{"access_token":"fixture"},"auth_mode":"chatgpt"});
++        assert_eq!(
++            prepare(text, &auth, "fixture", false).unwrap_err(),
++            CONFLICT
++        );
++        let (out, auth) = prepare(text, &auth, "fixture", true).unwrap();
++        assert!(matches(&out, &auth, "fixture"));
++        assert_eq!(
++            out.parse::<Value>().unwrap()["profiles"]["work"]["model"].as_str(),
++            Some("kept")
++        );
++        assert!(auth.get("tokens").is_none());
++    }
++}

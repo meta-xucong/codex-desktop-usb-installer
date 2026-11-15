@@ -3,7 +3,11 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { listen } from "@tauri-apps/api/event";
 
-import type { DownloadProgress, OperationSnapshot } from "../../shared/types";
+import {
+  WINDOWS_PORTABLE_EXTRACTION_SOURCE,
+  type DownloadProgress,
+  type OperationSnapshot,
+} from "../../shared/types";
 import { I18nProvider } from "../i18n";
 import { useDownloadProgress } from "./useDownloadProgress";
 
@@ -447,5 +451,76 @@ describe("useDownloadProgress", () => {
     expect(getOperationSnapshot).toHaveBeenCalledTimes(1);
     expect(cancelDownload).not.toHaveBeenCalled();
     expect(result.current.downloadStopBusy).toBe(false);
+  });
+
+  it("keeps Windows download bytes separate from install phases and extraction", async () => {
+    const { result } = renderHook(
+      () =>
+        useDownloadProgress({
+          eventName: "win://download-progress",
+          pauseDownload: vi.fn(async () => true),
+          cancelDownload: vi.fn(async () => true),
+          getOperationSnapshot: vi.fn(async () => null),
+          onError: vi.fn(),
+        }),
+      { wrapper },
+    );
+
+    await act(async () => {
+      await result.current.startDlListen();
+    });
+    act(() => {
+      onProgress?.({
+        payload: {
+          downloaded: 100,
+          total: 100,
+          source: "mirror.test",
+          phase: "downloading",
+          operationId: "op-windows",
+        },
+      });
+    });
+    expect(result.current.downloadProgress).toMatchObject({ downloaded: 100, total: 100 });
+    expect(result.current.installProgress).toBeNull();
+
+    act(() => {
+      onProgress?.({
+        payload: {
+          downloaded: 100,
+          total: 100,
+          source: "mirror.test",
+          phase: "verifying",
+          operationId: "op-windows",
+        },
+      });
+    });
+    expect(result.current.downloadProgress).toMatchObject({ downloaded: 100, total: 100 });
+    expect(result.current.installProgress).toMatchObject({
+      downloaded: 0,
+      total: 0,
+      phase: "verifying",
+    });
+
+    act(() => {
+      onProgress?.({
+        payload: {
+          downloaded: 35,
+          total: 100,
+          source: WINDOWS_PORTABLE_EXTRACTION_SOURCE,
+          phase: "applying",
+          operationId: "op-windows",
+        },
+      });
+    });
+    expect(result.current.installProgress).toMatchObject({
+      downloaded: 35,
+      total: 100,
+      source: WINDOWS_PORTABLE_EXTRACTION_SOURCE,
+      phase: "applying",
+    });
+
+    act(() => result.current.resetStop());
+    expect(result.current.downloadProgress).toBeNull();
+    expect(result.current.installProgress).toBeNull();
   });
 });

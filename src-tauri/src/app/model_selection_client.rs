@@ -34,6 +34,15 @@ pub(crate) struct SelectionReply {
 fn hash_string(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
+// GUI bootstrap and the finite model-selection child must resolve the same
+// USB Codex home and isolated CC Switch 4.x data store. Never inherit a
+// standalone CC Switch context for this manager-owned operation.
+fn configure_selection_home(command: &mut std::process::Command, home: &std::path::Path) {
+    command
+        .env("CODEX_USB_CCSWITCH_MODE", "usb")
+        .env("CCSWITCH_USB_CODEX_HOME", home)
+        .env("CODEX_USB_EXPECTED_CODEX_HOME", home);
+}
 fn decode(
     bytes: &[u8],
     request: &SelectionRequest<'_>,
@@ -290,9 +299,9 @@ pub(crate) fn request(
         return Err("selection-request-invalid");
     }
     let mut command = Command::new(&executable);
+    configure_selection_home(&mut command, codex_home);
     command
         .arg("--usb-model-selection")
-        .env("CODEX_USB_EXPECTED_CODEX_HOME", codex_home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -435,6 +444,27 @@ pub(crate) fn lock_configuration() -> Result<ConfigurationLock, &'static str> {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn selection_child_uses_same_usb_home_as_bootstrap() {
+        let home = std::path::Path::new("C:/isolated-fixture/usb-codex-home");
+        let mut command = std::process::Command::new("unused-test-executable");
+        command.env("CODEX_USB_CCSWITCH_MODE", "local");
+        command.env("CCSWITCH_USB_CODEX_HOME", "stale-home");
+        configure_selection_home(&mut command, home);
+        let environment = command
+            .get_envs()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            environment.get(std::ffi::OsStr::new("CODEX_USB_CCSWITCH_MODE")),
+            Some(&Some(std::ffi::OsStr::new("usb")))
+        );
+        for name in ["CCSWITCH_USB_CODEX_HOME", "CODEX_USB_EXPECTED_CODEX_HOME"] {
+            assert_eq!(
+                environment.get(std::ffi::OsStr::new(name)),
+                Some(&Some(home.as_os_str()))
+            );
+        }
+    }
     fn fixture_request(operation: &str) -> SelectionRequest<'_> {
         const HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let apply = operation == "apply";

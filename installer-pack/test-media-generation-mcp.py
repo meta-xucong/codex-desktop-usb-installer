@@ -222,6 +222,17 @@ class MediaMcpTestCase(unittest.TestCase):
     def record_path(self, confirmation_id: str) -> Path:
         return self.data / "confirmations" / f"{confirmation_id}.json"
 
+    def test_model_default_preserves_environment_and_saved_catalog_choices(self) -> None:
+        with unittest.mock.patch.dict(os.environ, {"MEDIA_IMAGE2_MODEL": ""}):
+            self.assertEqual(media._configured_model("image-2"), "gpt-image-2.5")
+            self.config.write_text(json.dumps({"schemaVersion": 1, "gateway": self.http.url,
+                "models": {"image-2": "saved-image-choice"}}), encoding="utf-8")
+            self.assertEqual(media._configured_model("image-2"), "saved-image-choice")
+            with unittest.mock.patch.dict(os.environ, {"MEDIA_IMAGE2_MODEL": "environment-image-choice"}):
+                self.assertEqual(media._configured_model("image-2"), "environment-image-choice")
+            self.assertEqual(media._configured_model("grok-image"), "")
+        self.assertEqual(self.http.state.requests, [])
+
     def test_image_mime_detector_recognizes_supported_signatures(self) -> None:
         fixtures = (
             (b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0d", "image/png"),
@@ -1511,8 +1522,8 @@ class MediaMcpTestCase(unittest.TestCase):
         self.assertFalse(parameters_schema["additionalProperties"])
         self.assertEqual(parameters_schema["properties"]["aspect_ratio"]["type"], "string")
         self.assertEqual(parameters_schema["properties"]["aspect_ratio"]["enum"], media.MEDIA_PARAMETER_PROPERTIES["aspect_ratio"]["enum"])
-        self.assertEqual(parameters_schema["properties"]["resolution"]["enum"], ["1k", "2k", "480p", "720p", "1080p"])
-        self.assertIn("aspect_ratio and resolution are required", parameters_schema["description"])
+        self.assertCountEqual(parameters_schema["properties"]["resolution"]["enum"], ["1k", "2k", "480p", "720p", "1080p"])
+        self.assertIn("Provider-specific parameters", parameters_schema["description"])
         capability = json.loads(replies[2]["result"]["content"][0]["text"])
         self.assertEqual(capability["generation_capability"], "not_tested")
         self.assertEqual(result.stderr, b"")

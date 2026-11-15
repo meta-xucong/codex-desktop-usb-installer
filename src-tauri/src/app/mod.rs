@@ -2,14 +2,16 @@ pub mod account;
 pub mod appx_volume;
 pub mod atomic_file;
 pub mod capability_pack;
+pub(crate) mod capability_config;
 // These manager paths are compiled for macOS CI but active only in the Windows USB build.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub mod ccswitch;
 pub mod channels;
 pub mod codex_agents_hint;
 pub mod codex_config_guard;
-#[cfg(test)]
 pub(crate) mod codex_config_readback;
+pub(crate) mod usb_conversation_mode;
+pub(crate) mod usb_node_repl;
 #[cfg(target_os = "windows")]
 pub mod codex_entry_ipc;
 pub mod codex_self_update;
@@ -52,6 +54,7 @@ pub mod url_guard;
 pub mod usb_bundle;
 #[cfg_attr(not(windows), allow(dead_code))]
 pub mod usb_guard;
+pub mod usb_host;
 pub mod usb_media_cleanup;
 #[cfg_attr(not(windows), allow(dead_code))]
 pub mod usb_revocation;

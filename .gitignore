@@ -64,3 +64,8 @@ release/usb-oneclick-v*/
 .test-tmp/
 .codex-audit/
 src-tauri/resources/prerequisites/*.exe
+
+# Offline distribution inputs; retain their existing release manifests in Git.
+installer-pack/runtime/bundled/chrome-headless-shell-152.0.7977.30-win64.zip
+installer-pack/runtime/bundled/ffmpeg-n9.0-latest-win64-gpl-shared-9.0.zip
+installer-pack/runtime/bundled/hyperframes-0.8.134-win-x64-node-modules.zip

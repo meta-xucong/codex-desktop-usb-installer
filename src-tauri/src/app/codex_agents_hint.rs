@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 const MARKER_BEGIN: &str = "# BEGIN CODEX-USB-I18N-MOJIBAKE-HINT v1";
 const MARKER_END: &str = "# END CODEX-USB-I18N-MOJIBAKE-HINT v1";
+const RUNTIME_GUIDANCE: &str = include_str!("usb_runtime_guidance.md");
 const HINT_BODY: &str = r#"## 中文输出乱码处理（仅在出现时使用）
 
 若 exec 读取 UTF-8 中文文件时出现「閫氳繃」「鏄惧紡」一类明显乱码，不要反复重试或把整份大文件重复输出。先确认源文件编码和当前 exec 输出解码方式；只在已确认 Windows 输出按系统代码页 936 解码时，使用下面的 PowerShell 方法：
@@ -23,6 +24,21 @@ $m='乱码文本'; [Text.Encoding]::UTF8.GetString([Text.Encoding]::GetEncoding(
 - 对大文件只输出相关片段，避免反复将整份乱码内容送入上下文。
 
 ## 图片与视频生成的默认方式
+
+首次使用 U 盘默认媒体入口生成/编辑图片、生成视频或检查该入口是否可用时，自行完成下面的发现和只读能力查询，再继续用户任务。不要先查询 CUA 应用/浏览器清单，也不要让用户替你查工具、复制命令或重新安装。本会话已有成功的媒体工具查询时可沿用；用户只要提示词/方案或明确指定其他生成方式时不做此探测。
+
+若当轮 `functions.exec` 声明提供 `ALL_TOOLS`，先在其中执行：
+
+<!-- snippet: media-entry-discovery -->
+```js
+text(ALL_TOOLS.filter(tool =>
+  /media_generation|media_capabilities/i.test(tool.name + "\n" + tool.description)
+));
+```
+
+读取匹配工具的真实声明，然后用返回的注册名调用只读 `media_capabilities({})`；当前包常见注册名是 `mcp__media_generation__media_capabilities`，通过 `functions.exec` 的 `tools` 调用，不能因顶层没有 `media` 就跳过。实际调用及安全摘要示例在本轮技能目录的 `image-2/SKILL.md`。不要用脚本或 HTTP 代替会话 MCP 验证。
+
+只有本轮完整发现确实无匹配，才能报告“当前会话未发现媒体工具”；不能据此说文件未安装。发现后调用报错，要报告调用错误；查询成功但目录为 `not_checked`/`stale`，表示仍需目录检查，不表示 MCP 缺失。查询成功就继续原任务，不再要求用户确认工具是否存在。
 
 当用户要求实际生成或编辑图片、生成视频时，默认使用本机已安装的统一 `media_generation` MCP：先检查 `media_capabilities`，再按 MCP 工作流准备、展示确认信息，并在用户确认后提交。不要先尝试 Codex 原生 ImageGen、其他图片/视频工具、外部脚本或直连 API，也不要只输出提示词来代替实际生成。
 
@@ -88,8 +104,88 @@ fn ensure_hint_at(codex_home: &Path) -> io::Result<bool> {
 }
 
 fn render_block(newline: &str) -> String {
-    let body = HINT_BODY.replace('\n', newline);
+    let body = format!("{}\n\n{HINT_BODY}", RUNTIME_GUIDANCE.trim_end()).replace('\n', newline);
     format!("{MARKER_BEGIN}{newline}{newline}{body}{newline}{newline}{MARKER_END}")
+}
+
+#[cfg(test)]
+mod runtime_guidance_tests {
+    use super::*;
+
+    #[test]
+    fn upgrade_preserves_user_text_and_replaces_only_owned_block() {
+        let old =
+            format!("user before\r\n{MARKER_BEGIN}\r\nold hint\r\n{MARKER_END}\r\nuser after\r\n");
+        let block = render_block("\r\n");
+        let next = merge_owned_block(&old, &block, "\r\n").unwrap().unwrap();
+        assert_eq!(next, format!("user before\r\n{block}\r\nuser after\r\n"));
+        assert!(next.contains(&HINT_BODY.replace('\n', "\r\n")));
+        assert!(merge_owned_block(&next, &block, "\r\n").unwrap().is_none());
+    }
+
+    #[test]
+    fn append_preserves_bom_and_unowned_instructions() {
+        let original = "\u{feff}# My instructions\nKeep my workflow.";
+        let block = render_block("\n");
+        let next = merge_owned_block(original, &block, "\n").unwrap().unwrap();
+        assert_eq!(next, format!("{original}\n\n{block}\n"));
+    }
+
+    #[test]
+    fn incomplete_or_duplicate_markers_do_not_produce_a_replacement() {
+        let block = render_block("\n");
+        for original in [MARKER_BEGIN.to_string(), format!("{block}\n{block}")] {
+            assert!(merge_owned_block(&original, &block, "\n").is_err());
+        }
+    }
+
+    #[test]
+    fn installation_is_idempotent_and_leaves_override_and_config_untouched() {
+        let root = std::env::temp_dir().join(format!(
+            "usb-guidance-{}-{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let user_prefix = "# User instructions\r\nKeep my workflow.\r\n";
+        fs::write(
+            root.join("AGENTS.md"),
+            format!("{user_prefix}{MARKER_BEGIN}\r\nold owned hint\r\n{MARKER_END}\r\n"),
+        )
+        .unwrap();
+        fs::write(root.join("AGENTS.override.md"), b"User override wins.\r\n").unwrap();
+        fs::write(root.join("config.toml"), b"model = \"fixture\"\n").unwrap();
+        assert!(ensure_hint_at(&root).unwrap());
+        assert_eq!(
+            fs::read_to_string(root.join("AGENTS.md")).unwrap(),
+            format!("{user_prefix}{}\r\n", render_block("\r\n"))
+        );
+        assert!(!ensure_hint_at(&root).unwrap());
+        assert_eq!(
+            fs::read(root.join("AGENTS.override.md")).unwrap(),
+            b"User override wins.\r\n"
+        );
+        assert_eq!(
+            fs::read(root.join("config.toml")).unwrap(),
+            b"model = \"fixture\"\n"
+        );
+    }
+
+    #[test]
+    fn concurrent_user_edit_is_preserved() {
+        let root = std::env::temp_dir().join(format!(
+            "usb-guidance-race-{}-{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("AGENTS.md");
+        fs::write(&path, b"new user edit").unwrap();
+        let error =
+            write_replace_if_unchanged(&path, Some(b"old user edit"), b"replacement").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(fs::read(path).unwrap(), b"new user edit");
+    }
 }
 
 fn merge_owned_block(existing: &str, block: &str, newline: &str) -> io::Result<Option<String>> {

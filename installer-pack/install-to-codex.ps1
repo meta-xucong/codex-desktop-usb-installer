@@ -3,9 +3,11 @@ param(
     [switch]$IncludeNonDefault,
     [switch]$IncludeUnsupported,
     [switch]$Overwrite,
+    [switch]$ReplaceExisting,
     [string]$PackRoot,
     [string]$TargetUserProfile,
     [string]$TargetCodexHome,
+    [string]$ProgressFile = '',
     [switch]$EnableFullAccess,
     [ValidateSet('tenant','oauth','user')][string]$FeishuAuthMode = 'tenant',
     [string]$FeishuDomain = 'https://open.feishu.cn',
@@ -29,6 +31,13 @@ if ($MediaGatewayCatalogStatus -eq 'verified' -and [string]::IsNullOrWhiteSpace(
     throw 'A verified media gateway catalog must include its verification timestamp.'
 }
 $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+
+function Set-InstallProgress([string]$Stage) {
+    if ([string]::IsNullOrWhiteSpace($ProgressFile)) { return }
+    [IO.File]::WriteAllText($ProgressFile, $Stage, [Text.Encoding]::ASCII)
+}
+
+Set-InstallProgress 'pack.validate'
 
 function Write-JsonNoBom([string]$Path, [object]$Value, [int]$Depth = 8) {
     $parent = Split-Path -Parent $Path
@@ -213,7 +222,7 @@ foreach ($entry in $previousFiles) {
 function Remove-RecordsUnder([string]$RootPath) {
     $prefix = [IO.Path]::GetFullPath($RootPath).TrimEnd('\') + '\'
     $keep = [System.Collections.Generic.List[object]]::new()
-    foreach ($entry in @($installed)) {
+    foreach ($entry in $installed.ToArray()) {
         $path = if ($entry.path) { [IO.Path]::GetFullPath([string]$entry.path) } else { '' }
         if (-not $path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) -and -not $path.Equals([IO.Path]::GetFullPath($RootPath), [StringComparison]::OrdinalIgnoreCase)) { $keep.Add($entry) }
     }
@@ -234,11 +243,23 @@ function Add-OwnedRecord([string]$Kind, [string]$Path, [string]$Hash) {
     $installed.Add([pscustomobject]@{ kind = $Kind; path = $Path; sha256 = $Hash })
 }
 
+function Backup-ReplacedItem([string]$Path, [string]$Kind) {
+    $item = Get-Item -LiteralPath $Path -Force
+    $items = @($item)
+    if ($item.PSIsContainer) { $items += @(Get-ChildItem -LiteralPath $Path -Recurse -Force) }
+    if (@($items | Where-Object { ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 }).Count -gt 0) { throw "Cannot replace linked package content: $Path" }
+    $backup = Join-Path $ownershipRoot ('backups\replaced-' + $Kind + '\' + [guid]::NewGuid().ToString('N') + '\' + [IO.Path]::GetFileName($Path))
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $backup) | Out-Null
+    Copy-Item -LiteralPath $Path -Destination $backup -Recurse
+}
+
 function Copy-OwnedFile([string]$Source, [string]$Destination, [string]$Kind) {
     $existing = Test-Path -LiteralPath $Destination -PathType Leaf
     if ((Test-Path -LiteralPath $Destination) -and -not $existing) { throw "Expected a file but found another item type: $Destination" }
     if ($existing -and -not $Overwrite) { Write-Warning "Skipped existing ${Kind}: $Destination (use -Overwrite to update)."; return $false }
-    if ($existing -and $Overwrite) {
+    if ($existing -and $ReplaceExisting) {
+        Backup-ReplacedItem $Destination 'files'
+    } elseif ($existing -and $Overwrite) {
         $previousOwnership = Get-PreviousOwnership $Destination @($Kind)
         if (-not $previousOwnership) {
             Write-Warning "Skipped unowned existing ${Kind}: $Destination (the installer only overwrites files recorded in its ownership manifest)."
@@ -318,6 +339,7 @@ if ($EnableMediaGeneration) {
     $skillNames = @(@($skillNames) + @($mediaSkills) | Select-Object -Unique)
 }
 
+Set-InstallProgress 'pack.skills'
 Write-Host "Agents target: $agentTarget"
 foreach ($relativeAgent in $agentFiles) {
     $relative = ([string]$relativeAgent) -replace '/', '\'
@@ -337,7 +359,10 @@ foreach ($skillName in $skillNames) {
     if (-not (Test-Path -LiteralPath (Join-Path $source 'SKILL.md') -PathType Leaf)) { throw "Missing SKILL.md in pack: $name" }
     if (Test-Path -LiteralPath $destination) {
         if (-not $Overwrite) { Write-Warning "Skipped existing skill: $destination (use -Overwrite to update)."; continue }
-        if (-not (Remove-OwnedSkillTree $destination)) {
+        if ($ReplaceExisting) {
+            Backup-ReplacedItem $destination 'skills'
+            Remove-RecordsUnder $destination
+        } elseif (-not (Remove-OwnedSkillTree $destination)) {
             Write-Warning "Skipped unowned existing skill: $destination (the installer only overwrites a tree recorded in its ownership manifest)."
             continue
         }
@@ -364,6 +389,7 @@ $supportFiles = @(
     @{ source = 'model-catalog.json'; destination = (Join-Path $ownershipRoot 'model-catalog.json'); kind = 'model-catalog' },
     @{ source = 'render-codex-config.ps1'; destination = (Join-Path $ownershipRoot 'bin\render-codex-config.ps1'); kind = 'config-renderer' },
     @{ source = 'configure-codex.ps1'; destination = (Join-Path $ownershipRoot 'bin\configure-codex.ps1'); kind = 'config-merger' },
+    @{ source = 'replace-pack-config.py'; destination = (Join-Path $ownershipRoot 'bin\replace-pack-config.py'); kind = 'config-merger' },
     @{ source = 'audit-codex-compatibility.py'; destination = (Join-Path $ownershipRoot 'bin\audit-codex-compatibility.py'); kind = 'compatibility-auditor' },
     @{ source = 'manifest/feishu-tools.json'; destination = (Join-Path $ownershipRoot 'manifest\feishu-tools.json'); kind = 'tool-contract' },
     @{ source = 'manifest/media-generation-tools.json'; destination = (Join-Path $ownershipRoot 'manifest\media-generation-tools.json'); kind = 'tool-contract' },
@@ -398,12 +424,8 @@ if ($mediaGenerationEnabled) {
         $mediaProfile = 'responses'
     }
     if ($mediaProfile -notin @('auto','legacy','wokey','responses')) { throw 'Unsupported media API profile.' }
-    if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable('MEDIA_IMAGE2_MODEL', 'Process'))) {
-        [Environment]::SetEnvironmentVariable('MEDIA_IMAGE2_MODEL', 'gpt-image-2.5', 'Process')
-    }
-    $mediaModelEnvNames = @('MEDIA_IMAGE2_MODEL','MEDIA_GROK_IMAGE_MODEL','MEDIA_GROK_VIDEO_MODEL','MEDIA_SEEDANCE_MODEL','MEDIA_MINIMAX_VIDEO_MODEL')
-    $configuredMediaModels = @($mediaModelEnvNames | Where-Object { -not [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_, 'Process')) })
-    if ($configuredMediaModels.Count -eq 0) { throw 'EnableMediaGeneration requires at least one provider model ID.' }
+    # The MCP wrapper resolves the existing default after reading saved user
+    # models, identically for CredentialCheck and real server startup.
     if (-not [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable('MEDIA_SEEDANCE_MODEL', 'Process')) -and [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable('MEDIA_GENERATION_AGENT_ID', 'Process'))) {
         throw 'EnableMediaGeneration requires MEDIA_GENERATION_AGENT_ID for the configured Seedance route.'
     }
@@ -450,8 +472,8 @@ function Test-RuntimeReady([object]$State) {
         if (-not $component -or [string]$component.Value.health -ne 'passed') { return $false }
     }
     $hyperframes = $State.PSObject.Properties['hyperframes']
-    if (-not $hyperframes -or [string]$hyperframes.Value.cliHealth -notin @('passed','requires-network')) { return $false }
-    if ([string]$hyperframes.Value.cliHealth -eq 'passed' -and [string]$hyperframes.Value.browserHealth -notin @('passed','requires-network')) { return $false }
+    if (-not $hyperframes -or [string]$hyperframes.Value.cliHealth -notin @('passed','requires-network','install-failed')) { return $false }
+    if ([string]$hyperframes.Value.cliHealth -eq 'passed' -and [string]$hyperframes.Value.browserHealth -notin @('passed','requires-network','install-failed')) { return $false }
     return [string]$State.feishu.health -in @('passed','disabled','skipped')
 }
 
@@ -482,6 +504,7 @@ $runtimeState = [ordered]@{
     }
     paths = [ordered]@{ kitHome = $ownershipRoot; runtimeRoot = (Join-Path $ownershipRoot 'runtime'); binRoot = (Join-Path $ownershipRoot 'bin') }
     secretsStored = $false
+    error = ''
 }
 try {
     New-Item -ItemType Directory -Force -Path $diagnosticsRoot | Out-Null
@@ -491,10 +514,10 @@ try {
     # The provisioner emits one JSON document on success; native diagnostics
     # are captured in its structured component state.
     $runtimeArguments = @{ PackRoot = $PackRoot; TargetUserProfile = $userProfile; TargetCodexHome = $codexHome }
+    if (-not [string]::IsNullOrWhiteSpace($ProgressFile)) { $runtimeArguments.ProgressFile = $ProgressFile }
     if ($feishuEnabled) { $runtimeArguments.EnableFeishu = $true }
     $runtimeOutput = (& $runtimeScript @runtimeArguments | Out-String)
     $runtimeState = $runtimeOutput | ConvertFrom-Json
-    if (-not (Test-RuntimeReady $runtimeState)) { throw 'Bundled runtime provisioning returned a partial or unhealthy state.' }
     $initialMediaHealth = if ($mediaGenerationEnabled) { 'unknown' } else { 'disabled' }
     $mediaRuntimeDefaults = [ordered]@{
         health = $initialMediaHealth
@@ -516,6 +539,7 @@ try {
         }
     }
     if (-not $runtimeState.PSObject.Properties['error']) { $runtimeState | Add-Member -NotePropertyName error -NotePropertyValue '' }
+    if (-not (Test-RuntimeReady $runtimeState)) { throw 'Bundled runtime provisioning returned a partial or unhealthy state.' }
 } catch {
     $runtimeState.error = Redact-Diagnostic (($runtimeOutput + "`n" + $runtimeStderr + "`n" + $_.Exception.Message).Trim())
 }
@@ -524,6 +548,7 @@ $runtimeStatePath = Join-Path $ownershipRoot 'runtime-state.json'
 Write-JsonNoBom $runtimeStatePath $runtimeState 8
 
 $pdfSmokeScript = Join-Path $PackRoot 'skills\pdf-processing-toolkit\scripts\pdf_tool.py'
+Set-InstallProgress 'pack.pdf'
 $pdfSmokeDiagnosticPath = Join-Path $diagnosticsRoot 'pdf-smoke.log'
 $pdfSmokeOutput = ''
 $pdfSmokeStatus = [ordered]@{ status = 'skipped'; script = $pdfSmokeScript; reason = 'Bundled Python runtime is not healthy.' }
@@ -581,6 +606,7 @@ $wrapperTarget = Join-Path $ownershipRoot 'bin\start-feishu-mcp.ps1'
 $mediaWrapperTarget = Join-Path $ownershipRoot 'bin\start-media-generation-mcp.ps1'
 $mediaHealthStatus = [ordered]@{ status = if ($mediaGenerationEnabled) { 'not-checked' } else { 'disabled' }; runtime = 'not-checked'; protocol = 'not-checked'; gatewayCatalog = if ($mediaGenerationEnabled) { $MediaGatewayCatalogStatus } else { 'not-checked' }; generationCapability = 'not-tested'; python = ''; serverVersion = ''; catalogVerifiedAt = if (-not [string]::IsNullOrWhiteSpace($MediaGatewayCatalogVerifiedAt)) { $MediaGatewayCatalogVerifiedAt } else { $null }; modelCount = if ($MediaGatewayCatalogStatus -eq 'verified') { $MediaGatewayModelCount } else { 0 } }
 if ($mediaGenerationEnabled) {
+    Set-InstallProgress 'pack.media'
     $mediaHealthOutput = ''
     try {
         # Run the helper in this host. The wrapper's helper modes return rather
@@ -602,10 +628,18 @@ if ($mediaGenerationEnabled) {
         Write-JsonNoBom $runtimeStatePath $runtimeState 8
     } catch {
         $mediaHealthStatus.status = 'failed'
+        $mediaHealthStatus.runtime = 'failed'
+        $mediaHealthStatus.protocol = 'failed'
         $mediaHealthOutput = Redact-Diagnostic (($mediaHealthOutput + "`n" + $_.Exception.Message).Trim())
         $mediaHealthDiagnosticPath = Join-Path $diagnosticsRoot 'media-generation-health.log'
         [void](Write-Diagnostic $mediaHealthDiagnosticPath ($mediaHealthOutput + "`nstatus=failed"))
-        throw "Bundled Python media MCP is not ready: $mediaHealthOutput"
+        $runtimeState.status = 'partial'
+        $runtimeState.mediaGeneration.health = 'failed'
+        $runtimeState.mediaGeneration.protocol = 'failed'
+        Set-StatusReason $runtimeState.mediaGeneration $mediaHealthOutput
+        Write-JsonNoBom $runtimeStatePath $runtimeState 8
+        # Config/model setup and readiness reporting are independent of this
+        # local self-check. The manager still rejects failed media readiness.
     }
 }
 # This is a point-in-time process snapshot before config write; it does not
@@ -647,6 +681,7 @@ $configOutput = ''
 $renderStatus = [ordered]@{ status = 'not-run'; totalSkills = 0; enabledSkillCount = 0; disabledSkillCount = 0; enabledSkills = @(); disabledSkills = @(); reason = 'Configuration renderer did not complete.' }
 $configStatus = [ordered]@{ status = 'partial'; merged = $false; reason = 'Configuration stage did not complete.' }
 try {
+    Set-InstallProgress 'pack.config'
     # These helper scripts exchange structured JSON with the installer. Run
     # them in-process so a Windows PowerShell startup/provider failure cannot
     # replace a valid result with host diagnostics.
@@ -654,6 +689,7 @@ try {
     $renderStatus = $renderOutput | ConvertFrom-Json
     $configOutput = $renderOutput
     $configArguments = @{ GeneratedFragment = $generatedConfig; TargetUserProfile = $userProfile; TargetCodexHome = $codexHome; KitHome = $ownershipRoot }
+    if ($ReplaceExisting) { $configArguments.ReplaceExisting = $true }
     if ($EnableFullAccess) { $configArguments.EnableFullAccess = $true }
     if (-not [string]::IsNullOrWhiteSpace([string]$runtimeState.python.executable)) {
         $configArguments.PythonExe = [string]$runtimeState.python.executable
@@ -677,6 +713,7 @@ $modelSyncDiagnosticPath = Join-Path $diagnosticsRoot 'model-sync.log'
 $modelSyncOutput = ''
 $modelSyncStatus = [ordered]@{ schemaVersion = 1; status = 'failed'; migration = 'not-run'; preferredModel = ''; currentModel = $null; configChanged = $false; reason = 'Model sync did not complete.' }
 try {
+    Set-InstallProgress 'pack.models'
     $modelSyncArguments = @{ PackRoot = $PackRoot; TargetUserProfile = $userProfile; TargetCodexHome = $codexHome; KitHome = $ownershipRoot }
     if (-not [string]::IsNullOrWhiteSpace([string]$runtimeState.python.executable)) {
         $modelSyncArguments.PythonExe = [string]$runtimeState.python.executable
@@ -756,6 +793,7 @@ $expectedAgentCount = @($agentFiles).Count
 $coreReady = ($installedSkillCount -ge $expectedSkillCount) -and ($installedAgentCount -ge $expectedAgentCount)
 $coreStatus = if ($coreReady) { 'ready' } else { 'partial' }
 $runtimeReady = Test-RuntimeReady $runtimeState
+Set-InstallProgress 'pack.finalize'
 $pdfReady = [string]$pdfSmokeStatus.status -eq 'passed'
 $configReady = [string]$configStatus.status -notin @('failed', 'partial', 'conflict')
 $modelReady = [string]$modelSyncStatus.status -eq 'ready'
@@ -839,7 +877,7 @@ $record = [ordered]@{
     skillRoot = $skillTarget
     readinessFile = $readinessFile
     overwrite = [bool]$Overwrite
-    files = @($installed)
+    files = $installed.ToArray()
     note = 'Ownership record contains package-owned paths and hashes only; it contains no credentials or user content.'
 }
 Write-JsonNoBom $ownershipFile $record 8

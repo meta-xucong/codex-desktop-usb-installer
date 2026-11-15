@@ -61,9 +61,15 @@ pub struct LocalMediaModelSettings {
 
 /// Read only the non-secret model routing values saved for this Windows user.
 pub fn local_model_settings() -> LocalMediaModelSettings {
-    let values = current_user_model_settings()
-        .into_iter()
-        .collect::<std::collections::HashMap<_, _>>();
+    let values = match current_user_model_settings() {
+        Ok(values) => values
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>(),
+        Err(error) => {
+            log::warn!("media model settings could not be read for the desktop user: {error}");
+            std::collections::HashMap::new()
+        }
+    };
     let setting = |name: &str| {
         values
             .get(name)
@@ -196,7 +202,12 @@ pub fn usb_launch_environment() -> Vec<(String, String)> {
             launch_environment(None)
         }
     };
-    values.extend(current_user_model_settings());
+    match current_user_model_settings() {
+        Ok(settings) => values.extend(settings),
+        Err(error) => {
+            log::error!("media model settings could not be read for the desktop user: {error}")
+        }
+    }
     values
 }
 
@@ -263,26 +274,43 @@ pub fn verify_authorized_local_connection() -> Result<(), AppError> {
         .env_remove(MEDIA_SIGNED_LAUNCH);
     #[cfg(target_os = "windows")]
     command.creation_flags(0x0800_0000);
-    let output = command
-        .output()
-        .map_err(|_| AppError::Engine("无法启动媒体 MCP 授权自检".into()))?;
+    let output = crate::app::capability_pack::run_capability_probe(&mut command)?;
+    validate_credential_check_output(&output)
+}
+
+fn validate_credential_check_output(output: &std::process::Output) -> Result<(), AppError> {
     if !output.status.success() {
-        return Err(AppError::Engine("媒体 MCP DPAPI 凭据自检失败".into()));
+        return Err(AppError::Engine(format!("媒体 MCP 授权自检脚本失败（退出码 {:?}）", output.status.code())));
     }
     let result: Value = serde_json::from_slice(&output.stdout)
         .map_err(|_| AppError::Engine("媒体 MCP 授权自检返回格式无效".into()))?;
-    if result.get("credentialSource").and_then(Value::as_str) != Some("dpapi-current-user")
-        || result.get("apiKeyConfigured").and_then(Value::as_bool) != Some(true)
-        || result.get("baseUrlConfigured").and_then(Value::as_bool) != Some(true)
-        || result
-            .get("configuredModelCount")
-            .and_then(Value::as_u64)
-            .unwrap_or(0)
-            == 0
-    {
-        return Err(AppError::Engine(
-            "媒体 MCP DPAPI 凭据、网关地址或模型配置未就绪".into(),
-        ));
+    let source = match result.get("credentialSource").and_then(Value::as_str) {
+        Some("dpapi-current-user") => "dpapi-current-user",
+        Some("process") => "process",
+        Some("missing") => "missing",
+        _ => "unknown",
+    };
+    let key_ready = result.get("apiKeyConfigured").and_then(Value::as_bool) == Some(true);
+    let base_ready = result.get("baseUrlConfigured").and_then(Value::as_bool) == Some(true);
+    let models = result.get("configuredModelCount").and_then(Value::as_u64).unwrap_or(0);
+    let mut reasons = Vec::new();
+    if source != "dpapi-current-user" || !key_ready { reasons.push("本机凭据未成功解密"); }
+    if !base_ready { reasons.push("网关地址未配置"); }
+    if models == 0 { reasons.push("媒体模型未配置"); }
+    if !reasons.is_empty() {
+        let mut detail = format!("credentialSource={source}, apiKeyConfigured={key_ready}, baseUrlConfigured={base_ready}, configuredModelCount={models}");
+        for prefix in ["connection", "credential", "model"] {
+            // Only the wrapper's type name and numeric HRESULT are safe to
+            // retain; never include exception text or raw process output.
+            if let Some(kind) = result.get(format!("{prefix}ErrorType")).and_then(Value::as_str)
+                .filter(|s| !s.is_empty() && s.len() <= 64 && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')) {
+                detail.push_str(&format!(", {prefix}ErrorType={kind}"));
+            }
+            if let Some(code) = result.get(format!("{prefix}ErrorCode")).and_then(Value::as_i64) {
+                detail.push_str(&format!(", {prefix}ErrorCode={code}"));
+            }
+        }
+        return Err(AppError::Engine(format!("媒体 MCP 自检未通过：{}（{detail}）", reasons.join("；"))));
     }
     Ok(())
 }
@@ -395,10 +423,10 @@ fn protect_for_current_user(_plain: &[u8]) -> Result<Vec<u8>, AppError> {
 }
 
 #[cfg(target_os = "windows")]
-fn current_user_model_settings() -> Vec<(String, String)> {
+pub(crate) fn current_user_environment_settings(names: &[&str]) -> Result<Vec<(String, String)>, AppError> {
     use windows_sys::Win32::System::Registry::{
-        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE,
-        REG_SZ,
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, HKEY_USERS,
+        KEY_QUERY_VALUE, REG_SZ,
     };
 
     struct Key(HKEY);
@@ -408,72 +436,122 @@ fn current_user_model_settings() -> Vec<(String, String)> {
         }
     }
 
-    let subkey: Vec<u16> = "Environment\0".encode_utf16().collect();
+    let target_user_sid = usb_guard::user_environment_registry_sid()?;
+    let mut desktop_hive = std::ptr::null_mut();
+    let (root, subkey_text) = match target_user_sid.as_deref() {
+        Some(user_sid) => {
+            let sid_key = user_sid
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect::<Vec<_>>();
+            let status = unsafe {
+                RegOpenKeyExW(
+                    HKEY_USERS,
+                    sid_key.as_ptr(),
+                    0,
+                    KEY_QUERY_VALUE,
+                    &mut desktop_hive,
+                )
+            };
+            if status != 0 || desktop_hive.is_null() {
+                return Err(AppError::Engine(format!(
+                    "打开当前桌面用户注册表配置失败（Win32 {status}）"
+                )));
+            }
+            (desktop_hive, "Environment\0".to_string())
+        }
+        None => (HKEY_CURRENT_USER, "Environment\0".to_string()),
+    };
+    let _desktop_hive = (!desktop_hive.is_null()).then_some(Key(desktop_hive));
+    let subkey: Vec<u16> = subkey_text.encode_utf16().collect();
     let mut raw_key = std::ptr::null_mut();
-    if unsafe {
-        RegOpenKeyExW(
-            HKEY_CURRENT_USER,
-            subkey.as_ptr(),
-            0,
-            KEY_QUERY_VALUE,
-            &mut raw_key,
-        )
-    } != 0
-    {
-        return media_model_environment_names()
-            .into_iter()
+    let status = unsafe { RegOpenKeyExW(root, subkey.as_ptr(), 0, KEY_QUERY_VALUE, &mut raw_key) };
+    if status == 2 || status == 3 {
+        if target_user_sid.is_some() {
+            return Err(AppError::Engine(format!(
+                "读取桌面用户媒体模型设置失败（Win32 {status}）"
+            )));
+        }
+        return Ok(names.iter().copied()
             .map(|name| (name.to_owned(), String::new()))
-            .collect();
+            .collect());
+    }
+    if status != 0 || raw_key.is_null() {
+        return Err(AppError::Engine(format!(
+            "读取桌面用户媒体模型设置失败（Win32 {status}）"
+        )));
     }
     let key = Key(raw_key);
-    media_model_environment_names()
-        .into_iter()
-        .map(|name| {
-            let value_name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
-            let mut value_type = 0;
-            let mut byte_len = 0;
-            let status = unsafe {
-                RegQueryValueExW(
-                    key.0,
-                    value_name.as_ptr(),
-                    std::ptr::null(),
-                    &mut value_type,
-                    std::ptr::null_mut(),
-                    &mut byte_len,
-                )
-            };
-            if status != 0 || value_type != REG_SZ || byte_len < 2 || byte_len % 2 != 0 {
-                return (name.to_owned(), String::new());
-            }
-            let mut value = vec![0u16; byte_len as usize / 2];
-            let status = unsafe {
-                RegQueryValueExW(
-                    key.0,
-                    value_name.as_ptr(),
-                    std::ptr::null(),
-                    &mut value_type,
-                    value.as_mut_ptr().cast(),
-                    &mut byte_len,
-                )
-            };
-            if status != 0 || value_type != REG_SZ {
-                return (name.to_owned(), String::new());
-            }
-            let end = value
-                .iter()
-                .position(|unit| *unit == 0)
-                .unwrap_or(value.len());
-            (name.to_owned(), String::from_utf16_lossy(&value[..end]))
-        })
-        .collect()
+    let mut settings = Vec::new();
+    for name in names.iter().copied() {
+        let value_name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut value_type = 0;
+        let mut byte_len = 0;
+        let status = unsafe {
+            RegQueryValueExW(
+                key.0,
+                value_name.as_ptr(),
+                std::ptr::null(),
+                &mut value_type,
+                std::ptr::null_mut(),
+                &mut byte_len,
+            )
+        };
+        if status == 2 {
+            settings.push((name.to_owned(), String::new()));
+            continue;
+        }
+        if status != 0 {
+            return Err(AppError::Engine(format!(
+                "读取桌面用户媒体设置 {name} 失败（Win32 {status}）"
+            )));
+        }
+        if value_type != REG_SZ || byte_len < 2 || byte_len % 2 != 0 {
+            settings.push((name.to_owned(), String::new()));
+            continue;
+        }
+        let mut value = vec![0u16; byte_len as usize / 2];
+        let status = unsafe {
+            RegQueryValueExW(
+                key.0,
+                value_name.as_ptr(),
+                std::ptr::null(),
+                &mut value_type,
+                value.as_mut_ptr().cast(),
+                &mut byte_len,
+            )
+        };
+        if status == 2 {
+            settings.push((name.to_owned(), String::new()));
+            continue;
+        }
+        if status != 0 {
+            return Err(AppError::Engine(format!(
+                "读取桌面用户媒体设置 {name} 失败（Win32 {status}）"
+            )));
+        }
+        if value_type != REG_SZ {
+            settings.push((name.to_owned(), String::new()));
+            continue;
+        }
+        let end = value
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(value.len());
+        settings.push((name.to_owned(), String::from_utf16_lossy(&value[..end])));
+    }
+    Ok(settings)
 }
 
 #[cfg(not(target_os = "windows"))]
-fn current_user_model_settings() -> Vec<(String, String)> {
-    media_model_environment_names()
-        .into_iter()
+pub(crate) fn current_user_environment_settings(names: &[&str]) -> Result<Vec<(String, String)>, AppError> {
+    Ok(names.iter().copied()
         .map(|name| (name.to_owned(), String::new()))
-        .collect()
+        .collect())
+}
+
+fn current_user_model_settings() -> Result<Vec<(String, String)>, AppError> {
+    current_user_environment_settings(&media_model_environment_names())
 }
 
 fn media_model_environment_names() -> [&'static str; 6] {
@@ -491,6 +569,50 @@ fn media_model_environment_names() -> [&'static str; 6] {
 mod tests {
     use super::*;
     use codex_usb_license::UsbCcswitchBinding;
+
+    #[cfg(windows)]
+    fn check_fixture(value: Value) -> Result<(), AppError> {
+        use std::os::windows::process::ExitStatusExt;
+        validate_credential_check_output(&std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: serde_json::to_vec(&value).unwrap(),
+            stderr: b"must-not-appear-in-error secret-fixture".to_vec(),
+        })
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn credential_check_distinguishes_missing_models_from_authorization_failure() {
+        let mut value = serde_json::json!({"credentialSource":"dpapi-current-user",
+            "apiKeyConfigured":true,"baseUrlConfigured":true,"configuredModelCount":1});
+        assert!(check_fixture(value.clone()).is_ok());
+        value["configuredModelCount"] = 0.into();
+        let error = check_fixture(value.clone()).unwrap_err().to_string();
+        assert!(error.contains("媒体模型未配置"));
+        assert!(!error.contains("本机凭据未成功解密"));
+        value["configuredModelCount"] = 1.into();
+        value["credentialSource"] = "missing".into();
+        value["apiKeyConfigured"] = false.into();
+        value["credentialErrorType"] = "CryptographicException".into();
+        value["credentialErrorCode"] = (-2147024809_i64).into();
+        let error = check_fixture(value).unwrap_err().to_string();
+        assert!(error.contains("本机凭据未成功解密"));
+        assert!(error.contains("CryptographicException"));
+        assert!(error.contains("-2147024809"));
+        assert!(!error.contains("secret-fixture"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn credential_check_reports_endpoint_and_never_raw_diagnostics() {
+        let error = check_fixture(serde_json::json!({"credentialSource":"process",
+            "apiKeyConfigured":true,"baseUrlConfigured":false,"configuredModelCount":1,
+            "connectionErrorType":"secret\nAuthorization: fixture"})).unwrap_err().to_string();
+        assert!(error.contains("网关地址未配置"));
+        assert!(error.contains("credentialSource=process"));
+        assert!(!error.contains("secret"));
+        assert!(!error.contains("Authorization:"));
+    }
 
     fn binding(provider_id: &str, device_api_key: &str) -> UsbAccountBinding {
         UsbAccountBinding {

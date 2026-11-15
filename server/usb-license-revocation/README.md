@@ -51,6 +51,8 @@ The “作废” action requires a reason, checking the confirmation box, and re
 
 The public service endpoints are `POST /v1/licenses/check`, `POST /v1/licenses/register`, and `GET /healthz`. Admin routes are separate and authenticated. The example Caddy configuration forwards only those endpoints and `/admin` paths; all other paths return 404.
 
+`/healthz` returns 503 while the store is marked unknown, with only `{"status":"unavailable"}` in its public body. Fixed failure categories are recorded in server logs, including `registration_mismatch` for a valid proof conflicting with a stored binding and `license_not_registered` for an absent record. A binding conflict rejects only that request (HTTP 409); it does not disable other USB licenses. A 200 health result reflects the store's known state, while each business request still performs the existing journal/database consistency checks.
+
 ## Local run
 
 Set these environment variables to temporary paths and a fixture keyring before running the binary:

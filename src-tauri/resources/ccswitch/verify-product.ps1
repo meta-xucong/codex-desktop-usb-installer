@@ -36,6 +36,12 @@ Assert-Condition ($provider.baseUrl -eq "https://404token.xyz/v1") "Base URL 不
 Assert-Condition ($provider.modelsUrl -eq "https://404token.xyz/v1/models") "模型目录 URL 不正确"
 Assert-Condition ($provider.protocol -eq "responses") "协议必须为 Responses"
 Assert-Condition ($manifest.secretsIncluded -eq $false) "发布物不应包含密钥"
+Assert-Condition ($manifest.sourceVersion -eq "4.0.20") "CCSwitch 源码版本必须为 4.0.20"
+Assert-Condition ($manifest.sourceCommit -eq "85ad4969b3399500baaea9d46b1e08f87aba80e1") "CCSwitch 源码提交不匹配固定升级基线"
+Assert-Condition ($manifest.artifact.buildStatus -eq "built") "CCSwitch 尚未完成 4.0.20 实包重建，不能发布旧 EXE"
+Assert-Condition ($manifest.artifact.sourceVersion -eq $manifest.sourceVersion) "EXE 构建版本与源码版本不一致"
+Assert-Condition ($manifest.artifact.sourceCommit -eq $manifest.sourceCommit) "EXE 构建提交与源码提交不一致"
+Assert-Condition ($manifest.sourcePatch -eq "source-patches/ccswitch-usb-product-85ad4969.patch") "CCSwitch 产品补丁路径不是本次升级基线"
 
 $sha256 = (Get-FileHash -LiteralPath $exePath -Algorithm SHA256).Hash.ToUpperInvariant()
 Assert-Condition ($sha256 -eq ([string]$manifest.artifact.sha256).ToUpperInvariant()) "EXE SHA256 与 manifest 不一致"
@@ -52,8 +58,8 @@ Assert-Condition ($sourcePatchHash -eq ([string]$manifest.sourcePatchSha256).ToU
 $binaryText = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($exePath))
 Assert-Condition ($binaryText.Contains("404token.xyz/v1")) "EXE 未包含 404TOKEN 端点"
 Assert-Condition ($binaryText.Contains("CODEX_USB_404TOKEN_HANDOFF_V1")) "EXE 不支持管理器确认式 API Key 注入；请使用包含持久化回读确认协议的 CCSwitch 源码重新构建"
-Assert-Condition ($binaryText.Contains("CODEX_USB_MCP_PRESERVATION_V1")) "EXE 缺少 USB Codex MCP 保留实现；拒绝发布可能覆盖 config.toml 的旧版 CCSwitch"
-Assert-Condition ($binaryText.Contains("CODEX_USB_MCP_SYNC_FAILURE_RECOVERY_V1")) "EXE 缺少 Codex MCP 同步失败恢复实现；拒绝发布可能复活已禁用 MCP 的 CCSwitch"
+Assert-Condition ($binaryText.Contains("CODEX_USB_V4_FIELD_WRITE_V1")) "EXE 缺少 4.x 原生字段写入协议；拒绝发布旧版 CCSwitch"
+Assert-Condition ($binaryText.Contains("CODEX_USB_FULL_IMPORT_V1")) "EXE lacks complete legacy-store import"
 Assert-Condition (-not $binaryText.Contains("127.0.0.1:8080")) "EXE 不应包含旧本地代理地址"
 # A release binary built without Tauri's custom-protocol feature falls back to
 # devUrl (localhost:3000) on a blank machine.  The compiled renderer asset

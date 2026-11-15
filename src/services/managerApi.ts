@@ -11,6 +11,7 @@ import type {
   CodexThemeSummary,
   CommandError,
   CcswitchLaunchReport,
+  UsbHostStatus,
   AccountStatus,
   CcswitchUninstallReport,
   CapabilityPackInstallOptions,
@@ -1958,6 +1959,15 @@ export const managerApi = {
     return invoke<WinInstallStatus>("win_adopt_path", { path });
   },
   // Open the installed Codex — explicit user action (mirrors macLaunch).
+  usbHostStatus(): Promise<UsbHostStatus> {
+    if (!hasTauriRuntime()) return Promise.resolve({ required: false, ready: true,
+      accountReady: true, capabilitiesReady: true, conflict: false, message: "" });
+    return invoke<UsbHostStatus>("usb_host_status");
+  },
+  initializeUsbHost(replaceAccount = false): Promise<UsbHostStatus> {
+    if (!hasTauriRuntime()) return this.usbHostStatus();
+    return invoke<UsbHostStatus>("initialize_usb_host", { replaceAccount });
+  },
   winLaunch(locale?: string): Promise<void> {
     if (!hasTauriRuntime()) {
       return Promise.resolve();
@@ -2102,6 +2112,7 @@ export const managerApi = {
   /** Install or repair the complete offline capability pack. */
   installCapabilityPack(
     options: CapabilityPackInstallOptions,
+    preserveExisting = false,
   ): Promise<CapabilityPackReport> {
     if (!hasTauriRuntime()) {
       return Promise.resolve({
@@ -2131,7 +2142,7 @@ export const managerApi = {
         message: "browser preview: capability pack installation is unavailable",
       });
     }
-    return invoke<CapabilityPackReport>("install_capability_pack", { options });
+    return invoke<CapabilityPackReport>("install_capability_pack", { options, preserveExisting });
   },
   /** Inspect the independent unsigned Skill Hub overlay. */
   skillRepoCheckUpdate(): Promise<SkillRepoUpdateInfo> {

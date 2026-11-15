@@ -229,7 +229,8 @@ fn require_usb_install_account_binding() -> Result<(), AppError> {
 }
 
 async fn require_usb_install_preflight() -> Result<(), AppError> {
-    require_usb_install_network().await?;
+    // Authorization is checked at every mutation boundary. A gateway homepage
+    // probe cannot determine whether the verified local payload can install.
     require_usb_install_account_binding()
 }
 
@@ -238,6 +239,7 @@ async fn require_usb_install_preflight() -> Result<(), AppError> {
 pub struct UsbInstallPreflightReport {
     pub internet_available: bool,
     pub api_key_ready: bool,
+    pub has_existing_usb_managed_config: bool,
 }
 
 enum HistoricalReleaseNetwork {
@@ -884,6 +886,8 @@ struct DownloadProgressEvent {
     operation_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     phase: Option<OperationPhase>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    activity: Option<String>,
 }
 
 fn emit_op_phase(
@@ -906,6 +910,7 @@ fn emit_op_phase(
             source: progress.map(|p| p.source).unwrap_or_default(),
             operation_id: token.0.clone(),
             phase: Some(phase),
+            activity: None,
         },
     );
 }
@@ -918,6 +923,21 @@ fn emit_op_download_progress(
     downloaded: u64,
     total: u64,
     source: String,
+) {
+    emit_op_download_progress_with_activity(
+        app, operations, token, channel, downloaded, total, source, None,
+    );
+}
+
+fn emit_op_download_progress_with_activity(
+    app: &AppHandle,
+    operations: &OperationManager,
+    token: &OperationToken,
+    channel: &str,
+    downloaded: u64,
+    total: u64,
+    source: String,
+    activity: Option<String>,
 ) {
     let progress = OperationProgress {
         downloaded,
@@ -956,6 +976,7 @@ fn emit_op_download_progress(
             source,
             operation_id: token.0.clone(),
             phase,
+            activity,
         },
     );
 }
@@ -1371,9 +1392,19 @@ pub async fn win_check_install_preflight(
     reject_uninstall_handoff(&state)?;
     let internet_available = require_usb_install_network().await.is_ok();
     let api_key_ready = require_usb_install_account_binding().is_ok();
+    let has_existing_usb_managed_config = if crate::app::usb_guard::guard_required() {
+        crate::app::usb_guard::local_data_paths()?
+            .codex_home
+            .join("config.toml")
+            .try_exists()
+            .map_err(|error| AppError::Engine(format!("读取受管 Codex 配置状态失败：{error}")))?
+    } else {
+        false
+    };
     Ok(UsbInstallPreflightReport {
         internet_available,
         api_key_ready,
+        has_existing_usb_managed_config,
     })
 }
 
@@ -2765,6 +2796,7 @@ fn begin_theme_restart_guard(state: &ManagerState) -> Result<OperationGuard, Com
     // boundary before any theme flow mutates it or quits the running process.
     if matches!(state.target.os, OperatingSystem::Windows) {
         crate::app::codex_config_guard::ensure_user_config_ready()?;
+        crate::app::usb_host::ensure_ready()?;
     }
     Ok(operation)
 }
@@ -3376,6 +3408,7 @@ pub async fn win_launch_codex(
     // stay untouched and are returned to the UI instead of becoming a silent
     // no-window startup failure.
     crate::app::codex_config_guard::ensure_user_config_ready()?;
+    crate::app::usb_host::ensure_ready()?;
     let persisted = PersistedAppSettings::load();
     let settings = windows_domain_settings_for_persisted(&state);
     let codex_locale = locale
@@ -3443,6 +3476,79 @@ pub fn usb_guard_status() -> UsbGuardStatus {
     crate::app::usb_guard::current_status()
 }
 
+#[tauri::command]
+pub async fn usb_host_status() -> Result<crate::app::usb_host::UsbHostStatus, CommandError> {
+    tauri::async_runtime::spawn_blocking(crate::app::usb_host::status).await
+        .map_err(|e| AppError::Internal(format!("join: {e}")))?.map_err(Into::into)
+}
+
+/// Separate from the short direct-entry launch request. One existing Install
+/// lease covers all host writes; internal implementations never reacquire it.
+#[tauri::command]
+pub async fn initialize_usb_host(
+    app: AppHandle,
+    state: State<'_, ManagerState>,
+    replace_account: bool,
+) -> Result<crate::app::usb_host::UsbHostStatus, CommandError> {
+    let op = begin_guard(&state, OperationKind::Install)?;
+    crate::app::usb_guard::require_usb_content_access("usb-host-initialize")?;
+    if !crate::app::usb_guard::guard_required() { return usb_host_status().await; }
+    let token = op.token().clone();
+    let operations = state.operations.clone();
+    operations.set_phase(&token, OperationPhase::Finishing)
+        .map_err(|e| AppError::Engine(e.to_string()))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _op = op;
+        let stage = |name: &str| {
+            let _ = operations.set_progress(&token, OperationProgress {
+                downloaded: 0, total: 0, source: format!("usb-host:{name}"),
+            });
+            let _ = app.emit("usb-host://progress", name);
+            log::info!("USB host initialization stage={name}");
+        };
+        stage("check");
+        let before = crate::app::usb_host::status()?;
+        if before.ready { return Ok(before); }
+        if before.conflict && !replace_account {
+            return Err(AppError::Engine(before.message));
+        }
+        // The existing launch consumer closes only this authorized USB root,
+        // then clears the marker after a successful spawn. Persist intent
+        // before any write so an interrupted setup cannot reuse a stale login
+        // process on the next Launch request.
+        crate::app::model_catalog::mark_restart_required()?;
+        crate::app::codex_config_guard::ensure_user_config_ready()?;
+        crate::app::usb_host::complete_initialization(|| {
+          if !before.capabilities_ready {
+            stage("capabilities");
+            let home = crate::app::usb_guard::local_data_paths()?.codex_home;
+            let config = crate::app::usb_host::read_config(&home)?;
+            if crate::app::capability_pack::host_core_ready(&home, &config)? {
+                crate::app::capability_pack::refresh_media_authorization(&home)?;
+            } else {
+                let options = crate::app::capability_pack::host_install_options(&home)?;
+                install_capability_pack_impl(&app, options)?;
+            }
+          }
+          Ok(())
+        }, || {
+          if !crate::app::usb_host::status()?.account_ready {
+            stage("account");
+            let report = crate::app::ccswitch::initialize_host_account(&app, replace_account)?;
+            if report.account_injection_status != "verified" {
+                return Err(AppError::Engine("本机账号配置未确认成功；程序已保留，请查看安装详情后重试本机初始化。".into()));
+            }
+          }
+          Ok(())
+        })?;
+        stage("verify");
+        let after = crate::app::usb_host::status()?;
+        if !after.ready { return Err(AppError::Engine(after.message)); }
+        log::info!("USB host initialization completed");
+        Ok(after)
+    }).await.map_err(|e| AppError::Internal(format!("join: {e}")))?.map_err(Into::into)
+}
+
 /// Read the signed 404token binding and perform an explicitly requested,
 /// read-only model-directory check or gateway capability probe.
 #[tauri::command]
@@ -3499,7 +3605,7 @@ pub async fn install_and_launch_ccswitch(
     app: AppHandle,
     state: State<'_, ManagerState>,
 ) -> Result<CcswitchLaunchReport, CommandError> {
-    reject_uninstall_handoff(&state)?;
+    let _op = begin_guard(&state, OperationKind::Install)?;
     crate::app::usb_guard::require_usb_content_access("ccswitch-launch")?;
     tauri::async_runtime::spawn_blocking(move || install_and_launch_ccswitch_impl(&app))
         .await
@@ -3569,10 +3675,22 @@ pub async fn install_capability_pack(
     app: AppHandle,
     state: State<'_, ManagerState>,
     options: CapabilityPackInstallOptions,
+    preserve_existing: Option<bool>,
 ) -> Result<CapabilityPackReport, CommandError> {
     let _op = begin_guard(&state, OperationKind::Install)?;
     crate::app::usb_guard::require_usb_content_access("capability-pack-install")?;
-    tauri::async_runtime::spawn_blocking(move || install_capability_pack_impl(&app, options))
+    tauri::async_runtime::spawn_blocking(move || {
+        let options = if preserve_existing == Some(true) && crate::app::usb_guard::guard_required() {
+            // Capability setup preserves settings independently of the account;
+            // the following USB bootstrap applies the authorized USB account.
+            let home = crate::app::usb_guard::local_data_paths()?.codex_home;
+            let config = crate::app::usb_host::read_config(&home)?;
+            if config.get("mcp_servers").is_some() || home.join("codex-agent-kit/readiness.json").is_file() {
+                crate::app::capability_pack::host_install_options(&home)?
+            } else { options }
+        } else { options };
+        install_capability_pack_impl(&app, options)
+    })
         .await
         .map_err(|error| AppError::Internal(format!("join: {error}")))?
         .map_err(Into::into)
@@ -3704,7 +3822,7 @@ pub async fn win_perform_update(
     let report = tauri::async_runtime::spawn_blocking(move || {
         let report = move |p: WinDownloadProgress| {
             if let Some(token) = progress_token.as_ref() {
-                emit_op_download_progress(
+                emit_op_download_progress_with_activity(
                     &progress_app,
                     &progress_ops,
                     token,
@@ -3712,6 +3830,7 @@ pub async fn win_perform_update(
                     p.downloaded,
                     p.total,
                     p.source,
+                    p.activity,
                 );
             } else {
                 let _ = progress_app.emit("win://download-progress", p);
@@ -3950,7 +4069,7 @@ pub async fn win_install_historical_release(
         }
         let progress = move |p: WinDownloadProgress| {
             if let Some(token) = progress_token.as_ref() {
-                emit_op_download_progress(
+                emit_op_download_progress_with_activity(
                     &progress_app,
                     &progress_ops,
                     token,
@@ -3958,6 +4077,7 @@ pub async fn win_install_historical_release(
                     p.downloaded,
                     p.total,
                     p.source,
+                    p.activity,
                 );
             }
         };
@@ -4412,9 +4532,9 @@ fn finish_bundle_uninstall_report(report: &mut WinBundleUninstallReport) {
 /// Windows USB build: remove the manager-owned Codex installation and the
 /// locally copied CCSwitch program in one guarded operation. Both operations
 /// are idempotent; if one side is already absent, the other side is still
-/// attempted. User data is retained unless the corresponding purge flag is
-/// explicitly enabled by the UI. The offline USB installation kit is always
-/// preserved so the drive remains reusable for a future reinstall.
+/// attempted. The uninstall UI explicitly enables both local-data purge flags
+/// after its two confirmation steps. The offline USB installation kit is
+/// always preserved so the drive remains reusable for a future reinstall.
 #[tauri::command]
 pub async fn win_uninstall_bundle(
     state: State<'_, ManagerState>,

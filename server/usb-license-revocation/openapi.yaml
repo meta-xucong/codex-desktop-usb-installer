@@ -11,13 +11,22 @@ paths:
       operationId: health
       responses:
         '200':
-          description: Process liveness only; does not expose license state.
+          description: Store has no known unavailable state; does not expose internal reasons or individual license state. Business requests still perform full consistency checks.
           content:
             application/json:
               schema:
                 type: object
                 properties:
                   status: { const: ok }
+                required: [status]
+        '503':
+          description: Store is in an unavailable state; internal reason is logged only on the server.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { const: unavailable }
                 required: [status]
   /v1/licenses/check:
     post:
@@ -36,6 +45,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/SignedEnvelope'
         '400': { description: Malformed request or rejected registration proof; unsigned. }
+        '409': { description: Valid proof conflicts with the stored binding; unsigned. Other licenses remain available. }
         '413': { description: Request exceeds 64 KiB; unsigned. }
         '415': { description: Content-Type is not application/json; unsigned. }
         '429': { description: Rate limit exceeded; unsigned. }

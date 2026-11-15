@@ -71,12 +71,21 @@ func NewHTTPServer(store *Store, keyring map[string]ed25519.PublicKey, cfg HTTPC
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
+	if !store.IsHealthy() {
+		logger.Error("license storage unavailable", "reason", store.failureReason(errStoreUnknown))
+	}
 	bucket := newTokenBucket(cfg.MaxRatePerMinute, cfg.RateBurst)
 	registrationBucket := newTokenBucket(20, 4)
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "no-store")
+		if !store.IsHealthy() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = io.WriteString(w, `{"status":"unavailable"}`)
+			logger.Warn("license health", "outcome", "state_unknown", "reason", store.failureReason(errStoreUnknown))
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, `{"status":"ok"}`)
 	})
@@ -121,9 +130,11 @@ func NewHTTPServer(store *Store, keyring map[string]ed25519.PublicKey, cfg HTTPC
 			status, outcome := http.StatusServiceUnavailable, "state_unknown"
 			if errors.Is(err, errInvalidRegistration) {
 				status, outcome = http.StatusBadRequest, "proof_rejected"
+			} else if errors.Is(err, errRegistrationMismatch) {
+				status, outcome = http.StatusConflict, "registration_conflict"
 			}
 			writeError(w, status)
-			logger.Info("license check", "outcome", outcome, "installation_id", safeLogID(req.InstallationID), "request_id", safeLogID(req.RequestID), "elapsed_ms", time.Since(start).Milliseconds())
+			logger.Info("license check", "outcome", outcome, "reason", store.failureReason(err), "installation_id", safeLogID(req.InstallationID), "request_id", safeLogID(req.RequestID), "elapsed_ms", time.Since(start).Milliseconds())
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -205,7 +216,7 @@ func handleRegistrationUpload(w http.ResponseWriter, r *http.Request, store *Sto
 			status, outcome, code = http.StatusConflict, "registration_conflict", "registration_conflict"
 		}
 		writeRegistrationError(w, status, code)
-		logger.Info("license registration", "outcome", outcome, "elapsed_ms", time.Since(start).Milliseconds())
+		logger.Info("license registration", "outcome", outcome, "reason", store.failureReason(err), "elapsed_ms", time.Since(start).Milliseconds())
 		return
 	}
 	if record.Status != "active" {

@@ -130,10 +130,12 @@ client rejects other destinations, and HTTP redirects are disabled for
 requests carrying the administrator credential.
 The target CCSwitch group is fixed to `unified-api-internal`; there is no
 group-ID field and no per-model key selection. New accounts use the fixed
-initial password `12345678`. The signer allocates the next
-`USB-xxxx` account, creates the user API key through the user login flow, injects
-the binding into the signed `usb-license.json`, verifies the writeback, and only
-then performs the first balance addition with a stable idempotency key.
+initial password `12345678`. The signer allocates the next `USB-xxxx` account,
+creates the user API key through the user login flow, injects the binding into
+the signed `usb-license.json`, and verifies the writeback. For a newly created
+account with a positive preload amount, it then sends the initial balance
+addition directly. VPS license activation is a separate status and does not
+gate this 404token balance request. Existing accounts are not charged again.
 
 The administrator key is loaded automatically: managed environment variables
 take precedence and production builds contain the credential embedded at
@@ -142,7 +144,10 @@ signer directories must not contain a sidecar administrator-key file. Only
 non-secret endpoint preferences are saved in the normal signer-local
 configuration.
 The administrator key is never put in the runtime USB bundle, license, reports,
-logs, or CCSwitch. Existing bindings are
+logs, or CCSwitch. Pending preload records contain only the user ID, amount,
+USB asset ID, license digest, idempotency key, and timestamp; they are stored
+under the current Windows user's `%LOCALAPPDATA%`, not on the USB. Moving the
+USB to another computer does not move this pending intent. Existing bindings are
 reused and do not trigger an implicit second preload. Before sending the
 account-creation request, the signer records the intended USB number and email
 in a DPAPI-encrypted recovery record. It then records the remote user ID and
@@ -155,18 +160,14 @@ and preload still require a separately authorized disposable test
 account/amount;
 the repository tests use a local HTTP fixture only.
 
-In this one-click flow, initial balance addition runs only after the signed USB
-license is locally verified and the VPS confirms a matching active registration.
-Pending, conflicting, or revoked VPS states skip the preload; syncing the same
-proof later does not create another account or repeat a completed preload.
-
-If signing and readback succeed but the preload request fails, the GUI keeps a
-non-secret pending record under
-`%LOCALAPPDATA%\CodexUsbLicenseSigner\pending\USB-xxxx.json` and enables
-“retry preload”. The retry replays only the balance request with the original
-idempotency key; it never creates another account or API key. The backend must
-honor `Idempotency-Key`; otherwise confirm the balance in the admin console
-before retrying.
+Before the balance request, the signer stores a non-secret pending record under
+`%LOCALAPPDATA%\CodexUsbLicenseSigner\pending\USB-xxxx.json`. If the request
+fails, the record keeps the same account, amount, license digest, and
+idempotency key. “重试预充值” retries that exact request directly; it does not
+create an account, generate an API key, or contact the license VPS. The separate
+“同步/补发并激活” action updates only the license registration and never
+initiates a balance request. Duplicate prevention on an uncertain retry depends
+on the 404token balance endpoint honoring `Idempotency-Key`.
 
 ## Release binding gate
 

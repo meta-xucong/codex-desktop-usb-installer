@@ -22,6 +22,21 @@ custom-protocol = ["tauri/custom-protocol"]
 # WebView2/VC/recovery/lease side effect. Development builds keep the
 # explicit unsigned auto-enrolment path for local assembly.
 signed-required = []
+# Separate, explicitly signed diagnostic manager target. Its USB guard state and
+# helper use a dedicated namespace; the ordinary manager remains unchanged.
+usb-cdp-diagnostic = ["custom-protocol", "signed-required"]
+# USB helper integration retained from the tested November USB builds.
+# Keep the historical feature name to match those builds and their resources.
+usb-cua-helper-mta-experiment = ["custom-protocol", "signed-required"]
+
+[[bin]]
+name = "codex-app-manager"
+path = "src/main.rs"
+
+[[bin]]
+name = "codex-usb-cdp-diagnostic"
+path = "src/diagnostic_main.rs"
+required-features = ["usb-cdp-diagnostic"]
 
 [lib]
 name = "codex_app_manager_lib"

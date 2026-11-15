@@ -7,6 +7,8 @@ description: 将自然语言视频需求先提取为结构化 SceneSpec，再针
 
 把创意需求拆成可审计的规格，再生成适合 Grok 的短 Prompt。Skill 不承诺模型会帧级执行；它必须明确哪些要求被保留、哪些要求被降级，以及哪些结果需要后期完成。
 
+用户要求实际生成视频时，U 盘版默认使用统一 `media_generation` MCP。先按相邻 [image-2 技能的首次发现与只读能力检查](../image-2/SKILL.md) 自行发现并调用媒体入口；顶层没有视频工具或 CUA 清单为空，不代表视频 MCP 缺失。只编写 Prompt/分镜时无需探测或提交任务。
+
 ## 工作流
 
 1. 读取用户需求和参考图，提取 `SceneSpec`。每次按具体需求确定 `reference.usage`：`i2v_first_frame`、`identity_only`、`keyframe` 或 `unknown`；不能把某一种参考图用途写成全局默认。对于当前没有独立身份参考/关键帧通道的调用链，只有在本次任务明确要求身份参考或关键帧时，才提出相应替代方案。参考图有拼贴、贴纸或多人物时，显式标记 `reference.kind=collage`，但不要因此默认删除这些画面元素。只有本镜确实需要跨帧关系稳定时，才添加 `continuity` 锚点；它不推导出单人、单场景、固定镜头或少道具。
@@ -66,7 +68,7 @@ description: 将自然语言视频需求先提取为结构化 SceneSpec，再针
 - `qa_checklist`: 生成后要检查的项目
 - `post_production`: 需要剪辑、遮罩或单独配乐完成的项目
 
-调用视频 MCP 时保留用户选定的模型和参数。先读取 `get_video_preflight`，再使用与 profile 对应的字段和限制；不要把 `xai-video-v1`、兼容网关或其他 host 的字段混用。读取任务返回的 `visual_input_mode`：`text_to_video` 表示本次没有视觉输入，`image_to_video` 表示本次提交按首帧语义处理，`reference_to_video` 表示本次提交按独立参考语义处理；它是请求模式回显，不是模型已正确理解图片的证明。创建任务后只轮询同一个 request ID；不要因为内容偏差盲目重复付费任务，先审计并得到用户确认。
+调用视频 MCP 时保留用户选定的模型和参数。统一媒体 MCP 使用 `media_capabilities` 确认 provider 状态，再用 `media_prepare` 做本地请求预检并生成确认清单；用户确认这份请求后才调用 `media_submit`。只有用户明确选择另一 MCP 且其实际声明提供 `get_video_preflight` 时，才使用该入口。使用与当前 profile 对应的字段和限制，不要把 `xai-video-v1`、兼容网关或其他 host 的字段混用。读取任务返回的 `visual_input_mode`：`text_to_video` 表示本次没有视觉输入，`image_to_video` 表示本次提交按首帧语义处理，`reference_to_video` 表示本次提交按独立参考语义处理；它是请求模式回显，不是模型已正确理解图片的证明。创建任务后只轮询同一个 request ID；不要因为内容偏差盲目重复付费任务，先审计并得到用户确认。
 
 ## 资源
 

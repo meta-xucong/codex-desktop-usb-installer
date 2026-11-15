@@ -46,9 +46,18 @@ pub use license_core::{
     LICENSE_SCHEMA_VERSION, PRODUCT_ID,
 };
 
+#[cfg(not(feature = "usb-cdp-diagnostic"))]
 pub const GUARD_ARG: &str = "--codex-usb-guard";
+#[cfg(feature = "usb-cdp-diagnostic")]
+pub const GUARD_ARG: &str = "--codex-usb-cdp-guard";
+#[cfg(not(feature = "usb-cdp-diagnostic"))]
 pub const GUARD_EXE_NAME: &str = "CodexUsbGuard.exe";
+#[cfg(feature = "usb-cdp-diagnostic")]
+pub const GUARD_EXE_NAME: &str = "CodexUsbCdpGuard.exe";
+#[cfg(not(feature = "usb-cdp-diagnostic"))]
 pub const GUARD_DIR_NAME: &str = "CodexUsbGuard";
+#[cfg(feature = "usb-cdp-diagnostic")]
+pub const GUARD_DIR_NAME: &str = "CodexUsbCdpDiagnosticGuard";
 pub const USB_APPS_DIR_NAME: &str = "apps";
 pub const USB_CODEX_DIR_NAME: &str = "Codex";
 pub const USB_CONTENT_DIR_NAME: &str = "content";
@@ -315,6 +324,8 @@ pub struct UsbLocalDataPaths {
     pub codex_home: PathBuf,
     pub roaming_app_data: PathBuf,
     pub local_app_data: PathBuf,
+    pub user_profile: Option<PathBuf>,
+    pub user_sid: Option<String>,
 }
 
 fn engine(message: impl Into<String>) -> AppError {
@@ -1784,22 +1795,73 @@ pub fn authorized_usb_codex_root() -> Result<PathBuf, AppError> {
     Ok(codex)
 }
 
-fn required_profile_path(name: &str) -> Result<PathBuf, AppError> {
-    let value = std::env::var_os(name)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| engine(format!("Windows 用户环境缺少 {name}")))?;
-    let path = PathBuf::from(value);
+fn validate_profile_path(name: &str, path: PathBuf) -> Result<PathBuf, AppError> {
+    if path.as_os_str().is_empty() {
+        return Err(engine(format!("Windows 用户环境缺少 {name}")));
+    }
     if !path.is_absolute() {
         return Err(engine(format!("Windows 用户环境 {name} 不是绝对路径")));
     }
     Ok(path)
 }
 
+fn required_profile_path(name: &str) -> Result<PathBuf, AppError> {
+    let value = std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| engine(format!("Windows 用户环境缺少 {name}")))?;
+    validate_profile_path(name, PathBuf::from(value))
+}
+
 /// Validate that all mutable Codex state stays outside the removable product
 /// volume. This is an observed boundary, not an AppX policy assumption.
 pub fn local_data_paths() -> Result<UsbLocalDataPaths, AppError> {
-    let roaming_app_data = required_profile_path("APPDATA")?;
-    let local_app_data = required_profile_path("LOCALAPPDATA")?;
+    let desktop_profile_paths = codex_win_engine::desktop_user_profile_paths_if_elevated()
+        .map_err(|error| {
+            engine(format!(
+                "无法读取当前桌面用户环境，不能解析 USB 配置目录：{error}"
+            ))
+        })?;
+    local_data_paths_from_desktop_profile(desktop_profile_paths)
+}
+
+/// Resolve the USB data roots only when this process is both running in USB
+/// mode and elevated. Deferred uninstall uses this to preserve its original
+/// BaseDirs behavior for non-elevated and non-USB launches.
+pub(crate) fn elevated_usb_local_data_paths() -> Result<Option<UsbLocalDataPaths>, AppError> {
+    if !guard_required() {
+        return Ok(None);
+    }
+    let desktop_profile_paths = codex_win_engine::desktop_user_profile_paths_if_elevated()
+        .map_err(|error| {
+            engine(format!(
+                "无法读取当前桌面用户环境，不能解析 USB 卸载目录：{error}"
+            ))
+        })?;
+    desktop_profile_paths
+        .map(|paths| local_data_paths_from_desktop_profile(Some(paths)))
+        .transpose()
+}
+
+fn local_data_paths_from_desktop_profile(
+    desktop_profile_paths: Option<codex_win_engine::DesktopUserEnvironmentPaths>,
+) -> Result<UsbLocalDataPaths, AppError> {
+    let (roaming_app_data, local_app_data, user_profile, user_sid) = match desktop_profile_paths {
+        Some(paths) => (
+            validate_profile_path("APPDATA", paths.app_data)?,
+            validate_profile_path("LOCALAPPDATA", paths.local_app_data)?,
+            paths.user_profile,
+            Some(paths.user_sid),
+        ),
+        None => (
+            required_profile_path("APPDATA")?,
+            required_profile_path("LOCALAPPDATA")?,
+            std::env::var_os("USERPROFILE").map(PathBuf::from),
+            None,
+        ),
+    };
+    #[cfg(feature = "usb-cdp-diagnostic")]
+    let codex_home = diagnostic_codex_home()?;
+    #[cfg(not(feature = "usb-cdp-diagnostic"))]
     let codex_home = local_app_data
         .join("CodexAppManager")
         .join("usb-codex-home");
@@ -1832,7 +1894,61 @@ pub fn local_data_paths() -> Result<UsbLocalDataPaths, AppError> {
         codex_home,
         roaming_app_data,
         local_app_data,
+        user_profile,
+        user_sid,
     })
+}
+
+#[cfg(feature = "usb-cdp-diagnostic")]
+const DIAGNOSTIC_CODEX_HOME_ENV: &str = "CODEX_USB_CDP_DIAGNOSTIC_CODEX_HOME";
+
+#[cfg(feature = "usb-cdp-diagnostic")]
+fn diagnostic_codex_home() -> Result<PathBuf, AppError> {
+    let requested = std::env::var_os(DIAGNOSTIC_CODEX_HOME_ENV).map(PathBuf::from);
+    validate_diagnostic_codex_home(requested)
+}
+
+#[cfg(feature = "usb-cdp-diagnostic")]
+fn validate_diagnostic_codex_home(requested: Option<PathBuf>) -> Result<PathBuf, AppError> {
+    let requested = requested.ok_or_else(|| engine(format!(
+            "CDP 诊断启动前必须显式设置 {DIAGNOSTIC_CODEX_HOME_ENV} 为已有 Codex 配置目录；程序不会复制或新建配置"
+        )))?;
+    if !requested.is_absolute() {
+        return Err(engine(format!(
+            "{DIAGNOSTIC_CODEX_HOME_ENV} 必须是绝对路径"
+        )));
+    }
+    let metadata = std::fs::symlink_metadata(&requested).map_err(|_| {
+        engine(format!(
+            "{DIAGNOSTIC_CODEX_HOME_ENV} 必须指向已存在的 Codex 配置目录"
+        ))
+    })?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(engine(format!(
+            "{DIAGNOSTIC_CODEX_HOME_ENV} 必须指向普通目录，不能是文件或符号链接"
+        )));
+    }
+    requested.canonicalize().map_err(|_| {
+        engine(format!(
+            "无法解析 {DIAGNOSTIC_CODEX_HOME_ENV} 指定的现有目录"
+        ))
+    })
+}
+
+/// Select the registry identity for user-scoped USB capability settings.
+/// Elevated USB managers target the interactive desktop user's loaded hive;
+/// non-elevated and non-USB callers retain the process user's HKCU behavior.
+pub fn user_environment_registry_sid() -> Result<Option<String>, AppError> {
+    if !guard_required() {
+        return Ok(None);
+    }
+    codex_win_engine::desktop_user_profile_paths_if_elevated()
+        .map(|paths| paths.map(|paths| paths.user_sid))
+        .map_err(|error| {
+            engine(format!(
+                "无法读取当前桌面用户身份，不能选择 USB 环境变量配置：{error}"
+            ))
+        })
 }
 
 /// Re-check the physical USB identity at a privileged-operation boundary.
@@ -4621,6 +4737,39 @@ pub fn guard_requested() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guard_artifacts_and_state_directory_use_the_diagnostic_namespace_only_in_diagnostic_builds()
+    {
+        #[cfg(feature = "usb-cdp-diagnostic")]
+        {
+            assert_eq!(GUARD_ARG, "--codex-usb-cdp-guard");
+            assert_eq!(GUARD_EXE_NAME, "CodexUsbCdpGuard.exe");
+            assert_eq!(GUARD_DIR_NAME, "CodexUsbCdpDiagnosticGuard");
+        }
+        #[cfg(not(feature = "usb-cdp-diagnostic"))]
+        {
+            assert_eq!(GUARD_ARG, "--codex-usb-guard");
+            assert_eq!(GUARD_EXE_NAME, "CodexUsbGuard.exe");
+            assert_eq!(GUARD_DIR_NAME, "CodexUsbGuard");
+        }
+    }
+
+    #[cfg(feature = "usb-cdp-diagnostic")]
+    #[test]
+    fn diagnostic_codex_home_requires_an_explicit_existing_absolute_directory() {
+        let root = std::env::temp_dir().join(format!("codex-cdp-home-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let explicit = super::validate_diagnostic_codex_home(Some(root.clone())).unwrap();
+        assert_eq!(explicit, root.canonicalize().unwrap());
+        assert!(super::validate_diagnostic_codex_home(None).is_err());
+        assert!(
+            super::validate_diagnostic_codex_home(Some(PathBuf::from("relative-codex-home")))
+                .is_err()
+        );
+        assert!(super::validate_diagnostic_codex_home(Some(root.join("missing"))).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
     use base64::engine::general_purpose::STANDARD as B64;
     use ed25519_dalek::{Signer, SigningKey};
 

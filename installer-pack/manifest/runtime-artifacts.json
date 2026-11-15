@@ -3,10 +3,10 @@
   "releaseGate": {
     "materializationStatus": "ready",
     "installReady": true,
-    "rule": "Python 3.12, Node.js 22, FFmpeg and Manim are hash-locked bundled Windows x64 runtimes for offline installation. HyperFrames CLI/Chrome bootstrap is separately reported and requires network only when no usable local copy is present. Credentials and tenant authorization remain first-run configuration."
+    "rule": "Python 3.12, Node.js 22, FFmpeg, Manim, HyperFrames CLI Windows dependencies and its pinned browser are bundled for local installation. Credentials and online services remain separate requirements."
   },
   "policy": {
-    "starterKitContains": "metadata, source inputs, bundled Windows x64 runtimes, locked Python closures and explicit online-bootstrap metadata for HyperFrames CLI/browser.",
+    "starterKitContains": "metadata, source inputs, bundled Windows x64 runtimes and locked Python/npm dependency closures.",
     "installerOwns": "offline media, exact artifact hashes, Authenticode verification, package materialization, installation and rollback",
     "pythonStrategy": {
       "choice": "per-user-cpython-3.12-x64",
@@ -80,7 +80,7 @@
     },
     {
       "artifactId": "runtime.hyperframes-browser",
-      "materializationStatus": "network-bootstrap",
+      "materializationStatus": "ready",
       "installReady": true,
       "purpose": "Chrome browser required for HyperFrames local rendering",
       "relatedSkills": [
@@ -89,20 +89,22 @@
       "required": true,
       "optional": false,
       "source": {
-        "installer": "HyperFrames browser ensure",
-        "systemBrowser": "Use a compatible locally installed Chrome when available"
+        "url": "https://storage.googleapis.com/chrome-for-testing-public/152.0.7977.30/win64/chrome-headless-shell-win64.zip",
+        "archive": "runtime/bundled/chrome-headless-shell-152.0.7977.30-win64.zip"
       },
       "install": {
-        "method": "hyperframes browser ensure",
-        "networkRequired": "only when no usable system/cached Chrome is found",
-        "scope": "current-user browser cache"
+        "method": "extract bundled archive and set HYPERFRAMES_BROWSER_PATH in hyperframes.cmd",
+        "networkRequired": false,
+        "scope": "private Codex Agent Kit runtime",
+        "path": "runtime/hyperframes-browser/152.0.7977.30/chrome-headless-shell-win64"
       },
       "healthCheck": "hyperframes.cmd doctor; runtime-state.json hyperframes.browserHealth == passed",
-      "offlineConstraint": "Offline install can use a previously available supported browser; otherwise mark requires-network."
+      "offlineConstraint": "CLI and browser are both bundled; no preinstalled Chrome is required.",
+      "version": "152.0.7977.30"
     },
     {
       "artifactId": "runtime.hyperframes-cli",
-      "materializationStatus": "network-bootstrap",
+      "materializationStatus": "ready",
       "installReady": true,
       "purpose": "Local HyperFrames composition CLI, pinned to npm package 0.8.134",
       "relatedSkills": [
@@ -114,21 +116,22 @@
         "registry": "https://registry.npmjs.org/hyperframes",
         "package": "hyperframes@0.8.134",
         "license": "Apache-2.0",
-        "nodeEngine": ">=22"
+        "nodeEngine": ">=22",
+        "bundleFilename": "runtime/bundled/hyperframes-0.8.134-win-x64-node-modules.zip"
       },
       "integrity": {
-        "materializationStatus": "version-pinned",
+        "materializationStatus": "ready",
         "lock": "runtime/bundled/hyperframes-package-lock.json; every npm package tarball has registry integrity in the lock."
       },
       "install": {
-        "method": "npm user-prefix install",
-        "networkRequired": true,
+        "method": "extract bundled locked Windows x64 node_modules archive",
+        "networkRequired": false,
         "scope": "current-user",
         "path": "runtime/hyperframes; exposes hyperframes.cmd only when installed",
-        "command": "npm ci --prefix <private-hyperframes-runtime> using the bundled, hashed package.json/package-lock.json contract"
+        "command": "Extract the local archive, check the CLI version with bundled Node, then retain the existing lock marker."
       },
       "healthCheck": "hyperframes.cmd --version; runtime-state.json hyperframes.cliHealth == passed",
-      "offlineConstraint": "Without access to npm tarball URLs on first install, this capability is marked requires-network; later installs reuse the per-user lock marker and npm cache."
+      "offlineConstraint": "First install uses local media only. No system Node, Chrome or npm cache is required. Online generation and remote composition assets still require their services."
     },
     {
       "artifactId": "runtime.manim",
@@ -350,6 +353,27 @@
       },
       "healthCheck": "CODEX_PYTHON -c \"import openpyxl,docx,pptx,pypdf; print('wheelhouse-ok')\"",
       "uninstallUpgrade": "Install a new versioned per-user environment and switch the runtime pointer only after all wheel hashes and import checks pass; retain the old environment for rollback."
+    },
+    {
+      "artifactId": "runtime.hyperframes-ffmpeg",
+      "materializationStatus": "ready",
+      "installReady": true,
+      "purpose": "Private libx264 encoder required by the existing HyperFrames default H.264 pipeline",
+      "relatedSkills": [
+        "hyperframes-video"
+      ],
+      "source": {
+        "archive": "runtime/bundled/ffmpeg-n9.0-latest-win64-gpl-shared-9.0.zip",
+        "license": "GPL shared build; preserve included licenses"
+      },
+      "install": {
+        "method": "extract bundled archive",
+        "networkRequired": false,
+        "scope": "private HyperFrames runtime",
+        "path": "runtime/hyperframes-ffmpeg"
+      },
+      "healthCheck": "Bundled ffmpeg/ffprobe version probes; real HyperFrames MP4 regression at release time",
+      "offlineConstraint": "Does not replace the original LGPL FFmpeg used by other skills."
     }
   ]
 }

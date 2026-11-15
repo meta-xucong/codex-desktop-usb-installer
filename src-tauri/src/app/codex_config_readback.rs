@@ -3,9 +3,11 @@ use toml::Value;
 use url::Url;
 
 pub(crate) const USB_404TOKEN_PROVIDER_ID: &str = "404token-sub2api";
-const USB_CODEX_MODEL_PROVIDER_ID: &str = "404token";
+#[cfg(test)]
+pub(crate) const USB_CODEX_MODEL_PROVIDER_ID: &str = "404token";
 const READBACK_MISMATCH: &str = "selection-config-readback-mismatch";
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CodexConfigReadback {
     pub active_model_provider: String,
@@ -14,6 +16,7 @@ pub(crate) struct CodexConfigReadback {
     pub wire_api: String,
 }
 
+#[cfg(test)]
 fn expected_codex_model_provider(provider_id: &str) -> Option<&'static str> {
     match provider_id {
         USB_404TOKEN_PROVIDER_ID => Some(USB_CODEX_MODEL_PROVIDER_ID),
@@ -21,7 +24,7 @@ fn expected_codex_model_provider(provider_id: &str) -> Option<&'static str> {
     }
 }
 
-fn canonical_base_url(raw: &str) -> Option<String> {
+pub(crate) fn canonical_base_url(raw: &str) -> Option<String> {
     let mut url = Url::parse(raw.trim()).ok()?;
     if url.scheme() != "https"
         || url.host_str().is_none()
@@ -37,7 +40,7 @@ fn canonical_base_url(raw: &str) -> Option<String> {
     Some(url.to_string())
 }
 
-fn selected_profile(document: &Value) -> Result<Option<&Value>, &'static str> {
+pub(crate) fn selected_profile(document: &Value) -> Result<Option<&Value>, &'static str> {
     let Some(profile_name) = document.get("profile") else {
         return Ok(None);
     };
@@ -55,7 +58,7 @@ fn selected_profile(document: &Value) -> Result<Option<&Value>, &'static str> {
     Ok(Some(profile))
 }
 
-fn effective_string<'a>(
+pub(crate) fn effective_string<'a>(
     document: &'a Value,
     profile: Option<&'a Value>,
     key: &str,
@@ -68,6 +71,35 @@ fn effective_string<'a>(
         .filter(|value| !value.is_empty())
 }
 
+/// Return only the selected provider identifier from a parsed Codex config.
+/// The USB launch path uses this to scope its local detail-mode adjustment to
+/// the 404token provider without inspecting or logging credentials.
+pub(crate) fn active_model_provider(document: &Value) -> Option<&str> {
+    let profile = selected_profile(document).ok()?;
+    effective_string(document, profile, "model_provider")
+}
+
+/// Identify the selected provider through the product's canonical 404token
+/// endpoint. This recognizes Codex's generic `custom` provider ID only when
+/// its configured URL is the exact 404token API base URL.
+pub(crate) fn active_provider_uses_404token_endpoint(document: &Value) -> bool {
+    let Some(provider_id) = active_model_provider(document) else {
+        return false;
+    };
+    let Some(base_url) = document
+        .get("model_providers")
+        .and_then(Value::as_table)
+        .and_then(|providers| providers.get(provider_id))
+        .and_then(Value::as_table)
+        .and_then(|provider| provider.get("base_url"))
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    canonical_base_url(base_url).as_deref() == Some("https://404token.xyz/v1/")
+}
+
+#[cfg(test)]
 pub(crate) fn validate(
     bytes: &[u8],
     binding_provider_id: &str,
@@ -76,8 +108,8 @@ pub(crate) fn validate(
 ) -> Result<CodexConfigReadback, &'static str> {
     let text = std::str::from_utf8(bytes).map_err(|_| READBACK_MISMATCH)?;
     let document: Value = text.parse().map_err(|_| READBACK_MISMATCH)?;
-    let profile = selected_profile(&document)?;
-    let active = effective_string(&document, profile, "model_provider").ok_or(READBACK_MISMATCH)?;
+    let profile = selected_profile(&document).map_err(|_| READBACK_MISMATCH)?;
+    let active = active_model_provider(&document).ok_or(READBACK_MISMATCH)?;
     if expected_codex_model_provider(binding_provider_id) != Some(active) {
         return Err(READBACK_MISMATCH);
     }

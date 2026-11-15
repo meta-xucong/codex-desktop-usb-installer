@@ -3,11 +3,17 @@ param(
     [Parameter(Mandatory = $true)][string]$PackRoot,
     [Parameter(Mandatory = $true)][string]$TargetUserProfile,
     [string]$TargetCodexHome,
+    [string]$ProgressFile = '',
     [switch]$EnableFeishu
 )
 
 $ErrorActionPreference = 'Stop'
 $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+
+function Set-InstallProgress([string]$Stage) {
+    if ([string]::IsNullOrWhiteSpace($ProgressFile)) { return }
+    [IO.File]::WriteAllText($ProgressFile, $Stage, [Text.Encoding]::ASCII)
+}
 
 function Write-JsonNoBom([string]$Path, [object]$Value, [int]$Depth = 8) {
     $parent = Split-Path -Parent $Path
@@ -55,14 +61,24 @@ function Test-ExactPython([string]$Executable) {
     # can otherwise mangle a Python -c payload before it reaches python.exe.
     $probe = 'import platform,sys,sysconfig; print(str(sys.version_info[0])+chr(46)+str(sys.version_info[1])+chr(46)+str(sys.version_info[2])+chr(124)+sys.implementation.cache_tag+chr(124)+sysconfig.get_platform()+chr(124)+platform.machine())'
     $result = Invoke-NativeCapture -Executable $Executable -Arguments @('-c', $probe)
-    return $result.ExitCode -eq 0 -and $result.Output -match '^3\.12\.\d+\|cpython-312\|win-amd64\|(AMD64|x86_64)$'
+    $stdout = ([string]$result.StdOut).Trim()
+    return $result.ExitCode -eq 0 -and $stdout -match '^3\.12\.\d+\|cpython-312\|win-amd64\|(AMD64|x86_64)$'
+}
+
+function Test-BasePython([string]$Executable) {
+    if (-not (Test-ExactPython $Executable)) { return $false }
+    # venv invokes ensurepip, which reads its bundled pip wheel. A version
+    # probe alone accepts an interpreter left without these install files.
+    $probe = 'import venv,ensurepip; from importlib.resources import files; assert files(ensurepip).joinpath("_bundled", "pip-"+ensurepip.version()+"-py3-none-any.whl").is_file()'
+    $result = Invoke-NativeCapture -Executable $Executable -Arguments @('-c', $probe)
+    return $result.ExitCode -eq 0
 }
 
 function Get-NodeVersion([string]$Executable) {
     if ([string]::IsNullOrWhiteSpace($Executable) -or -not (Test-Path -LiteralPath $Executable -PathType Leaf)) { return $null }
     $result = Invoke-NativeCapture -Executable $Executable -Arguments @('--version')
     if ($result.ExitCode -ne 0) { return $null }
-    $text = $result.Output.TrimStart('v')
+    $text = $result.StdOut.TrimStart('v')
     $version = $null
     if ([version]::TryParse($text, [ref]$version)) { return $version }
     return $null
@@ -74,32 +90,120 @@ function Write-AsciiFile([string]$Path, [string]$Text) {
     Set-Content -LiteralPath $Path -Value $Text -Encoding ASCII
 }
 
-function Invoke-NativeCapture([string]$Executable, [string[]]$Arguments) {
-    $previousErrorActionPreference = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = 'Continue'
-        $output = (& $Executable @Arguments 2>&1 | Out-String).Trim()
-        $exitCode = $LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $previousErrorActionPreference
+function ConvertTo-WindowsArgument([string]$Argument) {
+    if ([string]::IsNullOrEmpty($Argument)) { return '""' }
+    if ($Argument -notmatch '[\s"]') { return $Argument }
+    $builder = [System.Text.StringBuilder]::new()
+    [void]$builder.Append('"')
+    $backslashes = 0
+    foreach ($character in $Argument.ToCharArray()) {
+        if ($character -eq '\') { $backslashes++; continue }
+        if ($character -eq '"') {
+            if ($backslashes -gt 0) { [void]$builder.Append(('\' * (2 * $backslashes))) }
+            [void]$builder.Append('\"')
+            $backslashes = 0
+            continue
+        }
+        if ($backslashes -gt 0) { [void]$builder.Append(('\' * $backslashes)) }
+        [void]$builder.Append($character)
+        $backslashes = 0
     }
-    return [pscustomobject]@{ ExitCode = $exitCode; Output = $output }
+    if ($backslashes -gt 0) { [void]$builder.Append(('\' * (2 * $backslashes))) }
+    [void]$builder.Append('"')
+    return $builder.ToString()
 }
 
-function Test-VenvPython([string]$Executable) {
+function Stop-NativeProcessTree([int]$ProcessId) {
+    $taskkill = Join-Path $env:SystemRoot 'System32\taskkill.exe'
+    try {
+        $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+        $startInfo.FileName = $taskkill
+        $startInfo.Arguments = "/PID $ProcessId /T /F"
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $killer = [System.Diagnostics.Process]::Start($startInfo)
+        if ($null -ne $killer -and -not $killer.WaitForExit(10000)) { $killer.Kill() }
+    } catch {
+        # The direct process kill below remains the final best-effort action.
+    }
+}
+
+function Invoke-NativeCapture([string]$Executable, [string[]]$Arguments, [ValidateRange(1,1800)][int]$TimeoutSeconds = 60) {
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $Executable
+    $startInfo.Arguments = (($Arguments | ForEach-Object { ConvertTo-WindowsArgument ([string]$_) }) -join ' ')
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) { return [pscustomobject]@{ ExitCode = -1; Output = 'Process did not start.'; StdOut = ''; StdErr = ''; TimedOut = $false } }
+    } catch {
+        return [pscustomobject]@{ ExitCode = -1; Output = $_.Exception.Message; StdOut = ''; StdErr = $_.Exception.Message; TimedOut = $false }
+    }
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
+    $finished = $process.WaitForExit($TimeoutSeconds * 1000)
+    if (-not $finished) {
+        Stop-NativeProcessTree -ProcessId $process.Id
+        try { if (-not $process.HasExited) { $process.Kill() } } catch { }
+        [void]$process.WaitForExit(10000)
+        $partialStdOut = if ($stdoutTask.Wait(1000)) { $stdoutTask.Result } else { '' }
+        $partialStdErr = if ($stderrTask.Wait(1000)) { $stderrTask.Result } else { '' }
+        $process.Dispose()
+        return [pscustomobject]@{ ExitCode = -1; Output = ($partialStdOut + $partialStdErr).Trim(); StdOut = $partialStdOut; StdErr = $partialStdErr; TimedOut = $true }
+    }
+    # A descendant can inherit either redirected pipe and keep it open after
+    # this process exits. Bound the drain so that inherited handles cannot hold
+    # capability installation indefinitely; the Rust supervisor owns the
+    # process tree and will terminate any remaining descendants on script exit.
+    $drainTimeoutMs = 5000
+    $drainWatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $stdoutDrained = $stdoutTask.Wait($drainTimeoutMs)
+    $remainingDrainMs = [Math]::Max(0, $drainTimeoutMs - [int]$drainWatch.ElapsedMilliseconds)
+    $stderrDrained = $stderrTask.Wait($remainingDrainMs)
+    if (-not $stdoutDrained -or -not $stderrDrained) {
+        $partialStdOut = if ($stdoutTask.Status -eq [System.Threading.Tasks.TaskStatus]::RanToCompletion) { $stdoutTask.Result } else { '' }
+        $partialStdErr = if ($stderrTask.Status -eq [System.Threading.Tasks.TaskStatus]::RanToCompletion) { $stderrTask.Result } else { '' }
+        try { $process.StandardOutput.Dispose() } catch { }
+        try { $process.StandardError.Dispose() } catch { }
+        $exitCode = $process.ExitCode
+        $process.Dispose()
+        $partialOutput = ($partialStdOut + $partialStdErr).Trim()
+        throw "Native process exited with code $exitCode, but redirected output pipes remained open beyond $drainTimeoutMs ms. Partial output: $partialOutput"
+    }
+    $stdOut = $stdoutTask.GetAwaiter().GetResult()
+    $stdErr = $stderrTask.GetAwaiter().GetResult()
+    $output = ($stdOut + $stdErr).Trim()
+    $exitCode = $process.ExitCode
+    $process.Dispose()
+    return [pscustomobject]@{ ExitCode = $exitCode; Output = $output; StdOut = $stdOut; StdErr = $stdErr; TimedOut = $false }
+}
+
+function Test-VenvPython([string]$Executable, [string]$HealthProbe) {
     if (-not (Test-ExactPython $Executable)) { return $false }
     # A failed first-time ensurepip can leave Scripts\python.exe behind without
     # pip. Version-only detection would then reuse a broken venv on every retry.
     $pipProbe = Invoke-NativeCapture -Executable $Executable -Arguments @('-m','pip','--version')
-    return $pipProbe.ExitCode -eq 0 -and $pipProbe.Output -match '^pip\s+\d+'
+    if ($pipProbe.ExitCode -ne 0 -or $pipProbe.StdOut -notmatch '^pip\s+\d+') { return $false }
+    # pip can consider a wheel installed after METADATA is written, before its
+    # modules exist. Reuse only when the existing runtime import check passes.
+    $health = Invoke-NativeCapture -Executable $Executable -Arguments @('-c',$HealthProbe)
+    return $health.ExitCode -eq 0
 }
 
+Set-InstallProgress 'runtime.verify'
 $mediaManifest = Read-Json $mediaManifestPath
 $pythonInstaller = Assert-Media $mediaManifest 'runtime.python312' $packRootFull
 $nodeZip = Assert-Media $mediaManifest 'runtime.node22-common' $packRootFull
 $ffmpegZip = Assert-Media $mediaManifest 'runtime.ffmpeg-windows-x64' $packRootFull
 $hyperframesPackageFile = Assert-Media $mediaManifest 'runtime.hyperframes-package-json' $packRootFull
 $hyperframesLockFile = Assert-Media $mediaManifest 'runtime.hyperframes-package-lock' $packRootFull
+$hyperframesCliZip = Assert-Media $mediaManifest 'runtime.hyperframes-cli' $packRootFull
+$hyperframesFfmpegZip = Assert-Media $mediaManifest 'runtime.hyperframes-ffmpeg' $packRootFull
+$hyperframesBrowserZip = Assert-Media $mediaManifest 'runtime.hyperframes-browser' $packRootFull
 $feishuZip = $null
 if ($EnableFeishu) {
     $feishuZip = Assert-Media $mediaManifest 'runtime.feishu-mcp-package' $packRootFull
@@ -130,18 +234,24 @@ $pythonSignature = Get-AuthenticodeSignature -LiteralPath $pythonInstaller
 if ([string]$pythonSignature.Status -ne 'Valid') { throw "Python installer Authenticode validation failed: $($pythonSignature.Status)" }
 
 New-Item -ItemType Directory -Force -Path $runtimeRoot | Out-Null
+Set-InstallProgress 'runtime.python'
+# Use the same target-user path for discovery and installation. PrependPath=0
+# means a healthy previous installation need not be discoverable on PATH.
+$pythonRoot = Join-Path (Join-Path $profileFull 'AppData\Local') 'Programs\Python\Python312'
+$kitPythonRoot = Join-Path $runtimeRoot 'cpython-3.12.10'
 $pythonCandidates = [System.Collections.Generic.List[string]]::new()
 foreach ($candidate in @(
     [Environment]::GetEnvironmentVariable('CODEX_PYTHON', 'Process'),
     [Environment]::GetEnvironmentVariable('CODEX_PYTHON', 'User'),
     $(try { (Get-Command python -ErrorAction Stop).Source } catch { $null }),
-    (Join-Path $runtimeRoot 'cpython-3.12.10\python.exe')
+    (Join-Path $pythonRoot 'python.exe'),
+    (Join-Path $kitPythonRoot 'python.exe')
 )) {
     if (-not [string]::IsNullOrWhiteSpace([string]$candidate) -and -not $pythonCandidates.Contains([string]$candidate)) { $pythonCandidates.Add([string]$candidate) }
 }
 $basePython = $null
 foreach ($candidate in $pythonCandidates) {
-    if (Test-ExactPython $candidate) { $basePython = [IO.Path]::GetFullPath($candidate); break }
+    if (Test-BasePython $candidate) { $basePython = [IO.Path]::GetFullPath($candidate); break }
 }
 
 if ([string]::IsNullOrWhiteSpace($basePython)) {
@@ -149,14 +259,20 @@ if ([string]::IsNullOrWhiteSpace($basePython)) {
     # LocalApplicationData can belong to the administrator rather than the
     # requested target user. Derive the per-user install path from the explicit
     # target profile instead.
-    $pythonRoot = Join-Path (Join-Path $profileFull 'AppData\Local') 'Programs\Python\Python312'
-    $kitPythonRoot = Join-Path $runtimeRoot 'cpython-3.12.10'
-    $argumentList = @('/quiet', 'InstallAllUsers=0', 'PrependPath=0', 'Include_test=0', ('TargetDir="{0}"' -f $pythonRoot))
-    $process = Start-Process -FilePath $pythonInstaller -ArgumentList $argumentList -WindowStyle Hidden -Wait -PassThru
-    if (@(0, 3010) -notcontains [int]$process.ExitCode) { throw "Python installer failed with exit code $($process.ExitCode)." }
+    # CPython 3.12.10 converts /repair to install when its bundle is absent.
+    # For a registered installation it restores missing files; plain /quiet
+    # would only modify selected features and could leave the same failure.
+    # Invoke-NativeCapture quotes each argument; embedded quotes become part
+    # of MSI's TARGETDIR value and make a fresh installation fail with 1606.
+    $argumentList = @('/repair', '/quiet', 'InstallAllUsers=0', 'PrependPath=0', 'Include_test=0', ('TargetDir={0}' -f $pythonRoot))
+    $process = Invoke-NativeCapture -Executable $pythonInstaller -Arguments $argumentList -TimeoutSeconds 600
+    if ($process.TimedOut) { throw 'Bundled Python installer exceeded its 600-second limit.' }
+    if (@(0, 3010) -notcontains [int]$process.ExitCode) { throw "Python installer failed with exit code $($process.ExitCode): $($process.Output)" }
     $installedPython = $null
-    foreach ($candidate in @((Join-Path $pythonRoot 'python.exe'), (Join-Path $kitPythonRoot 'python.exe'))) {
-        if (Test-ExactPython $candidate) { $installedPython = [IO.Path]::GetFullPath($candidate); break }
+    # Repair preserves an existing registered install location, so inspect
+    # the original candidates again as well as the target-user locations.
+    foreach ($candidate in $pythonCandidates) {
+        if (Test-BasePython $candidate) { $installedPython = [IO.Path]::GetFullPath($candidate); break }
     }
     if ([string]::IsNullOrWhiteSpace($installedPython)) {
         throw "Bundled Python installer completed but no healthy CPython 3.12 interpreter was found under $pythonRoot or $kitPythonRoot."
@@ -166,27 +282,28 @@ if ([string]::IsNullOrWhiteSpace($basePython)) {
 
 $venvRoot = Join-Path $runtimeRoot 'python-env'
 $venvPython = Join-Path $venvRoot 'Scripts\python.exe'
-$venvHealthy = Test-VenvPython $venvPython
+$pythonHealthProbe = 'import akshare,pandas,numpy,matplotlib,openpyxl,docx,pptx,pypdf,pdfplumber,reportlab,PIL,scrapling,html2text,jsonpath,requests'
+$venvHealthy = Test-VenvPython $venvPython $pythonHealthProbe
 if (-not $venvHealthy) {
-    $venvResult = Invoke-NativeCapture -Executable $basePython -Arguments @('-m','venv','--clear',$venvRoot)
+    $venvResult = Invoke-NativeCapture -Executable $basePython -Arguments @('-m','venv','--clear',$venvRoot) -TimeoutSeconds 600
     if ($venvResult.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $venvPython -PathType Leaf)) { throw "Could not create the per-user CPython 3.12 environment: $($venvResult.Output)" }
 }
 
-$pythonInstall = Invoke-NativeCapture -Executable $venvPython -Arguments @('-m','pip','install','--disable-pip-version-check','--no-input','--no-index','--find-links',$wheelDir,'--require-hashes','-r',$lockPath)
+$pythonInstall = Invoke-NativeCapture -Executable $venvPython -Arguments @('-m','pip','install','--disable-pip-version-check','--no-input','--no-index','--find-links',$wheelDir,'--require-hashes','-r',$lockPath) -TimeoutSeconds 600
 if ($pythonInstall.ExitCode -ne 0) { throw "Offline Python dependency installation failed: $($pythonInstall.Output)" }
-$pythonHealthProbe = 'import akshare,pandas,numpy,matplotlib,openpyxl,docx,pptx,pypdf,pdfplumber,reportlab,PIL,scrapling,html2text,jsonpath,requests'
 $pythonHealthResult = Invoke-NativeCapture -Executable $venvPython -Arguments @('-c',$pythonHealthProbe)
 if ($pythonHealthResult.ExitCode -ne 0) { throw "Python runtime health check failed: $($pythonHealthResult.Output)" }
 
+Set-InstallProgress 'runtime.manim'
 $manimRoot = Join-Path $runtimeRoot 'manim-env'
 $manimPython = Join-Path $manimRoot 'Scripts\python.exe'
-if (-not (Test-VenvPython $manimPython)) {
-    $manimVenvResult = Invoke-NativeCapture -Executable $basePython -Arguments @('-m','venv','--clear',$manimRoot)
+$manimHealthProbe = 'import importlib.metadata as m; import manim, av, manimpango; print(m.version(chr(109)+chr(97)+chr(110)+chr(105)+chr(109)))'
+if (-not (Test-VenvPython $manimPython $manimHealthProbe)) {
+    $manimVenvResult = Invoke-NativeCapture -Executable $basePython -Arguments @('-m','venv','--clear',$manimRoot) -TimeoutSeconds 600
     if ($manimVenvResult.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $manimPython -PathType Leaf)) { throw "Could not create the isolated Manim CPython 3.12 environment: $($manimVenvResult.Output)" }
 }
-$manimInstall = Invoke-NativeCapture -Executable $manimPython -Arguments @('-m','pip','install','--disable-pip-version-check','--no-input','--no-index','--find-links',$wheelDir,'--require-hashes','-r',$manimLockPath)
+$manimInstall = Invoke-NativeCapture -Executable $manimPython -Arguments @('-m','pip','install','--disable-pip-version-check','--no-input','--no-index','--find-links',$wheelDir,'--require-hashes','-r',$manimLockPath) -TimeoutSeconds 600
 if ($manimInstall.ExitCode -ne 0) { throw "Offline Manim dependency installation failed: $($manimInstall.Output)" }
-$manimHealthProbe = 'import importlib.metadata as m; import manim, av, manimpango; print(m.version(chr(109)+chr(97)+chr(110)+chr(105)+chr(109)))'
 $previousManimErrorActionPreference = $ErrorActionPreference
 try {
     # PowerShell 5.1 can promote native Python stderr into a terminating
@@ -197,23 +314,23 @@ try {
 } finally {
     $ErrorActionPreference = $previousManimErrorActionPreference
 }
-$manimVersion = ($manimProbe.Output -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Last 1).Trim()
+$manimVersion = ($manimProbe.StdOut -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Last 1).Trim()
 if ($manimProbe.ExitCode -ne 0 -or $manimVersion -ne '0.21.0') { throw "Manim runtime health check failed (exit=$($manimProbe.ExitCode)): $($manimProbe.Output)" }
 
+Set-InstallProgress 'runtime.nodeMedia'
 $nodeRoot = Join-Path $runtimeRoot 'node-v22.22.0-win-x64'
 $nodeExe = Join-Path $nodeRoot 'node.exe'
 $nodeHealth = 'unknown'
 $nodeVersion = $null
 $feishuRoot = ''
 $feishuHealth = 'disabled'
-$nodeVersionObject = Get-NodeVersion $nodeExe
-if ($nodeVersionObject -eq $null -or $nodeVersionObject.Major -lt 22) {
-    Expand-Archive -LiteralPath $nodeZip -DestinationPath $runtimeRoot -Force
-}
+# node.exe can run before npm/npx have been extracted. Explicit capability
+# setup restores the complete bundled Node distribution.
+Expand-Archive -LiteralPath $nodeZip -DestinationPath $runtimeRoot -Force
 $nodeVersionObject = Get-NodeVersion $nodeExe
 if ($nodeVersionObject -eq $null -or $nodeVersionObject.Major -lt 22) { throw 'Bundled Node.js 22 runtime is not healthy after extraction.' }
 $nodeHealth = 'passed'
-$nodeVersion = (Invoke-NativeCapture -Executable $nodeExe -Arguments @('--version')).Output
+$nodeVersion = (Invoke-NativeCapture -Executable $nodeExe -Arguments @('--version')).StdOut
 
 $ffmpegRoot = Join-Path $runtimeRoot 'ffmpeg'
 $ffmpegPackageRoot = Join-Path $ffmpegRoot 'ffmpeg-n9.0-latest-win64-lgpl-shared-9.0'
@@ -221,19 +338,18 @@ $ffmpegBinRoot = Join-Path $ffmpegPackageRoot 'bin'
 $ffmpegExe = Join-Path $ffmpegBinRoot 'ffmpeg.exe'
 $ffprobeExe = Join-Path $ffmpegBinRoot 'ffprobe.exe'
 $ffplayExe = Join-Path $ffmpegBinRoot 'ffplay.exe'
-if (-not (Test-Path -LiteralPath $ffmpegExe -PathType Leaf) -or -not (Test-Path -LiteralPath $ffprobeExe -PathType Leaf)) {
-    Expand-Archive -LiteralPath $ffmpegZip -DestinationPath $ffmpegRoot -Force
-}
+# A partial archive can contain ffmpeg/ffprobe but lack ffplay or DLLs.
+Expand-Archive -LiteralPath $ffmpegZip -DestinationPath $ffmpegRoot -Force
 foreach ($requiredMediaExecutable in @($ffmpegExe, $ffprobeExe, $ffplayExe)) {
     if (-not (Test-Path -LiteralPath $requiredMediaExecutable -PathType Leaf)) { throw "Bundled FFmpeg executable is missing: $requiredMediaExecutable" }
 }
 $ffmpegVersionResult = Invoke-NativeCapture -Executable $ffmpegExe -Arguments @('-version')
-$ffmpegVersionOutput = $ffmpegVersionResult.Output
+$ffmpegVersionOutput = $ffmpegVersionResult.StdOut
 $ffmpegExitCode = $ffmpegVersionResult.ExitCode
 $ffmpegVersionText = ($ffmpegVersionOutput -split "`r?`n" | Select-Object -First 1).Trim()
 if ($ffmpegExitCode -ne 0 -or $ffmpegVersionText -notmatch '^ffmpeg version (?:9\.|N-|n9\.)') { throw "Bundled FFmpeg health check failed (exit=$ffmpegExitCode): $ffmpegVersionText" }
 $ffprobeVersionResult = Invoke-NativeCapture -Executable $ffprobeExe -Arguments @('-version')
-$ffprobeVersionOutput = $ffprobeVersionResult.Output
+$ffprobeVersionOutput = $ffprobeVersionResult.StdOut
 $ffprobeExitCode = $ffprobeVersionResult.ExitCode
 $ffprobeVersionText = ($ffprobeVersionOutput -split "`r?`n" | Select-Object -First 1).Trim()
 if ($ffprobeExitCode -ne 0 -or $ffprobeVersionText -notmatch '^ffprobe version (?:9\.|N-|n9\.)') { throw "Bundled FFprobe health check failed (exit=$ffprobeExitCode): $ffprobeVersionText" }
@@ -243,67 +359,95 @@ $hyperframesVersion = '0.8.134'
 $hyperframesRoot = Join-Path $runtimeRoot 'hyperframes'
 $hyperframesEntry = Join-Path $hyperframesRoot 'node_modules\hyperframes\bin\hyperframes.mjs'
 $hyperframesCmd = Join-Path $hyperframesRoot 'hyperframes.cmd'
-$npmCli = Join-Path $nodeRoot 'node_modules\npm\bin\npm-cli.js'
-$hyperframesHealth = 'requires-network'
-$hyperframesCliHealth = 'requires-network'
+$hyperframesBrowserVersion = '152.0.7977.30'
+$hyperframesBrowserRoot = Join-Path $runtimeRoot ('hyperframes-browser\' + $hyperframesBrowserVersion)
+$hyperframesBrowserExe = Join-Path $hyperframesBrowserRoot 'chrome-headless-shell-win64\chrome-headless-shell.exe'
+$hyperframesHealth = 'unknown'
+$hyperframesCliHealth = 'unknown'
 $hyperframesBrowserHealth = 'unknown'
 $hyperframesError = ''
 $installedHyperframesVersion = ''
-$hyperframesPackageJson = Join-Path $hyperframesRoot 'node_modules\hyperframes\package.json'
-$hyperframesMarker = Join-Path $hyperframesRoot '.installed-lock-sha256'
-$expectedHyperframesLockHash = (Get-FileHash -LiteralPath $hyperframesLockFile -Algorithm SHA256).Hash.ToLowerInvariant()
-New-Item -ItemType Directory -Force -Path $hyperframesRoot | Out-Null
-Copy-Item -LiteralPath $hyperframesPackageFile -Destination (Join-Path $hyperframesRoot 'package.json') -Force
-Copy-Item -LiteralPath $hyperframesLockFile -Destination (Join-Path $hyperframesRoot 'package-lock.json') -Force
-$installedLockHash = if (Test-Path -LiteralPath $hyperframesMarker -PathType Leaf) { (Get-Content -LiteralPath $hyperframesMarker -Raw -Encoding ASCII).Trim().ToLowerInvariant() } else { '' }
-$npmCacheRoot = Join-Path $runtimeRoot 'npm-cache'
-New-Item -ItemType Directory -Force -Path $npmCacheRoot | Out-Null
-if ($installedLockHash -ne $expectedHyperframesLockHash -or -not (Test-Path -LiteralPath $hyperframesEntry -PathType Leaf)) {
-    $npmResult = Invoke-NativeCapture -Executable $nodeExe -Arguments @($npmCli,'ci','--prefix',$hyperframesRoot,'--cache',$npmCacheRoot,'--no-audit','--no-fund','--no-progress','--fetch-retries=2','--fetch-timeout=60000')
-    $npmOutput = $npmResult.Output
-    if ($npmResult.ExitCode -eq 0) {
-        [IO.File]::WriteAllText($hyperframesMarker,$expectedHyperframesLockHash + [Environment]::NewLine,[Text.Encoding]::ASCII)
-    } else {
-        $hyperframesError = "HyperFrames CLI install requires network access: $npmOutput"
+try {
+    $hyperframesMarker = Join-Path $hyperframesRoot '.installed-lock-sha256'
+    $expectedHyperframesLockHash = (Get-FileHash -LiteralPath $hyperframesLockFile -Algorithm SHA256).Hash.ToLowerInvariant()
+    New-Item -ItemType Directory -Force -Path $hyperframesRoot | Out-Null
+    Copy-Item -LiteralPath $hyperframesPackageFile -Destination (Join-Path $hyperframesRoot 'package.json') -Force
+    Copy-Item -LiteralPath $hyperframesLockFile -Destination (Join-Path $hyperframesRoot 'package-lock.json') -Force
+    $installedLockHash = if (Test-Path -LiteralPath $hyperframesMarker -PathType Leaf) { (Get-Content -LiteralPath $hyperframesMarker -Raw -Encoding ASCII).Trim().ToLowerInvariant() } else { '' }
+    Set-InstallProgress 'runtime.hyperframes'
+    $deployHyperframes = $installedLockHash -ne $expectedHyperframesLockHash -or -not (Test-Path -LiteralPath $hyperframesEntry -PathType Leaf)
+    if ($deployHyperframes) {
+        # Keep the existing lock identity, but never reuse a partial extraction
+        # as a completed deployment. No npm or lifecycle downloads run here.
+        if (Test-Path -LiteralPath $hyperframesMarker -PathType Leaf) { Remove-Item -LiteralPath $hyperframesMarker }
+        Expand-Archive -LiteralPath $hyperframesCliZip -DestinationPath $hyperframesRoot -Force
     }
-}
-if (Test-Path -LiteralPath $hyperframesEntry -PathType Leaf) {
-    Write-AsciiFile $hyperframesCmd ('@echo off' + [Environment]::NewLine + '"%~dp0..\node-v22.22.0-win-x64\node.exe" "%~dp0node_modules\hyperframes\bin\hyperframes.mjs" %*' + $newline)
+    if (-not (Test-Path -LiteralPath $hyperframesEntry -PathType Leaf)) { throw 'Bundled HyperFrames CLI entry is missing after extraction.' }
+    Set-InstallProgress 'runtime.hyperframesCliCheck'
     $cliResult = Invoke-NativeCapture -Executable $nodeExe -Arguments @($hyperframesEntry,'--version')
-    $cliOutput = $cliResult.Output
-    if ($cliResult.ExitCode -eq 0) {
-        $hyperframesCliHealth = 'passed'
-        $installedHyperframesVersion = $cliOutput
-        $browserResult = Invoke-NativeCapture -Executable $nodeExe -Arguments @($hyperframesEntry,'browser','ensure')
-        $browserOutput = $browserResult.Output
-        if ($browserResult.ExitCode -eq 0) {
-            $hyperframesBrowserHealth = 'passed'
-            $hyperframesHealth = 'passed'
-        } else {
-            $hyperframesBrowserHealth = 'requires-network'
-            $hyperframesError = "HyperFrames browser setup requires network access or a supported local Chrome: $browserOutput"
-        }
-    } else {
-        $hyperframesCliHealth = 'failed'
-        $hyperframesError = "HyperFrames CLI health check failed: $cliOutput"
+    if ($cliResult.ExitCode -ne 0 -or $cliResult.StdOut.Trim() -ne $hyperframesVersion) { throw "HyperFrames CLI health check failed: $($cliResult.Output)" }
+    $installedHyperframesVersion = $cliResult.StdOut
+    # HyperFrames' default H.264 renderer requires libx264. Keep its GPL
+    # build private; other skills continue using the original LGPL FFmpeg.
+    Set-InstallProgress 'runtime.hyperframesFfmpeg'
+    $hyperframesFfmpegRoot = Join-Path $runtimeRoot 'hyperframes-ffmpeg'
+    $hyperframesFfmpegBin = Join-Path $hyperframesFfmpegRoot 'ffmpeg-n9.0-latest-win64-gpl-shared-9.0\bin'
+    $hyperframesFfmpegExe = Join-Path $hyperframesFfmpegBin 'ffmpeg.exe'
+    $hyperframesFfprobeExe = Join-Path $hyperframesFfmpegBin 'ffprobe.exe'
+    # An interrupted extraction can leave both EXEs without their DLLs.
+    # Explicit capability setup restores the complete private archive.
+    Expand-Archive -LiteralPath $hyperframesFfmpegZip -DestinationPath $hyperframesFfmpegRoot -Force
+    foreach ($tool in @($hyperframesFfmpegExe, $hyperframesFfprobeExe)) {
+        $toolResult = Invoke-NativeCapture -Executable $tool -Arguments @('-version')
+        if ($toolResult.ExitCode -ne 0) { throw "HyperFrames encoder health check failed (exit=$($toolResult.ExitCode)): $($toolResult.Output)" }
     }
-} else {
-    $hyperframesCliHealth = 'requires-network'
-    if ([string]::IsNullOrWhiteSpace($hyperframesError)) { $hyperframesError = 'HyperFrames CLI is not installed; npm access is required during one-click setup.' }
+    $hyperframesCliHealth = 'passed'
+    if ($deployHyperframes) {
+        [IO.File]::WriteAllText($hyperframesMarker,$expectedHyperframesLockHash + [Environment]::NewLine,[Text.Encoding]::ASCII)
+    }
+
+    Set-InstallProgress 'runtime.hyperframesBrowser'
+    # --version can succeed with missing ICU/resources. Restore these files
+    # during explicit setup even when the browser EXE already exists.
+    Expand-Archive -LiteralPath $hyperframesBrowserZip -DestinationPath $hyperframesBrowserRoot -Force
+    Set-InstallProgress 'runtime.hyperframesBrowserCheck'
+    $browserVersionResult = Invoke-NativeCapture -Executable $hyperframesBrowserExe -Arguments @('--version')
+    if ($browserVersionResult.ExitCode -ne 0 -or $browserVersionResult.StdOut -notmatch ('\b' + [regex]::Escape($hyperframesBrowserVersion) + '\b')) {
+        throw "Bundled HyperFrames browser version check failed: $($browserVersionResult.Output)"
+    }
+    # HyperFrames 0.8.134 uses this override before its managed-cache and
+    # Google download branches, including render and Studio. Keep it scoped
+    # to the child CLI; do not change the user's browser or global settings.
+    $savedBrowserPath = [Environment]::GetEnvironmentVariable('HYPERFRAMES_BROWSER_PATH', 'Process')
+    try {
+        $env:HYPERFRAMES_BROWSER_PATH = $hyperframesBrowserExe
+        $browserResult = Invoke-NativeCapture -Executable $nodeExe -Arguments @($hyperframesEntry,'browser','ensure') -TimeoutSeconds 600
+        if ($browserResult.ExitCode -ne 0) { throw "Bundled HyperFrames browser check failed: $($browserResult.Output)" }
+    } finally {
+        [Environment]::SetEnvironmentVariable('HYPERFRAMES_BROWSER_PATH', $savedBrowserPath, 'Process')
+    }
+    $hyperframesBrowserHealth = 'passed'
+    $hyperframesHealth = 'passed'
+} catch {
+    # HyperFrames is optional for core setup. Preserve this component's failure
+    # while letting the healthy core, config and readiness records finalize.
+    $hyperframesHealth = 'install-failed'
+    if ($hyperframesCliHealth -eq 'passed') { $hyperframesBrowserHealth = 'install-failed' } else { $hyperframesCliHealth = 'install-failed' }
+    $hyperframesError = $_.Exception.Message
+}
+if ($hyperframesCliHealth -eq 'passed') {
+    $newline = [Environment]::NewLine
+    Write-AsciiFile $hyperframesCmd ('@echo off' + $newline + 'setlocal' + $newline + ('set "HYPERFRAMES_BROWSER_PATH=%~dp0..\hyperframes-browser\{0}\chrome-headless-shell-win64\chrome-headless-shell.exe"' -f $hyperframesBrowserVersion) + $newline + 'set "HYPERFRAMES_FFMPEG_PATH=%~dp0..\hyperframes-ffmpeg\ffmpeg-n9.0-latest-win64-gpl-shared-9.0\bin\ffmpeg.exe"' + $newline + 'set "HYPERFRAMES_FFPROBE_PATH=%~dp0..\hyperframes-ffmpeg\ffmpeg-n9.0-latest-win64-gpl-shared-9.0\bin\ffprobe.exe"' + $newline + 'if not exist "%HYPERFRAMES_BROWSER_PATH%" (echo Bundled HyperFrames browser is missing. Rerun capability setup. 1>&2 & exit /b 1)' + $newline + '"%~dp0..\node-v22.22.0-win-x64\node.exe" "%~dp0node_modules\hyperframes\bin\hyperframes.mjs" %*' + $newline + 'exit /b %errorlevel%' + $newline)
 }
 
 if ($EnableFeishu) {
+    Set-InstallProgress 'runtime.feishu'
     $feishuRoot = Join-Path $runtimeRoot 'feishu'
     $feishuPackageJson = Join-Path $feishuRoot 'node_modules\@larksuiteoapi\lark-mcp\package.json'
     $feishuCli = Join-Path $feishuRoot 'node_modules\@larksuiteoapi\lark-mcp\dist\cli.js'
-    $feishuHealthy = $false
-    if ((Test-Path -LiteralPath $feishuPackageJson -PathType Leaf) -and (Test-Path -LiteralPath $feishuCli -PathType Leaf)) {
-        $packageMetadata = Get-Content -LiteralPath $feishuPackageJson -Raw -Encoding UTF8 | ConvertFrom-Json
-        $feishuHealthy = [string]$packageMetadata.name -eq '@larksuiteoapi/lark-mcp' -and [string]$packageMetadata.version -eq '0.5.1'
-    }
-    if (-not $feishuHealthy) {
-        Expand-Archive -LiteralPath $feishuZip -DestinationPath $feishuRoot -Force
-    }
+    # The CLI and package.json precede dependencies in the archive. Restore
+    # the whole closure only when Feishu is enabled for this installation.
+    Expand-Archive -LiteralPath $feishuZip -DestinationPath $feishuRoot -Force
     if (-not (Test-Path -LiteralPath $feishuPackageJson -PathType Leaf) -or -not (Test-Path -LiteralPath $feishuCli -PathType Leaf)) { throw 'Feishu npm closure is incomplete after extraction.' }
     $packageMetadata = Get-Content -LiteralPath $feishuPackageJson -Raw -Encoding UTF8 | ConvertFrom-Json
     if ([string]$packageMetadata.name -ne '@larksuiteoapi/lark-mcp' -or [string]$packageMetadata.version -ne '0.5.1') { throw 'Extracted Feishu package does not match the locked version.' }
@@ -358,6 +502,7 @@ if ($environmentApplied) {
     $env:PATH = $binRoot + ';' + $env:PATH
 }
 
+Set-InstallProgress 'runtime.complete'
 $runtimeState = [ordered]@{
     schemaVersion = 1
     status = if ($hyperframesHealth -eq 'passed') { 'ready' } else { 'partial' }
@@ -367,7 +512,7 @@ $runtimeState = [ordered]@{
     manim = [ordered]@{ executable = $manimPython; command = (Join-Path $binRoot 'manim.cmd'); version = $manimVersion; health = 'passed'; latex = 'optional-not-installed' }
     node = [ordered]@{ executable = $nodeExe; version = $nodeVersion; health = $nodeHealth }
     ffmpeg = [ordered]@{ executable = $ffmpegExe; ffprobe = $ffprobeExe; version = $ffmpegVersionText; health = $ffmpegHealth; license = 'LGPL shared build' }
-    hyperframes = [ordered]@{ executable = $hyperframesEntry; command = if (Test-Path -LiteralPath $hyperframesCmd -PathType Leaf) { $hyperframesCmd } else { '' }; version = $hyperframesVersion; cliHealth = $hyperframesCliHealth; browserHealth = $hyperframesBrowserHealth; health = $hyperframesHealth; error = $hyperframesError }
+    hyperframes = [ordered]@{ executable = $hyperframesEntry; command = if (Test-Path -LiteralPath $hyperframesCmd -PathType Leaf) { $hyperframesCmd } else { '' }; version = $hyperframesVersion; cliHealth = $hyperframesCliHealth; browserHealth = $hyperframesBrowserHealth; browserExecutable = $hyperframesBrowserExe; browserVersion = $hyperframesBrowserVersion; health = $hyperframesHealth; error = $hyperframesError }
     feishu = [ordered]@{ packageRoot = $feishuRoot; package = '@larksuiteoapi/lark-mcp@0.5.1'; health = $feishuHealth }
     paths = [ordered]@{ kitHome = $kitHome; runtimeRoot = $runtimeRoot; binRoot = $binRoot; wheelhouse = $wheelDir; manimEnvironment = $manimRoot; ffmpeg = $ffmpegRoot; hyperframes = $hyperframesRoot }
     secretsStored = $false

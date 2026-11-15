@@ -125,4 +125,4 @@ MiniMax 视频能力由统一媒体 MCP 管理，不提供独立工作流 Skill�
 
 ## HyperFrames 首次部署边界
 
-Node.js 22、FFmpeg/FFprobe 和 Manim 0.21 离线包含在能力包中。HyperFrames CLI 通过 npm 固定版本安装；若本机没有可用 Chrome，浏览器初始化会下载 Chrome。网络不可用时 `runtime-state.json` 会将 `hyperframes.cliHealth` 或 `hyperframes.browserHealth` 标记为 `requires-network`，不会阻断 Python、Manim、FFmpeg、飞书或 Codex 配置安装。联网后可用 `hyperframes.cmd browser ensure` 重试。
+Node.js 22、FFmpeg/FFprobe 和 Manim 0.21 离线包含在能力包中。HyperFrames CLI 固定为 `hyperframes@0.8.134`，完整 Windows x64 依赖已随包携带，从本地 ZIP 部署，安装时不执行 npm 下载。Chrome Headless Shell `152.0.7977.30` 已随包携带，从本地部署到 kit 私有目录；无需预装 Chrome，也不访问 Google 浏览器下载源。安装检查和 `hyperframes.cmd` 的后续渲染使用同一份本地浏览器。请通过 `hyperframes.cmd` 调用，避免绕过其浏览器路径设置。查看 `runtime-state.json` 的 `hyperframes.cliHealth`、`hyperframes.browserHealth` 和 `hyperframes.error`；两项 health 均为 `passed` 才表示该组件就绪。本地 CLI 或浏览器部署失败会保留具体原因并记为 `install-failed`，不阻断其他已通过核心能力的配置与 readiness 收尾。按诊断修复后可重新安装能力包；不能把可选组件未就绪写成安装成功。

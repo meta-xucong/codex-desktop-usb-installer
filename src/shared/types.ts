@@ -1,4 +1,12 @@
 export type OperatingSystem = "windows" | "macos" | "linux" | "unknown";
+export interface UsbHostStatus {
+  required: boolean;
+  ready: boolean;
+  accountReady: boolean;
+  capabilitiesReady: boolean;
+  conflict: boolean;
+  message: string;
+}
 export type Architecture = "x64" | "arm64" | "unknown";
 export type OperationKind =
   "install" | "update" | "uninstall" | "set-install-root" | "adopt" | "launch";
@@ -124,12 +132,17 @@ export interface DownloadProgress {
   source: string;
   /** Backend lifecycle phase; present on phase transition packets. */
   phase?: OperationPhase;
+  /** Optional current substage for long portable install work. */
+  activity?: string;
   /**
    * Backend operation id that produced this event. Present on live desktop
    * progress so a reloaded UI can reject late events from a previous op.
    */
   operationId?: string;
 }
+
+/** Backend source label for byte progress emitted while unpacking the Windows portable payload. */
+export const WINDOWS_PORTABLE_EXTRACTION_SOURCE = "U盘文件解压";
 
 export type HistoricalReleasePlatform = "macos" | "windows";
 export type HistoricalReleaseArchitecture = "arm64" | "x64";

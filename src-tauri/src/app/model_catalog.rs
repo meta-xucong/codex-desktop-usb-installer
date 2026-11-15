@@ -876,9 +876,9 @@ fn codex_home_dir() -> Option<PathBuf> {
     // cannot receive a false "refreshed" result written to a directory that
     // the launched Codex never reads.
     if usb_guard::guard_required() {
-        if let Ok(paths) = usb_guard::local_data_paths() {
-            return Some(paths.codex_home);
-        }
+        return usb_guard::local_data_paths()
+            .ok()
+            .map(|paths| paths.codex_home);
     }
     if let Some(value) = env::var_os("CODEX_HOME").filter(|value| !value.is_empty()) {
         let path = PathBuf::from(value);
@@ -1350,6 +1350,28 @@ where
     Ok((normalized, ids))
 }
 
+fn with_bundled_terra(bytes: Vec<u8>) -> Result<Vec<u8>, AppError> {
+    let mut value: Value =
+        serde_json::from_slice(&bytes).map_err(|_| engine("管理器模型目录不是有效 JSON"))?;
+    let ids = catalog_model_ids(&value)?;
+    if ids.iter().any(|id| id == "gpt-6.1-terra") {
+        return Ok(bytes);
+    }
+    // model_catalog_json replaces Codex's built-in list. An older manager-owned
+    // snapshot would otherwise hide Terra even after the runtime is upgraded.
+    // Keep existing entries (including deliberate overrides) and user selection.
+    let terra: Value = serde_json::from_str(include_str!("bundled_gpt_6_1_terra.json"))
+        .map_err(|_| engine("随包 Terra 模型条目无效；原模型目录已保留"))?;
+    value["models"].as_array_mut().unwrap().push(terra);
+    catalog_model_ids(&value)?;
+    let normalized =
+        serde_json::to_vec_pretty(&value).map_err(|_| engine("模型目录迁移失败；原文件已保留"))?;
+    if normalized.len() > BODY_LIMIT {
+        return Err(engine("模型目录超过本地大小限制"));
+    }
+    Ok(normalized)
+}
+
 /// Repair the exact legacy shape emitted by earlier manager builds. This is
 /// intentionally limited to manager-owned catalogs: unknown values are
 /// preserved and rejected rather than guessed at.
@@ -1554,6 +1576,9 @@ where
         .and_then(|bytes| validated_catalog_candidate(bytes, &validate_catalog).ok());
 
     if let Some((normalized, _)) = current_valid {
+        // A failed addition is not corruption: never restore an older backup
+        // over a valid current catalogue merely because this addition failed.
+        let normalized = with_bundled_terra(normalized)?;
         ensure_managed_config_unchanged(&config, &config_snapshot)?;
         if read_optional(&catalog)? != current_snapshot {
             return Err(engine("模型目录在校验期间发生变化；请重新点击启动"));
@@ -1591,6 +1616,7 @@ where
         .map_err(|_| {
             engine("当前模型目录和备份均未通过本地目录校验；未修改文件，请复位模型目录")
         })?;
+    let normalized_backup = with_bundled_terra(normalized_backup)?;
     if read_optional(&catalog)? != current_snapshot
         || read_optional(&catalog_backup)? != backup_snapshot
     {
@@ -4276,7 +4302,7 @@ mod tests {
         let migrated: Value = serde_json::from_slice(&std::fs::read(&catalog).unwrap()).unwrap();
         assert_eq!(
             catalog_model_ids(&migrated).unwrap(),
-            ["vendor/legacy", "vendor/concurrent-add"]
+            ["vendor/legacy", "vendor/concurrent-add", "gpt-6.1-terra"]
         );
         assert!(migrated["models"][0].get("node_repl_disabled").is_none());
     }
@@ -4336,6 +4362,117 @@ mod tests {
             "models": [conservative_tested_model_entry(model_id, None, 1)]
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn bundled_terra_migrates_old_catalog_once_without_changing_selection_or_entries() {
+        let home = CatalogTempHome::new();
+        let config = config_path_for(home.path());
+        let catalog = catalog_path_for(home.path());
+        let mut config_bytes = managed_catalog_config(home.path());
+        config_bytes.extend_from_slice(b"model = \"gpt-6.1-sol\"\nmodel_reasoning_effort = \"high\"\n[profiles.kept]\nmodel = \"vendor/custom\"\n[mcp_servers.media_generation]\ncommand = \"unchanged\"\nenabled = true\n");
+        std::fs::write(&config, &config_bytes).unwrap();
+        let before = fixture_catalog("gpt-6.1-sol");
+        std::fs::write(&catalog, &before).unwrap();
+        let original: Value = serde_json::from_slice(&before).unwrap();
+        let reloads = std::cell::Cell::new(0);
+        for _ in 0..2 {
+            preflight_managed_catalog_at_home_with_reload(
+                home.path(),
+                |_| Ok(()),
+                || {
+                    reloads.set(reloads.get() + 1);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        }
+        let result: Value = serde_json::from_slice(&std::fs::read(&catalog).unwrap()).unwrap();
+        assert_eq!(result["models"].as_array().unwrap().len(), 2);
+        assert_eq!(result["models"][0], original["models"][0]);
+        let native: Value =
+            serde_json::from_str(include_str!("bundled_gpt_6_1_terra.json")).unwrap();
+        assert_eq!(result["models"][1], native);
+        assert_eq!(native["slug"], "gpt-6.1-terra");
+        assert_eq!(native["visibility"], "list");
+        assert_eq!(native["node_repl_disabled"], false);
+        assert_eq!(reloads.get(), 1);
+        assert_eq!(std::fs::read(&config).unwrap(), config_bytes);
+        assert_eq!(
+            std::fs::read(atomic_file::backup_path(&catalog)).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn bundled_terra_preserves_existing_terra_and_does_not_create_or_reattach_catalogs() {
+        let home = CatalogTempHome::new();
+        let config = config_path_for(home.path());
+        let catalog = catalog_path_for(home.path());
+        assert!(!preflight_managed_catalog_at_home(home.path(), |_| Ok(())).unwrap());
+        assert!(!catalog.exists());
+        let mut existing: Value =
+            serde_json::from_slice(&fixture_catalog("gpt-6.1-terra")).unwrap();
+        existing["models"][0]["display_name"] = json!("My Terra");
+        existing["models"][0]["visibility"] = json!("hide");
+        let bytes = serde_json::to_vec_pretty(&existing).unwrap();
+        std::fs::write(&catalog, &bytes).unwrap();
+        for text in [
+            b"model = \"gpt-6.1-sol\"\n".as_slice(),
+            b"model_catalog_json = \"user-owned.json\"\n".as_slice(),
+        ] {
+            std::fs::write(&config, text).unwrap();
+            assert!(!preflight_managed_catalog_at_home(home.path(), |_| Ok(())).unwrap());
+            assert_eq!(std::fs::read(&catalog).unwrap(), bytes);
+            assert_eq!(std::fs::read(&config).unwrap(), text);
+        }
+        std::fs::write(&config, managed_catalog_config(home.path())).unwrap();
+        assert!(preflight_managed_catalog_at_home_with_reload(
+            home.path(),
+            |_| Ok(()),
+            || { panic!("existing Terra must not be overwritten or trigger a reload") }
+        )
+        .unwrap());
+        assert_eq!(std::fs::read(&catalog).unwrap(), bytes);
+    }
+
+    #[test]
+    #[ignore = "requires an isolated USB_TERRA_ACCEPTANCE_HOME fixture"]
+    fn bundled_terra_real_fixture_preflight() {
+        let home = PathBuf::from(std::env::var_os("USB_TERRA_ACCEPTANCE_HOME").unwrap());
+        let config = config_path_for(&home);
+        let before = std::fs::read(&config).unwrap();
+        assert!(preflight_managed_catalog_at_home(&home, |_| Ok(())).unwrap());
+        assert_eq!(std::fs::read(&config).unwrap(), before);
+        let first = std::fs::read(catalog_path_for(&home)).unwrap();
+        assert!(preflight_managed_catalog_at_home_with_reload(
+            &home,
+            |_| Ok(()),
+            || { panic!("a second startup must not rewrite the migrated catalog") }
+        )
+        .unwrap());
+        assert_eq!(std::fs::read(catalog_path_for(&home)).unwrap(), first);
+    }
+
+    #[test]
+    fn bundled_terra_add_failure_never_restores_an_older_backup_over_valid_settings() {
+        let home = CatalogTempHome::new();
+        let config = config_path_for(home.path());
+        let catalog = catalog_path_for(home.path());
+        std::fs::write(&config, managed_catalog_config(home.path())).unwrap();
+        let mut value: Value = serde_json::from_slice(&fixture_catalog("vendor/current")).unwrap();
+        value["models"][0]["base_instructions"] = json!("x".repeat(BODY_LIMIT - 4096));
+        let current = serde_json::to_vec(&value).unwrap();
+        assert!(current.len() < BODY_LIMIT);
+        let old = fixture_catalog("vendor/older");
+        std::fs::write(&catalog, &current).unwrap();
+        std::fs::write(atomic_file::backup_path(&catalog), &old).unwrap();
+        assert!(preflight_managed_catalog_at_home(home.path(), |_| Ok(())).is_err());
+        assert_eq!(std::fs::read(&catalog).unwrap(), current);
+        assert_eq!(
+            std::fs::read(atomic_file::backup_path(&catalog)).unwrap(),
+            old
+        );
     }
 
     fn fixture_native_catalog(model_ids: &[&str]) -> Value {
@@ -4797,6 +4934,7 @@ mod tests {
         with_bom.extend_from_slice(&good);
         std::fs::write(&catalog, &with_bom).unwrap();
 
+        let expected = with_bundled_terra(good.clone()).unwrap();
         let validated = preflight_managed_catalog_at_home(home.path(), |bytes| {
             assert_eq!(bytes, good.as_slice());
             Ok(())
@@ -4804,7 +4942,7 @@ mod tests {
         .unwrap();
 
         assert!(validated);
-        assert_eq!(std::fs::read(&catalog).unwrap(), good);
+        assert_eq!(std::fs::read(&catalog).unwrap(), expected);
         assert_eq!(
             std::fs::read(atomic_file::backup_path(&catalog)).unwrap(),
             with_bom
@@ -4880,7 +5018,8 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(std::fs::read(&catalog).unwrap(), good);
+        let expected = with_bundled_terra(good.clone()).unwrap();
+        assert_eq!(std::fs::read(&catalog).unwrap(), expected);
         assert_eq!(std::fs::read(&backup).unwrap(), good);
     }
 
@@ -4900,7 +5039,8 @@ mod tests {
 
         preflight_managed_catalog_at_home(home.path(), |_| Ok(())).unwrap();
 
-        assert_eq!(std::fs::read(&catalog).unwrap(), good);
+        let expected = with_bundled_terra(good.clone()).unwrap();
+        assert_eq!(std::fs::read(&catalog).unwrap(), expected);
         assert_eq!(std::fs::read(&backup).unwrap(), unowned_backup);
     }
 

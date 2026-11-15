@@ -339,13 +339,29 @@ function Invoke-WizardInstall([switch]$SkipConnections) {
         foreach ($line in $output) { Write-WizardStatus ([string]$line) }
         if ($LASTEXITCODE -ne 0) { throw "安装失败，退出码 $LASTEXITCODE。" }
         $readinessPath = Join-Path ([Environment]::GetEnvironmentVariable('USERPROFILE')) '.codex\codex-agent-kit\readiness.json'
+        $ready = $null
         if (Test-Path -LiteralPath $readinessPath -PathType Leaf) {
             $ready = Get-Content -LiteralPath $readinessPath -Raw -Encoding UTF8 | ConvertFrom-Json
-            Write-WizardStatus "安装完成：$($ready.installed.skills) 个 Skills，$($ready.installed.agents) 个 Agents，运行时状态 $($ready.runtime.status)。"
+            $summary = "核心能力：$($ready.core.installedSkills)/$($ready.core.expectedSkills) 个 Skills，$($ready.core.installedAgents)/$($ready.core.expectedAgents) 个 Agents。运行时状态：$($ready.runtime.status)。"
+            $hyperframes = $ready.runtime.hyperframes
+            if ($hyperframes.cliHealth -eq 'install-failed') {
+                $summary += "`nHyperFrames CLI 安装未完成；这不表示 Skill 文件缺失。查看运行时诊断：$($ready.diagnostics.runtime)。解决诊断中指出的问题后，重新运行能力包安装器。Codex 启动时不会自动重试。"
+            } elseif ($hyperframes.cliHealth -eq 'requires-network') {
+                $summary += "`nHyperFrames CLI 尚未就绪，重新运行能力包安装器可从随包介质部署；Codex 启动时不会自动重试。"
+            } elseif ($hyperframes.cliHealth -eq 'passed' -and $hyperframes.browserHealth -in @('requires-network','install-failed')) {
+                $summary += "`nHyperFrames CLI 已安装，但本地浏览器尚未就绪。查看运行时诊断并重新部署随包浏览器，无需下载系统 Chrome。"
+            }
+            Write-WizardStatus $summary
         } else {
-            Write-WizardStatus '安装完成，但未找到 readiness 报告。'
+            $summary = '安装完成，但未找到 readiness 报告。'
+            Write-WizardStatus $summary
         }
-        [System.Windows.Forms.MessageBox]::Show($script:Form, '安装完成。请重启 Codex 或打开新任务，让新的 Skills 和 Agents 生效。', 'Codex Starter Kit', 'OK', 'Information') | Out-Null
+        if ($ready -and $ready.overallStatus -eq 'partial') {
+            $message = "$summary`n`n其余已就绪组件可以继续使用。请重启 Codex 或打开新任务，让新安装的 Skills 和 Agents 生效。"
+            [System.Windows.Forms.MessageBox]::Show($script:Form, $message, '安装完成（部分运行时未就绪）', 'OK', 'Warning') | Out-Null
+        } else {
+            [System.Windows.Forms.MessageBox]::Show($script:Form, '安装完成。请重启 Codex 或打开新任务，让新的 Skills 和 Agents 生效。', 'Codex Starter Kit', 'OK', 'Information') | Out-Null
+        }
     } catch {
         Write-WizardStatus ('错误：' + $_.Exception.Message)
         [System.Windows.Forms.MessageBox]::Show($script:Form, $_.Exception.Message, '安装失败', 'OK', 'Error') | Out-Null

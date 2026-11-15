@@ -34,6 +34,7 @@ use crate::errors::AppError;
 pub const DEFAULT_CODEX_PAYLOAD_REPO: &str = "Wangnov/codex-app-mirror";
 
 const STAGING_DIR: &str = ".staging";
+const TRANSACTION_PAYLOAD_BACKUP: &str = "previous-payload.msix";
 const TRANSACTION_PREFIX: &str = "codex-update-";
 const OWNER_SIDECAR_PREFIX: &str = ".codex-update-";
 const OWNER_SIDECAR_SUFFIX: &str = ".owner.json";
@@ -1200,9 +1201,9 @@ where
                     &mut resolve,
                 ) {
                     Ok(release) => {
-                        // A successfully parsed release is valid evidence even
-                        // when it is equal to or older than the local version.
-                        // A later fallback failure must not erase that evidence.
+                        // Keep reachable-source evidence for the error summary.
+                        // An old release cannot establish that an unavailable
+                        // later source has no newer release.
                         valid_source = true;
                         if let Some(reason) =
                             source_version_reason(current_version, &release.app_version)
@@ -1235,14 +1236,15 @@ where
             }
             log::info!(
                 "codex payload auto source exhausted result={} diagnostics={}",
-                if valid_source || !source_errors {
-                    "no-update"
-                } else {
-                    "error"
-                },
+                if source_errors { "error" } else { "no-update" },
                 diagnostics.join(";")
             );
-            if !valid_source && source_errors {
+            if source_errors && valid_source {
+                Err(AppError::Engine(format!(
+                    "Codex 更新检查未完成：部分更新源不可用，暂不能确认是否为最新版；{}",
+                    diagnostics.join("；")
+                )))
+            } else if source_errors {
                 Err(AppError::Engine(format!(
                     "Codex 更新源均不可用；{}",
                     diagnostics.join("；")
@@ -2633,11 +2635,20 @@ fn rollback_transaction(bundle_root: &Path, tx: &Path) -> Result<(), AppError> {
                 .filter(|value| !value.trim().is_empty())
         })
         .ok_or_else(|| AppError::Engine("旧 manifest 缺少可恢复版本".to_string()))?;
-    let expected_backup = final_backup_dir.join(format!(
+    let legacy_backup = final_backup_dir.join(format!(
         "OpenAI.Codex_{}_{}.msix",
         old_architecture,
         sanitize_version(old_version)
     ));
+    // New updates retain the old MSIX only until their transaction commits.
+    // Older managers left it in payload/_backup; keep recovery of their
+    // existing, interrupted transactions without changing the hash check below.
+    let transaction_backup = tx.join(TRANSACTION_PAYLOAD_BACKUP);
+    let expected_backup = if regular_file_exists(&transaction_backup)? {
+        transaction_backup
+    } else {
+        legacy_backup
+    };
     if let Some(recovery) = recovery_install {
         // A recovery transaction starts with this exact manifest-declared
         // payload absent. Remove only the file this transaction installed,
@@ -3742,6 +3753,7 @@ fn apply_inner(
         ));
     }
     recover_pending_transactions(&ctx.bundle_root)?;
+    crate::app::install_tx::recover_portable_before_update(&current_authorization.codex_root)?;
     // Re-observe after recovery as well. Recovery is the first mutating
     // operation and a drive removal/reuse during it must not be followed by
     // capability reads or a network-backed swap.
@@ -4542,17 +4554,12 @@ fn commit_staged_payload(input: StagedCommit<'_>) -> Result<(), AppError> {
             reject_reparse_chain(&backup_dir)?;
         }
     }
-    let old_version = latest_local
-        .manifest
-        .get("packageVersion")
-        .and_then(serde_json::Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or(&latest_local.current_version);
-    let backup_path = backup_dir.join(format!(
-        "OpenAI.Codex_{}_{}.msix",
-        latest_local.architecture,
-        sanitize_version(old_version)
-    ));
+    // Keep rollback bytes in this transaction until its existing committed
+    // marker, complete checksum verification and authorization check succeed.
+    // The normal committed-transaction cleanup then releases the old MSIX
+    // before the separate application deployment needs its staging space.
+    // Application-directory rollback remains owned by the portable installer.
+    let backup_path = tx.join(TRANSACTION_PAYLOAD_BACKUP);
     // Re-observe immediately before the first destructive rename. The earlier
     // check protects the read/verify phase; this one closes the final
     // drive-letter/replacement window after download and metadata preparation.
@@ -6563,46 +6570,172 @@ mod tests {
     }
 
     #[test]
-    fn auto_source_keeps_no_update_when_later_fallbacks_fail() {
+    fn auto_source_reports_incomplete_when_later_fallbacks_fail() {
         let settings = AppSettings {
             codex_payload_source_kind: CodexPayloadSourceKind::Auto,
             ..AppSettings::default()
         };
         let network = NetworkConfig::direct();
         let mut attempts = Vec::new();
-        let resolved = resolve_preferred_source_with(
+        for relay_version in ["26.903.0", "26.908.0"] {
+            attempts.clear();
+            let error = resolve_preferred_source_with(
+                &settings,
+                "x64",
+                &network,
+                "26.908.0",
+                |_, _, _, source_kind| {
+                    attempts.push(source_kind);
+                    match source_kind {
+                        CodexPayloadSourceKind::Mirror => {
+                            panic!("auto source must not resolve the legacy mirror")
+                        }
+                        CodexPayloadSourceKind::Relay => {
+                            Ok(fake_source_release(source_kind, relay_version))
+                        }
+                        CodexPayloadSourceKind::Github => {
+                            Err(AppError::Engine("github unavailable".to_string()))
+                        }
+                        CodexPayloadSourceKind::Auto => {
+                            Err(AppError::Internal("unexpected auto source".to_string()))
+                        }
+                    }
+                },
+            )
+            .unwrap_err();
+
+            assert!(error.to_string().contains("Codex 更新检查未完成"));
+            assert!(error.to_string().contains("source=github"));
+            assert!(!error.to_string().contains("Codex 更新源均不可用"));
+            assert_eq!(
+                attempts,
+                vec![
+                    CodexPayloadSourceKind::Relay,
+                    CodexPayloadSourceKind::Github
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn auto_source_reports_incomplete_when_only_later_source_has_no_update() {
+        let settings = AppSettings::default();
+        let error = resolve_preferred_source_with(
             &settings,
             "x64",
-            &network,
+            &NetworkConfig::direct(),
+            "26.908.0",
+            |_, _, _, source_kind| match source_kind {
+                CodexPayloadSourceKind::Relay => {
+                    Err(AppError::Engine("relay unavailable".to_string()))
+                }
+                CodexPayloadSourceKind::Github => Ok(fake_source_release(source_kind, "26.908.0")),
+                _ => panic!("unexpected auto source"),
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("Codex 更新检查未完成"));
+        assert!(error.to_string().contains("source=relay"));
+    }
+
+    #[test]
+    fn auto_source_selects_newer_relay_without_contacting_github() {
+        let settings = AppSettings::default();
+        let mut attempts = Vec::new();
+        let release = resolve_preferred_source_with(
+            &settings,
+            "x64",
+            &NetworkConfig::direct(),
             "26.908.0",
             |_, _, _, source_kind| {
                 attempts.push(source_kind);
-                match source_kind {
-                    CodexPayloadSourceKind::Mirror => {
-                        panic!("auto source must not resolve the legacy mirror")
-                    }
-                    CodexPayloadSourceKind::Relay => {
-                        Ok(fake_source_release(source_kind, "26.903.0"))
-                    }
-                    CodexPayloadSourceKind::Github => {
-                        Err(AppError::Engine("github unavailable".to_string()))
-                    }
-                    CodexPayloadSourceKind::Auto => {
-                        Err(AppError::Internal("unexpected auto source".to_string()))
-                    }
-                }
+                assert_eq!(source_kind, CodexPayloadSourceKind::Relay);
+                Ok(fake_source_release(source_kind, "26.909.0"))
             },
         )
+        .unwrap()
         .unwrap();
+        assert_eq!(attempts, vec![CodexPayloadSourceKind::Relay]);
+        assert_eq!(release.identity.source_kind, CodexPayloadSourceKind::Relay);
+        assert_eq!(release.app_version, "26.909.0");
+    }
 
-        assert!(resolved.is_none());
-        assert_eq!(
-            attempts,
-            vec![
-                CodexPayloadSourceKind::Relay,
-                CodexPayloadSourceKind::Github
-            ]
+    #[test]
+    #[ignore = "downloads the current relay MSIX; run explicitly for release acceptance"]
+    fn live_relay_direct_update_uses_production_transport_and_commit() {
+        let network = NetworkConfig::direct();
+        let settings = AppSettings::default();
+        let mut attempts = Vec::new();
+        let release = resolve_preferred_source_with(
+            &settings,
+            "x64",
+            &network,
+            "26.1016.62342",
+            |settings, architecture, network, source_kind| {
+                attempts.push(source_kind);
+                assert_eq!(
+                    source_kind,
+                    CodexPayloadSourceKind::Relay,
+                    "GitHub is forbidden in this test"
+                );
+                resolve_source(settings, architecture, network, source_kind)
+            },
+        )
+        .unwrap()
+        .expect("relay must provide a newer release");
+        assert_eq!(attempts, vec![CodexPayloadSourceKind::Relay]);
+        assert!(release.msix.url.starts_with(LEGACY_CODEX_PAYLOAD_BASE_URL));
+        assert!(release
+            .checksums
+            .url
+            .starts_with(LEGACY_CODEX_PAYLOAD_BASE_URL));
+        let root = v2_fixture();
+        let (local, tx) = prepare_transaction(&root);
+        let expected = UpdateInfo {
+            channel: ChannelKind::Codex,
+            current_version: local.current_version.clone(),
+            latest_version: release.app_version.clone(),
+            release_notes: None,
+            size_bytes: Some(release.msix.size),
+            requires_restart: false,
+            payload: codex_update_payload(&root, &local, &release.identity).unwrap(),
+        };
+        println!(
+            "live_relay_start fixture={} version={} bytes={}",
+            root.display(),
+            release.app_version,
+            release.msix.size
         );
+        let last_progress = std::cell::Cell::new(0_u64);
+        apply_transaction_with_transport(
+            &root,
+            &tx,
+            &local,
+            &release,
+            &expected,
+            &|done, total| {
+                if done == total || done.saturating_sub(last_progress.get()) >= 128 * 1024 * 1024 {
+                    println!("live_relay_download bytes={done} total={total}");
+                    last_progress.set(done);
+                }
+            },
+            &production_apply_transport(&network, false),
+        )
+        .unwrap();
+        let current = require_capability(&root).unwrap();
+        assert_eq!(current.current_version, release.app_version);
+        assert_eq!(
+            fs::metadata(&current.payload_path).unwrap().len(),
+            release.msix.size
+        );
+        assert!(!tx.exists());
+        verify_sha256_sums(
+            &root,
+            &fs::read(root.join(SHA256SUMS_NAME)).unwrap(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        println!("live_relay_passed fixture={} proxy=direct source=relay github_attempts=0 version={} authenticode=verified commit=verified", root.display(), current.current_version);
     }
 
     #[test]
@@ -7018,10 +7151,8 @@ mod tests {
         let current = require_capability(&root).unwrap();
         assert_eq!(fs::read(&current.payload_path).unwrap(), payload);
         assert_eq!(current.current_version, "2.0.0");
-        assert_eq!(
-            fs::read(root.join("payload/_backup/OpenAI.Codex_x64_1.0.0.0.msix")).unwrap(),
-            b"old payload"
-        );
+        assert_eq!(fs::read_dir(root.join("payload/_backup")).unwrap().count(), 0);
+        assert!(!root.join("payload/_backup/OpenAI.Codex_x64_1.0.0.0.msix").exists());
         let sums = fs::read(root.join(SHA256SUMS_NAME)).unwrap();
         verify_sha256_sums(&root, &sums, &BTreeMap::new()).unwrap();
         assert!(!tx.exists());
@@ -7061,6 +7192,7 @@ mod tests {
             deferred_cleanup: &mut deferred_cleanup,
         });
         assert!(result.is_err());
+        assert_eq!(fs::read(tx.join(TRANSACTION_PAYLOAD_BACKUP)).unwrap(), b"old payload");
         rollback_transaction(&root, &tx).unwrap();
 
         let current = require_capability(&root).unwrap();
@@ -7075,6 +7207,72 @@ mod tests {
         assert!(!tx.exists());
         let _ = fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn interrupted_payload_swap_recovers_new_and_legacy_backup_locations() {
+        for legacy in [false, true] {
+            let root = v2_fixture();
+            let (local, tx) = prepare_transaction(&root);
+            let backup = if legacy {
+                let dir = root.join("payload/_backup");
+                fs::create_dir_all(&dir).unwrap();
+                dir.join("OpenAI.Codex_x64_1.0.0.0.msix")
+            } else {
+                tx.join(TRANSACTION_PAYLOAD_BACKUP)
+            };
+            fs::rename(&local.payload_path, backup).unwrap();
+            fs::write(&local.payload_path, b"interrupted new payload").unwrap();
+            write_transaction_state(&tx, "payload-swapped").unwrap();
+            rollback_transaction(&root, &tx).unwrap();
+            assert_old_bundle_is_intact(&root);
+            assert!(!tx.exists());
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn consecutive_updates_release_old_msix_and_preexisting_backup_after_commit() {
+        let root = v2_fixture();
+        let backup_dir = root.join("payload/_backup");
+        fs::create_dir_all(&backup_dir).unwrap();
+        fs::write(backup_dir.join("OpenAI.Codex_x64_previous.msix"), b"older backup").unwrap();
+        let sums = build_sha256_sums(&root, &BTreeMap::new()).unwrap();
+        fs::write(root.join(SHA256SUMS_NAME), sums).unwrap();
+        for version in ["2.0.0", "3.0.0"] {
+            let (local, tx) = prepare_transaction(&root);
+            let staged = tx.join("codex-new.Msix");
+            let payload = format!("new committed payload {version}");
+            fs::write(&staged, payload.as_bytes()).unwrap();
+            let mut release = fake_resolved_release();
+            release.app_version = version.into();
+            release.identity.app_version = version.into();
+            release.identity.msix_version = format!("{version}.0");
+            let expected = UpdateInfo {
+                current_version: local.current_version.clone(),
+                latest_version: version.into(),
+                payload: codex_update_payload(&root, &local, &release.identity).unwrap(),
+                ..fake_update_info(&root, &local)
+            };
+            let mut cleanup = None;
+            commit_staged_payload(StagedCommit {
+                root: &root, tx: &tx, local: &local, fresh: &release, expected: &expected,
+                staged: &staged, actual_sha: &sha256_bytes(payload.as_bytes()), total: payload.len() as u64,
+                progress: &|_, _| {}, reactivation_reinstall: false, deferred_cleanup: &mut cleanup,
+            }).unwrap();
+            assert!(!tx.exists());
+            assert_eq!(fs::read_dir(&backup_dir).unwrap().count(), 0);
+            let current = require_capability(&root).unwrap();
+            assert_eq!(current.current_version, version);
+            assert_eq!(fs::read(current.payload_path).unwrap(), payload.as_bytes());
+            let sums = fs::read(root.join(SHA256SUMS_NAME)).unwrap();
+            verify_sha256_sums(&root, &sums, &BTreeMap::new()).unwrap();
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    include!("codex_capacity_acceptance.rs");
+    #[cfg(windows)]
+    include!("codex_cleanup_acceptance.rs");
 
     #[cfg(unix)]
     #[test]

@@ -1077,6 +1077,7 @@ fn copy_payload(source_executable: &Path, target_dir: &Path) -> Result<usize, Ap
 fn launch_with_intent(
     app: &AppHandle,
     intent: CcswitchLaunchIntent,
+    replace_account: bool,
 ) -> Result<CcswitchLaunchReport, AppError> {
     if !cfg!(target_os = "windows") {
         return Ok(report_missing("当前平台不支持自动启动 Windows CCSwitch"));
@@ -1293,6 +1294,7 @@ fn launch_with_intent(
         // its data directory. Tauri/Windows continue to resolve app data from
         // the user's profile, not from the removable working directory.
         .env("CODEX_USB_CCSWITCH_MODE", launch_mode)
+        .env("CCSWITCH_USB_REPLACE_ACCOUNT", if replace_account { "1" } else { "0" })
         // The bundled USB edition is a background configurator: its provider
         // bootstrap runs before the window becomes interactive, then the
         // manager hides the main window while leaving the tray process alive.
@@ -1498,13 +1500,24 @@ fn launch_with_intent(
 /// Automatic first-install path. It keeps the historical bootstrap behavior
 /// but records that the one-time tray hand-off already happened.
 pub fn install_and_launch(app: &AppHandle) -> Result<CcswitchLaunchReport, AppError> {
-    launch_with_intent(app, CcswitchLaunchIntent::Bootstrap)
+    let usb_mode = crate::app::usb_guard::guard_required();
+    if usb_mode {
+        let host = crate::app::usb_host::status()?;
+        if !host.account_ready { crate::app::model_catalog::mark_restart_required()?; }
+    }
+    // The USB installer defaults to the current signed account. UserOpen and
+    // non-USB launches retain their existing behavior and isolated data paths.
+    launch_with_intent(app, CcswitchLaunchIntent::Bootstrap, usb_mode)
+}
+
+pub(crate) fn initialize_host_account(app: &AppHandle, replace_account: bool) -> Result<CcswitchLaunchReport, AppError> {
+    launch_with_intent(app, CcswitchLaunchIntent::Bootstrap, replace_account)
 }
 
 /// Explicit user-facing open path. It restores an existing managed process and
 /// only starts a new visible process when none is running.
 pub fn open(app: &AppHandle) -> Result<CcswitchLaunchReport, AppError> {
-    launch_with_intent(app, CcswitchLaunchIntent::UserOpen)
+    launch_with_intent(app, CcswitchLaunchIntent::UserOpen, false)
 }
 
 /// Resolve only the signed USB product binary for a finite configuration RPC.

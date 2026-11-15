@@ -4,6 +4,16 @@ use std::path::{Path, PathBuf};
 const SMOKE_RUN_ENV: &str = "CAM_PACKAGED_SMOKE_RUN";
 const SMOKE_DATA_DIR_ENV: &str = "CAM_PACKAGED_SMOKE_DATA_DIR";
 const SMOKE_DATA_DIR_PREFIX: &str = "codex-app-manager-smoke-";
+const PRODUCTION_APP_QUALIFIER: &str = "codexappmanager";
+const DIAGNOSTIC_APP_QUALIFIER: &str = "Codex App Manager USB CDP Diagnostic";
+
+fn app_qualifier(diagnostic: bool) -> &'static str {
+    if diagnostic {
+        DIAGNOSTIC_APP_QUALIFIER
+    } else {
+        PRODUCTION_APP_QUALIFIER
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 enum SmokeDataDir {
@@ -101,8 +111,12 @@ fn select_staging_root(smoke: SmokeDataDir, temp_dir: &Path, process_id: u32) ->
 
 /// Manager data directory shared by settings, provenance, and operation locks.
 pub fn data_dir() -> Option<PathBuf> {
-    let production = directories::ProjectDirs::from("io.github", "wangnov", "codexappmanager")
-        .map(|dirs| dirs.data_dir().to_path_buf());
+    let production = directories::ProjectDirs::from(
+        "io.github",
+        "wangnov",
+        app_qualifier(cfg!(feature = "usb-cdp-diagnostic")),
+    )
+    .map(|dirs| dirs.data_dir().to_path_buf());
     select_data_dir(smoke_data_dir_from_env(), production)
 }
 
@@ -110,8 +124,12 @@ pub fn data_dir() -> Option<PathBuf> {
 /// catalog preview thumbnails). Safe to clear at any time — distinct from
 /// `data_dir`, which holds settings/provenance that must persist.
 pub fn cache_dir() -> Option<PathBuf> {
-    directories::ProjectDirs::from("io.github", "wangnov", "codexappmanager")
-        .map(|dirs| dirs.cache_dir().to_path_buf())
+    directories::ProjectDirs::from(
+        "io.github",
+        "wangnov",
+        app_qualifier(cfg!(feature = "usb-cdp-diagnostic")),
+    )
+    .map(|dirs| dirs.cache_dir().to_path_buf())
 }
 
 pub fn packaged_smoke_run_id() -> Option<String> {
@@ -144,7 +162,11 @@ pub fn codex_home_dir() -> Option<PathBuf> {
 /// one — skins are megabytes of re-downloadable content that must not ride
 /// a domain roaming profile.
 pub fn default_skins_store_dir() -> Option<PathBuf> {
-    let dirs = directories::ProjectDirs::from("io.github", "wangnov", "codexappmanager")?;
+    let dirs = directories::ProjectDirs::from(
+        "io.github",
+        "wangnov",
+        app_qualifier(cfg!(feature = "usb-cdp-diagnostic")),
+    )?;
     if cfg!(target_os = "windows") {
         Some(dirs.data_local_dir().join("themes"))
     } else {
@@ -155,12 +177,38 @@ pub fn default_skins_store_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        select_data_dir, select_staging_root, validate_smoke_data_dir, SmokeDataDir,
+        app_qualifier, select_data_dir, select_staging_root, validate_smoke_data_dir, SmokeDataDir,
         SMOKE_DATA_DIR_PREFIX,
     };
 
     fn test_run_id() -> String {
         format!("test-{}", uuid::Uuid::new_v4())
+    }
+
+    #[test]
+    fn diagnostic_manager_data_cache_and_log_roots_are_separate() {
+        let production =
+            directories::ProjectDirs::from("io.github", "wangnov", app_qualifier(false)).unwrap();
+        let diagnostic =
+            directories::ProjectDirs::from("io.github", "wangnov", app_qualifier(true)).unwrap();
+        assert_ne!(production.data_dir(), diagnostic.data_dir());
+        assert_ne!(production.cache_dir(), diagnostic.cache_dir());
+
+        let production_config: serde_json::Value =
+            serde_json::from_str(include_str!("../../tauri.conf.json")).unwrap();
+        let diagnostic_config: serde_json::Value =
+            serde_json::from_str(include_str!("../../tauri.diagnostic.conf.json")).unwrap();
+        let production_id = production_config["identifier"].as_str().unwrap();
+        let diagnostic_id = diagnostic_config["identifier"].as_str().unwrap();
+        assert_ne!(production_id, diagnostic_id);
+        assert_ne!(
+            format!("{production_id}/logs"),
+            format!("{diagnostic_id}/logs")
+        );
+        assert_eq!(
+            diagnostic_id,
+            "io.github.wangnov.codexappmanager.usbcddiagnostic"
+        );
     }
 
     #[test]

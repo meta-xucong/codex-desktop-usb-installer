@@ -6,7 +6,7 @@
 
 1. 安装/复用 CPython 3.12；
 2. 创建独立 Python 虚拟环境并从本地 wheelhouse 安装完整传递依赖；
-3. 离线部署 Node.js 22、FFmpeg/FFprobe 和 Manim；解压锁定的飞书 MCP npm 依赖；联网时再安装 HyperFrames CLI 并准备 Chrome；
+3. 离线部署 Node.js 22、FFmpeg/FFprobe 和 Manim；解压锁定的飞书 MCP npm 依赖；从随包 ZIP 部署 HyperFrames CLI、完整 Windows 依赖、私有编码器及固定版浏览器；
 4. 安装全部 54 个 Skill 和 7 个 Agent；
 5. 生成 Codex 的托管配置片段，并保留用户原有配置；
 6. 记录运行时、配置和连接健康状态；
@@ -66,7 +66,7 @@
         ↓
 解压 Node.js 22 与 FFmpeg/FFprobe
         ↓
-离线安装 Manim 0.21 独立环境；检查 HyperFrames CLI/Chrome（npm/浏览器下载需要网络）；解压并验证 Feishu MCP npm closure / CLI
+离线安装 Manim 0.21 独立环境；从本地部署并检查 HyperFrames CLI、Windows 依赖和固定版浏览器；解压并验证 Feishu MCP npm closure / CLI
         ↓
 复制 54 Skills、7 Agents、manifest、连接模板
         ↓
@@ -75,7 +75,7 @@
 写入 runtime-state.json、connection-status.json、readiness.json
 ```
 
-Python、Manim、Node 和 FFmpeg 的介质哈希/健康检查失败会终止运行时安装；若 HyperFrames 的 npm 或 Chrome 下载离线失败，只将该能力标记为 `requires-network`，其它本地能力照常安装。
+Python、Manim、Node 和 FFmpeg 的介质哈希/健康检查失败会终止运行时安装。HyperFrames CLI/浏览器本地部署或检查失败时标记为 `install-failed`，保留原始错误；不推断网络原因，也不阻断其余本地能力的收尾。安装机不执行 npm 或 Google 浏览器下载。解决 `readiness.json` 的运行时诊断中显示的问题后，重新运行能力包安装器可再次尝试；Codex 启动时不会自动重试。
 
 ## 5. 配置合并规则
 

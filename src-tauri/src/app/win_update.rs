@@ -25,12 +25,12 @@ use codex_win_engine::{
     CapabilityState, EngineError, InstalledWindowsCodex, MsixHealthReport, MsixIdentity,
     MsixMachineStateReport, MsixRemoveReport, MsixSideloadReport, NetworkConfig, PortableBoundary,
     PortableExtractionProgress, PortableInstallOptions, PortableInstallReport,
-    PortableUninstallReport, WinCapabilityReport, WinInstallRoute, WindowsRelease,
-    WindowsUpdatePlan,
+    PortableInstallStage, PortableUninstallReport, WinCapabilityReport, WinInstallRoute,
+    WindowsRelease, WindowsUpdatePlan,
 };
 
 use crate::app::appx_volume;
-use crate::app::install_tx::{ActiveInstallTx, InstallTxKind, SelfUpdatePolicyTransition};
+use crate::app::install_tx::{ActiveInstallTx, SelfUpdatePolicyTransition};
 use crate::app::msix_policy_tx::ActiveMsixPolicyTransition;
 use crate::app::op_phase::OperationPhase;
 use crate::app::operation_outcome::{
@@ -411,6 +411,8 @@ pub struct DownloadProgress {
     pub total: u64,
     /// Host the bytes are coming from, e.g. `codexapp.agentsmirror.com`.
     pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activity: Option<String>,
 }
 
 fn engine_err(err: impl ToString) -> AppError {
@@ -934,6 +936,59 @@ pub(crate) fn codex_launch_environment(
     environment
 }
 
+
+/// Add the fixed experimental Sky helper path to either USB Codex launch
+/// route. The app's native-pipe resolver consumes this same process-local
+/// override after the portable ASAR compatibility patch is applied.
+pub(crate) fn append_usb_cua_helper_experiment_environment(
+    usb_mode: bool,
+    bundle_root: Option<&Path>,
+    environment: &mut Vec<(String, String)>,
+) -> Result<(), AppError> {
+    #[cfg(feature = "usb-cua-helper-mta-experiment")]
+    if usb_mode {
+        let bundle_root = bundle_root.ok_or_else(|| {
+            AppError::Engine("USB CUA experiment could not resolve its bundle root".to_string())
+        })?;
+        let helper_path = bundle_root
+            .join("resources")
+            .join("codex-cua-helper-experiment")
+            .join("codex-computer-use-mta-wrapper-candidate-v3.exe");
+        environment.push((
+            "OAI_SKY_WINDOWS_BIN".to_string(),
+            helper_path.to_string_lossy().into_owned(),
+        ));
+    }
+
+    #[cfg(not(feature = "usb-cua-helper-mta-experiment"))]
+    let _ = (usb_mode, bundle_root, environment);
+
+    Ok(())
+}
+
+/// Apply USB-managed config changes after the engine has ruled out reuse and
+/// closed an unowned Codex core, immediately before creating a fresh process.
+/// This keeps the write out of the active-app interval without relying on an
+/// installation-root process count that the launch engine does not use.
+pub(crate) fn prepare_usb_conversation_mode_for_launch(usb_mode: bool, codex_home: Option<&Path>) {
+    if !usb_mode {
+        return;
+    }
+    let Some(codex_home) = codex_home else {
+        log::warn!("USB conversation detail-mode preparation skipped: CODEX_HOME missing");
+        return;
+    };
+    let outcome = crate::app::usb_conversation_mode::apply_for_launch(codex_home, usb_mode, false);
+    log::info!("USB conversation detail-mode preparation outcome={outcome:?}");
+    let node_repl_outcome = match usb_guard::current_bundle_root() {
+        Some(bundle_root) => {
+            crate::app::usb_node_repl::apply_for_launch(codex_home, &bundle_root, usb_mode, false)
+        }
+        None => crate::app::usb_node_repl::ApplyOutcome::MissingContext,
+    };
+    log::info!("USB local Node REPL registration outcome={node_repl_outcome:?}");
+}
+
 pub fn plan_windows_update(
     endpoints: &MirrorEndpoints,
     settings: &AppSettings,
@@ -1110,6 +1165,7 @@ pub fn stage_windows_update_with_install_mode_and_network(
                         downloaded,
                         total: expected_size,
                         source: source.clone(),
+                        activity: None,
                     });
                 },
                 network,
@@ -1147,6 +1203,7 @@ pub fn stage_windows_update_with_install_mode_and_network(
                 actual_size
             },
             source,
+            activity: None,
         });
 
         let actual_sha = sha256_file(&dest).map_err(engine_err)?;
@@ -1347,6 +1404,7 @@ fn stage_windows_historical_release(
                         downloaded,
                         total: resolved.size,
                         source: source.clone(),
+                        activity: None,
                     });
                 },
                 network,
@@ -1357,6 +1415,7 @@ fn stage_windows_historical_release(
                 downloaded: resolved.size,
                 total: resolved.size,
                 source,
+                activity: None,
             });
         }
         let actual_size = std::fs::metadata(&dest)
@@ -2640,6 +2699,7 @@ fn install_portable_after_stage(
     };
     let install_root_path = PathBuf::from(&install_root);
     let msix_path = PathBuf::from(staged_path);
+    crate::app::install_tx::recover_portable_before_update(&install_root_path)?;
     // Persist the transaction log before the first possible rename using the
     // real paths chosen by the engine. Once that journal is durable, publish
     // `Committing` before the first rename so the app cannot exit in the narrow
@@ -2674,12 +2734,24 @@ fn install_portable_after_stage(
             }
         }
         match boundary {
-            PortableBoundary::BeforeMoveOld {
+            PortableBoundary::BeforePrepare {
                 install_root,
                 payload,
                 backup,
                 had_previous,
             } => {
+                tx = Some(
+                    ActiveInstallTx::begin_portable_preparation(
+                        &install_root,
+                        &payload,
+                        &backup,
+                        had_previous,
+                    )
+                    .map_err(|e| codex_win_engine::EngineError::Io(e.to_string()))?,
+                );
+                Ok(())
+            }
+            PortableBoundary::BeforeMoveOld { install_root, .. } => {
                 if usb_portable {
                     let authorization =
                         usb_guard::require_signed_codex_bundle("portable-usb-precommit")
@@ -2698,21 +2770,19 @@ fn install_portable_after_stage(
                         ));
                     }
                 }
-                let mut started = ActiveInstallTx::begin(
-                    InstallTxKind::WindowsPortable,
-                    &install_root,
-                    &payload,
-                    &backup,
-                    had_previous,
-                    None,
-                )
-                .map_err(|e| codex_win_engine::EngineError::Io(e.to_string()))?;
+                let started = tx.as_mut().ok_or_else(|| {
+                    codex_win_engine::EngineError::Io(
+                        "portable extraction transaction missing".into(),
+                    )
+                })?;
+                started
+                    .mark_prepared()
+                    .map_err(|e| codex_win_engine::EngineError::Io(e.to_string()))?;
                 if let Some(transition) = policy_transition {
                     started
                         .set_self_update_policy_transition(transition)
                         .map_err(|e| codex_win_engine::EngineError::Io(e.to_string()))?;
                 }
-                tx = Some(started);
                 if let Some(hook) = phase {
                     hook(OperationPhase::Committing);
                 }
@@ -2751,6 +2821,12 @@ fn install_portable_after_stage(
                 downloaded: update.completed_bytes,
                 total: update.total_bytes,
                 source: "U盘文件解压".to_string(),
+                activity: match update.stage {
+                    PortableInstallStage::Extracting => None,
+                    PortableInstallStage::StartupCompatibility => {
+                        Some("portable-startup-compatibility".to_string())
+                    }
+                },
             });
         }
         Ok(())
@@ -3248,8 +3324,22 @@ pub fn launch_codex(settings: &AppSettings, codex_locale: Option<&str>) -> Resul
     let direct_entry_required = usb_authorization
         .as_ref()
         .is_some_and(|authorization| authorization.direct_entry_required);
-    let launch_environment = codex_launch_environment(usb_mode, codex_home.as_deref());
-    let report = codex_win_engine::launch_codex_with_options(
+    let mut launch_environment = codex_launch_environment(usb_mode, codex_home.as_deref());
+    #[cfg(feature = "usb-cua-helper-mta-experiment")]
+    let bundle_root = if usb_mode {
+        crate::app::usb_guard::current_bundle_root()
+    } else {
+        None
+    };
+    #[cfg(not(feature = "usb-cua-helper-mta-experiment"))]
+    let bundle_root: Option<PathBuf> = None;
+    append_usb_cua_helper_experiment_environment(
+        usb_mode,
+        bundle_root.as_deref(),
+        &mut launch_environment,
+    )?;
+    let prepare_home = codex_home.clone();
+    let report = codex_win_engine::launch_codex_with_options_and_before_spawn(
         &installed,
         codex_win_engine::LaunchOptions {
             // A program tree on removable media must never replace itself in
@@ -3259,11 +3349,14 @@ pub fn launch_codex(settings: &AppSettings, codex_locale: Option<&str>) -> Resul
             environment: launch_environment,
             usb_integrity_transaction: usb_mode,
             require_usb_entry_overlay: direct_entry_required,
-            remote_debugging_port: None,
+            remote_debugging_port: codex_remote_debugging_port(cfg!(
+                feature = "usb-cdp-diagnostic"
+            )),
             codex_home,
             locale_override: codex_locale.map(str::to_string),
             portable_launch_policy: launch_policy,
         },
+        move || prepare_usb_conversation_mode_for_launch(usb_mode, prepare_home.as_deref()),
     )
     .map_err(|e| AppError::Engine(e.to_string()))?;
     complete_usb_model_catalog_launch(catalog_reload_marker.as_deref());
@@ -3277,6 +3370,10 @@ pub fn launch_codex(settings: &AppSettings, codex_locale: Option<&str>) -> Resul
         report.no_sandbox
     );
     Ok(())
+}
+
+fn codex_remote_debugging_port(diagnostic_launch: bool) -> Option<u16> {
+    diagnostic_launch.then_some(9222)
 }
 
 pub fn uninstall_windows_codex(
@@ -4078,6 +4175,12 @@ where
 #[cfg(test)]
 mod tests {
     #[test]
+    fn remote_debugging_is_only_enabled_for_an_explicit_diagnostic_codex_launch() {
+        assert_eq!(super::codex_remote_debugging_port(false), None);
+        assert_eq!(super::codex_remote_debugging_port(true), Some(9222));
+    }
+
+    #[test]
     fn usb_runtime_environment_prefers_managed_bin_and_enables_utf8_python() {
         let root = temp_test_dir("usb-runtime-environment");
         let codex_home = root.join("codex-home");
@@ -4114,6 +4217,11 @@ mod tests {
         let codex_home = root.join("codex-home");
         let runtime_bin = codex_home.join("codex-agent-kit").join("bin");
         std::fs::create_dir_all(&runtime_bin).unwrap();
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "model_provider = \"custom\"\n\n[model_providers.custom]\nbase_url = \"https://404token.xyz/v1\"\n",
+        )
+        .unwrap();
 
         let environment = super::codex_launch_environment(true, Some(&codex_home));
         let path = environment
@@ -4136,6 +4244,40 @@ mod tests {
                 actual_name == &name && actual_value == &value
             }));
         }
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+
+    #[test]
+    fn cua_experiment_helper_override_is_usb_and_feature_scoped() {
+        let root = temp_test_dir("usb-cua-helper-environment");
+        let mut environment = Vec::new();
+
+        super::append_usb_cua_helper_experiment_environment(false, Some(&root), &mut environment)
+            .unwrap();
+        assert!(!environment
+            .iter()
+            .any(|(name, _)| name == "OAI_SKY_WINDOWS_BIN"));
+
+        super::append_usb_cua_helper_experiment_environment(true, Some(&root), &mut environment)
+            .unwrap();
+        #[cfg(feature = "usb-cua-helper-mta-experiment")]
+        {
+            let expected = root
+                .join("resources")
+                .join("codex-cua-helper-experiment")
+                .join("codex-computer-use-mta-wrapper-candidate-v3.exe")
+                .to_string_lossy()
+                .into_owned();
+            assert!(environment
+                .iter()
+                .any(|(name, value)| { name == "OAI_SKY_WINDOWS_BIN" && value == &expected }));
+        }
+        #[cfg(not(feature = "usb-cua-helper-mta-experiment"))]
+        assert!(!environment
+            .iter()
+            .any(|(name, _)| name == "OAI_SKY_WINDOWS_BIN"));
 
         std::fs::remove_dir_all(root).unwrap();
     }

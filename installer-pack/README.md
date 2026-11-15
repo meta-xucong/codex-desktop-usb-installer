@@ -148,7 +148,7 @@ Skill 或全局 `AGENTS.md`。它会校验 `file-manifest.json` 与 `checksums.s
 
 需要真实 Python 功能的 Skill 使用安装包提供的 Windows x64 CPython 3.12.10 per-user 运行时和 77 个 wheel，
 默认部署到安装记录下的独立 `runtime/python-env`，不依赖系统 PATH。Node.js 22、FFmpeg 和 Manim 环境
-同样从安装包离线部署；锁定的 Feishu npm closure 离线解压。HyperFrames CLI/Chrome 缺失时需联网初始化。安装器会校验介质字节数、SHA-256、Python 签名、wheel lock 和导入探针；具体文件名、
+同样从安装包离线部署；锁定的 Feishu npm closure 离线解压。HyperFrames CLI、完整 Windows 依赖及固定版浏览器均从随包 ZIP 本地部署，无需预装 Node/Chrome 或访问 npm/Google 下载源。安装器会校验介质字节数、SHA-256、Python 签名、wheel lock 和导入探针；具体文件名、
 签名、返回码、健康检查和回滚策略见 [`manifest/runtime-artifacts.json`](manifest/runtime-artifacts.json) 与
 [`docs/FULL-BUNDLE-ONE-CLICK-DEVELOPMENT.md`](docs/FULL-BUNDLE-ONE-CLICK-DEVELOPMENT.md)。
 

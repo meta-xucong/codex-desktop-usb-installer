@@ -27,8 +27,8 @@ pub enum ActivationError {
     Conflict,
     #[error("VPS 响应无效；没有确认授权已激活")]
     InvalidResponse,
-    #[error("VPS 未接受登记凭证；授权尚未确认")]
-    Rejected,
+    #[error("VPS rejected registration (HTTP {status})")]
+    Rejected { status: u16 },
 }
 
 #[derive(Serialize)]
@@ -101,11 +101,15 @@ fn validate_response(
         return match error.error.as_str() {
             "license_revoked" => Err(ActivationError::Revoked),
             "registration_conflict" => Err(ActivationError::Conflict),
-            _ => Err(ActivationError::Rejected),
+            _ => Err(ActivationError::Rejected {
+                status: status.as_u16(),
+            }),
         };
     }
     if status != StatusCode::OK && status != StatusCode::CREATED {
-        return Err(ActivationError::Rejected);
+        return Err(ActivationError::Rejected {
+            status: status.as_u16(),
+        });
     }
     let response: ActivationResponse =
         serde_json::from_slice(body).map_err(|_| ActivationError::InvalidResponse)?;
@@ -124,6 +128,25 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
+
+    #[test]
+    fn rejected_http_status_is_preserved_without_recording_response_body() {
+        for status in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            assert_eq!(
+                validate_response(status, b"opaque response body", "expected-installation"),
+                Err(ActivationError::Rejected {
+                    status: status.as_u16(),
+                })
+            );
+        }
+    }
 
     #[test]
     fn accepts_only_matching_active_registration_responses() {

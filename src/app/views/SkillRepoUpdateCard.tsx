@@ -159,12 +159,10 @@ function safeDiagnosticItem(item: SkillRepoItem) {
 function SourceAttempts({
   attempts,
   selectedSourceLabel,
-  expanded,
   t,
 }: {
   attempts: SkillRepoSourceAttempt[];
   selectedSourceLabel: SkillRepoSourceLabel | null;
-  expanded: boolean;
   t: TFn;
 }) {
   if (!attempts.length && !selectedSourceLabel) return null;
@@ -176,7 +174,7 @@ function SourceAttempts({
         </div>
       ) : null}
       {attempts.length ? (
-        <details className="skill-repo-source-attempts" open={expanded}>
+        <details className="skill-repo-source-attempts">
           <summary>{t("skillRepo.sourceAttempts", { count: attempts.length })}</summary>
           <div className="skill-repo-source-attempt-list">
             {attempts.map((attempt, index) => (
@@ -270,31 +268,13 @@ export function SkillRepoUpdateCard() {
       setSelectedSourceLabel(
         sourceLabelFromValue(nextInfo.sourceLabel) ?? sourceLabelForId(nextInfo.expected.sourceId),
       );
-    } catch (error) {
-      setSourceAttempts(skillRepoAttempts(error));
-      setFailure(resolveFailure(error, t, { sanitizeDetail: true }));
-      setRetryAction("check");
-    } finally {
-      finish();
-    }
-  };
-
-  const apply = async () => {
-    if (busyRef.current !== null || !info) return;
-    const expected = info.expected;
-    if (!begin("apply")) return;
-    const checkedSourceLabel = selectedSourceLabel ?? sourceLabelForId(expected.sourceId);
-    setFailure(null);
-    setInfo(null);
-    setReport(null);
-    setRollbackReport(null);
-    setSourceAttempts([]);
-    setSelectedSourceLabel(checkedSourceLabel);
-    setRetryAction(null);
-    try {
-      const nextReport = await managerApi.skillRepoApplyUpdate(expected);
-      setReport(nextReport);
-      setSelectedSourceLabel(sourceLabelForId(nextReport.identity.sourceId) ?? checkedSourceLabel);
+      if (nextInfo.updateAvailable) {
+        busyRef.current = "apply";
+        setBusy("apply");
+        const nextReport = await managerApi.skillRepoApplyUpdate(nextInfo.expected);
+        setReport(nextReport);
+        setSelectedSourceLabel(sourceLabelForId(nextReport.identity.sourceId));
+      }
     } catch (error) {
       setSourceAttempts(skillRepoAttempts(error));
       setFailure(resolveFailure(error, t, { sanitizeDetail: true }));
@@ -440,10 +420,7 @@ export function SkillRepoUpdateCard() {
 
           <div className="skill-repo-sheet-actions">
             <button type="button" className="btn primary" onClick={() => void check()} disabled={busy !== null}>
-              {busy === "check" ? t("skillRepo.checking") : t("skillRepo.check")}
-            </button>
-            <button type="button" className="btn ghost" onClick={() => setConfirmAction("rollback")} disabled={busy !== null}>
-              {busy === "rollback" ? t("skillRepo.rollingBack") : t("skillRepo.rollback")}
+              {busy === "check" ? t("skillRepo.checking") : busy === "apply" ? t("skillRepo.updating") : t("skillRepo.check")}
             </button>
           </div>
 
@@ -478,19 +455,10 @@ export function SkillRepoUpdateCard() {
               </details>
             </StatusBanner>
           ) : null}
-          <SourceAttempts
-            attempts={sourceAttempts}
-            selectedSourceLabel={selectedSourceLabel}
-            expanded={Boolean(failure || info)}
-            t={t}
-          />
           {info ? (
             <div className="skill-repo-update-summary">
               <div>{t("skillRepo.version", { current: shortCommit(info.currentCommit), latest: shortCommit(info.latestCommit) })}</div>
               <div>{t("skillRepo.counts", { installable: info.installableCount, conflicts: info.conflictCount, skipped: info.skippedCount })}</div>
-              <button type="button" className="btn primary" onClick={() => void apply()} disabled={busy !== null || !info.updateAvailable}>
-                {busy === "apply" ? t("skillRepo.updating") : t("skillRepo.update")}
-              </button>
             </div>
           ) : null}
           {report ? (
@@ -531,6 +499,14 @@ export function SkillRepoUpdateCard() {
                 : t("error.generic")}
             </StatusBanner>
           ) : null}
+
+          <details className="skill-repo-failure-details" data-testid="skill-repo-advanced">
+            <summary>{t("skillRepo.advanced")}</summary>
+            <SourceAttempts attempts={sourceAttempts} selectedSourceLabel={selectedSourceLabel} t={t} />
+            <button type="button" className="btn ghost" onClick={() => setConfirmAction("rollback")} disabled={busy !== null}>
+              {busy === "rollback" ? t("skillRepo.rollingBack") : t("skillRepo.rollback")}
+            </button>
+          </details>
 
           <div className="row2 sheet-actions">
             <button type="button" className="btn ghost" onClick={() => setOpen(false)} disabled={busy !== null}>

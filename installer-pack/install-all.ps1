@@ -2,7 +2,9 @@
 param(
     [string]$TargetUserProfile,
     [string]$TargetCodexHome,
+    [string]$ProgressFile = '',
     [switch]$EnableFullAccess,
+    [switch]$ReplaceExisting,
     [ValidateSet('tenant','oauth','user')][string]$FeishuAuthMode = 'tenant',
     [string]$FeishuDomain = 'https://open.feishu.cn',
     [string[]]$EnableSkills = @(),
@@ -46,7 +48,11 @@ if (-not [string]::IsNullOrWhiteSpace($TargetUserProfile)) {
 if (-not [string]::IsNullOrWhiteSpace($TargetCodexHome)) {
     $arguments += @('-TargetCodexHome', $TargetCodexHome)
 }
+if (-not [string]::IsNullOrWhiteSpace($ProgressFile)) {
+    $arguments += @('-ProgressFile', $ProgressFile)
+}
 if ($EnableFullAccess) { $arguments += '-EnableFullAccess' }
+if ($ReplaceExisting) { $arguments += '-ReplaceExisting' }
 if ($EnableFeishu) { $arguments += '-EnableFeishu' }
 if ($DisableFeishu) { $arguments += '-DisableFeishu' }
 if ($EnableMediaGeneration) { $arguments += '-EnableMediaGeneration' }

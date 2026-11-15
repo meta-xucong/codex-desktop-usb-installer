@@ -5,7 +5,8 @@ param(
     [string]$TargetCodexHome,
     [Parameter(Mandatory = $true)][string]$KitHome,
     [string]$PythonExe,
-    [switch]$EnableFullAccess
+    [switch]$EnableFullAccess,
+    [switch]$ReplaceExisting
 )
 
 $ErrorActionPreference = 'Stop'
@@ -25,11 +26,22 @@ if ($fragment -match '(?i)(app[_-]?secret\s*=|FEISHU_APP_SECRET\s*=\s*["''][^"''
 if ($fragment -match '__[A-Z0-9_]+__') { throw 'Generated Codex fragment contains unresolved placeholders.' }
 
 New-Item -ItemType Directory -Force -Path $configRoot, $backupRoot | Out-Null
-$existing = if (Test-Path -LiteralPath $configPath -PathType Leaf) { Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 } else { '' }
+$existing = if (Test-Path -LiteralPath $configPath -PathType Leaf) { [string](Get-Content -LiteralPath $configPath -Raw -Encoding UTF8) } else { '' }
 $usbAccessPattern = '(?ms)^' + [regex]::Escape($usbAccessBeginMarker) + '\r?\n.*?^' + [regex]::Escape($usbAccessEndMarker) + '\r?\n?'
 $existing = [regex]::Replace($existing, $usbAccessPattern, '')
 $managedPattern = '(?ms)^' + [regex]::Escape($beginMarker) + '\r?\n.*?^' + [regex]::Escape($endMarker) + '\r?\n?'
 $withoutManaged = [regex]::Replace($existing, $managedPattern, '')
+if ($ReplaceExisting) {
+    $replacementTemp = Join-Path $backupRoot ('merge-input-' + [guid]::NewGuid().ToString('N') + '.toml')
+    try {
+        & $PythonExe (Join-Path $PSScriptRoot 'replace-pack-config.py') $configPath $GeneratedFragment $replacementTemp
+        if ($LASTEXITCODE -ne 0) { throw 'Current-package configuration replacement failed.' }
+        $withoutManaged = [string](Get-Content -LiteralPath $replacementTemp -Raw -Encoding UTF8)
+        $withoutManaged = [regex]::Replace($withoutManaged, $usbAccessPattern, '')
+    } finally {
+        if (Test-Path -LiteralPath $replacementTemp) { Remove-Item -LiteralPath $replacementTemp -Force }
+    }
+}
 
 function Get-FeishuSections([string]$Text) {
     $lines = @($Text -split '\r?\n', 0)

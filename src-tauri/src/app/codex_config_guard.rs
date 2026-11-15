@@ -20,8 +20,12 @@ static BACKUP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 /// Check and, only when safe, normalize the current user's Codex config before
 /// any manager launch path mutates settings or starts Codex.
 pub fn ensure_user_config_ready() -> Result<(), AppError> {
-    let home = paths::codex_home_dir()
-        .ok_or_else(|| AppError::Engine("无法定位当前用户的 Codex 配置目录".into()))?;
+    let home = if crate::app::usb_guard::guard_required() {
+        crate::app::usb_guard::local_data_paths()?.codex_home
+    } else {
+        paths::codex_home_dir()
+            .ok_or_else(|| AppError::Engine("无法定位当前用户的 Codex 配置目录".into()))?
+    };
     let path = home.join("config.toml");
     match ensure_config_file(&path) {
         Ok(Some(backup)) => {

@@ -7,6 +7,7 @@ import type {
   OperationPhase,
   OperationSnapshot,
 } from "../../shared/types";
+import { WINDOWS_PORTABLE_EXTRACTION_SOURCE } from "../../shared/types";
 import {
   contextualFailure,
   messageFailure,
@@ -22,6 +23,31 @@ export type StartDlListenOptions = {
   /** Keep the last known progress (reattach) instead of clearing to empty. */
   preserveProgress?: boolean;
 };
+
+const WINDOWS_PROGRESS_CHANNEL = "win://download-progress";
+const INSTALL_PHASES: OperationPhase[] = ["verifying", "applying", "committing", "finishing"];
+
+function trackWindowsStageProgress(
+  eventName: string,
+  progress: DownloadProgress,
+  setDownloadProgress: (progress: DownloadProgress | null) => void,
+  setInstallProgress: (progress: DownloadProgress | null) => void,
+) {
+  if (eventName !== WINDOWS_PROGRESS_CHANNEL) return;
+
+  if (progress.source === WINDOWS_PORTABLE_EXTRACTION_SOURCE && progress.phase === "applying") {
+    setInstallProgress(progress);
+  } else if (
+    progress.phase === "downloading" ||
+    (progress.phase === undefined && progress.total > 0)
+  ) {
+    setDownloadProgress(progress);
+  } else if (progress.phase && INSTALL_PHASES.includes(progress.phase)) {
+    // Phase packets reuse the last transfer's byte counts. Keep the install
+    // phase, but never present those download bytes as installation progress.
+    setInstallProgress({ ...progress, downloaded: 0, total: 0 });
+  }
+}
 
 /** The live-download state machine shared by the Mac and Windows homes: the
  *  progress bytes + eased readouts, the pause/cancel intent, and the backend
@@ -39,6 +65,8 @@ export function useDownloadProgress(opts: {
   const { t } = useI18n();
 
   const [dl, setDl] = useState<DownloadProgress | null>(null);
+  const [downloadProgress, setDownloadProgress] = useState<DownloadProgress | null>(null);
+  const [installProgress, setInstallProgress] = useState<DownloadProgress | null>(null);
   const [speed, setSpeed] = useState(0);
   const dlSample = useRef<{ t: number; bytes: number } | null>(null);
   const [downloadStop, setDownloadStop] = useState<DownloadStopIntent | null>(null);
@@ -82,6 +110,7 @@ export function useDownloadProgress(opts: {
 
     setDl(p);
     dlRef.current = p;
+    trackWindowsStageProgress(eventName, p, setDownloadProgress, setInstallProgress);
     const now = Date.now();
     const prev = dlSample.current;
     if (!prev) {
@@ -90,13 +119,15 @@ export function useDownloadProgress(opts: {
       setSpeed((p.downloaded - prev.bytes) / ((now - prev.t) / 1000));
       dlSample.current = { t: now, bytes: p.downloaded };
     }
-  }, []);
+  }, [eventName]);
 
   const startDlListen = useCallback(
     async (options?: StartDlListenOptions) => {
       activeOperationIdRef.current = options?.operationId ?? null;
       if (!options?.preserveProgress) {
         setDl(null);
+        setDownloadProgress(null);
+        setInstallProgress(null);
         dlRef.current = null;
         setSpeed(0);
         dlSample.current = null;
@@ -120,9 +151,10 @@ export function useDownloadProgress(opts: {
     const next = phase ? { ...progress, phase } : progress;
     setDl(next);
     dlRef.current = next;
+    trackWindowsStageProgress(eventName, next, setDownloadProgress, setInstallProgress);
     setSpeed(0);
     dlSample.current = { t: Date.now(), bytes: next.downloaded };
-  }, []);
+  }, [eventName]);
 
   const clearActiveOperation = useCallback(() => {
     activeOperationIdRef.current = null;
@@ -254,6 +286,8 @@ export function useDownloadProgress(opts: {
   const resetStop = useCallback(() => {
     downloadStopRequestIdRef.current += 1;
     setDl(null);
+    setDownloadProgress(null);
+    setInstallProgress(null);
     dlRef.current = null;
     setSpeed(0);
     dlSample.current = null;
@@ -265,6 +299,8 @@ export function useDownloadProgress(opts: {
 
   return {
     dl,
+    downloadProgress,
+    installProgress,
     setDl,
     dlRef,
     dlPct,

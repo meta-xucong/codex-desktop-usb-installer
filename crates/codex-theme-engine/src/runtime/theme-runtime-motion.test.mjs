@@ -40,6 +40,19 @@ function createDom() {
     "<!doctype html><html><head></head><body><main data-app-shell-main-surface></main></body></html>",
     { pretendToBeVisual: true, runScripts: "outside-only" },
   );
+  const observers = new Set();
+  const NativeMutationObserver = dom.window.MutationObserver;
+  dom.window.MutationObserver = class extends NativeMutationObserver {
+    constructor(callback) {
+      super(callback);
+      observers.add(this);
+    }
+  };
+  const closeWindow = dom.window.close.bind(dom.window);
+  dom.window.close = () => {
+    for (const observer of observers) observer.disconnect();
+    closeWindow();
+  };
   dom.window.matchMedia = () => ({
     matches: false,
     addEventListener() {},

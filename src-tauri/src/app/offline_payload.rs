@@ -9,11 +9,7 @@
 
 use std::fs::{self, File};
 use std::io::Read;
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
-#[cfg(windows)]
-use std::process::Command;
 #[cfg(windows)]
 use std::{
     io::{Seek, SeekFrom},
@@ -31,8 +27,6 @@ use crate::errors::AppError;
 
 const MANIFEST_FILE_NAME: &str = "manifest.json";
 const TEMP_INSTALLER_DIR: &str = "CodexDesktopInstaller";
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Manifest written by `tools/collect-payload.ps1` and shipped at the root of
 /// the USB layout.  All fields are intentionally explicit: a user machine
@@ -435,32 +429,37 @@ pub fn parse_windows_build_number(output: &str) -> Option<u32> {
 
 #[cfg(windows)]
 fn current_windows_build_number() -> Result<u32, AppError> {
-    let powershell = std::env::var_os("WINDIR")
-        .map(PathBuf::from)
-        .map(|windir| {
-            windir
-                .join("System32")
-                .join("WindowsPowerShell")
-                .join("v1.0")
-                .join("powershell.exe")
-        })
-        .filter(|path| path.exists())
-        .unwrap_or_else(|| PathBuf::from("powershell.exe"));
-    let output = Command::new(powershell)
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "[Environment]::OSVersion.Version.Build",
-        ])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map_err(|error| engine_error(format!("读取 Windows Build 失败: {error}")))?;
-    if !output.status.success() {
-        return Err(engine_error("读取 Windows Build 失败"));
+    use windows_sys::Win32::System::Registry::{
+        RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RRF_SUBKEY_WOW6464KEY,
+    };
+    // A local version query must not depend on starting a PowerShell host or
+    // waiting indefinitely for its redirected output during payload preflight.
+    let key: Vec<u16> = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\0"
+        .encode_utf16()
+        .collect();
+    let name: Vec<u16> = "CurrentBuildNumber\0".encode_utf16().collect();
+    let mut value = [0u16; 32];
+    let mut bytes = std::mem::size_of_val(&value) as u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            key.as_ptr(),
+            name.as_ptr(),
+            RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY,
+            std::ptr::null_mut(),
+            value.as_mut_ptr().cast(),
+            &mut bytes,
+        )
+    };
+    if status != 0 {
+        return Err(engine_error(format!(
+            "读取 Windows Build 失败: Windows error {status}"
+        )));
     }
-    parse_windows_build_number(&String::from_utf8_lossy(&output.stdout))
-        .ok_or_else(|| engine_error("无法解析 Windows Build"))
+    String::from_utf16_lossy(&value)
+        .trim_end_matches('\0')
+        .parse()
+        .map_err(|_| engine_error("无法解析 Windows Build"))
 }
 
 fn validate_windows_requirement(min_build: &str) -> Result<Option<u32>, AppError> {
@@ -1396,6 +1395,18 @@ mod tests {
         assert_eq!(parse_windows_build_number("10.0.19045\r\n"), Some(19045));
         assert_eq!(parse_windows_build_number("Build: 22631"), Some(22631));
         assert_eq!(parse_windows_build_number("unknown"), None);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn native_windows_build_query_preserves_minimum_requirement() {
+        let current = current_windows_build_number().unwrap();
+        assert!(current > 0);
+        assert_eq!(
+            validate_windows_requirement(&current.to_string()).unwrap(),
+            Some(current)
+        );
+        assert!(validate_windows_requirement(&(current + 1).to_string()).is_err());
     }
 
     #[test]

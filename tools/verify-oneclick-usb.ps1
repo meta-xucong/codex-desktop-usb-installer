@@ -309,9 +309,10 @@ function Assert-CompiledCcswitchHandoff([string]$Path, [string]$Label) {
         "CCSWITCH_404TOKEN_HANDOFF_PATH",
         "CCSWITCH_404TOKEN_HANDOFF_NONCE",
         "CCSWITCH_404TOKEN_DEVICE_KEY",
-        "CODEX_USB_MCP_PRESERVATION_V1"
+        "CODEX_USB_V4_FIELD_WRITE_V1",
+        "CODEX_USB_FULL_IMPORT_V1"
     )) {
-        Assert-Condition ($ascii.IndexOf($marker, [System.StringComparison]::Ordinal) -ge 0) "$Label CCSwitch 缺少必需的 404token handoff / MCP 保留协议标记：$marker"
+        Assert-Condition ($ascii.IndexOf($marker, [System.StringComparison]::Ordinal) -ge 0) "$Label CCSwitch 缺少必需的 404token handoff / 4.x 原生字段写入协议标记：$marker"
     }
 }
 
@@ -340,6 +341,18 @@ Assert-Condition ($updateCapability.transactionDirectory -eq ".staging") "update
 Assert-Condition ($updateCapability.backupPolicy -eq "single-msix-listed-in-SHA256SUMS") "update capability 的 backup 策略不正确"
 Assert-Condition ($updateCapability.successState -eq "clean") "update capability 未声明成功状态清理策略"
 Assert-Condition ($usbManifest.product -eq "codex-usb-oneclick") "不是 Codex 一键安装包"
+$isCdpDiagnostic = $usbManifest.diagnosticProfile -eq "usb-cdp-diagnostic"
+Assert-Condition (($null -eq $usbManifest.diagnosticProfile) -or $isCdpDiagnostic) "联合清单 diagnosticProfile 无效"
+if ($isCdpDiagnostic) {
+    Assert-Condition (Test-Path -LiteralPath (Join-Path $root "USB-CDP-DIAGNOSTIC.txt") -PathType Leaf) "CDP 诊断包缺少显著用途标记"
+    Assert-Condition (Test-Path -LiteralPath (Join-Path $root "diagnostics\usb-cdp\collector.mjs") -PathType Leaf) "CDP 诊断包缺少随包校验脚本"
+    Assert-Condition (Test-Path -LiteralPath (Join-Path $root "diagnostics\usb-cdp\README.txt") -PathType Leaf) "CDP 诊断包缺少校验脚本说明"
+    Assert-Condition ($usbManifest.usbGuard.helper -eq "CodexUsbCdpGuard.exe") "诊断包 helper 命名空间不正确"
+    Assert-Condition ($usbManifest.usbGuard.localDirectory -eq "%LOCALAPPDATA%/CodexUsbCdpDiagnosticGuard") "诊断包 helper 状态目录不正确"
+} else {
+    Assert-Condition ($usbManifest.usbGuard.helper -eq "CodexUsbGuard.exe") "正式包 helper 身份不正确"
+    Assert-Condition ($usbManifest.usbGuard.localDirectory -eq "%LOCALAPPDATA%/CodexUsbGuard") "正式包 helper 状态目录不正确"
+}
 Assert-Condition ($usbManifest.status -eq "oneclick") "联合清单状态不是 oneclick"
 Assert-Condition (-not [string]::IsNullOrWhiteSpace([string]$usbManifest.releaseVersion)) "联合清单缺少 releaseVersion"
 $bundleReadmePath = Join-Path $root "README.txt"
@@ -410,7 +423,11 @@ Assert-Condition ($usbManifest.managedContent.skillsDirectory -eq "content/skill
 Assert-Condition ($usbManifest.managedContent.mcpDirectory -eq "content/mcp") "MCP U 盘目录声明不正确"
 Assert-Condition ($usbManifest.managedContent.capabilityPackDirectory -eq "content/codex-starter-kit") "能力包 U 盘目录声明不正确"
 Assert-Condition ($usbManifest.managedContent.configLocation -eq "%LOCALAPPDATA%/CodexAppManager/usb-codex-home/config.toml") "USB Codex 配置必须写入独立本机目录"
-Assert-Condition (@($usbManifest.workflow | Where-Object { $_ -match 'approval_policy=never' -and $_ -match 'sandbox_mode=danger-full-access' }).Count -eq 1) "USB Codex 必须默认启用完全访问权限"
+if ($isCdpDiagnostic) {
+    Assert-Condition (@($usbManifest.workflow | Where-Object { $_ -match 'Diagnostic only:' -and $_ -match 'existing absolute Codex profile directory' }).Count -eq 1) "诊断包必须说明使用用户显式选择的现有 Codex 配置目录"
+} else {
+    Assert-Condition (@($usbManifest.workflow | Where-Object { $_ -match 'approval_policy=never' -and $_ -match 'sandbox_mode=danger-full-access' }).Count -eq 1) "USB Codex 必须默认启用完全访问权限"
+}
 Assert-Condition ($usbManifest.managedContent.secretsIncluded -eq $false) "托管内容目录不得包含密钥"
 Assert-Condition ($usbManifest.managedContent.status -eq "bundled-auto-installable") "能力包必须声明已随包提供并可自动安装"
 Assert-Condition ($usbManifest.startupElevation.mode -eq "usb-launcher-requireAdministrator") "USB 入口必须声明 requireAdministrator 启动提权模式"
@@ -707,6 +724,9 @@ Assert-Condition (Test-Path -LiteralPath $ccswitchVerifier -PathType Leaf) "缺�
 $args = @{ ArtifactDir = (Join-Path $root "ccswitch"); SkipNetwork = $SkipNetwork; PromptForApiKey = $PromptForApiKey }
 if ($ApiKey) { $args.ApiKey = $ApiKey }
 & $ccswitchVerifier @args
+$embeddedVerifier = Join-Path $root "resources\ccswitch\verify-product.ps1"
+Assert-Condition (Test-Path -LiteralPath $embeddedVerifier -PathType Leaf) "缺少嵌入 CCSwitch 验证脚本"
+& $embeddedVerifier -ArtifactDir (Join-Path $root "resources\ccswitch") -SkipNetwork
 
 [pscustomobject]@{
     ready = $true

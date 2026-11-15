@@ -22,6 +22,9 @@ vi.mock("../../services/managerApi", async (importOriginal) => {
       winAdopt: vi.fn(),
       winInstallHistoricalRelease: vi.fn(),
       winLaunch: vi.fn(),
+      usbHostStatus: vi.fn(),
+      initializeUsbHost: vi.fn(),
+      getOperationSnapshot: vi.fn(),
       checkCodexPayloadUpdate: vi.fn(),
       applyCodexPayloadUpdate: vi.fn(),
       installAndLaunchCcswitch: vi.fn(),
@@ -123,6 +126,11 @@ describe("OfflineHome", () => {
     localStorage.removeItem("codex-usb-ccswitch-injection-issue-v1");
     localStorage.setItem("cam.lang", "zh-CN");
     api.offlinePayloadProbe.mockResolvedValue(PAYLOAD);
+    api.usbHostStatus.mockResolvedValue({ required: true, ready: true, accountReady: true,
+      capabilitiesReady: true, conflict: false, message: "本机已就绪" });
+    api.initializeUsbHost.mockResolvedValue({ required: true, ready: true, accountReady: true,
+      capabilitiesReady: true, conflict: false, message: "本机已就绪" });
+    api.getOperationSnapshot.mockResolvedValue(null);
     api.winCheckInstallPreflight.mockResolvedValue({
       internetAvailable: true,
       apiKeyReady: true,
@@ -348,7 +356,7 @@ describe("OfflineHome", () => {
     api.winStatus.mockResolvedValue({ status: "managed", installed: USB_PORTABLE_CODEX });
     renderView();
 
-    expect(await screen.findByRole("button", { name: "启动 Codex" })).toBeEnabled();
+    await waitFor(() => expect(screen.getByRole("button", { name: "启动 Codex" })).toBeEnabled());
     expect(screen.getByRole("button", { name: "打开 Codex Switch" })).toBeEnabled();
     expect(api.gatewayModelProbe).not.toHaveBeenCalled();
     expect(api.manageNativeModelCatalog).not.toHaveBeenCalled();
@@ -457,6 +465,21 @@ describe("OfflineHome", () => {
     expect(await screen.findByText("Codex 已更新到最新版。")).toBeInTheDocument();
   });
 
+  it("does not report up to date when a payload source check is incomplete", async () => {
+    const user = userEvent.setup();
+    api.usbGuardStatus.mockResolvedValue({ ...USB_GUARD, signed: true });
+    const message = "Codex 更新检查未完成：部分更新源不可用，暂不能确认是否为最新版";
+    api.checkCodexPayloadUpdate.mockResolvedValue({ kind: "unavailable", message });
+
+    renderView();
+    await user.click(await screen.findByRole("button", { name: "检查并安装更新" }));
+    await waitFor(() => expect(api.checkCodexPayloadUpdate).toHaveBeenCalledTimes(1));
+    expect(screen.queryByText("Codex 安装包已是最新版。")).not.toBeInTheDocument();
+    expect(api.applyCodexPayloadUpdate).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "查看详情" }));
+    expect(screen.getByText(message)).toBeInTheDocument();
+  });
+
   it("uses the same full-screen progress view while the USB update payload downloads", async () => {
     const user = userEvent.setup();
     let payloadProgressHandler: ((event: { payload: unknown }) => void) | null = null;
@@ -554,20 +577,26 @@ describe("OfflineHome", () => {
     expect(screen.getByText(/需要已配置签名许可证/)).toBeInTheDocument();
   });
 
-  it("blocks the USB install before staging when 404token is unreachable", async () => {
+  it("installs the local USB payload and components when the gateway is unreachable", async () => {
     const user = userEvent.setup();
     api.winCheckInstallPreflight.mockResolvedValue({
       internetAvailable: false,
       apiKeyReady: true,
     });
+    api.winInstallHistoricalRelease.mockImplementation(async () => {
+      api.winStatus.mockResolvedValue({ status: "managed", installed: USB_PORTABLE_CODEX });
+      return { success: true, message: "installed" } as never;
+    });
+    api.mediaModelCatalog.mockRejectedValueOnce(new Error("offline fixture"));
     renderView();
 
     await user.click(await screen.findByRole("button", { name: "一键安装" }));
 
-    expect(await screen.findByText(/安装需要连接互联网并能访问 404token/)).toBeInTheDocument();
-    expect(api.offlinePayloadStage).not.toHaveBeenCalled();
-    expect(api.winInstallHistoricalRelease).not.toHaveBeenCalled();
-    expect(api.installCapabilityPack).not.toHaveBeenCalled();
+    await screen.findByRole("button", { name: "启动 Codex" });
+    expect(api.offlinePayloadStage).toHaveBeenCalledTimes(1);
+    expect(api.winInstallHistoricalRelease).toHaveBeenCalledTimes(1);
+    expect(api.installCapabilityPack).toHaveBeenCalledTimes(1);
+    expect(api.installAndLaunchCcswitch).toHaveBeenCalledTimes(1);
   });
 
   it("blocks the USB install before staging when the signed API key binding is missing", async () => {
@@ -1125,7 +1154,7 @@ describe("OfflineHome", () => {
     expect(api.installAndLaunchCcswitch).not.toHaveBeenCalled();
   });
 
-  it("does not downgrade a newer managed installation", async () => {
+  it("uses the current package for a different version within the same authorized USB root", async () => {
     api.winStatus.mockResolvedValue({
       status: "managed",
       installed: {
@@ -1136,9 +1165,14 @@ describe("OfflineHome", () => {
         packageFamilyName: "OpenAI.Codex_2p2nqsd0c76g0",
       },
     });
+    api.winInstallHistoricalRelease.mockImplementation(async () => {
+      api.winStatus.mockResolvedValue({ status: "managed", installed: USB_PORTABLE_CODEX });
+      return { success: true, message: "replaced" } as never;
+    });
     renderView();
-    await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent(/更新版本/));
-    expect(screen.getByRole("button", { name: "一键安装" })).toBeDisabled();
+    await userEvent.click(await screen.findByRole("button", { name: "一键安装" }));
+    await screen.findByRole("button", { name: "启动 Codex" });
+    expect(api.winInstallHistoricalRelease).toHaveBeenCalledTimes(1);
   });
 
   it("blocks an external MSIX install without mutating it", async () => {
@@ -1159,6 +1193,216 @@ describe("OfflineHome", () => {
     await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent(/其他来源已安装的 Codex/));
     expect(screen.queryByRole("button", { name: "一键安装" })).not.toBeInTheDocument();
     expect(api.winInstallHistoricalRelease).not.toHaveBeenCalled();
+  });
+
+  it("initializes a new computer without staging or reinstalling the USB program", async () => {
+    api.winStatus.mockResolvedValue({ installed: USB_PORTABLE_CODEX, status: "managed" });
+    api.usbHostStatus.mockResolvedValue({ required: true, ready: false, accountReady: false,
+      capabilitiesReady: false, conflict: false, message: "程序已安装，本机账号尚未初始化" });
+    renderView();
+    await userEvent.click(await screen.findByRole("button", { name: "启动 Codex" }));
+    await waitFor(() => expect(api.winLaunch).toHaveBeenCalledTimes(1));
+    expect(api.initializeUsbHost).toHaveBeenCalledWith(true);
+    expect(api.offlinePayloadStage).not.toHaveBeenCalled();
+    expect(api.winInstallHistoricalRelease).not.toHaveBeenCalled();
+  });
+
+  it("shows four installation segments and local browser detail during host recovery without a download track", async () => {
+    let handler: ((event: { payload: unknown }) => void) | undefined;
+    listenMock.mockImplementation((event: string, callback: unknown) => {
+      if (event === "capability-pack://progress") handler = callback as typeof handler;
+      return Promise.resolve(() => {});
+    });
+    api.winStatus.mockResolvedValue({ installed: USB_PORTABLE_CODEX, status: "managed" });
+    api.usbHostStatus.mockResolvedValue({ required: true, ready: false, accountReady: true,
+      capabilitiesReady: false, conflict: false, message: "程序已安装，本机核心能力尚未准备完成" });
+    api.initializeUsbHost.mockImplementation(() => new Promise(() => {}));
+    renderView();
+    await userEvent.click(await screen.findByRole("button", { name: "启动 Codex" }));
+    const progress = await screen.findByTestId("install-progress-bar");
+    expect(progress.querySelectorAll(".install-stage-segment")).toHaveLength(4);
+    expect(progress.querySelectorAll('[data-state="complete"]')).toHaveLength(3);
+    expect(progress.querySelectorAll('[data-state="active"]')).toHaveLength(1);
+    expect(screen.queryByTestId("download-progress-bar")).not.toBeInTheDocument();
+    expect(handler).toBeDefined();
+    handler!({ payload: "runtime.hyperframes" });
+    await screen.findByText("正在从本地部署 HyperFrames CLI 和依赖…");
+    handler!({ payload: "runtime.hyperframesFfmpeg" });
+    await screen.findByText("正在从本地部署 HyperFrames 视频编码器…");
+    handler!({ payload: "runtime.hyperframesBrowser" });
+    await screen.findByText("正在从本地部署 HyperFrames 浏览器…");
+    expect(screen.queryByText(/下载完成/)).not.toBeInTheDocument();
+    expect(api.offlinePayloadStage).not.toHaveBeenCalled();
+  });
+
+  it("returns to a ready computer without initialization or catalog refresh", async () => {
+    api.winStatus.mockResolvedValue({ installed: USB_PORTABLE_CODEX, status: "managed" });
+    renderView();
+    const button = await screen.findByRole("button", { name: "启动 Codex" });
+    await waitFor(() => expect(button).toBeEnabled());
+    await userEvent.click(button);
+    await waitFor(() => expect(api.winLaunch).toHaveBeenCalledTimes(1));
+    expect(api.initializeUsbHost).not.toHaveBeenCalled();
+    expect(api.installCapabilityPack).not.toHaveBeenCalled();
+    expect(api.installAndLaunchCcswitch).not.toHaveBeenCalled();
+    expect(api.mediaModelCatalog).not.toHaveBeenCalled();
+  });
+
+  it("keeps the program installed and does not launch after failed host initialization", async () => {
+    api.winStatus.mockResolvedValue({ installed: USB_PORTABLE_CODEX, status: "managed" });
+    api.usbHostStatus.mockResolvedValue({ required: true, ready: false, accountReady: false,
+      capabilitiesReady: true, conflict: false, message: "账号未就绪" });
+    api.initializeUsbHost.mockRejectedValueOnce(new Error("account readback failed"));
+    renderView();
+    await userEvent.click(await screen.findByRole("button", { name: "启动 Codex" }));
+    await screen.findByRole("button", { name: "启动 Codex" });
+    expect(api.winLaunch).not.toHaveBeenCalled();
+    expect(api.offlinePayloadStage).not.toHaveBeenCalled();
+    expect(api.initializeUsbHost).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses the USB account on ordinary launch without a separate account choice", async () => {
+    api.winStatus.mockResolvedValue({ installed: USB_PORTABLE_CODEX, status: "managed" });
+    api.usbHostStatus.mockResolvedValue({ required: true, ready: false, accountReady: false,
+      capabilitiesReady: true, conflict: true, message: "现有账号不同" });
+    renderView();
+    await userEvent.click(await screen.findByRole("button", { name: "启动 Codex" }));
+    await waitFor(() => expect(api.initializeUsbHost).toHaveBeenCalledWith(true));
+    await waitFor(() => expect(api.winLaunch).toHaveBeenCalledTimes(1));
+    expect(api.winInstallHistoricalRelease).not.toHaveBeenCalled();
+  });
+
+  it("completes capability and account setup during installation despite a different local account", async () => {
+    const user = userEvent.setup();
+    const ready = { required: true, ready: true, accountReady: true,
+      capabilitiesReady: true, conflict: false, message: "本机已就绪" };
+    const conflict = { ...ready, ready: false, accountReady: false,
+      conflict: true, message: "启动时将自动使用当前 U 盘账号" };
+    localStorage.setItem("codex-usb-ccswitch-injection-issue-v1", "launch-failed");
+    api.usbHostStatus.mockResolvedValue(conflict);
+    api.winInstallHistoricalRelease.mockImplementation(async () => {
+      api.winStatus.mockResolvedValue({ status: "managed", installed: USB_PORTABLE_CODEX });
+      return { success: true, message: "备份保留在 C:\\Recovery\\host-state" } as never;
+    });
+    const report = await api.installAndLaunchCcswitch();
+    api.installAndLaunchCcswitch.mockClear();
+    api.installAndLaunchCcswitch.mockImplementation(async () => {
+      api.usbHostStatus.mockResolvedValue(ready);
+      return report;
+    });
+    const view = renderView();
+    await user.click(await screen.findByRole("button", { name: "一键安装" }));
+    await screen.findByRole("button", { name: "启动 Codex" });
+    expect(screen.queryByText(conflict.message)).not.toBeInTheDocument();
+    expect(screen.queryByText(/能力包未能自动安装|CCSwitch 未能正常启动|媒体 MCP 已注册/)).not.toBeInTheDocument();
+    expect(api.installCapabilityPack).toHaveBeenCalledTimes(1);
+    expect(api.installCapabilityPack.mock.calls[0]?.[1]).toBe(true);
+    expect(api.installAndLaunchCcswitch).toHaveBeenCalledTimes(1);
+    expect(api.mediaModelCatalog).toHaveBeenCalledTimes(1);
+    expect(api.initializeUsbHost).not.toHaveBeenCalled();
+    expect(api.winLaunch).not.toHaveBeenCalled();
+    expect(api.winInstallHistoricalRelease).toHaveBeenCalledTimes(1);
+    expect(localStorage.getItem("codex-usb-ccswitch-injection-issue-v1")).toBeNull();
+    expect(screen.queryByText(/API Key 自动配置未完成|能力包自动安装失败|能力包未能自动安装/)).not.toBeInTheDocument();
+    await user.click(screen.getByText("高级功能"));
+    await user.click(screen.getByText("安装／修复详情与备份位置"));
+    expect(screen.getByText(/备份保留在 C:/)).toBeVisible();
+
+    view.unmount();
+    renderView();
+    await screen.findByRole("button", { name: "启动 Codex" });
+    expect(screen.queryByText(/API Key 自动配置未完成/)).not.toBeInTheDocument();
+    expect(api.initializeUsbHost).not.toHaveBeenCalled();
+  });
+
+  it("retains the old account failure and does not launch when automatic initialization fails", async () => {
+    localStorage.setItem("codex-usb-ccswitch-injection-issue-v1", "launch-failed");
+    api.winStatus.mockResolvedValue({ installed: USB_PORTABLE_CODEX, status: "managed" });
+    api.usbHostStatus.mockResolvedValue({ required: true, ready: false, accountReady: false,
+      capabilitiesReady: false, conflict: true, message: "现有账号不同" });
+    api.initializeUsbHost.mockRejectedValueOnce(new Error("fixture initialization failed"));
+    renderView();
+    await userEvent.click(await screen.findByRole("button", { name: "启动 Codex" }));
+    await screen.findByRole("alert");
+    await userEvent.click(screen.getByRole("button", { name: "查看详情" }));
+    expect(screen.getByText(/fixture initialization failed/)).toBeVisible();
+    expect(localStorage.getItem("codex-usb-ccswitch-injection-issue-v1")).toBe("launch-failed");
+    expect(api.winLaunch).not.toHaveBeenCalled();
+    expect(api.winInstallHistoricalRelease).not.toHaveBeenCalled();
+    expect(api.initializeUsbHost).toHaveBeenCalledExactlyOnceWith(true);
+  });
+
+  it.each([false, true])("finishes independent setup and retains capability errors when final status lookup fails=%s", async (statusFails) => {
+    const user = userEvent.setup();
+    api.mediaModelCatalog.mockRejectedValue(new Error("fixture catalog unavailable"));
+    api.installCapabilityPack.mockImplementationOnce(async () => {
+      if (statusFails) api.usbHostStatus.mockRejectedValue(new Error("fixture final status unavailable"));
+      else api.usbHostStatus.mockResolvedValue({ required: true, ready: false, accountReady: true,
+        capabilitiesReady: false, conflict: false, message: "核心能力尚未准备完成" });
+      throw { code: "engine_error", message: "fixture media self-check failure" };
+    });
+    api.winInstallHistoricalRelease.mockImplementation(async () => {
+      api.winStatus.mockResolvedValue({ status: "managed", installed: USB_PORTABLE_CODEX });
+      return { success: true, message: "fixture program installed" } as never;
+    });
+    renderView();
+    await user.click(await screen.findByRole("button", { name: "一键安装" }));
+    await screen.findByRole("button", { name: "启动 Codex" });
+    expect(api.installAndLaunchCcswitch).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText(/媒体 MCP 已注册/)).not.toBeInTheDocument();
+    await user.click(screen.getByText("高级功能"));
+    await user.click(screen.getByText("安装／修复详情与备份位置"));
+    expect(screen.getByText(/能力包自动安装失败：fixture media self-check failure/)).toBeVisible();
+    expect(screen.queryByText(/\[object Object\]/)).not.toBeInTheDocument();
+    expect(api.winLaunch).not.toHaveBeenCalled();
+  });
+
+  it("clears a real capability failure after successful host initialization while retaining program backup details", async () => {
+    const user = userEvent.setup();
+    api.usbHostStatus.mockResolvedValue({ required: true, ready: false, accountReady: true,
+      capabilitiesReady: false, conflict: false, message: "核心能力尚未准备完成" });
+    api.installCapabilityPack.mockRejectedValueOnce(new Error("fixture capability failure"));
+    api.winInstallHistoricalRelease.mockImplementation(async () => {
+      api.winStatus.mockResolvedValue({ status: "managed", installed: USB_PORTABLE_CODEX });
+      return { success: true, message: "备份保留在 C:\\Recovery\\capability-state" } as never;
+    });
+    renderView();
+    await user.click(await screen.findByRole("button", { name: "一键安装" }));
+    await screen.findByRole("button", { name: "启动 Codex" });
+    await waitFor(() => expect(api.installAndLaunchCcswitch).toHaveBeenCalledTimes(1));
+    await user.click(screen.getByText("高级功能"));
+    await user.click(screen.getByText("安装／修复详情与备份位置"));
+    expect(screen.getByText(/能力包自动安装失败：fixture capability failure/)).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "启动 Codex" }));
+    await waitFor(() => expect(api.winLaunch).toHaveBeenCalledTimes(1));
+    expect(screen.queryByText(/fixture capability failure|能力包未能自动安装/)).not.toBeInTheDocument();
+    expect(screen.getByText(/备份保留在 C:/)).toBeInTheDocument();
+    expect(api.initializeUsbHost).toHaveBeenCalledExactlyOnceWith(true);
+    expect(api.winInstallHistoricalRelease).toHaveBeenCalledTimes(1);
+  });
+
+  it("clears a stale account failure after reattaching to completed initialization without resubmitting", async () => {
+    localStorage.setItem("codex-usb-ccswitch-injection-issue-v1", "launch-failed");
+    api.winStatus.mockResolvedValue({ installed: USB_PORTABLE_CODEX, status: "managed" });
+    api.getOperationSnapshot.mockResolvedValueOnce({ id: "host-op", kind: "install", phase: "finishing",
+      progress: { source: "usb-host:account", downloaded: 0, total: 0, phase: "finishing" },
+      paused: false, cancellable: false, interruptible: false }).mockResolvedValue(null);
+    renderView();
+    await waitFor(() => expect(localStorage.getItem("codex-usb-ccswitch-injection-issue-v1")).toBeNull(), { timeout: 3000 });
+    expect(api.initializeUsbHost).not.toHaveBeenCalled();
+    expect(api.winLaunch).not.toHaveBeenCalled();
+    expect(screen.queryByText(/API Key 自动配置未完成/)).not.toBeInTheDocument();
+  });
+
+  it("reattaches to host setup after reload without submitting it again", async () => {
+    api.winStatus.mockResolvedValue({ installed: USB_PORTABLE_CODEX, status: "managed" });
+    api.getOperationSnapshot.mockResolvedValue({ id: "host-op", kind: "install", phase: "finishing",
+      progress: { source: "usb-host:account", downloaded: 0, total: 0, phase: "finishing" },
+      paused: false, cancellable: false, interruptible: false });
+    renderView();
+    await screen.findByText("正在配置本机账号");
+    expect(api.initializeUsbHost).not.toHaveBeenCalled();
+    expect(api.winLaunch).not.toHaveBeenCalled();
   });
 
   it("blocks an external portable Codex install without an adoption action", async () => {

@@ -100,7 +100,10 @@ pub fn verify_bundle(
     let manifest = read_json(&manifest_path)?;
     let usb_manifest = read_json(&usb_manifest_path)?;
     validate_root_manifest(&manifest)?;
-    validate_usb_manifest(&usb_manifest)?;
+    let is_cdp_diagnostic = validate_usb_manifest(&usb_manifest)?;
+    if is_cdp_diagnostic {
+        required_file(&root, "USB-CDP-DIAGNOSTIC.txt")?;
+    }
     let manifest_schema = require_matching_document_schemas(&manifest, &usb_manifest)?;
     let root_anchor = required_u64(&manifest, "/updateCapability/anchorSchema")?;
     let usb_anchor = required_u64(&usb_manifest, "/updateCapability/anchorSchema")?;
@@ -274,7 +277,8 @@ fn validate_root_manifest(manifest: &Value) -> Result<(), SignerError> {
     Ok(())
 }
 
-fn validate_usb_manifest(manifest: &Value) -> Result<(), SignerError> {
+fn validate_usb_manifest(manifest: &Value) -> Result<bool, SignerError> {
+    let is_cdp_diagnostic = validate_codex_home_paths(manifest)?;
     require_supported_manifest_schema(manifest, "USB manifest")?;
     require_string_equals(manifest, "/product", "codex-usb-oneclick")?;
     require_string_equals(manifest, "/status", "oneclick")?;
@@ -292,11 +296,6 @@ fn validate_usb_manifest(manifest: &Value) -> Result<(), SignerError> {
     require_bool_equals(manifest, "/programLayout/createsWpSystem", false)?;
     require_bool_equals(manifest, "/programLayout/directShellLaunch", false)?;
 
-    require_string_equals(
-        manifest,
-        "/dataLayout/codexHome",
-        "%LOCALAPPDATA%/CodexAppManager/usb-codex-home",
-    )?;
     require_string_equals(manifest, "/dataLayout/roaming", "%APPDATA%/Codex")?;
     require_string_equals(manifest, "/dataLayout/local", "%LOCALAPPDATA%/Codex")?;
     require_bool_equals(manifest, "/dataLayout/onUsb", false)?;
@@ -311,11 +310,6 @@ fn validate_usb_manifest(manifest: &Value) -> Result<(), SignerError> {
         manifest,
         "/managedContent/capabilityPackDirectory",
         "content/codex-starter-kit",
-    )?;
-    require_string_equals(
-        manifest,
-        "/managedContent/configLocation",
-        "%LOCALAPPDATA%/CodexAppManager/usb-codex-home/config.toml",
     )?;
     require_bool_equals(manifest, "/managedContent/secretsIncluded", false)?;
     require_string_equals(
@@ -429,7 +423,31 @@ fn validate_usb_manifest(manifest: &Value) -> Result<(), SignerError> {
         "enumerate-and-preserve",
     )?;
     require_bool_equals(manifest, "/sourceMediaCleanup/usesRecycleBin", false)?;
-    Ok(())
+    Ok(is_cdp_diagnostic)
+}
+
+fn validate_codex_home_paths(manifest: &Value) -> Result<bool, SignerError> {
+    let is_cdp_diagnostic = match manifest.get("diagnosticProfile") {
+        None | Some(Value::Null) => false,
+        Some(Value::String(profile)) if profile == "usb-cdp-diagnostic" => true,
+        _ => {
+            return Err(SignerError::bundle(
+                "USB diagnosticProfile is unsupported or malformed",
+            ));
+        }
+    };
+
+    require_string_equals(
+        manifest,
+        "/dataLayout/codexHome",
+        "%LOCALAPPDATA%/CodexAppManager/usb-codex-home",
+    )?;
+    require_string_equals(
+        manifest,
+        "/managedContent/configLocation",
+        "%LOCALAPPDATA%/CodexAppManager/usb-codex-home/config.toml",
+    )?;
+    Ok(is_cdp_diagnostic)
 }
 
 fn require_supported_manifest_schema(manifest: &Value, label: &str) -> Result<u64, SignerError> {
@@ -1274,6 +1292,50 @@ mod tests {
             3
         )
         .is_err());
+    }
+
+    #[test]
+    fn diagnostic_profile_allows_only_its_exact_existing_codex_home_paths() {
+        let ordinary = json!({
+            "diagnosticProfile": null,
+            "dataLayout": {
+                "codexHome": "%LOCALAPPDATA%/CodexAppManager/usb-codex-home"
+            },
+            "managedContent": {
+                "configLocation": "%LOCALAPPDATA%/CodexAppManager/usb-codex-home/config.toml"
+            }
+        });
+        assert!(!validate_codex_home_paths(&ordinary).unwrap());
+
+        let diagnostic = json!({
+            "diagnosticProfile": "usb-cdp-diagnostic",
+            "dataLayout": {
+                "codexHome": "%LOCALAPPDATA%/CodexAppManager/usb-codex-home"
+            },
+            "managedContent": {
+                "configLocation": "%LOCALAPPDATA%/CodexAppManager/usb-codex-home/config.toml"
+            }
+        });
+        assert!(validate_codex_home_paths(&diagnostic).unwrap());
+
+        let mut mismatched_home = diagnostic.clone();
+        mismatched_home["dataLayout"]["codexHome"] = json!(
+            "%CODEX_USB_CDP_DIAGNOSTIC_CODEX_HOME% (existing directory explicitly selected before startup)"
+        );
+        assert!(validate_codex_home_paths(&mismatched_home).is_err());
+
+        let mut mismatched_config = diagnostic.clone();
+        mismatched_config["managedContent"]["configLocation"] = json!(
+            "%CODEX_USB_CDP_DIAGNOSTIC_CODEX_HOME%/config.toml (existing selected directory)"
+        );
+        assert!(validate_codex_home_paths(&mismatched_config).is_err());
+
+        let unknown_profile = json!({
+            "diagnosticProfile": "other-profile",
+            "dataLayout": {"codexHome": "anything"},
+            "managedContent": {"configLocation": "anything"}
+        });
+        assert!(validate_codex_home_paths(&unknown_profile).is_err());
     }
 
     #[test]

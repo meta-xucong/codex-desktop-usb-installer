@@ -5,6 +5,8 @@
 //! enterprise-policy machines cannot freeze the manager indefinitely.
 
 use std::ffi::OsStr;
+#[cfg(windows)]
+use std::io;
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -206,6 +208,250 @@ pub fn run_capturing(
     child
         .wait_with_output()
         .map_err(|e| RunError::Wait(e.to_string()))
+}
+
+/// Run a short-lived captured command inside a Windows job so descendants
+/// cannot keep redirected output pipes open after the command itself exits.
+/// This is used for the MSIX installer PowerShell command, whose result must be
+/// fully captured before the install transaction can continue.
+#[cfg(windows)]
+pub(crate) fn run_capturing_with_kill_job(
+    mut command: Command,
+    limits: RunLimits,
+    cancel: Option<&AtomicBool>,
+) -> Result<Output, RunError> {
+    use std::io::Read;
+    use std::os::windows::process::CommandExt;
+    use std::process::ExitStatus;
+    use std::sync::mpsc;
+
+    const CREATE_SUSPENDED: u32 = 0x0000_0004;
+    const TERMINATE_TIMEOUT: Duration = Duration::from_secs(5);
+    const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+    fn read_pipe(pipe: impl Read + Send + 'static) -> mpsc::Receiver<Vec<u8>> {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let mut pipe = pipe;
+            let _ = pipe.read_to_end(&mut bytes);
+            let _ = sender.send(bytes);
+        });
+        receiver
+    }
+
+    fn wait_after_termination(child: &mut Child) -> io::Result<ExitStatus> {
+        let deadline = Instant::now() + TERMINATE_TIMEOUT;
+        loop {
+            if let Some(status) = child.try_wait()? {
+                return Ok(status);
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "child process did not exit after job termination",
+                ));
+            }
+            thread::sleep(POLL_INTERVAL);
+        }
+    }
+
+    let job = KillOnCloseJob::create()
+        .map_err(|error| RunError::Spawn(format!("create captured-process job: {error}")))?;
+    command.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| RunError::Spawn(error.to_string()))?;
+    if let Err(error) = job.assign(&child) {
+        job.terminate();
+        let _ = child.kill();
+        let _ = wait_after_termination(&mut child);
+        return Err(RunError::Wait(format!(
+            "assign captured process to job: {error}"
+        )));
+    }
+    if let Err(error) = resume_suspended_process(&child) {
+        job.terminate();
+        let _ = child.kill();
+        let _ = wait_after_termination(&mut child);
+        return Err(RunError::Wait(format!(
+            "resume captured process after job assignment: {error}"
+        )));
+    }
+
+    let stdout = read_pipe(child.stdout.take().expect("stdout was piped"));
+    let stderr = read_pipe(child.stderr.take().expect("stderr was piped"));
+    let started = Instant::now();
+    loop {
+        if cancelled(cancel) {
+            job.terminate();
+            let _ = child.kill();
+            let _ = wait_after_termination(&mut child);
+            return Err(RunError::Cancelled);
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                job.terminate();
+                let stdout = stdout.recv_timeout(PIPE_DRAIN_TIMEOUT).map_err(|_| {
+                    RunError::Wait(
+                        "captured stdout pipe remained open after process-tree exit".to_string(),
+                    )
+                })?;
+                let stderr = stderr.recv_timeout(PIPE_DRAIN_TIMEOUT).map_err(|_| {
+                    RunError::Wait(
+                        "captured stderr pipe remained open after process-tree exit".to_string(),
+                    )
+                })?;
+                return Ok(Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+            Ok(None) => {
+                if started.elapsed() >= limits.total {
+                    job.terminate();
+                    let _ = child.kill();
+                    let _status = wait_after_termination(&mut child)
+                        .map_err(|error| RunError::Wait(error.to_string()))?;
+                    let partial_stderr =
+                        stderr.recv_timeout(PIPE_DRAIN_TIMEOUT).unwrap_or_default();
+                    return Err(RunError::Timeout {
+                        kind: TimeoutKind::Total,
+                        partial_stderr: String::from_utf8_lossy(&partial_stderr).into_owned(),
+                    });
+                }
+                thread::sleep(POLL_INTERVAL);
+            }
+            Err(error) => {
+                job.terminate();
+                let _ = child.kill();
+                let _ = wait_after_termination(&mut child);
+                return Err(RunError::Wait(error.to_string()));
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn run_capturing_with_kill_job(
+    command: Command,
+    limits: RunLimits,
+    cancel: Option<&AtomicBool>,
+) -> Result<Output, RunError> {
+    run_capturing(command, limits, cancel)
+}
+
+#[cfg(windows)]
+struct KillOnCloseJob(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl KillOnCloseJob {
+    fn create() -> std::io::Result<Self> {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::JobObjects::{
+            CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+
+        let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if unsafe {
+            SetInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                &limits as *const _ as *const _,
+                std::mem::size_of_val(&limits) as u32,
+            )
+        } == 0
+        {
+            let error = std::io::Error::last_os_error();
+            unsafe { CloseHandle(handle) };
+            return Err(error);
+        }
+        Ok(Self(handle))
+    }
+
+    fn assign(&self, child: &Child) -> std::io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+
+        if unsafe { AssignProcessToJobObject(self.0, child.as_raw_handle()) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn terminate(&self) {
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+        unsafe { TerminateJobObject(self.0, 1) };
+    }
+}
+
+#[cfg(windows)]
+impl Drop for KillOnCloseJob {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        unsafe {
+            windows_sys::Win32::System::JobObjects::TerminateJobObject(self.0, 1);
+            CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn resume_suspended_process(child: &Child) -> std::io::Result<()> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+    };
+    use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+
+    let error = || std::io::Error::last_os_error();
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err(error());
+        }
+        let mut entry: THREADENTRY32 = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+        let mut found = None;
+        let mut ambiguous = false;
+        let mut next = Thread32First(snapshot, &mut entry);
+        while next != 0 {
+            if entry.th32OwnerProcessID == child.id() {
+                if found.is_some() {
+                    ambiguous = true;
+                    break;
+                }
+                found = Some(entry.th32ThreadID);
+            }
+            entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+            next = Thread32Next(snapshot, &mut entry);
+        }
+        if CloseHandle(snapshot) == 0 || ambiguous {
+            return Err(std::io::Error::other(
+                "could not identify the suspended child thread",
+            ));
+        }
+        let thread = OpenThread(THREAD_SUSPEND_RESUME, 0, found.ok_or_else(error)?);
+        if thread.is_null() {
+            return Err(error());
+        }
+        let previous = ResumeThread(thread);
+        let closed = CloseHandle(thread) != 0;
+        if previous != 1 || !closed {
+            return Err(std::io::Error::other(
+                "suspended child thread did not resume exactly once",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Like [`run_capturing`], but tracks a progress signal for stall detection.
@@ -415,6 +661,78 @@ mod tests {
             ]);
             cmd
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn captured_installer_stops_descendants_that_hold_output_pipes() {
+        use std::fs;
+        use std::time::Instant;
+
+        let pid_file = std::env::temp_dir().join(format!(
+            "codex-msix-descendant-{}.txt",
+            uuid::Uuid::new_v4()
+        ));
+        let quoted_pid_path = pid_file.to_string_lossy().replace('\'', "''");
+        let script = format!(
+            r#"$si = [System.Diagnostics.ProcessStartInfo]::new(); $si.FileName = Join-Path $PSHOME 'powershell.exe'; $si.Arguments = '-NoProfile -NonInteractive -Command "Start-Sleep -Seconds 30"'; $si.UseShellExecute = $false; $si.CreateNoWindow = $true; $child = [System.Diagnostics.Process]::Start($si); [IO.File]::WriteAllText('{quoted_pid_path}', [string]$child.Id); [Console]::Out.WriteLine('parent-finished')"#
+        );
+        let mut command = hidden_command("powershell.exe");
+        command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+        let started = Instant::now();
+        let output =
+            run_capturing_with_kill_job(command, RunLimits::total(Duration::from_secs(10)), None)
+                .expect("captured installer should finish after its parent exits");
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("parent-finished"));
+        assert!(started.elapsed() < Duration::from_secs(8));
+
+        let descendant_pid = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        let descendant_pid_text = descendant_pid.to_string();
+        let process_list = Command::new("tasklist.exe")
+            .args([
+                "/FI",
+                &format!("PID eq {descendant_pid_text}"),
+                "/FO",
+                "CSV",
+                "/NH",
+            ])
+            .output()
+            .unwrap();
+        let process_list = String::from_utf8_lossy(&process_list.stdout);
+        let descendant_running = process_list.contains(&format!(",\"{descendant_pid_text}\","));
+        if descendant_running {
+            let _ = Command::new("taskkill.exe")
+                .args(["/PID", &descendant_pid_text, "/T", "/F"])
+                .output();
+        }
+        let _ = fs::remove_file(pid_file);
+        assert!(
+            !descendant_running,
+            "captured installer left a child holding its output pipes"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn captured_installer_total_timeout_terminates_its_job() {
+        let error = run_capturing_with_kill_job(
+            sleep_command(30),
+            RunLimits::total(Duration::from_millis(400)),
+            None,
+        )
+        .expect_err("captured installer must respect its total deadline");
+        assert!(matches!(
+            error,
+            RunError::Timeout {
+                kind: TimeoutKind::Total,
+                ..
+            }
+        ));
     }
 
     #[test]

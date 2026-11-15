@@ -17,6 +17,9 @@ use crate::process::{
 use crate::process::{run_capturing, RunLimits};
 use crate::EngineError;
 
+#[path = "portable_runtime_261111.rs"]
+mod runtime_261111;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PortableInstallReport {
@@ -105,7 +108,14 @@ struct PreparedPortable {
 /// ZIP central directory before the first write, so the UI can show a real
 /// percentage even when the destination is a slow removable drive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortableInstallStage {
+    Extracting,
+    StartupCompatibility,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PortableExtractionProgress {
+    pub stage: PortableInstallStage,
     pub completed_bytes: u64,
     pub total_bytes: u64,
     pub files_completed: u64,
@@ -238,9 +248,9 @@ const CODEX_CONSOLE_SUBSYSTEM_EXECUTABLES: &[&str] = &[
     "app.asar.unpacked/node_modules/node-pty/build/Release/winpty-agent.exe",
     "cua_node/bin/node.exe",
     "cua_node/bin/node_repl.exe",
-    "cua_node/bin/node_modules/%40oai/cua/bin/windows/codex-computer-use.exe",
-    "cua_node/bin/node_modules/%40oai/sky/bin/windows/codex-computer-use.exe",
-    "cua_node/bin/node_modules/%40oai/sky/bin/windows/swift/x64/codex-computer-use-swift.exe",
+    "cua_node/bin/node_modules/@oai/cua/bin/windows/codex-computer-use.exe",
+    "cua_node/bin/node_modules/@oai/sky/bin/windows/codex-computer-use.exe",
+    "cua_node/bin/node_modules/@oai/sky/bin/windows/swift/x64/codex-computer-use-swift.exe",
     "plugins/openai-bundled/plugins/chrome/extension-host/windows/x64/extension-host.exe",
     "plugins/openai-bundled/plugins/latex/bin/tectonic.exe",
 ];
@@ -250,7 +260,6 @@ const CODEX_CONSOLE_SUBSYSTEM_EXECUTABLES: &[&str] = &[
 // process hiding logic can run, including when the server restarts on a new
 // conversation. Invoke the already-bundled, GUI-subsystem CUA Node directly.
 const CODEX_APP_TOOLS_MCP_CONFIG: &str = "plugins/openai-bundled/plugins/codex-app-tools/.mcp.json";
-const CODEX_APP_TOOLS_MCP_NODE_COMMAND: &str = r"..\..\..\..\cua_node\bin\node.exe";
 const CODEX_APP_TOOLS_MCP_OLD_COMMAND: &str = "cmd.exe";
 const CODEX_APP_TOOLS_MCP_OLD_ARGS: &[&str] = &[
     "/d",
@@ -260,7 +269,89 @@ const CODEX_APP_TOOLS_MCP_OLD_ARGS: &[&str] = &[
     "./scripts/launch_codex_app_tools_mcp.cmd",
     "./server.mjs",
 ];
-const CODEX_APP_TOOLS_MCP_DIRECT_ARGS: &[&str] = &["./server.mjs"];
+const CODEX_ASAR_FEATURE_STATE_PUBLISH_GUARD_CALL: &[u8] = b"f||_e.isLoading||ve.isLoading||!p&&ve.reason===`statsig-disabled`||ye.isLoading||Ee.isLoading||Oe.isLoading||U===`loading`||L.status===`loading`||Je.status===`loading`||Ye.status===`loading`";
+const CODEX_ASAR_FEATURE_STATE_PUBLISH_GUARD_REPLACEMENT: &[u8] = b"f||_e.isLoading||ve.isLoading||ye.isLoading||Ee.isLoading||Oe.isLoading||U===`loading`||L.status===`loading`||Je.status===`loading`||Ye.status===`loading`";
+// The Windows native-pipe path resolves this helper in Electron's main bundle
+// rather than through Sky's package_bin override. Keep the same explicit USB
+// experiment override available to that resolver without changing its normal
+// bundled path, architecture selection, or component record.
+const CODEX_ASAR_CUA_HELPER_RESOLVER_CALL: &[u8] = br#"function qe(e,t=process.arch){let n=Qe(e,[`bin`,`windows`,t===`arm64`?`codex-computer-use-arm64.exe`:`codex-computer-use.exe`]);return U({component:`cua-helper`,executablePath:n}),n}"#;
+const CODEX_ASAR_CUA_HELPER_RESOLVER_REPLACEMENT: &[u8] = br#"function qe(e){return U({component:`cua-helper`,executablePath:e=process.env.OAI_SKY_WINDOWS_BIN||Qe(e,[`bin/windows/codex-computer-use${process.arch[0]==`a`?`-arm64`:``}.exe`])}),e}"#;
+
+// Sky 0.7.12 captures a monitor and crops the target bounds. Screenshot
+// requests must activate the target first; text-only observation stays passive.
+const CODEX_CUA_CLIENT_BASE: &str = "cua_node/bin/node_modules/@oai/sky/dist/project/cua/sky_js/src/targets/windows/internal/computer_use_client_base.js";
+const CODEX_CUA_CAPTURE_CALL: &str = r#"const r=f(n),o=function(e,t,{include_screenshot:i})"#;
+const CODEX_CUA_CAPTURE_REPLACEMENT: &str = r#"const r=f(n);if(e)yield this.activate_window({window:r});const o=function(e,t,{include_screenshot:i})"#;
+const CODEX_CUA_CAPTURE_261111_CALL: &str = r#"const r=m(n),o=function(e,t,{include_screenshot:i})"#;
+const CODEX_CUA_CAPTURE_261111_REPLACEMENT: &str = r#"const r=m(n);if(e)yield this.activate_window({window:r});const o=function(e,t,{include_screenshot:i})"#;
+
+// The USB helper override must be recognized by the existing notify unwrap
+// path; otherwise every startup nests another copy of the same CUA hook.
+const CODEX_ASAR_CUA_NOTIFY_UNWRAP_CALL: &[u8] = br#"function Ls(e){return e==null?null:Dre(e)?Ls(Ore(e)):e}function Dre(e){let[t,n]=e;return n===Is&&Sre.test(t?.replaceAll(`\\`,`/`).split(`/`).at(-1)??``)}function Ore(e){let t=e[e.indexOf(Fs)+1];if(t==null)return null;try{let e=JSON.parse(t);return Rs(e)?e:null}catch{return null}}"#;
+const CODEX_ASAR_CUA_NOTIFY_UNWRAP_REPLACEMENT: &[u8] = br#"function Ls(e){return e==null?null:Dre(e)?Ls(Ore(e)):e}function Dre([e,t]){return t===Is&&/^codex-computer-use(-arm64|-mta-wrapper-candidate-v3)?\.exe$/i.test(e?.split(/[\\/]/).pop())}function Ore(e){try{let t=JSON.parse(e[e.indexOf(Fs)+1]);return Rs(t)?t:null}catch{return null}}"#;
+
+// The UI catalog must share the existing bundled-plugin reconciliation barrier
+// already used by turn preparation. Missing durable ChatGPT authentication is
+// login-required, not a transient connection error to retry on a timer.
+// Exact pinned forms only; fixed width preserves the extracted ASAR layout.
+// Renderer IPC bypasses the hosted manager; use the same reconciliation barrier.
+const CODEX_ASAR_USB_UI_MCP_DISCOVERY_CALL: &[u8] = br#"case`mcp-request`:{Jq().debug(`app_server.bridge_received`,{safe:{messageType:`mcp-request`,requestId:String(n.request.id),method:n.request.method,originWebcontentsId:e.id,originHostId:n.hostId},sensitive:{}});let t=n.request;if(i.zi(n.hostId)){let r=Sb.send(n.request);if(r.type===`response`){this.sendAppServerResponseToView(e,n.hostId,n.request.method,r.response,n.request.trace,n.priority);break}t=r.request}try{let r=()=>this.getAppServerConnection(n.hostId).handleClientRequest(new Cq(e,this.chunkedMessageSender),t,{coalesce:n.coalesce,priority:n.priority,source:n.source,timeoutMs:n.timeoutMs,expiresAtMs:n.expiresAtMs,widget:n.widget},n.retainResponse,n.savedEnvironmentConfig,n.threadAccess,n.environmentDraftReplacement,n.persistentSideConversation);t.trace==null?await r():await l.rn({attributes:{"app_server.method":t.method},name:`electron.ipc_request_delivery`,op:`codex.app_server.ipc_request_delivery`,startTimeMs:n.dispatchedAtMs,trace:t.trace},r)}catch(t){if(n.retainResponse){this.sendMessageToView(e,{type:`mcp-request-delivery`,hostId:n.hostId,update:{type:`failed`,delivery:{requestId:n.request.id,method:n.request.method,stage:`not-sent`},message:t instanceof Error?t.message:`Desktop app server request failed`}});break}this.sendAppServerResponseToView(e,n.hostId,n.request.method,{id:n.request.id,error:{code:-32e3,message:t instanceof Error?t.message:`Desktop app server request failed`}},n.request.trace,n.priority)}break}"#;
+const CODEX_ASAR_USB_UI_MCP_DISCOVERY_REPLACEMENT: &[u8] = br#"case`mcp-request`:{let a=n.request,c=n.hostId;Jq().debug(`app_server.bridge_received`,{safe:{messageType:`mcp-request`,requestId:String(a.id),method:a.method,originWebcontentsId:e.id,originHostId:c},sensitive:{}});let t=a;if(i.zi(c)){let r=Sb.send(a);if(r.type===`response`){this.sendAppServerResponseToView(e,c,a.method,r.response,a.trace,n.priority);break}t=r.request}try{let r=async()=>{let i=this.getAppServerConnection(c);t.method===`mcpServerStatus/list`&&await Js(i);return i.handleClientRequest(new Cq(e,this.chunkedMessageSender),t,{coalesce:n.coalesce,priority:n.priority,source:n.source,timeoutMs:n.timeoutMs,expiresAtMs:n.expiresAtMs,widget:n.widget},n.retainResponse,n.savedEnvironmentConfig,n.threadAccess,n.environmentDraftReplacement,n.persistentSideConversation)};t.trace==null?await r():await l.rn({attributes:{"app_server.method":t.method},name:`electron.ipc_request_delivery`,op:`codex.app_server.ipc_request_delivery`,startTimeMs:n.dispatchedAtMs,trace:t.trace},r)}catch(t){if(n.retainResponse){this.sendMessageToView(e,{type:`mcp-request-delivery`,hostId:c,update:{type:`failed`,delivery:{requestId:a.id,method:a.method,stage:`not-sent`},message:t instanceof Error?t.message:`Desktop app server request failed`}});break}this.sendAppServerResponseToView(e,c,a.method,{id:a.id,error:{code:-32e3,message:t instanceof Error?t.message:`Desktop app server request failed`}},a.trace,n.priority)}break}"#;
+const CODEX_ASAR_USB_MCP_DISCOVERY_SYNC_CALL: &[u8] = br#"async sendRequest(e,t,n){return await this.send(this.createRequest(e,t,n?.trace),n,!1,e===`thread/start`||e===`thread/startAeon`||e===`thread/fork`||e===`turn/start`||e===`turn/steer`||e===`plugin/uninstall`)}async sendAppServerExtensionRequest(e,t,n){return await this.send(this.createExtensionRequest(e,t,n?.trace),n,!1,!0)}"#;
+const CODEX_ASAR_USB_MCP_DISCOVERY_SYNC_REPLACEMENT: &[u8] = br#"async sendRequest(e,t,n){e===`mcpServerStatus/list`&&await Js(this.connection);return this.send(this.createRequest(e,t,n?.trace),n,!1,/^(thread\/(start(Aeon)?|fork)|turn\/(start|steer)|plugin\/uninstall)$/.test(e))}async sendAppServerExtensionRequest(e,t,n){return this.send(this.createExtensionRequest(e,t,n?.trace),n,!1,!0)}"#;
+const CODEX_ASAR_USB_DURABLE_LOGIN_CLASSIFY_CALL: &[u8] = br#"function j(e){if(e.startsWith(`Parse Error`))return{code:`restart-required`};let t=A(e);return t==null?e.startsWith(`codex-app-server-version-unsupported:`)?{code:`update-required`,minRequiredVersion:x,currentVersion:e.slice(37)}:{code:`connection-failed`,message:e}:{code:`restart-required`,currentVersion:t.currentVersion,installedVersion:t.installedVersion}}"#;
+const CODEX_ASAR_USB_DURABLE_LOGIN_CLASSIFY_REPLACEMENT: &[u8] = br#"function j(e){let t=A(e);return e===`Sign in to ChatGPT to start a durable thread.`?{code:`login-required`}:e.startsWith(`Parse Error`)?{code:`restart-required`}:t?{code:`restart-required`,...t}:e.startsWith(S)?{code:`update-required`,minRequiredVersion:x,currentVersion:e.slice(37)}:{code:`connection-failed`,message:e}}"#;
+const CODEX_ASAR_USB_DURABLE_LOGIN_RECONNECT_CALL: &[u8] = br#"scheduleReconnect(){let e={unsupportedTransport:!this.options.transport.supportsReconnect(),timerAlreadyScheduled:this.reconnectTimer!=null,initializationInFlight:this.initializingPromise!=null,disposed:this.disposed,appQuitting:this.isAppQuitting};if(e.unsupportedTransport||e.timerAlreadyScheduled||e.initializationInFlight||e.disposed||e.appQuitting){this.logger.trace(`Reconnect scheduling skipped`,{safe:e,sensitive:{}});return}let t=this.reconnectDelayMs,r=this.reconnectAttempt+1,i=n.Wi(this.options.hostConfig)?zz(this.options.hostId,r):0,a=Bz(t,i);this.reconnectDelayMs=Math.min(this.reconnectDelayMs*2,Lz),this.logger.info(`app_server_connection.reconnect_scheduled`,{safe:{reconnectAttempt:r,baseDelayMs:t,delayMs:a,jitterMs:i,nextDelayMs:this.reconnectDelayMs,hostId:this.options.hostId},sensitive:{}}),this.scheduledReconnect=V(),this.wasNetworkOfflineDuringReconnect=!this.isOnline(),this.reconnectTimer=setTimeout(()=>{this.startScheduledReconnect(r,`timer`)},a),this.startNetworkOnlineReconnectTimer(r,i)}"#;
+const CODEX_ASAR_USB_DURABLE_LOGIN_RECONNECT_REPLACEMENT: &[u8] = br#"scheduleReconnect(){let e={loginRequired:this.connectionError?.code===`login-required`,unsupportedTransport:!this.options.transport.supportsReconnect(),timerAlreadyScheduled:this.reconnectTimer!=null,initializationInFlight:this.initializingPromise!=null,disposed:this.disposed,appQuitting:this.isAppQuitting};if(Object.values(e).some(Boolean)){this.logger.trace(`Reconnect scheduling skipped`,{safe:e,sensitive:{}});return}let t=this.reconnectDelayMs,r=this.reconnectAttempt+1,i=n.Wi(this.options.hostConfig)?zz(this.options.hostId,r):0,a=Bz(t,i);this.reconnectDelayMs=Math.min(this.reconnectDelayMs*2,Lz),this.logger.info(`app_server_connection.reconnect_scheduled`,{safe:{reconnectAttempt:r,baseDelayMs:t,delayMs:a,jitterMs:i,nextDelayMs:this.reconnectDelayMs,hostId:this.options.hostId},sensitive:{}}),this.scheduledReconnect=V(),this.wasNetworkOfflineDuringReconnect=!this.isOnline(),this.reconnectTimer=setTimeout(()=>{this.startScheduledReconnect(r,`timer`)},a),this.startNetworkOnlineReconnectTimer(r,i)}"#;
+
+// Only explicit IAB visibility commands await the existing renderer-state
+// completion queue; pending intent is not a rendered-state acknowledgement.
+// Explicit shows still select the requested panel/route when cached bounds exist.
+// Internal presentation/get and background page opens stay unchanged. One pair
+// upgrades the exact previously published visibility patch in the same span.
+const CODEX_ASAR_USB_IAB_VISIBILITY_PATCHES: &[(&[u8], &[u8], &str)] = &[
+    (br#"function fje({browserTabId:e,host:t}){return{[fG]:n=>{let r=pG.parse(n);return t.setBrowserVisibleForBrowserUse(r.visible,e),mG.parse({})},[sG]:n=>(cG.parse(n),lG.parse({visible:t.isBrowserVisibleForBrowserUse(e)})),[CG]:n=>{let r=wG.parse(n);t.setViewportForBrowserUse({width:r.width,height:r.height},e);let i=t.waitForPendingDebuggerSync?.(e);return i==null?TG.parse({}):i.then(()=>TG.parse({}))},[vG]:n=>{yG.parse(n),t.setViewportForBrowserUse(null,e);let r=t.waitForPendingDebuggerSync?.(e);return r==null?bG.parse({}):r.then(()=>bG.parse({}))}}}"#, br#"function fje({browserTabId:e,host:t}){return{[fG]:async n=>{let r=pG.parse(n);return await t.setBrowserVisibleForBrowserUse(r.visible,e,!0),mG.parse({})},[sG]:n=>(cG.parse(n),lG.parse({visible:t.isBrowserVisibleForBrowserUse(e)})),[CG]:n=>{let r=wG.parse(n);t.setViewportForBrowserUse({width:r.width,height:r.height},e);return t.waitForPendingDebuggerSync?.(e)?.then(()=>TG.parse({}))??TG.parse({})},[vG]:n=>{yG.parse(n),t.setViewportForBrowserUse(null,e);return t.waitForPendingDebuggerSync?.(e)?.then(()=>bG.parse({}))??bG.parse({})}}}"#, "iab-visibility-command-await"),
+    (br#"let n=this.openingPagePromisesByBrowserTabId.get(t)??null;if(n!=null)return n;let r=this.registry.getDelegate().openPageForBrowserUse(this.route,{browserTabId:t,createPanelTab:e.createPanelTab,startingUrl:e.startingUrl}).catch(e=>{this.setBrowserUseActive(!1,t);let n=this.getTabsForBrowserUse().find(e=>e.browserTabId===t);throw n?.lifetime===`persistent`?n.sessionControlled&&this.releasePageForBrowserUse(t):this.closePageForBrowserUse(t),e}).finally(()=>{this.openingPagePromisesByBrowserTabId.delete(t)});this.openingPagePromisesByBrowserTabId.set(t,r);let i=await r;return QG().info(`IAB_LIFECYCLE host opened page`,{safe:{conversationId:this.conversationId,pageKey:i.pageKey,routeKey:this.routeKey,webContentsId:i.webContents.id,windowId:this.windowId},sensitive:{}}),i}setBrowserVisibleForBrowserUse(e,t){if(this.registry.isSubagentBrowserUseRoute(this.route))throw Error(`IAB visibility is not supported in a subagent thread`);e&&this.setBrowserUseActive(!0,t),this.registry.getDelegate().setBrowserVisibleForBrowserUse(this.route,e,t)}"#, br#"let n=this.openingPagePromisesByBrowserTabId.get(t);if(n)return n;let r=this.registry.getDelegate().openPageForBrowserUse(this.route,{browserTabId:t,createPanelTab:e.createPanelTab,startingUrl:e.startingUrl}).catch(e=>{this.setBrowserUseActive(!1,t);let n=this.getTabsForBrowserUse().find(e=>e.browserTabId===t);throw n?.lifetime===`persistent`?n.sessionControlled&&this.releasePageForBrowserUse(t):this.closePageForBrowserUse(t),e}).finally(()=>{this.openingPagePromisesByBrowserTabId.delete(t)});this.openingPagePromisesByBrowserTabId.set(t,r);let i=await r;return QG().info(`IAB_LIFECYCLE host opened page`,{safe:{conversationId:this.conversationId,pageKey:i.pageKey,routeKey:this.routeKey,webContentsId:i.webContents.id,windowId:this.windowId},sensitive:{}}),i}setBrowserVisibleForBrowserUse(e,t,n){if(this.registry.isSubagentBrowserUseRoute(this.route))throw Error(`IAB visibility is not supported in a subagent thread`);return e&&this.setBrowserUseActive(!0,t),this.registry.getDelegate().setBrowserVisibleForBrowserUse(this.route,e,t,n)}"#, "iab-visibility-host-return"),
+    (br#"setBrowserVisibleForBrowserUse:(e,t,n)=>CNe(this.actions,e,t,n)"#, br#"setBrowserVisibleForBrowserUse:(...e)=>CNe(this.actions,...e)"#, "iab-visibility-forward-wait-flag"),
+    (br#"cMe=class{recordDebugEvent;requests=new Set;constructor(e=()=>void 0){this.recordDebugEvent=e}getDebugSnapshot(){return Array.from(this.requests).map(e=>({activeBrowserTabId:null,activeConversationId:null,browserTabId:e.browserTabId,conversationId:e.conversationId,guestWebContentsId:null,hasPage:null,ownerWebContentsId:e.owner.id,ownerRoutePath:null,pendingAttachCount:null,pendingBrowserUsePanelOpen:null,routeActive:null,windowId:null}))}waitForOpen(e,t,n){return new Promise((r,i)=>{let a={browserTabId:n,conversationId:t,owner:e,reject:i,resolve:r,timer:setTimeout(()=>{let r=Error(`Timed out waiting for the Browser webview to attach for this browser-use page`);this.recordDebugEvent({browserTabId:n,conversationId:t,guestWebContentsId:null,kind:`browser-open-wait-timeout`,message:`Timed out waiting for Browser webview attach`,ownerWebContentsId:e.id,pageKey:null,windowId:null}),uK().warning(`IAB_LIFECYCLE browser use open wait timed out`,{safe:{conversationId:t,ownerWebContentsId:e.id},sensitive:{}}),this.reject(a,r)},sMe)};a.timer.unref(),this.requests.add(a),uK().info(`IAB_LIFECYCLE browser use open wait started`,{safe:{browserTabId:n,conversationId:t,ownerWebContentsId:e.id},sensitive:{}}),this.recordDebugEvent({browserTabId:n,conversationId:t,guestWebContentsId:null,kind:`browser-open-wait-started`,message:`Waiting for Browser webview attach`,ownerWebContentsId:e.id,pageKey:null,windowId:null})})}resolveForWindow(e,t){let n=Array.from(this.requests).filter(t=>t.owner.id===e.owner.id);for(let e of n){let n=t(e);n!=null&&this.resolve(e,n)}}rejectForOwner(e,t){for(let n of Array.from(this.requests))n.owner.id===e.id&&this.reject(n,t)}rejectForRoute({browserTabId:e,conversationId:t,error:n,owner:r}){for(let i of Array.from(this.requests))i.owner.id===r.id&&i.conversationId===t&&i.browserTabId===e&&this.reject(i,n)}resolve(e,t){uK().info(`IAB_LIFECYCLE browser use open wait resolved`,{safe:{browserTabId:t.browserTabId,conversationId:e.conversationId,guestWebContentsId:t.webContents.id,ownerWebContentsId:e.owner.id,pageKey:t.pageKey},sensitive:{}}),this.recordDebugEvent({browserTabId:t.browserTabId,conversationId:e.conversationId,guestWebContentsId:t.webContents.id,kind:`browser-open-wait-resolved`,message:`Resolved Browser webview attach wait`,ownerWebContentsId:e.owner.id,pageKey:t.pageKey,windowId:null}),this.requests.delete(e),clearTimeout(e.timer),e.resolve(t)}reject(e,t){this.recordDebugEvent({browserTabId:e.browserTabId,conversationId:e.conversationId,details:[{label:`errorMessage`,value:t.message}],guestWebContentsId:null,kind:`browser-open-wait-rejected`,message:`Rejected Browser webview attach wait`,ownerWebContentsId:e.owner.id,pageKey:null,windowId:null}),uK().warning(`IAB_LIFECYCLE browser use open wait rejected`,{safe:{conversationId:e.conversationId,errorMessage:t.message,ownerWebContentsId:e.owner.id},sensitive:{}}),this.requests.delete(e),clearTimeout(e.timer),e.reject(t)}},dK=p.a(`browser-sidebar-manager`)"#, br#"cMe=class{recordDebugEvent;requests=new Set;constructor(e=()=>{}){this.recordDebugEvent=e}getDebugSnapshot(){return [...this.requests].map(e=>({activeBrowserTabId:null,activeConversationId:null,browserTabId:e.browserTabId,conversationId:e.conversationId,guestWebContentsId:null,hasPage:null,ownerWebContentsId:e.owner.id,ownerRoutePath:null,pendingAttachCount:null,pendingBrowserUsePanelOpen:null,routeActive:null,windowId:null}))}waitForOpen(e,t,n,o){return new Promise((r,i)=>{let a={ready:o,browserTabId:n,conversationId:t,owner:e,reject:i,resolve:r,timer:setTimeout(()=>{let r=Error(`Timed out waiting for the Browser webview to attach for this browser-use page`);this.recordDebugEvent({browserTabId:n,conversationId:t,guestWebContentsId:null,kind:`browser-open-wait-timeout`,message:`Timed out waiting for Browser webview attach`,ownerWebContentsId:e.id,pageKey:null,windowId:null}),uK().warning(`IAB_LIFECYCLE browser use open wait timed out`,{safe:{conversationId:t,ownerWebContentsId:e.id},sensitive:{}}),this.reject(a,r)},sMe)};a.timer.unref(),this.requests.add(a),uK().info(`IAB_LIFECYCLE browser use open wait started`,{safe:{browserTabId:n,conversationId:t,ownerWebContentsId:e.id},sensitive:{}}),this.recordDebugEvent({browserTabId:n,conversationId:t,guestWebContentsId:null,kind:`browser-open-wait-started`,message:`Waiting for Browser webview attach`,ownerWebContentsId:e.id,pageKey:null,windowId:null})})}resolveForWindow(e,t){let n=[...this.requests].filter(t=>t.owner.id===e.owner.id);for(let e of n){let n=t(e);n!=null&&e.ready?.()!==!1&&this.resolve(e,n)}}rejectForOwner(e,t){for(let n of [...this.requests])n.owner.id===e.id&&this.reject(n,t)}rejectForRoute({browserTabId:e,conversationId:t,error:n,owner:r}){for(let i of [...this.requests])i.owner.id===r.id&&i.conversationId===t&&i.browserTabId===e&&this.reject(i,n)}resolve(e,t){uK().info(`IAB_LIFECYCLE browser use open wait resolved`,{safe:{browserTabId:t.browserTabId,conversationId:e.conversationId,guestWebContentsId:t.webContents.id,ownerWebContentsId:e.owner.id,pageKey:t.pageKey},sensitive:{}}),this.recordDebugEvent({browserTabId:t.browserTabId,conversationId:e.conversationId,guestWebContentsId:t.webContents.id,kind:`browser-open-wait-resolved`,message:`Resolved Browser webview attach wait`,ownerWebContentsId:e.owner.id,pageKey:t.pageKey,windowId:null}),this.requests.delete(e),clearTimeout(e.timer),e.resolve(t)}reject(e,t){this.recordDebugEvent({browserTabId:e.browserTabId,conversationId:e.conversationId,details:[{label:`errorMessage`,value:t.message}],guestWebContentsId:null,kind:`browser-open-wait-rejected`,message:`Rejected Browser webview attach wait`,ownerWebContentsId:e.owner.id,pageKey:null,windowId:null}),uK().warning(`IAB_LIFECYCLE browser use open wait rejected`,{safe:{conversationId:e.conversationId,errorMessage:t.message,ownerWebContentsId:e.owner.id},sensitive:{}}),this.requests.delete(e),clearTimeout(e.timer),e.reject(t)}},dK=p.a(`browser-sidebar-manager`)"#, "iab-visibility-existing-waiter"),
+    (br#"function CNe(e,t,n,r){let{conversationId:i,windowId:a}=t,o=e.getPageWindowState({conversationId:i,windowId:a},r);if(o==null)throw QK().warning(`IAB_LIFECYCLE browser use route window missing for browser visibility`,{safe:{conversationId:i,windowId:a},sensitive:{}}),Error(`ChatGPT browser window ${a} is no longer available for browser session ${i}`);let s=oK(o,i,r);if(s==null){if(n)throw Error(`A browser tab id is required to show the browser`);return}let c=e.getThreadStateForWindow(o,i,s);if(!n){let e=c?.page?.view.webContents;e!=null&&!e.isDestroyed()&&e.closeExtensionActionContextMenu()}if(o.tabSourceWindow!=null){n?o.window.show():o.window.hide();return}if(n){e.ensureThreadStateForWindow(o,i,s,{isBrowserUseTab:!0}),ENe(e,o,i,s);return}c!=null&&(c.pendingBrowserUsePanelOpen=!1,c.hasPendingBrowserUseVisibilityRequest=!1,c.presented=!1,c.visible=!1,c.bounds=null,e.updateThreadSessionState(c)),e.windowManager.sendMessageToWebContents(o.owner,{type:`browser-sidebar-clear-pending-panel-open`,browserTabId:s,conversationId:i,reason:`hide`}),o.activeConversationId===i&&o.activeBrowserTabId===s&&e.windowManager.sendMessageToWebContents(o.owner,{type:`toggle-browser-panel`,browserTabId:s,open:!1,source:`browser_use`})}function wNe(e,{conversationId:t,windowId:n},r){let i=e.getPageWindowState({conversationId:t,windowId:n},r);if(i==null)throw QK().warning(`IAB_LIFECYCLE browser use route window missing for browser visibility read`,{safe:{conversationId:t,windowId:n},sensitive:{}}),Error(`ChatGPT browser window ${n} is no longer available for browser session ${t}`);let a=oK(i,t,r);if(a==null)return!1;let o=e.getThreadStateForWindow(i,t,a)??null;return(i.tabSourceWindow==null||i.window.isVisible())&&i.activeConversationId===t&&i.activeBrowserTabId===a&&(o?.hasPendingBrowserUseVisibilityRequest===!0||o?.visible===!0&&o.bounds!=null)}"#, br#"function CNe(e,t,n,r,l){let{conversationId:i,windowId:a}=t,o=e.getPageWindowState(t,r);if(o==null)throw QK().warning(`IAB_LIFECYCLE browser use route window missing for browser visibility`,{safe:{conversationId:i,windowId:a},sensitive:{}}),Error(`ChatGPT browser window ${a} is no longer available for browser session ${i}`);let s=oK(o,i,r);if(s==null){if(n)throw Error(`A browser tab id is required to show the browser`);return}let c=e.getThreadStateForWindow(o,i,s),d=!n&&c?.page?.view.webContents;d&&!d.isDestroyed()&&d.closeExtensionActionContextMenu();if(o.tabSourceWindow!=null)return o.window[n?`show`:`hide`]();if(n){e.ensureThreadStateForWindow(o,i,s,{isBrowserUseTab:!0}),ENe(e,o,i,s,l);return l&&(wNe(e,t,s,!0)||e.browserUseOpenRequests.waitForOpen(o.owner,i,s,()=>wNe(e,t,s,!0)))}c&&(c.pendingBrowserUsePanelOpen=c.hasPendingBrowserUseVisibilityRequest=c.presented=c.visible=!1,c.bounds=null,e.updateThreadSessionState(c)),e.windowManager.sendMessageToWebContents(o.owner,{type:`browser-sidebar-clear-pending-panel-open`,browserTabId:s,conversationId:i,reason:`hide`}),o.activeConversationId===i&&o.activeBrowserTabId===s&&e.windowManager.sendMessageToWebContents(o.owner,{type:`toggle-browser-panel`,browserTabId:s,open:!1,source:`browser_use`})}function wNe(e,o,r,l){let{conversationId:t,windowId:n}=o,i=e.getPageWindowState(o,r);if(i==null)throw QK().warning(`IAB_LIFECYCLE browser use route window missing for browser visibility read`,{safe:{conversationId:t,windowId:n},sensitive:{}}),Error(`ChatGPT browser window ${n} is no longer available for browser session ${t}`);let a=oK(i,t,r);if(a==null)return!1;o=e.getThreadStateForWindow(i,t,a);return(i.tabSourceWindow==null||i.window.isVisible())&&i.activeConversationId===t&&i.activeBrowserTabId===a&&(!l&&o?.hasPendingBrowserUseVisibilityRequest===!0||o?.visible===!0&&o.bounds!=null)}"#, "iab-visibility-wait-for-state"),
+    (br#"function CNe(e,t,n,r,l){let{conversationId:i,windowId:a}=t,o=e.getPageWindowState(t,r);if(o==null)throw QK().warning(`IAB_LIFECYCLE browser use route window missing for browser visibility`,{safe:{conversationId:i,windowId:a},sensitive:{}}),Error(`ChatGPT browser window ${a} is no longer available for browser session ${i}`);let s=oK(o,i,r);if(s==null){if(n)throw Error(`A browser tab id is required to show the browser`);return}let c=e.getThreadStateForWindow(o,i,s);if(!n){let e=c?.page?.view.webContents;e&&!e.isDestroyed()&&e.closeExtensionActionContextMenu()}if(o.tabSourceWindow!=null){n?o.window.show():o.window.hide();return}if(n){e.ensureThreadStateForWindow(o,i,s,{isBrowserUseTab:!0}),ENe(e,o,i,s);return l&&(wNe(e,t,s)||e.browserUseOpenRequests.waitForOpen(o.owner,i,s,()=>wNe(e,t,s)))}c&&(c.pendingBrowserUsePanelOpen=c.hasPendingBrowserUseVisibilityRequest=c.presented=c.visible=!1,c.bounds=null,e.updateThreadSessionState(c)),e.windowManager.sendMessageToWebContents(o.owner,{type:`browser-sidebar-clear-pending-panel-open`,browserTabId:s,conversationId:i,reason:`hide`}),o.activeConversationId===i&&o.activeBrowserTabId===s&&e.windowManager.sendMessageToWebContents(o.owner,{type:`toggle-browser-panel`,browserTabId:s,open:!1,source:`browser_use`})}function wNe(e,o,r){let{conversationId:t,windowId:n}=o,i=e.getPageWindowState(o,r);if(i==null)throw QK().warning(`IAB_LIFECYCLE browser use route window missing for browser visibility read`,{safe:{conversationId:t,windowId:n},sensitive:{}}),Error(`ChatGPT browser window ${n} is no longer available for browser session ${t}`);let a=oK(i,t,r);if(a==null)return!1;o=e.getThreadStateForWindow(i,t,a);return(i.tabSourceWindow==null||i.window.isVisible())&&i.activeConversationId===t&&i.activeBrowserTabId===a&&(o?.hasPendingBrowserUseVisibilityRequest===!0||o?.visible===!0&&o.bounds!=null)}"#, br#"function CNe(e,t,n,r,l){let{conversationId:i,windowId:a}=t,o=e.getPageWindowState(t,r);if(o==null)throw QK().warning(`IAB_LIFECYCLE browser use route window missing for browser visibility`,{safe:{conversationId:i,windowId:a},sensitive:{}}),Error(`ChatGPT browser window ${a} is no longer available for browser session ${i}`);let s=oK(o,i,r);if(s==null){if(n)throw Error(`A browser tab id is required to show the browser`);return}let c=e.getThreadStateForWindow(o,i,s),d=!n&&c?.page?.view.webContents;d&&!d.isDestroyed()&&d.closeExtensionActionContextMenu();if(o.tabSourceWindow!=null)return o.window[n?`show`:`hide`]();if(n){e.ensureThreadStateForWindow(o,i,s,{isBrowserUseTab:!0}),ENe(e,o,i,s,l);return l&&(wNe(e,t,s,!0)||e.browserUseOpenRequests.waitForOpen(o.owner,i,s,()=>wNe(e,t,s,!0)))}c&&(c.pendingBrowserUsePanelOpen=c.hasPendingBrowserUseVisibilityRequest=c.presented=c.visible=!1,c.bounds=null,e.updateThreadSessionState(c)),e.windowManager.sendMessageToWebContents(o.owner,{type:`browser-sidebar-clear-pending-panel-open`,browserTabId:s,conversationId:i,reason:`hide`}),o.activeConversationId===i&&o.activeBrowserTabId===s&&e.windowManager.sendMessageToWebContents(o.owner,{type:`toggle-browser-panel`,browserTabId:s,open:!1,source:`browser_use`})}function wNe(e,o,r,l){let{conversationId:t,windowId:n}=o,i=e.getPageWindowState(o,r);if(i==null)throw QK().warning(`IAB_LIFECYCLE browser use route window missing for browser visibility read`,{safe:{conversationId:t,windowId:n},sensitive:{}}),Error(`ChatGPT browser window ${n} is no longer available for browser session ${t}`);let a=oK(i,t,r);if(a==null)return!1;o=e.getThreadStateForWindow(i,t,a);return(i.tabSourceWindow==null||i.window.isVisible())&&i.activeConversationId===t&&i.activeBrowserTabId===a&&(!l&&o?.hasPendingBrowserUseVisibilityRequest===!0||o?.visible===!0&&o.bounds!=null)}"#, "iab-visibility-confirm-rendered-state"),
+    (br#"function ENe(e,t,n,r){if(t.activeConversationId!==n){iq(e,t,n,r);return}let i=e.getThreadStateForWindow(t,n,r)??null;(i?.visible!==!0||i.bounds==null)&&(i!=null&&(i.pendingBrowserUsePanelOpen=!1,i.hasPendingBrowserUseVisibilityRequest=!0),e.windowManager.sendMessageToWebContents(t.owner,{type:`toggle-browser-panel`,open:!0,browserTabId:r,conversationId:n,source:`browser_use`,initiator:`browser_use`}))}"#, br#"function ENe(e,t,n,r,a){let i;a&&t.window.show(),t.activeConversationId!==n?iq(e,t,n,r,a):(i=e.getThreadStateForWindow(t,n,r),(a||i?.visible!==!0||i.bounds==null)&&(i&&(i.pendingBrowserUsePanelOpen=!1,i.hasPendingBrowserUseVisibilityRequest=!0),e.windowManager.sendMessageToWebContents(t.owner,{type:`toggle-browser-panel`,open:!0,browserTabId:r,conversationId:n,source:a=`browser_use`,initiator:a})))}"#, "iab-visibility-explicit-panel-selection"),
+    // Explicit browser-use show must reveal the owning ordinary window. The
+    // second shape upgrades the fixed-width helper shipped in earlier USB packages.
+    (br#"function ENe(e,t,n,r,a){if(t.activeConversationId!==n)return iq(e,t,n,r,a);let i=e.getThreadStateForWindow(t,n,r);(a||i?.visible!==!0||i.bounds==null)&&(i&&(i.pendingBrowserUsePanelOpen=!1,i.hasPendingBrowserUseVisibilityRequest=!0),e.windowManager.sendMessageToWebContents(t.owner,{type:`toggle-browser-panel`,open:!0,browserTabId:r,conversationId:n,source:`browser_use`,initiator:`browser_use`}))}      "#, br#"function ENe(e,t,n,r,a){let i;a&&t.window.show(),t.activeConversationId!==n?iq(e,t,n,r,a):(i=e.getThreadStateForWindow(t,n,r),(a||i?.visible!==!0||i.bounds==null)&&(i&&(i.pendingBrowserUsePanelOpen=!1,i.hasPendingBrowserUseVisibilityRequest=!0),e.windowManager.sendMessageToWebContents(t.owner,{type:`toggle-browser-panel`,open:!0,browserTabId:r,conversationId:n,source:a=`browser_use`,initiator:a})))}"#, "iab-visibility-show-owner-window"),
+    (br#"function iq(e,t,n,r){let i=e.getThreadStateForWindow(t,n,r)??null;(i?.visible!==!0||i.bounds==null)&&(i!=null&&(i.pendingBrowserUsePanelOpen=!1,i.hasPendingBrowserUseVisibilityRequest=t.activeConversationId===n),e.windowManager.sendMessageToWebContents(t.owner,{type:`browser-sidebar-open-panel-without-animation`,conversationId:n,browserTabId:r,source:`browser_use`,initiator:`browser_use`}))}"#, br#"function iq(e,t,n,r,a){let i=e.getThreadStateForWindow(t,n,r);(a||i?.visible!==!0||i.bounds==null)&&(i&&(i.pendingBrowserUsePanelOpen=!1,i.hasPendingBrowserUseVisibilityRequest=t.activeConversationId===n),e.windowManager.sendMessageToWebContents(t.owner,{type:`browser-sidebar-open-panel-without-animation`,conversationId:n,browserTabId:r,source:`browser_use`,initiator:`browser_use`}))}"#, "iab-visibility-explicit-route-selection"),
+];
+
+// Keep this replacement no wider than the pinned renderer function. It gates
+// only the automatic `/work` mount effect for the managed local 404token
+// endpoint when the USB manager has explicitly prepared COMMANDS mode.
+const CODEX_ASAR_WORK_ROUTE_MODE_CALL: &[u8] = br#"function aIl(){let e=(0,p8.c)(9),t=E(J),n=Z(c_),r=Z(ly),i=Z(eYt),[a,o]=(0,m8.useState)(!1),s,c;e[0]!==a||e[1]!==i||e[2]!==t||e[3]!==n.status||e[4]!==r?(s=()=>{if(a||n.status===`loading`)return;n.status===`allowed`&&(r?i!==`work`&&dy(t,`work`):KJt(t,`work`));let e=!0;return queueMicrotask(()=>{e&&o(!0)}),()=>{e=!1}},c=[a,i,t,n.status,r],e[0]=a,e[1]=i,e[2]=t,e[3]=n.status,e[4]=r,e[5]=s,e[6]=c):(s=e[5],c=e[6]),(0,m8.useEffect)(s,c);let l;return e[7]===a?l=e[8]:(l=a?(0,h8.jsx)(iIl,{}):null,e[7]=a,e[8]=l),l}"#;
+const CODEX_ASAR_WORK_ROUTE_MODE_REPLACEMENT: &[u8] = br#"function aIl(){let e=E(J),t=Z(c_),s=t.status,n=Z(ly),r=Z(eYt),u=Z(xh({hostId:Do,cwd:null,failClosed:!0})),c=u.data?.config,p=c&&Xm(c),b=p?.model_providers?.[p.model_provider]?.base_url,v=URL.parse(b)?.href.replace(/\/+$/,'')===`https://404token.xyz/v1`&&c.desktop?.conversationDetailMode===`STEPS_COMMANDS`,[i,a]=m8.useState(!1);return m8.useEffect(()=>{if(i||s===`loading`||s===`allowed`&&u.isLoading)return;s===`allowed`&&(n?r!==`work`&&dy(e,`work`):v||KJt(e,`work`));a(!0)},[r,s,n,u]),i&&h8.jsx(iIl,{})}"#;
+const CODEX_ASAR_ONBOARDING_DETAIL_MODE_CALL: &[u8] = br#"function zc(e){return e===`non_coding`?{threadDetailLevel:ii,fontSizes:{sans:Vc,code:Hc},showFullAccessInComposer:!1}:{threadDetailLevel:Yr,fontSizes:null,showFullAccessInComposer:!0}}"#;
+const CODEX_ASAR_ONBOARDING_DETAIL_MODE_REPLACEMENT: &[u8] = br#"function zc(e){return e===`non_coding`?{threadDetailLevel:Yr,fontSizes:{sans:Vc,code:Hc},showFullAccessInComposer:!1}:{threadDetailLevel:Yr,fontSizes:null,showFullAccessInComposer:!0}}"#;
+// Temporary USB gate-source diagnosis at the existing feature publication log.
+const CODEX_ASAR_USB_GATE_DIAGNOSTIC_LOG_CALL: &[u8] = br#"iu.info(`browser_use_availability_resolved`,{safe:{available:_e.available,platform:fe?.osName??`unknown`,reason:_e.reason,release:fe?.version??`unknown`},sensitive:{browserPane:ee}})"#;
+const CODEX_ASAR_USB_GATE_DIAGNOSTIC_LOG_REPLACEMENT: &[u8] = br#"iu.info(`usb_gate_v1`,{safe:{s:h.loadingStatus,g:[410262010,410065390,1506311413].map(e=>{let t=h.getFeatureGate(``+e,{disableExposureLog:!0});return[e,t.value,t.details.reason]})}})"#;
+
+// Temporary SDK stage observations for the pinned USB renderer. The marker
+// shared callback has no renderer bindings; the renderer writer selects the
+// default client. Both SDK copies retain their original telemetry queue.
+const CODEX_ASAR_USB_INIT_DIAGNOSTIC_MARKERS_CALL: &[u8] = br#"_markInitProcessEnd:(e,t,n)=>{c(e,o(Object.assign(Object.assign({},t),{syncType:n}),i,`initialize`,`process`))},_clearMarkers:e=>{n.delete(e)},_formatError(e){if(e&&typeof e==`object`)return(0,t._getErrorDetails)(e)},_getDiagnosticsData(t,n,r,i,a){let o=(typeof navigator<`u`?navigator:null)?.onLine;return Object.assign(Object.assign({success:t?.ok===!0&&i===void 0&&a==null,statusCode:a?a.responseStatus??void 0:t?.status,sdkRegion:(t?.headers)?.get(`x-statsig-region`),isDelta:r.includes(`"is_delta":true`)===!0||void 0,attempt:n},typeof o==`boolean`?{hasInternet:o}:{}),{error:a?.errorDetails??e.Diagnostics._formatError(i)})},_enqueueDiagnosticsEvent(t,n,r,i,a){let o=e.Diagnostics._getMarkers(r);if(o==null||o.length<=0)return-1;let c=o[o.length-1].timestamp-o[0].timestamp;e.Diagnostics._clearMarkers(r);let l=s(t,{context:a===`initialize`?`initialize`:`update_user`,syncType:a,markers:o.slice(),statsigOptions:i});return n.enqueue(l),c}};function o(e,t,n,r){return Object.assign({key:n,action:t,step:r,timestamp:Date.now()},e)}function s(e,t){return{eventName:a,user:e,value:null,metadata:t,time:Date.now()}}function c(e,t){let r=n.get(e)??[];r.push(t),n.set(e,r)}}"#;
+const CODEX_ASAR_USB_INIT_DIAGNOSTIC_MARKERS_REPLACEMENT: &[u8] = br#"_markInitProcessEnd:(e,t,n)=>{c(e,o({...t,syncType:n},i,`initialize`,`process`))},_clearMarkers:e=>{n.delete(e)},_formatError(e){if(e&&typeof e==`object`)return(0,t._getErrorDetails)(e)},_getDiagnosticsData(t,n,r,i,a){let o=(typeof navigator<`u`?navigator:null)?.onLine;return{success:t?.ok===!0&&i===void 0&&a==null,statusCode:a?a.responseStatus??void 0:t?.status,sdkRegion:t?.headers?.get(`x-statsig-region`),isDelta:r.includes(`"is_delta":true`)||void 0,attempt:n,...typeof o==`boolean`?{hasInternet:o}:{},error:a?.errorDetails??e.Diagnostics._formatError(i)}},_enqueueDiagnosticsEvent(t,n,r,i,a){let o=e.Diagnostics._getMarkers(r);if(!o?.length)return-1;let c=o[o.length-1].timestamp-o[0].timestamp;e.Diagnostics._clearMarkers(r);return n.enqueue(s(t,{context:a===`initialize`?a:`update_user`,syncType:a,markers:o.slice(),statsigOptions:i})),c}};function o(e,t,n,r){return{key:n,action:t,step:r,timestamp:Date.now(),...e}}function s(e,t){return{eventName:a,user:e,value:null,metadata:t,time:Date.now()}}function c(e,t){let r=n.get(e)??[];r.push(t),n.set(e,r),globalThis.__usbDiag?.(e,[t.action,t.step,t.syncType,t.timestamp,t.statusCode,t.success],t.error)}}"#;
+// Exact repair for installed v2 diagnostics, also visited on portable startup.
+const CODEX_ASAR_USB_INIT_DIAGNOSTIC_MARKERS_V2_HOOK: &[u8] = b"e===n1l&&globalThis.__usbDiag?.(";
+const CODEX_ASAR_USB_INIT_DIAGNOSTIC_MARKERS_V3_HOOK: &[u8] = b"globalThis.__usbDiag?.(e,";
+const CODEX_ASAR_USB_INIT_DIAGNOSTIC_WRITER_V2: &[u8] = br#"globalThis.__usbDiag=(v,e)=>iu.info(`usb_init_v2`,{safe:{v:[...v,e?.name,e?.code]}}),__usbDiag([])"#;
+const CODEX_ASAR_USB_INIT_DIAGNOSTIC_WRITER_CALL: &[u8] = br#"iu.info(`[statsig-refresh-diagnostics] React root render requested`,{safe:{windowType:`electron`}})"#;
+const CODEX_ASAR_USB_INIT_DIAGNOSTIC_WRITER_REPLACEMENT: &[u8] = br#"globalThis.__usbDiag=(k,v,e)=>k===n1l&&iu.info(`usb_init_v3`,{safe:{v:[...v,e?.name,e?.code]}})"#;
+
+// An empty initial store cannot recover base-only gates from live overlays.
+// Reuse the existing full refresh on the existing polling cadence; populated
+// stores continue using live refresh. Both branches reuse SDK network policy.
+const CODEX_ASAR_USB_EMPTY_INIT_REFRESH_CALL: &[u8] = br#"_refreshLiveValuesAsyncImpl(){return t(this,void 0,void 0,function*(){let e=this._user,t=this._store.getValues(),n=this._store.getLiveCursor(),r=yield this._network.fetchLiveEvaluations(this._sdkKey,e,n.sinceTime,n.previousDerivedFields,`low`,n.fullChecksum);if(e===this._user&&t===this._store.getValues()&&this.loadingStatus===`Ready`&&r!=null){if(r.hasUpdates!==!0){r.lcut!=null&&this._store.advanceLiveCursor(r.lcut);return}this._store.setLiveValues(r.values,Date.now())&&this._setStatus(`Ready`,null)}})}"#;
+const CODEX_ASAR_USB_EMPTY_INIT_REFRESH_REPLACEMENT: &[u8] = br#"async _refreshLiveValuesAsyncImpl(){let e=this._user,t=this._store,n=t.getValues();if(n==null)return this._refreshValuesAsyncImpl({priority:`low`});let r=t.getLiveCursor(),i=await this._network.fetchLiveEvaluations(this._sdkKey,e,r.sinceTime,r.previousDerivedFields,`low`,r.fullChecksum);if(e===this._user&&n===t.getValues()&&this.loadingStatus===`Ready`&&i!=null)i.hasUpdates===!0?t.setLiveValues(i.values,Date.now())&&this._setStatus(`Ready`,null):i.lcut!=null&&t.advanceLiveCursor(i.lcut)}"#;
 
 // Codex ships the translated webview bundles, but several desktop releases
 // gate loading them behind a remote `enable_i18n` flag whose local fallback is
@@ -2012,8 +2103,7 @@ fn patch_all_fixed_width_calls(
             "portable Codex startup patch for {label} is wider than the original call"
         )));
     }
-    let mut replacement = vec![b' '; call.len()];
-    replacement[..replacement_prefix.len()].copy_from_slice(replacement_prefix);
+    let replacement = fixed_width_patch_bytes(call, replacement_prefix);
     let mut patched = 0usize;
     while let Some(offset) = find_bytes_in_file(app_asar, call)
         .map_err(|error| EngineError::Io(format!("scan Codex app.asar for {label}: {error}")))?
@@ -2027,6 +2117,39 @@ fn patch_all_fixed_width_calls(
         );
     }
     Ok(patched)
+}
+
+fn patch_usb_onboarding_detail_mode(
+    app_asar: &Path,
+    usb_integrity_transaction: bool,
+) -> Result<bool, EngineError> {
+    if !usb_integrity_transaction {
+        return Ok(false);
+    }
+    Ok(patch_all_fixed_width_calls(
+        app_asar,
+        CODEX_ASAR_ONBOARDING_DETAIL_MODE_CALL,
+        CODEX_ASAR_ONBOARDING_DETAIL_MODE_REPLACEMENT,
+        "usb-onboarding-default-detail-mode",
+    )? > 0)
+}
+
+fn replace_once_in_member(member: &mut Vec<u8>, call: &[u8], replacement: &[u8]) -> bool {
+    let Some(offset) = memchr::memmem::find(member, call) else {
+        return false;
+    };
+    if memchr::memmem::find(&member[offset + call.len()..], call).is_some() {
+        return false;
+    }
+    member.splice(offset..offset + call.len(), replacement.iter().copied());
+    true
+}
+
+
+fn fixed_width_patch_bytes(call: &[u8], replacement_prefix: &[u8]) -> Vec<u8> {
+    let mut replacement = vec![b' '; call.len()];
+    replacement[..replacement_prefix.len()].copy_from_slice(replacement_prefix);
+    replacement
 }
 
 fn patch_codex_console_spawn(app_asar: &Path) -> Result<bool, EngineError> {
@@ -2306,8 +2429,16 @@ fn replace_file_atomically(path: &Path, contents: &[u8]) -> Result<(), EngineErr
             use windows_sys::Win32::Storage::FileSystem::{
                 MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
             };
-            let source: Vec<u16> = temporary.as_os_str().encode_wide().chain(Some(0)).collect();
-            let destination: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            // Rust file I/O accepts long paths, while the direct Win32 call needs
+            // the extended absolute spelling. Keep the destination leaf unresolved
+            // so replacing a file and creating a new journal retain their semantics.
+            let absolute_temporary = fs::canonicalize(&temporary)
+                .map_err(|error| io_err("resolve temporary replacement file", error))?;
+            let absolute_destination = absolute_temporary.with_file_name(
+                path.file_name().expect("replacement destination has a file name"),
+            );
+            let source: Vec<u16> = absolute_temporary.as_os_str().encode_wide().chain(Some(0)).collect();
+            let destination: Vec<u16> = absolute_destination.as_os_str().encode_wide().chain(Some(0)).collect();
             let result = unsafe {
                 MoveFileExW(
                     source.as_ptr(),
@@ -2317,14 +2448,14 @@ fn replace_file_atomically(path: &Path, contents: &[u8]) -> Result<(), EngineErr
             };
             if result == 0 {
                 return Err(io_err(
-                    "atomically replace Codex MCP configuration",
+                    "atomically replace Codex runtime file",
                     io::Error::last_os_error(),
                 ));
             }
         }
         #[cfg(not(windows))]
         fs::rename(&temporary, path)
-            .map_err(|error| io_err("atomically replace Codex MCP configuration", error))?;
+            .map_err(|error| io_err("atomically replace Codex runtime file", error))?;
         Ok(())
     })();
     if write_result.is_err() {
@@ -2333,11 +2464,34 @@ fn replace_file_atomically(path: &Path, contents: &[u8]) -> Result<(), EngineErr
     write_result
 }
 
+fn patch_codex_cua_foreground_capture(install_root: &Path) -> Result<bool, EngineError> {
+    let path = install_root.join("resources").join(CODEX_CUA_CLIENT_BASE);
+    if !is_regular_non_reparse_file(&path)? {
+        return Ok(false);
+    }
+    let original = fs::read_to_string(&path)
+        .map_err(|error| io_err("read Codex CUA window client", error))?;
+    // Match only the known call shape; other SDK shapes remain unchanged.
+    for (call, replacement) in [
+        (CODEX_CUA_CAPTURE_CALL, CODEX_CUA_CAPTURE_REPLACEMENT),
+        (CODEX_CUA_CAPTURE_261111_CALL, CODEX_CUA_CAPTURE_261111_REPLACEMENT),
+    ] {
+        if original.matches(call).count() == 1 {
+            let updated = original.replacen(call, replacement, 1);
+            replace_file_atomically(&path, updated.as_bytes())?;
+            log::info!("portable CUA screenshot requests now activate the selected window before capture");
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn patch_codex_app_tools_mcp_config(
-    install_root: &Path,
+    config_root: &Path,
+    runtime_root: &Path,
     cua_node_subsystem: Option<u16>,
 ) -> Result<bool, EngineError> {
-    let path = install_root
+    let path = config_root
         .join("resources")
         .join(CODEX_APP_TOOLS_MCP_CONFIG);
     let metadata = match fs::symlink_metadata(&path) {
@@ -2364,7 +2518,7 @@ fn patch_codex_app_tools_mcp_config(
             "Codex App Tools MCP 配置超出安全大小上限".to_string(),
         ));
     }
-    ensure_plain_directory_tree(install_root, path.parent().expect("MCP config has parent"))?;
+    ensure_plain_directory_tree(config_root, path.parent().expect("MCP config has parent"))?;
     let original =
         fs::read(&path).map_err(|error| io_err("read Codex App Tools MCP configuration", error))?;
     let has_utf8_bom = original.starts_with(&[0xEF, 0xBB, 0xBF]);
@@ -2393,11 +2547,28 @@ fn patch_codex_app_tools_mcp_config(
     let args = server_object
         .get("args")
         .and_then(serde_json::Value::as_array);
-    let direct_args = CODEX_APP_TOOLS_MCP_DIRECT_ARGS
-        .iter()
-        .map(|value| serde_json::Value::String((*value).to_string()))
-        .collect::<Vec<_>>();
-    let is_direct = command.eq_ignore_ascii_case(CODEX_APP_TOOLS_MCP_NODE_COMMAND)
+
+    let node_path = config_root
+        .join("resources")
+        .join("cua_node")
+        .join("bin")
+        .join("node.exe");
+    let runtime_node_path = runtime_root
+        .join("resources")
+        .join("cua_node")
+        .join("bin")
+        .join("node.exe");
+    let server_path = runtime_root
+        .join("resources")
+        .join(CODEX_APP_TOOLS_MCP_CONFIG)
+        .parent()
+        .expect("Codex App Tools MCP configuration has a parent")
+        .join("server.mjs");
+    let direct_command = runtime_node_path.to_string_lossy().into_owned();
+    let direct_args = vec![serde_json::Value::String(
+        server_path.to_string_lossy().into_owned(),
+    )];
+    let is_direct = command.eq_ignore_ascii_case(&direct_command)
         && args.is_some_and(|args| args == &direct_args);
     let is_legacy = command.eq_ignore_ascii_case(CODEX_APP_TOOLS_MCP_OLD_COMMAND)
         && args.is_some_and(|args| {
@@ -2412,11 +2583,6 @@ fn patch_codex_app_tools_mcp_config(
         return Ok(false);
     }
 
-    let node_path = install_root
-        .join("resources")
-        .join("cua_node")
-        .join("bin")
-        .join("node.exe");
     if !is_regular_non_reparse_file(&node_path)? || cua_node_subsystem != Some(2) {
         return Err(EngineError::Install(
             "Codex App Tools MCP 隐藏控制台启动器未通过 PE 校验，拒绝保留会弹出控制台的启动方式"
@@ -2429,7 +2595,7 @@ fn patch_codex_app_tools_mcp_config(
 
     server_object.insert(
         "command".to_string(),
-        serde_json::Value::String(CODEX_APP_TOOLS_MCP_NODE_COMMAND.to_string()),
+        serde_json::Value::String(direct_command),
     );
     server_object.insert("args".to_string(), serde_json::Value::Array(direct_args));
     let mut serialized = serde_json::to_vec_pretty(&config).map_err(|error| {
@@ -2444,11 +2610,88 @@ fn patch_codex_app_tools_mcp_config(
     Ok(true)
 }
 
-/// Make an extracted Codex tree safe to launch without an MSIX package
-/// identity.  This is intentionally idempotent and best-effort for payloads
-/// that have already moved to a newer upstream bootstrap shape: the native
-/// window check below still rejects a fatal startup dialog instead of reporting
-/// a false success.
+/// Required USB consumers must have either a supported input or an applied
+/// patch. A window surviving startup cannot establish CUA/IAB compatibility.
+fn validate_required_usb_runtime_patches(
+    install_root: &Path,
+    require_applied: bool,
+) -> Result<(), EngineError> {
+    let version = read_codex_app_version_from_install_root(install_root)
+        .unwrap_or_else(|| "unknown".to_string());
+    let incompatible = |label: &str| EngineError::RuntimeCompatibility(format!(
+        "版本 {version} 的必要补丁未{}：{label}；未完成 USB 兼容适配，请使用兼容的管理器",
+        if require_applied { "生效" } else { "匹配" },
+    ));
+    let asar = install_root.join("resources/app.asar");
+    if !asar.is_file() {
+        return Err(incompatible("app.asar"));
+    }
+    let mut legacy = CODEX_ASAR_USB_IAB_VISIBILITY_PATCHES.to_vec();
+    legacy.extend([
+        (CODEX_ASAR_CUA_HELPER_RESOLVER_CALL, CODEX_ASAR_CUA_HELPER_RESOLVER_REPLACEMENT, "cua-helper-resolver"),
+        (CODEX_ASAR_CUA_NOTIFY_UNWRAP_CALL, CODEX_ASAR_CUA_NOTIFY_UNWRAP_REPLACEMENT, "cua-notify-unwrap"),
+    ]);
+    // Each row represents an existing consumer needed for the accepted USB
+    // behavior. Alternate old entries are migrations of already-patched files.
+    let groups: &[(&str, &[&str])] = &[
+        ("cua-helper-resolver", &["cua-helper-resolver"]),
+        ("cua-notify-unwrap", &["cua-notify-unwrap"]),
+        ("iab-command-await", &["iab-visibility-command-await"]),
+        ("iab-host-return", &["iab-visibility-host-return"]),
+        ("iab-rendered-state-waiter", &["iab-visibility-existing-waiter"]),
+        ("iab-delegate-rendered-state", &["iab-visibility-forward-wait-flag"]),
+        ("iab-delegate-rendered-state", &["iab-visibility-wait-for-state", "iab-visibility-confirm-rendered-state"]),
+        ("iab-delegate-rendered-state", &["iab-visibility-explicit-panel-selection", "iab-visibility-show-owner-window"]),
+        ("iab-explicit-route-selection", &["iab-visibility-explicit-route-selection"]),
+    ];
+    for (label, old_labels) in groups {
+        let mut candidates: Vec<_> = legacy.iter().filter(|(_, _, name)| old_labels.contains(name)).collect();
+        let newer = runtime_261111::PATCHES.iter().filter(|(_, _, name)| name == label);
+        if version == "26.1111.21308" {
+            candidates.splice(0..0, newer);
+        } else {
+            candidates.extend(newer);
+        }
+        let mut found = false;
+        for (call, replacement, _) in candidates {
+            if (!require_applied && find_bytes_in_file(&asar, call).map_err(|e| io_err("read USB runtime patch input", e))?.is_some())
+                || find_bytes_in_file(&asar, replacement).map_err(|e| io_err("read USB runtime patch result", e))?.is_some()
+            {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return Err(incompatible(label));
+        }
+    }
+    if version == "26.1111.21308" {
+        for required in ["bootstrap-appdata", "onboarding-default-detail-mode"] {
+            let (before, after, label) = runtime_261111::PATCHES.iter()
+                .find(|(_, _, label)| *label == required).expect("known version-specific patch");
+            let applied = find_bytes_in_file(&asar, after).map_err(|e| io_err("read USB runtime patch", e))?.is_some();
+            let original = !require_applied && find_bytes_in_file(&asar, before).map_err(|e| io_err("read USB runtime input", e))?.is_some();
+            if !applied && !original { return Err(incompatible(label)); }
+        }
+    }
+    let client = install_root.join("resources").join(CODEX_CUA_CLIENT_BASE);
+    if !client.is_file() {
+        return Err(incompatible("CUA window client"));
+    }
+    let client = fs::read_to_string(client).map_err(|e| io_err("read USB CUA capture patch", e))?;
+    let supported = [
+        (CODEX_CUA_CAPTURE_CALL, CODEX_CUA_CAPTURE_REPLACEMENT),
+        (CODEX_CUA_CAPTURE_261111_CALL, CODEX_CUA_CAPTURE_261111_REPLACEMENT),
+    ].iter().any(|(before, after)| client.matches(after).count() == 1
+        || (!require_applied && client.matches(before).count() == 1));
+    if !supported {
+        return Err(incompatible("CUA screenshot activation"));
+    }
+    Ok(())
+}
+
+/// Apply portable startup compatibility. USB callers additionally require the
+/// accepted CUA/IAB shapes; ordinary portable callers retain best-effort edits.
 pub fn ensure_portable_codex_startup_compatibility(
     install_root: &Path,
 ) -> Result<bool, EngineError> {
@@ -2459,7 +2702,29 @@ pub(crate) fn ensure_portable_codex_startup_compatibility_with_usb_integrity_mod
     install_root: &Path,
     usb_integrity_transaction: bool,
 ) -> Result<bool, EngineError> {
-    let patched = ensure_portable_codex_startup_compatibility_inner(install_root)?;
+    ensure_portable_codex_startup_compatibility_with_runtime_root(
+        install_root,
+        install_root,
+        usb_integrity_transaction,
+    )
+}
+
+fn ensure_portable_codex_startup_compatibility_with_runtime_root(
+    install_root: &Path,
+    runtime_root: &Path,
+    usb_integrity_transaction: bool,
+) -> Result<bool, EngineError> {
+    if usb_integrity_transaction {
+        validate_required_usb_runtime_patches(install_root, false)?;
+    }
+    let patched = ensure_portable_codex_startup_compatibility_inner(
+        install_root,
+        runtime_root,
+        usb_integrity_transaction,
+    )?;
+    if usb_integrity_transaction {
+        validate_required_usb_runtime_patches(install_root, true)?;
+    }
     let integrity_patched =
         refresh_embedded_asar_integrity(install_root, usb_integrity_transaction)?;
     Ok(patched || integrity_patched)
@@ -2467,12 +2732,17 @@ pub(crate) fn ensure_portable_codex_startup_compatibility_with_usb_integrity_mod
 
 fn ensure_portable_codex_startup_compatibility_inner(
     install_root: &Path,
+    runtime_root: &Path,
+    usb_integrity_transaction: bool,
 ) -> Result<bool, EngineError> {
     // The executable edit complements the ASAR `windowsHide` patch.  Both
     // run before the first portable launch and remain safe to repeat after an
     // in-place update or a manager restart.
     let (mut patched, cua_node_subsystem) = patch_console_subsystem_executables(install_root)?;
-    patched |= patch_codex_app_tools_mcp_config(install_root, cua_node_subsystem)?;
+    patched |= patch_codex_app_tools_mcp_config(install_root, runtime_root, cua_node_subsystem)?;
+    if usb_integrity_transaction {
+        patched |= patch_codex_cua_foreground_capture(install_root)?;
+    }
     let app_asar = install_root.join("resources").join("app.asar");
     if !app_asar.is_file() {
         return Ok(patched);
@@ -2482,6 +2752,99 @@ fn ensure_portable_codex_startup_compatibility_inner(
     // newer Codex builds can change or remove the updater bootstrap while the
     // app-server spawn remains the source of a visible console window.
     patched |= patch_codex_console_spawn(&app_asar)?;
+    patched |= patch_all_fixed_width_calls(
+        &app_asar,
+        CODEX_ASAR_CUA_HELPER_RESOLVER_CALL,
+        CODEX_ASAR_CUA_HELPER_RESOLVER_REPLACEMENT,
+        "native-pipe-cua-helper-resolver",
+    )? > 0;
+    patched |= patch_all_fixed_width_calls(
+        &app_asar,
+        CODEX_ASAR_CUA_NOTIFY_UNWRAP_CALL,
+        CODEX_ASAR_CUA_NOTIFY_UNWRAP_REPLACEMENT,
+        "native-pipe-cua-notify-unwrap",
+    )? > 0;
+    patched |= patch_all_fixed_width_calls(
+        &app_asar,
+        CODEX_ASAR_FEATURE_STATE_PUBLISH_GUARD_CALL,
+        CODEX_ASAR_FEATURE_STATE_PUBLISH_GUARD_REPLACEMENT,
+        "feature-state-publish-browser-gate",
+    )? > 0;
+    if usb_integrity_transaction {
+        for (call, replacement, label) in runtime_261111::PATCHES {
+            patched |= patch_all_fixed_width_calls(&app_asar, call, replacement, label)? > 0;
+        }
+        for (call, replacement, label) in CODEX_ASAR_USB_IAB_VISIBILITY_PATCHES {
+            patched |= patch_all_fixed_width_calls(&app_asar, call, replacement, label)? > 0;
+        }
+        patched |= patch_all_fixed_width_calls(
+            &app_asar,
+            CODEX_ASAR_USB_UI_MCP_DISCOVERY_CALL,
+            CODEX_ASAR_USB_UI_MCP_DISCOVERY_REPLACEMENT,
+            "usb-ui-mcp-discovery-await-reconcile",
+        )? > 0;
+        patched |= patch_all_fixed_width_calls(
+            &app_asar,
+            CODEX_ASAR_USB_MCP_DISCOVERY_SYNC_CALL,
+            CODEX_ASAR_USB_MCP_DISCOVERY_SYNC_REPLACEMENT,
+            "usb-mcp-discovery-await-reconcile",
+        )? > 0;
+        patched |= patch_all_fixed_width_calls(
+            &app_asar,
+            CODEX_ASAR_USB_DURABLE_LOGIN_CLASSIFY_CALL,
+            CODEX_ASAR_USB_DURABLE_LOGIN_CLASSIFY_REPLACEMENT,
+            "usb-durable-login-error-classification",
+        )? > 0;
+        patched |= patch_all_fixed_width_calls(
+            &app_asar,
+            CODEX_ASAR_USB_DURABLE_LOGIN_RECONNECT_CALL,
+            CODEX_ASAR_USB_DURABLE_LOGIN_RECONNECT_REPLACEMENT,
+            "usb-durable-login-reconnect-pause",
+        )? > 0;
+        patched |= patch_all_fixed_width_calls(
+            &app_asar,
+            CODEX_ASAR_USB_GATE_DIAGNOSTIC_LOG_CALL,
+            CODEX_ASAR_USB_GATE_DIAGNOSTIC_LOG_REPLACEMENT,
+            "usb-gate-source-v1",
+        )? > 0;
+        patched |= patch_all_fixed_width_calls(
+            &app_asar,
+            CODEX_ASAR_USB_INIT_DIAGNOSTIC_MARKERS_V2_HOOK,
+            CODEX_ASAR_USB_INIT_DIAGNOSTIC_MARKERS_V3_HOOK,
+            "usb-sdk-stage-scope-repair-v3",
+        )? > 0;
+        patched |= patch_all_fixed_width_calls(
+            &app_asar,
+            CODEX_ASAR_USB_INIT_DIAGNOSTIC_WRITER_V2,
+            CODEX_ASAR_USB_INIT_DIAGNOSTIC_WRITER_REPLACEMENT,
+            "usb-sdk-stage-writer-repair-v3",
+        )? > 0;
+        patched |= patch_all_fixed_width_calls(
+            &app_asar,
+            CODEX_ASAR_USB_INIT_DIAGNOSTIC_MARKERS_CALL,
+            CODEX_ASAR_USB_INIT_DIAGNOSTIC_MARKERS_REPLACEMENT,
+            "usb-sdk-stage-markers-v3",
+        )? > 0;
+        patched |= patch_all_fixed_width_calls(
+            &app_asar,
+            CODEX_ASAR_USB_INIT_DIAGNOSTIC_WRITER_CALL,
+            CODEX_ASAR_USB_INIT_DIAGNOSTIC_WRITER_REPLACEMENT,
+            "usb-sdk-stage-writer-v3",
+        )? > 0;
+        patched |= patch_all_fixed_width_calls(
+            &app_asar,
+            CODEX_ASAR_USB_EMPTY_INIT_REFRESH_CALL,
+            CODEX_ASAR_USB_EMPTY_INIT_REFRESH_REPLACEMENT,
+            "usb-sdk-empty-initial-values-refresh-v1",
+        )? > 0;
+        patched |= patch_all_fixed_width_calls(
+            &app_asar,
+            CODEX_ASAR_WORK_ROUTE_MODE_CALL,
+            CODEX_ASAR_WORK_ROUTE_MODE_REPLACEMENT,
+            "usb-404token-work-route-mode",
+        )? > 0;
+    }
+    patched |= patch_usb_onboarding_detail_mode(&app_asar, usb_integrity_transaction)?;
 
     // Only touch a Codex archive that actually contains the package-identity
     // updater.  This keeps the patch scoped to the known failure mechanism.
@@ -3029,6 +3392,28 @@ fn copy_dir_all(from: &Path, to: &Path) -> Result<(), EngineError> {
     Ok(())
 }
 
+fn restore_encoded_node_modules_path(path: &Path) -> PathBuf {
+    let mut restored = PathBuf::new();
+    let mut in_node_modules = false;
+    for component in path.components() {
+        let value = component.as_os_str().to_string_lossy();
+        if value.eq_ignore_ascii_case("node_modules") {
+            in_node_modules = true;
+            restored.push(value.as_ref());
+        } else if in_node_modules {
+            restored.push(
+                value
+                    .replace("%40", "@")
+                    .replace("%24", "$")
+                    .replace("%2B", "+"),
+            );
+        } else {
+            restored.push(value.as_ref());
+        }
+    }
+    restored
+}
+
 fn extract_msix(msix_path: &Path, dest: &Path) -> Result<String, EngineError> {
     let file = fs::File::open(msix_path).map_err(|e| io_err("open MSIX", e))?;
     let mut zip =
@@ -3513,6 +3898,7 @@ fn install_usb_entry_overlay(
 fn prepare_portable_payload(
     msix_path: &Path,
     work_dir: &Path,
+    runtime_root: &Path,
     usb_entry_shim: Option<&Path>,
     progress: Option<&PortableExtractionProgressObserver<'_>>,
 ) -> Result<PreparedPortable, EngineError> {
@@ -3548,12 +3934,14 @@ fn prepare_portable_payload(
     drop(manifest_entry);
 
     let identity = parse_appx_manifest_xml(&manifest_xml)?;
+    let mut selected_bytes = 0u64;
+    let mut extracted_files = 0usize;
+    let mut extracted_bytes = 0u64;
     if let Some(declared) = crate::msix::parse_appx_application_executable(&manifest_xml) {
         let declared_relative: PathBuf = declared.replace('\\', "/").split('/').collect();
         let app_prefix = declared_relative.parent().unwrap_or_else(|| Path::new(""));
 
         let mut selected_entries = 0usize;
-        let mut selected_bytes = 0u64;
         for idx in 0..package.len() {
             let entry = package
                 .by_index(idx)
@@ -3579,14 +3967,13 @@ fn prepare_portable_payload(
 
         if let Some(observer) = progress {
             observer(PortableExtractionProgress {
+                stage: PortableInstallStage::Extracting,
                 completed_bytes: 0,
                 total_bytes: selected_bytes,
                 files_completed: 0,
             })?;
         }
 
-        let mut extracted_files = 0usize;
-        let mut extracted_bytes = 0u64;
         let mut last_logged_bytes = 0u64;
         let mut last_logged_files = 0usize;
         let mut last_reported_bytes = 0u64;
@@ -3609,6 +3996,7 @@ fn prepare_portable_payload(
             let relative = enclosed.strip_prefix(app_prefix).map_err(|_| {
                 EngineError::Msix("MSIX app entry path was not under its app directory".to_string())
             })?;
+            let relative = restore_encoded_node_modules_path(relative);
             let output = payload.join(relative);
             if entry.is_dir() {
                 fs::create_dir_all(&output).map_err(|e| io_err("create extracted dir", e))?;
@@ -3641,6 +4029,7 @@ fn prepare_portable_payload(
                         || last_reported_at.elapsed() >= EXTRACTION_PROGRESS_INTERVAL
                     {
                         observer(PortableExtractionProgress {
+                            stage: PortableInstallStage::Extracting,
                             completed_bytes: extracted_bytes,
                             total_bytes: selected_bytes,
                             files_completed: extracted_files as u64,
@@ -3671,6 +4060,7 @@ fn prepare_portable_payload(
             extracted_files += 1;
             if let Some(observer) = progress {
                 observer(PortableExtractionProgress {
+                    stage: PortableInstallStage::Extracting,
                     completed_bytes: extracted_bytes,
                     total_bytes: selected_bytes,
                     files_completed: extracted_files as u64,
@@ -3699,6 +4089,7 @@ fn prepare_portable_payload(
         }
         if let Some(observer) = progress {
             observer(PortableExtractionProgress {
+                stage: PortableInstallStage::Extracting,
                 completed_bytes: extracted_bytes,
                 total_bytes: selected_bytes,
                 files_completed: extracted_files as u64,
@@ -3736,19 +4127,32 @@ fn prepare_portable_payload(
         install_usb_entry_overlay(&payload, &manifest_xml, shim_path)?;
     }
 
+    if let Some(observer) = progress {
+        observer(PortableExtractionProgress {
+            stage: PortableInstallStage::StartupCompatibility,
+            completed_bytes: extracted_bytes,
+            total_bytes: selected_bytes,
+            files_completed: extracted_files as u64,
+        })?;
+    }
+
     // Apply the unpackaged-launch compatibility fix before the transactional
     // payload is moved into place.  The operation is idempotent and is also
     // repeated lazily at launch so an already-installed tree upgraded by an
     // older manager is repaired without requiring a second reinstall.
-    if let Err(error) = ensure_portable_codex_startup_compatibility_with_usb_integrity_mode(
+    if let Err(error) = ensure_portable_codex_startup_compatibility_with_runtime_root(
         &payload,
+        runtime_root,
         usb_entry_shim.is_some(),
     ) {
-        // Windows Defender/indexers can briefly hold a freshly extracted
-        // 200–300 MB ASAR.  Do not roll back an otherwise verified install for
-        // that transient lock; launch performs the same bounded repair before
-        // it starts the app and will surface a precise error if it remains
-        // impossible to patch.
+        // A USB install must not commit until its required runtime patches and
+        // existing integrity update have completed. Retry can reuse the old
+        // installation; a later launch is not evidence of successful setup.
+        if usb_entry_shim.is_some() {
+            return Err(error);
+        }
+        // Preserve the ordinary (non-USB) portable behavior for a transient
+        // indexer/Defender lock. Its launch retries startup compatibility.
         log::warn!(
             "portable Codex startup compatibility patch deferred path={} error={error}",
             payload.display()
@@ -3761,7 +4165,7 @@ fn prepare_portable_payload(
     })
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn ps_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
@@ -3934,7 +4338,7 @@ fn register_uninstall_entry(
     Ok(false)
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn portable_metadata_ownership_script() -> &'static str {
     r#"
 $ErrorActionPreference = 'Stop'
@@ -4025,6 +4429,80 @@ function Test-PortableShortcutOwned($shortcutPath, $entry, $record) {
   return $false
 }
 "#
+}
+
+// Deliberately stricter than uninstall ownership: a user-created shortcut into
+// a managed tree is not permission to redirect it to a different USB bundle.
+#[cfg(any(windows, test))]
+fn usb_shortcut_repair_policy_script() -> &'static str {
+    r#"
+function Test-OwnedUsbShortcutForRepair($shortcutPath, $link, $record) {
+  if (-not [string]::IsNullOrWhiteSpace([string]$link.Arguments)) { return $false }
+  $target = Normalize-PortablePath ([string]$link.TargetPath)
+  if (-not $target -or $target -notmatch '\\apps\\Codex\\(CodexCore\.dat|ChatGPT\.exe|Codex\.exe)$') { return $false }
+  if ([string]$link.Description -eq 'codex-app-manager:managed-portable') { return $true }
+  if (-not $record) { return $false }
+  $path = Normalize-PortablePath $shortcutPath
+  $recordedPath = @($record.shortcutPaths | Where-Object { (Normalize-PortablePath ([string]$_)) -ieq $path }).Count -gt 0
+  if (-not $recordedPath) { return $false }
+  return @($record.installRoots | Where-Object { Test-PortablePathUnderRoot $target ([string]$_) }).Count -gt 0
+}
+"#
+}
+
+#[cfg(any(windows, test))]
+fn repair_owned_usb_shortcuts_script(install_root: &Path, shim: &Path) -> String {
+    format!(
+        r#"{ownership}
+{policy}
+$record = Get-PortableShellOwnership
+$repaired = $false
+foreach ($shortcutPath in @(Get-PortableShortcutCandidates)) {{
+  if (-not (Test-Path -LiteralPath $shortcutPath -PathType Leaf)) {{ continue }}
+  $link = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcutPath)
+  if (-not (Test-OwnedUsbShortcutForRepair $shortcutPath $link $record)) {{ continue }}
+  $target = Normalize-PortablePath ([string]$link.TargetPath)
+  # Keep live entries for other bundles. Also repair this bundle's old direct
+  # Core.dat link, which bypasses the entry shim even though its file exists.
+  if ((Test-Path -LiteralPath $target -PathType Leaf) -and $target -ine {core}) {{ continue }}
+  $link.TargetPath = {shim}
+  $link.WorkingDirectory = {workdir}
+  $link.IconLocation = {shim}
+  $link.Description = 'codex-app-manager:managed-portable'
+  $link.Save()
+  $repaired = $true
+}}
+if ($repaired) {{ 'repaired' }} else {{ 'unchanged' }}
+"#,
+        ownership = portable_metadata_ownership_script(),
+        policy = usb_shortcut_repair_policy_script(),
+        core = ps_quote(&install_root.join(USB_ENTRY_ORIGINAL_EXE).to_string_lossy()),
+        shim = ps_quote(&shim.to_string_lossy()),
+        workdir = ps_quote(&install_root.to_string_lossy()),
+    )
+}
+
+/// Repair existing, positively owned USB shortcuts after bundle authorization.
+/// Unknown provenance is intentionally left untouched; never create or delete
+/// a shell entry, and never point one at the manager-only Core.dat payload.
+#[cfg(all(windows, not(test)))]
+pub fn repair_owned_usb_shortcuts(install_root: &Path) -> Result<bool, EngineError> {
+    // This validates the existing overlay, including the bundle's trusted shim.
+    // Its return value is the private payload, NOT the shortcut destination.
+    installed_usb_codex_launch_exe(install_root)?;
+    let shim = installed_app_exe(install_root)
+        .ok_or_else(|| EngineError::Msix("USB shim entry is missing".to_string()))?;
+    let output = run_powershell(&repair_owned_usb_shortcuts_script(install_root, &shim))?;
+    let repaired = output.trim() == "repaired";
+    if repaired {
+        refresh_portable_shell_directories();
+    }
+    Ok(repaired)
+}
+
+#[cfg(any(not(windows), test))]
+pub fn repair_owned_usb_shortcuts(_install_root: &Path) -> Result<bool, EngineError> {
+    Ok(false)
 }
 
 #[cfg(windows)]
@@ -4441,6 +4919,13 @@ pub fn install_portable_from_msix(
 /// with the real staging/backup locations chosen by this install.
 #[derive(Debug, Clone)]
 pub enum PortableBoundary {
+    /// Persist ownership before extraction can leave a partial work directory.
+    BeforePrepare {
+        install_root: PathBuf,
+        payload: PathBuf,
+        backup: PathBuf,
+        had_previous: bool,
+    },
     /// About to move the current install aside. `payload` is the staged new tree;
     /// `backup` is where the old install will go (if any).
     BeforeMoveOld {
@@ -4577,6 +5062,14 @@ pub fn install_portable_from_msix_with_observer_options_and_progress(
     let work_dir = install_parent
         .join(".codex-app-manager-staging")
         .join(format!("portable-{operation_id}"));
+    let backup = install_parent.join(format!("Codex.rollback-{operation_id}"));
+    let had_previous = install_root.exists();
+    observer(PortableBoundary::BeforePrepare {
+        install_root: install_root.to_path_buf(),
+        payload: work_dir.join("payload"),
+        backup: backup.clone(),
+        had_previous,
+    })?;
     if work_dir.exists() {
         fs::remove_dir_all(&work_dir).map_err(|e| io_err("clear portable staging", e))?;
     }
@@ -4585,6 +5078,7 @@ pub fn install_portable_from_msix_with_observer_options_and_progress(
     let prepared = match prepare_portable_payload(
         msix_path,
         &work_dir,
+        install_root,
         options.usb_entry_shim.as_deref(),
         progress,
     ) {
@@ -4599,7 +5093,6 @@ pub fn install_portable_from_msix_with_observer_options_and_progress(
         }
     };
     let payload = prepared.payload_dir;
-    let backup = install_parent.join(format!("Codex.rollback-{operation_id}"));
     let mut notes = Vec::new();
 
     if options.close_running {
@@ -4607,7 +5100,6 @@ pub fn install_portable_from_msix_with_observer_options_and_progress(
     }
 
     let fault = take_portable_fault();
-    let had_previous = install_root.exists();
 
     if let Err(error) = observer(PortableBoundary::BeforeMoveOld {
         install_root: install_root.to_path_buf(),
@@ -5218,6 +5710,35 @@ mod tests {
         archive
     }
 
+    fn fake_asar_archive_with_named_member(member_path: &str, member: &[u8]) -> Vec<u8> {
+        let block_size = member.len().max(1);
+        let mut entry = serde_json::json!({
+            "size": member.len(),
+            "offset": "0",
+            "integrity": {
+                "algorithm": "SHA256",
+                "hash": sha256_hex(member),
+                "blockSize": block_size,
+                "blocks": member.chunks(block_size).map(sha256_hex).collect::<Vec<_>>(),
+            }
+        });
+        for part in member_path.split('/').rev() {
+            entry = serde_json::json!({ "files": { (part): entry } });
+        }
+        let json = serde_json::to_vec(&entry).unwrap();
+        let padded_json_len = (json.len() + 3) & !3;
+        let header_size = 8 + padded_json_len;
+        let mut archive = Vec::with_capacity(8 + header_size + member.len());
+        archive.extend_from_slice(&4u32.to_le_bytes());
+        archive.extend_from_slice(&(header_size as u32).to_le_bytes());
+        archive.extend_from_slice(&((header_size - 4) as u32).to_le_bytes());
+        archive.extend_from_slice(&(json.len() as u32).to_le_bytes());
+        archive.extend_from_slice(&json);
+        archive.resize(16 + padded_json_len, 0);
+        archive.extend_from_slice(member);
+        archive
+    }
+
     struct UsbIntegrityFixture {
         bundle_root: PathBuf,
         install_root: PathBuf,
@@ -5398,6 +5919,7 @@ mod tests {
         );
         fs::remove_dir_all(root).unwrap();
     }
+
 
     #[test]
     fn asar_integrity_refresh_skips_write_when_metadata_is_already_current() {
@@ -6072,7 +6594,7 @@ mod tests {
         let root = temp_test_dir("codex-app-tools-mcp");
         let resources = root.join("resources");
         let plugin_dir = resources.join("plugins/openai-bundled/plugins/codex-app-tools");
-        let node_path = resources.join("cua_node/bin/node.exe");
+        let node_path = resources.join("cua_node").join("bin").join("node.exe");
         fs::create_dir_all(&plugin_dir).unwrap();
         fs::create_dir_all(node_path.parent().unwrap()).unwrap();
         fs::write(&node_path, fake_pe_image(3)).unwrap();
@@ -6099,29 +6621,503 @@ mod tests {
             patch_console_subsystem_executables(&root).unwrap();
         assert!(sidecars_patched);
         assert_eq!(node_subsystem, Some(2));
-        assert!(patch_codex_app_tools_mcp_config(&root, node_subsystem).unwrap());
+        assert!(patch_codex_app_tools_mcp_config(&root, &root, node_subsystem).unwrap());
 
         let patched: serde_json::Value =
             serde_json::from_slice(&fs::read(plugin_dir.join(".mcp.json")).unwrap()).unwrap();
         let server = &patched["mcpServers"]["codex_app"];
         assert_eq!(
             server["command"],
-            serde_json::Value::String(CODEX_APP_TOOLS_MCP_NODE_COMMAND.to_string())
+            serde_json::Value::String(node_path.to_string_lossy().into_owned())
         );
-        assert_eq!(server["args"], serde_json::json!(["./server.mjs"]));
+        assert_eq!(
+            server["args"],
+            serde_json::json!([plugin_dir.join("server.mjs").to_string_lossy().into_owned()])
+        );
         assert_eq!(server["cwd"], ".");
         assert_eq!(server["enabled"], false);
         assert_eq!(server["env_vars"]["EXAMPLE"], "preserved");
         assert_eq!(server["approval_policy"], "user");
         assert_eq!(patched["pluginMetadata"]["keep"], true);
 
-        let resolved_node = plugin_dir.join(CODEX_APP_TOOLS_MCP_NODE_COMMAND);
-        assert_eq!(
-            fs::canonicalize(resolved_node).unwrap(),
-            fs::canonicalize(node_path).unwrap()
-        );
-        assert!(!patch_codex_app_tools_mcp_config(&root, Some(2)).unwrap());
+        assert!(!patch_codex_app_tools_mcp_config(&root, &root, Some(2)).unwrap());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn portable_node_modules_path_restores_reported_encoded_components() {
+        let input = Path::new(
+            "cua_node/bin/node_modules/%40oai/%24package/prebuilds/win32-x64%2Barm64/file.node",
+        );
+        assert_eq!(
+            restore_encoded_node_modules_path(input),
+            Path::new(
+                "cua_node/bin/node_modules/@oai/$package/prebuilds/win32-x64+arm64/file.node"
+            )
+        );
+        assert_eq!(
+            restore_encoded_node_modules_path(Path::new("assets/%40name/file.txt")),
+            Path::new("assets/%40name/file.txt")
+        );
+    }
+
+    #[test]
+    fn feature_publish_guard_replacement_keeps_width_and_other_gates() {
+        let replacement = fixed_width_patch_bytes(
+            CODEX_ASAR_FEATURE_STATE_PUBLISH_GUARD_CALL,
+            CODEX_ASAR_FEATURE_STATE_PUBLISH_GUARD_REPLACEMENT,
+        );
+        assert_eq!(
+            replacement.len(),
+            CODEX_ASAR_FEATURE_STATE_PUBLISH_GUARD_CALL.len()
+        );
+        assert!(replacement.starts_with(CODEX_ASAR_FEATURE_STATE_PUBLISH_GUARD_REPLACEMENT));
+        assert!(
+            replacement[CODEX_ASAR_FEATURE_STATE_PUBLISH_GUARD_REPLACEMENT.len()..]
+                .iter()
+                .all(|byte| *byte == b' ')
+        );
+        assert!(!CODEX_ASAR_FEATURE_STATE_PUBLISH_GUARD_REPLACEMENT
+            .windows(b"statsig-disabled".len())
+            .any(|window| window == b"statsig-disabled"));
+        assert!(CODEX_ASAR_FEATURE_STATE_PUBLISH_GUARD_REPLACEMENT
+            .windows(b"ye.isLoading".len())
+            .any(|window| window == b"ye.isLoading"));
+        assert!(CODEX_ASAR_FEATURE_STATE_PUBLISH_GUARD_REPLACEMENT
+            .windows(b"Ye.status===`loading`".len())
+            .any(|window| window == b"Ye.status===`loading`"));
+    }
+
+    #[test]
+    fn usb_gate_and_init_diagnostics_are_usb_scoped_and_idempotent() {
+        let root = temp_test_dir("usb-gate-and-init-diagnostics");
+        fs::create_dir_all(root.join("resources")).unwrap();
+        let app_asar = root.join("resources").join("app.asar");
+        let mut fixture = b"prefix:".to_vec();
+        let mut expected = fixture.clone();
+        for (call, replacement) in [
+            (
+                CODEX_ASAR_USB_GATE_DIAGNOSTIC_LOG_CALL,
+                CODEX_ASAR_USB_GATE_DIAGNOSTIC_LOG_REPLACEMENT,
+            ),
+            (
+                CODEX_ASAR_USB_INIT_DIAGNOSTIC_MARKERS_CALL,
+                CODEX_ASAR_USB_INIT_DIAGNOSTIC_MARKERS_REPLACEMENT,
+            ),
+            (
+                CODEX_ASAR_USB_INIT_DIAGNOSTIC_WRITER_CALL,
+                CODEX_ASAR_USB_INIT_DIAGNOSTIC_WRITER_REPLACEMENT,
+            ),
+        ] {
+            assert!(replacement.len() <= call.len());
+            fixture.extend_from_slice(call);
+            fixture.extend_from_slice(b":suffix:");
+            expected.extend_from_slice(&fixed_width_patch_bytes(call, replacement));
+            expected.extend_from_slice(b":suffix:");
+        }
+        fs::write(&app_asar, &fixture).unwrap();
+
+        assert!(!ensure_portable_codex_startup_compatibility_inner(&root, &root, false).unwrap());
+        assert_eq!(fs::read(&app_asar).unwrap(), fixture);
+        assert!(ensure_portable_codex_startup_compatibility_inner(&root, &root, true).unwrap());
+        assert_eq!(expected.len(), fixture.len());
+        assert_eq!(fs::read(&app_asar).unwrap(), expected);
+        assert!(!ensure_portable_codex_startup_compatibility_inner(&root, &root, true).unwrap());
+        assert_eq!(fs::read(&app_asar).unwrap(), expected);
+    }
+
+    #[test]
+    fn usb_init_v2_scope_repair_is_usb_scoped_and_idempotent() {
+        let root = temp_test_dir("usb-init-v2-scope-repair");
+        fs::create_dir_all(root.join("resources")).unwrap();
+        let app_asar = root.join("resources").join("app.asar");
+        let collector = b"r.push(t),n.set(e,r),e===n1l&&globalThis.__usbDiag?.([t.action,t.step,t.syncType,t.timestamp,t.statusCode,t.success],t.error)}}";
+        let mut fixture = b"main:".to_vec();
+        fixture.extend_from_slice(collector);
+        fixture.extend_from_slice(b":renderer:");
+        fixture.extend_from_slice(collector);
+        fixture.extend_from_slice(b":writer:");
+        fixture.extend_from_slice(CODEX_ASAR_USB_INIT_DIAGNOSTIC_WRITER_V2);
+        fs::write(&app_asar, &fixture).unwrap();
+
+        assert!(!ensure_portable_codex_startup_compatibility_inner(&root, &root, false).unwrap());
+        assert_eq!(fs::read(&app_asar).unwrap(), fixture);
+        assert!(ensure_portable_codex_startup_compatibility_inner(&root, &root, true).unwrap());
+        let repaired = fs::read(&app_asar).unwrap();
+        assert_eq!(repaired.len(), fixture.len());
+        assert!(!repaired.windows(b"e===n1l".len()).any(|part| part == b"e===n1l"));
+        assert_eq!(repaired.windows(CODEX_ASAR_USB_INIT_DIAGNOSTIC_MARKERS_V3_HOOK.len())
+            .filter(|part| *part == CODEX_ASAR_USB_INIT_DIAGNOSTIC_MARKERS_V3_HOOK).count(), 2);
+        assert!(repaired.windows(CODEX_ASAR_USB_INIT_DIAGNOSTIC_WRITER_REPLACEMENT.len())
+            .any(|part| part == CODEX_ASAR_USB_INIT_DIAGNOSTIC_WRITER_REPLACEMENT));
+        assert!(!ensure_portable_codex_startup_compatibility_inner(&root, &root, true).unwrap());
+        assert_eq!(fs::read(&app_asar).unwrap(), repaired);
+    }
+
+    #[test]
+    fn usb_empty_initial_values_refresh_patch_is_scoped_and_idempotent() {
+        let root = temp_test_dir("usb-empty-initial-values-refresh");
+        fs::create_dir_all(root.join("resources")).unwrap();
+        let app_asar = root.join("resources").join("app.asar");
+        let mut fixture = b"main:".to_vec();
+        fixture.extend_from_slice(CODEX_ASAR_USB_EMPTY_INIT_REFRESH_CALL);
+        fixture.extend_from_slice(b":renderer:");
+        fixture.extend_from_slice(CODEX_ASAR_USB_EMPTY_INIT_REFRESH_CALL);
+        fs::write(&app_asar, &fixture).unwrap();
+
+        assert!(!ensure_portable_codex_startup_compatibility_inner(&root, &root, false).unwrap());
+        assert_eq!(fs::read(&app_asar).unwrap(), fixture);
+        assert!(ensure_portable_codex_startup_compatibility_inner(&root, &root, true).unwrap());
+        let patched = fs::read(&app_asar).unwrap();
+        assert_eq!(patched.len(), fixture.len());
+        assert_eq!(
+            patched
+                .windows(CODEX_ASAR_USB_EMPTY_INIT_REFRESH_REPLACEMENT.len())
+                .filter(|part| *part == CODEX_ASAR_USB_EMPTY_INIT_REFRESH_REPLACEMENT)
+                .count(),
+            2
+        );
+        assert!(!ensure_portable_codex_startup_compatibility_inner(&root, &root, true).unwrap());
+        assert_eq!(fs::read(&app_asar).unwrap(), patched);
+    }
+
+    #[test]
+    fn usb_404token_work_route_patch_is_fixed_width_and_scoped_to_explicit_commands() {
+        let replacement = fixed_width_patch_bytes(
+            CODEX_ASAR_WORK_ROUTE_MODE_CALL,
+            CODEX_ASAR_WORK_ROUTE_MODE_REPLACEMENT,
+        );
+        assert_eq!(
+            replacement.len(),
+            CODEX_ASAR_WORK_ROUTE_MODE_CALL.len()
+        );
+        assert!(replacement.starts_with(CODEX_ASAR_WORK_ROUTE_MODE_REPLACEMENT));
+        assert!(replacement[CODEX_ASAR_WORK_ROUTE_MODE_REPLACEMENT.len()..]
+            .iter()
+            .all(|byte| *byte == b' '));
+        for required in [
+            &b"xh({hostId:Do,cwd:null,failClosed:!0})"[..],
+            &b"Xm(c)"[..],
+            &b"https://404token.xyz/v1"[..],
+            &b"URL.parse(b)?.href.replace(/\\/+$/,'')"[..],
+            &b"conversationDetailMode===`STEPS_COMMANDS`"[..],
+            &b"p?.model_providers?.[p.model_provider]?.base_url"[..],
+            &b"n?r!==`work`&&dy(e,`work`):v||KJt(e,`work`)"[..],
+            &b"r!==`work`&&dy(e,`work`)"[..],
+            &b"KJt(e,`work`)"[..],
+            &b"s===`allowed`&&u.isLoading"[..],
+        ] {
+            assert!(CODEX_ASAR_WORK_ROUTE_MODE_REPLACEMENT
+                .windows(required.len())
+                .any(|window| window == required));
+        }
+    }
+
+    #[test]
+    fn usb_onboarding_detail_mode_patch_is_fixed_width_and_usb_scoped() {
+        assert_eq!(
+            CODEX_ASAR_ONBOARDING_DETAIL_MODE_CALL.len(),
+            CODEX_ASAR_ONBOARDING_DETAIL_MODE_REPLACEMENT.len()
+        );
+        assert!(CODEX_ASAR_ONBOARDING_DETAIL_MODE_CALL
+            .windows(b"threadDetailLevel:ii".len())
+            .any(|window| window == b"threadDetailLevel:ii"));
+        assert!(CODEX_ASAR_ONBOARDING_DETAIL_MODE_REPLACEMENT
+            .windows(b"threadDetailLevel:ii".len())
+            .all(|window| window != b"threadDetailLevel:ii"));
+        assert_eq!(
+            CODEX_ASAR_ONBOARDING_DETAIL_MODE_REPLACEMENT
+                .windows(b"threadDetailLevel:Yr".len())
+                .filter(|window| *window == b"threadDetailLevel:Yr")
+                .count(),
+            2
+        );
+        for unchanged in [
+            &b"fontSizes:{sans:Vc,code:Hc}"[..],
+            &b"showFullAccessInComposer:!1"[..],
+            &b"fontSizes:null"[..],
+            &b"showFullAccessInComposer:!0"[..],
+        ] {
+            assert!(CODEX_ASAR_ONBOARDING_DETAIL_MODE_REPLACEMENT
+                .windows(unchanged.len())
+                .any(|window| window == unchanged));
+        }
+
+        let root = temp_test_dir("codex-usb-onboarding-detail-mode-patch");
+        let app_asar = root.join("app.asar");
+        let mut fixture = b"prefix:".to_vec();
+        fixture.extend_from_slice(CODEX_ASAR_ONBOARDING_DETAIL_MODE_CALL);
+        fixture.extend_from_slice(b":suffix");
+        fs::write(&app_asar, &fixture).unwrap();
+
+        assert!(!patch_usb_onboarding_detail_mode(&app_asar, false).unwrap());
+        assert_eq!(fs::read(&app_asar).unwrap(), fixture);
+
+        assert!(patch_usb_onboarding_detail_mode(&app_asar, true).unwrap());
+        let patched = fs::read(&app_asar).unwrap();
+        assert_eq!(patched.len(), fixture.len());
+        assert!(patched
+            .windows(CODEX_ASAR_ONBOARDING_DETAIL_MODE_REPLACEMENT.len())
+            .any(|window| window == CODEX_ASAR_ONBOARDING_DETAIL_MODE_REPLACEMENT));
+        assert!(patched.ends_with(b":suffix"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn usb_startup_discovery_and_login_patches_are_scoped_and_idempotent() {
+        let root = temp_test_dir("usb-startup-discovery-login");
+        let path = root.join("resources").join("app.asar");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let patches: &[(&[u8], &[u8])] = &[
+            (CODEX_ASAR_USB_UI_MCP_DISCOVERY_CALL, CODEX_ASAR_USB_UI_MCP_DISCOVERY_REPLACEMENT),
+            (CODEX_ASAR_USB_MCP_DISCOVERY_SYNC_CALL, CODEX_ASAR_USB_MCP_DISCOVERY_SYNC_REPLACEMENT),
+            (CODEX_ASAR_USB_DURABLE_LOGIN_CLASSIFY_CALL, CODEX_ASAR_USB_DURABLE_LOGIN_CLASSIFY_REPLACEMENT),
+            (CODEX_ASAR_USB_DURABLE_LOGIN_RECONNECT_CALL, CODEX_ASAR_USB_DURABLE_LOGIN_RECONNECT_REPLACEMENT),
+        ];
+        // A flat source fixture exercises the real startup caller without
+        // manufacturing or verifying any archive integrity metadata.
+        let mut original = b"plain-source-fixture:".to_vec();
+        let mut expected = original.clone();
+        for (call, replacement) in patches.iter().copied().chain(
+            CODEX_ASAR_USB_IAB_VISIBILITY_PATCHES
+                .iter()
+                .map(|(call, replacement, _)| (*call, *replacement)),
+        ) {
+            assert!(replacement.len() <= call.len());
+            original.extend_from_slice(call);
+            original.push(b'\n');
+            expected.extend_from_slice(&fixed_width_patch_bytes(call, replacement));
+            expected.push(b'\n');
+        }
+        fs::write(&path, &original).unwrap();
+        assert!(!ensure_portable_codex_startup_compatibility_inner(&root, &root, false).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(ensure_portable_codex_startup_compatibility_inner(&root, &root, true).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), expected);
+        assert!(!ensure_portable_codex_startup_compatibility_inner(&root, &root, true).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), expected);
+        fs::write(&path, b"unmatched upstream startup shape").unwrap();
+        assert!(!ensure_portable_codex_startup_compatibility_inner(&root, &root, true).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), b"unmatched upstream startup shape");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn atomic_runtime_replace_supports_staging_temporary_long_paths() {
+        use std::os::windows::ffi::OsStrExt;
+
+        let root = temp_test_dir("atomic-staging-long-path");
+        let mut directory = root.clone();
+        while directory.as_os_str().encode_wide().count() < 215 {
+            directory.push("staging");
+        }
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("computer_use_client_base.js");
+        let temporary = directory.join(
+            ".computer_use_client_base.js.codex-usb-00000000-0000-4000-8000-000000000001.tmp",
+        );
+        // The real staging destination fits MAX_PATH; its temporary sibling does not.
+        assert!(path.as_os_str().encode_wide().count() < 260);
+        assert!(temporary.as_os_str().encode_wide().count() > 260);
+        fs::write(&path, b"original runtime").unwrap();
+        replace_file_atomically(&path, b"updated runtime").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"updated runtime");
+
+        // The same production helper creates a transaction journal before it exists.
+        let journal = directory.join("new-runtime-journal.json");
+        replace_file_atomically(&journal, b"journal").unwrap();
+        assert_eq!(fs::read(&journal).unwrap(), b"journal");
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn required_usb_patch_fixture(new_version: bool, applied: bool) -> PathBuf {
+        let root = temp_test_dir("required-usb-runtime-patches");
+        let resources = root.join("resources");
+        fs::create_dir_all(&resources).unwrap();
+        let mut pairs = if new_version {
+            runtime_261111::PATCHES.to_vec()
+        } else {
+            CODEX_ASAR_USB_IAB_VISIBILITY_PATCHES.to_vec()
+        };
+        if !new_version {
+            pairs.extend([
+                (CODEX_ASAR_CUA_HELPER_RESOLVER_CALL, CODEX_ASAR_CUA_HELPER_RESOLVER_REPLACEMENT, "resolver"),
+                (CODEX_ASAR_CUA_NOTIFY_UNWRAP_CALL, CODEX_ASAR_CUA_NOTIFY_UNWRAP_REPLACEMENT, "notify"),
+            ]);
+        }
+        let mut contents = Vec::new();
+        for (before, after, _) in pairs {
+            contents.extend_from_slice(if applied { after } else { before });
+            contents.push(b'\n');
+        }
+        fs::write(resources.join("app.asar"), contents).unwrap();
+        let client = resources.join(CODEX_CUA_CLIENT_BASE);
+        fs::create_dir_all(client.parent().unwrap()).unwrap();
+        let (before, after) = if new_version {
+            (CODEX_CUA_CAPTURE_261111_CALL, CODEX_CUA_CAPTURE_261111_REPLACEMENT)
+        } else {
+            (CODEX_CUA_CAPTURE_CALL, CODEX_CUA_CAPTURE_REPLACEMENT)
+        };
+        fs::write(client, if applied { after } else { before }).unwrap();
+        root
+    }
+
+    #[test]
+    fn required_usb_runtime_patches_accept_old_new_and_already_patched_shapes() {
+        for new_version in [false, true] {
+            for applied in [false, true] {
+                let root = required_usb_patch_fixture(new_version, applied);
+                validate_required_usb_runtime_patches(&root, false).unwrap();
+                let post = validate_required_usb_runtime_patches(&root, true);
+                assert_eq!(post.is_ok(), applied);
+                fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn new_usb_runtime_patches_apply_through_the_real_patcher_and_remain_idempotent() {
+        let root = required_usb_patch_fixture(true, false);
+        let asar = root.join("resources/app.asar");
+        let bytes = fake_asar_archive_with_member(&fs::read(&asar).unwrap());
+        fs::write(&asar, bytes).unwrap();
+        assert!(ensure_portable_codex_startup_compatibility_with_usb_integrity_mode(&root, true).unwrap());
+        validate_required_usb_runtime_patches(&root, true).unwrap();
+        let once = fs::read(&asar).unwrap();
+        assert!(!ensure_portable_codex_startup_compatibility_with_usb_integrity_mode(&root, true).unwrap());
+        assert_eq!(fs::read(&asar).unwrap(), once);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn required_usb_runtime_patches_reject_missing_iab_and_changed_cua_client() {
+        let root = required_usb_patch_fixture(true, false);
+        let asar = root.join("resources/app.asar");
+        let bytes = fs::read(&asar).unwrap();
+        let needle = runtime_261111::PATCHES.iter().find(|(_, _, label)| *label == "iab-command-await").unwrap().0;
+        let offset = bytes.windows(needle.len()).position(|part| part == needle).unwrap();
+        let mut missing = bytes.clone();
+        missing.drain(offset..offset + needle.len());
+        fs::write(&asar, missing).unwrap();
+        let error = validate_required_usb_runtime_patches(&root, false).unwrap_err();
+        assert!(matches!(error, EngineError::RuntimeCompatibility(_)));
+        assert!(error.to_string().contains("iab-command-await"));
+        fs::write(&asar, bytes).unwrap();
+        fs::write(root.join("resources").join(CODEX_CUA_CLIENT_BASE), "changed upstream client").unwrap();
+        assert!(validate_required_usb_runtime_patches(&root, false).unwrap_err()
+            .to_string().contains("CUA screenshot activation"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn usb_missing_runtime_patch_stops_before_replacing_the_existing_install() {
+        let root = temp_test_dir("usb-incompatible-upgrade");
+        let install = root.join("Codex");
+        fs::create_dir_all(&install).unwrap();
+        fs::write(install.join("previous-install.txt"), b"keep existing install").unwrap();
+        let shim = root.join("CodexEntryShim.exe");
+        fs::write(&shim, b"trusted test shim bytes").unwrap();
+        let package = root.join("unsupported-fixture.msix");
+        let mut zip = zip::ZipWriter::new(fs::File::create(&package).unwrap());
+        for (name, bytes) in [
+            ("AppxManifest.xml", br#"<Package><Identity Name="OpenAI.Codex" Publisher="CN=X" Version="1.0.0.0" ProcessorArchitecture="x64"/><Applications><Application Id="App" Executable="app/ChatGPT.exe"/></Applications></Package>"#.as_slice()),
+            ("app/ChatGPT.exe", b"test executable".as_slice()),
+            ("app/resources/app.asar", b"unsupported upstream shape".as_slice()),
+        ] {
+            zip.start_file(name, SimpleFileOptions::default()).unwrap();
+            zip.write_all(bytes).unwrap();
+        }
+        zip.finish().unwrap();
+        let mut options = PortableInstallOptions::usb_offline();
+        options.usb_entry_shim = Some(shim);
+        let mut boundaries = Vec::new();
+        let result = install_portable_from_msix_with_observer_options(
+            &package, &install, options, &mut |boundary| { boundaries.push(boundary); Ok(()) },
+        );
+        assert!(matches!(result, Err(EngineError::RuntimeCompatibility(_))));
+        assert_eq!(boundaries.len(), 1);
+        assert!(matches!(boundaries[0], PortableBoundary::BeforePrepare { .. }), "unsupported runtime must never reach a swap boundary");
+        assert_eq!(fs::read(install.join("previous-install.txt")).unwrap(), b"keep existing install");
+        assert_eq!(fs::read_dir(&install).unwrap().count(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_pipe_cua_capture_patch_is_exact_and_idempotent() {
+        let root = temp_test_dir("cua-foreground-capture");
+        let path = root.join("resources").join(CODEX_CUA_CLIENT_BASE);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, format!("prefix {CODEX_CUA_CAPTURE_CALL} suffix")).unwrap();
+        assert!(!ensure_portable_codex_startup_compatibility_inner(&root, &root, false).unwrap());
+        assert_eq!(fs::read_to_string(&path).unwrap(), format!("prefix {CODEX_CUA_CAPTURE_CALL} suffix"));
+        assert!(ensure_portable_codex_startup_compatibility_inner(&root, &root, true).unwrap());
+        let patched = fs::read_to_string(&path).unwrap();
+        assert_eq!(patched, format!("prefix {CODEX_CUA_CAPTURE_REPLACEMENT} suffix"));
+        assert!(!patch_codex_cua_foreground_capture(&root).unwrap());
+        assert_eq!(fs::read_to_string(&path).unwrap(), patched);
+        fs::write(&path, "new SDK client shape").unwrap();
+        assert!(!patch_codex_cua_foreground_capture(&root).unwrap());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new SDK client shape");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn native_pipe_cua_notify_unwrap_patch_is_fixed_width_and_idempotent() {
+        let root = temp_test_dir("cua-notify-unwrap-patch");
+        let path = root.join("app.asar");
+        let mut original = b"prefix:".to_vec();
+        original.extend_from_slice(CODEX_ASAR_CUA_NOTIFY_UNWRAP_CALL);
+        original.extend_from_slice(b":suffix");
+        fs::write(&path, &original).unwrap();
+        assert_eq!(
+            patch_all_fixed_width_calls(&path, CODEX_ASAR_CUA_NOTIFY_UNWRAP_CALL,
+                CODEX_ASAR_CUA_NOTIFY_UNWRAP_REPLACEMENT, "cua-notify-test").unwrap(),
+            1
+        );
+        let patched = fs::read(&path).unwrap();
+        let mut expected = b"prefix:".to_vec();
+        expected.extend_from_slice(CODEX_ASAR_CUA_NOTIFY_UNWRAP_REPLACEMENT);
+        expected.extend_from_slice(b":suffix");
+        assert_eq!(patched, expected);
+        assert_eq!(patched.len(), original.len());
+        assert_eq!(
+            patch_all_fixed_width_calls(&path, CODEX_ASAR_CUA_NOTIFY_UNWRAP_CALL,
+                CODEX_ASAR_CUA_NOTIFY_UNWRAP_REPLACEMENT, "cua-notify-test").unwrap(),
+            0
+        );
+        assert_eq!(fs::read(&path).unwrap(), expected);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn native_pipe_cua_helper_resolver_override_is_fixed_width_and_preserves_default() {
+        let replacement = fixed_width_patch_bytes(
+            CODEX_ASAR_CUA_HELPER_RESOLVER_CALL,
+            CODEX_ASAR_CUA_HELPER_RESOLVER_REPLACEMENT,
+        );
+        assert_eq!(replacement.len(), CODEX_ASAR_CUA_HELPER_RESOLVER_CALL.len());
+        assert!(replacement.starts_with(CODEX_ASAR_CUA_HELPER_RESOLVER_REPLACEMENT));
+        assert!(
+            replacement[CODEX_ASAR_CUA_HELPER_RESOLVER_REPLACEMENT.len()..]
+                .iter()
+                .all(|byte| *byte == b' ')
+        );
+        assert!(CODEX_ASAR_CUA_HELPER_RESOLVER_REPLACEMENT
+            .windows(b"process.env.OAI_SKY_WINDOWS_BIN".len())
+            .any(|window| window == b"process.env.OAI_SKY_WINDOWS_BIN"));
+        assert!(CODEX_ASAR_CUA_HELPER_RESOLVER_REPLACEMENT
+            .windows(
+                b"Qe(e,[`bin/windows/codex-computer-use${process.arch[0]==`a`?`-arm64`:``}.exe`])"
+                    .len()
+            )
+            .any(|window| {
+                window == b"Qe(e,[`bin/windows/codex-computer-use${process.arch[0]==`a`?`-arm64`:``}.exe`])"
+            }));
+        assert!(CODEX_ASAR_CUA_HELPER_RESOLVER_REPLACEMENT
+            .windows(b"component:`cua-helper`,executablePath:e".len())
+            .any(|window| window == b"component:`cua-helper`,executablePath:e"));
     }
 
     #[test]
@@ -6143,7 +7139,7 @@ mod tests {
         let path = plugin_dir.join(".mcp.json");
         fs::write(&path, &bytes).unwrap();
 
-        assert!(!patch_codex_app_tools_mcp_config(&root, None).unwrap());
+        assert!(!patch_codex_app_tools_mcp_config(&root, &root, None).unwrap());
         assert_eq!(fs::read(&path).unwrap(), bytes);
         let _ = fs::remove_dir_all(root);
     }
@@ -6597,12 +7593,31 @@ mod tests {
         zip.write_all(b"entry").unwrap();
         zip.start_file("app/resources/helper.bin", options).unwrap();
         zip.write_all(b"helper").unwrap();
+        zip.start_file(
+            "app/resources/cua_node/bin/node_modules/%40oai/pkg/index.js",
+            options,
+        )
+        .unwrap();
+        zip.write_all(b"").unwrap();
+        zip.start_file(
+            "app/resources/cua_node/bin/node_modules/%24pkg/file.js",
+            options,
+        )
+        .unwrap();
+        zip.write_all(b"").unwrap();
+        zip.start_file(
+            "app/resources/cua_node/bin/node_modules/classic-level/prebuilds/win32-x64%2Barm64/file.node",
+            options,
+        )
+        .unwrap();
+        zip.write_all(b"").unwrap();
         zip.finish().unwrap();
 
         let progress = RefCell::new(Vec::new());
         let prepared = prepare_portable_payload(
             &package,
             &work,
+            &root.join("Codex"),
             None,
             Some(&|update| {
                 progress.borrow_mut().push(update);
@@ -6612,6 +7627,18 @@ mod tests {
         .unwrap();
         assert!(prepared.payload_dir.join("ChatGPT.exe").is_file());
         assert!(prepared.payload_dir.join("resources/helper.bin").is_file());
+        assert!(prepared
+            .payload_dir
+            .join("resources/cua_node/bin/node_modules/@oai/pkg/index.js")
+            .is_file());
+        assert!(prepared
+            .payload_dir
+            .join("resources/cua_node/bin/node_modules/$pkg/file.js")
+            .is_file());
+        assert!(prepared
+            .payload_dir
+            .join("resources/cua_node/bin/node_modules/classic-level/prebuilds/win32-x64+arm64/file.node")
+            .is_file());
         assert!(!prepared.payload_dir.join("assets/not-copied.bin").exists());
         assert!(prepared.payload_dir.join("AppxManifest.xml").is_file());
         assert!(!work.join("extracted").exists());
@@ -6620,10 +7647,86 @@ mod tests {
         assert_eq!(progress.first().unwrap().completed_bytes, 0);
         assert_eq!(progress.last().unwrap().completed_bytes, 11);
         assert_eq!(progress.last().unwrap().total_bytes, 11);
-        assert_eq!(progress.last().unwrap().files_completed, 2);
+        assert_eq!(progress.last().unwrap().files_completed, 5);
+        assert_eq!(
+            progress.last().unwrap().stage,
+            PortableInstallStage::StartupCompatibility
+        );
+        assert!(progress[..progress.len() - 1]
+            .iter()
+            .all(|update| update.stage == PortableInstallStage::Extracting));
         assert!(progress
             .windows(2)
             .all(|window| window[1].completed_bytes >= window[0].completed_bytes));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn portable_payload_mcp_paths_follow_staging_to_final_move() {
+        let root = temp_test_dir("portable-mcp-staging-move");
+        let package = root.join("fixture.msix");
+        let work = root.join("work");
+        let final_root = root.join("Codex");
+        fs::create_dir_all(&work).unwrap();
+
+        let file = fs::File::create(&package).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+        let manifest = r#"<Package><Identity Name="OpenAI.Codex" Publisher="CN=X" Version="1.0.0.0" ProcessorArchitecture="x64"/><Applications><Application Id="App" Executable="app/ChatGPT.exe"/></Applications></Package>"#;
+        zip.start_file("AppxManifest.xml", options).unwrap();
+        zip.write_all(manifest.as_bytes()).unwrap();
+        zip.start_file("app/ChatGPT.exe", options).unwrap();
+        zip.write_all(b"entry").unwrap();
+        zip.start_file("app/resources/cua_node/bin/node.exe", options)
+            .unwrap();
+        zip.write_all(&fake_pe_image(3)).unwrap();
+        zip.start_file(
+            "app/resources/plugins/openai-bundled/plugins/codex-app-tools/.mcp.json",
+            options,
+        )
+        .unwrap();
+        zip.write_all(
+            br#"{"mcpServers":{"codex_app":{"command":"cmd.exe","args":["/d","/s","/c","call","./scripts/launch_codex_app_tools_mcp.cmd","./server.mjs"]}}}"#,
+        )
+        .unwrap();
+        zip.start_file(
+            "app/resources/plugins/openai-bundled/plugins/codex-app-tools/server.mjs",
+            options,
+        )
+        .unwrap();
+        zip.write_all(b"server").unwrap();
+        zip.finish().unwrap();
+
+        let prepared = prepare_portable_payload(&package, &work, &final_root, None, None).unwrap();
+        let staging_payload = prepared.payload_dir;
+        assert_ne!(staging_payload, final_root);
+        fs::rename(&staging_payload, &final_root).unwrap();
+
+        let config_path = final_root
+            .join("resources")
+            .join(CODEX_APP_TOOLS_MCP_CONFIG);
+        let config: serde_json::Value =
+            serde_json::from_slice(&fs::read(config_path).unwrap()).unwrap();
+        let server = &config["mcpServers"]["codex_app"];
+        let expected_node = final_root
+            .join("resources")
+            .join("cua_node")
+            .join("bin")
+            .join("node.exe");
+        let expected_server = final_root
+            .join("resources")
+            .join(CODEX_APP_TOOLS_MCP_CONFIG)
+            .parent()
+            .unwrap()
+            .join("server.mjs");
+        assert_eq!(server["command"], expected_node.to_string_lossy().as_ref());
+        assert_eq!(
+            server["args"],
+            serde_json::json!([expected_server.to_string_lossy().as_ref()])
+        );
+        assert!(expected_node.is_file());
+        assert!(expected_server.is_file());
+
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -6639,22 +7742,34 @@ mod tests {
         let file = fs::File::create(&package).unwrap();
         let mut zip = zip::ZipWriter::new(file);
         let options = SimpleFileOptions::default();
+        let compatible = required_usb_patch_fixture(true, true);
+        let compatible_asar = compatible.join("resources/app.asar");
+        let asar_bytes = fake_asar_archive_with_member(&fs::read(&compatible_asar).unwrap());
+        fs::write(&compatible_asar, &asar_bytes).unwrap();
+        let official_entry = fake_pe_image_with_electron_asar_hash(
+            &app_asar_header_sha256(&compatible_asar).unwrap(),
+        );
         let manifest = r#"<Package><Identity Name="OpenAI.Codex" Publisher="CN=X" Version="1.0.0.0" ProcessorArchitecture="x64"/><Applications><Application Id="App" Executable="app/ChatGPT.exe"/></Applications></Package>"#;
         zip.start_file("AppxManifest.xml", options).unwrap();
         zip.write_all(manifest.as_bytes()).unwrap();
         zip.start_file("app/ChatGPT.exe", options).unwrap();
-        zip.write_all(b"official entry bytes").unwrap();
+        zip.write_all(&official_entry).unwrap();
         zip.start_file("app/Codex.exe", options).unwrap();
         zip.write_all(b"official package alias bytes").unwrap();
         zip.start_file("app/resources/app.asar", options).unwrap();
-        zip.write_all(b"app payload").unwrap();
+        zip.write_all(&asar_bytes).unwrap();
+        zip.start_file(format!("app/resources/{CODEX_CUA_CLIENT_BASE}"), options).unwrap();
+        zip.write_all(&fs::read(compatible.join("resources").join(CODEX_CUA_CLIENT_BASE)).unwrap()).unwrap();
         zip.finish().unwrap();
+        fs::remove_dir_all(compatible).unwrap();
 
-        let prepared = prepare_portable_payload(&package, &work, Some(&shim), None).unwrap();
+        let prepared =
+            prepare_portable_payload(&package, &work, &root.join("Codex"), Some(&shim), None)
+                .unwrap();
         let payload = prepared.payload_dir;
         assert_eq!(
             fs::read(payload.join("CodexCore.dat")).unwrap(),
-            b"official entry bytes"
+            official_entry
         );
         assert_eq!(
             fs::read(payload.join("ChatGPT.exe")).unwrap(),
@@ -6776,6 +7891,7 @@ mod tests {
                 let prepared = prepare_portable_payload(
                     &package_or_payload,
                     &work,
+                    &work.join("payload"),
                     Some(&bundle_entry_shim),
                     None,
                 )
@@ -7354,6 +8470,63 @@ if ($null -ne (Get-OwnedPortableEntry)) {{ 'owned' }} else {{ 'missing' }}
         assert_eq!(run_powershell(&parsed).unwrap().trim(), "parsed");
     }
 
+    #[test]
+    fn usb_shortcut_repair_targets_shim_without_creating_or_deleting_links() {
+        let root = Path::new("E:/usb-current/apps/Codex");
+        let shim = root.join("ChatGPT.exe");
+        let script = repair_owned_usb_shortcuts_script(root, &shim);
+        assert!(script.contains(&format!(
+            "$link.TargetPath = {}",
+            ps_quote(&shim.to_string_lossy())
+        )));
+        assert!(script.contains("Test-OwnedUsbShortcutForRepair $shortcutPath $link $record"));
+        assert!(script.contains("Test-Path -LiteralPath $shortcutPath -PathType Leaf"));
+        assert!(script.contains(&format!(
+            "$target -ine {}",
+            ps_quote(&root.join(USB_ENTRY_ORIGINAL_EXE).to_string_lossy())
+        )));
+        assert!(!script
+            .split("$record = Get-PortableShellOwnership")
+            .last()
+            .unwrap()
+            .contains("Remove-Item"));
+        assert!(!script.contains("$link.Arguments ="));
+        assert!(!script.contains(&format!(
+            "$link.TargetPath = {}",
+            ps_quote(&root.join(USB_ENTRY_ORIGINAL_EXE).to_string_lossy())
+        )));
+        #[cfg(windows)]
+        assert_powershell_parses(&script);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn usb_shortcut_repair_requires_positive_provenance_and_exact_legacy_target() {
+        let script = format!(
+            r#"{ownership}
+{policy}
+$path = 'C:\Users\Fixture\Desktop\ChatGPT.lnk'
+$link = [pscustomobject]@{{ TargetPath='E:\usb-oneclick-v0.5.24-20261023-model-host-tools-fix-r4\apps\Codex\CodexCore.dat'; Description='codex-app-manager:managed-portable'; Arguments='' }}
+if (-not (Test-OwnedUsbShortcutForRepair $path $link $null)) {{ throw 'owned old Core.dat was not repairable' }}
+$link.Description = ''
+if (Test-OwnedUsbShortcutForRepair $path $link $null) {{ throw 'unknown ownership must survive' }}
+$record = [pscustomobject]@{{ shortcutPaths=@($path); installRoots=@('E:\usb-oneclick-v0.5.24-20261023-model-host-tools-fix-r4\apps\Codex') }}
+if (-not (Test-OwnedUsbShortcutForRepair $path $link $record)) {{ throw 'recorded ownership was not repairable' }}
+if (Test-OwnedUsbShortcutForRepair 'C:\Users\Fixture\Desktop\User.lnk' $link $record) {{ throw 'root alone is not ownership' }}
+$link.Description = 'codex-app-manager:managed-portable'
+$link.TargetPath = 'C:\Program Files\WindowsApps\Official\ChatGPT.exe'
+if (Test-OwnedUsbShortcutForRepair $path $link $record) {{ throw 'official app must survive' }}
+$link.TargetPath = 'E:\usb-old\apps\Codex\ChatGPT.exe'
+$link.Arguments = '--user-custom-option'
+if (Test-OwnedUsbShortcutForRepair $path $link $record) {{ throw 'custom arguments must survive' }}
+'passed'
+"#,
+            ownership = portable_metadata_ownership_script(),
+            policy = usb_shortcut_repair_policy_script(),
+        );
+        assert_eq!(run_powershell(&script).unwrap().trim(), "passed");
+    }
+
     #[cfg(windows)]
     #[test]
     fn portable_shell_create_and_apps_features_scripts_parse() {
@@ -7800,6 +8973,16 @@ if ($null -ne (Get-OwnedPortableEntry)) {{ 'owned' }} else {{ 'missing' }}
         let mut kinds = Vec::new();
         install_portable_from_msix_with_observer(&msix, &install_root, false, false, &mut |b| {
             kinds.push(match b {
+                PortableBoundary::BeforePrepare {
+                    payload, backup, ..
+                } => {
+                    assert!(
+                        !payload.parent().unwrap().exists(),
+                        "journal event must precede all extraction writes"
+                    );
+                    assert!(!backup.exists());
+                    "before-prepare"
+                }
                 PortableBoundary::BeforeMoveOld { .. } => "before-old",
                 PortableBoundary::AfterMoveOld { .. } => "after-old",
                 PortableBoundary::BeforeMoveNew { .. } => "before-new",
@@ -7812,7 +8995,13 @@ if ($null -ne (Get-OwnedPortableEntry)) {{ 'owned' }} else {{ 'missing' }}
         .unwrap();
         assert_eq!(
             kinds,
-            ["before-old", "after-old", "before-new", "after-new"]
+            [
+                "before-prepare",
+                "before-old",
+                "after-old",
+                "before-new",
+                "after-new"
+            ]
         );
         let _ = fs::remove_dir_all(&root);
     }
@@ -7838,6 +9027,7 @@ if ($null -ne (Get-OwnedPortableEntry)) {{ 'owned' }} else {{ 'missing' }}
             false,
             &mut |boundary| {
                 kinds.push(match boundary {
+                    PortableBoundary::BeforePrepare { .. } => "before-prepare",
                     PortableBoundary::BeforeMoveOld { .. } => "before-old",
                     PortableBoundary::AfterMoveOld { .. } => "after-old",
                     PortableBoundary::BeforeMoveNew { .. } => "before-new",
@@ -7854,6 +9044,7 @@ if ($null -ne (Get-OwnedPortableEntry)) {{ 'owned' }} else {{ 'missing' }}
         assert_eq!(
             kinds,
             [
+                "before-prepare",
                 "before-old",
                 "after-old",
                 "before-new",

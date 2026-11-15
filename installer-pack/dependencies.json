@@ -528,7 +528,7 @@
       "required": true,
       "autoInstallable": true,
       "healthCheck": "runtime-state.json hyperframes.browserHealth == passed",
-      "failureMessage": "需要可用 Chrome；没有系统 Chrome 时首次初始化需联网下载。",
+      "failureMessage": "需要随包固定版浏览器；从本地 ZIP 部署，无需预装 Chrome 或联网下载。",
       "dependentCapabilities": [
         "hyperframes video"
       ],
@@ -542,7 +542,7 @@
       "required": true,
       "autoInstallable": true,
       "healthCheck": "runtime-state.json hyperframes.cliHealth == passed",
-      "failureMessage": "首次部署需联网从 npm 获取锁定版 CLI。",
+      "failureMessage": "需要随包锁定版 CLI 和完整 Windows 依赖；从本地 ZIP 部署，无需访问 npm。",
       "dependentCapabilities": [
         "hyperframes video"
       ],
@@ -1737,7 +1737,7 @@
         "hyperframes video"
       ],
       "healthCheck": "runtime-state.json records the locked CLI/library and local executable health; no billable API is called",
-      "notes": "本地渲染链路需要 Node 22、FFmpeg/FFprobe、HyperFrames CLI 与 Chrome；安装器自动部署本地运行时，首次获取 CLI/Chrome 需联网。云端发布或特定在线 AI 功能另需账号。"
+      "notes": "本地渲染链路需要 Node 22、FFmpeg/FFprobe、HyperFrames CLI 与 Chrome；安装器自动部署本地运行时，CLI、Windows 依赖和固定版浏览器均随包离线部署。云端发布或特定在线 AI 功能另需账号。"
     },
     {
       "id": "image-2",

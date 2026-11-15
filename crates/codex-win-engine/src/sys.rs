@@ -12,8 +12,8 @@ use crate::limits::MAX_TEXT_BYTES;
 use crate::msix::parse_appx_manifest_xml;
 use crate::network::{is_schannel_revocation_offline, NetworkConfig, SchannelRevocationCheck};
 use crate::process::{
-    curl_exe, hidden_command, run_capturing, spawn_and_require_liveness, LivenessResult, RunLimits,
-    PORTABLE_LIVENESS_WINDOW,
+    curl_exe, hidden_command, run_capturing, run_capturing_with_kill_job,
+    spawn_and_require_liveness, LivenessResult, RunLimits, PORTABLE_LIVENESS_WINDOW,
 };
 #[cfg(windows)]
 use crate::process::{
@@ -1013,6 +1013,27 @@ fn run_powershell_json_with_limits(
     script: &str,
     limits: RunLimits,
 ) -> Result<String, PowerShellRunError> {
+    run_powershell_json_with_capture(script, limits, |command, limits| {
+        run_capturing(command, limits, None)
+    })
+}
+
+#[cfg(windows)]
+fn run_powershell_json_with_kill_job(
+    script: &str,
+    limits: RunLimits,
+) -> Result<String, PowerShellRunError> {
+    run_powershell_json_with_capture(script, limits, |command, limits| {
+        run_capturing_with_kill_job(command, limits, None)
+    })
+}
+
+#[cfg(windows)]
+fn run_powershell_json_with_capture(
+    script: &str,
+    limits: RunLimits,
+    capture: impl FnOnce(std::process::Command, RunLimits) -> Result<std::process::Output, RunError>,
+) -> Result<String, PowerShellRunError> {
     let mut command = hidden_command(powershell_exe());
     // Windows PowerShell 5.1 inherits the active ANSI/OEM code page for
     // redirected stdout. The caller decodes the JSON response as UTF-8, so
@@ -1039,7 +1060,7 @@ fn run_powershell_json_with_limits(
         command.args(["-NoProfile", "-NonInteractive", "-Command"]);
         command.arg(&script);
     }
-    let output = run_capturing(command, limits, None);
+    let output = capture(command, limits);
     if let Some(path) = script_path {
         let _ = std::fs::remove_file(path);
     }
@@ -3602,7 +3623,7 @@ fn install_msix_sideload_to_volume_with_observer(
     } else {
         RunLimits::install()
     };
-    let json = run_powershell_json_with_limits(&script, limits)
+    let json = run_powershell_json_with_kill_job(&script, limits)
         .map_err(|e| EngineError::Install(format!("run MSIX deployment: {}", e.message())))?;
     let mut report: MsixSideloadReport = serde_json::from_str(&json)
         .map_err(|e| EngineError::Install(format!("parse MSIX deployment result: {e}")))?;
@@ -5271,6 +5292,54 @@ fn configure_portable_launch_command(
 }
 
 #[cfg(windows)]
+fn spawn_portable_process(
+    exe: &Path,
+    options: &LaunchOptions,
+    software_rendering: bool,
+    no_sandbox: bool,
+) -> std::io::Result<PortableChild> {
+    if options.codex_home.is_some() {
+        let mut environment = portable_launch_environment_overrides(options);
+        environment.extend(
+            options
+                .environment
+                .iter()
+                .map(|(name, value)| (name.into(), value.into())),
+        );
+        let arguments = portable_launch_arguments(options, software_rendering, no_sandbox);
+        let desktop_launch =
+            crate::windows_process::spawn_as_desktop_user(exe, &arguments, &environment).map_err(
+                |error| {
+                    log::error!(
+                        "managed USB Codex desktop-token launch failed exe={} error={error}",
+                        exe.display()
+                    );
+                    std::io::Error::new(
+                        error.kind(),
+                        format!(
+                    "无法以当前桌面用户令牌启动受管 Codex（未回退到提权启动；exe={}）：{error}",
+                    exe.display()
+                ),
+                    )
+                },
+            )?;
+        if let Some(child) = desktop_launch {
+            log::info!(
+                "managed USB Codex launched with current desktop user token pid={} exe={}",
+                child.id(),
+                exe.display()
+            );
+            return Ok(PortableChild::DesktopUser(child));
+        }
+    }
+
+    let mut command =
+        configure_portable_launch_command(exe, options, software_rendering, no_sandbox);
+    command.stdout(Stdio::null()).stderr(Stdio::null());
+    command.spawn().map(PortableChild::Standard)
+}
+
+#[cfg(windows)]
 fn schedule_console_window_suppression(root: &Path) {
     // Fallback for systems where the WinEvent hook cannot be installed. Start
     // before CreateProcess and keep watching through startup and process exit.
@@ -5364,6 +5433,257 @@ const USB_COLD_START_WINDOW_TIMEOUT: std::time::Duration = std::time::Duration::
 #[cfg(any(windows, test))]
 const USB_COMPATIBILITY_WINDOW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
+#[cfg(windows)]
+struct ManagedPortableLaunch {
+    root: PathBuf,
+    home: PathBuf,
+    debugging_port: Option<u16>,
+    child: PortableChild,
+    process_creation_time: Option<u64>,
+    process_exit_time: Option<u64>,
+    report: CodexLaunchReport,
+}
+
+#[cfg(windows)]
+enum PortableChild {
+    Standard(std::process::Child),
+    DesktopUser(crate::windows_process::DesktopUserChild),
+}
+
+#[cfg(windows)]
+impl PortableChild {
+    fn id(&self) -> u32 {
+        match self {
+            Self::Standard(child) => child.id(),
+            Self::DesktopUser(child) => child.id(),
+        }
+    }
+
+    fn raw_process_handle(&self) -> std::os::windows::io::RawHandle {
+        use std::os::windows::io::AsRawHandle;
+        match self {
+            Self::Standard(child) => child.as_raw_handle(),
+            Self::DesktopUser(child) => child.raw_process_handle(),
+        }
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        match self {
+            Self::Standard(child) => child.try_wait(),
+            Self::DesktopUser(child) => child.try_wait().map(|status| {
+                status.map(|code| {
+                    use std::os::windows::process::ExitStatusExt;
+                    std::process::ExitStatus::from_raw(code)
+                })
+            }),
+        }
+    }
+}
+
+#[cfg(windows)]
+static MANAGED_PORTABLE_LAUNCH: std::sync::Mutex<Option<ManagedPortableLaunch>> =
+    std::sync::Mutex::new(None);
+
+// Preserve ordinary portable launch's best-effort process probe. Only a
+// managed launch needs a successful probe as proof of child ownership.
+#[cfg(any(windows, test))]
+fn child_running_for_window_check(
+    managed: bool,
+    running: std::io::Result<bool>,
+) -> Result<bool, EngineError> {
+    if managed {
+        running.map_err(|error| EngineError::Io(format!("检查 Codex 启动进程失败：{error}")))
+    } else {
+        Ok(running.unwrap_or(true))
+    }
+}
+
+#[cfg(any(windows, test))]
+fn managed_window_matches_launch(window_pid: u32, child_pid: u32, child_is_running: bool) -> bool {
+    child_is_running && window_pid == child_pid
+}
+
+#[cfg(any(windows, test))]
+fn managed_launch_context_matches(
+    previous_root: &Path,
+    previous_home: &Path,
+    previous_debugging_port: Option<u16>,
+    root: &Path,
+    options: &LaunchOptions,
+) -> bool {
+    options.codex_home.as_deref().is_some_and(|home| {
+        crate::windows_process::same_windows_path(previous_root, root)
+            && crate::windows_process::same_windows_path(previous_home, home)
+            && previous_debugging_port == options.remote_debugging_port
+    })
+}
+
+/// An owned live Child handle is the proof that this manager supplied the
+/// requested home. A PID on its own, a same-root window, or a process inherited
+/// from an earlier manager session is not such proof.
+#[cfg(windows)]
+fn reuse_managed_portable_launch(
+    root: &Path,
+    options: &LaunchOptions,
+) -> Result<Option<CodexLaunchReport>, EngineError> {
+    let Some(home) = options.codex_home.as_deref() else {
+        return Ok(None);
+    };
+    let mut tracked = MANAGED_PORTABLE_LAUNCH
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some(previous) = tracked.as_mut() else {
+        return Ok(None);
+    };
+    if previous
+        .child
+        .try_wait()
+        .map_err(|e| EngineError::Io(format!("检查已启动 Codex 进程失败：{e}")))?
+        .is_some()
+    {
+        if let Some(times) =
+            crate::windows_process::query_process_times(previous.child.raw_process_handle())
+        {
+            if Some(times.creation_time) == previous.process_creation_time {
+                previous.process_exit_time = times.exit_time;
+            }
+        }
+        return Ok(None);
+    }
+    if !managed_launch_context_matches(
+        &previous.root,
+        &previous.home,
+        previous.debugging_port,
+        root,
+        options,
+    ) {
+        return Ok(None);
+    }
+    if let Some(window) =
+        crate::windows_process::wait_for_usable_window_for_root(root, std::time::Duration::ZERO)?
+    {
+        if managed_window_matches_launch(window.pid, previous.child.id(), true) {
+            log::info!(
+                "reused managed Codex instance pid={} home={}",
+                window.pid,
+                home.display()
+            );
+            return Ok(Some(previous.report.clone()));
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(windows)]
+fn recover_exited_managed_children(
+    root: &Path,
+    exe: &Path,
+    options: &LaunchOptions,
+) -> Result<Vec<u32>, EngineError> {
+    if options.codex_home.is_none() {
+        return Ok(Vec::new());
+    }
+    let mut tracked = MANAGED_PORTABLE_LAUNCH
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some(previous) = tracked.as_mut() else {
+        return Ok(Vec::new());
+    };
+    if !managed_launch_context_matches(
+        &previous.root,
+        &previous.home,
+        previous.debugging_port,
+        root,
+        options,
+    ) {
+        return Ok(Vec::new());
+    }
+    if previous
+        .child
+        .try_wait()
+        .map_err(|error| EngineError::Io(format!("检查已启动 Codex 进程失败：{error}")))?
+        .is_none()
+    {
+        return Ok(Vec::new());
+    }
+    let Some(expected_creation_time) = previous.process_creation_time else {
+        return Ok(Vec::new());
+    };
+    let Some(times): Option<crate::windows_process::ProcessTimes> =
+        crate::windows_process::query_process_times(previous.child.raw_process_handle())
+    else {
+        return Ok(Vec::new());
+    };
+    if times.creation_time != expected_creation_time {
+        return Ok(Vec::new());
+    }
+    let Some(exit_time) = times.exit_time else {
+        return Ok(Vec::new());
+    };
+    if previous
+        .process_exit_time
+        .is_some_and(|observed_exit_time| observed_exit_time != exit_time)
+    {
+        return Ok(Vec::new());
+    }
+    previous.process_exit_time = Some(exit_time);
+    crate::windows_process::recover_verified_direct_children(
+        exe,
+        previous.child.id(),
+        previous.child.raw_process_handle(),
+        expected_creation_time,
+    )
+}
+
+#[cfg(windows)]
+fn close_old_image_or_recover_owned_child(
+    root: &Path,
+    exe: &Path,
+    options: &LaunchOptions,
+) -> Result<(), EngineError> {
+    match crate::windows_process::close_image_gracefully_for_launch(10, exe) {
+        Ok(()) => Ok(()),
+        Err(close_error) => {
+            let recovered = match recover_exited_managed_children(root, exe, options) {
+                Ok(recovered) => recovered,
+                Err(error) => {
+                    let failure = EngineError::Io(format!(
+                        "{close_error}; 无法验证受管 Codex 子进程归属，未继续启动：{error}"
+                    ));
+                    log::warn!("Codex relaunch stopped after orphan recovery could not verify ownership: {failure}");
+                    return Err(failure);
+                }
+            };
+            if !recovered.is_empty() {
+                log::warn!(
+                    "terminated verified headless direct Codex children from exited managed launch pids={recovered:?}"
+                );
+            }
+            let Some(image_root) = exe.parent() else {
+                return Err(close_error);
+            };
+            let Some(image_name) = exe.file_name() else {
+                return Err(close_error);
+            };
+            let result = match crate::windows_process::processes_running_for_executable_under_root_strict(
+                image_root, image_name,
+            ) {
+                Ok(false) => Ok(()),
+                Ok(true) => Err(EngineError::Io(format!(
+                    "{close_error}; 无法确认剩余进程是本管理器上次启动的无窗口直接子进程，因此未终止该进程。"
+                ))),
+                Err(error) => Err(EngineError::Io(format!(
+                    "{close_error}; 无法确认 Codex 进程身份或退出状态，因此未终止未验证进程：{error}"
+                ))),
+            };
+            if let Err(error) = &result {
+                log::warn!("Codex relaunch stopped because the remaining process was not safely recoverable: {error}");
+            }
+            result
+        }
+    }
+}
+
 #[cfg(any(windows, test))]
 fn stable_window_reports_same_process(
     first: &crate::windows_process::UsableWindowReport,
@@ -5404,8 +5724,34 @@ fn launch_portable_with_usable_window(
     software_rendering: bool,
     no_sandbox: bool,
     window_timeout: std::time::Duration,
+    before_spawn: &mut Option<impl FnOnce()>,
 ) -> Result<CodexLaunchReport, PortableLaunchFailure> {
+    // A managed entry shim waits beside the core executable. Failed-attempt
+    // cleanup must not terminate that shim or other programs under the root.
+    let cleanup_scope = if options.codex_home.is_some() {
+        exe
+    } else {
+        root
+    };
     const STABILITY_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
+
+    if options.codex_home.is_some() {
+        if let Some(report) =
+            reuse_managed_portable_launch(root, options).map_err(PortableLaunchFailure::Fatal)?
+        {
+            return Ok(report);
+        }
+        // Unknown same-image instances may own Electron's single-instance
+        // listener with the default home. Ask them to close before spawning;
+        // never force-close or report their old window as the new launch.
+        prepare_after_close_before_spawn(
+            || close_old_image_or_recover_owned_child(root, exe, options),
+            before_spawn,
+        )
+        .map_err(PortableLaunchFailure::Fatal)?;
+    } else if let Some(before_spawn) = before_spawn.take() {
+        before_spawn();
+    }
 
     if let Err(error) = crate::windows_process::start_console_window_watcher(root) {
         log::warn!(
@@ -5413,20 +5759,18 @@ fn launch_portable_with_usable_window(
         );
         schedule_console_window_suppression(root);
     }
-    let mut command =
-        configure_portable_launch_command(exe, options, software_rendering, no_sandbox);
-    command.stdout(Stdio::null()).stderr(Stdio::null());
-    let mut child = command.spawn().map_err(|error| {
-        PortableLaunchFailure::Fatal(EngineError::Io(format!("launch Codex: {error}")))
-    })?;
+    let mut child =
+        spawn_portable_process(exe, options, software_rendering, no_sandbox).map_err(|error| {
+            PortableLaunchFailure::Fatal(EngineError::Io(format!("launch Codex: {error}")))
+        })?;
 
     let first = match crate::windows_process::wait_for_usable_window_for_root(root, window_timeout)
     {
         Ok(report) => report,
         Err(error) => {
             return Err(PortableLaunchFailure::Fatal(
-                cleanup_failed_portable_launch(root, error),
-            ))
+                cleanup_failed_portable_launch(cleanup_scope, error),
+            ));
         }
     };
     if let Some(window) = first {
@@ -5440,14 +5784,23 @@ fn launch_portable_with_usable_window(
             Ok(report) => report,
             Err(error) => {
                 return Err(PortableLaunchFailure::Fatal(
-                    cleanup_failed_portable_launch(root, error),
-                ))
+                    cleanup_failed_portable_launch(cleanup_scope, error),
+                ));
             }
         };
         if let Some(stable) = stable {
             if stable_window_reports_same_process(&window, &stable) {
-                if child.try_wait().ok().flatten().is_none() {
-                    std::mem::forget(child);
+                let child_is_running = child_running_for_window_check(
+                    options.codex_home.is_some(),
+                    child.try_wait().map(|status| status.is_none()),
+                )
+                .map_err(PortableLaunchFailure::Fatal)?;
+                if options.codex_home.is_some()
+                    && !managed_window_matches_launch(stable.pid, child.id(), child_is_running)
+                {
+                    return Err(PortableLaunchFailure::Fatal(EngineError::Io(
+                        "检测到的 Codex 窗口不属于本次受管启动，未将旧实例视为启动成功。请保存工作并关闭该窗口后重试。".into(),
+                    )));
                 }
                 let launch_mode = portable_launch_mode(software_rendering, no_sandbox);
                 log::info!(
@@ -5458,7 +5811,7 @@ fn launch_portable_with_usable_window(
                     window.was_visible,
                     stable.foreground_accepted
                 );
-                return Ok(CodexLaunchReport {
+                let report = CodexLaunchReport {
                     launch_mode: launch_mode.to_string(),
                     usable_window_confirmed: true,
                     no_sandbox,
@@ -5473,7 +5826,26 @@ fn launch_portable_with_usable_window(
                                 .to_string()
                         }
                     },
-                });
+                };
+                if let Some(home) = options.codex_home.as_ref() {
+                    let process_creation_time =
+                        crate::windows_process::query_process_times(child.raw_process_handle())
+                            .map(|times| times.creation_time);
+                    *MANAGED_PORTABLE_LAUNCH
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Some(ManagedPortableLaunch {
+                        root: root.to_path_buf(),
+                        home: home.clone(),
+                        debugging_port: options.remote_debugging_port,
+                        child,
+                        process_creation_time,
+                        process_exit_time: None,
+                        report: report.clone(),
+                    });
+                } else if child_is_running {
+                    std::mem::forget(child);
+                }
+                return Ok(report);
             }
             log::warn!(
                 "portable Codex startup window changed process during stability check first_pid={} followup_pid={}",
@@ -5492,7 +5864,7 @@ fn launch_portable_with_usable_window(
         Ok(None) => "child-still-running".to_string(),
         Err(error) => format!("child-status-unavailable({error})"),
     };
-    let root_processes_running = crate::windows_process::processes_running_for_root(root)
+    let root_processes_running = crate::windows_process::processes_running_for_root(cleanup_scope)
         .map_err(PortableLaunchFailure::Fatal)?;
     log::warn!(
         "portable Codex startup has no usable window mode={} child_state={} install_root_process_tree_running={} window_timeout_ms={}",
@@ -5502,9 +5874,9 @@ fn launch_portable_with_usable_window(
         window_timeout.as_millis()
     );
     // The retry must not attach to a broken first attempt or leave its GPU
-    // cache locks alive. Scope shutdown to this exact portable program root.
+    // cache locks alive. Keep managed cleanup pinned to the failed core image, not its entry shim.
     if root_processes_running {
-        crate::windows_process::close_processes_for_root(5, root)
+        crate::windows_process::close_processes_for_root(5, cleanup_scope)
             .map_err(PortableLaunchFailure::Fatal)?;
     }
     Err(PortableLaunchFailure::NoUsableWindow(format!(
@@ -5515,10 +5887,42 @@ fn launch_portable_with_usable_window(
     )))
 }
 
+#[cfg(any(windows, test))]
+fn prepare_after_close_before_spawn<C, F>(
+    close_existing: C,
+    before_spawn: &mut Option<F>,
+) -> Result<(), EngineError>
+where
+    C: FnOnce() -> Result<(), EngineError>,
+    F: FnOnce(),
+{
+    close_existing()?;
+    if let Some(before_spawn) = before_spawn.take() {
+        before_spawn();
+    }
+    Ok(())
+}
+
 pub fn launch_codex_with_options(
     installed: &InstalledWindowsCodex,
     options: LaunchOptions,
 ) -> Result<CodexLaunchReport, EngineError> {
+    launch_codex_with_options_and_before_spawn(installed, options, || {})
+}
+
+/// Run `before_spawn` only when this call will create a new Codex process.
+/// A reusable manager-owned instance returns before the callback. On the USB
+/// portable path, the callback runs after an unowned core process is closed
+/// and immediately before a fresh process is created.
+pub fn launch_codex_with_options_and_before_spawn<F>(
+    installed: &InstalledWindowsCodex,
+    options: LaunchOptions,
+    before_spawn: F,
+) -> Result<CodexLaunchReport, EngineError>
+where
+    F: FnOnce(),
+{
+    let mut before_spawn = Some(before_spawn);
     if installed.source == "portable" {
         let root = Path::new(&installed.path);
         // A prior USB launch may have stopped between replacing the core PE
@@ -5565,6 +5969,7 @@ pub fn launch_codex_with_options(
                 false,
                 first_no_sandbox,
                 USB_COLD_START_WINDOW_TIMEOUT,
+                &mut before_spawn,
             ) {
                 Ok(report) => return Ok(report),
                 Err(first_failure) if first_failure.should_retry_compatibility() => {
@@ -5579,6 +5984,7 @@ pub fn launch_codex_with_options(
                         true,
                         true,
                         USB_COMPATIBILITY_WINDOW_TIMEOUT,
+                        &mut before_spawn,
                     )
                     .map_err(|fallback_error| {
                         EngineError::Io(format!(
@@ -5592,6 +5998,9 @@ pub fn launch_codex_with_options(
 
         // CREATE_NO_WINDOW only suppresses a console flash; the GUI still shows.
         // The ordinary non-USB manager retains its historical liveness check.
+        if let Some(before_spawn) = before_spawn.take() {
+            before_spawn();
+        }
         let mut command = hidden_command(exe);
         for (name, value) in &options.environment {
             command.env(name, value);
@@ -5626,6 +6035,9 @@ pub fn launch_codex_with_options(
             Err(err) => Err(EngineError::Io(format!("launch Codex: {}", err.message()))),
         }
     } else {
+        if let Some(before_spawn) = before_spawn.take() {
+            before_spawn();
+        }
         if options.disable_codex_self_updates {
             log::debug!(
                 "launching MSIX Codex with updater disabled via persisted user environment"
@@ -5941,12 +6353,20 @@ fn capabilities_from_probe_json(value: &serde_json::Value) -> WinCapabilityRepor
         Some(other) => {
             CapabilityCheck::unknown(format!("AllowAllTrustedApps={other} at {policy_source}"))
         }
-        None => match value.get("allowAllTrustedAppsState").and_then(|v| v.as_str()) {
+        None => match value
+            .get("allowAllTrustedAppsState")
+            .and_then(|v| v.as_str())
+        {
             Some("readError" | "invalid") => CapabilityCheck::unknown(format!(
                 "AllowAllTrustedApps could not be determined at {policy_source}: {}",
-                value.get("allowAllTrustedAppsError").and_then(|v| v.as_str()).unwrap_or("unknown registry error")
+                value
+                    .get("allowAllTrustedAppsError")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown registry error")
             )),
-            _ => CapabilityCheck::unknown("AllowAllTrustedApps is not explicitly configured; Windows defaults apply, this is not an explicit policy denial"),
+            _ => CapabilityCheck::unknown(
+                "AllowAllTrustedApps is not explicitly configured; Windows defaults apply, this is not an explicit policy denial",
+            ),
         },
     };
 
@@ -6108,6 +6528,29 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn managed_usb_launch_injects_exact_codex_home_for_unicode_user_path() {
+        let home =
+            std::path::PathBuf::from(r"C:\Users\周\AppData\Local\CodexAppManager\usb-codex-home");
+        let options = LaunchOptions {
+            codex_home: Some(home.clone()),
+            ..LaunchOptions::default()
+        };
+        let overrides = portable_launch_environment_overrides(&options);
+        let codex_home = overrides
+            .iter()
+            .filter(|(name, _)| name.to_string_lossy().eq_ignore_ascii_case("CODEX_HOME"))
+            .collect::<Vec<_>>();
+        assert_eq!(codex_home.len(), 1);
+        assert_eq!(codex_home[0].1, home.as_os_str());
+
+        let unmanaged = portable_launch_environment_overrides(&LaunchOptions::default());
+        assert!(!unmanaged
+            .iter()
+            .any(|(name, _)| name.to_string_lossy().eq_ignore_ascii_case("CODEX_HOME")));
+    }
+
     #[test]
     fn portable_launch_only_retries_after_a_successful_probe_without_a_usable_window() {
         let spawn_error = super::PortableLaunchFailure::Fatal(super::EngineError::Io(
@@ -6134,6 +6577,45 @@ mod tests {
     }
 
     #[test]
+    fn fresh_launch_preparation_runs_after_close_and_only_once() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let close_events = Rc::clone(&events);
+        let prepare_events = Rc::clone(&events);
+        let mut prepare = Some(move || prepare_events.borrow_mut().push("prepare"));
+
+        super::prepare_after_close_before_spawn(
+            || {
+                close_events.borrow_mut().push("close");
+                Ok(())
+            },
+            &mut prepare,
+        )
+        .unwrap();
+
+        assert_eq!(*events.borrow(), ["close", "prepare"]);
+        assert!(prepare.is_none());
+    }
+
+    #[test]
+    fn fresh_launch_preparation_is_skipped_when_close_fails() {
+        use std::cell::Cell;
+
+        let prepared = Cell::new(false);
+        let mut prepare = Some(|| prepared.set(true));
+        let result = super::prepare_after_close_before_spawn(
+            || Err(super::EngineError::Io("close failed".to_string())),
+            &mut prepare,
+        );
+
+        assert!(result.is_err());
+        assert!(!prepared.get());
+        assert!(prepare.is_some());
+    }
+
+    #[test]
     fn usb_launch_uses_a_bounded_cold_start_grace_and_shorter_fallback() {
         assert_eq!(super::USB_COLD_START_WINDOW_TIMEOUT.as_secs(), 45);
         assert_eq!(super::USB_COMPATIBILITY_WINDOW_TIMEOUT.as_secs(), 20);
@@ -6148,6 +6630,73 @@ mod tests {
                 + std::time::Duration::from_secs(20)
                 <= std::time::Duration::from_secs(91)
         );
+    }
+
+    #[test]
+    fn launch_child_probe_failure_is_strict_only_for_managed_launch() {
+        let probe_error = || std::io::Error::other("synthetic process probe failure");
+        assert!(super::child_running_for_window_check(false, Err(probe_error())).unwrap());
+        assert!(super::child_running_for_window_check(true, Err(probe_error())).is_err());
+        for managed in [false, true] {
+            assert!(super::child_running_for_window_check(managed, Ok(true)).unwrap());
+            assert!(!super::child_running_for_window_check(managed, Ok(false)).unwrap());
+        }
+    }
+
+    #[test]
+    fn usb_launch_window_requires_live_owned_child_not_just_same_root() {
+        assert!(super::managed_window_matches_launch(100, 100, true));
+        assert!(!super::managed_window_matches_launch(99, 100, true));
+        assert!(!super::managed_window_matches_launch(100, 100, false));
+        assert!(!super::managed_window_matches_launch(99, 100, false));
+    }
+
+    #[test]
+    fn usb_launch_reuse_requires_same_managed_home_root_and_debug_mode() {
+        use super::LaunchOptions;
+        use std::path::Path;
+        let root = Path::new(r"E:\套件\apps\Codex");
+        let home = Path::new(r"C:\Users\周\AppData\Local\CodexAppManager\usb-codex-home");
+        let mut options = LaunchOptions {
+            codex_home: Some(home.to_path_buf()),
+            ..Default::default()
+        };
+        assert!(super::managed_launch_context_matches(
+            root, home, None, root, &options
+        ));
+        assert!(!super::managed_launch_context_matches(
+            Path::new(r"F:\other"),
+            home,
+            None,
+            root,
+            &options
+        ));
+        assert!(!super::managed_launch_context_matches(
+            root,
+            Path::new(r"C:\Users\周\.codex"),
+            None,
+            root,
+            &options
+        ));
+        options.remote_debugging_port = Some(9222);
+        assert!(!super::managed_launch_context_matches(
+            root, home, None, root, &options
+        ));
+        assert!(super::managed_launch_context_matches(
+            root,
+            home,
+            Some(9222),
+            root,
+            &options
+        ));
+        options.codex_home = None;
+        assert!(!super::managed_launch_context_matches(
+            root,
+            home,
+            Some(9222),
+            root,
+            &options
+        ));
     }
 
     #[test]
@@ -7608,7 +8157,9 @@ function Get-Item {
             "$backupPath = Backup-CodexPackageData $p",
             "$backupPath = $null",
         );
-        let script = format!("{UNINSTALL_MOCKS}\nfunction Test-Path {{ param($LiteralPath, $ErrorAction); $false }}\n{production}");
+        let script = format!(
+            "{UNINSTALL_MOCKS}\nfunction Test-Path {{ param($LiteralPath, $ErrorAction); $false }}\n{production}"
+        );
         let report: MsixRemoveReport =
             serde_json::from_str(&run_powershell_json(&script).unwrap()).unwrap();
         assert!(report.success, "{report:?}");
@@ -7631,7 +8182,9 @@ function Get-Item {
             } else {
                 "$script:developmentMode = $true"
             };
-            let script = format!("{UNINSTALL_MOCKS}\n{setup}\n$report = & {{\n{production}\n}} | ConvertFrom-Json\n@{{ report = $report; calls = $script:removeCalls }} | ConvertTo-Json -Depth 8 -Compress");
+            let script = format!(
+                "{UNINSTALL_MOCKS}\n{setup}\n$report = & {{\n{production}\n}} | ConvertFrom-Json\n@{{ report = $report; calls = $script:removeCalls }} | ConvertTo-Json -Depth 8 -Compress"
+            );
             let value: serde_json::Value =
                 serde_json::from_str(&run_powershell_json(&script).unwrap()).unwrap();
             assert_eq!(value["report"]["success"], true, "{value:?}");
@@ -7656,7 +8209,10 @@ function Get-Item {
   Microsoft.PowerShell.Management\Get-Item -LiteralPath $LiteralPath -Force -ErrorAction Stop
 }
 "#;
-        let script = format!("{UNINSTALL_MOCKS}\n$env:LOCALAPPDATA = {}\n{setup}\n$report = & {{\n{production}\n}} | ConvertFrom-Json\n@{{ report = $report; removes = $script:removeCalls }} | ConvertTo-Json -Depth 8 -Compress", ps_quote(&root.to_string_lossy()));
+        let script = format!(
+            "{UNINSTALL_MOCKS}\n$env:LOCALAPPDATA = {}\n{setup}\n$report = & {{\n{production}\n}} | ConvertFrom-Json\n@{{ report = $report; removes = $script:removeCalls }} | ConvertTo-Json -Depth 8 -Compress",
+            ps_quote(&root.to_string_lossy())
+        );
         let value: serde_json::Value =
             serde_json::from_str(&run_powershell_json(&script).unwrap()).unwrap();
         assert_eq!(value["report"]["success"], false);
@@ -8768,7 +9324,10 @@ try {{
             "0x80073CFA: generic uninstall failed",
         ] {
             let production = remove_msix_package_script(true);
-            let script = format!("{UNINSTALL_MOCKS}\n$script:developmentMode = $true\n$script:forceError = {}\n{production}", ps_quote(error));
+            let script = format!(
+                "{UNINSTALL_MOCKS}\n$script:developmentMode = $true\n$script:forceError = {}\n{production}",
+                ps_quote(error)
+            );
             let report: MsixRemoveReport =
                 serde_json::from_str(&run_powershell_json(&script).unwrap()).unwrap();
             assert!(!report.success, "{report:?}");
@@ -8833,7 +9392,9 @@ $report = & {{ {production} }} | ConvertFrom-Json
             "$backupPath = Backup-CodexPackageData $p",
             "throw 'Cannot safely preserve linked package data: AC; removal was not started'",
         );
-        let script = format!("{UNINSTALL_MOCKS}\n$report = & {{ {production} }} | ConvertFrom-Json\n@{{ report = $report; calls = $script:removeCalls; registered = -not $script:removed }} | ConvertTo-Json -Depth 8 -Compress");
+        let script = format!(
+            "{UNINSTALL_MOCKS}\n$report = & {{ {production} }} | ConvertFrom-Json\n@{{ report = $report; calls = $script:removeCalls; registered = -not $script:removed }} | ConvertTo-Json -Depth 8 -Compress"
+        );
         let value: serde_json::Value =
             serde_json::from_str(&run_powershell_json(&script).unwrap()).unwrap();
         assert_eq!(value["report"]["success"], false);
@@ -9122,7 +9683,10 @@ $report = & {{ {production} }} | ConvertFrom-Json
     #[test]
     fn native_msix_file_uri_roundtrips_reserved_characters() {
         let path = r"C:\安装 100% #测试\Codex.msix";
-        let script = format!("$uri = [Uri]::new({}, [UriKind]::Absolute); @{{ path = $uri.LocalPath; fragment = $uri.Fragment; isFile = $uri.IsFile }} | ConvertTo-Json -Compress", ps_quote(path));
+        let script = format!(
+            "$uri = [Uri]::new({}, [UriKind]::Absolute); @{{ path = $uri.LocalPath; fragment = $uri.Fragment; isFile = $uri.IsFile }} | ConvertTo-Json -Compress",
+            ps_quote(path)
+        );
         let value: serde_json::Value =
             serde_json::from_str(&run_powershell_json(&script).unwrap()).unwrap();
         assert_eq!(value["path"], path);
@@ -9389,7 +9953,9 @@ function Get-CimInstance { [CmdletBinding()]param($ClassName,$Filter) throw 'une
             (r"C:\Program Files\WindowsApps", false),
             (r"D:\WindowsApps", true),
         ] {
-            let script = format!("{SYSTEM_PACKAGE_ALIAS_MOCKS}\n{mocks}\n$script:processPath='{root}\\'+$script:fullName+'\\app\\ChatGPT.exe'; $script:denied=${denied}\n$result=& {{ {production} }} | ConvertFrom-Json\n@{{report=$result;starts=$script:starts;stops=$script:stops}} | ConvertTo-Json -Compress -Depth 5");
+            let script = format!(
+                "{SYSTEM_PACKAGE_ALIAS_MOCKS}\n{mocks}\n$script:processPath='{root}\\'+$script:fullName+'\\app\\ChatGPT.exe'; $script:denied=${denied}\n$result=& {{ {production} }} | ConvertFrom-Json\n@{{report=$result;starts=$script:starts;stops=$script:stops}} | ConvertTo-Json -Compress -Depth 5"
+            );
             let json = run_powershell_json(&script).unwrap();
             let data: serde_json::Value = serde_json::from_str(&json).unwrap();
             assert_eq!(data["report"]["activationOk"], !denied, "{json}");

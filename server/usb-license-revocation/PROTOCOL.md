@@ -2,9 +2,9 @@
 
 ## Public endpoints
 
-The USB client-facing API is `POST /v1/licenses/check`, `POST /v1/licenses/register`, and `GET /healthz`. `healthz` reports process liveness only; it reveals no database/key details. An optional authenticated operator console is served at `/admin/`; its paths are separate from the USB client protocol. All other paths are 404/405. The app listener must be a literal loopback address and is intended to sit behind a TLS reverse proxy.
+The USB client-facing API is `POST /v1/licenses/check`, `POST /v1/licenses/register`, and `GET /healthz`. `healthz` returns 200 when the store has no known unavailable state and 503 when it is unknown; it reveals no database/key details and does not replace the full consistency checks on business requests. An optional authenticated operator console is served at `/admin/`; its paths are separate from the USB client protocol. All other paths are 404/405. The app listener must be a literal loopback address and is intended to sit behind a TLS reverse proxy.
 
-The check accepts `application/json`, at most 64 KiB, strict known fields only, rejects duplicate JSON keys, and has 3 second application, 5 second connection read/write, and 30 second idle limits. A process-wide token bucket defaults to 60 checks/minute with burst 10. Error bodies are generic and unsigned. Unknown database state and unknown installation records return 503; malformed request/proof returns 400; no error path returns a signed status.
+The check accepts `application/json`, at most 64 KiB, strict known fields only, rejects duplicate JSON keys, and has 3 second application, 5 second connection read/write, and 30 second idle limits. A process-wide token bucket defaults to 60 checks/minute with burst 10. Error bodies are generic and unsigned. Unknown database state and unknown installation records return 503; malformed request/proof returns 400; a valid proof conflicting with the stored binding returns 409 without disabling other licenses. No error path returns a signed status.
 
 ## Registration proof verification
 
@@ -60,7 +60,7 @@ SQLite uses WAL, `synchronous=FULL`, foreign-key mode, and a 2500 ms busy timeou
 
 An append is fsynced to both journals before the SQLite transaction; failure or a crash cannot produce a signed state before state and audit agree. Startup may replay a database snapshot that is an exact prefix of the fully verified dual journals. It never signs a divergent or journal-ahead state. A restore marker always disables signing until an operator recovers and verifies state. The optional admin console has separate account/password authentication, in-memory sessions, strict configured Origin checks, and CSRF tokens; see the VPS admin-console development design. The CLI remains available for server recovery and local maintenance.
 
-The service logs only outcome category, installation ID, state version when available, request ID, elapsed time, and service lifecycle messages. It does not log registration bytes, signature, fingerprint, private key, reason, or database content. SQLite/journal data contains no full fingerprint or bearer credential.
+The service logs only outcome category, fixed failure-reason category, installation ID, state version when available, request ID, elapsed time, and service lifecycle messages. It does not log registration bytes, signature, fingerprint, private key, operator-supplied revoke reason, or database content. SQLite/journal data contains no full fingerprint or bearer credential.
 
 ## Fixed local test vector
 

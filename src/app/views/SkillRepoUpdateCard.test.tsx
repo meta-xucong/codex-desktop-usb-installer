@@ -107,6 +107,7 @@ const ROLLBACK_REPORT: SkillRepoRollbackReport = {
 describe("SkillRepoUpdateCard", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    api.skillRepoApplyUpdate.mockReset().mockResolvedValue(REPORT);
     vi.spyOn(window, "confirm").mockReturnValue(true);
   });
 
@@ -118,14 +119,16 @@ describe("SkillRepoUpdateCard", () => {
     render(<I18nProvider><SkillRepoUpdateCard /></I18nProvider>);
 
     expect(screen.getByRole("button", { name: "Install Skill Hub" })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Check updates" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Install / update" })).not.toBeInTheDocument();
     expect(screen.queryByText(/independently unsigned/i)).not.toBeInTheDocument();
 
     openDetails();
     expect(screen.getByRole("dialog")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Check updates" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Install / update" })).toBeInTheDocument();
     expect(screen.getByText(/Find and install extra Skills/)).toBeInTheDocument();
     expect(screen.getByText(/Product Design plugin.*10 skills.*installed with the update/i)).toBeInTheDocument();
+    expect(screen.getByTestId("skill-repo-advanced")).not.toHaveAttribute("open");
+    expect(screen.getByText("Rollback last version")).not.toBeVisible();
   });
 
   it("checks then applies the frozen identity with one update click", async () => {
@@ -134,12 +137,12 @@ describe("SkillRepoUpdateCard", () => {
     render(<I18nProvider><SkillRepoUpdateCard /></I18nProvider>);
 
     openDetails();
-    fireEvent.click(screen.getByRole("button", { name: "Check updates" }));
+    fireEvent.click(screen.getByRole("button", { name: "Install / update" }));
     await waitFor(() => expect(screen.getByText(/Current/)).toBeTruthy());
     expect(screen.getByText(/Installable 2.*conflicts 1.*skipped 0/)).toBeInTheDocument();
-    expect(screen.getByText(/Product Design plugin.*10 skills/i)).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Update now" }));
     await waitFor(() => expect(api.skillRepoApplyUpdate).toHaveBeenCalledWith(INFO.expected));
+    expect(api.skillRepoApplyUpdate).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("skill-repo-advanced")).not.toHaveAttribute("open");
     expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
     expect(screen.getByText(/Update success/)).toBeTruthy();
     expect(screen.getByTestId("skill-repo-product-design-count")).toHaveTextContent("Product Design plugin is installed, with 10 skills.");
@@ -151,7 +154,7 @@ describe("SkillRepoUpdateCard", () => {
     render(<I18nProvider><SkillRepoUpdateCard /></I18nProvider>);
 
     openDetails();
-    fireEvent.click(screen.getByRole("button", { name: "Check updates" }));
+    fireEvent.click(screen.getByRole("button", { name: "Install / update" }));
     await waitFor(() => expect(screen.getByText(/Current/)).toBeInTheDocument());
 
     expect(screen.queryByText("unsigned")).not.toBeInTheDocument();
@@ -169,7 +172,7 @@ describe("SkillRepoUpdateCard", () => {
       render(<I18nProvider><SkillRepoUpdateCard /></I18nProvider>);
 
       openDetails();
-      fireEvent.click(screen.getByRole("button", { name: "Check updates" }));
+      fireEvent.click(screen.getByRole("button", { name: "Install / update" }));
       expect(screen.getByRole("button", { name: "Checking…" })).toBeDisabled();
 
       await act(async () => {
@@ -179,7 +182,7 @@ describe("SkillRepoUpdateCard", () => {
       });
 
       expect(screen.getByRole("alert")).toHaveTextContent(/timed out/i);
-      expect(screen.getByRole("button", { name: "Check updates" })).toBeEnabled();
+      expect(screen.getByRole("button", { name: "Install / update" })).toBeEnabled();
 
       await act(async () => {
         resolveCheck(INFO);
@@ -199,8 +202,11 @@ describe("SkillRepoUpdateCard", () => {
     render(<I18nProvider><SkillRepoUpdateCard /></I18nProvider>);
 
     openDetails();
-    fireEvent.click(screen.getByRole("button", { name: "Check updates" }));
+    fireEvent.click(screen.getByRole("button", { name: "Install / update" }));
     await waitFor(() => expect(screen.getByText("Selected source: Domestic source 2")).toBeInTheDocument());
+    expect(screen.getByText("Selected source: Domestic source 2")).not.toBeVisible();
+    fireEvent.click(screen.getByText("Alternative sources and advanced actions"));
+    expect(screen.getByText("Selected source: Domestic source 2")).toBeVisible();
 
     const attempts = screen.getAllByTestId("skill-repo-source-attempt");
     expect(attempts).toHaveLength(2);
@@ -220,7 +226,7 @@ describe("SkillRepoUpdateCard", () => {
     render(<I18nProvider><SkillRepoUpdateCard /></I18nProvider>);
 
     openDetails();
-    fireEvent.click(screen.getByRole("button", { name: "Check updates" }));
+    fireEvent.click(screen.getByRole("button", { name: "Install / update" }));
     await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(/temporarily unavailable/i));
 
     const alert = screen.getByRole("alert");
@@ -243,7 +249,7 @@ describe("SkillRepoUpdateCard", () => {
     render(<I18nProvider><SkillRepoUpdateCard /></I18nProvider>);
 
     openDetails();
-    fireEvent.click(screen.getByRole("button", { name: "Check updates" }));
+    fireEvent.click(screen.getByRole("button", { name: "Install / update" }));
     await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
     expect(screen.getByRole("alert")).toHaveTextContent("The update source or confirmed version is invalid");
 
@@ -267,7 +273,7 @@ describe("SkillRepoUpdateCard", () => {
     render(<I18nProvider><SkillRepoUpdateCard /></I18nProvider>);
 
     openDetails();
-    fireEvent.click(screen.getByRole("button", { name: "Check updates" }));
+    fireEvent.click(screen.getByRole("button", { name: "Install / update" }));
     await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
     fireEvent.click(screen.getByText("Show details"));
     fireEvent.click(screen.getByRole("button", { name: "Copy diagnostics" }));
@@ -286,9 +292,7 @@ describe("SkillRepoUpdateCard", () => {
     render(<I18nProvider><SkillRepoUpdateCard /></I18nProvider>);
 
     openDetails();
-    fireEvent.click(screen.getByRole("button", { name: "Check updates" }));
-    await waitFor(() => expect(screen.getByRole("button", { name: "Update now" })).toBeEnabled());
-    fireEvent.click(screen.getByRole("button", { name: "Update now" }));
+    fireEvent.click(screen.getByRole("button", { name: "Install / update" }));
 
     await waitFor(() => expect(screen.getByTestId("skill-repo-apply-result")).toHaveTextContent("Update partial"));
     expect(screen.getByTestId("skill-repo-apply-counts")).toHaveTextContent(
@@ -306,9 +310,7 @@ describe("SkillRepoUpdateCard", () => {
     render(<I18nProvider><SkillRepoUpdateCard /></I18nProvider>);
 
     openDetails();
-    fireEvent.click(screen.getByRole("button", { name: "Check updates" }));
-    await waitFor(() => expect(screen.getByRole("button", { name: "Update now" })).toBeEnabled());
-    fireEvent.click(screen.getByRole("button", { name: "Update now" }));
+    fireEvent.click(screen.getByRole("button", { name: "Install / update" }));
 
     await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
     expect(screen.getByRole("alert")).not.toHaveTextContent(rawFailure);
@@ -322,6 +324,7 @@ describe("SkillRepoUpdateCard", () => {
     render(<I18nProvider><SkillRepoUpdateCard /></I18nProvider>);
 
     openDetails();
+    fireEvent.click(screen.getByText("Alternative sources and advanced actions"));
     fireEvent.click(screen.getByRole("button", { name: "Rollback last version" }));
     const confirm = screen.getByRole("alertdialog");
     expect(confirm).toHaveTextContent("Roll back the last complete hot-update generation?");
@@ -342,6 +345,7 @@ describe("SkillRepoUpdateCard", () => {
     render(<I18nProvider><SkillRepoUpdateCard /></I18nProvider>);
 
     openDetails();
+    fireEvent.click(screen.getByText("Alternative sources and advanced actions"));
     fireEvent.click(screen.getByRole("button", { name: "Rollback last version" }));
     fireEvent.click(screen.getByRole("alertdialog").querySelector("button.btn.primary")!);
 

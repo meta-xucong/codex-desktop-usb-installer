@@ -12,6 +12,7 @@ import base64
 import contextlib
 import hashlib
 import hmac
+import http.client
 import ipaddress
 import json
 import mimetypes
@@ -34,6 +35,7 @@ from typing import Any, Callable
 
 
 SERVER_VERSION = "1.3.11"
+TRANSPORT_DIAGNOSTICS_REVISION = "phase-trace-v2-catalog-v1"
 PROTOCOL_VERSION = "2025-03-26"
 MAX_JSON_BYTES = 32 * 1024 * 1024
 HTTP_TIMEOUT_SECONDS = 600
@@ -140,7 +142,9 @@ def _configured_model(provider: str) -> str:
     if explicit:
         return explicit
     models = _runtime_config().get("models", {})
-    return str(models.get(provider, "")).strip() if isinstance(models, dict) else ""
+    saved = str(models.get(provider, "")).strip() if isinstance(models, dict) else ""
+    # Preserve both supported setting sources before the existing installer default.
+    return saved or ("gpt-image-2.5" if provider == "image-2" else "")
 
 
 def _route_context() -> dict[str, str]:
@@ -156,12 +160,13 @@ def media_refresh_models(args: dict[str, Any]) -> dict[str, Any]:
     # Wokey's default model catalog is text-only. Ask explicitly for all
     # modalities so the media model slots can be matched against its live list.
     catalog_path = "/v1/models?output_modalities=all" if _api_profile() == "wokey" else "/v1/models"
-    response = _http_json("GET", catalog_path, None, "catalog")
+    transport_diagnostic: dict[str, Any] = {}
+    response = _http_json("GET", catalog_path, None, "catalog", diagnostic_out=transport_diagnostic)
     rows = response.get("data")
     if not isinstance(rows, list):
-        raise MediaError("模型目录缺少 data 数组；未更新配置。")
+        raise MediaError("模型目录缺少 data 数组；未更新配置。", details={"transport_diagnostic": transport_diagnostic})
     if len(rows) > 10000:
-        raise MediaError("模型目录项目数超过上限；未更新配置。", code="MODEL_CATALOG_INVALID")
+        raise MediaError("模型目录项目数超过上限；未更新配置。", code="MODEL_CATALOG_INVALID", details={"transport_diagnostic": transport_diagnostic})
     available = set()
     for row in rows:
         if not isinstance(row, dict) or not isinstance(row.get("id"), str):
@@ -196,6 +201,7 @@ def media_refresh_models(args: dict[str, Any]) -> dict[str, Any]:
     return {"success": True, "api_request_sent": True, "generation_request_sent": False,
             "gateway_catalog_status": "verified", "catalog_verified_at": config["catalogVerifiedAt"],
             "models": models, "catalog_count": len(available), "config_path": str(_config_path()),
+            "transport_diagnostic": transport_diagnostic,
             "note": "目录认证通过；模型生成路由仍需实际验收。"}
 
 
@@ -1377,7 +1383,162 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         raise MediaError("媒体服务 API 返回重定向；为避免泄露凭据，已拒绝跟随。")
 
 
-def _http_json(method: str, path: str, payload: dict[str, Any] | bytes | None, provider: str, idempotency_key: str | None = None, content_type: str = "application/json", before_request: Callable[[], None] | None = None, sensitive_texts: tuple[str, ...] = ()) -> dict[str, Any]:
+class _TransportTrace:
+    """Bounded metadata only: never collect headers, payloads or exception text."""
+    def __init__(self):
+        self.started = time.monotonic()
+        self.phase = "not_started"
+        self.events: list[dict[str, Any]] = []
+        self.addresses: list[dict[str, Any]] = []
+        self.peer: dict[str, Any] | None = None
+        self.request_bytes_written = 0
+        self.response_received = False
+        self.http_status: int | None = None
+        self.request_attempted = False
+        self.events_truncated = False
+        self.address_count = 0
+
+    def mark(self, phase: str, **extra: Any) -> None:
+        elapsed = round((time.monotonic() - self.started) * 1000, 1)
+        if self.events and "duration_ms" not in self.events[-1]:
+            self.events[-1]["duration_ms"] = round(max(0, elapsed - self.events[-1]["elapsed_ms"]), 1)
+        self.phase = phase
+        if len(self.events) < 48:
+            self.events.append({"phase": phase, "elapsed_ms": elapsed, **extra})
+        else:
+            self.events_truncated = True
+
+    def snapshot(self, *, failed: bool = True) -> dict[str, Any]:
+        elapsed = round((time.monotonic() - self.started) * 1000, 1)
+        events = [dict(event) for event in self.events]
+        if events and "duration_ms" not in events[-1]:
+            events[-1]["duration_ms"] = round(max(0, elapsed - events[-1]["elapsed_ms"]), 1)
+        return {"failure_phase": self.phase if failed else None, "last_phase": self.phase, "elapsed_ms": elapsed,
+                "events": events, "events_truncated": self.events_truncated,
+                "dns_addresses": list(self.addresses), "dns_candidate_count": max(self.address_count, len(self.addresses)), "peer": self.peer,
+                "request_bytes_written": self.request_bytes_written,
+                "http_response_received": self.response_received,
+                "process": {"pid": os.getpid(), "executable": sys.executable,
+                            "python_version": sys.version.split()[0],
+                            "proxy_sources": sorted(urllib.request.getproxies().keys()),
+                            "api_profile": _api_profile()}}
+
+
+class _TracedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, *args: Any, trace: _TransportTrace, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        self._trace = trace
+        self._create_connection = self._traced_create_connection
+
+    def _traced_create_connection(self, address: tuple[str, int], timeout: Any, source_address: Any = None):
+        trace = self._trace
+        trace.mark("dns_resolution")
+        addresses = socket.getaddrinfo(address[0], address[1], 0, socket.SOCK_STREAM)
+        trace.address_count = len(addresses)
+        trace.addresses = [{"family": "IPv6" if af == socket.AF_INET6 else "IPv4", "ip": sa[0], "port": sa[1]}
+                           for af, _, _, _, sa in addresses[:16]]
+        trace.mark("dns_resolved")
+        # Preserve socket.create_connection's address iteration, source binding,
+        # timeout and final error semantics. No HTTP request is retried here.
+        errors = []
+        for af, socktype, proto, _, sa in addresses:
+            sock = None
+            try:
+                sock = socket.socket(af, socktype, proto)
+                if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+                    sock.settimeout(timeout)
+                if source_address:
+                    sock.bind(source_address)
+                trace.mark("tcp_connect", family="IPv6" if af == socket.AF_INET6 else "IPv4", ip=sa[0], port=sa[1])
+                sock.connect(sa)
+                # The successful connect target is already known. Do not add a
+                # peer query whose diagnostic failure could reject a live socket.
+                trace.peer = {"family": "IPv6" if af == socket.AF_INET6 else "IPv4", "ip": sa[0], "port": sa[1]}
+                trace.mark("tcp_connected")
+                return sock
+            except OSError as exc:
+                trace.mark("tcp_connect_failed", exception_type=type(exc).__name__, errno=getattr(exc, "errno", None), winerror=getattr(exc, "winerror", None))
+                errors[:] = [exc]
+                if sock is not None:
+                    sock.close()
+        if errors:
+            raise errors[0]
+        raise OSError("getaddrinfo returns an empty list")
+
+    def _tunnel(self):
+        self._trace.mark("proxy_tunnel")
+        super()._tunnel()
+        self._trace.mark("proxy_tunnel_established")
+
+    def connect(self):
+        http.client.HTTPConnection.connect(self)
+        self._trace.mark("tls_handshake")
+        self.sock = self._context.wrap_socket(self.sock, server_hostname=self._tunnel_host or self.host)
+        self._trace.mark("tls_established", tls_version=self.sock.version())
+
+    def send(self, data):
+        if self.sock is None and self.auto_open:
+            self.connect()
+        self._trace.mark("http_write")
+        super().send(data)
+        size = len(data) if isinstance(data, (bytes, bytearray, memoryview, str)) else None
+        if size is not None:
+            self._trace.request_bytes_written += size
+        self._trace.mark("http_write_completed", bytes=size)
+
+    def getresponse(self):
+        self._trace.mark("response_headers_wait")
+        response = super().getresponse()
+        self._trace.response_received = True
+        self._trace.http_status = response.status
+        self._trace.mark("response_headers_received", http_status=response.status)
+        return response
+
+
+class _TracedHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, trace: _TransportTrace):
+        super().__init__()
+        self._trace = trace
+
+    def https_open(self, req):
+        def connection(*args, **kwargs):
+            return _TracedHTTPSConnection(*args, trace=self._trace, **kwargs)
+        return self.do_open(connection, req, context=self._context)
+
+
+def _transport_diagnostic(exc: BaseException | None, path: str, *, response_received: bool = False, trace: _TransportTrace | None = None) -> dict[str, Any]:
+    """Retain safe evidence without recording headers, keys, URLs or prompts.
+
+    api_request_sent is a legacy conservative attempt marker written before
+    opener.open(). It must not be treated as proof of delivery to the gateway.
+    Never use these diagnostics to authorize an automatic retry.
+    """
+    cause = getattr(exc, "reason", None)
+    if not isinstance(cause, BaseException):
+        cause = exc
+    diagnostic: dict[str, Any] = {
+        "revision": TRANSPORT_DIAGNOSTICS_REVISION,
+        "delivery_evidence": "http_response_received" if response_received or isinstance(exc, urllib.error.HTTPError) or (trace and trace.response_received) else "unconfirmed",
+        "endpoint": urllib.parse.urlsplit(path).path,
+        "api_request_sent_semantics": "request_attempted_not_delivery_confirmed",
+    }
+    if exc is not None:
+        diagnostic.update(exception_type=type(exc).__name__, cause_type=type(cause).__name__)
+    for name in ("errno", "winerror"):
+        value = getattr(cause, name, None)
+        if isinstance(value, int):
+            diagnostic[name] = value
+    if isinstance(exc, urllib.error.HTTPError):
+        diagnostic["http_status"] = exc.code
+    if trace is not None:
+        diagnostic["request_attempted"] = trace.request_attempted
+        if isinstance(trace.http_status, int):
+            diagnostic["http_status"] = trace.http_status
+        diagnostic["phase_trace"] = trace.snapshot(failed=exc is not None)
+    return diagnostic
+
+
+def _http_json(method: str, path: str, payload: dict[str, Any] | bytes | None, provider: str, idempotency_key: str | None = None, content_type: str = "application/json", before_request: Callable[[], None] | None = None, sensitive_texts: tuple[str, ...] = (), diagnostic_out: dict[str, Any] | None = None) -> dict[str, Any]:
     key = _api_key()
     if not key:
         raise MediaError("未配置 MEDIA_GENERATION_API_KEY；没有发送 API 请求。")
@@ -1403,16 +1564,31 @@ def _http_json(method: str, path: str, payload: dict[str, Any] | bytes | None, p
     # The local single-use state machine is not an upstream duplicate-charge guarantee.
     data = _canonical(payload) if isinstance(payload, dict) else payload
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
-    opener = urllib.request.build_opener(_NoRedirect)
+    trace = _TransportTrace()
+    opener = urllib.request.build_opener(_NoRedirect, _TracedHTTPSHandler(trace))
+    response_received = False
     try:
         if before_request is not None:
             before_request()
+        trace.request_attempted = True
         with opener.open(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
+            response_received = True
+            trace.response_received = True
+            if isinstance(getattr(response, "status", None), int):
+                trace.http_status = response.status
+            trace.mark("response_body_read")
             raw = response.read(MAX_JSON_BYTES + 1)
+            trace.mark("response_body_read_completed")
             if len(raw) > MAX_JSON_BYTES:
                 raise MediaError("媒体服务 JSON 响应超过大小上限。")
+            trace.mark("response_json_parse")
             parsed = json.loads(raw.decode("utf-8-sig"))
+            if not isinstance(parsed, dict):
+                raise MediaError("媒体服务返回了非对象 JSON。")
+            trace.mark("completed")
     except urllib.error.HTTPError as exc:
+        trace.response_received = True
+        trace.http_status = exc.code
         try:
             provider_body = json.loads(exc.read(8192).decode("utf-8", errors="replace"))
         except Exception:
@@ -1427,24 +1603,26 @@ def _http_json(method: str, path: str, payload: dict[str, Any] | bytes | None, p
             message = f"上游 HTTP {exc.code}，提交结果未知；请勿重新提交。"
             if remote_detail:
                 message += f" 服务端诊断：{remote_detail}"
-            raise MediaError(message, code="SUBMISSION_UNKNOWN", provider=provider, http_status=exc.code, provider_request_id=provider_request_id, gateway_request_id=gateway_request_id, submission_state="submission_unknown", api_request_sent=True) from exc
+            raise MediaError(message, code="SUBMISSION_UNKNOWN", provider=provider, http_status=exc.code, provider_request_id=provider_request_id, gateway_request_id=gateway_request_id, submission_state="submission_unknown", api_request_sent=True, details={"transport_diagnostic": _transport_diagnostic(exc, path, trace=trace)}) from exc
         if method != "POST" and exc.code >= 500:
-            raise MediaError(f"上游暂时无法响应（HTTP {exc.code}）；可稍后查询同一任务。", code="UPSTREAM_UNAVAILABLE", provider=provider, http_status=exc.code, provider_request_id=provider_request_id, gateway_request_id=gateway_request_id, retryable=True, api_request_sent=False) from exc
+            raise MediaError(f"上游暂时无法响应（HTTP {exc.code}）；可稍后查询同一任务。", code="UPSTREAM_UNAVAILABLE", provider=provider, http_status=exc.code, provider_request_id=provider_request_id, gateway_request_id=gateway_request_id, retryable=True, api_request_sent=False, details={"transport_diagnostic": _transport_diagnostic(exc, path, trace=trace)}) from exc
         mapping = {401: ("UPSTREAM_AUTH_FAILED", "上游认证失败。"), 403: ("UPSTREAM_AUTH_FAILED", "上游拒绝当前账户或能力权限。"), 404: ("UPSTREAM_MODEL_NOT_FOUND", "上游未找到请求的模型或接口。"), 400: ("UPSTREAM_INPUT_REJECTED", "上游拒绝请求参数或内容。"), 422: ("UPSTREAM_INPUT_REJECTED", "上游拒绝请求参数或内容。")}
         code, safe_message = mapping.get(exc.code, ("UPSTREAM_REQUEST_REJECTED", f"上游拒绝请求（HTTP {exc.code}）。"))
         if provider_code in {"content_policy_violation", "safety_violation", "content_policy"}:
             code, safe_message = "UPSTREAM_CONTENT_POLICY", "上游内容政策拒绝了本次请求。"
         if remote_detail:
             safe_message += f" 服务端诊断：{remote_detail}"
-        raise MediaError(safe_message, code=code, provider=provider, http_status=exc.code, provider_request_id=provider_request_id, gateway_request_id=gateway_request_id, submission_state="submission_rejected" if method == "POST" else None, api_request_sent=method == "POST") from exc
-    except MediaError:
+        raise MediaError(safe_message, code=code, provider=provider, http_status=exc.code, provider_request_id=provider_request_id, gateway_request_id=gateway_request_id, submission_state="submission_rejected" if method == "POST" else None, api_request_sent=method == "POST", details={"transport_diagnostic": _transport_diagnostic(exc, path, trace=trace)}) from exc
+    except MediaError as exc:
+        exc.details.setdefault("transport_diagnostic", _transport_diagnostic(exc, path, trace=trace))
         raise
-    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException, UnicodeDecodeError, json.JSONDecodeError) as exc:
         if method == "POST":
-            raise MediaError("提交状态未知：连接在提交后中断，无法确认上游是否接受；请勿重新提交。", code="SUBMISSION_UNKNOWN", provider=provider, submission_state="submission_unknown", api_request_sent=True) from exc
-        raise MediaError("媒体服务暂时无法响应；原任务状态未更改。", code="UPSTREAM_UNAVAILABLE", provider=provider, retryable=True, api_request_sent=False) from exc
-    if not isinstance(parsed, dict):
-        raise MediaError("媒体服务返回了非对象 JSON。")
+            message = "已收到 HTTP 响应，但读取或解析失败；无法确认生成结果，请勿重新提交。" if response_received else "网络请求失败，无法确认请求是否已发送或被上游接受；请勿重新提交。"
+            raise MediaError(message, code="SUBMISSION_UNKNOWN", provider=provider, submission_state="submission_unknown", api_request_sent=True, details={"transport_diagnostic": _transport_diagnostic(exc, path, response_received=response_received, trace=trace)}) from exc
+        raise MediaError("媒体服务暂时无法响应；原任务状态未更改。", code="UPSTREAM_UNAVAILABLE", provider=provider, retryable=True, api_request_sent=False, details={"transport_diagnostic": _transport_diagnostic(exc, path, response_received=response_received, trace=trace)}) from exc
+    if diagnostic_out is not None:
+        diagnostic_out.update(_transport_diagnostic(None, path, trace=trace))
     return parsed
 
 
@@ -1822,6 +2000,8 @@ def _media_submit_locked(args: dict[str, Any]) -> dict[str, Any]:
         record["last_error_code"] = exc.code
         record["provider_request_id"] = exc.provider_request_id
         record["gateway_request_id"] = exc.gateway_request_id
+        if isinstance(exc.details.get("transport_diagnostic"), dict):
+            record["last_transport_diagnostic"] = exc.details["transport_diagnostic"]
         _atomic_json(path, record)
         raise
     except Exception as exc:
@@ -2271,6 +2451,7 @@ def _configured() -> dict[str, Any]:
         "base_url_configured": base_ok,
         "api_profile": _api_profile(),
         "http_timeout_seconds": HTTP_TIMEOUT_SECONDS,
+        "transport_diagnostics": {"revision": TRANSPORT_DIAGNOSTICS_REVISION, "base_revision": "phase-trace-v2", "loaded_pid": os.getpid(), "python_executable": sys.executable, "catalog_get_success_trace": True},
         "gateway_catalog": {"status": "fresh" if catalog_fresh else "stale" if catalog_at else "not_checked", "verified_at": catalog_at, "model_count": catalog_count, "ttl_seconds": MODEL_CATALOG_TTL_SECONDS},
         "generation_capability": "not_tested",
         "providers": providers,
@@ -2487,6 +2668,15 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    if "--configuration-check" in sys.argv[1:]:
+        # Local only. Use the same model resolver as the MCP, including its
+        # saved catalog; never query the gateway or disclose credentials/models.
+        try:
+            count = sum(bool(_configured_model(provider)) for provider in PROVIDERS)
+            print(json.dumps({"configuredModelCount": count}))
+        except Exception as exc:
+            print(json.dumps({"configuredModelCount": 0, "modelErrorType": type(exc).__name__}))
+        raise SystemExit(0)
     if "--healthcheck" in sys.argv[1:]:
         runtime_ready = sys.implementation.name == "cpython" and sys.version_info >= (3, 12)
         protocol_ready = False
@@ -2541,6 +2731,7 @@ if __name__ == "__main__":
             "python": ".".join(str(part) for part in sys.version_info[:3]),
             "implementation": sys.implementation.name,
             "serverVersion": SERVER_VERSION,
+            "transportDiagnosticsRevision": TRANSPORT_DIAGNOSTICS_REVISION,
             "dependencies": "python-standard-library",
             "protocol": "utf-8" if protocol_ready else "failed",
             "toolCount": len(TOOL_SCHEMAS),

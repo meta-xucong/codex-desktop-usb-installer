@@ -54,6 +54,10 @@ $env:MEDIA_GENERATION_DATA_DIR = $dataRoot
 $connectionPath = Join-Path $kitHome 'connections\media-generation.connection.json'
 $credentialPath = Join-Path $kitHome 'connections\media-generation.credential.dpapi'
 $credentialSource = if (-not [string]::IsNullOrWhiteSpace($env:MEDIA_GENERATION_API_KEY)) { 'process' } else { 'missing' }
+$connectionErrorType = $null
+$connectionErrorCode = $null
+$credentialErrorType = $null
+$credentialErrorCode = $null
 if (Test-Path -LiteralPath $connectionPath -PathType Leaf) {
     try {
         $connection = Get-Content -LiteralPath $connectionPath -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -67,6 +71,9 @@ if (Test-Path -LiteralPath $connectionPath -PathType Leaf) {
             $env:MEDIA_GENERATION_API_PROFILE = [string]$connection.apiProfile
         }
     } catch {
+        $connectionError = if ($_.Exception.InnerException) { $_.Exception.InnerException } else { $_.Exception }
+        $connectionErrorType = $connectionError.GetType().Name
+        $connectionErrorCode = $connectionError.HResult
         [Console]::Error.WriteLine('Media MCP connection settings could not be read; API calls remain disabled.')
     }
 }
@@ -88,6 +95,8 @@ if ([string]::IsNullOrWhiteSpace($env:MEDIA_GENERATION_API_KEY) -and (Test-Path 
     } catch {
         $failureType = if ($_.Exception.InnerException) { $_.Exception.InnerException.GetType().Name } else { $_.Exception.GetType().Name }
         $failureCode = if ($_.Exception.InnerException) { $_.Exception.InnerException.HResult } else { $_.Exception.HResult }
+        $credentialErrorType = $failureType
+        $credentialErrorCode = $failureCode
         [Console]::Error.WriteLine(('Media MCP credential is unavailable for this Windows user ({0}, 0x{1:X8}); API calls remain disabled.' -f $failureType, $failureCode))
     }
 }
@@ -103,13 +112,18 @@ try {
     # Models may still be supplied by the USB launcher environment.
 }
 if ($CredentialCheck) {
-    $modelNames = @('MEDIA_IMAGE2_MODEL','MEDIA_GROK_IMAGE_MODEL','MEDIA_GROK_VIDEO_MODEL','MEDIA_SEEDANCE_MODEL','MEDIA_MINIMAX_VIDEO_MODEL')
-    $configuredModels = @($modelNames | Where-Object { -not [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_, 'Process')) }).Count
+    $modelCheck = (& $python $server --configuration-check | Out-String) | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0) { throw 'The media MCP local configuration check failed.' }
     [ordered]@{
         baseUrlConfigured = -not [string]::IsNullOrWhiteSpace($env:MEDIA_GENERATION_API_BASE_URL)
         apiKeyConfigured = -not [string]::IsNullOrWhiteSpace($env:MEDIA_GENERATION_API_KEY)
-        configuredModelCount = $configuredModels
+        configuredModelCount = [int]$modelCheck.configuredModelCount
+        modelErrorType = $modelCheck.modelErrorType
         credentialSource = $credentialSource
+        connectionErrorType = $connectionErrorType
+        connectionErrorCode = $connectionErrorCode
+        credentialErrorType = $credentialErrorType
+        credentialErrorCode = $credentialErrorCode
     } | ConvertTo-Json -Compress
     return
 }

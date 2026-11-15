@@ -3,18 +3,22 @@
 //! The pack is a separate, signed-by-build-input directory shipped beside the
 //! USB manager. This module invokes the pack's local PowerShell installer.
 //! Skills, Python/Node base runtimes, Feishu MCP, FFmpeg, and Manim are bundled;
-//! the HyperFrames CLI and its browser may need network access during setup.
+//! the HyperFrames CLI may need npm access; its pinned browser is bundled.
 //! A missing network-dependent component is reported as requires-network and
 //! does not prevent the remaining capability pack from being installed.
 
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Read};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::errors::AppError;
 
@@ -27,6 +31,31 @@ const MEDIA_AUTHORIZATION_RELATIVE: &str =
 const CONNECTION_OWNERSHIP_RELATIVE: &str = "codex-agent-kit/connection-ownership.json";
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+#[cfg(target_os = "windows")]
+const CREATE_SUSPENDED: u32 = 0x0000_0004;
+const CAPABILITY_INSTALL_PROGRESS_EVENT: &str = "capability-pack://progress";
+const CAPABILITY_INSTALL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const CAPABILITY_PROGRESS_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const CAPABILITY_INSTALL_STAGES: &[&str] = &[
+    "pack.validate",
+    "pack.skills",
+    "runtime.verify",
+    "runtime.python",
+    "runtime.manim",
+    "runtime.nodeMedia",
+    "runtime.hyperframes",
+    "runtime.hyperframesFfmpeg",
+    "runtime.hyperframesCliCheck",
+    "runtime.hyperframesBrowser",
+    "runtime.hyperframesBrowserCheck",
+    "runtime.feishu",
+    "runtime.complete",
+    "pack.pdf",
+    "pack.media",
+    "pack.config",
+    "pack.models",
+    "pack.finalize",
+];
 const OWNED_CONNECTION_ENV_NAMES: &[&str] = &[
     "FEISHU_APP_ID",
     "FEISHU_APP_SECRET",
@@ -194,10 +223,41 @@ fn report_missing(message: impl Into<String>) -> CapabilityPackReport {
 }
 
 fn user_profile() -> Result<PathBuf, AppError> {
+    if crate::app::usb_guard::guard_required() {
+        let profile = crate::app::usb_guard::local_data_paths()?
+            .user_profile
+            .filter(|path| path.is_absolute())
+            .ok_or_else(|| AppError::Engine("无法确定当前桌面用户目录".to_string()))?;
+        return Ok(profile);
+    }
     std::env::var_os("USERPROFILE")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
         .ok_or_else(|| AppError::Engine("无法确定当前 Windows 用户目录".to_string()))
+}
+
+fn powershell_provider_path(path: &Path) -> std::ffi::OsString {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+        let wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        let verbatim_prefix = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+        let is_ascii_drive_letter = |value: u16| {
+            (b'A' as u16..=b'Z' as u16).contains(&value)
+                || (b'a' as u16..=b'z' as u16).contains(&value)
+        };
+        if wide.starts_with(&verbatim_prefix)
+            && wide.len() >= 7
+            && is_ascii_drive_letter(wide[4])
+            && wide[5] == b':' as u16
+            && wide[6] == b'\\' as u16
+        {
+            return std::ffi::OsString::from_wide(&wide[verbatim_prefix.len()..]);
+        }
+    }
+
+    path.as_os_str().to_owned()
 }
 
 fn is_reparse_point(path: &Path) -> bool {
@@ -452,13 +512,129 @@ fn readiness_summary(codex_home: &Path) -> ReadinessSummary {
 mod tests {
     use super::{
         core_ready_from_readiness, legacy_media_names_owned, media_install_ready,
-        media_install_switch, persist_connection_ownership, readiness_path, readiness_summary,
-        strip_utf8_bom, validate_options, write_media_authorization_status,
-        CapabilityPackInstallOptions, ConnectionOwnershipRecord, CONNECTION_OWNERSHIP_RELATIVE,
-        KIT_HOME_RELATIVE, PACK_ID,
+        media_install_switch, persist_connection_ownership, powershell_provider_path,
+        readiness_path, readiness_summary, strip_utf8_bom, validate_options,
+        write_media_authorization_status, CapabilityPackInstallOptions, ConnectionOwnershipRecord,
+        CONNECTION_OWNERSHIP_RELATIVE, KIT_HOME_RELATIVE, PACK_ID,
     };
     use serde_json::json;
     use std::fs;
+
+    #[cfg(windows)]
+    #[test]
+    fn capability_installer_timeout_reports_latest_stage_and_captures_output() {
+        use super::{run_capability_installer, CapabilityProcessError, CapabilityProgressFile};
+        use std::process::Command;
+        use std::time::Duration;
+
+        let progress = CapabilityProgressFile::create().unwrap();
+        fs::write(progress.path(), "pack.validate").unwrap();
+        let quoted_path = progress.path().to_string_lossy().replace('\'', "''");
+        let script = format!(
+            "[IO.File]::WriteAllText('{quoted_path}', 'runtime.python', [Text.Encoding]::ASCII); [Console]::WriteLine('process-started'); Start-Sleep -Seconds 8"
+        );
+        let mut command = Command::new("powershell.exe");
+        command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+        let mut stages = Vec::new();
+        let error = run_capability_installer(
+            &mut command,
+            progress.path(),
+            Duration::from_secs(2),
+            |stage| stages.push(stage.to_string()),
+        )
+        .unwrap_err();
+
+        match error {
+            CapabilityProcessError::Timeout { stage, output } => {
+                assert_eq!(stage, "runtime.python");
+                assert!(String::from_utf8_lossy(&output.stdout).contains("process-started"));
+                assert!(!output.status.success());
+            }
+            other => panic!("expected timeout, got {other:?}"),
+        }
+        assert!(stages.iter().any(|stage| stage == "runtime.python"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn capability_installer_stops_descendants_that_hold_output_pipes() {
+        use super::{run_capability_installer, CapabilityProgressFile};
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        let progress = CapabilityProgressFile::create().unwrap();
+        fs::write(progress.path(), "pack.validate").unwrap();
+        let pid_file = std::env::temp_dir().join(format!(
+            "codex-capability-descendant-{}.txt",
+            uuid::Uuid::new_v4()
+        ));
+        let quoted_pid_path = pid_file.to_string_lossy().replace('\'', "''");
+        let script = format!(
+            r#"$si = [System.Diagnostics.ProcessStartInfo]::new(); $si.FileName = Join-Path $PSHOME 'powershell.exe'; $si.Arguments = '-NoProfile -NonInteractive -Command "Start-Sleep -Seconds 30"'; $si.UseShellExecute = $false; $si.CreateNoWindow = $true; $child = [System.Diagnostics.Process]::Start($si); [IO.File]::WriteAllText('{quoted_pid_path}', [string]$child.Id); [Console]::Out.WriteLine('parent-finished')"#
+        );
+        let mut command = Command::new("powershell.exe");
+        command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+        let started = Instant::now();
+        let output = run_capability_installer(
+            &mut command,
+            progress.path(),
+            Duration::from_secs(10),
+            |_| {},
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("parent-finished"));
+        assert!(started.elapsed() < Duration::from_secs(8));
+
+        let descendant_pid = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        let descendant_pid_text = descendant_pid.to_string();
+        let process_list = Command::new("tasklist.exe")
+            .args([
+                "/FI",
+                &format!("PID eq {descendant_pid_text}"),
+                "/FO",
+                "CSV",
+                "/NH",
+            ])
+            .output()
+            .unwrap();
+        let process_list = String::from_utf8_lossy(&process_list.stdout);
+        let descendant_running = process_list.contains(&format!(",\"{descendant_pid_text}\","));
+        if descendant_running {
+            let _ = Command::new("taskkill.exe")
+                .args(["/PID", &descendant_pid_text, "/T", "/F"])
+                .output();
+        }
+        let _ = fs::remove_file(pid_file);
+        assert!(
+            !descendant_running,
+            "capability installer left a process alive after its parent exited"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_provider_path_removes_only_verbatim_local_drive_prefix() {
+        use std::ffi::OsString;
+        use std::path::Path;
+
+        assert_eq!(
+            powershell_provider_path(Path::new(r"\\?\C:\Users\测试\usb-codex-home")),
+            OsString::from(r"C:\Users\测试\usb-codex-home")
+        );
+        assert_eq!(
+            powershell_provider_path(Path::new(r"C:\Users\测试\usb-codex-home")),
+            OsString::from(r"C:\Users\测试\usb-codex-home")
+        );
+        assert_eq!(
+            powershell_provider_path(Path::new(r"\\?\UNC\server\share\codex-home")),
+            OsString::from(r"\\?\UNC\server\share\codex-home")
+        );
+    }
 
     #[test]
     fn explicit_partial_readiness_is_not_upgraded_by_counts() {
@@ -470,6 +646,43 @@ mod tests {
     fn explicit_ready_readiness_is_accepted() {
         let value = json!({"core": {"status": "ready"}});
         assert!(core_ready_from_readiness(&value, true, 1, 1));
+    }
+
+    #[test]
+    fn host_core_ignores_optional_failure_but_requires_live_media_files() {
+        let home = std::env::temp_dir().join(format!("usb-host-core-{}", uuid::Uuid::new_v4()));
+        let bin = home.join("codex-agent-kit/bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(home.join("agents")).unwrap();
+        for file in ["configure-codex.ps1", "start-media-generation-mcp.ps1", "media-generation-mcp.py", "python.exe", "node.exe"] {
+            fs::write(bin.join(file), "fixture").unwrap();
+        }
+        let readiness = json!({"pack":{"id":PACK_ID,"version":"fixture"}, "core":{"status":"ready"},
+            "config":{"merged":true,"status":"partial"}, "overallStatus":"partial",
+            "runtime":{"python":{"executable":bin.join("python.exe")},"node":{"executable":bin.join("node.exe")},"hyperframes":{"status":"install-failed"}},
+            "connections":{"mediaGeneration":{"runtime":"passed","protocol":"passed","gatewayCatalog":"failed"}}});
+        let wrapper = bin.join("start-media-generation-mcp.ps1");
+        let config: toml::Value = format!("[mcp_servers.media_generation]\nenabled=true\ncommand='powershell.exe'\nargs=['-File', '{}']\n", wrapper.display()).parse().unwrap();
+        assert!(super::host_core_files_ready(&home, &config, &readiness, "fixture"));
+        assert!(!super::host_core_files_ready(&home, &config, &readiness, "new-version"));
+        fs::remove_file(&wrapper).unwrap();
+        assert!(!super::host_core_files_ready(&home, &config, &readiness, "fixture"));
+        let disabled: toml::Value = "[mcp_servers.media_generation]\nenabled=false".parse().unwrap();
+        assert!(super::host_core_files_ready(&home, &disabled, &readiness, "fixture"));
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn host_repair_preserves_explicit_disabled_and_remote_selections() {
+        let home = std::env::temp_dir().join(format!("usb-host-options-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&home).unwrap();
+        fs::write(home.join("config.toml"), "[mcp_servers.media_generation]\nenabled=false\n[mcp_servers.cloudflare]\nenabled=true\n[mcp_servers.notion]\nenabled=false\n").unwrap();
+        let options = super::host_install_options_with_settings(&home, std::collections::HashMap::new()).unwrap();
+        assert!(!options.persist_connections);
+        assert!(!options.enable_media_generation);
+        assert!(!options.enable_feishu);
+        assert_eq!(options.enabled_remote_mcps, vec!["cloudflare"]);
+        fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
@@ -501,6 +714,31 @@ mod tests {
         assert_eq!(summary.runtime_status, "ready");
         assert_eq!(summary.config_status, "merged");
         let _ = fs::remove_dir_all(profile);
+    }
+
+    #[test]
+    fn media_authorization_failure_then_recovery_updates_the_same_record() {
+        let home = std::env::temp_dir().join(format!("media-auth-recovery-{}", uuid::Uuid::new_v4()));
+        let failed = super::record_media_authorization(&home, true,
+            Err(crate::errors::AppError::Engine("fixture credential failure".into())));
+        assert!(failed.unwrap_err().to_string().contains("fixture credential failure"));
+        assert_eq!(super::read_media_authorization_status(&home), "failed");
+        super::record_media_authorization(&home, true, Ok(())).unwrap();
+        assert_eq!(super::read_media_authorization_status(&home), "verified");
+        super::record_media_authorization(&home, false, Ok(())).unwrap();
+        assert_eq!(super::read_media_authorization_status(&home), "not-required");
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn media_probe_uses_a_bounded_process_tree() {
+        let mut command = std::process::Command::new("powershell.exe");
+        command.args(["-NoProfile", "-Command", "Start-Sleep -Seconds 120"]);
+        let start = std::time::Instant::now();
+        let error = super::run_capability_probe(&mut command).unwrap_err();
+        assert!(error.to_string().contains("45 秒"));
+        assert!(start.elapsed() < std::time::Duration::from_secs(55));
     }
 
     #[test]
@@ -730,7 +968,7 @@ fn write_media_authorization_status(profile: &Path, status: &str) -> Result<(), 
         .map_err(|error| AppError::Engine(format!("保存媒体授权状态失败: {error}")))
 }
 
-fn read_media_authorization_status(profile: &Path) -> String {
+pub(crate) fn read_media_authorization_status(profile: &Path) -> String {
     let path = profile.join(MEDIA_AUTHORIZATION_RELATIVE);
     let Ok(metadata) = fs::symlink_metadata(&path) else {
         return "unknown".to_string();
@@ -755,6 +993,22 @@ fn read_media_authorization_status(profile: &Path) -> String {
         .filter(|status| matches!(*status, "pending" | "verified" | "failed" | "not-required"))
         .unwrap_or("unknown")
         .to_string()
+}
+
+fn record_media_authorization(
+    home: &Path,
+    enabled: bool,
+    result: Result<(), AppError>,
+) -> Result<(), AppError> {
+    let status = if !enabled { "not-required" } else if result.is_ok() { "verified" } else { "failed" };
+    write_media_authorization_status(home, status)?;
+    result
+}
+
+pub(crate) fn refresh_media_authorization(home: &Path) -> Result<(), AppError> {
+    let result = crate::app::media_generation::sync_authorized_local_connection()
+        .and_then(|_| crate::app::media_generation::verify_authorized_local_connection());
+    record_media_authorization(home, true, result)
 }
 
 fn media_install_switch(enabled: bool) -> &'static str {
@@ -796,6 +1050,287 @@ fn sanitized_child_output(output: &Output, options: &CapabilityPackInstallOption
     chars.into_iter().collect()
 }
 
+struct CapabilityProgressFile(PathBuf);
+
+impl CapabilityProgressFile {
+    fn create() -> Result<Self, AppError> {
+        let temp_dir = std::env::temp_dir();
+        for attempt in 0..16u32 {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let path = temp_dir.join(format!(
+                "codex-capability-progress-{}-{nonce}-{attempt}.txt",
+                std::process::id()
+            ));
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(_) => return Ok(Self(path)),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(AppError::Engine(format!("创建能力包进度通道失败: {error}")))
+                }
+            }
+        }
+        Err(AppError::Engine(
+            "创建能力包进度通道失败：无法取得唯一临时文件名".to_string(),
+        ))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for CapabilityProgressFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+#[derive(Debug)]
+enum CapabilityProcessError {
+    Spawn(io::Error),
+    Containment(io::Error),
+    Wait(io::Error),
+    Timeout { stage: String, output: Output },
+}
+
+#[cfg(windows)]
+struct CapabilityInstallerJob(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl CapabilityInstallerJob {
+    fn create() -> io::Result<Self> {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::JobObjects::{
+            CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+
+        let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if handle.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = unsafe {
+            SetInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                &limits as *const _ as *const _,
+                std::mem::size_of_val(&limits) as u32,
+            )
+        };
+        if configured == 0 {
+            let error = io::Error::last_os_error();
+            unsafe { CloseHandle(handle) };
+            return Err(error);
+        }
+        Ok(Self(handle))
+    }
+
+    fn assign(&self, child: &Child) -> io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+
+        if unsafe { AssignProcessToJobObject(self.0, child.as_raw_handle()) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn terminate(&self) {
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+        unsafe { TerminateJobObject(self.0, 1) };
+    }
+}
+
+#[cfg(windows)]
+impl Drop for CapabilityInstallerJob {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+        unsafe {
+            TerminateJobObject(self.0, 1);
+            CloseHandle(self.0);
+        }
+    }
+}
+
+fn wait_for_capability_child(
+    child: &mut Child,
+    timeout: Duration,
+) -> io::Result<Option<ExitStatus>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn terminate_capability_process_tree(
+    child: &mut Child,
+    #[cfg(windows)] job: &CapabilityInstallerJob,
+) -> io::Result<ExitStatus> {
+    #[cfg(windows)]
+    {
+        job.terminate();
+    }
+    let _ = child.kill();
+    wait_for_capability_child(child, Duration::from_secs(5))?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "installer process did not exit after process-tree termination",
+        )
+    })
+}
+
+fn receive_process_pipe(receiver: &mpsc::Receiver<Vec<u8>>) -> Vec<u8> {
+    receiver
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap_or_default()
+}
+
+fn run_capability_installer<F>(
+    command: &mut Command,
+    progress_path: &Path,
+    timeout: Duration,
+    mut on_progress: F,
+) -> Result<Output, CapabilityProcessError>
+where
+    F: FnMut(&str),
+{
+    #[cfg(windows)]
+    let job = CapabilityInstallerJob::create().map_err(CapabilityProcessError::Containment)?;
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(CapabilityProcessError::Spawn)?;
+    #[cfg(windows)]
+    {
+        if let Err(error) = job.assign(&child) {
+            let _ = child.kill();
+            let _ = wait_for_capability_child(&mut child, Duration::from_secs(2));
+            return Err(CapabilityProcessError::Containment(error));
+        }
+        if crate::app::model_process::resume_suspended(&child).is_err() {
+            job.terminate();
+            let _ = child.kill();
+            let _ = wait_for_capability_child(&mut child, Duration::from_secs(2));
+            return Err(CapabilityProcessError::Containment(io::Error::other(
+                "could not resume suspended installer process",
+            )));
+        }
+    }
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let stderr = child.stderr.take().expect("stderr was piped");
+    let (stdout_tx, stdout_rx) = mpsc::sync_channel(1);
+    let (stderr_tx, stderr_rx) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let mut reader = stdout;
+        let mut bytes = Vec::new();
+        let _ = reader.read_to_end(&mut bytes);
+        let _ = stdout_tx.send(bytes);
+    });
+    thread::spawn(move || {
+        let mut reader = stderr;
+        let mut bytes = Vec::new();
+        let _ = reader.read_to_end(&mut bytes);
+        let _ = stderr_tx.send(bytes);
+    });
+
+    let mut stage = "pack.validate".to_string();
+    on_progress(&stage);
+    let started = Instant::now();
+    let mut last_progress_poll = Instant::now();
+    loop {
+        let status = child.try_wait().map_err(CapabilityProcessError::Wait)?;
+        if let Some(status) = status {
+            #[cfg(windows)]
+            job.terminate();
+            let stdout = receive_process_pipe(&stdout_rx);
+            let stderr = receive_process_pipe(&stderr_rx);
+            return Ok(Output {
+                status,
+                stdout,
+                stderr,
+            });
+        }
+        if started.elapsed() >= timeout {
+            #[cfg(windows)]
+            let status = terminate_capability_process_tree(&mut child, &job)
+                .map_err(CapabilityProcessError::Wait)?;
+            #[cfg(not(windows))]
+            let status = terminate_capability_process_tree(&mut child)
+                .map_err(CapabilityProcessError::Wait)?;
+            return Err(CapabilityProcessError::Timeout {
+                stage,
+                output: Output {
+                    status,
+                    stdout: receive_process_pipe(&stdout_rx),
+                    stderr: receive_process_pipe(&stderr_rx),
+                },
+            });
+        }
+        if last_progress_poll.elapsed() >= CAPABILITY_PROGRESS_POLL_INTERVAL {
+            last_progress_poll = Instant::now();
+            if let Ok(raw_stage) = fs::read_to_string(progress_path) {
+                let next_stage = raw_stage.trim();
+                if CAPABILITY_INSTALL_STAGES.contains(&next_stage) && next_stage != stage {
+                    stage = next_stage.to_string();
+                    on_progress(&stage);
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The local credential probe uses the installer's existing bounded process
+/// tree and pipe cleanup; its output is parsed by the media caller, not logged.
+pub(super) fn run_capability_probe(command: &mut Command) -> Result<Output, AppError> {
+    let progress = CapabilityProgressFile::create()?;
+    run_capability_installer(command, progress.path(), Duration::from_secs(45), |_| {})
+        .map_err(|error| match error {
+            CapabilityProcessError::Timeout { .. } => AppError::Engine(
+                "媒体 MCP 授权自检超过 45 秒，已停止本次检查".into()),
+            CapabilityProcessError::Spawn(e) => AppError::Engine(format!(
+                "无法启动媒体 MCP 授权自检（系统错误码 {:?}）", e.raw_os_error())),
+            CapabilityProcessError::Containment(e) | CapabilityProcessError::Wait(e) =>
+                AppError::Engine(format!("媒体 MCP 授权自检进程未正常完成（系统错误码 {:?}）", e.raw_os_error())),
+        })
+}
+
+fn capability_stage_label(stage: &str) -> &'static str {
+    match stage {
+        "pack.validate" => "检查能力包清单",
+        "pack.skills" => "安装 Skills 与 Agents",
+        "runtime.verify" => "检查随包运行时文件",
+        "runtime.python" => "准备 Python 和离线依赖",
+        "runtime.manim" => "准备 Manim 环境",
+        "runtime.nodeMedia" => "准备 Node、FFmpeg 和本地媒体运行时",
+        "runtime.hyperframes" => "从本地部署 HyperFrames CLI 和依赖",
+        "runtime.hyperframesFfmpeg" => "从本地部署 HyperFrames 视频编码器",
+        "runtime.hyperframesCliCheck" => "检查 HyperFrames CLI",
+        "runtime.hyperframesBrowser" => "从本地部署 HyperFrames 浏览器",
+        "runtime.hyperframesBrowserCheck" => "检查本地 HyperFrames 浏览器",
+        "runtime.feishu" => "检查飞书 MCP",
+        "runtime.complete" => "写入运行时状态",
+        "pack.pdf" => "检查 PDF 工具",
+        "pack.media" => "验证媒体 MCP 本地连接",
+        "pack.config" => "生成并合并 Codex 配置",
+        "pack.models" => "同步模型目录",
+        "pack.finalize" => "整理能力包安装记录",
+        _ => "安装能力包",
+    }
+}
+
 /// Install the bundled Product Design plugin into the USB edition's isolated
 /// CODEX_HOME. This is called from the Skill Hub apply action so the plugin is
 /// available alongside the user's Skill Hub skills without touching the host
@@ -834,7 +1369,7 @@ pub fn install_product_design_plugin(app: &AppHandle) -> Result<u32, AppError> {
         .arg("-PackRoot")
         .arg(&pack_root)
         .arg("-TargetCodexHome")
-        .arg(&codex_home);
+        .arg(powershell_provider_path(&codex_home));
     #[cfg(target_os = "windows")]
     command.creation_flags(CREATE_NO_WINDOW);
     let output = command
@@ -868,6 +1403,93 @@ pub fn install_product_design_plugin(app: &AppHandle) -> Result<u32, AppError> {
         .get("skillCount")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or_default() as u32)
+}
+
+/// Core launch requirements only; optional/network readiness is not a launch gate.
+pub(crate) fn host_core_ready(home: &Path, config: &toml::Value) -> Result<bool, AppError> {
+    let executable = std::env::current_exe().map_err(|e| AppError::Internal(e.to_string()))?;
+    let Some(source) = find_pack(&executable, None) else { return Ok(false) };
+    let (version, _) = validate_pack(&source)?;
+    let Some(bytes) = crate::app::usb_host::read_optional(&readiness_path(home))? else { return Ok(false) };
+    let Ok(readiness) = serde_json::from_slice::<serde_json::Value>(strip_utf8_bom(&bytes)) else { return Ok(false) };
+    Ok(host_core_files_ready(home, config, &readiness, &version))
+}
+
+fn host_core_files_ready(home: &Path, config: &toml::Value, readiness: &serde_json::Value, version: &str) -> bool {
+    if readiness.pointer("/pack/id").and_then(|v| v.as_str()) != Some(PACK_ID)
+        || readiness.pointer("/pack/version").and_then(|v| v.as_str()) != Some(version)
+        || readiness.pointer("/core/status").and_then(|v| v.as_str()) != Some("ready")
+        || readiness.pointer("/config/merged").and_then(|v| v.as_bool()) != Some(true)
+        || !home.join("agents").is_dir()
+        || !home.join("codex-agent-kit/bin/configure-codex.ps1").is_file() {
+        return false;
+    }
+    for runtime in ["python", "node"] {
+        if !readiness.pointer(&format!("/runtime/{runtime}/executable"))
+            .and_then(|v| v.as_str()).is_some_and(|p| Path::new(p).is_file()) { return false; }
+    }
+    let Some(media) = config.get("mcp_servers").and_then(|v| v.get("media_generation")) else { return false };
+    // A deliberate disable is a user setting, not an installation failure.
+    if media.get("enabled").and_then(|v| v.as_bool()) == Some(false) { return true; }
+    let wrapper = home.join("codex-agent-kit/bin/start-media-generation-mcp.ps1");
+    let command_exists = media.get("command").and_then(|v| v.as_str())
+        .is_some_and(|p| p.eq_ignore_ascii_case("powershell.exe") || Path::new(p).is_file());
+    let wrapper_registered = media.get("args").and_then(|v| v.as_array()).is_some_and(|args|
+        args.windows(2).any(|pair| pair[0].as_str() == Some("-File")
+            && pair[1].as_str().is_some_and(|p| Path::new(p) == wrapper)));
+    command_exists && wrapper_registered && wrapper.is_file()
+        && home.join("codex-agent-kit/bin/media-generation-mcp.py").is_file()
+        && readiness.pointer("/connections/mediaGeneration/runtime").and_then(|v| v.as_str()) == Some("passed")
+        && readiness.pointer("/connections/mediaGeneration/protocol").and_then(|v| v.as_str()) == Some("passed")
+}
+
+/// Reinstall using this user's choices, never empty defaults that disable
+/// existing integrations or erase saved routing values.
+pub(crate) fn host_install_options(home: &Path) -> Result<CapabilityPackInstallOptions, AppError> {
+    let saved = crate::app::media_generation::current_user_environment_settings(OWNED_CONNECTION_ENV_NAMES)?
+        .into_iter().collect();
+    host_install_options_with_settings(home, saved)
+}
+
+fn host_install_options_with_settings(home: &Path, saved: std::collections::HashMap<String, String>) -> Result<CapabilityPackInstallOptions, AppError> {
+    let config = crate::app::usb_host::read_config(home)?;
+    let enabled = |name: &str, default: bool| config.get("mcp_servers").and_then(|v| v.get(name))
+        .map(|v| v.get("enabled").and_then(toml::Value::as_bool) != Some(false)).unwrap_or(default);
+    let setting = |key: &str| saved.get(key).cloned().unwrap_or_default();
+    let mut options = CapabilityPackInstallOptions {
+        persist_connections: false,
+        enable_feishu: enabled("feishu", false),
+        enable_media_generation: enabled("media_generation", true),
+        enabled_remote_mcps: ["cloudflare", "figma", "linear", "notion"].into_iter()
+            .filter(|id| enabled(id, false)).map(str::to_owned).collect(),
+        feishu_app_id: setting("FEISHU_APP_ID"),
+        feishu_app_secret: setting("FEISHU_APP_SECRET"),
+        feishu_user_access_token: setting("FEISHU_USER_ACCESS_TOKEN"),
+        dashscope_api_key: setting("DASHSCOPE_API_KEY"),
+        dashscope_model: setting("DASHSCOPE_MODEL"),
+        media_generation_agent_id: setting("MEDIA_GENERATION_AGENT_ID"),
+        image2_model: setting("MEDIA_IMAGE2_MODEL"),
+        grok_image_model: setting("MEDIA_GROK_IMAGE_MODEL"),
+        grok_video_model: setting("MEDIA_GROK_VIDEO_MODEL"),
+        seedance_model: setting("MEDIA_SEEDANCE_MODEL"),
+        minimax_video_model: setting("MEDIA_MINIMAX_VIDEO_MODEL"),
+        ..Default::default()
+    };
+    for (key, target) in [("FEISHU_DOMAIN", &mut options.feishu_domain),
+        ("FEISHU_AUTH_MODE", &mut options.feishu_auth_mode),
+        ("DASHSCOPE_BASE_URL", &mut options.dashscope_base_url),
+        ("MEDIA_GENERATION_API_PROFILE", &mut options.media_generation_api_profile)] {
+        let value = setting(key);
+        if !value.is_empty() { *target = value; }
+    }
+    if let Some(bytes) = crate::app::usb_host::read_optional(&readiness_path(home))? {
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(strip_utf8_bom(&bytes)) {
+            if value.pointer("/connections/apiServices/enabled/dashscope-web-search").and_then(|v| v.as_bool()) == Some(true) {
+                options.enabled_api_services.push("dashscope-web-search".into());
+            }
+        }
+    }
+    Ok(options)
 }
 
 pub fn status(app: &AppHandle) -> Result<CapabilityPackReport, AppError> {
@@ -922,7 +1544,7 @@ pub fn status(app: &AppHandle) -> Result<CapabilityPackReport, AppError> {
         agents: readiness.agents,
         runtime_ready,
         runtime_status: readiness.runtime_status.clone(),
-        config_status: readiness.config_status.clone(),
+        config_status: effective_config_status.to_string(),
         diagnostics_path: readiness.diagnostics_path,
         feishu_enabled: false,
         enabled_api_services: Vec::new(),
@@ -939,7 +1561,7 @@ pub fn status(app: &AppHandle) -> Result<CapabilityPackReport, AppError> {
         } else if installed {
             format!(
                 "核心 Skills/Agents 已安装；运行时状态为 {}，配置状态为 {}，可从组件修复入口继续处理",
-                readiness.runtime_status, readiness.config_status
+                readiness.runtime_status, effective_config_status
             )
         } else {
             "能力包已就绪，可安装或修复全部 Skills、Agents、运行时和本地 MCP 资源".to_string()
@@ -1049,7 +1671,10 @@ fn validate_options(options: &CapabilityPackInstallOptions) -> Result<(), AppErr
 }
 
 #[cfg(target_os = "windows")]
-fn update_user_environment(values: &[(&str, &str)]) -> Result<(), AppError> {
+fn update_user_environment(
+    values: &[(&str, &str)],
+    target_user_sid: Option<&str>,
+) -> Result<(), AppError> {
     use windows_sys::Win32::System::Registry::*;
 
     struct Key(HKEY);
@@ -1061,11 +1686,36 @@ fn update_user_environment(values: &[(&str, &str)]) -> Result<(), AppError> {
         }
     }
 
+    let mut desktop_hive = std::ptr::null_mut();
+    let root = if let Some(user_sid) = target_user_sid {
+        let sid_key = user_sid
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let status = unsafe {
+            RegOpenKeyExW(
+                HKEY_USERS,
+                sid_key.as_ptr(),
+                0,
+                KEY_CREATE_SUB_KEY | KEY_QUERY_VALUE,
+                &mut desktop_hive,
+            )
+        };
+        if status != 0 || desktop_hive.is_null() {
+            return Err(AppError::Engine(format!(
+                "打开当前桌面用户注册表配置失败（Win32 {status}）"
+            )));
+        }
+        desktop_hive
+    } else {
+        HKEY_CURRENT_USER
+    };
+    let _desktop_hive = (!desktop_hive.is_null()).then_some(Key(desktop_hive));
     let subkey: Vec<u16> = "Environment\0".encode_utf16().collect();
     let mut handle = std::ptr::null_mut();
     let status = unsafe {
         RegCreateKeyExW(
-            HKEY_CURRENT_USER,
+            root,
             subkey.as_ptr(),
             0,
             std::ptr::null(),
@@ -1078,7 +1728,7 @@ fn update_user_environment(values: &[(&str, &str)]) -> Result<(), AppError> {
     };
     if status != 0 {
         return Err(AppError::Engine(format!(
-            "写入当前用户环境变量失败（Win32 {status}）"
+            "写入用户环境变量失败（Win32 {status}）"
         )));
     }
     let _key = Key(handle);
@@ -1115,12 +1765,18 @@ fn update_user_environment(values: &[(&str, &str)]) -> Result<(), AppError> {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn update_user_environment(_values: &[(&str, &str)]) -> Result<(), AppError> {
+fn update_user_environment(
+    _values: &[(&str, &str)],
+    _target_user_sid: Option<&str>,
+) -> Result<(), AppError> {
     Err(AppError::UnsupportedPlatform)
 }
 
 #[cfg(target_os = "windows")]
-fn remove_owned_user_environment(names: &[&str]) -> Result<(), AppError> {
+fn remove_owned_user_environment(
+    names: &[&str],
+    target_user_sid: Option<&str>,
+) -> Result<(), AppError> {
     use windows_sys::Win32::System::Registry::*;
     struct Key(HKEY);
     impl Drop for Key {
@@ -1128,17 +1784,35 @@ fn remove_owned_user_environment(names: &[&str]) -> Result<(), AppError> {
             unsafe { RegCloseKey(self.0) };
         }
     }
-    let subkey: Vec<u16> = "Environment\0".encode_utf16().collect();
-    let mut handle = std::ptr::null_mut();
-    let status = unsafe {
-        RegOpenKeyExW(
-            HKEY_CURRENT_USER,
-            subkey.as_ptr(),
-            0,
-            KEY_SET_VALUE,
-            &mut handle,
-        )
+    let mut desktop_hive = std::ptr::null_mut();
+    let (root, subkey_text) = match target_user_sid {
+        Some(user_sid) => {
+            let sid_key = user_sid
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect::<Vec<_>>();
+            let status = unsafe {
+                RegOpenKeyExW(
+                    HKEY_USERS,
+                    sid_key.as_ptr(),
+                    0,
+                    KEY_QUERY_VALUE,
+                    &mut desktop_hive,
+                )
+            };
+            if status != 0 || desktop_hive.is_null() {
+                return Err(AppError::Engine(format!(
+                    "打开当前桌面用户注册表配置失败（Win32 {status}）"
+                )));
+            }
+            (desktop_hive, "Environment\0".to_string())
+        }
+        None => (HKEY_CURRENT_USER, "Environment\0".to_string()),
     };
+    let _desktop_hive = (!desktop_hive.is_null()).then_some(Key(desktop_hive));
+    let subkey: Vec<u16> = subkey_text.encode_utf16().collect();
+    let mut handle = std::ptr::null_mut();
+    let status = unsafe { RegOpenKeyExW(root, subkey.as_ptr(), 0, KEY_SET_VALUE, &mut handle) };
     if status == 2 {
         return Ok(());
     }
@@ -1161,7 +1835,10 @@ fn remove_owned_user_environment(names: &[&str]) -> Result<(), AppError> {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn remove_owned_user_environment(_names: &[&str]) -> Result<(), AppError> {
+fn remove_owned_user_environment(
+    _names: &[&str],
+    _target_user_sid: Option<&str>,
+) -> Result<(), AppError> {
     Err(AppError::UnsupportedPlatform)
 }
 
@@ -1251,7 +1928,8 @@ fn migrate_legacy_media_environment(profile: &Path) -> Result<(), AppError> {
     if owned.is_empty() {
         return Ok(());
     }
-    remove_owned_user_environment(&owned)?;
+    let target_user_sid = crate::app::usb_guard::user_environment_registry_sid()?;
+    remove_owned_user_environment(&owned, target_user_sid.as_deref())?;
     for name in &owned {
         std::env::remove_var(name);
     }
@@ -1336,11 +2014,12 @@ fn persist_configured_environment(
         return Ok(());
     }
     let names = values.iter().map(|(name, _)| *name).collect::<Vec<_>>();
+    let target_user_sid = crate::app::usb_guard::user_environment_registry_sid()?;
     // Persist ownership before writing values.  If a registry write is
     // interrupted after a partial update, the later purge still has a safe,
     // exact allowlist to remove; the record never stores the secret values.
     persist_connection_ownership(profile, &names)?;
-    update_user_environment(&values)
+    update_user_environment(&values, target_user_sid.as_deref())
 }
 
 pub fn install(
@@ -1392,12 +2071,16 @@ pub fn install(
             non_empty(&options.feishu_domain).unwrap_or("https://open.feishu.cn"),
         ]);
     if let Some(usb_codex_home) = usb_codex_home.as_ref() {
-        command.arg("-TargetCodexHome").arg(usb_codex_home);
-        command.arg("-EnableFullAccess");
+        command.arg("-TargetCodexHome").arg(powershell_provider_path(usb_codex_home));
+        command.arg("-ReplaceExisting");
+        let existing = crate::app::usb_host::read_config(usb_codex_home)?;
+        let profile = crate::app::codex_config_readback::selected_profile(&existing)
+            .map_err(|_| AppError::Engine("当前 Codex profile 无效，未修改权限设置".into()))?;
+        if ["approval_policy", "sandbox_mode"].iter().all(|key|
+            crate::app::codex_config_readback::effective_string(&existing, profile, key).is_none()) {
+            command.arg("-EnableFullAccess");
+        }
     }
-    #[cfg(target_os = "windows")]
-    command.creation_flags(CREATE_NO_WINDOW);
-
     if options.enable_feishu {
         command.arg("-EnableFeishu");
     } else {
@@ -1476,14 +2159,57 @@ pub fn install(
         // connection tuple after the installer exits.
         .env_remove("MEDIA_GENERATION_API_BASE_URL")
         .env_remove("MEDIA_GENERATION_API_KEY");
-
-    let output = command.output().map_err(|error| {
-        log::error!(
-            "capability pack installer process could not start source={} error={error}",
-            source.display()
-        );
-        AppError::Engine(format!("启动能力包安装器失败: {error}"))
-    })?;
+    let progress_file = CapabilityProgressFile::create()?;
+    command.arg("-ProgressFile").arg(progress_file.path());
+    let output = match run_capability_installer(
+        &mut command,
+        progress_file.path(),
+        CAPABILITY_INSTALL_TIMEOUT,
+        |stage| {
+            let _ = app.emit(CAPABILITY_INSTALL_PROGRESS_EVENT, stage.to_string());
+        },
+    ) {
+        Ok(output) => output,
+        Err(CapabilityProcessError::Spawn(error)) => {
+            log::error!(
+                "capability pack installer process could not start source={} error={error}",
+                source.display()
+            );
+            return Err(AppError::Engine(format!("启动能力包安装器失败: {error}")));
+        }
+        Err(CapabilityProcessError::Containment(error)) => {
+            log::error!(
+                "capability pack installer process containment failed source={} error={error}",
+                source.display()
+            );
+            return Err(AppError::Engine(format!(
+                "无法安全管理能力包安装进程树: {error}"
+            )));
+        }
+        Err(CapabilityProcessError::Wait(error)) => {
+            log::error!(
+                "capability pack installer process wait failed source={} error={error}",
+                source.display()
+            );
+            return Err(AppError::Engine(format!("等待能力包安装器失败: {error}")));
+        }
+        Err(CapabilityProcessError::Timeout { stage, output }) => {
+            let detail = sanitized_child_output(&output, &options);
+            log::error!(
+                "capability pack install timed out source={} version={} timeout_secs={} stage={} detail={}",
+                source.display(),
+                pack_version,
+                CAPABILITY_INSTALL_TIMEOUT.as_secs(),
+                stage,
+                if detail.is_empty() { "<no-output>" } else { &detail }
+            );
+            return Err(AppError::Engine(format!(
+                "能力包安装在“{}”阶段超过 {} 分钟，已停止本次能力包安装；Codex 程序仍已安装，可在组件修复中重试",
+                capability_stage_label(&stage),
+                CAPABILITY_INSTALL_TIMEOUT.as_secs() / 60
+            )));
+        }
+    };
     if !output.status.success() {
         let code = output.status.code().unwrap_or(-1);
         let detail = sanitized_child_output(&output, &options);
@@ -1528,18 +2254,7 @@ pub fn install(
         }
         Ok::<(), AppError>(())
     })();
-    let authorization_status = if !options.enable_media_generation {
-        "not-required"
-    } else if authorization_result.is_ok() {
-        "verified"
-    } else {
-        "failed"
-    };
-    if let Err(error) = write_media_authorization_status(&codex_home, authorization_status) {
-        log::error!("media MCP authorization readiness update failed: {error}");
-        return Err(error);
-    }
-    authorization_result?;
+    record_media_authorization(&codex_home, options.enable_media_generation, authorization_result)?;
     let readiness = readiness_summary(&codex_home);
     let installed = readiness.pack_identity_valid
         && readiness.core_ready

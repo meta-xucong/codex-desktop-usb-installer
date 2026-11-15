@@ -23,7 +23,7 @@
 | Node.js 22.22.0 x64 | 是 | `node.cmd --version` | 随包部署；HyperFrames 与 Feishu 共用 |
 | FFmpeg/FFprobe 9.x | 是 | `ffmpeg.cmd -version; ffprobe.cmd -version` | 随包部署；LGPL shared build |
 | Manim CE 0.21.0 | Manim Skill 需要 | `manim.cmd --version` / runtime-state | 独立 CPython 3.12 环境，离线轮子安装 |
-| HyperFrames CLI/Chrome | 程序化视频需要 | `hyperframes.cmd doctor` | npm/Chrome 首装没有本机可用副本时需联网 |
+| HyperFrames CLI/Chrome | 程序化视频需要 | `hyperframes.cmd doctor` | CLI 首装需要 npm；固定版本 Headless Chrome 随包离线部署 |
 | Git | 不属于运行时 | `git --version` | 仅用于仓库协作，不是能力包前置条件 |
 
 Python 选择普通 per-user CPython，而不是 embeddable ZIP：数据、文档和 PDF 能力需要正常的 SSL、pip、

@@ -41,6 +41,8 @@ impl InstallTxKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum InstallTxStep {
+    /// Work paths recorded before extraction; no install rename is permitted.
+    Extracting,
     /// Log persisted; no destructive rename yet.
     Prepared,
     /// Old install moved to backup; install path is empty (or missing).
@@ -71,6 +73,7 @@ pub struct SelfUpdatePolicyTransition {
 impl InstallTxStep {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Extracting => "extracting",
             Self::Prepared => "prepared",
             Self::OldMoved => "old-moved",
             Self::NewInstalled => "new-installed",
@@ -163,6 +166,9 @@ pub fn decide_recovery(
     new_exists: bool,
 ) -> RecoveryAction {
     match step {
+        InstallTxStep::Extracting => RecoveryAction::KeepManual {
+            reason: "extraction recovery requires the recorded previous-install state",
+        },
         InstallTxStep::Completed | InstallTxStep::RolledBack => RecoveryAction::ClearLog,
         InstallTxStep::NeedsManual => RecoveryAction::KeepManual {
             reason: "previous recovery already marked needs-manual",
@@ -245,12 +251,32 @@ impl InstallTransaction {
         had_previous: bool,
         was_running: Option<bool>,
     ) -> Result<Self, AppError> {
+        Self::begin_at_step(
+            kind,
+            install_path,
+            new_path,
+            backup_path,
+            had_previous,
+            was_running,
+            InstallTxStep::Prepared,
+        )
+    }
+
+    fn begin_at_step(
+        kind: InstallTxKind,
+        install_path: &Path,
+        new_path: &Path,
+        backup_path: &Path,
+        had_previous: bool,
+        was_running: Option<bool>,
+        step: InstallTxStep,
+    ) -> Result<Self, AppError> {
         let now = now_unix();
         let tx = Self {
             schema_version: SCHEMA_VERSION,
             id: uuid::Uuid::new_v4().to_string(),
             kind,
-            step: InstallTxStep::Prepared,
+            step,
             install_path: install_path.to_string_lossy().into_owned(),
             new_path: new_path.to_string_lossy().into_owned(),
             backup_path: backup_path.to_string_lossy().into_owned(),
@@ -327,6 +353,7 @@ impl InstallTransaction {
         // either write is replayed idempotently by startup recovery.
         self.persist()?;
         self.finalize_self_update_policy(true)?;
+        self.cleanup_portable_residue()?;
         self.remove_file_checked()?;
         Ok(())
     }
@@ -372,9 +399,12 @@ impl InstallTransaction {
         // Remove the journal only after both durable terminal state and policy
         // succeeded. Otherwise it is the recovery instruction for next launch.
         if terminal_persisted && policy_finalized {
-            if let Err(err) = self.remove_file_checked() {
+            if let Err(err) = self
+                .cleanup_portable_residue()
+                .and_then(|()| self.remove_file_checked())
+            {
                 let warning = format!(
-                    "应用已安装，但安装事务日志暂未清理（{err}）；管理器下次启动会自动清理"
+                    "应用已安装，但旧程序或安装临时材料暂未清理（{err}）；管理器下次启动或更新前会自动重试"
                 );
                 log::warn!(
                     "live install transaction cleanup warning id={} error={err}",
@@ -413,6 +443,75 @@ impl InstallTransaction {
             fs::read(path).map_err(|e| AppError::Internal(format!("读取事务日志失败: {e}")))?;
         serde_json::from_slice(&bytes)
             .map_err(|e| AppError::Internal(format!("解析事务日志失败: {e}")))
+    }
+
+    /// Only this engine's exact UUID work/backup pair is reclaimable. User HOME,
+    /// unrelated UUID directories and the installed tree are never candidates.
+    fn cleanup_portable_residue(&self) -> Result<(), AppError> {
+        if self.kind != InstallTxKind::WindowsPortable {
+            return Ok(());
+        }
+        let install = Path::new(&self.install_path);
+        let new = Path::new(&self.new_path);
+        let backup = Path::new(&self.backup_path);
+        let invalid =
+            || AppError::Internal("安装事务路径不符合 portable 布局，保留恢复材料".into());
+        let parent = install.parent().ok_or_else(invalid)?;
+        let work = new.parent().ok_or_else(invalid)?;
+        let id = work
+            .file_name()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.strip_prefix("portable-"))
+            .ok_or_else(invalid)?;
+        if uuid::Uuid::parse_str(id).is_err()
+            || new.file_name().and_then(|s| s.to_str()) != Some("payload")
+            || work.parent() != Some(parent.join(".codex-app-manager-staging").as_path())
+            || backup != parent.join(format!("Codex.rollback-{id}"))
+            || install == backup
+            || install.starts_with(work)
+        {
+            return Err(invalid());
+        }
+        for path in [install, work, backup] {
+            codex_win_engine::validate_cleanup_path(path)
+                .map_err(|e| AppError::Engine(e.to_string()))?;
+        }
+        // Before success the backup is still rollback material. Even a terminal
+        // rollback must not discard an unexpected remaining backup.
+        if self.step == InstallTxStep::Completed {
+            if !install.is_dir() {
+                return Err(AppError::Internal(
+                    "新程序目录缺失，保留旧程序及事务".into(),
+                ));
+            }
+            remove_portable_residue_dir(backup)?;
+        } else if !path_is_definitively_absent(&self.backup_path) {
+            return Err(AppError::Internal("旧程序仍需用于恢复，保留事务".into()));
+        }
+        remove_portable_residue_dir(work)?;
+        if let Some(staging) = work.parent() {
+            match fs::remove_dir(staging) {
+                Ok(()) => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                    ) => {}
+                Err(e) => return Err(AppError::Internal(format!("清理空安装暂存目录失败: {e}"))),
+            }
+        }
+        Ok(())
+    }
+}
+
+fn remove_portable_residue_dir(path: &Path) -> Result<(), AppError> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(AppError::Internal(format!(
+            "清理安装残留失败（{}）: {e}",
+            path.display()
+        ))),
     }
 }
 
@@ -1044,6 +1143,25 @@ pub fn path_is_protected(path: &Path, protected: &[PathBuf]) -> bool {
 pub fn recover_pending_transactions(
     ops: Option<&crate::app::oplock::OperationManager>,
 ) -> RecoverySummary {
+    recover_pending_transactions_scoped(ops, None)
+}
+
+/// Caller already holds the update/install operation and, for USB, the current
+/// bundle authorization/transaction lock. Never recover another install here.
+pub fn recover_portable_before_update(install_root: &Path) -> Result<(), AppError> {
+    let result = recover_pending_transactions_scoped(None, Some(install_root));
+    if result.failed > 0 || result.kept_manual > 0 {
+        return Err(AppError::Engine(
+            "上次安装事务或旧程序清理尚未完成；已保留恢复材料，未开始新的下载/解压，请释放被占用文件后重试".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn recover_pending_transactions_scoped(
+    ops: Option<&crate::app::oplock::OperationManager>,
+    scope: Option<&Path>,
+) -> RecoverySummary {
     let mut summary = RecoverySummary::default();
     let _lease = if let Some(ops) = ops {
         match ops.begin(crate::app::oplock::OperationKind::Install) {
@@ -1058,15 +1176,44 @@ pub fn recover_pending_transactions(
     };
 
     let Some(dir) = transactions_dir() else {
+        summary.failed += 1;
         return summary;
     };
-    let Ok(entries) = fs::read_dir(&dir) else {
-        return summary;
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return summary,
+        Err(e) => {
+            summary.failed += 1;
+            log::error!("cannot read install transactions: {e}");
+            return summary;
+        }
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                summary.failed += 1;
+                log::error!("cannot read install transaction entry: {e}");
+                continue;
+            }
+        };
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
+        }
+        if let Some(scope) = scope {
+            match InstallTransaction::load_from_path(&path) {
+                Ok(tx) if transaction_matches_scope(&tx, Some(scope)) => {}
+                Ok(_) => continue,
+                Err(err) => {
+                    summary.failed += 1;
+                    log::error!(
+                        "cannot attribute install transaction path={} error={err}",
+                        path.display()
+                    );
+                    continue;
+                }
+            }
         }
         summary.scanned += 1;
         match recover_one(&path) {
@@ -1123,6 +1270,7 @@ fn recover_one(path: &Path) -> Result<Recovered, AppError> {
         )
     {
         tx.finalize_self_update_policy(matches!(tx.step, InstallTxStep::Completed))?;
+        tx.cleanup_portable_residue()?;
         tx.remove_file_checked()?;
         return Ok(Recovered::Cleared);
     }
@@ -1146,6 +1294,7 @@ fn recover_one(path: &Path) -> Result<Recovered, AppError> {
             // Prepared + intact means the app swap never landed. Restore the
             // pre-confirmation policy before removing the only durable evidence.
             tx.finalize_self_update_policy(false)?;
+            tx.cleanup_portable_residue()?;
             tx.remove_file_checked()?;
             Ok(Recovered::Cleared)
         }
@@ -1176,19 +1325,21 @@ fn recover_one(path: &Path) -> Result<Recovered, AppError> {
                 })?;
             }
             tx.advance(InstallTxStep::RolledBack)?;
+            tx.cleanup_portable_residue()?;
             tx.remove_file_checked()?;
             Ok(Recovered::RolledBack)
         }
         RecoveryAction::FinishRollback => {
             tx.finalize_self_update_policy(false)?;
             tx.advance(InstallTxStep::RolledBack)?;
+            tx.cleanup_portable_residue()?;
             tx.remove_file_checked()?;
             Ok(Recovered::RolledBack)
         }
         RecoveryAction::Complete => {
             cleanup_backup_best_effort(&tx);
             // Staged new should already be gone; remove if leftover.
-            if path_exists(&tx.new_path) {
+            if tx.kind != InstallTxKind::WindowsPortable && path_exists(&tx.new_path) {
                 let _ = fs::remove_dir_all(&tx.new_path);
                 let _ = fs::remove_file(&tx.new_path);
             }
@@ -1222,6 +1373,15 @@ fn decide_transaction_recovery(
     backup_exists: bool,
     new_exists: bool,
 ) -> RecoveryAction {
+    if tx.step == InstallTxStep::Extracting {
+        return if !backup_exists && install_exists == tx.had_previous {
+            RecoveryAction::ClearLog
+        } else {
+            RecoveryAction::KeepManual {
+                reason: "install changed during extraction; retain all materials",
+            }
+        };
+    }
     if tx.step == InstallTxStep::RollingBack && !tx.had_previous {
         return if install_exists {
             RecoveryAction::Rollback
@@ -1244,6 +1404,10 @@ fn decide_transaction_recovery(
 }
 
 fn cleanup_backup_best_effort(tx: &InstallTransaction) {
+    // Windows cleanup is checked after the terminal state has been persisted.
+    if tx.kind == InstallTxKind::WindowsPortable {
+        return;
+    }
     if path_exists(&tx.backup_path) {
         let _ = fs::remove_dir_all(&tx.backup_path);
         let _ = fs::remove_file(&tx.backup_path);
@@ -1257,6 +1421,30 @@ pub struct ActiveInstallTx {
 }
 
 impl ActiveInstallTx {
+    pub fn begin_portable_preparation(
+        install: &Path,
+        payload: &Path,
+        backup: &Path,
+        had_previous: bool,
+    ) -> Result<Self, AppError> {
+        let tx = InstallTransaction::begin_at_step(
+            InstallTxKind::WindowsPortable,
+            install,
+            payload,
+            backup,
+            had_previous,
+            None,
+            InstallTxStep::Extracting,
+        )?;
+        Ok(Self { inner: Some(tx) })
+    }
+
+    pub fn mark_prepared(&mut self) -> Result<(), AppError> {
+        if let Some(tx) = self.inner.as_mut() {
+            tx.advance(InstallTxStep::Prepared)?;
+        }
+        Ok(())
+    }
     pub fn begin(
         kind: InstallTxKind,
         install_path: &Path,
@@ -1330,6 +1518,7 @@ impl ActiveInstallTx {
             let mut tx = tx;
             tx.advance(InstallTxStep::RolledBack)?;
             tx.finalize_self_update_policy(false)?;
+            tx.cleanup_portable_residue()?;
             tx.remove_file_checked()?;
         }
         Ok(())
@@ -1352,6 +1541,7 @@ impl ActiveInstallTx {
         if let Some(tx) = self.inner.take() {
             if matches!(tx.step, InstallTxStep::Prepared)
                 && tx.self_update_policy.is_none()
+                && tx.kind != InstallTxKind::WindowsPortable
                 && !prepared_looks_half_swapped(
                     path_exists(&tx.install_path),
                     path_exists(&tx.backup_path),
@@ -1378,6 +1568,7 @@ impl Drop for ActiveInstallTx {
             );
             if matches!(tx.step, InstallTxStep::Prepared)
                 && tx.self_update_policy.is_none()
+                && tx.kind != InstallTxKind::WindowsPortable
                 && !half
             {
                 tx.remove_file();
@@ -1398,6 +1589,130 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    fn portable_fixture(
+        root: &Path,
+        step: InstallTxStep,
+        had_previous: bool,
+    ) -> InstallTransaction {
+        let id = uuid::Uuid::new_v4().to_string();
+        InstallTransaction {
+            schema_version: SCHEMA_VERSION,
+            id: uuid::Uuid::new_v4().to_string(),
+            kind: InstallTxKind::WindowsPortable,
+            step,
+            install_path: root.join("Codex").to_string_lossy().into_owned(),
+            new_path: root
+                .join(".codex-app-manager-staging")
+                .join(format!("portable-{id}"))
+                .join("payload")
+                .to_string_lossy()
+                .into_owned(),
+            backup_path: root
+                .join(format!("Codex.rollback-{id}"))
+                .to_string_lossy()
+                .into_owned(),
+            had_previous,
+            was_running: None,
+            self_update_policy: None,
+            started_unix: 1,
+            updated_unix: 1,
+            notes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn partial_extraction_is_discarded_without_installing_or_touching_user_data() {
+        for previous in [true, false] {
+            let root = test_root("partial-extraction");
+            let tx = portable_fixture(&root, InstallTxStep::Extracting, previous);
+            if previous {
+                fs::create_dir_all(&tx.install_path).unwrap();
+                fs::write(Path::new(&tx.install_path).join("old"), "old").unwrap();
+            }
+            let other = root.join(".codex-app-manager-staging/portable-unowned/user-data");
+            fs::create_dir_all(other.parent().unwrap()).unwrap();
+            fs::write(&other, "preserve").unwrap();
+            fs::create_dir_all(&tx.new_path).unwrap();
+            fs::write(Path::new(&tx.new_path).join("partial"), "incomplete").unwrap();
+            assert_eq!(
+                decide_transaction_recovery(&tx, previous, false, true),
+                RecoveryAction::ClearLog
+            );
+            tx.cleanup_portable_residue().unwrap();
+            assert!(!Path::new(&tx.new_path).parent().unwrap().exists());
+            assert_eq!(Path::new(&tx.install_path).exists(), previous);
+            assert_eq!(fs::read_to_string(&other).unwrap(), "preserve");
+            tx.cleanup_portable_residue().unwrap();
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn extraction_and_uncommitted_cleanup_never_remove_rollback_materials() {
+        let root = test_root("keep-rollback");
+        let tx = portable_fixture(&root, InstallTxStep::Prepared, true);
+        fs::create_dir_all(&tx.backup_path).unwrap();
+        fs::write(Path::new(&tx.backup_path).join("old"), "old").unwrap();
+        assert!(tx.cleanup_portable_residue().is_err());
+        assert_eq!(
+            decide_transaction_recovery(&tx, false, true, false),
+            RecoveryAction::Rollback
+        );
+        let mut extracting = tx.clone();
+        extracting.step = InstallTxStep::Extracting;
+        assert!(matches!(
+            decide_transaction_recovery(&extracting, false, true, true),
+            RecoveryAction::KeepManual { .. }
+        ));
+        assert!(Path::new(&tx.backup_path).join("old").is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn completed_cleanup_requires_live_install_and_exact_owned_pair() {
+        let root = test_root("cleanup-scope");
+        let mut tx = portable_fixture(&root, InstallTxStep::Completed, true);
+        fs::create_dir_all(&tx.backup_path).unwrap();
+        fs::write(Path::new(&tx.backup_path).join("old"), "old").unwrap();
+        assert!(
+            tx.cleanup_portable_residue().is_err(),
+            "missing live app retains backup"
+        );
+        fs::create_dir_all(&tx.install_path).unwrap();
+        let valid_backup = tx.backup_path.clone();
+        tx.backup_path = root.to_string_lossy().into_owned();
+        assert!(tx.cleanup_portable_residue().is_err());
+        tx.backup_path = valid_backup;
+        tx.cleanup_portable_residue().unwrap();
+        assert!(!Path::new(&tx.backup_path).exists());
+        assert!(Path::new(&tx.install_path).is_dir());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn completed_cleanup_retries_after_real_windows_delete_sharing_failure() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = test_root("delete-sharing");
+        let tx = portable_fixture(&root, InstallTxStep::Completed, true);
+        fs::create_dir_all(&tx.install_path).unwrap();
+        fs::create_dir_all(&tx.backup_path).unwrap();
+        let marker = Path::new(&tx.backup_path).join("locked-old");
+        fs::write(&marker, "old").unwrap();
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&marker)
+            .unwrap();
+        assert!(tx.cleanup_portable_residue().is_err());
+        assert!(marker.exists());
+        drop(held);
+        tx.cleanup_portable_residue().unwrap();
+        assert!(!Path::new(&tx.backup_path).exists());
+        assert!(Path::new(&tx.install_path).is_dir());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn recovery_matrix_old_moved_boundaries() {

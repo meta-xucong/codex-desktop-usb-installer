@@ -65,17 +65,17 @@ pub use portable::{
     installed_codex_launch_exe, installed_usb_codex_launch_exe, purge_codex_user_data,
     remove_directory_all_with_retry, rename_directory_with_retry, uninstall_portable,
     validate_cleanup_path, PortableBoundary, PortableExtractionProgress, PortableFault,
-    PortableInstallOptions, PortableInstallReport, PortableUninstallReport,
+    PortableInstallOptions, PortableInstallReport, PortableInstallStage, PortableUninstallReport,
 };
 pub use sys::{
     close_msix_codex_processes, detect_installed_codex, detect_portable_install, fetch_text,
     fetch_text_with_network, fetch_text_with_network_no_redirect, launch_codex,
-    launch_codex_with_options, probe_capabilities, probe_https_reachable_with_network,
-    probe_msix_machine_state, registered_msix_package_full_name,
-    remove_exact_msix_machine_orphan_with_volume, remove_msix_package,
-    remove_msix_package_with_options, remove_msix_package_with_volume, CodexLaunchReport,
-    InstalledWindowsCodex, LaunchOptions, MsixMachineStateReport, MsixRemoveReport,
-    PortableLaunchPolicy,
+    launch_codex_with_options, launch_codex_with_options_and_before_spawn, probe_capabilities,
+    probe_https_reachable_with_network, probe_msix_machine_state,
+    registered_msix_package_full_name, remove_exact_msix_machine_orphan_with_volume,
+    remove_msix_package, remove_msix_package_with_options, remove_msix_package_with_volume,
+    CodexLaunchReport, InstalledWindowsCodex, LaunchOptions, MsixMachineStateReport,
+    MsixRemoveReport, PortableLaunchPolicy,
 };
 pub use sys::{
     install_msix_sideload, install_msix_sideload_with_observer,
@@ -95,7 +95,9 @@ pub use windows_process::{
 // Failure-kind constants for structured MSIX health outcomes.
 pub use sys::msix_failure;
 pub use version::{compare_versions, version_key};
-pub use windows_process::same_windows_path;
+pub use windows_process::{
+    desktop_user_profile_paths_if_elevated, same_windows_path, DesktopUserEnvironmentPaths,
+};
 
 pub const OPENAI_PACKAGE_IDENTITY: &str = "OpenAI.Codex";
 
@@ -113,6 +115,8 @@ pub enum EngineError {
     Capability(String),
     #[error("install error: {0}")]
     Install(String),
+    #[error("Codex USB runtime compatibility error: {0}")]
+    RuntimeCompatibility(String),
     #[error("io error: {0}")]
     Io(String),
 }

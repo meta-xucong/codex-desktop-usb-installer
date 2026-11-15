@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 
 import {
   errorCode,
+  errorMessage,
   managerApi,
   type CodexPayloadCheck,
   type UpdateInfo,
@@ -16,6 +17,7 @@ import type {
   OfflinePayloadReport,
   OfflineStageReport,
   UsbGuardStatus,
+  UsbHostStatus,
   WinInstallStatus,
 } from "../../shared/types";
 import {
@@ -44,7 +46,32 @@ type PayloadUpdateProgress = {
   bytesTotal?: number;
 };
 
+const CAPABILITY_INSTALL_PROGRESS_KEYS = {
+  "pack.validate": "offline.installActivity.pack.validate",
+  "pack.skills": "offline.installActivity.pack.skills",
+  "runtime.verify": "offline.installActivity.runtime.verify",
+  "runtime.python": "offline.installActivity.runtime.python",
+  "runtime.manim": "offline.installActivity.runtime.manim",
+  "runtime.nodeMedia": "offline.installActivity.runtime.nodeMedia",
+  "runtime.hyperframes": "offline.installActivity.runtime.hyperframes",
+  "runtime.hyperframesFfmpeg": "offline.installActivity.runtime.hyperframesFfmpeg",
+  "runtime.hyperframesCliCheck": "offline.installActivity.runtime.hyperframesCliCheck",
+  "runtime.hyperframesBrowser": "offline.installActivity.runtime.hyperframesBrowser",
+  "runtime.hyperframesBrowserCheck": "offline.installActivity.runtime.hyperframesBrowserCheck",
+  "runtime.feishu": "offline.installActivity.runtime.feishu",
+  "runtime.complete": "offline.installActivity.runtime.complete",
+  "pack.pdf": "offline.installActivity.pack.pdf",
+  "pack.media": "offline.installActivity.pack.media",
+  "pack.config": "offline.installActivity.pack.config",
+  "pack.models": "offline.installActivity.pack.models",
+  "pack.finalize": "offline.installActivity.pack.finalize",
+} as const;
+
 const USB_GUARD_STARTUP_FAST_POLL_LIMIT = 60;
+const HOST_PROGRESS_KEYS = {
+  check: "offline.host.check", capabilities: "offline.host.capabilities",
+  account: "offline.host.account", verify: "offline.host.verify",
+} as const;
 const USB_GUARD_STARTUP_FAST_POLL_MS = 250;
 const USB_GUARD_NORMAL_POLL_MS = 1_000;
 
@@ -348,12 +375,16 @@ export function OfflineHome({
   const [payloadLoading, setPayloadLoading] = useState(false);
   const [status, setStatus] = useState<WinInstallStatus | null>(null);
   const [usbGuard, setUsbGuard] = useState<UsbGuardStatus | null>(null);
+  const [hostStatus, setHostStatus] = useState<UsbHostStatus | null>(null);
+  const [hostInitializing, setHostInitializing] = useState(false);
   const [usbGuardQueryFailed, setUsbGuardQueryFailed] = useState(false);
   const [failure, setFailure] = useState<FailureSurface | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [ccswitchInjectionIssue, setCcswitchInjectionIssue] =
     useState<CcswitchInjectionIssue | null>(readStoredCcswitchInjectionIssue);
   const [installationDetail, setInstallationDetail] = useState<string | null>(null);
+  const [capabilityInstallError, setCapabilityInstallError] = useState<string | null>(null);
+  const [installActivity, setInstallActivity] = useState<string | null>(null);
   const [componentsOpen, setComponentsOpen] = useState(false);
   const [componentsView, setComponentsView] = useState<OfflineComponentsView>("connections");
   const [pendingCodexUpdate, setPendingCodexUpdate] = useState<UpdateInfo | null>(null);
@@ -370,7 +401,6 @@ export function OfflineHome({
   const usbGuardStartupPolls = useRef(0);
   const progressScopeRef = useRef<HTMLDivElement | null>(null);
   const usbGuardWasReady = useRef(false);
-
   const updateCcswitchInjectionIssue = useCallback((issue: CcswitchInjectionIssue | null) => {
     setCcswitchInjectionIssue(issue);
     try {
@@ -384,9 +414,58 @@ export function OfflineHome({
       // The banner still works for this session when storage is unavailable.
     }
   }, []);
+  const clearHostSetupErrors = useCallback(() => {
+    updateCcswitchInjectionIssue(null);
+    setCapabilityInstallError(null);
+    setNotice(null);
+  }, [updateCcswitchInjectionIssue]);
+  const refreshHostStatus = useCallback(async () => {
+    const next = await managerApi.usbHostStatus();
+    setHostStatus(next);
+    return next;
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    let unlisten: (() => void) | null = null;
+    void listen<string>("usb-host://progress", (event) => {
+      if (active && event.payload in HOST_PROGRESS_KEYS) {
+        setInstallActivity(t(HOST_PROGRESS_KEYS[event.payload as keyof typeof HOST_PROGRESS_KEYS]));
+      }
+    }).then((cleanup) => { if (active) unlisten = cleanup; else cleanup(); });
+    return () => { active = false; unlisten?.(); };
+  }, [t]);
+
+  // Renderer reload only observes the existing lease; it cannot submit again.
+  useEffect(() => {
+    let active = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const read = async (reattached = false) => {
+      try {
+        const snapshot = await managerApi.getOperationSnapshot();
+        if (!active) return;
+        const source = snapshot?.progress?.source ?? "";
+        if (source.startsWith("usb-host:")) {
+          setHostInitializing(true);
+          const stage = source.slice("usb-host:".length);
+          if (stage in HOST_PROGRESS_KEYS) setInstallActivity(t(HOST_PROGRESS_KEYS[stage as keyof typeof HOST_PROGRESS_KEYS]));
+          timer = setTimeout(() => void read(true), 1000);
+        } else if (reattached) {
+          setHostInitializing(false);
+          setInstallActivity(null);
+          const current = await refreshHostStatus();
+          if (current.ready) clearHostSetupErrors();
+        }
+      } catch (cause) { if (active && reattached) { setHostInitializing(false); setFailure(resolveFailure(cause, t)); } }
+    };
+    void read();
+    return () => { active = false; clearTimeout(timer); };
+  }, [clearHostSetupErrors, refreshHostStatus, t]);
 
   const {
     dl,
+    downloadProgress,
+    installProgress,
     dlPct,
     dlBytes,
     dlSpeed,
@@ -431,15 +510,36 @@ export function OfflineHome({
     };
   }, []);
 
+  useEffect(() => {
+    let active = true;
+    let unlisten: (() => void) | null = null;
+    void listen<string>("capability-pack://progress", (event) => {
+      if (!active || !(event.payload in CAPABILITY_INSTALL_PROGRESS_KEYS)) return;
+      const key = CAPABILITY_INSTALL_PROGRESS_KEYS[
+        event.payload as keyof typeof CAPABILITY_INSTALL_PROGRESS_KEYS
+      ];
+      setInstallActivity(t(key));
+    }).then((cleanup) => {
+      if (active) unlisten = cleanup;
+      else cleanup();
+    });
+    return () => {
+      active = false;
+      unlisten?.();
+    };
+  }, [t]);
+
   const load = useCallback(async () => {
     const generation = loadGeneration.current + 1;
     loadGeneration.current = generation;
     setPhase("loading");
+    setHostStatus(null);
     setPayload(null);
     setPayloadLoading(true);
     setFailure(null);
     setNotice(null);
     setInstallationDetail(null);
+    setCapabilityInstallError(null);
     setUsbGuardQueryFailed(false);
     try {
       // The payload probe hashes the complete MSIX and may also inspect its
@@ -543,12 +643,6 @@ export function OfflineHome({
       }
       setPayload(nextPayload);
       setPayloadLoading(false);
-      if (
-        settledStatus.installed &&
-        compareVersions(settledStatus.installed.version, nextPayload.codexDesktopVersion) > 0
-      ) {
-        setNotice(t("offline.newerVersion"));
-      }
       if (currentUsbInstallMatchesPayload(settledStatus, settledUsbGuard, nextPayload)) {
         // A startup snapshot can leave an "installed elsewhere" notice
         // behind while USB authorization is still settling. The proven USB
@@ -643,17 +737,13 @@ export function OfflineHome({
     };
   }, [componentsOpen, payload, usbGuardQueryFailed, usbGuardStatus]);
 
-  const newerInstalled = useMemo(() => {
-    if (!payload || !status?.installed) return false;
-    return compareVersions(status.installed.version, payload.codexDesktopVersion) > 0;
-  }, [payload, status]);
-
   const performInstall = useCallback(async (sourcePayload: OfflinePayloadReport) => {
     setPayload(sourcePayload);
     setPhase("staging");
     setFailure(null);
     setNotice(null);
     setInstallationDetail(null);
+    setInstallActivity(null);
     let stage: OfflineStageReport | null = null;
     let pendingRecovery = false;
     let verifiedInstalled: WinInstallStatus | null = null;
@@ -675,16 +765,9 @@ export function OfflineHome({
         return false;
       }
       setUsbGuard(preflightGuard);
-      // The shipped USB package is local, but first install also configures
-      // online services. Check both the required gateway route and the signed
-      // API-key binding before staging anything; backend mutation boundaries
-      // repeat these checks independently.
+      // Local installation needs the signed binding. Gateway reachability is
+      // reported by the catalog stage and does not block a verified local pack.
       const installPreflight = await managerApi.winCheckInstallPreflight();
-      if (!installPreflight.internetAvailable) {
-        setPhase("ready");
-        setNotice(t("offline.installRequiresNetwork"));
-        return false;
-      }
       if (!installPreflight.apiKeyReady) {
         setPhase("ready");
         setNotice(t("offline.installRequiresBinding"));
@@ -708,12 +791,6 @@ export function OfflineHome({
             : t("offline.existingOutsideUsb"),
         );
       }
-      if (
-        current.installed &&
-        compareVersions(current.installed.version, stage.payload.codexDesktopVersion) > 0
-      ) {
-        throw new Error(t("offline.newerVersion"));
-      }
       // A historical USB install owns the same progress lease as the normal
       // Windows flow. Reset the previous event owner before the new operation
       // so a late packet from an earlier install cannot paint this one.
@@ -733,9 +810,11 @@ export function OfflineHome({
       if (!result.success) {
         throw new Error(result.message || t("error.install"));
       }
+      setInstallActivity(t("offline.installActivity.verify"));
       // Preserve the recovery/backup locations even when the subsequent
       // configurator succeeds. A CCSwitch notice must not hide this evidence.
       setInstallationDetail(result.message);
+      setCapabilityInstallError(null);
       const installed = await managerApi.winStatus();
       if (installed.recoveryPending) {
         pendingRecovery = true;
@@ -767,6 +846,7 @@ export function OfflineHome({
       verifiedInstalled = installed;
       // Keep diagnostic staging until all installed-state/placement checks
       // pass. A verification failure must not claim a deleted file was kept.
+      setInstallActivity(t("offline.installActivity.cleanup"));
       await managerApi.offlinePayloadCleanup(stage.stagedPath).catch(() => undefined);
       // Codex is now confirmed on disk. Install the complete local capability
       // pack first, then hand off to CCSwitch. Either auxiliary component is
@@ -788,6 +868,7 @@ export function OfflineHome({
           minimaxVideoModel: "",
         };
         try {
+          setInstallActivity(t("offline.components.mediaModelsLoading"));
           // This is an authenticated GET /v1/models lookup only; it does not
           // submit a paid image or video generation request.
           const catalog = await managerApi.mediaModelCatalog();
@@ -827,6 +908,7 @@ export function OfflineHome({
             // safe behavior is to leave only this MCP disabled.
           }
         }
+        setInstallActivity(t("offline.installActivity.capability"));
         capabilityPackReport = await managerApi.installCapabilityPack({
           ...DEFAULT_CAPABILITY_PACK_OPTIONS,
           // A failed catalog lookup is not evidence that previously saved
@@ -834,49 +916,51 @@ export function OfflineHome({
           persistConnections: mediaCatalogStatus === "verified",
           ...mediaModels,
           // Register the local MCP regardless of upstream catalog availability.
-          // The installer supplies its default image route when no model is selected.
+          // The MCP wrapper resolves its default image route after saved settings.
           enableMediaGeneration: true,
           mediaGatewayCatalogStatus: mediaCatalogStatus,
           mediaGatewayModelCount,
           mediaGatewayCatalogVerifiedAt,
-        });
+        }, true);
       } catch (capabilityError) {
-        capabilityPackErrorDetail =
-          capabilityError instanceof Error
-            ? capabilityError.message
-            : String(capabilityError ?? "");
+        capabilityPackErrorDetail = errorMessage(capabilityError);
         console.warn("[capability-pack] automatic install failed", capabilityError);
       }
       let ccswitchReport = null;
       let ccswitchErrorDetail: string | null = null;
       try {
+        setInstallActivity(t("offline.ccswitchLaunching"));
         ccswitchReport = await managerApi.installAndLaunchCcswitch();
       } catch (ccswitchError) {
-        ccswitchErrorDetail =
-          ccswitchError instanceof Error
-            ? ccswitchError.message
-            : String(ccswitchError ?? "");
+        ccswitchErrorDetail = errorMessage(ccswitchError);
         console.warn("[ccswitch] automatic launch failed", ccswitchError);
       }
       const injectionIssue = ccswitchInjectionIssueFor(ccswitchReport);
       updateCcswitchInjectionIssue(injectionIssue);
+      const finalHostStatus = await managerApi.usbHostStatus().catch((cause) => {
+        setFailure(resolveFailure(cause, t));
+        return null;
+      });
+      setHostStatus(finalHostStatus);
+      // The backend returns a media-enabled install report only after its
+      // registration check. An exception or unmerged config is not evidence.
+      const mediaRegistrationConfirmed = capabilityPackReport?.configStatus === "merged";
       if (capabilityPackErrorDetail) {
-        setInstallationDetail(
-          `${result.message}\n能力包自动安装失败：${capabilityPackErrorDetail}\n可在“高级功能 > 组件修复”中重试。`,
-        );
-      } else if (!mediaModelsAvailable) {
+        setCapabilityInstallError(capabilityPackErrorDetail);
+      } else if (mediaRegistrationConfirmed && !mediaModelsAvailable) {
         const mediaMessage = mediaCatalogStatus === "failed"
           ? "无法读取上游模型目录"
           : "上游暂未返回可识别的图片或视频模型";
         setInstallationDetail(
           `${result.message}\n${mediaMessage}，媒体 MCP 已注册；可在“连接与扩展”重新检测模型。`,
         );
-      } else if (mediaCatalogStatus === "failed") {
+      } else if (mediaRegistrationConfirmed && mediaCatalogStatus === "failed") {
         setInstallationDetail(
           `${result.message}\n上游模型目录暂不可读，已保留本机现有媒体模型与 MCP 设置；本次没有刷新模型列表。`,
         );
       }
       setStatus(installed);
+      setInstallActivity(null);
       setPhase("installed");
       const notices: string[] = [];
       if (capabilityPackReport?.coreReady && capabilityPackReport.success) {
@@ -903,13 +987,13 @@ export function OfflineHome({
       } else {
         notices.push(t("offline.capabilityFailed"));
       }
-      if (!mediaModelsAvailable) {
+      if (mediaRegistrationConfirmed && !mediaModelsAvailable) {
         notices.push(
           mediaCatalogStatus === "failed"
             ? "媒体 MCP 已注册：当前无法读取上游模型目录，可在“连接与扩展”重试检测。"
             : "媒体 MCP 已注册：当前未发现可识别模型，可在“连接与扩展”重新检测。",
         );
-      } else if (mediaCatalogStatus === "failed") {
+      } else if (mediaRegistrationConfirmed && mediaCatalogStatus === "failed") {
         notices.push("上游模型目录暂不可读，本次继续使用已有媒体模型设置。");
       }
       if (!injectionIssue && ccswitchReport?.launched) {
@@ -922,9 +1006,10 @@ export function OfflineHome({
         notices.push(t("offline.ccswitchFailed"));
       }
       setNotice(notices.join(" "));
-      return true;
+      return finalHostStatus?.ready ?? false;
     } catch (cause) {
       if (verifiedInstalled) setStatus(verifiedInstalled);
+      setInstallActivity(null);
       setPhase(verifiedInstalled ? "installed" : "ready");
       setFailure(resolveFailure(cause, t));
       if (pendingRecovery) {
@@ -942,17 +1027,13 @@ export function OfflineHome({
       setNotice(t("offline.installRequiresAuthorized"));
       return;
     }
-    if (newerInstalled) {
-      setNotice(t("offline.newerVersion"));
-      return;
-    }
     setBusyAction("install");
     try {
       await performInstall(payload);
     } finally {
       setBusyAction(null);
     }
-  }, [busyAction, newerInstalled, payload, performInstall, t, usbGuard, usbGuardQueryFailed]);
+  }, [busyAction, payload, performInstall, t, usbGuard, usbGuardQueryFailed]);
 
   const codexPayloadAvailable = !usbGuardQueryFailed && canUpdateCodexPayload(usbGuard);
 
@@ -1088,6 +1169,17 @@ export function OfflineHome({
     setBusyAction("launch");
     setFailure(null);
     try {
+      const current = await refreshHostStatus();
+      if (!current.ready) {
+        setHostInitializing(true);
+        setInstallActivity(t("offline.host.check"));
+        // This USB product uses its authorized account by default. The backend
+        // changes only the managed account fields and verifies the handoff.
+        const initialized = await managerApi.initializeUsbHost(true);
+        setHostStatus(initialized);
+        if (!initialized.ready) throw new Error(initialized.message);
+      }
+      clearHostSetupErrors();
       const normalizedLang = lang.toLowerCase();
       const codexLocale = normalizedLang.startsWith("zh")
         ? normalizedLang.startsWith("zh-tw")
@@ -1097,10 +1189,13 @@ export function OfflineHome({
       await managerApi.winLaunch(codexLocale);
     } catch (cause) {
       setFailure(resolveFailure(cause, t));
+      await refreshHostStatus().catch(() => undefined);
     } finally {
+      setHostInitializing(false);
+      setInstallActivity(null);
       setBusyAction(null);
     }
-  }, [busyAction, lang, t]);
+  }, [busyAction, clearHostSetupErrors, lang, refreshHostStatus, t]);
 
   const openLogs = useCallback(async () => {
     if (busyAction) return;
@@ -1130,6 +1225,14 @@ export function OfflineHome({
   const usbGuardIsStarting = usbGuardStartupPending(usbGuard);
   const currentUsbInstalled = currentUsbInstallMatchesPayload(status, usbGuard, payload);
   const showInstalled = codexReady && (phase === "installed" || currentUsbInstalled);
+  useEffect(() => {
+    if (!showInstalled || phase === "installing" || busyAction || hostInitializing) return;
+    let active = true;
+    void managerApi.usbHostStatus().then((value) => { if (active) setHostStatus(value); })
+      .catch((cause) => { if (active) { setHostStatus(null); setFailure(resolveFailure(cause, t)); } });
+    return () => { active = false; };
+  }, [showInstalled, phase, busyAction, componentsOpen, hostInitializing, t]);
+  const hostPending = hostStatus?.required === true && !hostStatus.ready;
   const displayInstalled = codexReady ? installed : null;
   const startupReadinessPending =
     payloadLoading || phase === "loading" || usbGuardIsStarting;
@@ -1181,7 +1284,7 @@ export function OfflineHome({
           ? usbGuard?.message || usbGuardLabel(usbGuard?.status ?? "", t)
           : null);
   const unifiedNoticeTone = guardNeedsAttention && !notice ? "warn" : "info";
-  const visibleCcswitchInjectionIssue = showInstalled ? ccswitchInjectionIssue : null;
+  const visibleCcswitchInjectionIssue = showInstalled && !hostStatus?.conflict ? ccswitchInjectionIssue : null;
   const ccswitchIssueRetryable =
     visibleCcswitchInjectionIssue === "failed" ||
     visibleCcswitchInjectionIssue === "launch-failed" ||
@@ -1190,6 +1293,14 @@ export function OfflineHome({
   // Keep the main-screen phase union intact below; the progress screen is a
   // temporary view and the page still renders the normal phase copy after it
   // unmounts.
+  if (hostInitializing) {
+    return <ProgressScreen scene="usb-host-initialization" scopeRef={progressScopeRef}
+      paused={null} dl={{ downloaded: 0, total: 0, source: "", phase: "finishing" }}
+      dlPct={0} dlBytes={0} dlSpeed={0} installing splitWindowsInstall localSetup downloadStop={null} downloadStopBusy
+      failure={failure} activity={installActivity ?? t("offline.host.check")}
+      onResume={() => undefined} onPause={() => undefined} onCancel={() => undefined} showControls={false} />;
+  }
+
   if (String(phase) === "installing") {
     return (
       <ProgressScreen
@@ -1197,13 +1308,22 @@ export function OfflineHome({
         scopeRef={progressScopeRef}
         paused={null}
         dl={dl}
+        downloadProgress={downloadProgress}
+        installProgress={installProgress}
         dlPct={dlPct}
         dlBytes={dlBytes}
         dlSpeed={dlSpeed}
         installing
+        splitWindowsInstall
         downloadStop={downloadStop}
         downloadStopBusy={downloadStopBusy}
         failure={failure}
+        activity={
+          installActivity ??
+          (dl?.activity === "portable-startup-compatibility"
+            ? t("offline.installActivity.codexStartup")
+            : null)
+        }
         onResume={() => undefined}
         onPause={() => void requestDownloadStop("pause")}
         onCancel={() => void requestDownloadStop("cancel")}
@@ -1358,7 +1478,8 @@ export function OfflineHome({
           ) : showInstalled ? (
             <>
               <Ring icon="check" variant="success" />
-              <div className="headline">{t("offline.installed")}</div>
+              <div className="headline">{t(hostPending ? "offline.host.pending" : "offline.installed")}</div>
+              {hostPending ? <div className="sub" role="status">{hostStatus.message}</div> : null}
               <div className="microcue"><Icon name="shield" />{t("offline.hashVerified")}</div>
             </>
           ) : usbInstallBlockedByExistingCodex(status, usbGuard) ? (
@@ -1425,7 +1546,7 @@ export function OfflineHome({
         <div className="actions">
           {phase === "error" ? null : showInstalled ? (
             <>
-              <button className="btn primary big" onClick={() => void launch()} disabled={disabled}>
+              <button className="btn primary big" onClick={() => void launch()} disabled={disabled || hostStatus === null}>
                 {busyAction === "launch" ? <Icon name="loader" className="spinicon" /> : <CodexGlyph />}
                 {busyAction === "launch" ? t("offline.launching") : t("offline.launch")}
               </button>
@@ -1457,7 +1578,7 @@ export function OfflineHome({
             </>
           ) : (
             <>
-              <button className="btn primary big" onClick={() => void install()} disabled={disabled || newerInstalled || !codexInstallAllowed}>
+              <button className="btn primary big" onClick={() => void install()} disabled={disabled || !codexInstallAllowed}>
                 {busyAction === "install" ? <Icon name="loader" className="spinicon" /> : <Icon name="download" />}
                 {busyAction === "install" ? t("offline.installing") : status?.recoveryPending ? t("offline.resumeInstall") : t("offline.install")}
               </button>
@@ -1541,10 +1662,13 @@ export function OfflineHome({
                 <Icon name="sliders" />{t("offline.components.repairEntry")}
               </button>
             </div>
-            {installationDetail ? (
+            {installationDetail || capabilityInstallError ? (
               <details className="advanced-detail">
                 <summary>{t("offline.installDetails")}</summary>
                 <div>{installationDetail}</div>
+                {capabilityInstallError ? (
+                  <div>{`能力包自动安装失败：${capabilityInstallError}\n可在“高级功能 > 组件修复”中重试。`}</div>
+                ) : null}
               </details>
             ) : null}
           </div>

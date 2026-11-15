@@ -23,9 +23,10 @@ import (
 )
 
 var (
-	errStoreUnknown  = errors.New("license state unknown")
-	errAlreadyExists = errors.New("license already exists")
-	errNotFound      = errors.New("license not found")
+	errStoreUnknown         = errors.New("license state unknown")
+	errAlreadyExists        = errors.New("license already exists")
+	errNotFound             = errors.New("license not found")
+	errRegistrationMismatch = errors.New("registration does not match stored license")
 )
 
 type Config struct {
@@ -476,9 +477,14 @@ func (s *Store) LookupForCheck(ctx context.Context, req CheckRequest, keyring ma
 		s.setUnknown("database query failed")
 		return empty, LicenseRecord{}, errStoreUnknown
 	}
-	if record.LicenseSignatureSHA256 != reg.LicenseSignatureSHA256 || record.FingerprintDigest != reg.FingerprintSHA256 || record.KeyID != reg.LicenseKeyID || record.StateVersion < 1 || (record.Status != "active" && record.Status != "revoked") {
+	if record.StateVersion < 1 || (record.Status != "active" && record.Status != "revoked") {
 		s.setUnknown("license record integrity failed")
 		return empty, LicenseRecord{}, errStoreUnknown
+	}
+	if record.LicenseSignatureSHA256 != reg.LicenseSignatureSHA256 || record.FingerprintDigest != reg.FingerprintSHA256 || record.KeyID != reg.LicenseKeyID {
+		// A valid but different proof conflicts with this binding, not with
+		// the database/journals already verified above. Reject only this request.
+		return empty, LicenseRecord{}, errRegistrationMismatch
 	}
 	if record.CreatedAt, err = time.Parse(time.RFC3339Nano, created); err != nil {
 		s.setUnknown("database record invalid")
@@ -900,6 +906,26 @@ func sha256Hex(raw []byte) string { sum := sha256.Sum256(raw); return hex.Encode
 
 func (s *Store) isUnknown() bool { s.unknownMu.RLock(); defer s.unknownMu.RUnlock(); return s.unknown }
 func (s *Store) IsHealthy() bool { return !s.isUnknown() }
+
+// failureReason contains only fixed categories, never request or database values.
+func (s *Store) failureReason(err error) string {
+	switch {
+	case errors.Is(err, errRegistrationMismatch):
+		return "registration_mismatch"
+	case errors.Is(err, errInvalidRegistration):
+		return "invalid_registration"
+	case errors.Is(err, errNotFound):
+		return "license_not_registered"
+	case errors.Is(err, errAlreadyExists):
+		return "registration_conflict"
+	}
+	s.unknownMu.RLock()
+	defer s.unknownMu.RUnlock()
+	if s.unknown && s.unknownReason != "" {
+		return s.unknownReason
+	}
+	return "operation_unavailable"
+}
 func (s *Store) setUnknown(reason string) {
 	s.unknownMu.Lock()
 	s.unknown, s.unknownReason = true, reason

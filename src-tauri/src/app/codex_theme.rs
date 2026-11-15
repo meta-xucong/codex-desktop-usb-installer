@@ -1721,11 +1721,25 @@ fn launch_codex_with_cdp(
                 } else {
                     None
                 };
-                let launch_environment = crate::app::win_update::codex_launch_environment(
+                let mut launch_environment = crate::app::win_update::codex_launch_environment(
                     usb_mode,
                     codex_home.as_deref(),
                 );
-                let report = codex_win_engine::launch_codex_with_options(
+                #[cfg(feature = "usb-cua-helper-mta-experiment")]
+                let bundle_root = if usb_mode {
+                    crate::app::usb_guard::current_bundle_root()
+                } else {
+                    None
+                };
+                #[cfg(not(feature = "usb-cua-helper-mta-experiment"))]
+                let bundle_root: Option<PathBuf> = None;
+                crate::app::win_update::append_usb_cua_helper_experiment_environment(
+                    usb_mode,
+                    bundle_root.as_deref(),
+                    &mut launch_environment,
+                )?;
+                let prepare_home = codex_home.clone();
+                let report = codex_win_engine::launch_codex_with_options_and_before_spawn(
                     &detected,
                     codex_win_engine::LaunchOptions {
                         disable_codex_self_updates: disable_self_updates || usb_mode,
@@ -1736,6 +1750,12 @@ fn launch_codex_with_cdp(
                         codex_home,
                         locale_override: codex_locale.map(str::to_string),
                         portable_launch_policy: launch_policy,
+                    },
+                    move || {
+                        crate::app::win_update::prepare_usb_conversation_mode_for_launch(
+                            usb_mode,
+                            prepare_home.as_deref(),
+                        )
                     },
                 )
                 .map_err(|e| AppError::Engine(format!("以调试模式打开 Codex 失败: {e}")))?;

@@ -216,6 +216,13 @@ fn launch_through_manager(app: tauri::AppHandle) -> Result<(), String> {
         let result = crate::commands::win_launch_codex(state, None)
             .await
             .map_err(|error| error.message);
+        if result.as_ref().err().is_some_and(|message| message.contains("USB_HOST_NOT_READY")) {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }
         let _ = sender.send(result);
     });
     receiver

@@ -509,11 +509,12 @@ fn save_pending_preload(pending: &PendingPreload) -> Result<(), Sub2ApiError> {
     validate_pending_preload(pending)?;
     let path = pending_preload_path(&pending.usb_asset_id)?;
     if let Some(existing) = load_pending_preload(&pending.usb_asset_id)? {
-        if existing.idempotency_key != pending.idempotency_key {
+        if !same_pending_preload_operation(&existing, pending) {
             return Err(Sub2ApiError::Pending(
                 "已有另一条待处理预充值记录，请先完成或核对后再开始新操作".to_string(),
             ));
         }
+        return Ok(());
     }
     let parent = path
         .parent()
@@ -586,6 +587,37 @@ fn new_pending_preload(
     };
     validate_pending_preload(&pending)?;
     Ok(pending)
+}
+
+fn same_pending_preload_operation(left: &PendingPreload, right: &PendingPreload) -> bool {
+    left.schema_version == right.schema_version
+        && left.usb_asset_id == right.usb_asset_id
+        && left.sub2api_user_id == right.sub2api_user_id
+        && left.amount == right.amount
+        && left.license_digest == right.license_digest
+        && left.idempotency_key == right.idempotency_key
+}
+
+/// Persist or reuse one exact initial-preload intent without sending a request.
+/// This lets a newly signed USB survive a pending license activation and
+/// continue the same operation after the registration retry succeeds.
+pub fn prepare_pending_preload(
+    user_id: u64,
+    amount: f64,
+    license_digest: &str,
+    asset_id: &str,
+) -> Result<PendingPreload, Sub2ApiError> {
+    let requested = new_pending_preload(user_id, amount, license_digest, asset_id)?;
+    if let Some(existing) = load_pending_preload(asset_id)? {
+        if same_pending_preload_operation(&existing, &requested) {
+            return Ok(existing);
+        }
+        return Err(Sub2ApiError::Pending(
+            "已有另一条待处理预充值记录，请先完成或核对后再开始新操作".to_string(),
+        ));
+    }
+    save_pending_preload(&requested)?;
+    Ok(requested)
 }
 
 pub fn load_config() -> Result<Sub2ApiConfig, Sub2ApiError> {
@@ -1158,8 +1190,7 @@ impl Sub2ApiClient {
         license_digest: &str,
         asset_id: &str,
     ) -> Result<PendingPreload, Sub2ApiError> {
-        let pending = new_pending_preload(user_id, amount, license_digest, asset_id)?;
-        save_pending_preload(&pending)?;
+        let pending = prepare_pending_preload(user_id, amount, license_digest, asset_id)?;
         self.precharge(
             pending.sub2api_user_id,
             pending.amount,
@@ -1177,19 +1208,12 @@ impl Sub2ApiClient {
         binding: &UsbAccountBinding,
         current_license_digest: &str,
     ) -> Result<RetryPreloadResult, Sub2ApiError> {
-        codex_usb_license::validate_account_binding(binding)
-            .map_err(|error| Sub2ApiError::Pending(error.to_string()))?;
-        let Some(pending) = load_pending_preload(&binding.usb_asset_id)? else {
+        let Some(pending) = Self::load_matching_pending_preload(binding, current_license_digest)?
+        else {
             return Err(Sub2ApiError::Pending(
                 "没有找到该 U 盘的待处理预充值记录".to_string(),
             ));
         };
-        if pending.sub2api_user_id != binding.sub2api_user_id {
-            return Err(Sub2ApiError::Pending(
-                "待处理记录与许可证账号不一致，已停止".to_string(),
-            ));
-        }
-        ensure_pending_license_digest(&pending, current_license_digest)?;
         self.precharge(
             pending.sub2api_user_id,
             pending.amount,
@@ -1198,6 +1222,24 @@ impl Sub2ApiClient {
         )?;
         clear_pending_preload(&pending.usb_asset_id)?;
         Ok(RetryPreloadResult { pending })
+    }
+
+    pub fn load_matching_pending_preload(
+        binding: &UsbAccountBinding,
+        current_license_digest: &str,
+    ) -> Result<Option<PendingPreload>, Sub2ApiError> {
+        codex_usb_license::validate_account_binding(binding)
+            .map_err(|error| Sub2ApiError::Pending(error.to_string()))?;
+        let Some(pending) = load_pending_preload(&binding.usb_asset_id)? else {
+            return Ok(None);
+        };
+        if pending.sub2api_user_id != binding.sub2api_user_id {
+            return Err(Sub2ApiError::Pending(
+                "待处理记录与许可证账号不一致，已停止".to_string(),
+            ));
+        }
+        ensure_pending_license_digest(&pending, current_license_digest)?;
+        Ok(Some(pending))
     }
 
     fn list_usb_users(&self) -> Result<Vec<UserRecord>, Sub2ApiError> {
@@ -2040,6 +2082,87 @@ mod tests {
         clear_pending_preload("USB-0001").expect("clear pending record");
         assert!(!has_pending_preload("USB-0001").unwrap());
 
+        match previous {
+            Some(value) => std::env::set_var("LOCALAPPDATA", value),
+            None => std::env::remove_var("LOCALAPPDATA"),
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pending_preload_intent_is_reused_exactly_and_cannot_change_amount_or_account() {
+        let _guard = CONFIG_TEST_LOCK.lock().unwrap();
+        let root =
+            std::env::temp_dir().join(format!("usb-signer-pending-preload-{}", Uuid::new_v4()));
+        let previous = std::env::var_os("LOCALAPPDATA");
+        std::env::set_var("LOCALAPPDATA", &root);
+
+        let first = prepare_pending_preload(23, 10.5, "license-digest", "USB-0012")
+            .expect("persist initial preload intent");
+        let retry = prepare_pending_preload(23, 10.5, "license-digest", "USB-0012")
+            .expect("reuse same intent");
+        assert_eq!(retry, first);
+        assert!(prepare_pending_preload(23, 20.0, "license-digest", "USB-0012").is_err());
+        assert!(prepare_pending_preload(24, 10.5, "license-digest", "USB-0012").is_err());
+        assert_eq!(load_pending_preload("USB-0012").unwrap(), Some(first));
+
+        match previous {
+            Some(value) => std::env::set_var("LOCALAPPDATA", value),
+            None => std::env::remove_var("LOCALAPPDATA"),
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pending_preload_retry_uses_original_amount_and_idempotency_key_then_clears_intent() {
+        let _guard = CONFIG_TEST_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "usb-signer-pending-preload-retry-{}",
+            Uuid::new_v4()
+        ));
+        let previous = std::env::var_os("LOCALAPPDATA");
+        std::env::set_var("LOCALAPPDATA", &root);
+        let original = prepare_pending_preload(23, 10.5, "license-digest", "USB-0012")
+            .expect("persist initial preload");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let expected_idempotency_key = original.idempotency_key.to_ascii_lowercase();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept retried preload");
+            let request = read_http_request(&mut stream);
+            let request_lower = request.to_ascii_lowercase();
+            assert!(request.starts_with("POST /api/v1/admin/users/23/balance "));
+            assert!(request_lower.contains("idempotency-key: usb-preload-usb-0012-"));
+            assert!(request_lower.contains(&format!("idempotency-key: {expected_idempotency_key}")));
+            assert!(request.contains("\"balance\":10.5"));
+            send_json(&mut stream, "{}");
+        });
+        let client = Sub2ApiClient::new(Sub2ApiConfig {
+            base_url: format!("http://{address}"),
+            admin_api_key: "admin-test-key".to_string(),
+            ..Sub2ApiConfig::default()
+        })
+        .expect("fixture client");
+        let binding = UsbAccountBinding {
+            schema_version: 1,
+            usb_asset_id: "USB-0012".to_string(),
+            account_ref: "USB-0012".to_string(),
+            account_name: "USB-0012".to_string(),
+            login_email: "usb0012@u.404token.xyz".to_string(),
+            sub2api_user_id: 23,
+            ccswitch: UsbCcswitchBinding {
+                provider_id: "404token".to_string(),
+                credential_id: "USB-0012".to_string(),
+                device_api_key: "test-device-key".to_string(),
+                group_id: 7,
+            },
+        };
+        let resumed = client
+            .retry_pending_precharge(&binding, "license-digest")
+            .expect("retry the saved preload");
+        assert_eq!(resumed.pending, original);
+        assert_eq!(load_pending_preload("USB-0012").unwrap(), None);
+        handle.join().expect("preload fixture thread");
         match previous {
             Some(value) => std::env::set_var("LOCALAPPDATA", value),
             None => std::env::remove_var("LOCALAPPDATA"),

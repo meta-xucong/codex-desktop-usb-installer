@@ -1034,7 +1034,7 @@ fn activation_summary(
                 activation::ActivationError::Conflict => "conflict",
                 activation::ActivationError::Network
                 | activation::ActivationError::InvalidResponse
-                | activation::ActivationError::Rejected => "pending",
+                | activation::ActivationError::Rejected { .. } => "pending",
             };
             (status, None, Some(error.to_string()))
         }
