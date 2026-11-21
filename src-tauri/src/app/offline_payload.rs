@@ -859,28 +859,27 @@ pub fn stage_offline_payload(
     let mut payload =
         probe_offline_payload(executable, package_override, expected_architecture, false)?;
     let stage_root = secure_stage_directory(&payload.codex_desktop_version)?;
-    let destination = copy_or_reuse_staged_payload(&payload, &stage_root, available_space)?;
-    let staged_hash = verify_staged_payload_hash(&destination, &payload.sha256)?;
+    let destination = copy_or_reuse_verified_payload(&payload, &stage_root, available_space)?;
     payload.authenticode = verify_staged_authenticode(&destination, enforce_authenticode)?;
     Ok(OfflineStageReport {
         source_path: payload.payload_path.clone(),
         staged_path: path_text(&destination),
         size: payload.size,
-        sha256: staged_hash,
+        sha256: payload.sha256.clone(),
         payload,
     })
 }
 
-fn verify_staged_payload_hash(path: &Path, expected_sha256: &str) -> Result<String, AppError> {
+fn verify_staged_payload_hash(path: &Path, expected_sha256: &str) -> Result<(), AppError> {
     let staged_hash = codex_win_engine::sha256_file(path)
         .map_err(|error| engine_error(format!("再次计算暂存 MSIX SHA-256 失败: {error}")))?;
     if !staged_hash.eq_ignore_ascii_case(expected_sha256) {
         return Err(engine_error("暂存 MSIX 二次校验失败，拒绝安装"));
     }
-    Ok(staged_hash)
+    Ok(())
 }
 
-fn copy_or_reuse_staged_payload(
+fn copy_or_reuse_verified_payload(
     payload: &OfflinePayloadReport,
     stage_root: &Path,
     free_space: impl Fn(&Path) -> Result<Option<u64>, AppError>,
@@ -990,6 +989,8 @@ fn copy_or_reuse_staged_payload(
     if copied != payload.size {
         return Err(engine_error("源 MSIX 大小在复制过程中改变，拒绝安装"));
     }
+    drop(target);
+    verify_staged_payload_hash(&destination, &payload.sha256)?;
     Ok(destination)
 }
 
@@ -1339,9 +1340,8 @@ mod tests {
         let stage_root = root.join("isolated-stage");
         fs::create_dir(&stage_root).unwrap();
         let stage_root = stage_root.canonicalize().unwrap();
-        let copied = copy_or_reuse_staged_payload(&preflight, &stage_root, |_| Ok(None)).unwrap();
-
-        assert!(verify_staged_payload_hash(&copied, &preflight.sha256).is_err());
+        let error = copy_or_reuse_verified_payload(&preflight, &stage_root, |_| Ok(None)).unwrap_err();
+        assert!(error.to_string().contains("暂存 MSIX 二次校验失败"));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1366,8 +1366,7 @@ mod tests {
         let stage_root = root.join("isolated-stage");
         fs::create_dir(&stage_root).unwrap();
         let stage_root = stage_root.canonicalize().unwrap();
-        let snapshot = copy_or_reuse_staged_payload(&preflight, &stage_root, |_| Ok(None)).unwrap();
-        verify_staged_payload_hash(&snapshot, &preflight.sha256).unwrap();
+        let snapshot = copy_or_reuse_verified_payload(&preflight, &stage_root, |_| Ok(None)).unwrap();
 
         write_fake_msix_with_cli(&source, b"replacement CLI bytes");
         assert_eq!(
@@ -1429,7 +1428,7 @@ mod tests {
         fs::create_dir(&stage_root).unwrap();
         let stage_root = stage_root.canonicalize().unwrap();
         let staged =
-            copy_or_reuse_staged_payload(&payload, &stage_root, |_| Ok(Some(u64::MAX))).unwrap();
+            copy_or_reuse_verified_payload(&payload, &stage_root, |_| Ok(Some(u64::MAX))).unwrap();
         #[cfg(windows)]
         let locked = {
             use std::os::windows::fs::OpenOptionsExt;
@@ -1442,7 +1441,7 @@ mod tests {
                 .open(&staged)
                 .unwrap()
         };
-        let reused = copy_or_reuse_staged_payload(&payload, &stage_root, |_| {
+        let reused = copy_or_reuse_verified_payload(&payload, &stage_root, |_| {
             panic!("a validated cache requires no additional copy space")
         })
         .unwrap();
@@ -1525,9 +1524,9 @@ mod tests {
                 .open(&broken)
                 .unwrap()
         };
-        assert!(copy_or_reuse_staged_payload(&payload, &stage_root, |_| Ok(Some(0))).is_err());
+        assert!(copy_or_reuse_verified_payload(&payload, &stage_root, |_| Ok(Some(0))).is_err());
         let staged =
-            copy_or_reuse_staged_payload(&payload, &stage_root, |_| Ok(Some(u64::MAX))).unwrap();
+            copy_or_reuse_verified_payload(&payload, &stage_root, |_| Ok(Some(u64::MAX))).unwrap();
         assert_ne!(staged, broken);
         assert_eq!(staged.parent().unwrap().parent(), stage_root.parent());
         assert_eq!(
@@ -1539,7 +1538,7 @@ mod tests {
             payload.sha256
         );
         assert_eq!(
-            copy_or_reuse_staged_payload(&payload, &stage_root, |_| {
+            copy_or_reuse_verified_payload(&payload, &stage_root, |_| {
                 panic!("repeat fallback must reuse verified cache without another copy")
             })
             .unwrap(),

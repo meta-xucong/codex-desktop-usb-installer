@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { I18nProvider } from "./i18n";
 import { ThemeProvider } from "./theme";
@@ -32,7 +32,7 @@ function focusPageTarget(root: ParentNode | null) {
   preferred?.focus({ preventScroll: true });
 }
 
-function Shell() {
+function Shell({ feishuConnectionRequest }: { feishuConnectionRequest: number }) {
   const [view, setView] = useState<View>("home");
   const offlineOnly =
     currentPlatform() === "windows" &&
@@ -40,6 +40,9 @@ function Shell() {
   // Skip the first paint: NavBar / Home already own initial focus; stealing it
   // on mount is noisier than helpful for keyboard users.
   const skipInitialFocus = useRef(true);
+  useEffect(() => {
+    if (feishuConnectionRequest > 0) setView("home");
+  }, [feishuConnectionRequest]);
 
   // Home stays mounted (just hidden) so returning to it doesn't re-mount and
   // re-run the network check — it shows its last state instantly. Sub-views
@@ -86,6 +89,7 @@ function Shell() {
         <Home
           onOpenSettings={() => setView("settings")}
           onOpenUninstall={() => setView("uninstall")}
+          feishuConnectionRequest={feishuConnectionRequest}
         />
       </div>
       {view === "settings" ? (
@@ -125,6 +129,8 @@ function Shell() {
 }
 
 export function App() {
+  const [feishuConnectionRequest, setFeishuConnectionRequest] = useState(0);
+  const openFeishuConnection = useCallback(() => setFeishuConnectionRequest((request) => request + 1), []);
   // Keep QuitConfirm outside the rich boundary so native close / Cmd+Q events
   // still have a listener when Shell is replaced by its crash page. The
   // dependency-light RootCrashBoundary in bootstrap.tsx wraps this whole tree,
@@ -134,9 +140,9 @@ export function App() {
       <I18nProvider>
         <WindowModeProvider>
           <ErrorBoundary>
-            <Shell />
+            <Shell feishuConnectionRequest={feishuConnectionRequest} />
           </ErrorBoundary>
-          <QuitConfirm />
+          <QuitConfirm onOpenFeishuConnection={currentPlatform() === "windows" ? openFeishuConnection : undefined} />
         </WindowModeProvider>
       </I18nProvider>
     </ThemeProvider>

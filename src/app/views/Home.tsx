@@ -79,6 +79,7 @@ type MacOrdinaryExpectation = Extract<
 export function Home(props: {
   onOpenSettings: () => void;
   onOpenUninstall?: () => void;
+  feishuConnectionRequest?: number;
 }) {
   const [hostArchitecture, setHostArchitecture] = useState<string | null>(null);
   useEffect(() => {

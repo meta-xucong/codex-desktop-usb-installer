@@ -605,6 +605,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "toml 0.8.2",
+ "toml_edit 0.20.2",
  "url",
  "uuid",
  "webview2-com",
@@ -662,6 +663,7 @@ dependencies = [
 name = "codex-win-engine"
 version = "0.1.0"
 dependencies = [
+ "aho-corasick",
  "log",
  "memchr",
  "roxmltree",

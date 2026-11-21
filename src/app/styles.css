@@ -2165,6 +2165,52 @@ button.themecard-art:focus-visible {
 .component-sheet-heading h3 {
   margin: 0;
 }
+.sheet-frame:has(.component-connections) {
+  background-color: var(--bg);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+.component-connections {
+  text-align: start;
+}
+.component-sheet-close {
+  width: auto;
+  min-height: 32px;
+  margin-inline-start: auto;
+  padding: 4px 12px;
+}
+.component-feishu {
+  display: grid;
+  gap: 8px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--surface);
+}
+.component-feishu h4,
+.component-feishu p {
+  margin: 0;
+}
+.component-feishu-fields {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+.component-feishu-fields .component-error {
+  overflow-wrap: anywhere;
+}
+.component-other-connections {
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+}
+.component-other-connections > summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+.component-other-connections[open] > .component-service-list {
+  margin-top: 10px;
+}
 .component-maintenance-panel {
   display: grid;
   gap: 12px;
@@ -3198,6 +3244,15 @@ button.row.danger:hover {
 }
 .progress-track {
   min-width: 0;
+}
+.progress-activity {
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.4;
+}
+.progress-track .dlmeta {
+  overflow-wrap: anywhere;
 }
 .install-stage-track {
   display: flex;

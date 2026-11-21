@@ -9,6 +9,8 @@ pub enum AppError {
     UnsupportedPlatform,
     #[error("update engine error: {0}")]
     Engine(String),
+    #[error("USB_HOST_NOT_READY: {0}。请打开管理器完成本机初始化后启动。")]
+    UsbHostNotReady(String),
     /// Reality (installed bundle / feed target) no longer matches the snapshot
     /// the user confirmed — the TOCTOU guard before a destructive step. The
     /// message is already user-facing; the UI reacts to the code by silently
@@ -25,6 +27,13 @@ pub enum AppError {
     #[error("{0}")]
     Internal(String),
 }
+
+impl From<codex_win_engine::EngineError> for AppError {
+    fn from(error: codex_win_engine::EngineError) -> Self {
+        Self::Engine(error.to_string())
+    }
+}
+
 
 /// Stable failure category. Drives which localized title + hint the UI shows;
 /// the raw engine message stays available behind a "details" disclosure.
@@ -234,6 +243,7 @@ impl AppError {
             // Engine errors carry the real category — inferred from the opaque
             // message — instead of collapsing everything to `engine_error`.
             Self::Engine(message) => classify(message).as_code(),
+            Self::UsbHostNotReady(_) => "usb_host_not_ready",
             Self::StaleExpectation(_) => "stale_expectation",
             Self::Committed(_) => "post_commit_cleanup",
             Self::Busy(_) => "operation_busy",

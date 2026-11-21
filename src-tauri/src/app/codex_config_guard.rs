@@ -20,6 +20,10 @@ static BACKUP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 /// Check and, only when safe, normalize the current user's Codex config before
 /// any manager launch path mutates settings or starts Codex.
 pub fn ensure_user_config_ready() -> Result<(), AppError> {
+    validated_user_config().map(|_| ())
+}
+
+pub fn validated_user_config() -> Result<toml::Value, AppError> {
     let home = if crate::app::usb_guard::guard_required() {
         crate::app::usb_guard::local_data_paths()?.codex_home
     } else {
@@ -27,15 +31,15 @@ pub fn ensure_user_config_ready() -> Result<(), AppError> {
             .ok_or_else(|| AppError::Engine("无法定位当前用户的 Codex 配置目录".into()))?
     };
     let path = home.join("config.toml");
-    match ensure_config_file(&path) {
-        Ok(Some(backup)) => {
+    match read_validated_config(&path) {
+        Ok((config, Some(backup))) => {
             log::warn!(
                 "Removed UTF-8 BOM from Codex config after validating TOML; backup={}",
                 backup.display()
             );
-            Ok(())
+            Ok(config)
         }
-        Ok(None) => Ok(()),
+        Ok((config, None)) => Ok(config),
         Err(reason) => Err(AppError::Engine(format!(
             "Codex 配置检查未通过，已阻止启动以避免窗口无响应。配置文件：{}。{}",
             path.display(),
@@ -45,10 +49,15 @@ pub fn ensure_user_config_ready() -> Result<(), AppError> {
 }
 
 /// Returns the recovery backup path when it repaired a valid BOM-only file.
+#[cfg(test)]
 fn ensure_config_file(path: &Path) -> Result<Option<PathBuf>, String> {
+    read_validated_config(path).map(|(_, backup)| backup)
+}
+
+fn read_validated_config(path: &Path) -> Result<(toml::Value, Option<PathBuf>), String> {
     let link_metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((toml::Value::Table(Default::default()), None)),
         Err(error) => return Err(format!("无法读取配置文件信息：{error}")),
     };
     let is_symlink = link_metadata.file_type().is_symlink();
@@ -74,7 +83,7 @@ fn ensure_config_file(path: &Path) -> Result<Option<PathBuf>, String> {
     } else {
         original.as_slice()
     };
-    validate_toml(candidate).map_err(|reason| {
+    let config = validate_toml(candidate).map_err(|reason| {
         if has_bom {
             format!("检测到 UTF-8 BOM，移除 BOM 后仍无法解析 TOML：{reason} 原文件未更改。")
         } else {
@@ -83,7 +92,7 @@ fn ensure_config_file(path: &Path) -> Result<Option<PathBuf>, String> {
     })?;
 
     if !has_bom {
-        return Ok(None);
+        return Ok((config, None));
     }
     if is_symlink {
         return Err(
@@ -136,13 +145,12 @@ fn ensure_config_file(path: &Path) -> Result<Option<PathBuf>, String> {
         });
     }
 
-    Ok(Some(backup))
+    Ok((config, Some(backup)))
 }
 
-fn validate_toml(bytes: &[u8]) -> Result<(), String> {
+fn validate_toml(bytes: &[u8]) -> Result<toml::Value, String> {
     let text = std::str::from_utf8(bytes).map_err(|error| format!("UTF-8 解码失败：{error}"))?;
     toml::from_str::<toml::Value>(text)
-        .map(|_| ())
         .map_err(|error| error.to_string())
 }
 

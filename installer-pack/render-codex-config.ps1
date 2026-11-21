@@ -172,12 +172,6 @@ foreach ($pluginId in @('chrome', 'computer-use', 'latex', 'deep-research', 'vis
 
 if ($EnableFeishu) {
     if (-not (Test-Path -LiteralPath $FeishuWrapperPath -PathType Leaf)) { throw "Feishu wrapper not found: $FeishuWrapperPath" }
-    foreach ($name in @('FEISHU_APP_ID','FEISHU_APP_SECRET')) {
-        if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name, 'Process'))) { throw "$name is required before enabling Feishu." }
-    }
-    if ($FeishuAuthMode -eq 'user' -and [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable('FEISHU_USER_ACCESS_TOKEN', 'Process'))) {
-        throw 'FEISHU_USER_ACCESS_TOKEN is required when FeishuAuthMode=user.'
-    }
     $dryRunText = & $FeishuWrapperPath -PackageCache $FeishuPackageCache -Domain $FeishuDomain -AuthMode $FeishuAuthMode -DryRun | Out-String
     $dryRunPlan = $dryRunText | ConvertFrom-Json
     if (-not [bool]$dryRunPlan.packagePresent -or -not [bool]$dryRunPlan.packageValidated) {
@@ -185,7 +179,7 @@ if ($EnableFeishu) {
     }
     if (-not [bool]$dryRunPlan.nodeReady) { throw 'Node.js >=20 is required before enabling Feishu.' }
     $secretValue = [Environment]::GetEnvironmentVariable('FEISHU_APP_SECRET', 'Process')
-    if ($dryRunText -match [regex]::Escape($secretValue)) { throw 'Feishu wrapper dry-run exposed App Secret.' }
+    if ($secretValue -and $dryRunText -match [regex]::Escape($secretValue)) { throw 'Feishu wrapper dry-run exposed App Secret.' }
 }
 
 $mediaTemplate = Get-Content -LiteralPath $mediaTemplatePath -Raw -Encoding UTF8
@@ -220,6 +214,7 @@ foreach ($server in $remoteServers) {
 
 $template = Get-Content -LiteralPath $templatePath -Raw -Encoding UTF8
 $feishuEnvironmentNames = @('FEISHU_APP_ID', 'FEISHU_APP_SECRET')
+if ($FeishuAuthMode -eq 'tenant') { $feishuEnvironmentNames += 'CODEX_USB_FEISHU_SETUP_ENTRY' }
 if ($FeishuAuthMode -eq 'user') { $feishuEnvironmentNames += 'FEISHU_USER_ACCESS_TOKEN' }
 $renderedEnvironmentNames = '[' + (($feishuEnvironmentNames | ForEach-Object { ConvertTo-TomlString $_ }) -join ', ') + ']'
 $replacements = @{
@@ -228,6 +223,7 @@ $replacements = @{
     '__FEISHU_MCP_CACHE__' = (ConvertTo-TomlString ([IO.Path]::GetFullPath($FeishuPackageCache)))
     '__FEISHU_DOMAIN__' = (ConvertTo-TomlString $FeishuDomain.TrimEnd('/'))
     '__FEISHU_AUTH_MODE__' = (ConvertTo-TomlString $FeishuAuthMode)
+    '__FEISHU_CONNECT_TOOL__' = $(if ($FeishuAuthMode -eq 'tenant') { '  "connect",' } else { '' })
     '__FEISHU_ENV_VARS__' = $renderedEnvironmentNames
 }
 foreach ($key in $replacements.Keys) { $template = $template.Replace($key, [string]$replacements[$key]) }

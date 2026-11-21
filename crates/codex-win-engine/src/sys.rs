@@ -28,6 +28,9 @@ pub struct InstalledWindowsCodex {
     /// Human-facing Codex app version read from app.asar/package.json when available.
     /// Falls back to the Windows package version if the app payload is unreadable.
     pub version: String,
+    /// True when the desktop version could not be read and version is only a fallback.
+    #[serde(default)]
+    pub app_version_unavailable: bool,
     pub arch: Option<String>,
     /// "msix" | "portable"
     pub source: String,
@@ -201,7 +204,9 @@ fn path_mtime_secs(path: &str) -> Option<u64> {
 }
 
 fn prefer_codex_app_version(mut codex: InstalledWindowsCodex) -> InstalledWindowsCodex {
-    if let Some(version) = read_codex_app_version_from_install_root(Path::new(&codex.path)) {
+    let version = read_codex_app_version_from_install_root(Path::new(&codex.path));
+    codex.app_version_unavailable = version.is_none();
+    if let Some(version) = version {
         codex.version = version;
     }
     codex
@@ -1004,7 +1009,7 @@ impl PowerShellRunError {
 }
 
 #[cfg(windows)]
-fn run_powershell_json(script: &str) -> Result<String, EngineError> {
+pub(crate) fn run_powershell_json(script: &str) -> Result<String, EngineError> {
     run_powershell_json_with_limits(script, RunLimits::probe()).map_err(|e| e.into_capability())
 }
 
@@ -5219,6 +5224,7 @@ pub fn detect_portable_install(portable_root: &Path) -> Option<InstalledWindowsC
     };
 
     let installed = InstalledWindowsCodex {
+        app_version_unavailable: false,
         path: portable_root.to_string_lossy().into_owned(),
         version: identity
             .as_ref()
@@ -5396,23 +5402,13 @@ fn schedule_console_window_suppression(root: &Path) {
 }
 
 #[cfg(windows)]
-fn cleanup_failed_portable_launch(root: &Path, launch_error: EngineError) -> EngineError {
-    // A startup failure dialog is reported from inside the readiness probe.
-    // That probe returns early, so keep the same bounded process-tree cleanup
-    // used by the timeout path before a no-sandbox retry can begin. Otherwise
-    // the first broken Electron tree would make the retry observe the stale
-    // dialog and fail for the wrong reason.
-    match crate::windows_process::processes_running_for_root(root) {
-        Ok(true) => match crate::windows_process::close_processes_for_root(5, root) {
-            Ok(()) => launch_error,
-            Err(cleanup_error) => EngineError::Io(format!(
-                "{launch_error}; 清理失败启动进程时出错：{cleanup_error}"
-            )),
-        },
-        Ok(false) => launch_error,
-        Err(check_error) => EngineError::Io(format!(
-            "{launch_error}; 无法确认失败启动进程是否已退出：{check_error}"
-        )),
+fn cleanup_failed_portable_launch(
+    root: &Path,
+    process: Option<std::os::windows::io::BorrowedHandle<'_>>,
+) -> Result<(), EngineError> {
+    match process {
+        Some(process) => crate::windows_process::close_failed_launch_child(process),
+        None => crate::windows_process::close_processes_for_root(5, root),
     }
 }
 
@@ -5436,12 +5432,58 @@ const USB_COMPATIBILITY_WINDOW_TIMEOUT: std::time::Duration = std::time::Duratio
 #[cfg(windows)]
 struct ManagedPortableLaunch {
     root: PathBuf,
+    exe: PathBuf,
     home: PathBuf,
     debugging_port: Option<u16>,
     child: PortableChild,
     process_creation_time: Option<u64>,
     process_exit_time: Option<u64>,
-    report: CodexLaunchReport,
+    // A normally exited pre-window launch can also hand off to a new PID.
+    report: Option<CodexLaunchReport>,
+}
+
+#[cfg(windows)]
+fn remember_managed_launch(
+    root: &Path,
+    exe: &Path,
+    home: &Path,
+    options: &LaunchOptions,
+    child: PortableChild,
+    process_creation_time: Option<u64>,
+    report: Option<CodexLaunchReport>,
+) {
+    *MANAGED_PORTABLE_LAUNCH.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some(ManagedPortableLaunch {
+            root: root.to_path_buf(),
+            exe: exe.to_path_buf(),
+            home: home.to_path_buf(),
+            debugging_port: options.remote_debugging_port,
+            child,
+            process_creation_time,
+            process_exit_time: None,
+            report,
+        });
+}
+
+#[cfg(windows)]
+fn usb_core_running(exe: &Path) -> Result<bool, EngineError> {
+    let name = exe.file_name().ok_or_else(|| EngineError::Io("Codex 程序路径缺少文件名。".into()))?;
+    crate::windows_process::processes_running_for_executable_under_root_strict(exe, name)
+}
+
+#[cfg(windows)]
+pub(crate) fn require_clear_usb_core(exe: &Path) -> Result<(), EngineError> {
+    if usb_core_running(exe)? {
+        return Err(EngineError::Io("同一路径仍有 Codex 进程运行，已保留现有进程。请查看已有窗口。".into()));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+enum PriorManagedLaunch {
+    Fresh,
+    Reused(CodexLaunchReport),
+    CleanExit,
 }
 
 #[cfg(windows)]
@@ -5465,6 +5507,11 @@ impl PortableChild {
             Self::Standard(child) => child.as_raw_handle(),
             Self::DesktopUser(child) => child.raw_process_handle(),
         }
+    }
+
+    fn process_handle(&self) -> std::os::windows::io::BorrowedHandle<'_> {
+        // Both child variants retain the underlying process handle for self's lifetime.
+        unsafe { std::os::windows::io::BorrowedHandle::borrow_raw(self.raw_process_handle()) }
     }
 
     fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
@@ -5518,28 +5565,79 @@ fn managed_launch_context_matches(
     })
 }
 
-/// An owned live Child handle is the proof that this manager supplied the
-/// requested home. A PID on its own, a same-root window, or a process inherited
-/// from an earlier manager session is not such proof.
+/// A live tracked child is the only eligible fast path. Clean exit, another
+/// manager, and ambiguous ownership continue through normal launch recovery.
 #[cfg(windows)]
-fn reuse_managed_portable_launch(
+pub fn try_focus_live_usb_session<E>(
     root: &Path,
-    options: &LaunchOptions,
-) -> Result<Option<CodexLaunchReport>, EngineError> {
-    let Some(home) = options.codex_home.as_deref() else {
-        return Ok(None);
-    };
+    home: &Path,
+    authorize: impl FnOnce() -> Result<(), E>,
+) -> Result<bool, E>
+where
+    E: From<EngineError>,
+{
     let mut tracked = MANAGED_PORTABLE_LAUNCH
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let Some(previous) = tracked.as_mut() else {
-        return Ok(None);
+        return Ok(false);
     };
+    if !crate::windows_process::same_windows_path(&previous.root, root)
+        || !crate::windows_process::same_windows_path(&previous.home, home)
+        || previous
+            .child
+            .try_wait()
+            .map_err(|e| EngineError::Io(e.to_string()))?
+            .is_some()
+    {
+        return Ok(false);
+    }
+    authorize()?;
     if previous
         .child
         .try_wait()
-        .map_err(|e| EngineError::Io(format!("检查已启动 Codex 进程失败：{e}")))?
+        .map_err(|e| EngineError::Io(e.to_string()))?
         .is_some()
+    {
+        return Ok(false);
+    }
+    Ok(matches!(
+        focus_live_tracked_window(previous)?,
+        PriorManagedLaunch::Reused(_)
+    ))
+}
+
+/// Ordinary Launch with a saved theme may otherwise restart Codex to reapply
+/// the theme. Respect the running session regardless of its current CDP mode.
+#[cfg(windows)]
+pub fn focus_existing_usb_session(root: &Path, home: &Path) -> Result<bool, EngineError> {
+    let prior = inspect_managed_portable_launch(|previous| {
+        crate::windows_process::same_windows_path(&previous.root, root)
+            && crate::windows_process::same_windows_path(&previous.home, home)
+    })?;
+    Ok(matches!(prior, PriorManagedLaunch::Reused(_)))
+}
+
+/// An owned live Child handle is the proof that this manager supplied the
+/// requested home. A PID on its own, a same-root window, or a process inherited
+/// from an earlier manager session is not such proof.
+#[cfg(windows)]
+fn inspect_managed_portable_launch(
+    matches_context: impl FnOnce(&ManagedPortableLaunch) -> bool,
+) -> Result<PriorManagedLaunch, EngineError> {
+    let mut tracked = MANAGED_PORTABLE_LAUNCH
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some(previous) = tracked.as_mut() else {
+        return Ok(PriorManagedLaunch::Fresh);
+    };
+    if !matches_context(previous) {
+        return Ok(PriorManagedLaunch::Fresh);
+    }
+    if let Some(status) = previous
+        .child
+        .try_wait()
+        .map_err(|e| EngineError::Io(format!("检查已启动 Codex 进程失败：{e}")))?
     {
         if let Some(times) =
             crate::windows_process::query_process_times(previous.child.raw_process_handle())
@@ -5548,30 +5646,53 @@ fn reuse_managed_portable_launch(
                 previous.process_exit_time = times.exit_time;
             }
         }
-        return Ok(None);
+        if status.success() {
+            // Check the common clean shutdown without starting a role probe. A
+            // replacement main process may already be using the same image.
+            if usb_core_running(&previous.exe)? {
+                if let Some(created) = previous.process_creation_time {
+                    let parent = previous.child.id();
+                    let helpers = crate::windows_process::recover_verified_direct_children(
+                        &previous.exe, parent, previous.child.raw_process_handle(), created,
+                    )?;
+                    if !helpers.is_empty() {
+                        log::info!("recovered headless Codex helpers after normal exit parent={parent} helpers={helpers:?}");
+                    }
+                }
+                require_clear_usb_core(&previous.exe)?;
+            }
+            return Ok(PriorManagedLaunch::CleanExit);
+        }
+        return Ok(PriorManagedLaunch::Fresh);
     }
-    if !managed_launch_context_matches(
+    focus_live_tracked_window(previous)
+}
+
+#[cfg(windows)]
+fn focus_live_tracked_window(
+    previous: &ManagedPortableLaunch,
+) -> Result<PriorManagedLaunch, EngineError> {
+    if let Some(window) = crate::windows_process::wait_for_usable_window_for_root_with_process(
         &previous.root,
-        &previous.home,
-        previous.debugging_port,
-        root,
-        options,
-    ) {
-        return Ok(None);
-    }
-    if let Some(window) =
-        crate::windows_process::wait_for_usable_window_for_root(root, std::time::Duration::ZERO)?
-    {
+        std::time::Duration::ZERO,
+        None,
+        Some(previous.child.id()),
+    )? {
         if managed_window_matches_launch(window.pid, previous.child.id(), true) {
             log::info!(
                 "reused managed Codex instance pid={} home={}",
                 window.pid,
-                home.display()
+                previous.home.display()
             );
-            return Ok(Some(previous.report.clone()));
+            if let Some(report) = previous.report.as_ref() {
+                return Ok(PriorManagedLaunch::Reused(report.clone()));
+            }
         }
     }
-    Ok(None)
+    Err(EngineError::Io(format!(
+        "Codex 仍在运行（PID {}），暂未找到该会话的可操作窗口。请稍后再点启动。",
+        previous.child.id()
+    )))
 }
 
 #[cfg(windows)]
@@ -5636,52 +5757,17 @@ fn recover_exited_managed_children(
 }
 
 #[cfg(windows)]
-fn close_old_image_or_recover_owned_child(
+fn preserve_existing_core_before_spawn(
     root: &Path,
     exe: &Path,
     options: &LaunchOptions,
 ) -> Result<(), EngineError> {
-    match crate::windows_process::close_image_gracefully_for_launch(10, exe) {
-        Ok(()) => Ok(()),
-        Err(close_error) => {
-            let recovered = match recover_exited_managed_children(root, exe, options) {
-                Ok(recovered) => recovered,
-                Err(error) => {
-                    let failure = EngineError::Io(format!(
-                        "{close_error}; 无法验证受管 Codex 子进程归属，未继续启动：{error}"
-                    ));
-                    log::warn!("Codex relaunch stopped after orphan recovery could not verify ownership: {failure}");
-                    return Err(failure);
-                }
-            };
-            if !recovered.is_empty() {
-                log::warn!(
-                    "terminated verified headless direct Codex children from exited managed launch pids={recovered:?}"
-                );
-            }
-            let Some(image_root) = exe.parent() else {
-                return Err(close_error);
-            };
-            let Some(image_name) = exe.file_name() else {
-                return Err(close_error);
-            };
-            let result = match crate::windows_process::processes_running_for_executable_under_root_strict(
-                image_root, image_name,
-            ) {
-                Ok(false) => Ok(()),
-                Ok(true) => Err(EngineError::Io(format!(
-                    "{close_error}; 无法确认剩余进程是本管理器上次启动的无窗口直接子进程，因此未终止该进程。"
-                ))),
-                Err(error) => Err(EngineError::Io(format!(
-                    "{close_error}; 无法确认 Codex 进程身份或退出状态，因此未终止未验证进程：{error}"
-                ))),
-            };
-            if let Err(error) = &result {
-                log::warn!("Codex relaunch stopped because the remaining process was not safely recoverable: {error}");
-            }
-            result
-        }
+    // Only an exited, tracked parent can establish ownership of a headless orphan.
+    let recovered = recover_exited_managed_children(root, exe, options)?;
+    if !recovered.is_empty() {
+        log::warn!("terminated verified headless direct Codex children from exited managed launch pids={recovered:?}");
     }
+    require_clear_usb_core(exe)
 }
 
 #[cfg(any(windows, test))]
@@ -5724,7 +5810,6 @@ fn launch_portable_with_usable_window(
     software_rendering: bool,
     no_sandbox: bool,
     window_timeout: std::time::Duration,
-    before_spawn: &mut Option<impl FnOnce()>,
 ) -> Result<CodexLaunchReport, PortableLaunchFailure> {
     // A managed entry shim waits beside the core executable. Failed-attempt
     // cleanup must not terminate that shim or other programs under the root.
@@ -5734,24 +5819,6 @@ fn launch_portable_with_usable_window(
         root
     };
     const STABILITY_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
-
-    if options.codex_home.is_some() {
-        if let Some(report) =
-            reuse_managed_portable_launch(root, options).map_err(PortableLaunchFailure::Fatal)?
-        {
-            return Ok(report);
-        }
-        // Unknown same-image instances may own Electron's single-instance
-        // listener with the default home. Ask them to close before spawning;
-        // never force-close or report their old window as the new launch.
-        prepare_after_close_before_spawn(
-            || close_old_image_or_recover_owned_child(root, exe, options),
-            before_spawn,
-        )
-        .map_err(PortableLaunchFailure::Fatal)?;
-    } else if let Some(before_spawn) = before_spawn.take() {
-        before_spawn();
-    }
 
     if let Err(error) = crate::windows_process::start_console_window_watcher(root) {
         log::warn!(
@@ -5764,52 +5831,87 @@ fn launch_portable_with_usable_window(
             PortableLaunchFailure::Fatal(EngineError::Io(format!("launch Codex: {error}")))
         })?;
 
-    let first = match crate::windows_process::wait_for_usable_window_for_root(root, window_timeout)
-    {
+    let window_wait_started = std::time::Instant::now();
+    let managed = options.codex_home.is_some();
+    let process = managed.then(|| child.process_handle());
+    let probe_failure = |error| match cleanup_failed_portable_launch(cleanup_scope, process) {
+        Ok(()) => PortableLaunchFailure::Fatal(error),
+        Err(cleanup_error) => PortableLaunchFailure::Fatal(EngineError::Io(format!(
+            "{error}; 清理本次启动进程时出错：{cleanup_error}"
+        ))),
+    };
+    let first = match crate::windows_process::wait_for_usable_window_for_root_with_process(
+        root, window_timeout, process, None,
+    ) {
         Ok(report) => report,
         Err(error) => {
-            return Err(PortableLaunchFailure::Fatal(
-                cleanup_failed_portable_launch(cleanup_scope, error),
-            ));
+            return Err(probe_failure(error));
         }
     };
-    if let Some(window) = first {
+    'check_window: {
+        let Some(window) = first else { break 'check_window };
         // A transient HWND is not a successful launch. Re-check after a short
         // stability window before reporting that Codex is ready.
-        std::thread::sleep(STABILITY_WINDOW);
-        let stable = match crate::windows_process::wait_for_usable_window_for_root(
-            root,
-            std::time::Duration::ZERO,
+        if managed {
+            crate::windows_process::wait_for_process_exit(
+                child.raw_process_handle(),
+                STABILITY_WINDOW.as_millis() as u32,
+            )
+            .map_err(|error| {
+                probe_failure(EngineError::Io(format!("检查 Codex 启动进程失败：{error}")))
+            })?;
+        } else {
+            std::thread::sleep(STABILITY_WINDOW);
+        }
+        // The first owned window may be rebuilt during startup. Keep looking for
+        // this child's usable window only within the original attempt's budget.
+        let owned_pid = (managed && window.pid == child.id()).then_some(window.pid);
+        let remaining = if owned_pid.is_some() {
+            window_timeout.saturating_sub(window_wait_started.elapsed())
+        } else {
+            std::time::Duration::ZERO
+        };
+        let stable = match crate::windows_process::wait_for_usable_window_for_root_with_process(
+            root, remaining, process, owned_pid,
         ) {
             Ok(report) => report,
             Err(error) => {
-                return Err(PortableLaunchFailure::Fatal(
-                    cleanup_failed_portable_launch(cleanup_scope, error),
-                ));
+                return Err(probe_failure(error));
             }
         };
         if let Some(stable) = stable {
             if stable_window_reports_same_process(&window, &stable) {
                 let child_is_running = child_running_for_window_check(
-                    options.codex_home.is_some(),
+                    managed,
                     child.try_wait().map(|status| status.is_none()),
                 )
                 .map_err(PortableLaunchFailure::Fatal)?;
-                if options.codex_home.is_some()
-                    && !managed_window_matches_launch(stable.pid, child.id(), child_is_running)
+                if managed && !child_is_running {
+                    break 'check_window;
+                }
+                if managed && !managed_window_matches_launch(stable.pid, child.id(), child_is_running)
                 {
                     return Err(PortableLaunchFailure::Fatal(EngineError::Io(
                         "检测到的 Codex 窗口不属于本次受管启动，未将旧实例视为启动成功。请保存工作并关闭该窗口后重试。".into(),
                     )));
                 }
                 let launch_mode = portable_launch_mode(software_rendering, no_sandbox);
+                let process_creation_time = if managed {
+                    crate::windows_process::query_process_times(child.raw_process_handle())
+                        .map(|times| times.creation_time)
+                } else {
+                    None
+                };
+                let created_unix_ms = process_creation_time
+                    .and_then(crate::windows_process::filetime_to_unix_ms);
                 log::info!(
-                    "portable Codex usable window confirmed mode={launch_mode} pid={} size={}x{} initially_visible={} foreground_accepted={}",
+                    "portable Codex usable window confirmed mode={launch_mode} pid={} size={}x{} initially_visible={} foreground_accepted={} manager_pid={} created_unix_ms={created_unix_ms:?}",
                     stable.pid,
                     stable.width,
                     stable.height,
                     window.was_visible,
-                    stable.foreground_accepted
+                    stable.foreground_accepted,
+                    std::process::id(),
                 );
                 let report = CodexLaunchReport {
                     launch_mode: launch_mode.to_string(),
@@ -5828,20 +5930,14 @@ fn launch_portable_with_usable_window(
                     },
                 };
                 if let Some(home) = options.codex_home.as_ref() {
-                    let process_creation_time =
-                        crate::windows_process::query_process_times(child.raw_process_handle())
-                            .map(|times| times.creation_time);
-                    *MANAGED_PORTABLE_LAUNCH
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner()) = Some(ManagedPortableLaunch {
-                        root: root.to_path_buf(),
-                        home: home.clone(),
-                        debugging_port: options.remote_debugging_port,
-                        child,
-                        process_creation_time,
-                        process_exit_time: None,
-                        report: report.clone(),
-                    });
+                    if let Err(error) = crate::windows_process::start_managed_codex_exit_log(
+                        child.process_handle(), child.id(), launch_mode,
+                    ) {
+                        log::warn!("could not start Codex exit log for pid={}: {error}", child.id());
+                    }
+                    remember_managed_launch(
+                        root, exe, home, options, child, process_creation_time, Some(report.clone()),
+                    );
                 } else if child_is_running {
                     std::mem::forget(child);
                 }
@@ -5855,6 +5951,24 @@ fn launch_portable_with_usable_window(
         }
     }
 
+    finish_unusable_portable_launch(
+        root, exe, options, child, portable_launch_mode(software_rendering, no_sandbox),
+        window_timeout, window_wait_started.elapsed(),
+    )
+}
+
+#[cfg(windows)]
+fn finish_unusable_portable_launch(
+    root: &Path,
+    exe: &Path,
+    options: &LaunchOptions,
+    mut child: PortableChild,
+    mode: &str,
+    window_timeout: std::time::Duration,
+    window_wait: std::time::Duration,
+) -> Result<CodexLaunchReport, PortableLaunchFailure> {
+    let managed = options.codex_home.is_some();
+    let cleanup_scope = if managed { exe } else { root };
     let child_state = match child.try_wait() {
         Ok(Some(status)) => format!(
             "exited(code={:?},success={})",
@@ -5867,36 +5981,50 @@ fn launch_portable_with_usable_window(
     let root_processes_running = crate::windows_process::processes_running_for_root(cleanup_scope)
         .map_err(PortableLaunchFailure::Fatal)?;
     log::warn!(
-        "portable Codex startup has no usable window mode={} child_state={} install_root_process_tree_running={} window_timeout_ms={}",
-        portable_launch_mode(software_rendering, no_sandbox),
+        "portable Codex startup has no usable window mode={} pid={} child_state={} install_root_process_tree_running={} window_timeout_ms={} window_wait_ms={}",
+        mode,
+        child.id(),
         child_state,
         root_processes_running,
-        window_timeout.as_millis()
+        window_timeout.as_millis(),
+        window_wait.as_millis(),
     );
-    // The retry must not attach to a broken first attempt or leave its GPU
-    // cache locks alive. Keep managed cleanup pinned to the failed core image, not its entry shim.
-    if root_processes_running {
-        crate::windows_process::close_processes_for_root(5, cleanup_scope)
+    if managed || root_processes_running {
+        cleanup_failed_portable_launch(cleanup_scope, managed.then(|| child.process_handle()))
             .map_err(PortableLaunchFailure::Fatal)?;
+    }
+    if let Some(home) = options.codex_home.as_deref() {
+        let times = crate::windows_process::query_process_times(child.raw_process_handle());
+        if child.try_wait().map_err(|error| PortableLaunchFailure::Fatal(
+            EngineError::Io(format!("检查本次启动进程失败：{error}"))
+        ))?.is_some_and(|status| status.success()) {
+            remember_managed_launch(root, exe, home, options, child, times.map(|t| t.creation_time), None);
+        } else if root_processes_running {
+            if let Some(times) = times {
+                crate::windows_process::recover_verified_direct_children(
+                    exe, child.id(), child.raw_process_handle(), times.creation_time,
+                ).map_err(PortableLaunchFailure::Fatal)?;
+            }
+        }
+        require_clear_usb_core(exe).map_err(PortableLaunchFailure::Fatal)?;
     }
     Err(PortableLaunchFailure::NoUsableWindow(format!(
         "未显示稳定的 Codex 可操作窗口（模式={}，子进程状态={}，安装目录进程仍运行={}）",
-        portable_launch_mode(software_rendering, no_sandbox),
+        mode,
         child_state,
         root_processes_running
     )))
 }
 
-#[cfg(any(windows, test))]
-fn prepare_after_close_before_spawn<C, F>(
-    close_existing: C,
+fn prepare_before_spawn<C, F>(
+    preflight: C,
     before_spawn: &mut Option<F>,
 ) -> Result<(), EngineError>
 where
     C: FnOnce() -> Result<(), EngineError>,
     F: FnOnce(),
 {
-    close_existing()?;
+    preflight()?;
     if let Some(before_spawn) = before_spawn.take() {
         before_spawn();
     }
@@ -5912,8 +6040,8 @@ pub fn launch_codex_with_options(
 
 /// Run `before_spawn` only when this call will create a new Codex process.
 /// A reusable manager-owned instance returns before the callback. On the USB
-/// portable path, the callback runs after an unowned core process is closed
-/// and immediately before a fresh process is created.
+/// portable path, the callback runs after session protection and immediately
+/// before a fresh process is created.
 pub fn launch_codex_with_options_and_before_spawn<F>(
     installed: &InstalledWindowsCodex,
     options: LaunchOptions,
@@ -5939,21 +6067,30 @@ where
         } else {
             crate::portable::installed_codex_launch_exe(root)?
         };
-        // Keep older non-USB/standard portable roots safe as well.  The patch
-        // is no-op for a package whose bootstrap does not use the MSIX
-        // updater, and is applied before either launch strategy below.
-        crate::portable::ensure_portable_codex_startup_compatibility_with_usb_integrity_mode(
-            root,
-            options.usb_integrity_transaction,
-        )?;
-        // The locale patch is deliberately launch-time: the manager's
-        // language can change without reinstalling the payload, and the
-        // fixed-width edit is idempotent for existing USB installs.
-        let _ = crate::portable::ensure_portable_codex_locale_compatibility(
-            root,
-            options.locale_override.as_deref(),
-            options.usb_integrity_transaction,
-        )?;
+        #[cfg(windows)]
+        let prior_launch = if options.portable_launch_policy != PortableLaunchPolicy::Standard {
+            match inspect_managed_portable_launch(|previous| managed_launch_context_matches(
+                &previous.root, &previous.home, previous.debugging_port, root, &options,
+            ))? {
+                PriorManagedLaunch::Reused(report) => return Ok(report),
+                prior => prior,
+            }
+        } else {
+            PriorManagedLaunch::Fresh
+        };
+        #[cfg(windows)]
+        if options.portable_launch_policy != PortableLaunchPolicy::Standard
+            && options.codex_home.is_some()
+            && matches!(prior_launch, PriorManagedLaunch::Fresh)
+        {
+            preserve_existing_core_before_spawn(root, &exe, &options)?;
+        }
+        // Use one archive scan and one integrity update for startup and locale.
+        prepare_before_spawn(|| {
+            crate::portable::prepare_portable_codex_launch(
+                root, options.locale_override.as_deref(), options.usb_integrity_transaction,
+            ).map(|_| ())
+        }, &mut before_spawn)?;
         #[cfg(windows)]
         if options.portable_launch_policy != PortableLaunchPolicy::Standard {
             let first_no_sandbox =
@@ -5969,7 +6106,6 @@ where
                 false,
                 first_no_sandbox,
                 USB_COLD_START_WINDOW_TIMEOUT,
-                &mut before_spawn,
             ) {
                 Ok(report) => return Ok(report),
                 Err(first_failure) if first_failure.should_retry_compatibility() => {
@@ -5984,7 +6120,6 @@ where
                         true,
                         true,
                         USB_COMPATIBILITY_WINDOW_TIMEOUT,
-                        &mut before_spawn,
                     )
                     .map_err(|fallback_error| {
                         EngineError::Io(format!(
@@ -5998,9 +6133,6 @@ where
 
         // CREATE_NO_WINDOW only suppresses a console flash; the GUI still shows.
         // The ordinary non-USB manager retains its historical liveness check.
-        if let Some(before_spawn) = before_spawn.take() {
-            before_spawn();
-        }
         let mut command = hidden_command(exe);
         for (name, value) in &options.environment {
             command.env(name, value);
@@ -6576,37 +6708,137 @@ mod tests {
         assert!(no_usable_window.should_retry_compatibility());
     }
 
+    #[cfg(windows)]
+    mod launch_preservation {
+        use super::*;
+        use std::io::Write;
+        use std::os::windows::process::CommandExt;
+        use std::process::{Child, Command, Stdio};
+        use std::time::Duration;
+
+        // The public launch entry retains one process per manager.
+        static SESSION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        fn fixture() -> (PathBuf, InstalledWindowsCodex, LaunchOptions) {
+            let root = std::env::temp_dir().join(format!("codex-preserve-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&root).unwrap();
+            let exe = root.join("ChatGPT.exe");
+            std::fs::copy(Path::new(&std::env::var_os("SystemRoot").unwrap()).join("System32/cmd.exe"), &exe).unwrap();
+            let installed = InstalledWindowsCodex {
+                app_version_unavailable: false,
+                path: root.to_str().unwrap().into(), version: "fixture".into(),
+                arch: None, source: "portable".into(), package_family_name: None,
+                package_volume: None, installed_at: None,
+            };
+            let options = LaunchOptions {
+                codex_home: Some(root.join("home")),
+                portable_launch_policy: PortableLaunchPolicy::UsbCompatible,
+                ..Default::default()
+            };
+            (exe, installed, options)
+        }
+
+        fn start(exe: &Path) -> Child {
+            Command::new(exe).args(["/d", "/q"])
+                .creation_flags(0x08000000) // CREATE_NO_WINDOW
+                .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null())
+                .spawn().unwrap()
+        }
+
+        fn release_fixture(exe: PathBuf) {
+            MANAGED_PORTABLE_LAUNCH.lock().unwrap().take();
+            std::fs::remove_file(&exe).unwrap();
+            std::fs::remove_dir(exe.parent().unwrap()).unwrap();
+        }
+
+        #[test]
+        fn repeat_launch_preserves_live_session_without_window() {
+            let _session = SESSION.lock().unwrap();
+            let (exe, installed, options) = fixture();
+            let mut original = start(&exe);
+            let mut input = original.stdin.take().unwrap();
+            let pid = original.id();
+            let report = CodexLaunchReport {
+                launch_mode: "portable".into(), usable_window_confirmed: true,
+                no_sandbox: false, message: String::new(),
+            };
+            remember_managed_launch(exe.parent().unwrap(), &exe, options.codex_home.as_deref().unwrap(),
+                &options, PortableChild::Standard(original), None, Some(report));
+            let theme_error = focus_existing_usb_session(exe.parent().unwrap(), options.codex_home.as_deref().unwrap()).unwrap_err();
+            assert!(theme_error.to_string().contains(&format!("PID {pid}")), "{theme_error}");
+            let error = launch_codex_with_options_and_before_spawn(&installed, options, || {
+                panic!("second click reached fresh launch preparation")
+            }).unwrap_err();
+            assert!(error.to_string().contains(&format!("PID {pid}")), "{error}");
+            let mut tracked = MANAGED_PORTABLE_LAUNCH.lock().unwrap();
+            let child = &mut tracked.as_mut().unwrap().child;
+            assert_eq!(child.id(), pid);
+            assert!(child.try_wait().unwrap().is_none());
+            input.write_all(b"exit 23\r\n").unwrap();
+            assert_eq!(crate::windows_process::wait_for_process_exit(child.raw_process_handle(), 5000).unwrap(), Some(23));
+            drop(tracked);
+            release_fixture(exe);
+        }
+
+        #[test]
+        fn clean_exit_preserves_same_image_successor_during_cleanup_and_relaunch() {
+            let _session = SESSION.lock().unwrap();
+            let (exe, installed, options) = fixture();
+            let mut original = start(&exe);
+            original.stdin.take().unwrap().write_all(b"exit 0\r\n").unwrap();
+            assert!(original.wait().unwrap().success());
+            let mut successor = start(&exe);
+            assert_ne!(original.id(), successor.id());
+            let result = finish_unusable_portable_launch(exe.parent().unwrap(), &exe, &options,
+                PortableChild::Standard(original), "portable", Duration::ZERO, Duration::ZERO);
+            let failure = result.unwrap_err();
+            assert!(!failure.should_retry_compatibility());
+            assert!(failure.to_string().contains("已保留现有进程"), "{failure}");
+            let theme_error = focus_existing_usb_session(exe.parent().unwrap(), options.codex_home.as_deref().unwrap()).unwrap_err();
+            assert!(theme_error.to_string().contains("已保留现有进程"), "{theme_error}");
+            let error = launch_codex_with_options_and_before_spawn(&installed, options, || {
+                panic!("clean handoff reached destructive fresh launch")
+            }).unwrap_err();
+            assert!(error.to_string().contains("已保留现有进程"), "{error}");
+            assert!(successor.try_wait().unwrap().is_none());
+            successor.stdin.take().unwrap().write_all(b"exit 29\r\n").unwrap();
+            assert_eq!(successor.wait().unwrap().code(), Some(29));
+            assert!(require_clear_usb_core(&exe).is_ok());
+            release_fixture(exe);
+        }
+    }
+
     #[test]
-    fn fresh_launch_preparation_runs_after_close_and_only_once() {
+    fn fresh_launch_preparation_runs_after_preflight_and_only_once() {
         use std::cell::RefCell;
         use std::rc::Rc;
 
         let events = Rc::new(RefCell::new(Vec::new()));
-        let close_events = Rc::clone(&events);
+        let preflight_events = Rc::clone(&events);
         let prepare_events = Rc::clone(&events);
         let mut prepare = Some(move || prepare_events.borrow_mut().push("prepare"));
 
-        super::prepare_after_close_before_spawn(
+        super::prepare_before_spawn(
             || {
-                close_events.borrow_mut().push("close");
+                preflight_events.borrow_mut().push("preflight");
                 Ok(())
             },
             &mut prepare,
         )
         .unwrap();
 
-        assert_eq!(*events.borrow(), ["close", "prepare"]);
+        assert_eq!(*events.borrow(), ["preflight", "prepare"]);
         assert!(prepare.is_none());
     }
 
     #[test]
-    fn fresh_launch_preparation_is_skipped_when_close_fails() {
+    fn fresh_launch_preparation_is_skipped_when_preflight_fails() {
         use std::cell::Cell;
 
         let prepared = Cell::new(false);
         let mut prepare = Some(|| prepared.set(true));
-        let result = super::prepare_after_close_before_spawn(
-            || Err(super::EngineError::Io("close failed".to_string())),
+        let result = super::prepare_before_spawn(
+            || Err(super::EngineError::Io("preflight failed".to_string())),
             &mut prepare,
         );
 
@@ -10278,6 +10510,7 @@ mod portable_identity_tests {
     fn accepts_rebranded_portable_with_codex_identity() {
         let root = write_root("rebrand", "ChatGPT.exe", Some("OpenAI.Codex"));
         let installed = detect_portable_install(&root).expect("codex identity accepted");
+        assert!(installed.app_version_unavailable);
         assert_eq!(installed.version, "26.707.3748.0");
         assert_eq!(installed.source, "portable");
         cleanup(&root);
@@ -10314,6 +10547,7 @@ mod portable_identity_tests {
             br#"{"version":"26.707.31428","name":"openai-codex-electron"}"#,
         );
         let installed = detect_portable_install(&root).expect("asar marker accepted");
+        assert!(!installed.app_version_unavailable);
         assert_eq!(installed.version, "26.707.31428");
         cleanup(&root);
     }

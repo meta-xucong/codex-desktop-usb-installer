@@ -9,18 +9,18 @@
 - Manim Community 0.21.0 的 CPython 3.12 venv；
 - Node.js 22.22.0 Windows x64；
 - FFmpeg/FFprobe/FFplay 9.x LGPL shared Windows build；
-- Feishu MCP 0.5.1 的 npm 依赖 closure；
+- Feishu MCP 0.5.1 的 npm 依赖，随能力包安装部署；
 - HyperFrames 使用的 Chrome Headless Shell 152.0.7977.30 Windows x64。
 
 ## 联网初始化组件
 
-HyperFrames CLI 固定为 `hyperframes@0.8.134`，完整 Windows x64 依赖已随包携带，从本地 ZIP 部署，安装时不执行 npm 下载。Chrome Headless Shell `152.0.7977.30` 已随包携带，从本地部署到 kit 私有目录；无需预装 Chrome，也不访问 Google 浏览器下载源。安装检查和 `hyperframes.cmd` 的后续渲染使用同一份本地浏览器。请通过 `hyperframes.cmd` 调用，避免绕过其浏览器路径设置。
+HyperFrames CLI 固定为 `hyperframes@0.8.134`，完整 Windows x64 依赖已随包携带，从本地 ZIP 部署，安装时不执行 npm 下载。Chrome Headless Shell `152.0.7977.30` 已随包携带，从本地部署到 kit 私有目录；无需预装 Chrome，也不访问 Google 浏览器下载源。安装时启动这份内置浏览器校验版本和空白页。请通过 `hyperframes.cmd` 渲染，它使用同一份本地浏览器。
 
-查看 `runtime-state.json` 的 `hyperframes.cliHealth`、`hyperframes.browserHealth` 和 `hyperframes.error`；两项 health 均为 `passed` 才表示该组件就绪。本地 CLI 或浏览器部署失败会保留具体原因并记为 `install-failed`，不阻断其他已通过核心能力的配置与 readiness 收尾。按诊断修复后可重新安装能力包；不能把可选组件未就绪写成安装成功。
+查看 `runtime-state.json` 的 `hyperframes.cliHealth`、`hyperframes.browserHealth` 和 `hyperframes.error`；两项 health 均为 `passed` 才表示该组件就绪。`hyperframes.browserCheckMs` 和 `environmentApplyMs` 分别记录浏览器验证与应用运行环境的耗时。本地 CLI 或浏览器部署失败会保留具体原因并记为 `install-failed`，其他核心能力继续配置和记录安装结果。
 
 ## 可选组件和账号
 
-MiKTeX/LaTeX 仅在 Manim 需要 `Tex`/`MathTex` 公式时安装。Feishu 需用户自己的 App ID、App Secret 和租户授权；远程 OAuth MCP 需各自的账号/工作区授权。U 盘版的统一媒体 MCP 使用签名 License 中自动配置的设备 Key，不要求用户再填写媒体 Base URL 或 Key；具体模型可用性和调用额度仍由对应的 404token 上游配置决定。公开能力包不包含用户凭据。Python 3.12 安装器与依赖 wheelhouse 随包携带，初始化时离线安装并验证。
+MiKTeX/LaTeX 仅在 Manim 需要 `Tex`/`MathTex` 公式时安装。飞书部署完成后等待用户在管理器填写 App ID 和 App Secret，保存后启用。实际访问文档、云盘或知识库仍取决于应用的飞书授权范围。远程 OAuth MCP 需各自的账号或工作区授权。U 盘版的统一媒体 MCP 使用签名 License 中自动配置的设备 Key；具体模型可用性和调用额度由对应的 404token 上游配置决定。Python 3.12 安装器与依赖 wheelhouse 随包携带，初始化时离线安装并验证。
 
 逐项介质、来源、许可证和完整性见 `bundled/media-manifest.json`、`wheelhouse-manifest.json` 和 `THIRD-PARTY-NOTICES.md`。
 

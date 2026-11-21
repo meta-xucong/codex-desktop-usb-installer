@@ -1851,7 +1851,7 @@ pub(crate) fn add_tested_model_to_catalog(
 }
 
 #[cfg(test)]
-fn add_tested_model_files<F, C, M>(
+pub(crate) fn add_tested_model_files<F, C, M>(
     home: &Path,
     model_id: &str,
     owner: Option<&str>,

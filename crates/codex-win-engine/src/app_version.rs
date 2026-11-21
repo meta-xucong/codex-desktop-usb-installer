@@ -210,7 +210,7 @@ fn read_package_json_from_asar_reader<R: Read + Seek>(reader: R) -> Option<Packa
     serde_json::from_slice(&bytes).ok()
 }
 
-fn read_asar_header<R: Read + Seek>(mut file: R) -> Result<(R, Value, u64), ()> {
+pub(crate) fn read_asar_header<R: Read + Seek>(mut file: R) -> Result<(R, Value, u64), ()> {
     let mut prefix = [0_u8; 8];
     file.read_exact(&mut prefix).map_err(|_| ())?;
     let first = u32::from_le_bytes(prefix[0..4].try_into().map_err(|_| ())?);
@@ -245,7 +245,7 @@ fn parse_header_json(bytes: &[u8]) -> Option<Value> {
     None
 }
 
-fn find_asar_entry<'a>(header: &'a Value, components: &[&str]) -> Option<&'a Value> {
+pub(crate) fn find_asar_entry<'a>(header: &'a Value, components: &[&str]) -> Option<&'a Value> {
     let mut files = header.get("files")?;
     for (idx, component) in components.iter().enumerate() {
         let node = files.get(*component)?;
@@ -257,14 +257,14 @@ fn find_asar_entry<'a>(header: &'a Value, components: &[&str]) -> Option<&'a Val
     None
 }
 
-fn asar_entry_offset(entry: &Value) -> Option<u64> {
+pub(crate) fn asar_entry_offset(entry: &Value) -> Option<u64> {
     entry
         .get("offset")?
         .as_str()
         .and_then(|offset| offset.parse().ok())
 }
 
-fn asar_entry_size(entry: &Value) -> Option<u64> {
+pub(crate) fn asar_entry_size(entry: &Value) -> Option<u64> {
     entry.get("size")?.as_u64()
 }
 

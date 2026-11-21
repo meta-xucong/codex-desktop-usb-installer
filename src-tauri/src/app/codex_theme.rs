@@ -36,6 +36,17 @@ const CONFIG_SETTLE: Duration = Duration::from_secs(2);
 const QUIT_TIMEOUT_SECS: u64 = 30;
 const CDP_WAIT: Duration = Duration::from_secs(45);
 
+async fn wait_for_theme_cdp() -> Result<(), AppError> {
+    let deadline = tokio::time::Instant::now() + CDP_WAIT;
+    while !codex_theme_engine::cdp::cdp_http_ready(THEME_CDP_PORT).await {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(AppError::Engine("Codex 已启动但调试端口未就绪".to_string()));
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    Ok(())
+}
+
 async fn run_after_usb_target_gate<T, Gate, Action, Fut>(
     gate: Gate,
     action: Action,
@@ -1176,10 +1187,7 @@ impl ThemeService {
             .await
     }
 
-    /// Full apply variant used by the Windows manager's normal launch path.
-    /// The locale is carried through the one restart that opens Codex with a
-    /// CDP port, so choosing 简体中文 in the manager also applies to a
-    /// persisted theme launch.
+    /// Full apply, including the transactional restart selected by the user.
     pub async fn apply_with_restart_and_locale(
         &self,
         settings: &AppSettings,
@@ -1203,14 +1211,7 @@ impl ThemeService {
             if codex_theme_engine::cdp::cdp_http_ready(THEME_CDP_PORT).await {
                 match self.hot_apply_native(&theme_id, &native, false).await {
                     Ok(()) => {
-                        let handle = self.directive_handle().await;
-                        handle
-                            .send(Some(dir.clone()))
-                            .map_err(|_| AppError::Internal("主题守护未运行".to_string()))?;
-                        self.wait_daemon_theme(&theme_id, Duration::from_secs(30))
-                            .await?;
-                        remove_stash(); // applied == kept: the try-on stash is consumed
-                        return Ok(());
+                        return self.confirm_live_theme(&theme_id, dir).await;
                     }
                     Err(error) => {
                         log::warn!("热应用失败，降级为停机写 config.toml: {error}");
@@ -1229,6 +1230,33 @@ impl ThemeService {
             .await
         })
         .await
+    }
+
+    async fn confirm_live_theme(&self, theme_id: &str, dir: PathBuf) -> Result<(), AppError> {
+        self.directive_handle().await.send(Some(dir))
+            .map_err(|_| AppError::Internal("主题守护未运行".into()))?;
+        self.wait_daemon_theme(theme_id, Duration::from_secs(30)).await?;
+        remove_stash();
+        Ok(())
+    }
+
+    /// Ordinary USB Open has already launched Codex. Only live theme operations
+    /// belong here: a cosmetic failure cannot roll back that successful launch.
+    pub(crate) async fn restore_on_open(
+        &self,
+        settings: &AppSettings,
+        theme_ref: &str,
+    ) -> Result<(), AppError> {
+        authorize_theme_codex_target()?;
+        ensure_no_pending_tx()?;
+        let dir = resolve_theme(settings, theme_ref)?;
+        let theme = load_theme(&dir).map_err(|e| AppError::Engine(e.to_string()))?;
+        let native = strict_native(&theme)?;
+        codex_theme_engine::codex_theme::verified_share_strings(&native)
+            .map_err(|e| AppError::Engine(e.to_string()))?;
+        wait_for_theme_cdp().await?;
+        self.hot_apply_native(&theme.config.id, &native, false).await?;
+        self.confirm_live_theme(&theme.config.id, dir).await
     }
 
     async fn restart_debuggable_and_inject(
@@ -1274,13 +1302,7 @@ impl ThemeService {
         .await
         .map_err(|e| AppError::Internal(format!("主题应用任务失败: {e}")))??;
 
-        let deadline = tokio::time::Instant::now() + CDP_WAIT;
-        while !codex_theme_engine::cdp::cdp_http_ready(THEME_CDP_PORT).await {
-            if tokio::time::Instant::now() >= deadline {
-                return Err(AppError::Engine("Codex 已启动但调试端口未就绪".to_string()));
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
+        wait_for_theme_cdp().await?;
 
         if let Some(native) = &native {
             let stash_first = matches!(sync, NativeSync::Hot);
@@ -1397,13 +1419,7 @@ impl ThemeService {
 
         // Async half: CDP ready → inject → daemon confirmation → commit.
         let post_launch: Result<(), AppError> = async {
-            let deadline = tokio::time::Instant::now() + CDP_WAIT;
-            while !codex_theme_engine::cdp::cdp_http_ready(THEME_CDP_PORT).await {
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(AppError::Engine("Codex 已启动但调试端口未就绪".to_string()));
-                }
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
+            wait_for_theme_cdp().await?;
             let handle = self.directive_handle().await;
             handle
                 .send(Some(dir.to_path_buf()))
@@ -1692,9 +1708,8 @@ fn launch_codex_with_cdp(
             "codex-theme-launch-target",
         )?;
         let usb_mode = usb_authorization.is_some();
-        let settings = windows_domain_settings();
         launch_with_catalog_reload_preflight(
-            || crate::app::win_update::prepare_usb_model_catalog_for_theme_launch(&settings),
+            || crate::app::win_update::prepare_model_catalog_relaunch(&detected, usb_mode),
             || {
                 if disable_self_updates {
                     crate::app::codex_self_update::sync_setting(true)?;
@@ -1807,7 +1822,9 @@ fn require_theme_relaunch_authorization() -> Result<(), AppError> {
                 .unwrap_or_else(|| status.message.clone()),
         ));
     }
-    crate::app::usb_guard::require_signed_codex_bundle("codex-theme-relaunch").map(|_| ())
+    // The caller verifies the signed bundle against its selected target before
+    // launch. This step refreshes the online decision and watchdog lease.
+    Ok(())
 }
 
 fn run_gated_theme_relaunch<G, L>(gate: G, launch: L) -> Result<(), AppError>

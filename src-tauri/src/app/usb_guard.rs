@@ -4,9 +4,9 @@
 //! the same executable is started with `--codex-usb-guard` and runs without a
 //! window.  It owns a small lease file under `%LOCALAPPDATA%`; the lease
 //! contains the removable-volume fingerprint and the exact PIDs started by
-//! this product.  The helper polls once per second and, after a five-second
-//! monotonic grace period, terminates only those PIDs when the authorized USB
-//! volume can no longer be observed.
+//! this product. The helper polls once per second and allows up to 60 seconds
+//! to reverify the authorized USB volume and its license before stopping
+//! protected processes. A rejected license is handled immediately.
 //!
 //! This is a product access gate, not a DRM boundary.  An unsigned license is
 //! auto-enrolled on first run so a developer can assemble a bundle without a
@@ -66,7 +66,7 @@ pub const LEASE_FILE_NAME: &str = "lease.json";
 pub const STATUS_FILE_NAME: &str = "status.json";
 pub const LOCK_FILE_NAME: &str = "guard.lock";
 pub const POLL_INTERVAL_MS: u64 = 1_000;
-pub const DISCONNECT_GRACE_MS: u64 = 5_000;
+pub const DISCONNECT_GRACE_MS: u64 = 60_000;
 const LEASE_SCHEMA_VERSION: u32 = 1;
 const STATUS_SCHEMA_VERSION: u32 = 1;
 const USB_MANIFEST_POLICY_MAX_BYTES: u64 = 256 * 1024;
@@ -89,7 +89,48 @@ static SUPPRESS_STATUS_AFTER_UNINSTALL: AtomicBool = AtomicBool::new(false);
 /// local window exists.  Keep this fail-closed marker visible to read-only
 /// status calls so a stale authorized status cannot enable an operation while
 /// the first full scan is still running.
-static STARTUP_INTEGRITY_PENDING: AtomicBool = AtomicBool::new(false);
+static STARTUP_INTEGRITY: std::sync::Mutex<StartupIntegrity> =
+    std::sync::Mutex::new(StartupIntegrity::Idle);
+
+enum StartupIntegrity {
+    Idle,
+    Pending,
+    Failed(String),
+}
+
+impl StartupIntegrity {
+    fn finish(&mut self, result: &Result<UsbGuardStatus, AppError>) {
+        *self = match result {
+            Ok(_) => Self::Idle,
+            Err(error) => Self::Failed(error.to_string()),
+        };
+    }
+
+    fn visible_status(&self) -> Option<UsbGuardStatus> {
+        let mut status = match self {
+            Self::Idle => return None,
+            Self::Pending => {
+                let mut status = base_status("starting", "not-running");
+                status.codex_block_reason = Some("U 盘能力包正在进行启动完整性校验".to_string());
+                status.message = "正在校验 U 盘能力包，完成后才会开放 Codex 操作".to_string();
+                status
+            }
+            Self::Failed(error) => {
+                let mut status = base_status("initialization-failed", "not-running");
+                status.codex_block_reason = Some(error.clone());
+                status.message = format!("U 盘看门狗初始化失败：{error}。请关闭管理器后重新打开；如仍失败，请查看日志。");
+                status
+            }
+        };
+        status.removable = true;
+        Some(status)
+    }
+}
+
+fn set_startup_integrity_pending(pending: bool) {
+    *STARTUP_INTEGRITY.lock().unwrap_or_else(|error| error.into_inner()) =
+        if pending { StartupIntegrity::Pending } else { StartupIntegrity::Idle };
+}
 
 /// Called only after the detached cleanup hand-off is accepted. Normal exit
 /// callbacks must not recreate the very directory that the helper removes.
@@ -145,7 +186,7 @@ pub struct UsbGuardStatus {
     pub bundle_path: Option<String>,
     pub bundle_relative_path: Option<String>,
     pub signed: bool,
-    /// missing / unsigned / valid / invalid / unknown-key / revoked
+    /// missing / unsigned / valid / invalid / unknown / unknown-key / revoked
     #[serde(default = "default_signature_state")]
     pub signature_state: String,
     /// Whether Codex operations are currently permitted by the signed gate.
@@ -636,7 +677,7 @@ fn validate_lease_observation(
 fn validate_lease_license_snapshot(
     lease: &UsbLease,
     license: &UsbLicense,
-    bundle: &Path,
+    current_digest: impl FnOnce() -> Result<String, AppError>,
 ) -> Result<(), AppError> {
     if let Some(expected) = lease.installation_id.as_deref() {
         if expected != license.installation_id {
@@ -653,7 +694,7 @@ fn validate_lease_license_snapshot(
         }
     }
     if let Some(expected) = lease.license_digest.as_deref() {
-        let actual = license_digest(bundle)?;
+        let actual = current_digest()?;
         if !expected.eq_ignore_ascii_case(&actual) {
             return Err(engine(
                 "usb_toctou_changed：当前许可证摘要与本会话快照不一致",
@@ -968,9 +1009,11 @@ fn read_license(bundle_root: &Path) -> Result<Option<UsbLicense>, AppError> {
         return Ok(None);
     }
     let bytes = fs::read(&path).map_err(|error| engine(format!("读取许可证失败: {error}")))?;
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .map_err(|error| engine(format!("许可证 JSON 无效: {error}")))
+    decode_usb_license(&bytes).map(Some)
+}
+
+fn decode_usb_license(bytes: &[u8]) -> Result<UsbLicense, AppError> {
+    serde_json::from_slice(bytes).map_err(|error| engine(format!("许可证 JSON 无效: {error}")))
 }
 
 fn write_license(bundle_root: &Path, license: &UsbLicense) -> Result<(), AppError> {
@@ -1015,7 +1058,7 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
 fn status_message(status: &str) -> String {
     match status {
         "authorized" => "U 盘已验证，看门狗运行中".to_string(),
-        "grace" => "暂时未检测到 U 盘，正在等待重新连接".to_string(),
+        "grace" => "正在重新核验授权 U 盘".to_string(),
         "missing" => "未检测到授权 U 盘，已停止受保护进程".to_string(),
         "mismatch" => "检测到 U 盘，但设备或目录指纹不匹配".to_string(),
         "unsupported" => "当前启动位置不是可移动 U 盘".to_string(),
@@ -1081,16 +1124,23 @@ fn lock_path() -> Result<PathBuf, AppError> {
 }
 
 pub fn current_status() -> UsbGuardStatus {
-    if STARTUP_INTEGRITY_PENDING.load(Ordering::SeqCst) && guard_required() {
-        #[allow(unused_mut)]
-        let mut status = base_status("starting", "not-running");
-        status.removable = true;
-        status.codex_block_reason = Some("U 盘能力包正在进行启动完整性校验".to_string());
-        status.message = "正在校验 U 盘能力包，完成后才会开放 Codex 操作".to_string();
-        return status;
+    let status = stored_status();
+    #[cfg(windows)]
+    if guard_required() && status.status == "authorized" {
+        return mask_stale_authorized_status(status, read_lease().is_some(), guard_helper_is_live());
     }
-    #[allow(unused_mut)]
-    let mut status = status_path()
+    status
+}
+
+fn stored_status() -> UsbGuardStatus {
+    if guard_required() {
+        if let Some(status) = STARTUP_INTEGRITY.lock()
+            .unwrap_or_else(|error| error.into_inner()).visible_status()
+        {
+            return status;
+        }
+    }
+    status_path()
         .ok()
         .and_then(|path| read_json::<UsbGuardStatus>(&path))
         .unwrap_or_else(|| {
@@ -1099,19 +1149,7 @@ pub fn current_status() -> UsbGuardStatus {
             } else {
                 disabled_status()
             }
-        });
-    // `status.json` is a persisted renderer snapshot. A process crash or a
-    // slow helper launch can leave an old `authorized/running` value behind;
-    // never expose that stale value as an actionable authorization state when
-    // the live lease or helper lock is absent. Keep the status readable and
-    // retryable so the UI can poll until startup settles.
-    #[cfg(target_os = "windows")]
-    if guard_required() {
-        let lease_live = read_lease().is_some();
-        let helper_live = guard_helper_is_live();
-        status = mask_stale_authorized_status(status, lease_live, helper_live);
-    }
-    status
+        })
 }
 
 /// Only the fixed USB layout is mandatory-bound.  A normal installed manager
@@ -1170,8 +1208,12 @@ fn path_has_reparse_point(_path: &Path) -> Result<bool, AppError> {
 fn license_digest(bundle_root: &Path) -> Result<String, AppError> {
     let bytes = fs::read(license_path(bundle_root))
         .map_err(|error| engine(format!("读取许可证摘要失败: {error}")))?;
+    Ok(license_digest_from_bytes(&bytes))
+}
+
+fn license_digest_from_bytes(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
-    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// Capability content is independent from the formal Codex signature. It
@@ -1240,13 +1282,21 @@ pub fn require_usb_content_access(phase: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-/// Unified Codex gate. Every launch, install, repair, update and commit path
-/// calls this boundary. The returned snapshot is captured from the live
-/// observation immediately before the operation; it is never reconstructed
-/// from renderer-provided paths.
+/// Full signed-bundle gate for protected operations that can change the installation.
+/// Ordinary Open uses installed_launch_authorization after manager startup verification.
 pub fn require_signed_codex_bundle(
     phase: &str,
 ) -> Result<Option<SignedUsbAuthorization>, AppError> {
+    signed_codex_authorization(phase, false)
+}
+
+pub(super) fn installed_launch_authorization() -> Result<Option<SignedUsbAuthorization>, AppError> {
+    signed_codex_authorization("win-launch-target", true)
+}
+
+fn signed_usb_identity(
+    phase: &str,
+) -> Result<Option<(PathBuf, UsbFingerprint, UsbLicense, UsbLease)>, AppError> {
     if crate::app::usb_revocation::has_pending_revocation() {
         return Err(engine(format!(
             "usb_revocation_persistence_pending phase={phase}：已验签作废状态尚未安全写入 U 盘和本机，Codex 操作保持锁定"
@@ -1255,24 +1305,8 @@ pub fn require_signed_codex_bundle(
     if !guard_required() {
         return Ok(None);
     }
-    // Give startup a short bounded opportunity to publish the helper lease,
-    // and keep this failure distinct from an invalid package signature. The
-    // renderer also performs a preflight, but this backend gate remains the
-    // final authority for every protected operation.
-    require_authorized().map_err(|error| {
-        engine(format!(
-            "usb_watchdog_not_ready phase={phase} failed: {error}"
-        ))
-    })?;
-    let (bundle, fingerprint) = authorized_bundle_identity()
+    let (bundle, fingerprint, license, signed, lease) = authorized_bundle_license()
         .map_err(|error| engine(format!("usb_license_gate phase={phase} failed: {error}")))?;
-    let license = read_license(&bundle)?.ok_or_else(|| {
-        engine(format!(
-            "usb_license_missing phase={phase}：当前 U 盘缺少 usb-license.json"
-        ))
-    })?;
-    let signed = validate_license(&license, &fingerprint)
-        .map_err(|error| engine(format!("usb_license_invalid phase={phase}：{error}")))?;
     if signed && license.key_id.is_none() && signed_required() {
         return Err(engine(format!(
             "usb_license_missing_key_id phase={phase}：正式许可证必须包含 keyId"
@@ -1283,31 +1317,12 @@ pub fn require_signed_codex_bundle(
             "usb_license_unsigned phase={phase}：未签名许可证只允许诊断和能力包操作，Codex 操作必须使用正式签名许可证"
         )));
     }
-    let lease = read_lease().ok_or_else(|| {
-        engine(format!(
-            "usb_watchdog_not_running phase={phase}：当前没有有效 U 盘租约"
-        ))
-    })?;
     if lease.installation_id.is_none() || lease.key_id.is_none() || lease.license_digest.is_none() {
         return Err(engine(format!(
             "usb_toctou_changed phase={phase}：当前租约缺少正式授权快照，请重启管理器"
         )));
     }
 
-    // Hash/path/manifest verification is required for every route. Formal
-    // USB builds additionally require the internal license/anchor binding and
-    // Authenticode on the external MSIX/prerequisites; product-owned EXEs are
-    // protected by the same signed USB anchor and SHA-256 rows.
-    let integrity = verify_runtime_bundle_integrity(&bundle)
-        .map_err(|error| engine(format!("usb_bundle_invalid phase={phase}：{error}")))?;
-    if !integrity
-        .anchor_sha256
-        .eq_ignore_ascii_case(&fingerprint.anchor_sha256)
-    {
-        return Err(engine(format!(
-            "usb_bundle_anchor_changed phase={phase}：现场锚点与物理观察不一致"
-        )));
-    }
     let apps = bundle.join(USB_APPS_DIR_NAME);
     let codex_root = usb_codex_root(&bundle);
     for candidate in [&bundle, &apps, &codex_root] {
@@ -1320,14 +1335,48 @@ pub fn require_signed_codex_bundle(
     }
     let _ = local_data_paths()
         .map_err(|error| engine(format!("usb_data_boundary phase={phase} failed: {error}")))?;
+    Ok(Some((bundle, fingerprint, license, lease)))
+}
+
+pub(crate) fn authorize_live_usb_focus(root: &Path) -> Result<(), AppError> {
+    let (bundle, _, _, _) =
+        signed_usb_identity("win-focus-existing")?.ok_or_else(|| engine("当前 U 盘授权不可用"))?;
+    if !codex_win_engine::same_windows_path(root, &usb_codex_root(&bundle)) {
+        return Err(engine("当前会话不属于此 U 盘"));
+    }
+    Ok(())
+}
+
+fn signed_codex_authorization(
+    phase: &str,
+    installed_launch: bool,
+) -> Result<Option<SignedUsbAuthorization>, AppError> {
+    let Some((bundle, fingerprint, license, lease)) = signed_usb_identity(phase)? else {
+        return Ok(None);
+    };
+    let (anchor, direct_entry_required) = if installed_launch && signed_required() && fingerprint.anchor_schema == ANCHOR_SCHEMA_V3 {
+        crate::app::usb_bundle::verify_installed_launch(&bundle)
+    } else {
+        verify_runtime_bundle_integrity(&bundle)
+            .map(|report| (report.anchor_sha256, report.direct_entry_required))
+    }
+    .map_err(|error| engine(format!("usb_bundle_invalid phase={phase}：{error}")))?;
+    if !anchor.eq_ignore_ascii_case(&fingerprint.anchor_sha256) {
+        return Err(engine(format!(
+            "usb_bundle_anchor_changed phase={phase}：现场锚点与物理观察不一致"
+        )));
+    }
+    let codex_root = usb_codex_root(&bundle);
     Ok(Some(SignedUsbAuthorization {
         bundle_root: bundle.clone(),
         codex_root,
         fingerprint: fingerprint.clone(),
-        direct_entry_required: integrity.direct_entry_required,
+        direct_entry_required,
         installation_id: license.installation_id,
         key_id: license.key_id.unwrap_or_default(),
-        license_digest: license_digest(&bundle)?,
+        license_digest: lease
+            .license_digest
+            .ok_or_else(|| engine("当前租约缺少许可证摘要"))?,
         checked_at_ms: now_ms(),
     }))
 }
@@ -1683,7 +1732,12 @@ pub fn signed_install_account_binding_ready() -> Result<bool, AppError> {
 /// fingerprint; a renderer path or a drive letter is not an authorization
 /// token.
 pub fn authorized_bundle_identity() -> Result<(PathBuf, UsbFingerprint), AppError> {
-    require_authorized()?;
+    authorized_bundle_license().map(|(root, fingerprint, _, _, _)| (root, fingerprint))
+}
+
+fn authorized_bundle_license(
+) -> Result<(PathBuf, UsbFingerprint, UsbLicense, bool, UsbLease), AppError> {
+    require_authorized().map_err(|error| engine(format!("usb_watchdog_not_ready：{error}")))?;
     let bundle_candidate =
         current_bundle_root().ok_or_else(|| engine("无法确定当前 U 盘套件目录"))?;
     // Re-observe the running bundle at the mutating boundary.  Do not trust
@@ -1704,9 +1758,11 @@ pub fn authorized_bundle_identity() -> Result<(PathBuf, UsbFingerprint), AppErro
             bundle.display()
         )));
     }
-    let license = read_license(&bundle)?.ok_or_else(|| engine("当前 U 盘缺少许可证"))?;
-    validate_license(&license, current_fingerprint)?;
-    validate_lease_license_snapshot(&lease, &license, &bundle)?;
+    let bytes = fs::read(license_path(&bundle))
+        .map_err(|e| engine(format!("读取当前 U 盘许可证失败：{e}")))?;
+    let license = decode_usb_license(&bytes)?;
+    let signed = validate_license(&license, current_fingerprint)?;
+    validate_lease_license_snapshot(&lease, &license, || Ok(license_digest_from_bytes(&bytes)))?;
     if !fingerprints_match(&license.fingerprint, &lease.fingerprint) {
         return Err(engine(format!(
             "当前许可证与本会话租约不一致（currentPath={} leasePath={}）",
@@ -1722,7 +1778,7 @@ pub fn authorized_bundle_identity() -> Result<(PathBuf, UsbFingerprint), AppErro
         current_fingerprint.anchor_schema,
         fingerprint_excerpt(&current_fingerprint.anchor_sha256)
     );
-    Ok((bundle, current_fingerprint.clone()))
+    Ok((bundle, current_fingerprint.clone(), license, signed, lease))
 }
 
 /// Codex payload refresh is a release operation, not a development-mode
@@ -1751,17 +1807,10 @@ pub fn authorized_account_binding() -> Result<Option<license_core::UsbAccountBin
     if !guard_required() {
         return Ok(None);
     }
-    let (bundle, fingerprint) = authorized_bundle_identity()?;
-    let license =
-        read_license(&bundle)?.ok_or_else(|| engine("usb_license_missing：当前 U 盘缺少许可证"))?;
-    // Development/legacy USB bundles may still launch CCSwitch manually. Do
-    // not reject those bundles merely because they cannot provide automatic
-    // account injection; only a signed binding is eligible for the hand-off.
+    let (_, _, license, signed, _) = authorized_bundle_license()?;
     if license.signature.is_none() {
         return Ok(None);
     }
-    let signed = validate_license(&license, &fingerprint)
-        .map_err(|error| engine(format!("usb_license_invalid：{error}")))?;
     if !signed {
         return Err(engine(
             "usb_license_unsigned：自动 CCSwitch 账号注入需要签名许可证",
@@ -2004,13 +2053,17 @@ pub fn verify_authorized_volume_root(_volume_root: &Path) -> Result<(), AppError
 }
 
 pub fn require_authorized() -> Result<(), AppError> {
+    authorized_status().map(|_| ())
+}
+
+pub fn authorized_status() -> Result<UsbGuardStatus, AppError> {
     if !guard_required() {
-        return Ok(());
+        return Ok(disabled_status());
     }
     let deadline =
         std::time::Instant::now() + Duration::from_millis(AUTHORIZATION_RETRY_TIMEOUT_MS);
     loop {
-        let status = current_status();
+        let status = stored_status();
         let lease_live = read_lease().is_some();
         #[cfg(target_os = "windows")]
         let helper_live = guard_helper_is_live();
@@ -2021,7 +2074,7 @@ pub fn require_authorized() -> Result<(), AppError> {
             && lease_live
             && helper_live
         {
-            return Ok(());
+            return Ok(status);
         }
         // Startup publishes the status and helper lock asynchronously. Only
         // wait for states that can legitimately settle; a mismatch/invalid
@@ -2063,14 +2116,9 @@ fn mask_stale_authorized_status(
 
 #[cfg(target_os = "windows")]
 fn guard_helper_is_live() -> bool {
-    let Some(pid) = lock_path()
-        .ok()
-        .and_then(|path| fs::read_to_string(path).ok())
-        .and_then(|text| text.trim().parse::<u32>().ok())
-    else {
-        return false;
-    };
-    process_matches(pid, Some(GUARD_EXE_NAME))
+    lock_path().and_then(|path| {
+        guard_lock_owner_is_live(&path, &local_guard_dir()?.join(GUARD_EXE_NAME))
+    }).unwrap_or(false)
 }
 
 #[cfg(target_os = "windows")]
@@ -2165,10 +2213,10 @@ fn local_revocation_preflight(
 /// `IntegrityPending` state is active.
 fn startup_preflight_impl(complete_integrity: bool) -> Result<StartupPreflight, AppError> {
     if !guard_required() {
-        STARTUP_INTEGRITY_PENDING.store(false, Ordering::SeqCst);
+        set_startup_integrity_pending(false);
         return Ok(StartupPreflight::Ready);
     }
-    STARTUP_INTEGRITY_PENDING.store(!complete_integrity, Ordering::SeqCst);
+    set_startup_integrity_pending(!complete_integrity);
     let bundle = current_bundle_root()
         .ok_or_else(|| engine("usb_license_bundle_missing：无法确定当前 USB bundle"))?;
     validate_bundle_policy_binding(&bundle)?;
@@ -2222,11 +2270,11 @@ fn startup_preflight_impl(complete_integrity: bool) -> Result<StartupPreflight, 
     }
     let _ = local_data_paths()?;
     if let Some((reason, _)) = revocation_restriction {
-        STARTUP_INTEGRITY_PENDING.store(true, Ordering::SeqCst);
+        set_startup_integrity_pending(true);
         return Ok(StartupPreflight::RevocationPending { reason });
     }
     if complete_integrity {
-        STARTUP_INTEGRITY_PENDING.store(false, Ordering::SeqCst);
+        set_startup_integrity_pending(false);
         Ok(match license_reason {
             Some(reason) => StartupPreflight::AuthorizationBlocked { reason },
             None => StartupPreflight::Ready,
@@ -2257,7 +2305,7 @@ pub fn complete_startup_preflight() -> Result<StartupPreflight, AppError> {
 }
 
 pub fn startup_integrity_pending() -> bool {
-    STARTUP_INTEGRITY_PENDING.load(Ordering::SeqCst)
+    matches!(*STARTUP_INTEGRITY.lock().unwrap_or_else(|error| error.into_inner()), StartupIntegrity::Pending)
 }
 
 pub fn write_status(status: &UsbGuardStatus) -> Result<(), AppError> {
@@ -2403,7 +2451,11 @@ fn register_new_usb_codex_processes(before: &[u32], codex_root: &Path) {
         log::warn!("USB guard Codex manifest entry has a non-UTF-8 filename");
         return;
     };
-    for pid in snapshot_processes(image_name) {
+    let pids = match snapshot_usb_process_names(&[image_name]) {
+        Ok(pids) => pids,
+        Err(error) => { log::warn!("USB guard process registration: {error}"); return; }
+    };
+    for pid in pids {
         if before.contains(&pid) {
             continue;
         }
@@ -2414,7 +2466,7 @@ fn register_new_usb_codex_processes(before: &[u32], codex_root: &Path) {
                 continue;
             }
         };
-        if !codex_image_is_owned_by_root(codex_root, &image, &image) {
+        if !codex_win_engine::same_windows_path(&expected_entry, &image) {
             continue;
         }
         if let Err(error) = register_process(pid, "codex", Some(&image)) {
@@ -2426,27 +2478,82 @@ fn register_new_usb_codex_processes(before: &[u32], codex_root: &Path) {
 #[cfg(not(target_os = "windows"))]
 fn register_new_usb_codex_processes(_before: &[u32], _codex_root: &Path) {}
 
-/// Snapshot only the manager-launchable Codex image for the active USB bundle.
-/// USB overlay installs use the preserved official executable; legacy and
-/// non-overlay installs keep the manifest-declared entry.
-pub fn snapshot_usb_codex_entry_processes() -> Vec<u32> {
-    let Some(codex_root) = current_usb_codex_root() else {
-        return Vec::new();
-    };
-    let Some(executable) = usb_codex_entry_executable(&codex_root) else {
-        return Vec::new();
-    };
-    let Some(image_name) = executable.file_name().and_then(|name| name.to_str()) else {
-        return Vec::new();
-    };
-    snapshot_processes(image_name)
+/// Capture the pre-launch exclusion set in one Windows snapshot.
+pub fn snapshot_usb_codex_entry_processes() -> Result<Vec<u32>, AppError> {
+    let legacy =
+        current_usb_codex_root().and_then(|root| codex_win_engine::installed_app_exe(&root));
+    let mut names = vec!["Codex.exe", "CodexCore.dat"];
+    if let Some(name) = legacy
+        .as_deref()
+        .and_then(Path::file_name)
+        .and_then(|v| v.to_str())
+    {
+        names.push(name);
+    }
+    snapshot_usb_process_names(&names)
 }
+
+#[cfg(windows)]
+fn snapshot_usb_process_names(names: &[&str]) -> Result<Vec<u32>, AppError> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    let handle = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(engine(format!(
+            "读取进程快照失败：{}",
+            io::Error::last_os_error()
+        )));
+    }
+    let snapshot = unsafe { OwnedHandle::from_raw_handle(handle) };
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    let mut pids = Vec::new();
+    let mut first = true;
+    loop {
+        let found = unsafe {
+            if first {
+                Process32FirstW(snapshot.as_raw_handle(), &mut entry)
+            } else {
+                Process32NextW(snapshot.as_raw_handle(), &mut entry)
+            }
+        };
+        if found == 0 {
+            let error = io::Error::last_os_error();
+            return if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
+                Ok(pids)
+            } else {
+                Err(engine(format!("进程快照不完整：{error}")))
+            };
+        }
+        first = false;
+        let end = entry
+            .szExeFile
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(entry.szExeFile.len());
+        let image = String::from_utf16_lossy(&entry.szExeFile[..end]);
+        if names.iter().any(|name| image.eq_ignore_ascii_case(name)) {
+            pids.push(entry.th32ProcessID);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn snapshot_usb_process_names(_names: &[&str]) -> Result<Vec<u32>, AppError> { Ok(Vec::new()) }
 
 fn usb_codex_entry_executable(codex_root: &Path) -> Option<PathBuf> {
     let canonical_root = fs::canonicalize(codex_root).ok()?;
     let executable =
-        fs::canonicalize(codex_win_engine::installed_codex_launch_exe(&canonical_root).ok()?)
-            .ok()?;
+        fs::canonicalize(
+            codex_win_engine::installed_codex_launch_exe_for_usb_mode(&canonical_root).ok()?,
+        )
+        .ok()?;
     if !executable.is_file()
         || !executable
             .parent()
@@ -2602,6 +2709,14 @@ fn process_matches(_pid: u32, _expected_image: Option<&str>) -> bool {
 
 #[cfg(target_os = "windows")]
 fn terminate_managed_processes(lease: &UsbLease) -> usize {
+    terminate_managed_processes_with_verified_codex(lease, &[])
+}
+
+#[cfg(target_os = "windows")]
+fn terminate_managed_processes_with_verified_codex(
+    lease: &UsbLease,
+    verified_codex: &[(ManagedProcess, OwnedProcessHandle)],
+) -> usize {
     let mut terminated = 0;
     let self_pid = std::process::id();
     for managed in &lease.managed_processes {
@@ -2609,7 +2724,11 @@ fn terminate_managed_processes(lease: &UsbLease) -> usize {
             continue;
         }
         if managed.role == "codex" {
-            if terminate_usb_codex_process(lease, managed) {
+            let stopped = match verified_codex.iter().find(|(entry, _)| entry == managed) {
+                Some((_, process)) => terminate_verified_usb_codex_process(process, managed.pid),
+                None => terminate_usb_codex_process(lease, managed),
+            };
+            if stopped {
                 terminated += 1;
             }
             continue;
@@ -2684,28 +2803,32 @@ fn terminate_usb_codex_process(lease: &UsbLease, managed: &ManagedProcess) -> bo
 
 #[cfg(target_os = "windows")]
 fn terminate_usb_codex_process_under_root(codex_root: &Path, managed: &ManagedProcess) -> bool {
+    open_verified_usb_codex_process_under_root(codex_root, managed)
+        .is_some_and(|process| terminate_verified_usb_codex_process(&process, managed.pid))
+}
+
+#[cfg(target_os = "windows")]
+fn terminate_verified_usb_codex_process(process: &OwnedProcessHandle, pid: u32) -> bool {
     use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
     use windows_sys::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
 
-    let Some(process) = open_verified_usb_codex_process_under_root(codex_root, managed) else {
+    if unsafe { WaitForSingleObject(process.0, 0) } != windows_sys::Win32::Foundation::WAIT_TIMEOUT {
         return false;
-    };
-    request_graceful_close_to_verified_process(process.0, managed.pid);
+    }
+    request_graceful_close_to_verified_process(process.0, pid);
     match unsafe { WaitForSingleObject(process.0, 250) } {
         WAIT_OBJECT_0 => return true,
         windows_sys::Win32::Foundation::WAIT_TIMEOUT => {}
         status => {
             log::warn!(
-                "USB guard could not wait for verified USB Codex entry pid={} status={status}",
-                managed.pid
+                "USB guard could not wait for verified USB Codex entry pid={pid} status={status}"
             );
             return false;
         }
     }
     if unsafe { TerminateProcess(process.0, 1) } == 0 {
         log::warn!(
-            "USB guard could not terminate verified USB Codex entry pid={} error={}",
-            managed.pid,
+            "USB guard could not terminate verified USB Codex entry pid={pid} error={}",
             unsafe { windows_sys::Win32::Foundation::GetLastError() }
         );
         return false;
@@ -2772,16 +2895,6 @@ fn open_verified_usb_codex_process_under_root(
     if managed.role != "codex" {
         return None;
     }
-    let canonical_codex_root = fs::canonicalize(codex_root).ok()?;
-    if !codex_win_engine::same_windows_path(codex_root, &canonical_codex_root) {
-        return None;
-    }
-    let expected = usb_codex_entry_executable(&canonical_codex_root)?;
-    let registered = fs::canonicalize(managed.executable.as_deref().map(Path::new)?).ok()?;
-    if !codex_win_engine::same_windows_path(&expected, &registered) {
-        return None;
-    }
-
     let raw = unsafe {
         OpenProcess(
             PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | PROCESS_SYNCHRONIZE,
@@ -2804,8 +2917,13 @@ fn open_verified_usb_codex_process_under_root(
     }
     use std::os::windows::ffi::OsStringExt;
     let image = PathBuf::from(std::ffi::OsString::from_wide(&buffer[..length as usize]));
+    let canonical_codex_root = fs::canonicalize(codex_root).ok()?;
+    if !codex_win_engine::same_windows_path(codex_root, &canonical_codex_root) {
+        return None;
+    }
+    let registered = fs::canonicalize(managed.executable.as_deref().map(Path::new)?).ok()?;
     let image = fs::canonicalize(image).ok()?;
-    if !codex_win_engine::same_windows_path(&expected, &image) {
+    if !codex_image_is_owned_by_root(&canonical_codex_root, &registered, &image) {
         return None;
     }
     // Recheck liveness using the same object that TerminateProcess will
@@ -2817,12 +2935,20 @@ fn open_verified_usb_codex_process_under_root(
 }
 
 #[cfg(target_os = "windows")]
-fn terminate_managed_processes_without_manager(lease: &UsbLease) -> usize {
-    let mut scoped = lease.clone();
-    scoped
-        .managed_processes
-        .retain(|process| process.pid != lease.owner_pid && process.role != "manager");
-    terminate_managed_processes(&scoped)
+fn retain_verified_usb_codex_processes(
+    bundle: &Path,
+    managed_processes: &[ManagedProcess],
+    verified: &mut Vec<(ManagedProcess, OwnedProcessHandle)>,
+) {
+    verified.retain(|(entry, _)| managed_processes.contains(entry));
+    let codex_root = bundle.join(USB_APPS_DIR_NAME).join(USB_CODEX_DIR_NAME);
+    for entry in managed_processes.iter().filter(|entry| entry.role == "codex") {
+        if !verified.iter().any(|(managed, _)| managed == entry) {
+            if let Some(handle) = open_verified_usb_codex_process_under_root(&codex_root, entry) {
+                verified.push((entry.clone(), handle));
+            }
+        }
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -2941,41 +3067,86 @@ pub fn observe_bundle(bundle_root: &Path) -> Result<UsbObservation, AppError> {
 }
 
 #[cfg(target_os = "windows")]
-fn scan_removable_matches(expected: &UsbFingerprint) -> Vec<UsbObservation> {
-    let mut matches = Vec::new();
+fn scan_removable_with_error(
+    expected: &UsbFingerprint,
+    last_drive: Option<&str>,
+) -> Result<Option<UsbObservation>, AppError> {
+    use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives};
+
+    let drives = unsafe { GetLogicalDrives() };
+    if drives == 0 {
+        return Err(engine(format!("无法枚举 Windows 卷: {}", io::Error::last_os_error())));
+    }
+    scan_mounted_removable(
+        drives,
+        expected,
+        last_drive,
+        |root| unsafe { GetDriveTypeW(wide(root).as_ptr()) },
+        observe_windows_bundle,
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn scan_mounted_removable(
+    drives: u32,
+    expected: &UsbFingerprint,
+    last_drive: Option<&str>,
+    drive_type: impl Fn(&str) -> u32,
+    observe: impl Fn(&Path) -> Result<UsbObservation, AppError>,
+) -> Result<Option<UsbObservation>, AppError> {
+    use windows_sys::Win32::System::WindowsProgramming::{
+        DRIVE_NO_ROOT_DIR, DRIVE_REMOVABLE, DRIVE_UNKNOWN,
+    };
+
+    let mut matched = None;
+    let mut last_drive_error = None;
     for letter in b'A'..=b'Z' {
+        if drives & (1_u32 << (letter - b'A')) == 0 {
+            continue;
+        }
         let root = format!("{}:\\", letter as char);
+        let previously_matched = last_drive == Some(root.as_str());
+        let kind = drive_type(&root);
+        if kind != DRIVE_REMOVABLE {
+            // A known drive letter is assigned, but its volume may still be
+            // remounting. Keep that observation distinct from a missing drive.
+            if previously_matched && matches!(kind, DRIVE_UNKNOWN | DRIVE_NO_ROOT_DIR) {
+                last_drive_error = Some(engine(format!("授权 U 盘盘符 {root} 暂时无法访问")));
+            }
+            continue;
+        }
         let Some(candidate) = bundle_path_on_drive(&root, &expected.bundle_relative_path) else {
             continue;
         };
-        let candidate = PathBuf::from(candidate);
-        if let Ok(observation) = observe_windows_bundle(&candidate) {
-            if observation
-                .fingerprint
-                .as_ref()
-                .is_some_and(|actual| fingerprints_match(expected, actual))
+        match observe(Path::new(&candidate)) {
+            Ok(observation)
+                if observation
+                    .fingerprint
+                    .as_ref()
+                    .is_some_and(|actual| fingerprints_match(expected, actual)) =>
             {
-                matches.push(observation);
+                if matched.replace(observation).is_some() {
+                    return Err(engine("同时找到多个匹配的 U 盘，无法确认唯一授权设备"));
+                }
             }
+            Err(error) if previously_matched => last_drive_error = Some(error),
+            _ => {}
         }
     }
-    matches
+    match (matched, last_drive_error) {
+        (None, Some(error)) => Err(error),
+        (matched, _) => Ok(matched),
+    }
 }
 
 #[cfg(target_os = "windows")]
 fn scan_removable_for(expected: &UsbFingerprint) -> Option<UsbObservation> {
-    let matches = scan_removable_matches(expected);
-    (matches.len() == 1).then(|| matches.into_iter().next().expect("one match"))
+    scan_removable_with_error(expected, None).ok().flatten()
 }
 
 #[cfg(not(target_os = "windows"))]
 fn scan_removable_for(_expected: &UsbFingerprint) -> Option<UsbObservation> {
     None
-}
-
-#[cfg(not(target_os = "windows"))]
-fn scan_removable_matches(_expected: &UsbFingerprint) -> Vec<UsbObservation> {
-    Vec::new()
 }
 
 fn file_sha256(path: &Path) -> Result<[u8; 32], AppError> {
@@ -3015,25 +3186,69 @@ fn guard_binary_is_current(source: &Path, target: &Path) -> Result<bool, AppErro
 fn stop_previous_guard_for_refresh() -> Result<(), AppError> {
     remove_lease();
     let path = lock_path()?;
+    wait_for_guard_lock_release(&path, &local_guard_dir()?.join(GUARD_EXE_NAME))
+}
+
+#[cfg(target_os = "windows")]
+fn guard_lock_owner_is_live(path: &Path, expected_exe: &Path) -> Result<bool, AppError> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(engine(format!("读取看门狗锁失败: {error}"))),
+    };
+    let pid = text.trim().parse::<u32>()
+        .map_err(|error| engine(format!("看门狗锁中的进程编号无效: {error}")))?;
+    // A numeric PID can belong to an unrelated process after the helper exits.
+    // Query errors are not proof of staleness; retain the lock on access denial.
+    guard_process_is_live_at(pid, expected_exe)
+        .map_err(|error| engine(format!("无法确认看门狗锁所属进程 {pid}: {error}")))
+}
+
+#[cfg(target_os = "windows")]
+fn guard_process_is_live_at(pid: u32, expected_exe: &Path) -> io::Result<bool> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::Foundation::{GetLastError, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, WaitForSingleObject};
+    let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE, 0, pid) };
+    if raw.is_null() {
+        let code = unsafe { GetLastError() };
+        return if code == ERROR_INVALID_PARAMETER { Ok(false) } else { Err(io::Error::from_raw_os_error(code as i32)) };
+    }
+    let process = OwnedProcessHandle(raw);
+    match unsafe { WaitForSingleObject(process.0, 0) } {
+        WAIT_OBJECT_0 => return Ok(false),
+        WAIT_TIMEOUT => {},
+        _ => return Err(io::Error::last_os_error()),
+    }
+    let mut buffer = vec![0_u16; 32_768];
+    let mut length = buffer.len() as u32;
+    if unsafe { QueryFullProcessImageNameW(process.0, 0, buffer.as_mut_ptr(), &mut length) } == 0 {
+        let error = io::Error::last_os_error();
+        // A helper may exit between the liveness check and image query.
+        return if unsafe { WaitForSingleObject(process.0, 0) } == WAIT_OBJECT_0 { Ok(false) } else { Err(error) };
+    }
+    let image = PathBuf::from(std::ffi::OsString::from_wide(&buffer[..length as usize]));
+    Ok(codex_win_engine::same_windows_path(&image, expected_exe))
+}
+
+#[cfg(target_os = "windows")]
+fn wait_for_guard_lock_release(path: &Path, expected_exe: &Path) -> Result<(), AppError> {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let owner = fs::read_to_string(&path)
-            .ok()
-            .and_then(|text| text.trim().parse::<u32>().ok());
-        match owner {
-            Some(pid) if process_matches(pid, None) => {
+        match guard_lock_owner_is_live(path, expected_exe)? {
+            true => {
                 if std::time::Instant::now() >= deadline {
-                    return Err(engine(format!(
-                        "旧版看门狗进程 {pid} 未在 5 秒内退出，无法安全刷新本地组件"
-                    )));
+                    return Err(engine("旧版看门狗进程未在 5 秒内退出，无法安全刷新本地组件"));
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
-            _ => {
-                if let Err(error) = fs::remove_file(&path) {
+            false => {
+                if let Err(error) = fs::remove_file(path) {
                     if error.kind() != io::ErrorKind::NotFound {
                         return Err(engine(format!("清理旧版看门狗锁失败: {error}")));
                     }
+                } else {
+                    log::info!("USB guard stale lock reclaimed before helper refresh");
                 }
                 return Ok(());
             }
@@ -3352,12 +3567,9 @@ pub fn start_for_manager() -> Result<UsbGuardStatus, AppError> {
     if crate::app::usb_revocation::has_pending_revocation() {
         ensure_pending_revocation_retry_worker();
     }
-    // Keep the fail-closed `starting` status visible when an unexpected
-    // initialization error occurs. A stale status.json must never become the
-    // apparent authorization state after the pending marker is cleared.
-    if result.is_ok() {
-        STARTUP_INTEGRITY_PENDING.store(false, Ordering::SeqCst);
-    }
+    // Publish a terminal failure in memory before exposing persisted status.
+    // A stale authorized status.json cannot override an initialization error.
+    STARTUP_INTEGRITY.lock().unwrap_or_else(|error| error.into_inner()).finish(&result);
     result
 }
 
@@ -4502,7 +4714,7 @@ fn start_for_manager_inner() -> Result<UsbGuardStatus, AppError> {
 
 #[cfg(not(target_os = "windows"))]
 pub fn start_for_manager() -> Result<UsbGuardStatus, AppError> {
-    STARTUP_INTEGRITY_PENDING.store(false, Ordering::SeqCst);
+    set_startup_integrity_pending(false);
     let status = disabled_status();
     let _ = write_status(&status);
     Ok(status)
@@ -4550,6 +4762,77 @@ pub fn stop_and_uninstall() -> Vec<String> {
 pub fn run_guard_cli() {}
 
 #[cfg(target_os = "windows")]
+#[derive(Debug)]
+enum WatchdogFailure {
+    Missing,
+    Unverified(AppError),
+    Rejected(AppError),
+}
+
+#[cfg(target_os = "windows")]
+impl WatchdogFailure {
+    fn terminal_status(&self, expired: bool) -> Option<&'static str> {
+        match self {
+            Self::Rejected(_) => Some("mismatch"),
+            Self::Missing if expired => Some("missing"),
+            Self::Unverified(_) if expired => Some("stopped"),
+            _ => None,
+        }
+    }
+
+    fn reason(&self) -> String {
+        match self {
+            Self::Missing => "未找到可验证的授权 U 盘".to_string(),
+            Self::Unverified(error) => format!("暂时无法复核授权 U 盘：{error}"),
+            Self::Rejected(error) => format!("USB 许可证现场复核失败：{error}"),
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn check_watchdog_license(
+    lease: &UsbLease,
+    observation: &UsbObservation,
+) -> Result<bool, WatchdogFailure> {
+    use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+
+    let bundle = Path::new(&observation.bundle_path);
+    let bytes = fs::read(license_path(bundle)).map_err(|error| {
+        // Windows can report a missing parent path after a volume disappears.
+        // Only an explicit missing file is a license rejection.
+        if error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) {
+            WatchdogFailure::Rejected(engine("USB 看门狗发现许可证缺失"))
+        } else {
+            WatchdogFailure::Unverified(engine(format!("读取许可证失败: {error}")))
+        }
+    })?;
+    let verify = || {
+        let license = decode_usb_license(&bytes)?;
+        validate_lease_observation(lease, observation, lease.owner_pid)?;
+        let signed = validate_license(
+            &license,
+            observation
+                .fingerprint
+                .as_ref()
+                .ok_or_else(|| engine("USB 看门狗发现物理指纹缺失"))?,
+        )?;
+        if signed_required() && !signed {
+            return Err(engine("USB 看门狗发现未签名许可证"));
+        }
+        if signed
+            && (lease.installation_id.is_none()
+                || lease.key_id.is_none()
+                || lease.license_digest.is_none())
+        {
+            return Err(engine("USB 看门狗发现租约缺少签名授权快照"));
+        }
+        validate_lease_license_snapshot(lease, &license, || Ok(license_digest_from_bytes(&bytes)))?;
+        Ok(signed)
+    };
+    verify().map_err(WatchdogFailure::Rejected)
+}
+
+#[cfg(target_os = "windows")]
 pub fn run_guard_cli() {
     let args = std::env::args().collect::<Vec<_>>();
     let lease_override = args
@@ -4563,129 +4846,113 @@ pub fn run_guard_cli() {
         return;
     };
     let _lock = lock;
-    let mut missing_since: Option<std::time::Instant> = None;
-    while let Some(lease) = read_json::<UsbLease>(&lease_file) {
+    let status_file = status_path().unwrap_or_else(|_| lease_file.with_file_name(STATUS_FILE_NAME));
+    let started = std::time::Instant::now();
+    let mut unverified_since_ms = None;
+    let mut last_bundle = None::<String>;
+    let mut verified_codex = Vec::new();
+    let mut verified_lease_id = String::new();
+    while let Some(mut lease) = read_json::<UsbLease>(&lease_file) {
         if lease.schema_version != LEASE_SCHEMA_VERSION || lease.product != PRODUCT_ID {
             break;
         }
-        let present = scan_removable_for(&lease.fingerprint);
-        let now = now_ms();
-        if let Some(observation) = present {
-            missing_since = None;
-            let bundle = PathBuf::from(&observation.bundle_path);
-            let license_check = read_license(&bundle).and_then(|license| {
-                let license = license.ok_or_else(|| engine("USB 看门狗发现许可证缺失"))?;
-                validate_lease_observation(&lease, &observation, lease.owner_pid)?;
-                let signed = validate_license(
-                    &license,
-                    observation
-                        .fingerprint
-                        .as_ref()
-                        .ok_or_else(|| engine("USB 看门狗发现物理指纹缺失"))?,
-                )?;
-                if signed_required() && !signed {
-                    return Err(engine("USB 看门狗发现未签名许可证"));
-                }
-                if signed
-                    && (lease.installation_id.is_none()
-                        || lease.key_id.is_none()
-                        || lease.license_digest.is_none())
-                {
-                    return Err(engine("USB 看门狗发现租约缺少签名授权快照"));
-                }
-                validate_lease_license_snapshot(&lease, &license, &bundle)?;
-                Ok((license, signed))
+        if verified_lease_id != lease.lease_id {
+            verified_codex.clear();
+            verified_lease_id.clone_from(&lease.lease_id);
+        }
+        let last_drive = normalize_drive_root(last_bundle.as_deref().unwrap_or(&lease.bundle_path));
+        let checked = scan_removable_with_error(&lease.fingerprint, last_drive.as_deref())
+            .map_err(WatchdogFailure::Unverified)
+            .and_then(|observation| {
+                let observation = observation.ok_or(WatchdogFailure::Missing)?;
+                last_bundle = Some(observation.bundle_path.clone());
+                check_watchdog_license(&lease, &observation).map(|signed| (observation, signed))
             });
-            let (license, signed) = match license_check {
-                Ok(value) => value,
-                Err(error) => {
-                    // A mutable-license failure can race with a restricted
-                    // manager startup that is clearing the lease. Stop only
-                    // Codex/other managed children; never taskkill the
-                    // manager that must remain available for diagnostics and
-                    // user-initiated uninstall.
-                    let terminated = terminate_managed_processes_without_manager(&lease);
-                    let mut status = base_status("mismatch", "not-running");
-                    status.removable = true;
-                    status.drive_root = observation.drive_root;
-                    status.bundle_path = Some(observation.bundle_path);
-                    status.bundle_relative_path =
-                        Some(lease.fingerprint.bundle_relative_path.clone());
-                    status.signature_state = "invalid".to_string();
-                    status.codex_block_reason = Some(error.to_string());
-                    status.last_checked_at_ms = now;
-                    status.managed_processes = lease.managed_processes.clone();
-                    status.message = format!(
-                        "USB 许可证现场复核失败，已停止 {terminated} 个受保护进程：{error}"
-                    );
-                    let _ = write_json_atomic(
-                        &status_path()
-                            .unwrap_or_else(|_| lease_file.with_file_name(STATUS_FILE_NAME)),
-                        &status,
-                    );
-                    let _ = fs::remove_file(&lease_file);
-                    let _ = fs::remove_file(atomic_file::backup_path(&lease_file));
-                    break;
-                }
-            };
-            let mut status = base_status("authorized", "running");
-            status.removable = true;
-            status.drive_root = observation.drive_root;
-            status.bundle_path = Some(observation.bundle_path);
-            status.bundle_relative_path = Some(lease.fingerprint.bundle_relative_path.clone());
-            status.signed = signed;
-            status.signature_state = if signed {
-                "valid".to_string()
-            } else {
-                "unsigned-development".to_string()
-            };
-            status.codex_allowed = signed;
-            status.codex_block_reason =
-                (!status.codex_allowed).then(|| "未签名开发许可证不能执行 Codex 操作".to_string());
-            let _ = license;
-            status.last_checked_at_ms = now;
-            status.managed_processes = lease.managed_processes.clone();
-            let _ = write_json_atomic(
-                &status_path().unwrap_or_else(|_| lease_file.with_file_name(STATUS_FILE_NAME)),
-                &status,
-            );
-        } else {
-            let since = missing_since.get_or_insert_with(std::time::Instant::now);
-            let elapsed = since.elapsed();
-            let remaining = Duration::from_millis(DISCONNECT_GRACE_MS).saturating_sub(elapsed);
-            if elapsed >= Duration::from_millis(DISCONNECT_GRACE_MS) {
-                let terminated = terminate_managed_processes(&lease);
-                let mut status = base_status("missing", "not-running");
-                status.last_checked_at_ms = now;
-                status.missing_since_ms = Some(now.saturating_sub(elapsed.as_millis() as u64));
-                status.countdown_seconds = Some(0);
-                status.bundle_path = Some(lease.bundle_path.clone());
-                status.bundle_relative_path = Some(lease.fingerprint.bundle_relative_path.clone());
-                status.managed_processes = lease.managed_processes.clone();
-                status.message = format!(
-                    "{}（已结束 {terminated} 个受保护进程）",
-                    status_message("missing")
+        let now = now_ms();
+        let monotonic_now = started.elapsed().as_millis() as u64;
+        let decision = next_disconnect_state(
+            unverified_since_ms,
+            checked.is_ok(),
+            monotonic_now,
+            DISCONNECT_GRACE_MS,
+        );
+        unverified_since_ms = decision.missing_since_ms;
+        let (mut status, terminal) = match checked {
+            Ok((observation, signed)) => {
+                // Keep the exact verified OS process object while the USB is
+                // readable. Shutdown must still work after its image and
+                // manifest can no longer be opened through the drive letter.
+                retain_verified_usb_codex_processes(
+                    Path::new(&observation.bundle_path),
+                    &lease.managed_processes,
+                    &mut verified_codex,
                 );
-                let _ = write_json_atomic(
-                    &status_path().unwrap_or_else(|_| lease_file.with_file_name(STATUS_FILE_NAME)),
-                    &status,
-                );
-                let _ = fs::remove_file(&lease_file);
-                let _ = fs::remove_file(atomic_file::backup_path(&lease_file));
-                break;
+                let mut status = base_status("authorized", "running");
+                status.removable = true;
+                status.drive_root = observation.drive_root;
+                status.signed = signed;
+                status.signature_state =
+                    if signed { "valid" } else { "unsigned-development" }.to_string();
+                status.codex_allowed = signed;
+                status.codex_block_reason =
+                    (!signed).then(|| "未签名开发许可证不能执行 Codex 操作".to_string());
+                (status, None)
             }
-            let mut status = base_status("grace", "running");
-            status.last_checked_at_ms = now;
-            status.missing_since_ms = Some(now.saturating_sub(elapsed.as_millis() as u64));
-            status.countdown_seconds =
-                Some((remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0)).max(1));
-            status.bundle_path = Some(lease.bundle_path.clone());
-            status.bundle_relative_path = Some(lease.fingerprint.bundle_relative_path.clone());
-            status.managed_processes = lease.managed_processes.clone();
-            let _ = write_json_atomic(
-                &status_path().unwrap_or_else(|_| lease_file.with_file_name(STATUS_FILE_NAME)),
-                &status,
-            );
+            Err(failure) => {
+                let terminal_status = failure.terminal_status(decision.expired);
+                let mut status = base_status(
+                    terminal_status.unwrap_or("grace"),
+                    if terminal_status.is_some() {
+                        "not-running"
+                    } else {
+                        "running"
+                    },
+                );
+                match &failure {
+                    WatchdogFailure::Rejected(_) => {
+                        status.removable = true;
+                        status.signature_state = "invalid".to_string();
+                    }
+                    WatchdogFailure::Unverified(_) => status.signature_state = "unknown".to_string(),
+                    WatchdogFailure::Missing => {}
+                }
+                if !matches!(&failure, WatchdogFailure::Missing) {
+                    status.drive_root =
+                        last_bundle.as_deref().and_then(normalize_drive_root).or(last_drive);
+                }
+                status.missing_since_ms = decision
+                    .missing_since_ms
+                    .map(|since| now.saturating_sub(monotonic_now - since));
+                if !matches!(&failure, WatchdogFailure::Rejected(_)) {
+                    status.countdown_seconds = decision.countdown_seconds;
+                }
+                let reason = failure.reason();
+                status.codex_block_reason = Some(reason.clone());
+                status.message = if terminal_status.is_some() {
+                    format!("{reason}，正在停止受保护进程")
+                } else {
+                    format!("{reason}，正在重新检查")
+                };
+                (status, terminal_status.map(|_| failure))
+            }
+        };
+        status.last_checked_at_ms = now;
+        status.bundle_path = Some(last_bundle.as_deref().unwrap_or(&lease.bundle_path).to_string());
+        status.bundle_relative_path = Some(lease.fingerprint.bundle_relative_path.clone());
+        status.managed_processes = lease.managed_processes.clone();
+        let _ = write_json_atomic(&status_file, &status);
+        if let Some(failure) = terminal {
+            if !matches!(&failure, WatchdogFailure::Missing) {
+                let owner_pid = lease.owner_pid;
+                lease.managed_processes
+                    .retain(|process| process.pid != owner_pid && process.role != "manager");
+            }
+            let terminated = terminate_managed_processes_with_verified_codex(&lease, &verified_codex);
+            status.message = format!("{}（已结束 {terminated} 个受保护进程）", failure.reason());
+            let _ = write_json_atomic(&status_file, &status);
+            let _ = fs::remove_file(&lease_file);
+            let _ = fs::remove_file(atomic_file::backup_path(&lease_file));
+            break;
         }
         std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
     }
@@ -4694,6 +4961,11 @@ pub fn run_guard_cli() {
 #[cfg(target_os = "windows")]
 fn acquire_guard_lock() -> Result<File, AppError> {
     let path = lock_path()?;
+    acquire_guard_lock_at(&path, &local_guard_dir()?.join(GUARD_EXE_NAME))
+}
+
+#[cfg(target_os = "windows")]
+fn acquire_guard_lock_at(path: &Path, expected_exe: &Path) -> Result<File, AppError> {
     if let Ok(mut file) = OpenOptions::new().write(true).create_new(true).open(&path) {
         file.write_all(std::process::id().to_string().as_bytes())
             .map_err(|error| engine(format!("写入看门狗锁失败: {error}")))?;
@@ -4701,16 +4973,10 @@ fn acquire_guard_lock() -> Result<File, AppError> {
             .map_err(|error| engine(format!("刷新看门狗锁失败: {error}")))?;
         return Ok(file);
     }
-    // The lock stores the owning helper PID.  Never reclaim a lock while that
-    // process is alive; this prevents a second manager launch from starting a
-    // competing helper and both writing the same status file.
-    let stale = fs::read_to_string(&path)
-        .ok()
-        .and_then(|text| text.trim().parse::<u32>().ok())
-        .map(|pid| !process_matches(pid, None))
-        .unwrap_or(true);
-    if stale {
-        let _ = fs::remove_file(&path);
+    // Both manager refresh and helper acquisition use the same image identity.
+    if !guard_lock_owner_is_live(path, expected_exe)? {
+        fs::remove_file(path).map_err(|error| engine(format!("清理旧版看门狗锁失败: {error}")))?;
+        log::info!("USB guard stale lock reclaimed before helper acquisition");
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -4737,6 +5003,140 @@ pub fn guard_requested() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn one_native_snapshot_finds_current_process_without_duplicate_names() {
+        let exe = std::env::current_exe().unwrap();
+        let image = exe.file_name().unwrap().to_str().unwrap();
+        let start = std::time::Instant::now();
+        let pids = snapshot_usb_process_names(&[image, image, "nonexistent-usb-fixture.exe"]).unwrap();
+        assert_eq!(
+            pids.iter()
+                .filter(|&&pid| pid == std::process::id())
+                .count(),
+            1
+        );
+        println!("native Windows process snapshot: {:?}", start.elapsed());
+    }
+
+    #[test]
+    fn startup_failure_is_terminal_and_successful_restart_clears_it() {
+        let mut state = StartupIntegrity::Pending;
+        assert_eq!(state.visible_status().unwrap().status, "starting");
+        state.finish(&Err(engine("guard lock owner query denied")));
+        let failed = state.visible_status().unwrap();
+        assert_eq!(failed.status, "initialization-failed");
+        assert!(failed.message.contains("guard lock owner query denied"));
+        assert!(!failed.codex_allowed && !failed.signed && !failed.reinstall_allowed);
+        assert_eq!(failed.watchdog, "not-running");
+        assert!(!authorization_may_still_settle(&failed));
+        // The terminal in-memory result precedes any old authorized disk snapshot.
+        assert!(!matches!(state, StartupIntegrity::Pending));
+        state.finish(&Ok(base_status("authorized", "running")));
+        assert!(state.visible_status().is_none());
+    }
+
+    #[cfg(windows)]
+    struct GuardLockTestChild(std::process::Child);
+
+    #[cfg(windows)]
+    impl Drop for GuardLockTestChild {
+        fn drop(&mut self) {
+            // Only the child created by this test; never a PID read from a lock.
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn guard_lock_reused_by_unrelated_process_is_reclaimed_without_termination() {
+        let root = std::env::temp_dir().join(format!("codex-guard-reused-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let lock_path = root.join(LOCK_FILE_NAME);
+        let expected = root.join(GUARD_EXE_NAME);
+        let mut child = GuardLockTestChild(Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 60"])
+            .creation_flags(CREATE_NO_WINDOW).spawn().unwrap());
+        let pid = child.0.id().to_string();
+        fs::write(&lock_path, &pid).unwrap();
+        assert!(!guard_lock_owner_is_live(&lock_path, &expected).unwrap());
+        wait_for_guard_lock_release(&lock_path, &expected).unwrap();
+        assert!(!lock_path.exists());
+        assert!(child.0.try_wait().unwrap().is_none());
+        fs::write(&lock_path, &pid).unwrap();
+        let lock = acquire_guard_lock_at(&lock_path, &expected).unwrap();
+        assert_eq!(fs::read_to_string(&lock_path).unwrap(), std::process::id().to_string());
+        assert!(child.0.try_wait().unwrap().is_none());
+        drop(lock);
+        drop(child);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "child process fixture; launched by guard_lock_live_owner_is_preserved"]
+    fn guard_lock_child() {
+        let root = PathBuf::from(std::env::var_os("CODEX_GUARD_LOCK_TEST_DIR").expect("test directory"));
+        let _lock = acquire_guard_lock_at(&root.join(LOCK_FILE_NAME), &std::env::current_exe().unwrap()).unwrap();
+        fs::write(root.join("ready"), "ready").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !root.join("release").exists() {
+            assert!(std::time::Instant::now() < deadline, "parent did not release test helper");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn guard_lock_live_owner_is_preserved_then_reclaimed_after_exit() {
+        let root = std::env::temp_dir().join(format!("codex-guard-live-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let expected = root.join(GUARD_EXE_NAME);
+        fs::copy(std::env::current_exe().unwrap(), &expected).unwrap();
+        let mut child = GuardLockTestChild(Command::new(&expected)
+            .args(["--exact", "app::usb_guard::tests::guard_lock_child", "--ignored"])
+            .env("CODEX_GUARD_LOCK_TEST_DIR", &root)
+            .creation_flags(CREATE_NO_WINDOW).spawn().unwrap());
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while !root.join("ready").exists() {
+            assert!(child.0.try_wait().unwrap().is_none(), "test helper exited before acquiring lock");
+            assert!(std::time::Instant::now() < deadline, "test helper did not acquire lock");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let path = root.join(LOCK_FILE_NAME);
+        let original = fs::read(&path).unwrap();
+        assert!(guard_lock_owner_is_live(&path, &expected).unwrap());
+        // Even the same image name in a different directory is not the owner.
+        assert!(!guard_lock_owner_is_live(&path, &root.join("other").join(GUARD_EXE_NAME)).unwrap());
+        assert!(wait_for_guard_lock_release(&path, &expected).unwrap_err().to_string().contains("5 秒"));
+        assert!(acquire_guard_lock_at(&path, &expected).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(child.0.try_wait().unwrap().is_none());
+        fs::write(root.join("release"), "release").unwrap();
+        assert!(child.0.wait().unwrap().success());
+        assert!(!guard_lock_owner_is_live(&path, &expected).unwrap());
+        wait_for_guard_lock_release(&path, &expected).unwrap();
+        let lock = acquire_guard_lock_at(&path, &expected).unwrap();
+        drop(lock);
+        drop(child);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn guard_lock_unknown_owner_is_reported_without_reclaiming() {
+        let root = std::env::temp_dir().join(format!("codex-guard-unknown-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join(LOCK_FILE_NAME);
+        let expected = root.join(GUARD_EXE_NAME);
+        fs::write(&path, "unreadable-owner").unwrap();
+        assert!(wait_for_guard_lock_release(&path, &expected).is_err());
+        assert!(acquire_guard_lock_at(&path, &expected).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "unreadable-owner");
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn guard_artifacts_and_state_directory_use_the_diagnostic_namespace_only_in_diagnostic_builds()
@@ -5296,19 +5696,197 @@ mod tests {
     }
 
     #[test]
-    fn disconnect_state_has_five_second_boundary() {
-        let grace = next_disconnect_state(None, false, 10_000, 5_000);
-        assert_eq!(grace.countdown_seconds, Some(5));
+    fn disconnect_state_has_sixty_second_boundary() {
+        let start = 10_000;
+        let grace = next_disconnect_state(None, false, start, DISCONNECT_GRACE_MS);
+        assert_eq!(grace.countdown_seconds, Some(60));
         assert!(!grace.expired);
-        let grace_late = next_disconnect_state(grace.missing_since_ms, false, 14_999, 5_000);
+        let grace_late = next_disconnect_state(
+            grace.missing_since_ms,
+            false,
+            start + 59_999,
+            DISCONNECT_GRACE_MS,
+        );
         assert_eq!(grace_late.countdown_seconds, Some(1));
-        let expired = next_disconnect_state(grace.missing_since_ms, false, 15_000, 5_000);
+        assert!(!grace_late.expired);
+        let expired = next_disconnect_state(
+            grace.missing_since_ms,
+            false,
+            start + 60_000,
+            DISCONNECT_GRACE_MS,
+        );
         assert!(expired.expired);
         assert_eq!(expired.countdown_seconds, Some(0));
         assert_eq!(
-            next_disconnect_state(expired.missing_since_ms, true, 15_001, 5_000).missing_since_ms,
+            next_disconnect_state(grace.missing_since_ms, true, start + 59_999, DISCONNECT_GRACE_MS)
+                .missing_since_ms,
             None
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn watchdog_distinguishes_unreadable_volume_from_missing_or_reassigned_drive() {
+        use windows_sys::Win32::System::WindowsProgramming::{
+            DRIVE_FIXED, DRIVE_NO_ROOT_DIR, DRIVE_REMOVABLE,
+        };
+
+        let fingerprint = UsbFingerprint {
+            volume_serial: 7,
+            anchor_sha256: "b".repeat(64),
+            bundle_relative_path: "codex".to_string(),
+            anchor_schema: ANCHOR_SCHEMA_V1,
+        };
+        let bit = |letter: u8| 1_u32 << (letter - b'A');
+        let observe = |path: &Path| {
+            let root = normalize_drive_root(&path.to_string_lossy()).unwrap();
+            Ok(UsbObservation {
+                removable: true,
+                drive_root: Some(root),
+                bundle_path: path.to_string_lossy().into_owned(),
+                fingerprint: Some(fingerprint.clone()),
+            })
+        };
+        let old_drive = Some(r"F:\");
+
+        let failed = scan_mounted_removable(
+            bit(b'F'),
+            &fingerprint,
+            old_drive,
+            |_| DRIVE_REMOVABLE,
+            |_| Err(engine("读取 U 盘卷序列号失败: os error 21")),
+        )
+        .unwrap_err();
+        assert!(failed.to_string().contains("os error 21"));
+        assert!(scan_mounted_removable(
+            bit(b'F'),
+            &fingerprint,
+            old_drive,
+            |_| DRIVE_NO_ROOT_DIR,
+            |_| panic!("drive without a root should not be read"),
+        )
+        .is_err());
+        assert!(scan_mounted_removable(
+            bit(b'C'),
+            &fingerprint,
+            old_drive,
+            |_| DRIVE_FIXED,
+            |_| panic!("fixed drive should not be read"),
+        )
+        .unwrap()
+        .is_none());
+        let moved = scan_mounted_removable(
+            bit(b'F') | bit(b'G'),
+            &fingerprint,
+            old_drive,
+            |root| {
+                if Some(root) == old_drive {
+                    DRIVE_NO_ROOT_DIR
+                } else {
+                    DRIVE_REMOVABLE
+                }
+            },
+            observe,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(moved.drive_root.as_deref(), Some(r"G:\"));
+        assert!(scan_mounted_removable(
+            bit(b'F') | bit(b'G'),
+            &fingerprint,
+            old_drive,
+            |_| DRIVE_REMOVABLE,
+            observe,
+        )
+        .is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn watchdog_license_sharing_violation_uses_bounded_grace() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let root = std::env::temp_dir().join(format!("codex-watchdog-license-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let path = license_path(&root);
+        let fingerprint = UsbFingerprint {
+            volume_serial: 7,
+            anchor_sha256: "b".repeat(64),
+            bundle_relative_path: "codex".to_string(),
+            anchor_schema: ANCHOR_SCHEMA_V1,
+        };
+        let signing = SigningKey::from_bytes(&[11; 32]);
+        let mut license = new_unsigned_license(fingerprint.clone());
+        license.key_id = Some("watchdog-test".to_string());
+        let payload = unsigned_license_payload(&license).unwrap();
+        license.signature = Some(B64.encode(signing.sign(&payload).to_bytes()));
+        let bytes = serde_json::to_vec(&license).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        let observation = UsbObservation {
+            removable: true,
+            drive_root: None,
+            bundle_path: root.to_string_lossy().into_owned(),
+            fingerprint: Some(fingerprint.clone()),
+        };
+        let lease = UsbLease {
+            schema_version: LEASE_SCHEMA_VERSION,
+            product: PRODUCT_ID.to_string(),
+            lease_id: "test".to_string(),
+            bundle_path: observation.bundle_path.clone(),
+            fingerprint,
+            installation_id: Some(license.installation_id.clone()),
+            key_id: license.key_id.clone(),
+            license_digest: Some(license_digest_from_bytes(&bytes)),
+            owner_pid: std::process::id(),
+            managed_processes: vec![],
+            issued_at: "test".to_string(),
+        };
+        let public = B64.encode(signing.verifying_key().to_bytes());
+        with_test_license_public_key("watchdog-test", &public, || {
+            assert!(check_watchdog_license(&lease, &observation).unwrap());
+            let lock = OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&path)
+                .unwrap();
+            let failure = check_watchdog_license(&lease, &observation).unwrap_err();
+            assert!(matches!(&failure, WatchdogFailure::Unverified(_)));
+            assert!(failure.reason().contains("os error 32"));
+            let grace = next_disconnect_state(None, false, 0, DISCONNECT_GRACE_MS);
+            assert_eq!(failure.terminal_status(grace.expired), None);
+            let expired = next_disconnect_state(
+                grace.missing_since_ms,
+                false,
+                DISCONNECT_GRACE_MS,
+                DISCONNECT_GRACE_MS,
+            );
+            assert_eq!(failure.terminal_status(expired.expired), Some("stopped"));
+            assert_eq!(WatchdogFailure::Missing.terminal_status(grace.expired), None);
+            assert_eq!(WatchdogFailure::Missing.terminal_status(expired.expired), Some("missing"));
+
+            drop(lock);
+            let reverified = check_watchdog_license(&lease, &observation);
+            assert!(reverified.as_ref().is_ok_and(|signed| *signed));
+            let recovered = next_disconnect_state(
+                grace.missing_since_ms,
+                reverified.is_ok(),
+                55_000,
+                DISCONNECT_GRACE_MS,
+            );
+            assert_eq!(recovered.missing_since_ms, None);
+            assert!(!recovered.expired);
+
+            fs::write(&path, serde_json::to_vec_pretty(&license).unwrap()).unwrap();
+            let changed_snapshot = check_watchdog_license(&lease, &observation).unwrap_err();
+            assert_eq!(changed_snapshot.terminal_status(false), Some("mismatch"));
+            assert!(changed_snapshot.reason().contains("usb_toctou_changed"));
+            fs::remove_file(&path).unwrap();
+            let missing_file = check_watchdog_license(&lease, &observation).unwrap_err();
+            assert_eq!(missing_file.terminal_status(false), Some("mismatch"));
+            fs::remove_dir(&root).unwrap();
+            let missing_path = check_watchdog_license(&lease, &observation).unwrap_err();
+            assert!(matches!(missing_path, WatchdogFailure::Unverified(_)));
+        });
     }
 
     #[test]
@@ -5667,7 +6245,16 @@ mod tests {
             issued_at: "test".to_string(),
         };
 
-        assert_eq!(terminate_managed_processes(&lease), 1);
+        let mut verified = Vec::new();
+        retain_verified_usb_codex_processes(&bundle_root, &lease.managed_processes, &mut verified);
+        assert_eq!(verified.len(), 1);
+        let detached = UsbLease {
+            bundle_path: temp.join("detached").to_string_lossy().into_owned(),
+            ..lease.clone()
+        };
+        assert_eq!(terminate_managed_processes(&detached), 0);
+        assert!(test_process_is_running(target_pid));
+        assert_eq!(terminate_managed_processes_with_verified_codex(&detached, &verified), 1);
         assert!(!test_process_is_running(target_pid));
         assert!(test_process_is_running(unrelated_pid));
         assert!(test_process_is_running(descendant_pid));

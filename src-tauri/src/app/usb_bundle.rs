@@ -87,7 +87,7 @@ pub struct BundleIntegrityReport {
     pub payload_sha256: String,
 }
 
-type VerifiedFileLedger = HashMap<String, (String, u64)>;
+type FileMetadataLedger = HashMap<String, (String, u64)>;
 
 /// The release tree has two independent trust boundaries.  The USB license
 /// and SHA-256 anchor protect product-owned files, while Authenticode is used
@@ -95,7 +95,8 @@ type VerifiedFileLedger = HashMap<String, (String, u64)>;
 /// license cannot accidentally be treated as a requirement for certificates
 /// on every product-owned executable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BundleVerificationMode {
+enum BundleVerificationMode {
+    InstalledLaunch,
     HashOnly,
     InternalSigned,
     StrictAuthenticode,
@@ -431,7 +432,7 @@ fn verify_sums(
     root: &Path,
     payload_relative: &str,
     allow_missing_targets: Option<&HashSet<String>>,
-) -> Result<(usize, String, VerifiedFileLedger), AppError> {
+) -> Result<(usize, String, FileMetadataLedger), AppError> {
     let text = read_sums_text(root)?;
     verify_sums_from_text(root, payload_relative, allow_missing_targets, &text, None)
 }
@@ -442,9 +443,60 @@ fn verify_sums_from_text(
     allow_missing_targets: Option<&HashSet<String>>,
     text: &str,
     metadata_snapshot: Option<(&[u8], &[u8])>,
-) -> Result<(usize, String, VerifiedFileLedger), AppError> {
+) -> Result<(usize, String, FileMetadataLedger), AppError> {
+    verify_sum_rows(root, payload_relative, allow_missing_targets, text, metadata_snapshot, false)
+}
+
+// These exact deployment inputs have a separate content check before use.
+// Keep all unknown files, package descriptors, scripts and live executables in scope.
+fn install_only_input(relative: &str, payload_relative: &str) -> bool {
+    if relative == payload_relative
+        && matches!(
+            relative,
+            "payload/OpenAI.Codex_x64.msix" | "payload/OpenAI.Codex_arm64.msix"
+        )
+    {
+        return true;
+    }
+    if matches!(
+        relative,
+        "resources/prerequisites/vc_redist.x64.exe"
+            | "resources/prerequisites/MicrosoftEdgeWebView2RuntimeInstallerX64.exe"
+    ) {
+        return true;
+    }
+    // The wheelhouse consumer checks each wheel against its manifest and then
+    // invokes pip with a locked requirement list and --require-hashes.
+    if let Some(name) =
+        relative.strip_prefix("content/codex-starter-kit/runtime/bundled/python-wheels/")
+    {
+        return !name.contains('/') && name.ends_with(".whl");
+    }
+    matches!(
+        relative.strip_prefix("content/codex-starter-kit/runtime/bundled/"),
+        Some(
+            "chrome-headless-shell-152.0.7977.30-win64.zip"
+                | "ffmpeg-n9.0-latest-win64-gpl-shared-9.0.zip"
+                | "ffmpeg-n9.0-latest-win64-lgpl-shared-9.0.zip"
+                | "hyperframes-0.8.134-win-x64-node-modules.zip"
+                | "node-v22.22.0-win-x64.zip"
+                | "feishu-node-modules.zip"
+                | "python-3.12.10-amd64.exe"
+        )
+    )
+}
+
+fn verify_sum_rows(
+    root: &Path,
+    payload_relative: &str,
+    allow_missing_targets: Option<&HashSet<String>>,
+    text: &str,
+    metadata_snapshot: Option<(&[u8], &[u8])>,
+    installed_launch: bool,
+) -> Result<(usize, String, FileMetadataLedger), AppError> {
+    let mut deferred = 0usize;
     let mut listed = HashSet::<String>::new();
-    let mut ledger = VerifiedFileLedger::new();
+    let mut ledger = FileMetadataLedger::new();
     let mut payload_sha = None;
     let mut atomic_temp_count = 0usize;
     for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
@@ -501,7 +553,13 @@ fn verify_sums_from_text(
             expected.to_ascii_lowercase()
         } else {
             let path = listed_path(root, &relative)?;
-            sha256_file(&path)?
+            if installed_launch && install_only_input(&relative, payload_relative) {
+                deferred += 1;
+                // Compare signed manifest declarations below, not a claimed content verification.
+                expected.to_ascii_lowercase()
+            } else {
+                sha256_file(&path)?
+            }
         };
         if !actual.eq_ignore_ascii_case(expected) {
             return Err(bundle_error(format!("SHA 不匹配：{relative}")));
@@ -577,7 +635,7 @@ fn verify_sums_from_text(
         }
     }
     Ok((
-        listed.len(),
+        listed.len() - deferred,
         payload_sha.ok_or_else(|| bundle_error("SHA 清单中没有 MSIX 载荷"))?,
         ledger,
     ))
@@ -963,7 +1021,7 @@ fn hash_and_size(path: &Path) -> Result<(String, u64), AppError> {
 #[allow(clippy::too_many_arguments)]
 fn verify_file_metadata(
     root: &Path,
-    ledger: &VerifiedFileLedger,
+    ledger: &FileMetadataLedger,
     object: &serde_json::Value,
     label: &str,
     file_pointer: &str,
@@ -1001,7 +1059,7 @@ fn verify_cross_file_metadata(
     _payload_path: &Path,
     payload_relative: &str,
     payload_sha256: &str,
-    ledger: &VerifiedFileLedger,
+    ledger: &FileMetadataLedger,
     allow_missing_payload: bool,
 ) -> Result<(), AppError> {
     let document_schema = required_u64(manifest, "/schemaVersion")?;
@@ -1307,12 +1365,13 @@ fn verify_bundle_integrity_mode(
     let checksum_bytes = read_bounded_file(&root.join(SUMS_FILE), MAX_SHA_SUMS_BYTES, SUMS_FILE)?;
     let checksum_text = String::from_utf8(checksum_bytes.clone())
         .map_err(|error| bundle_error(format!("{SUMS_FILE} 不是 UTF-8：{error}")))?;
-    let (files_verified, payload_sha256, ledger) = verify_sums_from_text(
+    let (files_verified, payload_sha256, ledger) = verify_sum_rows(
         root,
         &payload_relative,
         None,
         &checksum_text,
         Some((&manifest_bytes, &usb_manifest_bytes)),
+        mode == BundleVerificationMode::InstalledLaunch,
     )?;
     verify_cross_file_metadata(
         root,
@@ -1325,6 +1384,13 @@ fn verify_bundle_integrity_mode(
         false,
     )?;
     match mode {
+        BundleVerificationMode::InstalledLaunch => {
+            verify_formal_signing_binding(&usb_manifest)?;
+            // A legacy/nonstandard payload remains subject to its publisher check.
+            if !install_only_input(&payload_relative, &payload_relative) {
+                verify_external_authenticode(root, &payload_path)?;
+            }
+        }
         BundleVerificationMode::HashOnly => {}
         BundleVerificationMode::InternalSigned => {
             verify_formal_signing_binding(&usb_manifest)?;
@@ -1564,6 +1630,13 @@ pub fn verify_signed_internal_bundle(root: &Path) -> Result<BundleIntegrityRepor
     verify_bundle_integrity_mode(root, BundleVerificationMode::InternalSigned)
 }
 
+/// Return only the fields consumed by launch. A scoped check is never a full release report.
+pub(super) fn verify_installed_launch(root: &Path) -> Result<(String, bool), AppError> {
+    let report = verify_bundle_integrity_mode(root, BundleVerificationMode::InstalledLaunch)?;
+    Ok((report.anchor_sha256, report.direct_entry_required))
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1724,6 +1797,80 @@ mod tests {
         assert!(error.to_string().contains("unowned-runtime.bin"));
 
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn installed_open_defers_only_audited_deployment_inputs() {
+        let root = std::env::temp_dir().join(format!("usb-open-{}", uuid::Uuid::new_v4()));
+        let payload = "payload/OpenAI.Codex_x64.msix";
+        let browser =
+            "content/codex-starter-kit/runtime/bundled/chrome-headless-shell-152.0.7977.30-win64.zip";
+        let unknown = "content/codex-starter-kit/runtime/bundled/unknown.zip";
+        let mut rows = String::new();
+        for name in [payload, browser, unknown, "CodexEntryShim.exe"] {
+            let path = root.join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, b"valid input").unwrap();
+            rows.push_str(&format!("{}  {name}\n", sha256_file(&path).unwrap()));
+        }
+        assert!(install_only_input(
+            "content/codex-starter-kit/runtime/bundled/python-wheels/a.whl",
+            payload
+        ));
+        assert!(!install_only_input(
+            "content/codex-starter-kit/runtime/bundled/python-wheels/sub/a.whl",
+            payload
+        ));
+        assert!(!install_only_input(
+            "content/codex-starter-kit/runtime/bundled/python-wheels/check.ps1",
+            payload
+        ));
+        assert!(!install_only_input(
+            "content/codex-starter-kit/runtime/bundled/product-design-dependencies-win-x64.zip",
+            payload
+        ));
+        let check = |launch| verify_sum_rows(&root, payload, None, &rows, None, launch);
+        assert_eq!(check(false).unwrap().0, 4);
+        for name in [payload, browser] {
+            fs::write(root.join(name), b"bad content").unwrap();
+            assert_eq!(check(true).unwrap().0, 2);
+            assert!(check(false).unwrap_err().to_string().contains(name));
+            fs::write(root.join(name), b"valid input").unwrap();
+        }
+        for name in [unknown, "CodexEntryShim.exe"] {
+            fs::write(root.join(name), b"bad content").unwrap();
+            assert!(check(true).unwrap_err().to_string().contains(name));
+            fs::write(root.join(name), b"valid input").unwrap();
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "reads every file in a release fixture"]
+    fn release_open_matches_full_metadata_with_fewer_content_reads() {
+        let root = PathBuf::from(std::env::var_os("USB_OPEN_TEST_BUNDLE").unwrap());
+        let rows = read_sums_text(&root).unwrap();
+        let payload = "payload/OpenAI.Codex_x64.msix";
+        let start = std::time::Instant::now();
+        let full = verify_sum_rows(&root, payload, None, &rows, None, false).unwrap();
+        let full_elapsed = start.elapsed();
+        let start = std::time::Instant::now();
+        let open = verify_sum_rows(&root, payload, None, &rows, None, true).unwrap();
+        assert_eq!(full.1, open.1);
+        assert_eq!(full.2, open.2);
+        let deferred: Vec<_> = full
+            .2
+            .iter()
+            .filter(|(name, _)| install_only_input(name, payload))
+            .collect();
+        assert_eq!(full.0 - open.0, deferred.len());
+        println!(
+            "release rows full={} open={} deferred_bytes={} full={full_elapsed:?} open={:?}",
+            full.0,
+            open.0,
+            deferred.iter().map(|(_, entry)| entry.1).sum::<u64>(),
+            start.elapsed()
+        );
     }
 
     #[test]

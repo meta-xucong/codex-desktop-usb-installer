@@ -125,7 +125,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 双击 `Install-Codex-Starter.cmd` 会打开 Windows 图形向导。向导根据
 [`manifest/connection-fields.json`](manifest/connection-fields.json)、[`manifest/mcp-servers.json`](manifest/mcp-servers.json)
 和 [`manifest/api-services.json`](manifest/api-services.json) 动态列出 6 个 MCP 与 1 个直连 API 的配置项，共 14 个连接字段。
-飞书、DashScope 和远程服务默认等待用户连接；U 盘版统一媒体 MCP 默认启用，设备 Key 和 404token 端点由签名 License 在 Codex 启动时提供，不要求用户输入或写入 Windows 用户环境变量。启用其他服务时，填写其必需字段；密钥输入框会遮罩，Codex 配置只保存环境变量名。留空的密钥会沿用已有的本机用户环境变量（若存在），不会在界面或日志中显示。
+U 盘版的飞书 MCP 默认启用，首次安装时 App ID 和 App Secret 留空。打开管理器的「连接与扩展 → 飞书」，或在 Codex 会话说「连接飞书」，即可进入同一个本机表单。默认租户认证只需填写这两项，点「保存飞书连接」后即可回到当前会话使用。App Secret 在遮罩输入框填写，凭据保存在当前 Windows 用户的本机环境设置中。DashScope 和远程服务等待单独连接。U 盘版统一媒体 MCP 默认启用，设备 Key 和 404token 端点由签名 License 在 Codex 启动时提供。
 向导中的“清理本机已有环境变量”默认关闭；即使明确勾选，也只会清理本安装器此前记录为自己写入的变量名，不会碰其他程序或用户手工配置。
 
 无界面部署或自动化测试仍可直接调用 `install-all.ps1`；设置 `CODEX_STARTER_NONINTERACTIVE=1`，或给 `.cmd` 传入参数，
@@ -168,10 +168,7 @@ Skill 或全局 `AGENTS.md`。它会校验 `file-manifest.json` 与 `checksums.s
 .\scripts\render-codex-config.ps1 -OutputPath .\codex-starter.fragment.toml
 ```
 
-启用飞书前，需在启动 Codex 的进程环境中提供 `FEISHU_APP_ID`、`FEISHU_APP_SECRET`，准备锁定的本地包 cache，
-并给渲染器传 `-EnableFeishu`。配置只保存环境变量名，不保存值；但官方 CLI 最终仍以子进程参数接收 Secret，
-本机高权限进程检查可能观察到它。当前官方实现不支持文件上传、下载和直接编辑云文档正文。没有健康检查通过时，
-Agent 只能输出配置步骤或无连接降级结果，不能声称已经访问外部服务。
+手动渲染租户模式的飞书 MCP 时，准备锁定的本地包 cache，并向渲染器传 `-EnableFeishu`。运行中的租户 MCP 在调用工具时读取本机保存的凭据，配置只引用环境变量名。高级 user 和 OAuth 模式沿用官方 CLI 的启动配置，需要进程环境中的凭据，修改认证模式后重新打开 Codex。云文档正文支持读取，云盘和 Wiki 操作以随包工具清单与应用权限为准。
 
 ## 构建和验收
 

@@ -14,12 +14,11 @@ import { Tooltip } from "../components";
 
 type ApiServiceId = "dashscope-web-search";
 type RemoteMcpId = "cloudflare" | "figma" | "linear" | "notion";
-type ServiceId = "feishu" | "media-generation" | ApiServiceId | RemoteMcpId;
+type ServiceId = "media-generation" | ApiServiceId | RemoteMcpId;
 export type OfflineComponentsView = "connections" | "maintenance";
-type FormValues = Omit<CapabilityPackInstallOptions, "enabledApiServices" | "enabledRemoteMcps" | "enableMediaGeneration">;
+type FormValues = Omit<CapabilityPackInstallOptions, "enabledApiServices" | "enabledRemoteMcps" | "enableMediaGeneration" | "enableFeishu" | "feishuAction">;
 
 const EMPTY_FORM: FormValues = {
-  enableFeishu: false,
   persistConnections: true,
   feishuAppId: "",
   feishuAppSecret: "",
@@ -74,7 +73,6 @@ export function OfflineComponentsSheet({
   const bodyId = useId();
   const [form, setForm] = useState<FormValues>(EMPTY_FORM);
   const [enabled, setEnabled] = useState<Record<ServiceId, boolean>>({
-    feishu: false,
     "media-generation": true,
     "dashscope-web-search": false,
     cloudflare: false,
@@ -82,13 +80,16 @@ export function OfflineComponentsSheet({
     linear: false,
     notion: false,
   });
-  const [busy, setBusy] = useState<"pack" | "ccswitch" | null>(null);
+  const [busy, setBusy] = useState<"pack" | "ccswitch" | "feishu" | null>(null);
   const [statusLoading, setStatusLoading] = useState(false);
   const [mediaCatalogLoading, setMediaCatalogLoading] = useState(false);
   const [mediaCatalogError, setMediaCatalogError] = useState<string | null>(null);
   const [maintenanceSettingsLoading, setMaintenanceSettingsLoading] = useState(false);
   const [maintenanceSettingsError, setMaintenanceSettingsError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [feishuError, setFeishuError] = useState<string | null>(null);
+  const [feishuNotice, setFeishuNotice] = useState<string | null>(null);
+  const [otherConnectionsOpened, setOtherConnectionsOpened] = useState(false);
   const [packReport, setPackReport] = useState<CapabilityPackReport | null>(null);
   const [ccswitchReport, setCcswitchReport] = useState<CcswitchLaunchReport | null>(null);
   const statusRequestRef = useRef(0);
@@ -100,6 +101,10 @@ export function OfflineComponentsSheet({
     if (!open) {
       statusRequestRef.current += 1;
       setStatusLoading(false);
+      setOtherConnectionsOpened(false);
+      setFeishuError(null);
+      setFeishuNotice(null);
+      setForm((current) => ({ ...current, feishuAppSecret: "", feishuUserAccessToken: "" }));
       return;
     }
     const requestId = statusRequestRef.current + 1;
@@ -224,7 +229,7 @@ export function OfflineComponentsSheet({
   const mediaGenerationEnabled = enabled["media-generation"];
 
   useEffect(() => {
-    if (!open || view !== "connections" || !mediaGenerationEnabled) {
+    if (!open || view !== "connections" || !otherConnectionsOpened || !mediaGenerationEnabled) {
       mediaCatalogRequestRef.current += 1;
       setMediaCatalogLoading(false);
       return;
@@ -233,11 +238,16 @@ export function OfflineComponentsSheet({
     return () => {
       mediaCatalogRequestRef.current += 1;
     };
-  }, [open, view, mediaGenerationEnabled, refreshMediaModels]);
+  }, [open, view, otherConnectionsOpened, mediaGenerationEnabled, refreshMediaModels]);
 
   const update = <K extends keyof FormValues>(key: K, value: FormValues[K]) => {
     setForm((current) => ({ ...current, [key]: value }));
-    setError(null);
+    if (key.startsWith("feishu")) {
+      setFeishuError(null);
+      setFeishuNotice(null);
+    } else {
+      setError(null);
+    }
   };
 
   const toggleService = (service: ServiceId) => {
@@ -256,12 +266,6 @@ export function OfflineComponentsSheet({
   const validate = (): string | null => {
     if (view === "maintenance" && maintenanceSettingsError) {
       return t("offline.components.maintenanceSettingsUnavailable");
-    }
-    if (enabled.feishu && (!form.feishuAppId.trim() || !form.feishuAppSecret.trim())) {
-      return t("offline.components.validationFeishu");
-    }
-    if (enabled.feishu && form.feishuAuthMode === "user" && !form.feishuUserAccessToken.trim()) {
-      return t("offline.components.validationFeishuUser");
     }
     if (
       enabled["dashscope-web-search"] &&
@@ -297,7 +301,11 @@ export function OfflineComponentsSheet({
         // media route fields in the request for config rendering, while
         // explicitly preventing credential persistence/clearing.
         persistConnections: view === "connections" && form.persistConnections,
-        enableFeishu: enabled.feishu,
+        enableFeishu: false,
+        feishuAction: "preserve",
+        feishuAppId: "",
+        feishuAppSecret: "",
+        feishuUserAccessToken: "",
         enableMediaGeneration: enabled["media-generation"],
         enabledApiServices: API_SERVICE_KEYS.filter((service) => enabled[service]),
         enabledRemoteMcps: REMOTE_MCP_KEYS.filter((server) => enabled[server]),
@@ -306,6 +314,50 @@ export function OfflineComponentsSheet({
       if (!report.coreReady) setError(report.message);
     } catch (cause) {
       setError(errorMessage(cause));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const applyFeishu = async (enable: boolean) => {
+    if (busy !== null) return;
+    if (enable && (!form.feishuAppId.trim() || !form.feishuAppSecret.trim())) {
+      setFeishuError(t("offline.components.validationFeishu"));
+      return;
+    }
+    if (enable && form.feishuAuthMode === "user" && !form.feishuUserAccessToken.trim()) {
+      setFeishuError(t("offline.components.validationFeishuUser"));
+      return;
+    }
+    statusRequestRef.current += 1;
+    setStatusLoading(false);
+    setBusy("feishu");
+    setFeishuError(null);
+    setFeishuNotice(null);
+    try {
+      const report = await managerApi.installCapabilityPack({
+        ...EMPTY_FORM,
+        enableFeishu: enable,
+        feishuAction: "apply",
+        feishuAppId: enable ? form.feishuAppId.trim() : "",
+        feishuAppSecret: enable ? form.feishuAppSecret.trim() : "",
+        feishuUserAccessToken: enable ? form.feishuUserAccessToken.trim() : "",
+        feishuAuthMode: form.feishuAuthMode,
+        feishuDomain: form.feishuDomain.trim(),
+        enabledApiServices: [],
+        enabledRemoteMcps: [],
+        enableMediaGeneration: true,
+      });
+      setPackReport(report);
+      if (report.feishuEnabled !== enable || (enable && (!report.feishuConfigured || report.feishuRuntimeStatus !== "passed"))) {
+        setFeishuError(t("offline.components.feishuApplyFailed"));
+        return;
+      }
+      setForm((current) => ({ ...current, feishuAppSecret: "", feishuUserAccessToken: "" }));
+      setFeishuNotice(t(!enable ? "offline.components.feishuDisabled"
+        : report.feishuSavedLive ? "offline.components.feishuSavedLive" : "offline.components.feishuConfigured"));
+    } catch (cause) {
+      setFeishuError(errorMessage(cause).replace(/^update engine error:\s*/i, ""));
     } finally {
       setBusy(null);
     }
@@ -348,6 +400,42 @@ export function OfflineComponentsSheet({
     </label>
   );
 
+  const packResult = packReport ? (
+    <div className={`component-result${packReport.coreReady ? " success" : ""}`}>
+      <strong>
+        {packReport.coreReady
+          ? packReport.success
+            ? t("offline.components.ready")
+            : configNeedsAttention(packReport)
+              ? t("offline.components.configConflict")
+              : t("offline.components.partial")
+          : t("offline.components.notReady")}
+      </strong>
+      <span>{packReport.message}</span>
+      {packReport.codexRestartRequired ||
+      packReport.mediaProtocolStatus !== "not-checked" ||
+      packReport.mediaGatewayCatalogStatus !== "not-checked" ? (
+        <small role="status">
+          {t("offline.components.mediaReadiness", {
+            protocol: t(packReport.mediaProtocolStatus === "passed" ? "offline.components.statusPassed" : "offline.components.statusNotChecked"),
+            catalog: t(packReport.mediaGatewayCatalogStatus === "verified" ? "offline.components.statusPassed" : packReport.mediaGatewayCatalogStatus === "failed" ? "offline.components.statusFailed" : "offline.components.statusNotChecked"),
+            restart: packReport.codexRestartRequired && packReport.codexRunning
+              ? t("offline.components.restartRunning")
+              : "",
+          })}
+        </small>
+      ) : null}
+      {packReport.skills > 0 ? (
+        <small>
+          {t("offline.components.counts", {
+            skills: packReport.skills,
+            agents: packReport.agents,
+          })}
+        </small>
+      ) : null}
+    </div>
+  ) : null;
+
   return (
     <Sheet
       open={open}
@@ -360,7 +448,7 @@ export function OfflineComponentsSheet({
       initialFocus="dismiss"
       centeredInExpanded
     >
-      <div className="component-sheet">
+      <div className={`component-sheet${view === "connections" ? " component-connections" : ""}`}>
         <div className="component-sheet-heading">
           <Icon name="sliders" />
           <h3 id={titleId}>
@@ -368,67 +456,70 @@ export function OfflineComponentsSheet({
               ? t("offline.components.title")
               : t("offline.components.repairEntry")}
           </h3>
-          <Tooltip
-            content={`${t("offline.components.body")}\n\n${t("offline.components.skipNote")}`}
-            side="bottom"
-          >
-            <span className="tooltip-icon" aria-label={t("themes.details")}>
-              <Icon name="info" />
-            </span>
-          </Tooltip>
+          {view === "connections" ? (
+            <button className="btn ghost component-sheet-close" type="button" onClick={onDismiss} disabled={busy !== null}>
+              {t("offline.components.close")}
+            </button>
+          ) : null}
         </div>
         <span id={bodyId} className="sr-only">
-          {t("offline.components.body")} {t("offline.components.skipNote")}
+          {t(view === "connections" ? "offline.components.feishuPrivacy" : "offline.components.maintenanceBody")}
         </span>
 
         {view === "connections" ? (
-          <div className="component-service-list">
-          <section className="component-service">
-            <div className="component-service-toggle">
-              <input
-                id="component-feishu-enabled"
-                type="checkbox"
-                checked={enabled.feishu}
-                onChange={() => toggleService("feishu")}
-                disabled={busy !== null}
-              />
-              <label
-                className="component-service-toggle-label"
-                htmlFor="component-feishu-enabled"
-                aria-label={t("offline.components.feishu")}
-              >
-                <span>
-                  <strong>{t("offline.components.feishu")}</strong>
-                </span>
-              </label>
-              <Tooltip content={t("offline.components.feishuDesc")}>
-                <span className="tooltip-icon" aria-label={t("themes.details")}>
-                  <Icon name="info" />
-                </span>
-              </Tooltip>
+          <>
+          <form className="component-feishu" onSubmit={(event) => { event.preventDefault(); void applyFeishu(true); }}>
+            <h4>{t("offline.components.feishu")}</h4>
+            <p className="component-note" role="status">
+              {feishuNotice ?? t(packReport?.feishuRuntimeStatus === "install-failed"
+                ? "offline.components.feishuRuntimeFailed"
+                : packReport?.feishuEnabled
+                  ? packReport.feishuConfigured ? "offline.components.feishuEnabled" : "offline.components.feishuPending"
+                  : packReport?.feishuRuntimeStatus === "passed"
+                    ? "offline.components.feishuAwaitingCredentials"
+                    : "offline.components.feishuSetupHint")}
+            </p>
+            <div className="component-feishu-fields">
+              {field("feishuAppId", t("offline.components.feishuAppId"), false, "cli_…")}
+              {field("feishuAppSecret", t("offline.components.feishuAppSecret"), true)}
+              <small className="component-note">{t("offline.components.feishuPrivacy")}</small>
+              {feishuError ? <div className="component-error" role="alert">{feishuError}</div> : null}
+              <button className="btn primary" type="submit"
+                disabled={busy !== null || !form.feishuAppId.trim() || !form.feishuAppSecret.trim()}>
+                {t(busy === "feishu" ? "offline.components.feishuApplying" : "offline.components.feishuSave")}
+              </button>
+              <details className="component-advanced">
+                <summary>{t("offline.components.feishuAdvanced")}</summary>
+                <div className="component-advanced-fields">
+                  <label className="component-field">
+                    <span>{t("offline.components.feishuAuthMode")}</span>
+                    <select
+                      className="input"
+                      value={form.feishuAuthMode}
+                      onChange={(event) => update("feishuAuthMode", event.target.value)}
+                      disabled={busy !== null}
+                    >
+                      <option value="tenant">tenant</option>
+                      <option value="user">user</option>
+                      <option value="oauth">oauth</option>
+                    </select>
+                  </label>
+                  {form.feishuAuthMode === "user" ? field("feishuUserAccessToken", t("offline.components.feishuToken"), true) : null}
+                  {field("feishuDomain", t("offline.components.feishuDomain"))}
+                  {packReport?.feishuEnabled ? (
+                    <button className="btn ghost" type="button" onClick={() => void applyFeishu(false)} disabled={busy !== null || statusLoading}>
+                      {t("offline.components.feishuDisable")}
+                    </button>
+                  ) : null}
+                </div>
+              </details>
             </div>
-            {enabled.feishu ? (
-              <div className="component-fields">
-                {field("feishuAppId", t("offline.components.feishuAppId"))}
-                {field("feishuAppSecret", t("offline.components.feishuAppSecret"), true)}
-                <label className="component-field">
-                  <span>{t("offline.components.feishuAuthMode")}</span>
-                  <select
-                    className="input"
-                    value={form.feishuAuthMode}
-                    onChange={(event) => update("feishuAuthMode", event.target.value)}
-                    disabled={busy !== null}
-                  >
-                    <option value="tenant">tenant</option>
-                    <option value="user">user</option>
-                    <option value="oauth">oauth</option>
-                  </select>
-                </label>
-                {field("feishuUserAccessToken", t("offline.components.feishuToken"), true)}
-                {field("feishuDomain", t("offline.components.feishuDomain"))}
-              </div>
-            ) : null}
-          </section>
+          </form>
+          <details className="component-other-connections"
+            onToggle={(event) => { if (event.currentTarget.open) setOtherConnectionsOpened(true); }}>
+          <summary>{t("offline.components.otherConnections")}</summary>
+          {otherConnectionsOpened ? (
+          <div className="component-service-list">
           <section className="component-service">
             <div className="component-service-toggle">
               <input
@@ -542,7 +633,20 @@ export function OfflineComponentsSheet({
             ) : null}
           </section>
 
+            {packResult}
+            {error ? <div className="component-error" role="alert">{error}</div> : null}
+            <button
+              className="btn ghost"
+              type="button"
+              onClick={() => void installPack()}
+              disabled={busy !== null || statusLoading || (mediaGenerationEnabled && mediaCatalogLoading)}
+            >
+              {t(busy === "pack" ? "offline.components.installing" : "offline.components.apply")}
+            </button>
           </div>
+          ) : null}
+          </details>
+          </>
         ) : (
           <div className="component-maintenance-panel">
             <p className="component-note">{t("offline.components.maintenanceBody")}</p>
@@ -569,42 +673,8 @@ export function OfflineComponentsSheet({
           </div>
         )}
 
-        {packReport ? (
-          <div className={`component-result${packReport.coreReady ? " success" : ""}`}>
-            <strong>
-              {packReport.coreReady
-                ? packReport.success
-                  ? t("offline.components.ready")
-                  : configNeedsAttention(packReport)
-                    ? t("offline.components.configConflict")
-                    : t("offline.components.partial")
-                : t("offline.components.notReady")}
-            </strong>
-            <span>{packReport.message}</span>
-            {packReport.codexRestartRequired ||
-            packReport.mediaProtocolStatus !== "not-checked" ||
-            packReport.mediaGatewayCatalogStatus !== "not-checked" ? (
-              <small role="status">
-                {t("offline.components.mediaReadiness", {
-                  protocol: t(packReport.mediaProtocolStatus === "passed" ? "offline.components.statusPassed" : "offline.components.statusNotChecked"),
-                  catalog: t(packReport.mediaGatewayCatalogStatus === "verified" ? "offline.components.statusPassed" : packReport.mediaGatewayCatalogStatus === "failed" ? "offline.components.statusFailed" : "offline.components.statusNotChecked"),
-                  restart: packReport.codexRestartRequired && packReport.codexRunning
-                    ? t("offline.components.restartRunning")
-                    : "",
-                })}
-              </small>
-            ) : null}
-            {packReport.skills > 0 ? (
-              <small>
-                {t("offline.components.counts", {
-                  skills: packReport.skills,
-                  agents: packReport.agents,
-                })}
-              </small>
-            ) : null}
-          </div>
-        ) : null}
-        {ccswitchReport ? (
+        {view === "maintenance" ? packResult : null}
+        {view === "maintenance" && ccswitchReport ? (
           <div className={`component-result${ccswitchReport.launched ? " success" : ""}`}>
             <strong>
               {ccswitchReport.launched
@@ -614,31 +684,26 @@ export function OfflineComponentsSheet({
             <span>{ccswitchReport.message}</span>
           </div>
         ) : null}
-        {error ? <div className="component-error">{error}</div> : null}
+        {error && view === "maintenance" ? (
+          <div className="component-error" role="alert">{error}</div>
+        ) : null}
 
-        <div className="row2 sheet-actions">
-          <button className="btn ghost" onClick={onDismiss} disabled={busy !== null}>
-            {t("offline.components.skip")}
-          </button>
-          <button
-            className="btn primary"
-            onClick={() => void installPack()}
-            disabled={
-              busy !== null ||
-              statusLoading ||
-              maintenanceSettingsLoading ||
-              (view === "maintenance" && Boolean(maintenanceSettingsError)) ||
-              (view === "connections" && enabled["media-generation"] && mediaCatalogLoading)
-            }
-          >
-            {busy === "pack" ? <Icon name="loader" className="spinicon" /> : <Icon name="download" />}
-            {busy === "pack"
-              ? t("offline.components.installing")
-              : view === "connections"
-                ? t("offline.components.apply")
-                : t("offline.components.install")}
-          </button>
-        </div>
+        {view === "maintenance" ? (
+          <div className="row2 sheet-actions">
+            <button className="btn ghost" type="button" onClick={onDismiss} disabled={busy !== null}>
+              {t("offline.components.close")}
+            </button>
+            <button
+              className="btn primary"
+              type="button"
+              onClick={() => void installPack()}
+              disabled={busy !== null || statusLoading || maintenanceSettingsLoading || !!maintenanceSettingsError}
+            >
+              {busy === "pack" ? <Icon name="loader" className="spinicon" /> : <Icon name="download" />}
+              {t(busy === "pack" ? "offline.components.installing" : "offline.components.install")}
+            </button>
+          </div>
+        ) : null}
       </div>
     </Sheet>
   );

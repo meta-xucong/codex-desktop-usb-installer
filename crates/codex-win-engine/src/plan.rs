@@ -100,6 +100,7 @@ mod tests {
             vec![],
         );
         let installed = Some(InstalledWindowsCodex {
+            app_version_unavailable: false,
             path: "C:/Program Files/WindowsApps/OpenAI.Codex".to_string(),
             version: "26.602.3000.0".to_string(),
             arch: Some("x64".to_string()),
@@ -159,6 +160,7 @@ mod tests {
             vec![],
         );
         let installed = Some(InstalledWindowsCodex {
+            app_version_unavailable: false,
             path: "C:/Program Files/WindowsApps/OpenAI.Codex".to_string(),
             version: "26.623.42026".to_string(),
             arch: Some("x64".to_string()),
@@ -200,6 +202,7 @@ mod tests {
             vec![],
         );
         let installed = Some(InstalledWindowsCodex {
+            app_version_unavailable: false,
             path: "C:/Program Files/WindowsApps/OpenAI.Codex".to_string(),
             version: "26.623.5546.0".to_string(),
             arch: Some("x64".to_string()),

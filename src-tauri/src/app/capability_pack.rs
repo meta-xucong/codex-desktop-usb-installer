@@ -49,6 +49,7 @@ const CAPABILITY_INSTALL_STAGES: &[&str] = &[
     "runtime.hyperframesBrowser",
     "runtime.hyperframesBrowserCheck",
     "runtime.feishu",
+    "runtime.environment",
     "runtime.complete",
     "pack.pdf",
     "pack.media",
@@ -105,11 +106,19 @@ struct ConnectionOwnershipRecord {
     note: String,
 }
 
+#[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum FeishuConnectionAction {
+    Apply,
+    Preserve,
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(default)]
 pub struct CapabilityPackInstallOptions {
     pub enable_feishu: bool,
+    pub feishu_action: Option<FeishuConnectionAction>,
     pub persist_connections: bool,
     pub feishu_app_id: String,
     pub feishu_app_secret: String,
@@ -137,7 +146,8 @@ pub struct CapabilityPackInstallOptions {
 impl Default for CapabilityPackInstallOptions {
     fn default() -> Self {
         Self {
-            enable_feishu: false,
+            enable_feishu: true,
+            feishu_action: None,
             persist_connections: true,
             feishu_app_id: String::new(),
             feishu_app_secret: String::new(),
@@ -181,6 +191,9 @@ pub struct CapabilityPackReport {
     pub config_status: String,
     pub diagnostics_path: Option<String>,
     pub feishu_enabled: bool,
+    pub feishu_configured: bool,
+    pub feishu_saved_live: bool,
+    pub feishu_runtime_status: String,
     pub enabled_api_services: Vec<String>,
     pub media_runtime_status: String,
     pub media_protocol_status: String,
@@ -209,6 +222,9 @@ fn report_missing(message: impl Into<String>) -> CapabilityPackReport {
         config_status: "unknown".to_string(),
         diagnostics_path: None,
         feishu_enabled: false,
+        feishu_configured: false,
+        feishu_saved_live: false,
+        feishu_runtime_status: "unknown".to_string(),
         enabled_api_services: Vec::new(),
         media_runtime_status: "unknown".to_string(),
         media_protocol_status: "unknown".to_string(),
@@ -330,7 +346,6 @@ fn find_pack(executable: &Path, resource_dir: Option<&Path>) -> Option<PathBuf> 
 fn validate_pack(root: &Path) -> Result<(String, PathBuf), AppError> {
     assert_no_reparse_points(root)?;
     let required = [
-        "pack.json",
         "dependencies.json",
         "file-manifest.json",
         "checksums.sha256",
@@ -347,7 +362,14 @@ fn validate_pack(root: &Path) -> Result<(String, PathBuf), AppError> {
             )));
         }
     }
+    Ok((pack_version(root)?, root.join("install-all.ps1")))
+}
+
+fn pack_version(root: &Path) -> Result<String, AppError> {
     let pack_path = root.join("pack.json");
+    if !pack_path.is_file() || is_reparse_point(&pack_path) {
+        return Err(AppError::Engine("能力包清单不是普通文件".into()));
+    }
     let pack_bytes = fs::read(&pack_path)
         .map_err(|error| AppError::Engine(format!("读取能力包清单失败: {error}")))?;
     let value: serde_json::Value = serde_json::from_slice(strip_utf8_bom(&pack_bytes))
@@ -364,7 +386,7 @@ fn validate_pack(root: &Path) -> Result<(String, PathBuf), AppError> {
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .to_string();
-    Ok((version, root.join("install-all.ps1")))
+    Ok(version)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -376,6 +398,7 @@ struct ReadinessSummary {
     agents: usize,
     runtime_status: String,
     config_status: String,
+    feishu_runtime_status: String,
     media_runtime_status: String,
     media_protocol_status: String,
     media_registered: bool,
@@ -446,6 +469,11 @@ fn readiness_summary(codex_home: &Path) -> ReadinessSummary {
         agents,
         runtime_status: value
             .pointer("/runtime/status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string(),
+        feishu_runtime_status: value
+            .pointer("/runtime/feishu/health")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown")
             .to_string(),
@@ -676,13 +704,143 @@ mod tests {
     fn host_repair_preserves_explicit_disabled_and_remote_selections() {
         let home = std::env::temp_dir().join(format!("usb-host-options-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&home).unwrap();
-        fs::write(home.join("config.toml"), "[mcp_servers.media_generation]\nenabled=false\n[mcp_servers.cloudflare]\nenabled=true\n[mcp_servers.notion]\nenabled=false\n").unwrap();
+        fs::write(home.join("config.toml"), "[mcp_servers.feishu]\nenabled=false\n[mcp_servers.media_generation]\nenabled=false\n[mcp_servers.cloudflare]\nenabled=true\n[mcp_servers.notion]\nenabled=false\n").unwrap();
         let options = super::host_install_options_with_settings(&home, std::collections::HashMap::new()).unwrap();
         assert!(!options.persist_connections);
         assert!(!options.enable_media_generation);
         assert!(!options.enable_feishu);
         assert_eq!(options.enabled_remote_mcps, vec!["cloudflare"]);
         fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn feishu_apply_preserves_other_connection_settings() {
+        use super::{
+            feishu_environment_values, plan_feishu_config, preserve_feishu_selection,
+            validate_feishu_options, FeishuConnectionAction,
+        };
+
+        let current = r#"model = "existing"
+# BEGIN CODEX-STARTER-KIT MANAGED CONFIG v1
+[mcp_servers.media_generation]
+command = "existing-media"
+enabled = true
+[mcp_servers.cloudflare]
+enabled = false
+url = "https://example.invalid/mcp"
+# END CODEX-STARTER-KIT MANAGED CONFIG v1
+"#;
+        let mut submitted = CapabilityPackInstallOptions {
+            enable_feishu: true,
+            feishu_action: Some(FeishuConnectionAction::Apply),
+            feishu_app_id: "cli_fixture".into(),
+            feishu_app_secret: "invalid".into(),
+            ..CapabilityPackInstallOptions::default()
+        };
+        assert!(validate_feishu_options(&submitted).is_err());
+        submitted.feishu_app_secret = " fixture-secret ".into();
+        assert!(validate_feishu_options(&submitted).is_ok());
+        let home = std::path::Path::new(r"C:\Users\Fixture\.codex");
+        let planned = plan_feishu_config(current, home, &submitted).unwrap();
+        assert!(planned.contains("# BEGIN CODEX-STARTER-KIT MANAGED CONFIG v1"));
+        assert!(planned.contains("# END CODEX-STARTER-KIT MANAGED CONFIG v1"));
+        let before: toml::Value = current.parse().unwrap();
+        assert!(!planned.contains("fixture-secret"));
+        assert!(!planned.contains("cli_fixture"));
+        let parsed: toml::Value = planned.parse().unwrap();
+        assert_eq!(
+            parsed["mcp_servers"]["feishu"]["enabled"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(parsed["model"], before["model"]);
+        for server in ["media_generation", "cloudflare"] {
+            assert_eq!(parsed["mcp_servers"][server], before["mcp_servers"][server]);
+        }
+        assert_eq!(
+            parsed["mcp_servers"]["feishu"]["tools"]["drive.v1.file.delete"]["approval_mode"]
+                .as_str(),
+            Some("prompt"),
+        );
+        assert_eq!(
+            feishu_environment_values(&submitted)[1],
+            ("FEISHU_APP_SECRET", "fixture-secret")
+        );
+
+        let preserved =
+            preserve_feishu_selection(CapabilityPackInstallOptions::default(), submitted.clone());
+        assert!(preserved.enable_feishu);
+        assert!(preserved.persist_connections);
+        assert_eq!(preserved.feishu_auth_mode, "tenant");
+        assert_eq!(preserved.feishu_app_id, "cli_fixture");
+
+        submitted.enable_feishu = false;
+        let disabled: toml::Value = plan_feishu_config(&planned, home, &submitted)
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            disabled["mcp_servers"]["feishu"]["enabled"].as_bool(),
+            Some(false)
+        );
+        for server in ["media_generation", "cloudflare"] {
+            assert_eq!(
+                parsed["mcp_servers"][server],
+                disabled["mcp_servers"][server]
+            );
+        }
+    }
+
+    #[test]
+    fn feishu_first_install_and_live_save_keep_the_existing_config() {
+        use super::{feishu_can_save_live, host_install_options_with_settings, FeishuConnectionAction};
+
+        let home = std::env::temp_dir().join(format!("usb-feishu-options-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&home).unwrap();
+        let mut options = host_install_options_with_settings(&home, Default::default()).unwrap();
+        assert!(options.enable_feishu);
+        assert!(options.feishu_app_id.is_empty() && options.feishu_app_secret.is_empty());
+        assert!(validate_options(&options).is_ok());
+
+        options.feishu_action = Some(FeishuConnectionAction::Apply);
+        assert!(validate_options(&options).is_err());
+        options.feishu_app_id = "cli_fixture".into();
+        options.feishu_app_secret = "fixture-secret".into();
+        assert!(validate_options(&options).is_ok());
+
+        let mut config: toml::Value = r#"
+            model_provider = "custom"
+            [mcp_servers.feishu]
+            enabled = true
+            command = "powershell.exe"
+            env_vars = ["FEISHU_APP_ID", "FEISHU_APP_SECRET", "CODEX_USB_FEISHU_SETUP_ENTRY"]
+            args = ["-File", "wrapper", "-PackageCache", "cache", "-AuthMode", "tenant", "-Domain", "https://open.feishu.cn"]
+            [mcp_servers.media_generation]
+            enabled = true
+            [mcp_servers.existing]
+            enabled = true
+        "#.parse().unwrap();
+        config["mcp_servers"]["feishu"]["args"].as_array_mut().unwrap()[1] =
+            toml::Value::String(home.join("codex-agent-kit/bin/start-feishu-mcp.ps1").to_string_lossy().into_owned());
+        config["mcp_servers"]["feishu"]["args"].as_array_mut().unwrap()[3] =
+            toml::Value::String(home.join("codex-agent-kit/runtime/feishu").to_string_lossy().into_owned());
+        assert!(feishu_can_save_live(&config, &home, &options));
+        options.feishu_domain = "https://open.larksuite.com".into();
+        assert!(!feishu_can_save_live(&config, &home, &options));
+
+        config["mcp_servers"]["feishu"]["enabled"] = toml::Value::Boolean(false);
+        let config_path = home.join("config.toml");
+        fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+        let saved = [
+            ("FEISHU_APP_ID".to_string(), "cli_saved".to_string()),
+            ("FEISHU_APP_SECRET".to_string(), "saved-test-secret".to_string()),
+            ("FEISHU_DOMAIN".to_string(), "https://open.larksuite.com".to_string()),
+        ].into_iter().collect();
+        let preserved = host_install_options_with_settings(&home, saved).unwrap();
+        assert!(!preserved.enable_feishu);
+        assert_eq!(preserved.feishu_app_id, "cli_saved");
+        assert_eq!(preserved.feishu_domain, "https://open.larksuite.com");
+        fs::remove_file(config_path).unwrap();
+        fs::remove_dir(home).unwrap();
     }
 
     #[test]
@@ -1319,8 +1477,9 @@ fn capability_stage_label(stage: &str) -> &'static str {
         "runtime.hyperframesFfmpeg" => "从本地部署 HyperFrames 视频编码器",
         "runtime.hyperframesCliCheck" => "检查 HyperFrames CLI",
         "runtime.hyperframesBrowser" => "从本地部署 HyperFrames 浏览器",
-        "runtime.hyperframesBrowserCheck" => "检查本地 HyperFrames 浏览器",
-        "runtime.feishu" => "检查飞书 MCP",
+        "runtime.hyperframesBrowserCheck" => "验证本地 HyperFrames 浏览器能否启动",
+        "runtime.feishu" => "部署本地飞书 MCP",
+        "runtime.environment" => "设置命令入口和用户环境",
         "runtime.complete" => "写入运行时状态",
         "pack.pdf" => "检查 PDF 工具",
         "pack.media" => "验证媒体 MCP 本地连接",
@@ -1409,7 +1568,7 @@ pub fn install_product_design_plugin(app: &AppHandle) -> Result<u32, AppError> {
 pub(crate) fn host_core_ready(home: &Path, config: &toml::Value) -> Result<bool, AppError> {
     let executable = std::env::current_exe().map_err(|e| AppError::Internal(e.to_string()))?;
     let Some(source) = find_pack(&executable, None) else { return Ok(false) };
-    let (version, _) = validate_pack(&source)?;
+    let version = pack_version(&source)?;
     let Some(bytes) = crate::app::usb_host::read_optional(&readiness_path(home))? else { return Ok(false) };
     let Ok(readiness) = serde_json::from_slice::<serde_json::Value>(strip_utf8_bom(&bytes)) else { return Ok(false) };
     Ok(host_core_files_ready(home, config, &readiness, &version))
@@ -1458,7 +1617,7 @@ fn host_install_options_with_settings(home: &Path, saved: std::collections::Hash
     let setting = |key: &str| saved.get(key).cloned().unwrap_or_default();
     let mut options = CapabilityPackInstallOptions {
         persist_connections: false,
-        enable_feishu: enabled("feishu", false),
+        enable_feishu: enabled("feishu", true),
         enable_media_generation: enabled("media_generation", true),
         enabled_remote_mcps: ["cloudflare", "figma", "linear", "notion"].into_iter()
             .filter(|id| enabled(id, false)).map(str::to_owned).collect(),
@@ -1492,6 +1651,87 @@ fn host_install_options_with_settings(home: &Path, saved: std::collections::Hash
     Ok(options)
 }
 
+fn preserve_feishu_selection(
+    mut options: CapabilityPackInstallOptions,
+    feishu: CapabilityPackInstallOptions,
+) -> CapabilityPackInstallOptions {
+    options.feishu_action = Some(FeishuConnectionAction::Preserve);
+    options.enable_feishu = feishu.enable_feishu;
+    options.feishu_app_id = feishu.feishu_app_id;
+    options.feishu_app_secret = feishu.feishu_app_secret;
+    options.feishu_user_access_token = feishu.feishu_user_access_token;
+    options.feishu_auth_mode = feishu.feishu_auth_mode;
+    options.feishu_domain = feishu.feishu_domain;
+    options
+}
+
+fn feishu_config_enabled(home: &Path) -> Result<bool, AppError> {
+    let config = crate::app::usb_host::read_config(home)?;
+    Ok(config
+        .get("mcp_servers")
+        .and_then(|value| value.get("feishu"))
+        .is_some_and(|server| {
+            server.is_table() && server.get("enabled").and_then(toml::Value::as_bool) != Some(false)
+        }))
+}
+
+fn feishu_credentials_valid(app_id: &str, app_secret: &str) -> bool {
+    app_id.trim().strip_prefix("cli_").is_some_and(|id| {
+        !id.is_empty() && id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+    }) && app_secret.trim().chars().count() >= 8
+}
+
+fn feishu_configured() -> bool {
+    crate::app::media_generation::current_user_environment_settings(&["FEISHU_APP_ID", "FEISHU_APP_SECRET"])
+        .ok()
+        .is_some_and(|values| {
+            let setting = |name| values.iter().find(|(key, _)| key == name).map_or("", |(_, value)| value.as_str());
+            feishu_credentials_valid(setting("FEISHU_APP_ID"), setting("FEISHU_APP_SECRET"))
+        })
+}
+
+fn feishu_can_save_live(
+    config: &toml::Value,
+    home: &Path,
+    options: &CapabilityPackInstallOptions,
+) -> bool {
+    if !options.enable_feishu || options.feishu_auth_mode != "tenant" {
+        return false;
+    }
+    let Some(server) = config.get("mcp_servers").and_then(|v| v.get("feishu")) else {
+        return false;
+    };
+    let Some(args) = server.get("args").and_then(toml::Value::as_array) else {
+        return false;
+    };
+    let wrapper = home.join("codex-agent-kit/bin/start-feishu-mcp.ps1");
+    let package_cache = home.join("codex-agent-kit/runtime/feishu");
+    let argument = |flag: &str| {
+        args.windows(2).find_map(|pair| {
+            (pair[0].as_str() == Some(flag))
+                .then(|| pair[1].as_str())
+                .flatten()
+        })
+    };
+    server.get("enabled").and_then(toml::Value::as_bool) == Some(true)
+        && server.get("command").and_then(toml::Value::as_str) == Some("powershell.exe")
+        && server
+            .get("env_vars")
+            .and_then(toml::Value::as_array)
+            .is_some_and(|vars| {
+                vars.iter()
+                    .any(|value| value.as_str() == Some("CODEX_USB_FEISHU_SETUP_ENTRY"))
+            })
+        && argument("-File")
+            .is_some_and(|p| codex_win_engine::same_windows_path(Path::new(p), &wrapper))
+        && argument("-PackageCache")
+            .is_some_and(|p| codex_win_engine::same_windows_path(Path::new(p), &package_cache))
+        && argument("-AuthMode") == Some("tenant")
+        && argument("-Domain").is_some_and(|domain| {
+            domain.eq_ignore_ascii_case(options.feishu_domain.trim().trim_end_matches('/'))
+        })
+}
+
 pub fn status(app: &AppHandle) -> Result<CapabilityPackReport, AppError> {
     if !cfg!(target_os = "windows") {
         return Ok(report_missing("当前平台不支持 Windows 能力包安装"));
@@ -1512,13 +1752,23 @@ pub fn status(app: &AppHandle) -> Result<CapabilityPackReport, AppError> {
         None
     };
     let codex_home = usb_codex_home.unwrap_or_else(|| profile.join(".codex"));
-    let readiness = readiness_summary(&codex_home);
+    Ok(pack_status_at(&source, &version, &codex_home, true))
+}
+
+fn pack_status_at(
+    source: &Path,
+    version: &str,
+    codex_home: &Path,
+    probe_media: bool,
+) -> CapabilityPackReport {
+    let readiness = readiness_summary(codex_home);
     let installed = readiness.pack_identity_valid
         && readiness.core_ready
-        && readiness.pack_version.as_deref() == Some(version.as_str());
+        && readiness.pack_version.as_deref() == Some(version);
     let runtime_ready = installed && readiness.runtime_status == "ready";
     let media_needs_auth = readiness.media_enabled || readiness.media_registered;
-    let media_auth_live = !readiness.media_enabled
+    let media_auth_live = !probe_media
+        || !readiness.media_enabled
         || crate::app::media_generation::verify_authorized_local_connection().is_ok();
     let effective_config_status = if media_needs_auth
         && (readiness.media_authorization_status != "verified" || !media_auth_live)
@@ -1532,21 +1782,24 @@ pub fn status(app: &AppHandle) -> Result<CapabilityPackReport, AppError> {
         &readiness.runtime_status,
         effective_config_status,
     );
-    Ok(CapabilityPackReport {
+    CapabilityPackReport {
         available: true,
         installed,
         success: status == "ready",
         core_ready: installed,
         overall_status: status.to_string(),
         source_path: Some(source.to_string_lossy().into_owned()),
-        pack_version: Some(readiness.pack_version.unwrap_or(version)),
+        pack_version: Some(readiness.pack_version.unwrap_or_else(|| version.to_owned())),
         skills: readiness.skills,
         agents: readiness.agents,
         runtime_ready,
         runtime_status: readiness.runtime_status.clone(),
         config_status: effective_config_status.to_string(),
         diagnostics_path: readiness.diagnostics_path,
-        feishu_enabled: false,
+        feishu_enabled: feishu_config_enabled(codex_home).unwrap_or(false),
+        feishu_configured: feishu_configured(),
+        feishu_saved_live: false,
+        feishu_runtime_status: readiness.feishu_runtime_status,
         enabled_api_services: Vec::new(),
         media_runtime_status: readiness.media_runtime_status.clone(),
         media_protocol_status: readiness.media_protocol_status.clone(),
@@ -1566,7 +1819,7 @@ pub fn status(app: &AppHandle) -> Result<CapabilityPackReport, AppError> {
         } else {
             "能力包已就绪，可安装或修复全部 Skills、Agents、运行时和本地 MCP 资源".to_string()
         },
-    })
+    }
 }
 
 fn non_empty(value: &str) -> Option<&str> {
@@ -1585,6 +1838,43 @@ fn selected_service(options: &CapabilityPackInstallOptions, id: &str) -> bool {
         .enabled_api_services
         .iter()
         .any(|value| value.trim().eq_ignore_ascii_case(id))
+}
+
+fn validate_feishu_options(options: &CapabilityPackInstallOptions) -> Result<(), AppError> {
+    if !options.enable_feishu {
+        return Ok(());
+    }
+    let pending = options.feishu_auth_mode == "tenant"
+        && options.feishu_action != Some(FeishuConnectionAction::Apply)
+        && non_empty(&options.feishu_app_id).is_none()
+        && non_empty(&options.feishu_app_secret).is_none();
+    if !pending && !feishu_credentials_valid(&options.feishu_app_id, &options.feishu_app_secret) {
+        return Err(AppError::Engine(
+            "请填写有效的飞书 App ID 和 App Secret".into(),
+        ));
+    }
+    if !matches!(
+        options.feishu_auth_mode.as_str(),
+        "tenant" | "oauth" | "user"
+    ) || !["https://open.feishu.cn", "https://open.larksuite.com"]
+        .iter()
+        .any(|domain| {
+            options
+                .feishu_domain
+                .trim()
+                .trim_end_matches('/')
+                .eq_ignore_ascii_case(domain)
+        })
+    {
+        return Err(AppError::Engine("飞书认证方式或 API 地址不受支持".into()));
+    }
+    if options.feishu_auth_mode == "user" && non_empty(&options.feishu_user_access_token).is_none()
+    {
+        return Err(AppError::Engine(
+            "飞书 user 认证模式必须填写 User Access Token".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_options(options: &CapabilityPackInstallOptions) -> Result<(), AppError> {
@@ -1613,22 +1903,7 @@ fn validate_options(options: &CapabilityPackInstallOptions) -> Result<(), AppErr
             return Err(AppError::Engine(format!("不支持的远程 MCP 服务: {server}")));
         }
     }
-    if options.enable_feishu {
-        if non_empty(&options.feishu_app_id).is_none()
-            || non_empty(&options.feishu_app_secret).is_none()
-        {
-            return Err(AppError::Engine(
-                "启用飞书 MCP 时必须填写 App ID 和 App Secret".to_string(),
-            ));
-        }
-        if options.feishu_auth_mode.eq_ignore_ascii_case("user")
-            && non_empty(&options.feishu_user_access_token).is_none()
-        {
-            return Err(AppError::Engine(
-                "飞书 user 认证模式必须填写 User Access Token".to_string(),
-            ));
-        }
-    }
+    validate_feishu_options(options)?;
     if selected_service(options, "dashscope-web-search")
         && (non_empty(&options.dashscope_api_key).is_none()
             || non_empty(&options.dashscope_base_url).is_none()
@@ -1964,17 +2239,8 @@ fn persist_configured_environment(
         return Ok(());
     }
     let mut values = Vec::<(&str, &str)>::new();
-    if options.enable_feishu {
-        values.extend([
-            ("FEISHU_APP_ID", options.feishu_app_id.as_str()),
-            ("FEISHU_APP_SECRET", options.feishu_app_secret.as_str()),
-            ("FEISHU_DOMAIN", options.feishu_domain.as_str()),
-            ("FEISHU_AUTH_MODE", options.feishu_auth_mode.as_str()),
-            (
-                "FEISHU_USER_ACCESS_TOKEN",
-                options.feishu_user_access_token.as_str(),
-            ),
-        ]);
+    if options.enable_feishu && options.feishu_action != Some(FeishuConnectionAction::Preserve) {
+        values.extend(feishu_environment_values(options));
     }
     if selected_service(options, "dashscope-web-search") {
         values.extend([
@@ -2006,6 +2272,20 @@ fn persist_configured_environment(
         ("MEDIA_SEEDANCE_MODEL", media_values[4]),
         ("MEDIA_MINIMAX_VIDEO_MODEL", media_values[5]),
     ]);
+    persist_connection_values(profile, values)
+}
+
+fn feishu_environment_values(options: &CapabilityPackInstallOptions) -> [(&str, &str); 5] {
+    [
+        ("FEISHU_APP_ID", options.feishu_app_id.trim()),
+        ("FEISHU_APP_SECRET", options.feishu_app_secret.trim()),
+        ("FEISHU_DOMAIN", options.feishu_domain.trim()),
+        ("FEISHU_AUTH_MODE", options.feishu_auth_mode.trim()),
+        ("FEISHU_USER_ACCESS_TOKEN", options.feishu_user_access_token.trim()),
+    ]
+}
+
+fn persist_connection_values(profile: &Path, values: Vec<(&str, &str)>) -> Result<(), AppError> {
     let values = values
         .into_iter()
         .filter(|(name, value)| name.starts_with("MEDIA_") || non_empty(value).is_some())
@@ -2022,14 +2302,244 @@ fn persist_configured_environment(
     update_user_environment(&values, target_user_sid.as_deref())
 }
 
+fn plan_feishu_config(
+    current: &str,
+    home: &Path,
+    options: &CapabilityPackInstallOptions,
+) -> Result<String, AppError> {
+    use toml_edit::{value, Document, Item, Table};
+
+    let invalid_config = || AppError::Engine("无法读取本机飞书 MCP 配置，原设置未更改".into());
+    let mut config = current.parse::<Document>().map_err(|_| invalid_config())?;
+    if !options.enable_feishu {
+        if let Some(server) = config
+            .get_mut("mcp_servers")
+            .and_then(Item::as_table_like_mut)
+            .and_then(|servers| servers.get_mut("feishu"))
+        {
+            server
+                .as_table_like_mut()
+                .ok_or_else(invalid_config)?
+                .insert("enabled", value(false));
+        }
+        return Ok(config.to_string());
+    }
+
+    // Render the same table and tool approval rules as the first-install script.
+    let quote = |text: &str| serde_json::to_string(text).expect("serialize TOML string");
+    let mut environment = vec!["FEISHU_APP_ID", "FEISHU_APP_SECRET"];
+    let tenant = options.feishu_auth_mode == "tenant";
+    if tenant {
+        environment.push("CODEX_USB_FEISHU_SETUP_ENTRY");
+    }
+    if options.feishu_auth_mode == "user" {
+        environment.push("FEISHU_USER_ACCESS_TOKEN");
+    }
+    let wrapper = home.join("codex-agent-kit/bin/start-feishu-mcp.ps1");
+    let cache = home.join("codex-agent-kit/runtime/feishu");
+    let mut fragment = include_str!(
+        "../../../installer-pack/config-fragments/feishu-official-stdio.template.toml"
+    )
+    .to_owned();
+    for (placeholder, replacement) in [
+        ("__FEISHU_ENABLED__", "true".to_owned()),
+        (
+            "__FEISHU_WRAPPER__",
+            quote(&powershell_provider_path(&wrapper).to_string_lossy()),
+        ),
+        (
+            "__FEISHU_MCP_CACHE__",
+            quote(&powershell_provider_path(&cache).to_string_lossy()),
+        ),
+        (
+            "__FEISHU_DOMAIN__",
+            quote(options.feishu_domain.trim().trim_end_matches('/')),
+        ),
+        ("__FEISHU_AUTH_MODE__", quote(&options.feishu_auth_mode)),
+        (
+            "__FEISHU_CONNECT_TOOL__",
+            if tenant { "  \"connect\"," } else { "" }.to_owned(),
+        ),
+        (
+            "__FEISHU_ENV_VARS__",
+            serde_json::to_string(&environment).expect("serialize env names"),
+        ),
+    ] {
+        fragment = fragment.replace(placeholder, &replacement);
+    }
+    let fragment = fragment
+        .parse::<Document>()
+        .map_err(|_| AppError::Internal("随包飞书 MCP 模板无法解析".into()))?;
+    let defaults = fragment["mcp_servers"]["feishu"]
+        .as_table()
+        .expect("Feishu template table");
+    let servers = config
+        .as_table_mut()
+        .entry("mcp_servers")
+        .or_insert(Item::Table(Table::new()))
+        .as_table_like_mut()
+        .ok_or_else(invalid_config)?;
+    if let Some(server) = servers.get_mut("feishu") {
+        let server = server.as_table_like_mut().ok_or_else(invalid_config)?;
+        server.remove("url");
+        for (key, item) in defaults.iter() {
+            if matches!(key, "enabled" | "command" | "args" | "env_vars")
+                || !server.contains_key(key)
+            {
+                server.insert(key, item.clone());
+            }
+        }
+    } else {
+        servers.insert("feishu", Item::Table(defaults.clone()));
+    }
+    let planned = config.to_string();
+    planned
+        .parse::<toml::Value>()
+        .map_err(|_| invalid_config())?;
+    Ok(planned)
+}
+
+#[derive(Deserialize)]
+struct FeishuRuntimeReport {
+    repaired: bool,
+    feishu: serde_json::Value,
+}
+
+fn prepare_feishu_runtime(
+    source: &Path,
+    profile: &Path,
+    home: &Path,
+    options: &CapabilityPackInstallOptions,
+) -> Result<FeishuRuntimeReport, AppError> {
+    for path in [
+        "bin/start-feishu-mcp.ps1",
+        "bin/feishu-tenant-server.cjs",
+        "manifest/feishu-tools.json",
+    ] {
+        if !home.join(KIT_HOME_RELATIVE).join(path).is_file() {
+            return Err(AppError::Engine(
+                "飞书组件文件缺失。请在组件修复中补齐后再保存".into(),
+            ));
+        }
+    }
+    let progress = CapabilityProgressFile::create()?;
+    let mut command = Command::new("powershell.exe");
+    command
+        .current_dir(source)
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(source.join("runtime/provision-runtime.ps1"))
+        .arg("-PackRoot")
+        .arg(source)
+        .arg("-TargetUserProfile")
+        .arg(profile)
+        .arg("-TargetCodexHome")
+        .arg(powershell_provider_path(home))
+        .arg("-FeishuOnly");
+    let result = run_capability_installer(
+        &mut command,
+        progress.path(),
+        CAPABILITY_INSTALL_TIMEOUT,
+        |_| {},
+    )
+    .map_err(|_| AppError::Engine("飞书运行时准备进程未完成，请重试".into()))?;
+    if !result.status.success() {
+        log::warn!(
+            "Feishu runtime preparation failed: {}",
+            sanitized_child_output(&result, options)
+        );
+        return Err(AppError::Engine(
+            "无法从安装包准备飞书运行时。请查看管理器日志".into(),
+        ));
+    }
+    serde_json::from_slice(strip_utf8_bom(&result.stdout))
+        .map_err(|_| AppError::Engine("飞书运行时准备未返回有效结果".into()))
+}
+
+fn record_feishu_runtime(home: &Path, feishu: serde_json::Value) {
+    let path = readiness_path(home);
+    let Ok(bytes) = fs::read(&path) else { return };
+    let Ok(mut record) = serde_json::from_slice::<serde_json::Value>(strip_utf8_bom(&bytes)) else {
+        return;
+    };
+    let Some(runtime) = record
+        .get_mut("runtime")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    if runtime.get("feishu") == Some(&feishu) {
+        return;
+    }
+    runtime.insert("feishu".into(), feishu);
+    if let Err(error) = crate::app::atomic_file::write_atomic(&path, record.to_string().as_bytes())
+    {
+        log::warn!("Could not update Feishu runtime readiness: {error}");
+    }
+}
+
+fn save_feishu_connection(
+    source: &Path,
+    version: &str,
+    profile: &Path,
+    home: &Path,
+    options: &CapabilityPackInstallOptions,
+) -> Result<CapabilityPackReport, AppError> {
+    validate_feishu_options(options)?;
+    let runtime = options
+        .enable_feishu
+        .then(|| prepare_feishu_runtime(source, profile, home, options))
+        .transpose()?;
+    let _config_lock = crate::app::model_selection_client::lock_configuration()
+        .map_err(|_| AppError::Busy("另一个 Codex 配置操作正在进行，请稍后再保存飞书".into()))?;
+    let config_path = home.join("config.toml");
+    let current_bytes = crate::app::usb_host::read_optional(&config_path)?.unwrap_or_default();
+    let current = std::str::from_utf8(strip_utf8_bom(&current_bytes))
+        .map_err(|_| AppError::Engine("无法读取本机 Codex 配置，原设置未更改".into()))?;
+    let config = current
+        .parse::<toml::Value>()
+        .map_err(|_| AppError::Engine("无法解析本机 Codex 配置，原设置未更改".into()))?;
+    let same_registration = feishu_can_save_live(&config, home, options);
+    if !same_registration {
+        let planned = plan_feishu_config(current, home, options)?;
+        if planned != current {
+            crate::app::atomic_file::write_atomic_preserving_backup(
+                &config_path,
+                planned.as_bytes(),
+            )
+            .map_err(|_| {
+                AppError::Engine("无法写入飞书 MCP 配置，请检查本机配置文件是否可写".into())
+            })?;
+        }
+    }
+    let saved_live = if let Some(runtime) = runtime {
+        persist_connection_values(home, feishu_environment_values(options).to_vec())?;
+        record_feishu_runtime(home, runtime.feishu);
+        same_registration && !runtime.repaired
+    } else {
+        false
+    };
+    let mut report = pack_status_at(source, version, home, false);
+    report.feishu_saved_live = saved_live;
+    if options.enable_feishu {
+        report.feishu_configured = true;
+        report.feishu_runtime_status = "passed".into();
+    }
+    Ok(report)
+}
+
 pub fn install(
     app: &AppHandle,
-    options: CapabilityPackInstallOptions,
+    mut options: CapabilityPackInstallOptions,
 ) -> Result<CapabilityPackReport, AppError> {
     if !cfg!(target_os = "windows") {
         return Ok(report_missing("当前平台不支持 Windows 能力包安装"));
     }
-    validate_options(&options)?;
     let executable = std::env::current_exe()
         .map_err(|error| AppError::Internal(format!("无法确定安装器路径: {error}")))?;
     let resource_dir = app.path().resource_dir().ok();
@@ -2054,6 +2564,16 @@ pub fn install(
     let codex_home = usb_codex_home
         .clone()
         .unwrap_or_else(|| profile.join(".codex"));
+    match options.feishu_action {
+        Some(FeishuConnectionAction::Apply) => {
+            return save_feishu_connection(&source, &pack_version, &profile, &codex_home, &options);
+        }
+        Some(FeishuConnectionAction::Preserve) => {
+            options = preserve_feishu_selection(options, host_install_options(&codex_home)?);
+        }
+        None => {}
+    }
+    validate_options(&options)?;
     if options.enable_media_generation {
         migrate_legacy_media_environment(&codex_home)?;
     }
@@ -2327,7 +2847,10 @@ pub fn install(
         runtime_status: readiness.runtime_status.clone(),
         config_status: readiness.config_status.clone(),
         diagnostics_path: readiness.diagnostics_path,
-        feishu_enabled: options.enable_feishu,
+        feishu_enabled: feishu_config_enabled(&codex_home).unwrap_or(false),
+        feishu_configured: feishu_configured(),
+        feishu_saved_live: false,
+        feishu_runtime_status: readiness.feishu_runtime_status,
         enabled_api_services,
         media_runtime_status: readiness.media_runtime_status.clone(),
         media_protocol_status: readiness.media_protocol_status.clone(),

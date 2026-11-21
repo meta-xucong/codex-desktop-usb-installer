@@ -57,6 +57,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             fs::create_dir_all(&home)?;
             let identity = engine::parse_appx_manifest_xml(&fs::read_to_string(install.join("AppxManifest.xml"))?)?;
             let installed = engine::InstalledWindowsCodex {
+                app_version_unavailable: false,
                 path: install.to_string_lossy().into_owned(),
                 version: identity.version,
                 arch: Some(identity.processor_architecture),

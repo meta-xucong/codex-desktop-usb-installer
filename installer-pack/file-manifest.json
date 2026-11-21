@@ -19,8 +19,8 @@
     {
       "owned": true,
       "path": "README.md",
-      "sha256": "0497a51bdcb26ded2de605ccf6d9f5f3d4257338ff0d6d1967b0dcab670f525e",
-      "bytes": 15908
+      "sha256": "a3ead5a6dfc795bb68ec10f417d9f1440607ed5fb0555e73370ed3fa6373ff5e",
+      "bytes": 15947
     },
     {
       "owned": true,
@@ -91,8 +91,8 @@
     {
       "owned": true,
       "path": "config-fragments/feishu-official-stdio.template.toml",
-      "sha256": "edcb51edc83ba0bb6be07263525f8d0492a95f2e2ec719527da10a585318c82b",
-      "bytes": 1540
+      "sha256": "d3e33422e43b3331bf2124f108ff721f32b2ec2381aadb29522208a3350b78d4",
+      "bytes": 1564
     },
     {
       "owned": true,
@@ -175,8 +175,8 @@
     {
       "owned": true,
       "path": "install-to-codex.ps1",
-      "sha256": "9d04a5d20f9cae39516f324000e3fb3d9cfe9838d5f99e14f6fea041c2d07571",
-      "bytes": 57694
+      "sha256": "8be31f82f075edf560e01778b68c66148a137386dc209d562753a48b7ec67e37",
+      "bytes": 58233
     },
     {
       "owned": true,
@@ -288,6 +288,12 @@
     },
     {
       "owned": true,
+      "path": "mcp/feishu-tenant-server.cjs",
+      "sha256": "4179a145321e4a879db191fe056c4554679537f8bc34704c786eef590e18e886",
+      "bytes": 4560
+    },
+    {
+      "owned": true,
       "path": "mcp/mcp-servers.json",
       "sha256": "881ed2ffc4e50f32b01404edff0eca3b5027f458fd96142a17d13800a317a0ec",
       "bytes": 10078
@@ -307,8 +313,8 @@
     {
       "owned": true,
       "path": "mcp/start-feishu-mcp.ps1",
-      "sha256": "6d9cb34ebc0f37b4b71d92f9de330750033bad90a2c34b70afee08b0f92e2d87",
-      "bytes": 6097
+      "sha256": "4d83d585b0da521fd3b8b3309744634ef4c04b3544b86fcaf0b2a4d57fb7fdf2",
+      "bytes": 6523
     },
     {
       "owned": true,
@@ -325,7 +331,7 @@
     {
       "owned": true,
       "path": "pack.json",
-      "sha256": "7d1afb33c85069458973aa6c122b6981bab208da2d7242597f7efcc0adfa3607",
+      "sha256": "102cce91762643a7aeae7a60f18a8a8b8495a032ce22300e05d4e08f21c14235",
       "bytes": 4064
     },
     {
@@ -931,8 +937,8 @@
     {
       "owned": true,
       "path": "render-codex-config.ps1",
-      "sha256": "23d3e28022ee7a8b3811bcc5b66e5cc0fa79708bf736e7224b0885f880e17593",
-      "bytes": 16275
+      "sha256": "fad2c7caec924c590f7ed0d427c8a68185aa02765f12fc5fdcecff4226105dda",
+      "bytes": 16031
     },
     {
       "owned": true,
@@ -943,8 +949,8 @@
     {
       "owned": true,
       "path": "runtime/README.md",
-      "sha256": "e8f8d04793799cb1f6233201c2223aba5d15858dfc18f5f4908b310fda742eec",
-      "bytes": 2488
+      "sha256": "f2c8045902d5df1e5f493d04e72fdfae6d8206f552f44e8fc4c57d381c2f6771",
+      "bytes": 2510
     },
     {
       "owned": true,
@@ -1549,8 +1555,8 @@
     {
       "owned": true,
       "path": "runtime/provision-runtime.ps1",
-      "sha256": "4b748fe7b3d537aeca3ee719d3f58678963c84a662e454f84e5a85b6b5c810f5",
-      "bytes": 35127
+      "sha256": "a186440b9c5de1eef2be7b923d38faffff0eb54e839f272804781262dd1a5be9",
+      "bytes": 37454
     },
     {
       "owned": true,

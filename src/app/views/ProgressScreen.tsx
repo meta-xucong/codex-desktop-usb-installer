@@ -50,6 +50,7 @@ export function ProgressScreen({
   installing,
   splitWindowsInstall = false,
   localSetup = false,
+  localPayloadReady = false,
   downloadStop,
   downloadStopBusy,
   failure,
@@ -78,6 +79,8 @@ export function ProgressScreen({
   splitWindowsInstall?: boolean;
   /** Host-only setup resumes the fourth stage without downloading the program. */
   localSetup?: boolean;
+  /** The installer is applying a verified local package. */
+  localPayloadReady?: boolean;
   downloadStop: DownloadStopIntent | null;
   downloadStopBusy: boolean;
   failure: FailureSurface | null;
@@ -142,6 +145,17 @@ export function ProgressScreen({
     downloadProgress && downloadProgress.total > 0
       ? Math.min(100, (downloadProgress.downloaded / downloadProgress.total) * 100)
       : 0;
+  const downloadComplete = localPayloadReady || installStarted || downloadPercent === 100;
+  const downloadStagePercent = downloadComplete ? 100 : downloadKnown ? downloadPercent : null;
+  const downloadStageStatus = localPayloadReady
+    ? t("progress.localPayloadReady")
+    : downloadComplete
+      ? t("progress.downloadComplete")
+      : downloadProgress?.source
+        ? t("progress.downloadingFrom", { source: downloadProgress.source })
+        : phaseCode === "preparing" || phaseCode === "idle"
+          ? t("progress.preparing")
+          : t("progress.downloading");
   const extractionKnown = Boolean(
     installProgress &&
       installProgress.source === WINDOWS_PORTABLE_EXTRACTION_SOURCE &&
@@ -223,7 +237,7 @@ export function ProgressScreen({
             </div>
           ) : null}
           {!paused && activity ? (
-            <div className="sub" aria-live="polite" aria-atomic="true">
+            <div className="sub progress-activity" aria-live="polite" aria-atomic="true">
               {activity}
             </div>
           ) : null}
@@ -259,15 +273,7 @@ export function ProgressScreen({
               {!localSetup ? <div className="progress-track">
                 <div className="dlmeta">
                   <strong>{t("progress.downloadStage")}: </strong>
-                  {downloadKnown && downloadProgress
-                    ? downloadProgress.downloaded >= downloadProgress.total
-                      ? t("progress.downloadComplete")
-                      : downloadProgress.source
-                        ? t("progress.downloadingFrom", { source: downloadProgress.source })
-                        : t("progress.downloading")
-                    : phaseCode === "preparing" || phaseCode === "idle"
-                      ? t("progress.preparing")
-                      : t("progress.downloading")}
+                  {downloadStageStatus}
                 </div>
                 <div
                   className="bar"
@@ -275,20 +281,20 @@ export function ProgressScreen({
                   aria-label={t("progress.downloadStage")}
                   aria-valuemin={0}
                   aria-valuemax={100}
-                  aria-valuenow={downloadKnown ? Math.round(downloadPercent) : undefined}
+                  aria-valuenow={downloadStagePercent === null ? undefined : Math.round(downloadStagePercent)}
                   aria-valuetext={
-                    downloadKnown
-                      ? `${Math.round(downloadPercent)}% · ${t("progress.downloadStage")}`
-                      : t("progress.preparing")
+                    downloadStagePercent !== null && !downloadComplete
+                      ? `${Math.round(downloadStagePercent)}% · ${downloadStageStatus}`
+                      : downloadStageStatus
                   }
                   data-testid="download-progress-bar"
                 >
                   <div
-                    className={`bar-fill${downloadKnown ? "" : " indeterminate"}`}
-                    style={downloadKnown ? { width: `${downloadPercent}%` } : undefined}
+                    className={`bar-fill${downloadStagePercent === null ? " indeterminate" : ""}`}
+                    style={downloadStagePercent === null ? undefined : { width: `${downloadStagePercent}%` }}
                   />
                 </div>
-                {downloadKnown && downloadProgress ? (
+                {!localPayloadReady && downloadKnown && downloadProgress && (!downloadComplete || downloadPercent === 100) ? (
                   <div className="dlmeta">
                     {mib(downloadProgress.downloaded)} / {mib(downloadProgress.total)}
                   </div>

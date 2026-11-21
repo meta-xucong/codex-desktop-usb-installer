@@ -110,11 +110,11 @@ const USB_PORTABLE_CODEX = {
   packageVolume: null,
 };
 
-function renderView(onOpenUninstall = vi.fn()) {
+function renderView(onOpenUninstall = vi.fn(), feishuConnectionRequest = 0) {
   return render(
     <ThemeProvider>
       <I18nProvider>
-        <OfflineHome onOpenSettings={vi.fn()} onOpenUninstall={onOpenUninstall} />
+        <OfflineHome onOpenSettings={vi.fn()} onOpenUninstall={onOpenUninstall} feishuConnectionRequest={feishuConnectionRequest} />
       </I18nProvider>
     </ThemeProvider>,
   );
@@ -132,7 +132,6 @@ describe("OfflineHome", () => {
       capabilitiesReady: true, conflict: false, message: "本机已就绪" });
     api.getOperationSnapshot.mockResolvedValue(null);
     api.winCheckInstallPreflight.mockResolvedValue({
-      internetAvailable: true,
       apiKeyReady: true,
     });
     api.offlinePayloadStage.mockResolvedValue(STAGE);
@@ -268,6 +267,13 @@ describe("OfflineHome", () => {
     await waitFor(() => expect(screen.getByText("26.602.40724")).toBeInTheDocument());
   });
 
+  it("opens the same local Feishu form for a connection request from Codex", async () => {
+    renderView(undefined, 1);
+    expect(await screen.findByLabelText("飞书 App ID")).toHaveValue("");
+    expect(screen.getByLabelText("飞书 App Secret")).toHaveAttribute("type", "password");
+    expect(api.installCapabilityPack).not.toHaveBeenCalled();
+  });
+
   it("shows a spinning readiness indicator while USB authorization settles", async () => {
     let resolveProbe: (value: OfflinePayloadReport) => void = () => undefined;
     api.offlinePayloadProbe.mockReturnValue(
@@ -314,6 +320,28 @@ describe("OfflineHome", () => {
     expect(api.usbGuardStatus.mock.calls.length).toBeGreaterThanOrEqual(2);
   });
 
+  it("ends the startup spinner on guard failure even while the payload probe is pending", async () => {
+    let resolveProbe: (value: OfflinePayloadReport) => void = () => undefined;
+    api.offlinePayloadProbe.mockReturnValue(new Promise<OfflinePayloadReport>((resolve) => {
+      resolveProbe = resolve;
+    }));
+    const detail = "U 盘看门狗初始化失败：真实看门狗仍在运行，请关闭管理器后重新打开。";
+    api.usbGuardStatus
+      .mockResolvedValueOnce({ ...USB_GUARD, status: "starting", watchdog: "not-running", codexAllowed: false })
+      .mockResolvedValue({ ...USB_GUARD, status: "initialization-failed", watchdog: "not-running", codexAllowed: false, message: detail });
+    const { container } = renderView();
+    await screen.findByText(detail);
+    expect(screen.getByTestId("offline-hero")).toHaveTextContent("U 盘启动检查失败");
+    expect(container.querySelector("[data-testid=offline-hero] .ring.spin")).toBeNull();
+    expect(screen.getByRole("button", { name: "一键安装" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "检查并安装更新" })).toBeDisabled();
+    resolveProbe(PAYLOAD);
+    await waitFor(() => expect(screen.getByText("26.602.40724")).toBeInTheDocument());
+    expect(screen.getByTestId("offline-hero")).toHaveTextContent("U 盘启动检查失败");
+    expect(api.offlinePayloadStage).not.toHaveBeenCalled();
+    expect(api.winLaunch).not.toHaveBeenCalled();
+  });
+
   it("re-reads an installation after USB authorization so a stale external snapshot cannot block it", async () => {
     api.winStatus
       .mockResolvedValueOnce({ status: "external", installed: USB_PORTABLE_CODEX })
@@ -332,6 +360,67 @@ describe("OfflineHome", () => {
     await waitFor(() => expect(screen.getByText("此版本已经安装")).toBeInTheDocument());
     expect(screen.queryByText(/Codex 已安装在其他位置/)).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "检查并安装更新" })).toBeEnabled();
+  });
+
+  it("shows an existing program is being checked while the package probe is pending", async () => {
+    api.winStatus.mockResolvedValue({ status: "managed", installed: USB_PORTABLE_CODEX });
+    let finish!: (value: OfflinePayloadReport) => void;
+    api.offlinePayloadProbe.mockReturnValue(new Promise((resolve) => { finish = resolve; }));
+    renderView();
+    expect(await screen.findByRole("button", { name: /正在确认已安装版本/ })).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "一键安装" })).not.toBeInTheDocument();
+    finish(PAYLOAD);
+    await waitFor(() => expect(screen.getByRole("button", { name: "启动 Codex" })).toBeEnabled());
+    expect(api.offlinePayloadStage).not.toHaveBeenCalled();
+  });
+
+  it("reopens a healthy installation with one installed-program read per mount", async () => {
+    api.winStatus.mockResolvedValue({ status: "managed", installed: USB_PORTABLE_CODEX });
+    const first = renderView();
+    await waitFor(() => expect(screen.getByRole("button", { name: "启动 Codex" })).toBeEnabled());
+    first.unmount();
+    renderView();
+    await waitFor(() => expect(screen.getByRole("button", { name: "启动 Codex" })).toBeEnabled());
+    expect(api.winStatus).toHaveBeenCalledTimes(2);
+    expect(api.offlinePayloadStage).not.toHaveBeenCalled();
+    expect(api.winInstallHistoricalRelease).not.toHaveBeenCalled();
+  });
+
+  it.each([PAYLOAD.packageVersion, PAYLOAD.codexDesktopVersion])(
+    "keeps an unreadable desktop version separate from a package version of %s",
+    async (version) => {
+      api.winStatus.mockResolvedValue({ status: "managed", installed: {
+        ...USB_PORTABLE_CODEX, version, appVersionUnavailable: true,
+      } });
+      renderView();
+      const retry = await screen.findByRole("button", { name: "重新读取版本" });
+      expect(screen.queryByRole("button", { name: "一键安装" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "启动 Codex" })).not.toBeInTheDocument();
+
+      api.winStatus.mockResolvedValue({ status: "managed", installed: USB_PORTABLE_CODEX });
+      await userEvent.click(retry);
+      await waitFor(() => expect(screen.getByRole("button", { name: "启动 Codex" })).toBeEnabled());
+      expect(api.offlinePayloadProbe).toHaveBeenCalledTimes(1);
+      expect(api.winCheckInstallPreflight).not.toHaveBeenCalled();
+      expect(api.offlinePayloadStage).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    [false, "启动 Codex"],
+    [true, "重新读取版本"],
+  ] as const)("rechecks a stale install button before staging (unavailable=%s)", async (unavailable, action) => {
+    renderView();
+    const install = await screen.findByRole("button", { name: "一键安装" });
+    await waitFor(() => expect(install).toBeEnabled());
+    api.winStatus.mockResolvedValue({ status: "managed", installed: {
+      ...USB_PORTABLE_CODEX, appVersionUnavailable: unavailable,
+    } });
+    await userEvent.click(install);
+    await waitFor(() => expect(screen.getByRole("button", { name: action })).toBeEnabled());
+    expect(api.winCheckInstallPreflight).not.toHaveBeenCalled();
+    expect(api.offlinePayloadStage).not.toHaveBeenCalled();
+    expect(api.winInstallHistoricalRelease).not.toHaveBeenCalled();
   });
 
   it("does not claim Codex is installed until signed authorization is live", async () => {
@@ -401,16 +490,16 @@ describe("OfflineHome", () => {
     expect(api.winInstallHistoricalRelease).not.toHaveBeenCalled();
   });
 
-  it("shows the unplug grace countdown reported by the helper", async () => {
+  it("shows the USB recheck countdown reported by the helper", async () => {
     api.usbGuardStatus.mockResolvedValue({
       ...USB_GUARD,
       status: "grace",
-      countdownSeconds: 4,
-      message: "暂时未检测到 U 盘，正在等待重新连接",
+      countdownSeconds: 60,
+      message: "暂时无法复核授权 U 盘",
     });
     renderView();
-    await waitFor(() => expect(screen.getByTestId("usb-guard-status")).toHaveTextContent("4s"));
-    expect(screen.getByTestId("usb-guard-status")).toHaveTextContent("正在等待 U 盘重新连接");
+    await waitFor(() => expect(screen.getByTestId("usb-guard-status")).toHaveTextContent("60s"));
+    expect(screen.getByTestId("usb-guard-status")).toHaveTextContent("正在重新核验 U 盘");
   });
 
   it("exposes the signed USB update flow and redeploys the refreshed payload", async () => {
@@ -580,7 +669,6 @@ describe("OfflineHome", () => {
   it("installs the local USB payload and components when the gateway is unreachable", async () => {
     const user = userEvent.setup();
     api.winCheckInstallPreflight.mockResolvedValue({
-      internetAvailable: false,
       apiKeyReady: true,
     });
     api.winInstallHistoricalRelease.mockImplementation(async () => {
@@ -599,10 +687,21 @@ describe("OfflineHome", () => {
     expect(api.installAndLaunchCcswitch).toHaveBeenCalledTimes(1);
   });
 
+  it("shows a completed local package track before extraction emits progress", async () => {
+    api.winInstallHistoricalRelease.mockImplementation(() => new Promise(() => {}));
+    renderView();
+
+    await userEvent.click(await screen.findByRole("button", { name: "一键安装" }));
+
+    const downloadProgress = await screen.findByTestId("download-progress-bar");
+    expect(downloadProgress).toHaveAttribute("aria-valuetext", "本地安装包已就绪");
+    expect(downloadProgress.querySelector(".bar-fill")).not.toHaveClass("indeterminate");
+    expect(screen.getByTestId("install-progress-bar").querySelectorAll(".install-stage-segment")).toHaveLength(4);
+  });
+
   it("blocks the USB install before staging when the signed API key binding is missing", async () => {
     const user = userEvent.setup();
     api.winCheckInstallPreflight.mockResolvedValue({
-      internetAvailable: true,
       apiKeyReady: false,
     });
     renderView();
@@ -658,7 +757,7 @@ describe("OfflineHome", () => {
     expect(api.offlinePayloadCleanup).toHaveBeenCalledWith(STAGE.stagedPath);
     expect(api.installCapabilityPack).toHaveBeenCalledTimes(1);
     expect(api.installCapabilityPack.mock.calls[0]?.[0]).toMatchObject({
-      enableFeishu: false,
+      enableFeishu: true,
       enableMediaGeneration: true,
       persistConnections: true,
       image2Model: "gpt-image-2.5",
@@ -1093,6 +1192,22 @@ describe("OfflineHome", () => {
     expect(screen.queryByRole("button", { name: "启动 Codex" })).not.toBeInTheDocument();
   });
 
+  it("honors an explicit program repair when the desktop version stays unreadable", async () => {
+    api.winStatus.mockResolvedValue({ status: "managed", installed: {
+      ...USB_PORTABLE_CODEX, version: PAYLOAD.packageVersion, appVersionUnavailable: true,
+    } });
+    api.winInstallHistoricalRelease.mockImplementation(async () => {
+      api.winStatus.mockResolvedValue({ status: "managed", installed: USB_PORTABLE_CODEX });
+      return { success: true, message: "repaired" } as never;
+    });
+    renderView();
+    await screen.findByRole("button", { name: "重新读取版本" });
+    await userEvent.click(screen.getByRole("button", { name: "重新校验并修复程序" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "启动 Codex" })).toBeEnabled());
+    expect(api.offlinePayloadStage).toHaveBeenCalledTimes(1);
+    expect(api.winInstallHistoricalRelease).toHaveBeenCalledTimes(1);
+  });
+
   it("can repair the same USB version and keeps recovery evidence after CCSwitch starts", async () => {
     const user = userEvent.setup();
     const current = {
@@ -1197,11 +1312,12 @@ describe("OfflineHome", () => {
 
   it("initializes a new computer without staging or reinstalling the USB program", async () => {
     api.winStatus.mockResolvedValue({ installed: USB_PORTABLE_CODEX, status: "managed" });
+    api.winLaunch.mockRejectedValueOnce({ code: "usb_host_not_ready", message: "本机待初始化" });
     api.usbHostStatus.mockResolvedValue({ required: true, ready: false, accountReady: false,
       capabilitiesReady: false, conflict: false, message: "程序已安装，本机账号尚未初始化" });
     renderView();
     await userEvent.click(await screen.findByRole("button", { name: "启动 Codex" }));
-    await waitFor(() => expect(api.winLaunch).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(api.winLaunch).toHaveBeenCalledTimes(2));
     expect(api.initializeUsbHost).toHaveBeenCalledWith(true);
     expect(api.offlinePayloadStage).not.toHaveBeenCalled();
     expect(api.winInstallHistoricalRelease).not.toHaveBeenCalled();
@@ -1214,6 +1330,7 @@ describe("OfflineHome", () => {
       return Promise.resolve(() => {});
     });
     api.winStatus.mockResolvedValue({ installed: USB_PORTABLE_CODEX, status: "managed" });
+    api.winLaunch.mockRejectedValueOnce({ code: "usb_host_not_ready", message: "本机待初始化" });
     api.usbHostStatus.mockResolvedValue({ required: true, ready: false, accountReady: true,
       capabilitiesReady: false, conflict: false, message: "程序已安装，本机核心能力尚未准备完成" });
     api.initializeUsbHost.mockImplementation(() => new Promise(() => {}));
@@ -1231,6 +1348,10 @@ describe("OfflineHome", () => {
     await screen.findByText("正在从本地部署 HyperFrames 视频编码器…");
     handler!({ payload: "runtime.hyperframesBrowser" });
     await screen.findByText("正在从本地部署 HyperFrames 浏览器…");
+    handler!({ payload: "runtime.hyperframesBrowserCheck" });
+    expect(await screen.findByText("正在验证本地 HyperFrames 浏览器能否启动")).toHaveClass("progress-activity");
+    handler!({ payload: "runtime.environment" });
+    await screen.findByText("正在设置命令入口和用户环境");
     expect(screen.queryByText(/下载完成/)).not.toBeInTheDocument();
     expect(api.offlinePayloadStage).not.toHaveBeenCalled();
   });
@@ -1240,8 +1361,12 @@ describe("OfflineHome", () => {
     renderView();
     const button = await screen.findByRole("button", { name: "启动 Codex" });
     await waitFor(() => expect(button).toBeEnabled());
+    await waitFor(() => expect(api.usbHostStatus).toHaveBeenCalled());
+    api.usbHostStatus.mockClear();
     await userEvent.click(button);
     await waitFor(() => expect(api.winLaunch).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(button).toBeEnabled());
+    expect(api.usbHostStatus).not.toHaveBeenCalled();
     expect(api.initializeUsbHost).not.toHaveBeenCalled();
     expect(api.installCapabilityPack).not.toHaveBeenCalled();
     expect(api.installAndLaunchCcswitch).not.toHaveBeenCalled();
@@ -1250,25 +1375,27 @@ describe("OfflineHome", () => {
 
   it("keeps the program installed and does not launch after failed host initialization", async () => {
     api.winStatus.mockResolvedValue({ installed: USB_PORTABLE_CODEX, status: "managed" });
+    api.winLaunch.mockRejectedValueOnce({ code: "usb_host_not_ready", message: "本机待初始化" });
     api.usbHostStatus.mockResolvedValue({ required: true, ready: false, accountReady: false,
       capabilitiesReady: true, conflict: false, message: "账号未就绪" });
     api.initializeUsbHost.mockRejectedValueOnce(new Error("account readback failed"));
     renderView();
     await userEvent.click(await screen.findByRole("button", { name: "启动 Codex" }));
     await screen.findByRole("button", { name: "启动 Codex" });
-    expect(api.winLaunch).not.toHaveBeenCalled();
+    expect(api.winLaunch).toHaveBeenCalledTimes(1);
     expect(api.offlinePayloadStage).not.toHaveBeenCalled();
     expect(api.initializeUsbHost).toHaveBeenCalledTimes(1);
   });
 
   it("uses the USB account on ordinary launch without a separate account choice", async () => {
     api.winStatus.mockResolvedValue({ installed: USB_PORTABLE_CODEX, status: "managed" });
+    api.winLaunch.mockRejectedValueOnce({ code: "usb_host_not_ready", message: "本机待初始化" });
     api.usbHostStatus.mockResolvedValue({ required: true, ready: false, accountReady: false,
       capabilitiesReady: true, conflict: true, message: "现有账号不同" });
     renderView();
     await userEvent.click(await screen.findByRole("button", { name: "启动 Codex" }));
     await waitFor(() => expect(api.initializeUsbHost).toHaveBeenCalledWith(true));
-    await waitFor(() => expect(api.winLaunch).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(api.winLaunch).toHaveBeenCalledTimes(2));
     expect(api.winInstallHistoricalRelease).not.toHaveBeenCalled();
   });
 
@@ -1318,6 +1445,7 @@ describe("OfflineHome", () => {
   it("retains the old account failure and does not launch when automatic initialization fails", async () => {
     localStorage.setItem("codex-usb-ccswitch-injection-issue-v1", "launch-failed");
     api.winStatus.mockResolvedValue({ installed: USB_PORTABLE_CODEX, status: "managed" });
+    api.winLaunch.mockRejectedValueOnce({ code: "usb_host_not_ready", message: "本机待初始化" });
     api.usbHostStatus.mockResolvedValue({ required: true, ready: false, accountReady: false,
       capabilitiesReady: false, conflict: true, message: "现有账号不同" });
     api.initializeUsbHost.mockRejectedValueOnce(new Error("fixture initialization failed"));
@@ -1327,7 +1455,7 @@ describe("OfflineHome", () => {
     await userEvent.click(screen.getByRole("button", { name: "查看详情" }));
     expect(screen.getByText(/fixture initialization failed/)).toBeVisible();
     expect(localStorage.getItem("codex-usb-ccswitch-injection-issue-v1")).toBe("launch-failed");
-    expect(api.winLaunch).not.toHaveBeenCalled();
+    expect(api.winLaunch).toHaveBeenCalledTimes(1);
     expect(api.winInstallHistoricalRelease).not.toHaveBeenCalled();
     expect(api.initializeUsbHost).toHaveBeenCalledExactlyOnceWith(true);
   });
@@ -1357,8 +1485,10 @@ describe("OfflineHome", () => {
     expect(api.winLaunch).not.toHaveBeenCalled();
   });
 
-  it("clears a real capability failure after successful host initialization while retaining program backup details", async () => {
+  it.each([false, true])("clears a capability failure after initialization even when the window launch fails=%s", async (launchFails) => {
     const user = userEvent.setup();
+    api.winLaunch.mockRejectedValueOnce({ code: "usb_host_not_ready", message: "本机待初始化" });
+    if (launchFails) api.winLaunch.mockRejectedValueOnce(new Error("fixture window launch failed"));
     api.usbHostStatus.mockResolvedValue({ required: true, ready: false, accountReady: true,
       capabilitiesReady: false, conflict: false, message: "核心能力尚未准备完成" });
     api.installCapabilityPack.mockRejectedValueOnce(new Error("fixture capability failure"));
@@ -1374,7 +1504,8 @@ describe("OfflineHome", () => {
     await user.click(screen.getByText("安装／修复详情与备份位置"));
     expect(screen.getByText(/能力包自动安装失败：fixture capability failure/)).toBeVisible();
     await user.click(screen.getByRole("button", { name: "启动 Codex" }));
-    await waitFor(() => expect(api.winLaunch).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(api.winLaunch).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getByRole("button", { name: "启动 Codex" })).toBeEnabled());
     expect(screen.queryByText(/fixture capability failure|能力包未能自动安装/)).not.toBeInTheDocument();
     expect(screen.getByText(/备份保留在 C:/)).toBeInTheDocument();
     expect(api.initializeUsbHost).toHaveBeenCalledExactlyOnceWith(true);

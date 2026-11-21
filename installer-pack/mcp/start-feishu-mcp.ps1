@@ -41,11 +41,10 @@ if ([string]$toolContract.packageName -ne '@larksuiteoapi/lark-mcp' -or
 $appId = [Environment]::GetEnvironmentVariable('FEISHU_APP_ID', 'Process')
 $appSecret = [Environment]::GetEnvironmentVariable('FEISHU_APP_SECRET', 'Process')
 $userAccessToken = [Environment]::GetEnvironmentVariable('FEISHU_USER_ACCESS_TOKEN', 'Process')
-if ([string]::IsNullOrWhiteSpace($appId) -or $appId -notmatch '^cli_[A-Za-z0-9_-]+$') {
-    throw 'FEISHU_APP_ID is missing or invalid.'
-}
-if ([string]::IsNullOrWhiteSpace($appSecret) -or $appSecret.Length -lt 8) {
-    throw 'FEISHU_APP_SECRET is missing or invalid.'
+$credentialsPresent = $appId -cmatch '^cli_[A-Za-z0-9_-]+$' -and
+    -not [string]::IsNullOrWhiteSpace($appSecret) -and $appSecret.Length -ge 8
+if ($AuthMode -ne 'tenant' -and -not $credentialsPresent) {
+    throw 'FEISHU_APP_ID or FEISHU_APP_SECRET is missing or invalid.'
 }
 if ($AuthMode -eq 'user' -and [string]::IsNullOrWhiteSpace($userAccessToken)) {
     throw 'FEISHU_USER_ACCESS_TOKEN is required when AuthMode=user.'
@@ -107,11 +106,15 @@ switch ($AuthMode) {
     'user' { $arguments += @('--user-access-token', $userAccessToken, '--token-mode', 'user_access_token') }
 }
 
+$tenantServer = Join-Path $PSScriptRoot 'feishu-tenant-server.cjs'
+if ($AuthMode -eq 'tenant' -and -not (Test-Path -LiteralPath $tenantServer -PathType Leaf)) {
+    throw 'Bundled Feishu tenant MCP entry is missing.'
+}
 if ($DryRun) {
     [ordered]@{
         schemaVersion = 1
         command = if ($nodePath) { $nodePath } else { 'node' }
-        entrypoint = $cliPath
+        entrypoint = if ($AuthMode -eq 'tenant') { $tenantServer } else { $cliPath }
         packageCache = $cacheFull
         packagePresent = [bool]$packagePresent
         packageValidated = [bool]$packageValidated
@@ -123,7 +126,7 @@ if ($DryRun) {
         toolNameCase = 'dot'
         tools = $tools
         credentialSources = @('FEISHU_APP_ID', 'FEISHU_APP_SECRET') + $(if ($AuthMode -eq 'user') { @('FEISHU_USER_ACCESS_TOKEN') } else { @() })
-        credentialsPresent = $true
+        credentialsPresent = [bool]$credentialsPresent
         secretsRendered = $false
     } | ConvertTo-Json -Depth 6
     return
@@ -135,6 +138,11 @@ if (-not $packagePresent -or -not $packageValidated) {
 if ([string]::IsNullOrWhiteSpace($nodePath)) { throw 'Node.js >=20 is required for the Feishu MCP server.' }
 if (-not $nodeReady) {
     throw "Node.js >=20 is required; detected: $nodeVersionText"
+}
+
+if ($AuthMode -eq 'tenant') {
+    & $nodePath $tenantServer $packageRoot $Domain ($tools -join ',')
+    exit $LASTEXITCODE
 }
 
 # Do not write to stdout before the child starts: stdout is reserved for MCP JSON-RPC.

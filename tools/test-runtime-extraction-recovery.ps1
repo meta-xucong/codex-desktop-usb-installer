@@ -1,7 +1,8 @@
 # Real ZIP/native recovery regression, isolated from user settings and network.
+param([string]$EvidenceDirectory='tmp\usb-runtime-extract-recovery-1114')
 $ErrorActionPreference='Stop'
 $repo=(Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$evidence=Join-Path $repo 'tmp\usb-runtime-extract-recovery-1114'
+$evidence=Join-Path $repo $EvidenceDirectory
 $fixture=Join-Path $repo ('tmp\runtime-recovery-'+[guid]::NewGuid().ToString('N').Substring(0,8))
 New-Item -ItemType Directory -Path $fixture | Out-Null
 $env:USERPROFILE=Join-Path $fixture 'profile';$env:HOME=$env:USERPROFILE
@@ -81,6 +82,10 @@ foreach($case in @('node','ffmpeg','feishu')){
  $block=switch($case){'node'{$nodeBlock};'ffmpeg'{$ffmpegBlock};'feishu'{$feishuBlock}}
  $script:inject=$true;$script:extractCalls.Clear();$originalError=''
  try{. $block}catch{$originalError=$_.Exception.Message}
+ if($case -eq 'feishu'){
+  if($feishuHealth -ne 'install-failed'){throw 'Interrupted Feishu preparation did not mark the component unavailable'}
+  $originalError=$feishuError
+ }
  if(-not $originalError.StartsWith('Injected interruption')){throw "Expected original interruption missing: $case; actual=$originalError"}
  $entry=switch($case){'node'{$nodeExe};'ffmpeg'{$ffprobeExe};'feishu'{$feishuCli}}
  $dependency=switch($case){'node'{Join-Path $nodeRoot 'node_modules\npm\bin\npm-cli.js'};'ffmpeg'{$ffplayExe};'feishu'{Join-Path $feishuRoot 'node_modules\dotenv\package.json'}}
@@ -116,6 +121,15 @@ foreach($case in @('node','ffmpeg','feishu')){
  $results.Add($record)
  Write-Host "Actual recovery passed: $case"
 }
+$env:USB_TEST_STAGE='feishu-fresh-default'
+[Environment]::SetEnvironmentVariable('FEISHU_APP_ID',$null,'Process')
+[Environment]::SetEnvironmentVariable('FEISHU_APP_SECRET',$null,'Process')
+$runtimeRoot=Join-Path $fixture 'feishu-fresh-default\runtime'
+$EnableFeishu=$true;$feishuHealth='disabled';$script:extractCalls.Clear()
+. $feishuBlock
+if($feishuHealth -ne 'passed' -or $extractCalls.Count -ne 1){throw 'Fresh Feishu deployment without credentials failed'}
+$results.Add([ordered]@{case='feishu-fresh-default';extractions=$extractCalls.Count;health=$feishuHealth;credentialsProvided=$false})
+Write-Host 'Fresh offline Feishu deployment without credentials passed'
 if(Test-Path -LiteralPath (Join-Path $env:NPM_CONFIG_CACHE '_cacache')){throw 'npm package cache unexpectedly populated'}
 $report=[ordered]@{scope='actual local ZIP recovery; production commands; private HOME, no system Node/npm/npx PATH, external Node requests blocked';fixture=$fixture;results=$results;packageCacheAbsent=$true;paidCalls=0}
 $json=$report|ConvertTo-Json -Depth 7

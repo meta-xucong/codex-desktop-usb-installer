@@ -225,7 +225,7 @@ function MaximizeButton() {
  *
  *  When the backend is mid point-of-no-return install (`app://quit-blocked`),
  *  a different sheet explains why quit is refused. */
-export function QuitConfirm() {
+export function QuitConfirm({ onOpenFeishuConnection }: { onOpenFeishuConnection?: () => void } = {}) {
   const { t, lang } = useI18n();
   const [open, setOpen] = useState(false);
   const [blockedCode, setBlockedCode] = useState<string | null>(null);
@@ -283,6 +283,15 @@ export function QuitConfirm() {
           releaseListeners(currentAttempt);
           return;
         }
+        if (onOpenFeishuConnection) {
+          const unlisten = await listen("app://open-feishu-connection", onOpenFeishuConnection);
+          registered.add(unlisten);
+          currentAttempt.push(unlisten);
+          if (disposed) {
+            releaseListeners(currentAttempt);
+            return;
+          }
+        }
         setListenersReady(true);
       } catch (cause) {
         releaseListeners(currentAttempt);
@@ -319,7 +328,7 @@ export function QuitConfirm() {
       releaseListeners();
       window.removeEventListener("cam:confirm-quit", onWeb);
     };
-  }, []);
+  }, [onOpenFeishuConnection]);
 
   useEffect(() => {
     if (!listenersReady) return;

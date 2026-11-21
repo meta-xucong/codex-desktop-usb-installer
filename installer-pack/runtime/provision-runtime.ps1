@@ -4,7 +4,8 @@ param(
     [Parameter(Mandatory = $true)][string]$TargetUserProfile,
     [string]$TargetCodexHome,
     [string]$ProgressFile = '',
-    [switch]$EnableFeishu
+    [switch]$EnableFeishu,
+    [switch]$FeishuOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -88,6 +89,13 @@ function Write-AsciiFile([string]$Path, [string]$Text) {
     $parent = Split-Path -Parent $Path
     New-Item -ItemType Directory -Force -Path $parent | Out-Null
     Set-Content -LiteralPath $Path -Value $Text -Encoding ASCII
+}
+
+function Set-UserEnvironmentIfChanged([string]$Name, $Value) {
+    $current = [Environment]::GetEnvironmentVariable($Name, 'User')
+    if ([string]$current -cne [string]$Value) {
+        [Environment]::SetEnvironmentVariable($Name, $Value, 'User')
+    }
 }
 
 function ConvertTo-WindowsArgument([string]$Argument) {
@@ -192,6 +200,58 @@ function Test-VenvPython([string]$Executable, [string]$HealthProbe) {
     # modules exist. Reuse only when the existing runtime import check passes.
     $health = Invoke-NativeCapture -Executable $Executable -Arguments @('-c',$HealthProbe)
     return $health.ExitCode -eq 0
+}
+
+function Test-FeishuRuntime([string]$NodeExe, [string]$FeishuRoot) {
+    $packageRoot = Join-Path $FeishuRoot 'node_modules\@larksuiteoapi\lark-mcp'
+    $packageJson = Join-Path $packageRoot 'package.json'
+    $cli = Join-Path $packageRoot 'dist\cli.js'
+    if (-not (Test-Path -LiteralPath $packageJson -PathType Leaf) -or -not (Test-Path -LiteralPath $cli -PathType Leaf)) { return $false }
+    try { $metadata = Read-Json $packageJson } catch { return $false }
+    if ([string]$metadata.name -ne '@larksuiteoapi/lark-mcp' -or [string]$metadata.version -ne '0.5.1') { return $false }
+    $helpResult = Invoke-NativeCapture -Executable $NodeExe -Arguments @($cli, 'mcp', '--help')
+    return $helpResult.ExitCode -eq 0 -and $helpResult.Output -match 'Start Feishu/Lark MCP Service'
+}
+
+function Restore-FeishuRuntime([string]$Zip, [string]$NodeExe, [string]$FeishuRoot) {
+    # A prior extraction can leave the CLI behind without its dependencies.
+    Expand-Archive -LiteralPath $Zip -DestinationPath $FeishuRoot -Force
+    if (-not (Test-FeishuRuntime $NodeExe $FeishuRoot)) {
+        throw 'Offline Feishu MCP CLI health check failed after extraction.'
+    }
+}
+
+if ($FeishuOnly) {
+    [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+    Set-InstallProgress 'runtime.feishu'
+    $nodeExe = Join-Path $runtimeRoot 'node-v22.22.0-win-x64\node.exe'
+    $feishuRoot = Join-Path $runtimeRoot 'feishu'
+    $nodeVersion = Get-NodeVersion $nodeExe
+    $nodeNeedsRepair = $null -eq $nodeVersion -or $nodeVersion.Major -lt 22
+    $feishuNeedsRepair = $true
+    if (-not $nodeNeedsRepair) {
+        $feishuNeedsRepair = -not (Test-FeishuRuntime $nodeExe $feishuRoot)
+    }
+    if ($nodeNeedsRepair -or $feishuNeedsRepair) {
+        $mediaManifest = Read-Json $mediaManifestPath
+        if ($nodeNeedsRepair) {
+            $nodeZip = Assert-Media $mediaManifest 'runtime.node22-common' $packRootFull
+            Expand-Archive -LiteralPath $nodeZip -DestinationPath $runtimeRoot -Force
+            $nodeVersion = Get-NodeVersion $nodeExe
+            if ($null -eq $nodeVersion -or $nodeVersion.Major -lt 22) {
+                throw 'Bundled Node.js 22 runtime is not healthy after extraction.'
+            }
+        }
+        if ($feishuNeedsRepair) {
+            $feishuZip = Assert-Media $mediaManifest 'runtime.feishu-mcp-package' $packRootFull
+            Restore-FeishuRuntime $feishuZip $nodeExe $feishuRoot
+        }
+    }
+    [ordered]@{
+        repaired = $nodeNeedsRepair -or $feishuNeedsRepair
+        feishu = [ordered]@{ packageRoot = $feishuRoot; package = '@larksuiteoapi/lark-mcp@0.5.1'; health = 'passed'; error = '' }
+    } | ConvertTo-Json -Compress -Depth 4
+    return
 }
 
 Set-InstallProgress 'runtime.verify'
@@ -324,6 +384,7 @@ $nodeHealth = 'unknown'
 $nodeVersion = $null
 $feishuRoot = ''
 $feishuHealth = 'disabled'
+$feishuError = ''
 # node.exe can run before npm/npx have been extracted. Explicit capability
 # setup restores the complete bundled Node distribution.
 Expand-Archive -LiteralPath $nodeZip -DestinationPath $runtimeRoot -Force
@@ -365,6 +426,7 @@ $hyperframesBrowserExe = Join-Path $hyperframesBrowserRoot 'chrome-headless-shel
 $hyperframesHealth = 'unknown'
 $hyperframesCliHealth = 'unknown'
 $hyperframesBrowserHealth = 'unknown'
+$hyperframesBrowserCheckMs = $null
 $hyperframesError = ''
 $installedHyperframesVersion = ''
 try {
@@ -411,21 +473,30 @@ try {
     # during explicit setup even when the browser EXE already exists.
     Expand-Archive -LiteralPath $hyperframesBrowserZip -DestinationPath $hyperframesBrowserRoot -Force
     Set-InstallProgress 'runtime.hyperframesBrowserCheck'
-    $browserVersionResult = Invoke-NativeCapture -Executable $hyperframesBrowserExe -Arguments @('--version')
-    if ($browserVersionResult.ExitCode -ne 0 -or $browserVersionResult.StdOut -notmatch ('\b' + [regex]::Escape($hyperframesBrowserVersion) + '\b')) {
-        throw "Bundled HyperFrames browser version check failed: $($browserVersionResult.Output)"
-    }
-    # HyperFrames 0.8.134 uses this override before its managed-cache and
-    # Google download branches, including render and Studio. Keep it scoped
-    # to the child CLI; do not change the user's browser or global settings.
-    $savedBrowserPath = [Environment]::GetEnvironmentVariable('HYPERFRAMES_BROWSER_PATH', 'Process')
+    $browserProbe = @'
+const [entry, executablePath, expectedVersion] = process.argv.slice(1);
+const puppeteer = require('node:module').createRequire(entry)('puppeteer-core');
+(async () => {
+  const browser = await puppeteer.launch({ executablePath, headless: 'shell', pipe: true });
+  try {
+    const version = (await browser.version()).split('/').pop();
+    if (version !== expectedVersion) throw new Error(`Expected browser ${expectedVersion}, got ${version}`);
+    const page = await browser.newPage();
+    await page.goto('about:blank');
+  } finally {
+    await browser.close();
+  }
+})().catch(error => { console.error(error.message); process.exitCode = 1; });
+'@
+    # The bundled Puppeteer launches the exact EXE over a local DevTools pipe.
+    $browserWatch = [Diagnostics.Stopwatch]::StartNew()
     try {
-        $env:HYPERFRAMES_BROWSER_PATH = $hyperframesBrowserExe
-        $browserResult = Invoke-NativeCapture -Executable $nodeExe -Arguments @($hyperframesEntry,'browser','ensure') -TimeoutSeconds 600
-        if ($browserResult.ExitCode -ne 0) { throw "Bundled HyperFrames browser check failed: $($browserResult.Output)" }
+        $browserResult = Invoke-NativeCapture -Executable $nodeExe -Arguments @('--input-type=commonjs','-e',$browserProbe,$hyperframesEntry,$hyperframesBrowserExe,$hyperframesBrowserVersion)
     } finally {
-        [Environment]::SetEnvironmentVariable('HYPERFRAMES_BROWSER_PATH', $savedBrowserPath, 'Process')
+        $hyperframesBrowserCheckMs = $browserWatch.ElapsedMilliseconds
     }
+    if ($browserResult.TimedOut) { throw 'Bundled HyperFrames browser startup check timed out.' }
+    if ($browserResult.ExitCode -ne 0) { throw "Bundled HyperFrames browser startup check failed: $($browserResult.Output)" }
     $hyperframesBrowserHealth = 'passed'
     $hyperframesHealth = 'passed'
 } catch {
@@ -443,20 +514,17 @@ if ($hyperframesCliHealth -eq 'passed') {
 if ($EnableFeishu) {
     Set-InstallProgress 'runtime.feishu'
     $feishuRoot = Join-Path $runtimeRoot 'feishu'
-    $feishuPackageJson = Join-Path $feishuRoot 'node_modules\@larksuiteoapi\lark-mcp\package.json'
-    $feishuCli = Join-Path $feishuRoot 'node_modules\@larksuiteoapi\lark-mcp\dist\cli.js'
-    # The CLI and package.json precede dependencies in the archive. Restore
-    # the whole closure only when Feishu is enabled for this installation.
-    Expand-Archive -LiteralPath $feishuZip -DestinationPath $feishuRoot -Force
-    if (-not (Test-Path -LiteralPath $feishuPackageJson -PathType Leaf) -or -not (Test-Path -LiteralPath $feishuCli -PathType Leaf)) { throw 'Feishu npm closure is incomplete after extraction.' }
-    $packageMetadata = Get-Content -LiteralPath $feishuPackageJson -Raw -Encoding UTF8 | ConvertFrom-Json
-    if ([string]$packageMetadata.name -ne '@larksuiteoapi/lark-mcp' -or [string]$packageMetadata.version -ne '0.5.1') { throw 'Extracted Feishu package does not match the locked version.' }
-    $mcpHelpResult = Invoke-NativeCapture -Executable $nodeExe -Arguments @($feishuCli,'mcp','--help')
-    $mcpHelp = $mcpHelpResult.Output
-    if ($mcpHelpResult.ExitCode -ne 0 -or $mcpHelp -notmatch 'Start Feishu/Lark MCP Service') { throw 'Offline Feishu MCP CLI health check failed.' }
-    $feishuHealth = 'passed'
+    try {
+        Restore-FeishuRuntime $feishuZip $nodeExe $feishuRoot
+        $feishuHealth = 'passed'
+    } catch {
+        $feishuHealth = 'install-failed'
+        $feishuError = $_.Exception.Message
+    }
 }
 
+Set-InstallProgress 'runtime.environment'
+$environmentWatch = [Diagnostics.Stopwatch]::StartNew()
 $binRoot = Join-Path $kitHome 'bin'
 $newline = [Environment]::NewLine
 Write-AsciiFile (Join-Path $binRoot 'python.cmd') ('@echo off' + $newline + '"%~dp0..\runtime\python-env\Scripts\python.exe" %*' + $newline)
@@ -475,20 +543,20 @@ if (Test-Path -LiteralPath $hyperframesCmd -PathType Leaf) {
 $actualUserProfile = [IO.Path]::GetFullPath([Environment]::GetEnvironmentVariable('USERPROFILE')).TrimEnd('\')
 $environmentApplied = $profileFull.Equals($actualUserProfile, [StringComparison]::OrdinalIgnoreCase)
 if ($environmentApplied) {
-    [Environment]::SetEnvironmentVariable('CODEX_AGENT_KIT_HOME', $kitHome, 'User')
-    [Environment]::SetEnvironmentVariable('CODEX_PYTHON', $venvPython, 'User')
-    [Environment]::SetEnvironmentVariable('CODEX_MANIM_PYTHON', $manimPython, 'User')
-    [Environment]::SetEnvironmentVariable('CODEX_NODE', $nodeExe, 'User')
-    [Environment]::SetEnvironmentVariable('CODEX_FFMPEG', $ffmpegExe, 'User')
-    [Environment]::SetEnvironmentVariable('CODEX_FFPROBE', $ffprobeExe, 'User')
-    if ($hyperframesCliHealth -eq 'passed') { [Environment]::SetEnvironmentVariable('CODEX_HYPERFRAMES', $hyperframesEntry, 'User') } else { [Environment]::SetEnvironmentVariable('CODEX_HYPERFRAMES', $null, 'User') }
-    if ($EnableFeishu) {
-        [Environment]::SetEnvironmentVariable('CODEX_FEISHU_PACKAGE_CACHE', $feishuRoot, 'User')
+    Set-UserEnvironmentIfChanged 'CODEX_AGENT_KIT_HOME' $kitHome
+    Set-UserEnvironmentIfChanged 'CODEX_PYTHON' $venvPython
+    Set-UserEnvironmentIfChanged 'CODEX_MANIM_PYTHON' $manimPython
+    Set-UserEnvironmentIfChanged 'CODEX_NODE' $nodeExe
+    Set-UserEnvironmentIfChanged 'CODEX_FFMPEG' $ffmpegExe
+    Set-UserEnvironmentIfChanged 'CODEX_FFPROBE' $ffprobeExe
+    if ($hyperframesCliHealth -eq 'passed') { Set-UserEnvironmentIfChanged 'CODEX_HYPERFRAMES' $hyperframesEntry } else { Set-UserEnvironmentIfChanged 'CODEX_HYPERFRAMES' $null }
+    if ($feishuHealth -eq 'passed') {
+        Set-UserEnvironmentIfChanged 'CODEX_FEISHU_PACKAGE_CACHE' $feishuRoot
     }
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
     $pathItems = @($userPath -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     if (-not @($pathItems | Where-Object { $_.TrimEnd('\').Equals($binRoot.TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase) }).Count) { $pathItems += $binRoot }
-    [Environment]::SetEnvironmentVariable('Path', ($pathItems -join ';'), 'User')
+    Set-UserEnvironmentIfChanged 'Path' ($pathItems -join ';')
     $env:CODEX_AGENT_KIT_HOME = $kitHome
     $env:CODEX_PYTHON = $venvPython
     $env:CODEX_MANIM_PYTHON = $manimPython
@@ -496,24 +564,26 @@ if ($environmentApplied) {
     $env:CODEX_FFMPEG = $ffmpegExe
     $env:CODEX_FFPROBE = $ffprobeExe
     if ($hyperframesCliHealth -eq 'passed') { $env:CODEX_HYPERFRAMES = $hyperframesEntry } else { Remove-Item Env:\CODEX_HYPERFRAMES -ErrorAction SilentlyContinue }
-    if ($EnableFeishu) {
+    if ($feishuHealth -eq 'passed') {
         $env:CODEX_FEISHU_PACKAGE_CACHE = $feishuRoot
     }
     $env:PATH = $binRoot + ';' + $env:PATH
 }
+$environmentApplyMs = $environmentWatch.ElapsedMilliseconds
 
 Set-InstallProgress 'runtime.complete'
 $runtimeState = [ordered]@{
     schemaVersion = 1
-    status = if ($hyperframesHealth -eq 'passed') { 'ready' } else { 'partial' }
+    status = if ($hyperframesHealth -eq 'passed' -and $feishuHealth -ne 'install-failed') { 'ready' } else { 'partial' }
     targetUserProfile = $profileFull
     environmentApplied = $environmentApplied
+    environmentApplyMs = $environmentApplyMs
     python = [ordered]@{ executable = $venvPython; baseInterpreter = $basePython; version = '3.12.10'; wheelCount = $wheelCount; health = 'passed' }
     manim = [ordered]@{ executable = $manimPython; command = (Join-Path $binRoot 'manim.cmd'); version = $manimVersion; health = 'passed'; latex = 'optional-not-installed' }
     node = [ordered]@{ executable = $nodeExe; version = $nodeVersion; health = $nodeHealth }
     ffmpeg = [ordered]@{ executable = $ffmpegExe; ffprobe = $ffprobeExe; version = $ffmpegVersionText; health = $ffmpegHealth; license = 'LGPL shared build' }
-    hyperframes = [ordered]@{ executable = $hyperframesEntry; command = if (Test-Path -LiteralPath $hyperframesCmd -PathType Leaf) { $hyperframesCmd } else { '' }; version = $hyperframesVersion; cliHealth = $hyperframesCliHealth; browserHealth = $hyperframesBrowserHealth; browserExecutable = $hyperframesBrowserExe; browserVersion = $hyperframesBrowserVersion; health = $hyperframesHealth; error = $hyperframesError }
-    feishu = [ordered]@{ packageRoot = $feishuRoot; package = '@larksuiteoapi/lark-mcp@0.5.1'; health = $feishuHealth }
+    hyperframes = [ordered]@{ executable = $hyperframesEntry; command = if (Test-Path -LiteralPath $hyperframesCmd -PathType Leaf) { $hyperframesCmd } else { '' }; version = $hyperframesVersion; cliHealth = $hyperframesCliHealth; browserHealth = $hyperframesBrowserHealth; browserExecutable = $hyperframesBrowserExe; browserVersion = $hyperframesBrowserVersion; browserCheckMs = $hyperframesBrowserCheckMs; health = $hyperframesHealth; error = $hyperframesError }
+    feishu = [ordered]@{ packageRoot = $feishuRoot; package = '@larksuiteoapi/lark-mcp@0.5.1'; health = $feishuHealth; error = $feishuError }
     paths = [ordered]@{ kitHome = $kitHome; runtimeRoot = $runtimeRoot; binRoot = $binRoot; wheelhouse = $wheelDir; manimEnvironment = $manimRoot; ffmpeg = $ffmpegRoot; hyperframes = $hyperframesRoot }
     secretsStored = $false
 }

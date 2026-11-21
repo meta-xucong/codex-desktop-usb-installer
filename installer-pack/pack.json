@@ -1,10 +1,10 @@
 {
   "schemaVersion": 2,
   "id": "codex-starter",
-  "version": "1.5.12",
+  "version": "1.5.15",
   "sourceCommit": "1ee1a9640175710fff52a3c98b0e6cf9fe459c09",
   "sourceCommitRole": "build-input",
-  "sourceTreeSha256": "beb3b80c6d8481592fd11c61b9642eb264f14ba7dedba5b82f13da14272bf49b",
+  "sourceTreeSha256": "c384b7f3a6235cabd24836f873bebfc0c10dd83ae94b2d2f002617f132654cc3",
   "sourceDate": "2026-10-06",
   "compatibleCodex": {
     "minCodexVersion": "0.144.0",

@@ -66,13 +66,16 @@ describe("ProgressScreen split Windows install progress", () => {
     localStorage.setItem("cam.lang", "zh-CN");
   });
 
-  function renderInstall(progress: DownloadProgress, installation: DownloadProgress) {
-    const download: DownloadProgress = {
+  function renderInstall(
+    progress: DownloadProgress,
+    installation: DownloadProgress,
+    download: DownloadProgress | null = {
       downloaded: 100,
       total: 100,
       source: "mirror.example",
       phase: "downloading",
-    };
+    },
+  ) {
     return render(
       <ThemeProvider>
         <I18nProvider>
@@ -138,6 +141,32 @@ describe("ProgressScreen split Windows install progress", () => {
     expect(installProgress.querySelector('[data-state="active"] .install-stage-fill')).toHaveStyle({
       width: "35%",
     });
+  });
+
+  it("finishes a download without a byte total once installation starts", () => {
+    renderInstall(
+      { downloaded: 0, total: 0, source: "", phase: "applying" },
+      { downloaded: 0, total: 0, source: "", phase: "applying" },
+      { downloaded: 256, total: 0, source: "mirror.example", phase: "downloading" },
+    );
+
+    const downloadProgress = screen.getByTestId("download-progress-bar");
+    expect(downloadProgress).toHaveAttribute("aria-valuenow", "100");
+    expect(downloadProgress).toHaveAttribute("aria-valuetext", "下载完成");
+    expect(downloadProgress.querySelector(".bar-fill")).toHaveStyle({ width: "100%" });
+    expect(downloadProgress.querySelector(".bar-fill")).not.toHaveClass("indeterminate");
+    expect(screen.getByText("正在安装能力包…")).toHaveClass("progress-activity");
+  });
+
+  it("keeps an unknown transfer animated while it is still downloading", () => {
+    const download: DownloadProgress = {
+      downloaded: 256, total: 0, source: "mirror.example", phase: "downloading",
+    };
+    renderInstall(download, { downloaded: 0, total: 0, source: "", phase: "preparing" }, download);
+
+    const downloadProgress = screen.getByTestId("download-progress-bar");
+    expect(downloadProgress).not.toHaveAttribute("aria-valuenow");
+    expect(downloadProgress.querySelector(".bar-fill")).toHaveClass("indeterminate");
   });
 
   it("holds at three of four steps while final health checks are running", () => {

@@ -201,21 +201,6 @@ fn win_network_config_for_settings() -> Result<codex_win_engine::NetworkConfig, 
     }
 }
 
-async fn require_usb_install_network() -> Result<(), AppError> {
-    let network = win_network_config_for_settings()?;
-    tauri::async_runtime::spawn_blocking(move || {
-        codex_win_engine::probe_https_reachable_with_network("https://404token.xyz/", &network)
-            .map(|_| ())
-            .map_err(|error| {
-                AppError::Engine(format!(
-                    "USB installation requires internet access to 404token; connect to the internet and retry. No installation changes were started. ({error})"
-                ))
-            })
-    })
-    .await
-    .map_err(|error| AppError::Internal(format!("join: {error}")))?
-}
-
 fn require_usb_install_account_binding() -> Result<(), AppError> {
     if !crate::app::usb_guard::guard_required() {
         return Ok(());
@@ -228,18 +213,10 @@ fn require_usb_install_account_binding() -> Result<(), AppError> {
     Ok(())
 }
 
-async fn require_usb_install_preflight() -> Result<(), AppError> {
-    // Authorization is checked at every mutation boundary. A gateway homepage
-    // probe cannot determine whether the verified local payload can install.
-    require_usb_install_account_binding()
-}
-
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsbInstallPreflightReport {
-    pub internet_available: bool,
     pub api_key_ready: bool,
-    pub has_existing_usb_managed_config: bool,
 }
 
 enum HistoricalReleaseNetwork {
@@ -1362,7 +1339,7 @@ pub async fn offline_payload_stage(
     }
     reject_uninstall_handoff(&state)?;
     crate::app::usb_guard::require_signed_codex_install_bundle("offline-payload-stage")?;
-    require_usb_install_preflight().await?;
+    require_usb_install_account_binding()?;
     let executable = std::env::current_exe()
         .map_err(|error| AppError::Internal(format!("无法确定安装器路径: {error}")))?;
     let expected_architecture = state.target.arch.as_str().to_string();
@@ -1380,8 +1357,7 @@ pub async fn offline_payload_stage(
     .map_err(Into::into)
 }
 
-/// Check network access and the signed API-key binding before the UI stages or
-/// installs any local payload. The mutating commands repeat both checks.
+/// Report the signed account binding for the local installation UI.
 #[tauri::command]
 pub async fn win_check_install_preflight(
     state: State<'_, ManagerState>,
@@ -1390,21 +1366,8 @@ pub async fn win_check_install_preflight(
         return Err(AppError::UnsupportedPlatform.into());
     }
     reject_uninstall_handoff(&state)?;
-    let internet_available = require_usb_install_network().await.is_ok();
-    let api_key_ready = require_usb_install_account_binding().is_ok();
-    let has_existing_usb_managed_config = if crate::app::usb_guard::guard_required() {
-        crate::app::usb_guard::local_data_paths()?
-            .codex_home
-            .join("config.toml")
-            .try_exists()
-            .map_err(|error| AppError::Engine(format!("读取受管 Codex 配置状态失败：{error}")))?
-    } else {
-        false
-    };
     Ok(UsbInstallPreflightReport {
-        internet_available,
-        api_key_ready,
-        has_existing_usb_managed_config,
+        api_key_ready: require_usb_install_account_binding().is_ok(),
     })
 }
 
@@ -3374,6 +3337,7 @@ pub async fn win_adopt(state: State<'_, ManagerState>) -> Result<WinInstallStatu
 /// surface to the UI after the blocking work finishes.
 #[tauri::command]
 pub async fn win_launch_codex(
+    app: AppHandle,
     state: State<'_, ManagerState>,
     locale: Option<String>,
 ) -> Result<(), CommandError> {
@@ -3384,15 +3348,11 @@ pub async fn win_launch_codex(
     // or applying startup compatibility changes. The guard remains live until
     // the selected launch path returns.
     let _op = begin_guard(&state, OperationKind::Launch)?;
-    if crate::app::usb_guard::guard_required() {
-        // Manager startup already performs the online revocation decision and
-        // starts the USB watchdog. Re-running start_for_manager here tears
-        // down and respawns that helper for every launch click, then the
-        // launch implementation performs the full signed-bundle check again.
-        // Keep this command boundary cheap and live; win_update::launch_codex
-        // repeats the signed bundle verification immediately before spawn.
-        crate::app::usb_guard::require_authorized()?;
-        let authorization = crate::app::usb_guard::current_status();
+    let usb = crate::app::usb_guard::guard_required();
+    if usb {
+        // Manager startup owns the online decision and watchdog. A click
+        // checks the live lease before focusing or starting the signed runtime.
+        let authorization = crate::app::usb_guard::authorized_status()?;
         if !authorization.codex_allowed {
             return Err(AppError::Engine(
                 authorization
@@ -3407,8 +3367,19 @@ pub async fn win_launch_codex(
     // A valid BOM-only file is backed up and repaired; all other parse errors
     // stay untouched and are returned to the UI instead of becoming a silent
     // no-window startup failure.
-    crate::app::codex_config_guard::ensure_user_config_ready()?;
-    crate::app::usb_host::ensure_ready()?;
+    let config = crate::app::codex_config_guard::validated_user_config()?;
+    #[cfg(windows)]
+    if usb && !crate::app::win_update::usb_appx_recovery_pending() {
+        if let Some(root) = crate::app::usb_guard::current_usb_codex_root() {
+            let home = crate::app::usb_guard::local_data_paths()?.codex_home;
+            let focused = codex_win_engine::sys::try_focus_live_usb_session(&root, &home, || {
+                crate::app::usb_guard::authorize_live_usb_focus(&root)?;
+                crate::app::usb_host::ensure_ready_for_open(Some(&config), false)
+            })?;
+            if focused { return Ok(()); }
+        }
+    }
+    crate::app::usb_host::ensure_ready_for_open(Some(&config), true)?;
     let persisted = PersistedAppSettings::load();
     let settings = windows_domain_settings_for_persisted(&state);
     let codex_locale = locale
@@ -3416,25 +3387,12 @@ pub async fn win_launch_codex(
         .map(str::trim)
         .filter(|locale| matches!(*locale, "zh-CN" | "zh-TW"))
         .map(str::to_owned);
-    let catalog_reload_marker = if persisted.codex_theme.is_some() {
-        crate::app::win_update::prepare_usb_model_catalog_for_theme_launch(&settings)?
+    let (before_codex, before_chatgpt) = if usb {
+        (crate::app::usb_guard::snapshot_usb_codex_entry_processes()?, Vec::new())
     } else {
-        None
+        (crate::app::usb_guard::snapshot_processes("Codex.exe"), crate::app::usb_guard::snapshot_processes("ChatGPT.exe"))
     };
-    let mut before_codex = crate::app::usb_guard::snapshot_processes("Codex.exe");
-    if crate::app::usb_guard::guard_required() {
-        before_codex.extend(crate::app::usb_guard::snapshot_usb_codex_entry_processes());
-    }
-    let before_chatgpt = crate::app::usb_guard::snapshot_processes("ChatGPT.exe");
-    // A pending catalog reload must use the normal USB launch transaction.
-    // The theme route can treat any listener on its fixed CDP port as success,
-    // even when that listener belongs to an unrelated local Codex instance.
-    // The normal route guarantees the authorized USB executable is launched;
-    // the saved theme resumes on the next launch.
-    if should_attempt_theme_codex_launch(
-        persisted.codex_theme.is_some(),
-        catalog_reload_marker.is_some(),
-    ) {
+    if !usb && persisted.codex_theme.is_some() {
         let themed = crate::app::codex_theme::launch_with_active_theme(
             &state.codex_theme,
             &persisted,
@@ -3442,9 +3400,6 @@ pub async fn win_launch_codex(
         )
         .await?;
         if themed {
-            crate::app::win_update::complete_usb_model_catalog_launch(
-                catalog_reload_marker.as_deref(),
-            );
             tauri::async_runtime::spawn_blocking(move || {
                 std::thread::sleep(std::time::Duration::from_millis(500));
                 crate::app::usb_guard::register_new_codex_processes(&before_codex, &before_chatgpt);
@@ -3452,8 +3407,12 @@ pub async fn win_launch_codex(
             return Ok(());
         }
     }
-    tauri::async_runtime::spawn_blocking(move || {
-        let result = crate::app::win_update::launch_codex(&settings, codex_locale.as_deref());
+    let saved_theme = persisted.codex_theme.as_deref().filter(|_| usb);
+    let has_saved_theme = saved_theme.is_some();
+    let theme = tauri::async_runtime::spawn_blocking(move || {
+        let result = crate::app::win_update::launch_codex_for_open(
+            &settings, codex_locale.as_deref(), has_saved_theme,
+        );
         if result.is_ok() {
             std::thread::sleep(std::time::Duration::from_millis(500));
             crate::app::usb_guard::register_new_codex_processes(&before_codex, &before_chatgpt);
@@ -3461,12 +3420,34 @@ pub async fn win_launch_codex(
         result
     })
     .await
-    .map_err(|e| AppError::Internal(format!("join: {e}")))?
-    .map_err(Into::into)
+    .map_err(|e| AppError::Internal(format!("join: {e}")))??;
+    if let Some(theme_ref) = saved_theme {
+        if let Some(notice) = saved_theme_notice(
+            theme, state.codex_theme.restore_on_open(&persisted, theme_ref),
+        ).await {
+            app.dialog().message(notice).title("Codex App 管理器").show(|_| {});
+        }
+    }
+    Ok(())
 }
 
-fn should_attempt_theme_codex_launch(has_theme: bool, catalog_reload_pending: bool) -> bool {
-    has_theme && !catalog_reload_pending
+#[cfg(all(test, windows))]
+mod session_preservation_tests;
+
+async fn saved_theme_notice(
+    theme: crate::app::win_update::ThemeOnOpen,
+    restore: impl std::future::Future<Output = Result<(), AppError>>,
+) -> Option<&'static str> {
+    use crate::app::win_update::ThemeOnOpen;
+    match theme {
+        ThemeOnOpen::Skip => return None,
+        ThemeOnOpen::Restore => match restore.await {
+            Ok(()) => return None,
+            Err(error) => log::warn!("could not restore the saved Codex theme: {error}"),
+        },
+        ThemeOnOpen::PortInUse => log::warn!("saved theme port unavailable before launch"),
+    }
+    Some("Codex 已打开，本次未能应用已保存的主题。你可以继续使用当前会话。")
 }
 
 /// Return the latest local USB guard snapshot.  The command is read-only and
@@ -3665,11 +3646,9 @@ pub async fn capability_pack_status(app: AppHandle) -> Result<CapabilityPackRepo
         .map_err(Into::into)
 }
 
-/// Install or repair the complete local capability pack.  All connection
-/// fields are opt-in; empty fields never enable Feishu, API adapters, or paid
-/// requests.  Secrets are passed to the child only for this invocation and,
-/// after a successful install, persisted to the current user's environment
-/// rather than to the USB package or Codex TOML.
+/// Install or repair the local capability pack, or save the existing Feishu
+/// connection. The default Feishu server can wait for credentials. Secrets
+/// are persisted to the current user's environment, outside Codex TOML.
 #[tauri::command]
 pub async fn install_capability_pack(
     app: AppHandle,
@@ -3771,7 +3750,7 @@ pub async fn win_perform_update(
     if crate::app::usb_guard::guard_required() {
         // Recheck immediately before the install path: the UI preflight and
         // background staging may have happened earlier or in another process.
-        require_usb_install_preflight().await?;
+        require_usb_install_account_binding()?;
     }
     let mut op = DetachedGuard::validate_tracked(&state, token)?;
     op.set_phase(OperationPhase::Preparing);
@@ -3936,7 +3915,7 @@ pub async fn win_install_historical_release(
     );
     if install_to_usb {
         crate::app::usb_guard::require_signed_codex_install_bundle("win-install-historical")?;
-        require_usb_install_preflight().await?;
+        require_usb_install_account_binding()?;
     } else {
         crate::app::usb_guard::require_signed_codex_bundle("win-install-historical")?;
     }
@@ -4898,7 +4877,7 @@ mod tests {
         install_root_from_picked_dir, invalidate_retained_pause_if_stale, is_usb_install_path,
         manager_update_matches_confirmation, normalize_windows_source_base,
         record_macos_policy_install_state, record_windows_policy_install_state,
-        should_attempt_theme_codex_launch, validate_historical_architecture_with_compatibility,
+        validate_historical_architecture_with_compatibility,
         validate_install_root_path, validated_custom_proxy_for_settings,
         HistoricalPolicyInstallState, INSTALL_LOCATION_PROBE_PREFIX,
     };
@@ -4913,6 +4892,7 @@ mod tests {
 
     #[test]
     fn catalog_reload_uses_normal_usb_launch_instead_of_fixed_port_theme_hot_attach() {
+        use crate::app::win_update::should_attempt_theme_codex_launch;
         assert!(!should_attempt_theme_codex_launch(true, true));
         assert!(should_attempt_theme_codex_launch(true, false));
         assert!(!should_attempt_theme_codex_launch(false, false));

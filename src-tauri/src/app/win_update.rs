@@ -737,7 +737,7 @@ fn detect_managed_codex(
 }
 
 fn is_current_usb_portable(installed: &InstalledWindowsCodex) -> bool {
-    if installed.source != "portable" || !usb_guard::guard_required() {
+    if installed.source != "portable" {
         return false;
     }
     usb_guard::current_usb_codex_root().is_some_and(|expected| {
@@ -839,15 +839,20 @@ where
     }
 }
 
-fn prepare_model_catalog_launch(
+pub(crate) fn pending_usb_catalog_reload() -> Result<Option<Vec<u8>>, AppError> {
+    crate::app::model_catalog::preflight_usb_catalog()?;
+    crate::app::model_catalog::restart_marker_snapshot_checked()
+}
+
+/// Only an explicit relaunch may close an existing process to load the catalog.
+pub(crate) fn prepare_model_catalog_relaunch(
     installed: &InstalledWindowsCodex,
     usb_mode: bool,
 ) -> Result<Option<Vec<u8>>, AppError> {
     if !usb_mode {
         return Ok(None);
     }
-    crate::app::model_catalog::preflight_usb_catalog()?;
-    let reload_marker = crate::app::model_catalog::restart_marker_snapshot_checked()?;
+    let reload_marker = pending_usb_catalog_reload()?;
     let root = Path::new(&installed.path);
     if reload_marker.is_some() {
         log::info!(
@@ -872,22 +877,6 @@ fn prepare_model_catalog_launch(
         |root| close_codex_gracefully_for_root(30, root).map_err(|error| error.to_string()),
     )?;
     Ok(reload_marker)
-}
-
-/// Prepare the same catalog reload boundary for the persisted-theme launch
-/// path, which otherwise bypasses `launch_codex` and may hot-apply onto an old
-/// single-instance Codex process.
-pub(crate) fn prepare_usb_model_catalog_for_theme_launch(
-    settings: &AppSettings,
-) -> Result<Option<Vec<u8>>, AppError> {
-    if !usb_guard::guard_required() {
-        return Ok(None);
-    }
-    let store = ProvenanceStore::load();
-    let installed = detect_managed_codex(settings, &store)
-        .ok_or_else(|| AppError::Engine("没有可打开的 Codex".to_string()))?;
-    let authorization = authorize_usb_codex_launch(&installed, "win-launch-theme-target")?;
-    prepare_model_catalog_launch(&installed, authorization.is_some())
 }
 
 pub(crate) fn complete_usb_model_catalog_launch(reload_marker: Option<&[u8]>) {
@@ -933,6 +922,9 @@ pub(crate) fn codex_launch_environment(
 
     let mut environment = codex_home.map(usb_runtime_environment).unwrap_or_default();
     environment.extend(crate::app::media_generation::usb_launch_environment());
+    if let Some(entry) = usb_guard::current_bundle_root().map(|root| root.join("CodexEntryShim.exe")) {
+        environment.push(("CODEX_USB_FEISHU_SETUP_ENTRY".into(), entry.to_string_lossy().into_owned()));
+    }
     environment
 }
 
@@ -967,7 +959,7 @@ pub(crate) fn append_usb_cua_helper_experiment_environment(
 }
 
 /// Apply USB-managed config changes after the engine has ruled out reuse and
-/// closed an unowned Codex core, immediately before creating a fresh process.
+/// verified that a fresh process can be launched.
 /// This keeps the write out of the active-app interval without relying on an
 /// installation-root process count that the launch engine does not use.
 pub(crate) fn prepare_usb_conversation_mode_for_launch(usb_mode: bool, codex_home: Option<&Path>) {
@@ -3085,45 +3077,37 @@ fn validate_fixed_msix_dependencies(
     Ok(())
 }
 
-fn appx_recovery_pending_at(backup_root: &Path) -> bool {
-    ["recovery.json", "recovery.json.bak"].iter().any(|name| {
-        // Absence must be positively known. Permission errors and unexpected
-        // filesystem objects cannot mean that data recovery is complete.
-        match std::fs::symlink_metadata(backup_root.join(name)) {
-            Ok(_) => true,
-            Err(error) => error.kind() != std::io::ErrorKind::NotFound,
-        }
-    })
+fn appx_recovery_pending_at(backup_root: Option<&Path>, program_root: &Path) -> bool {
+    let pending = backup_root.is_none_or(|root| {
+        ["recovery.json", "recovery.json.bak"].iter().any(|name| {
+            // A missing file is known absent. Other I/O errors leave recovery pending.
+            match std::fs::symlink_metadata(root.join(name)) {
+                Ok(_) => true,
+                Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+            }
+        })
+    });
+    // Modern portable installs supersede legacy AppX recovery. Inspect the
+    // program tree only when a pending journal could change the result.
+    pending && detect_portable_install(program_root).is_none()
 }
 
-fn usb_appx_recovery_pending() -> bool {
-    if !usb_guard::guard_required() {
+pub(crate) fn usb_appx_recovery_pending() -> bool {
+    let Some(program_root) = usb_guard::current_usb_codex_root() else {
         return false;
-    }
-    // v0.5.20+ portable USB installs do not use AppX data recovery. A stale
-    // v0.5.x journal must not block launching a fully present, verified program
-    // tree after migration away from WpSystem.
-    if usb_guard::current_usb_codex_root()
-        .as_deref()
-        .and_then(detect_portable_install)
-        .is_some()
-    {
-        return false;
-    }
-    std::env::var_os("LOCALAPPDATA")
-        .map(|local| {
-            appx_recovery_pending_at(
-                &PathBuf::from(local)
-                    .join("CodexAppxDataBackups")
-                    .join("OpenAI.Codex_2p2nqsd0c76g0"),
-            )
-        })
-        .unwrap_or(true)
+    };
+    let backups = std::env::var_os("LOCALAPPDATA").map(|local| {
+        PathBuf::from(local)
+            .join("CodexAppxDataBackups")
+            .join("OpenAI.Codex_2p2nqsd0c76g0")
+    });
+    appx_recovery_pending_at(backups.as_deref(), &program_root)
 }
 
 pub fn win_install_status(settings: &AppSettings) -> WinInstallStatus {
     let store = ProvenanceStore::load();
     let installed = detect_managed_codex(settings, &store);
+    let current_usb = installed.as_ref().is_some_and(is_current_usb_portable);
     let status = match &installed {
         None => "none",
         // Build-aware (matching the macOS path): a self-updated or path-reused
@@ -3131,7 +3115,7 @@ pub fn win_install_status(settings: &AppSettings) -> WinInstallStatus {
         // user is prompted to re-adopt rather than silently treated as managed.
         Some(codex)
             if store.is_managed_build(&codex.path, version_key(&codex.version))
-                || is_current_usb_portable(codex) =>
+                || current_usb =>
         {
             "managed"
         }
@@ -3141,7 +3125,7 @@ pub fn win_install_status(settings: &AppSettings) -> WinInstallStatus {
     WinInstallStatus {
         installed,
         status,
-        recovery_pending: usb_appx_recovery_pending(),
+        recovery_pending: !current_usb && usb_appx_recovery_pending(),
     }
 }
 
@@ -3275,6 +3259,66 @@ pub(crate) fn remember_usb_no_sandbox_compatibility(codex_version: &str) {
 /// never a stale MSIX that lingers behind a managed portable install.
 /// Fully-qualified engine call to avoid shadowing this function's name.
 pub fn launch_codex(settings: &AppSettings, codex_locale: Option<&str>) -> Result<(), AppError> {
+    launch_installed_codex(settings, codex_locale, false, false).map(|_| ())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ThemeOnOpen {
+    Skip,
+    Restore,
+    PortInUse,
+}
+
+pub(crate) fn should_attempt_theme_codex_launch(has_theme: bool, catalog_reload_pending: bool) -> bool {
+    has_theme && !catalog_reload_pending
+}
+
+/// Return None when Open focuses the current session. Only a successful fresh
+/// spawn can have read the pending catalog snapshot.
+pub(crate) fn open_with_catalog_snapshot(
+    installed: &InstalledWindowsCodex,
+    options: codex_win_engine::LaunchOptions,
+    marker: Option<&[u8]>,
+    has_saved_theme: bool,
+    before_spawn: impl FnOnce(),
+) -> Result<Option<codex_win_engine::CodexLaunchReport>, AppError> {
+    #[cfg(windows)]
+    if let Some(home) = options.codex_home.as_deref() {
+        if (marker.is_some() || has_saved_theme)
+            && codex_win_engine::focus_existing_usb_session(Path::new(&installed.path), home)
+                .map_err(engine_err)?
+        {
+            return Ok(None);
+        }
+    }
+    let mut applied_marker = None;
+    let report = codex_win_engine::launch_codex_with_options_and_before_spawn(
+        installed,
+        options,
+        || {
+            before_spawn();
+            applied_marker = marker;
+        },
+    )
+    .map_err(engine_err)?;
+    complete_usb_model_catalog_launch(applied_marker);
+    Ok(Some(report))
+}
+
+pub(crate) fn launch_codex_for_open(
+    settings: &AppSettings,
+    codex_locale: Option<&str>,
+    has_saved_theme: bool,
+) -> Result<ThemeOnOpen, AppError> {
+    launch_installed_codex(settings, codex_locale, has_saved_theme, true)
+}
+
+fn launch_installed_codex(
+    settings: &AppSettings,
+    codex_locale: Option<&str>,
+    has_saved_theme: bool,
+    ordinary_open: bool,
+) -> Result<ThemeOnOpen, AppError> {
     if usb_appx_recovery_pending() {
         return Err(AppError::Engine(
             "上次安装或数据恢复尚未完成，请先在 U 盘安装器中继续完成安装；恢复期间暂不启动 Codex，以免改写待恢复数据".into(),
@@ -3286,12 +3330,22 @@ pub fn launch_codex(settings: &AppSettings, codex_locale: Option<&str>) -> Resul
     // Bind the selected tree to the signed USB root before applying any
     // startup compatibility changes. The detection fallback may otherwise
     // select a previously registered portable install on the local disk.
-    let usb_authorization = authorize_usb_codex_launch(&installed, "win-launch-target")?;
+    let usb_authorization = if ordinary_open {
+        usb_guard::installed_launch_authorization()?
+    } else {
+        usb_guard::require_signed_codex_bundle("win-launch-target")?
+    };
+    if let Some(authorization) = &usb_authorization {
+        validate_usb_launch_target(&installed, &authorization.codex_root)?;
+    }
     let usb_mode = usb_authorization.is_some();
+    let codex_home = if usb_mode {
+        Some(usb_guard::local_data_paths()?.codex_home)
+    } else {
+        None
+    };
     let catalog_reload_marker = if usb_mode {
-        // Validate/recover the manager-owned model catalog before either launch
-        // path can close an existing window or run a Codex compatibility patch.
-        prepare_model_catalog_launch(&installed, true)?
+        pending_usb_catalog_reload()?
     } else {
         None
     };
@@ -3307,11 +3361,17 @@ pub fn launch_codex(settings: &AppSettings, codex_locale: Option<&str>) -> Resul
     }
     let path = &installed.path;
     log::info!("Windows launch Codex path={path}");
-    let codex_home = if usb_mode {
-        Some(usb_guard::local_data_paths()?.codex_home)
-    } else {
-        None
-    };
+    let mut theme = ThemeOnOpen::Skip;
+    if usb_mode && should_attempt_theme_codex_launch(has_saved_theme, catalog_reload_marker.is_some()) {
+        // A listener already present before this launch belongs to another instance.
+        theme = if std::net::TcpListener::bind((
+            std::net::Ipv4Addr::LOCALHOST, crate::app::codex_theme::THEME_CDP_PORT,
+        )).is_ok() {
+            ThemeOnOpen::Restore
+        } else {
+            ThemeOnOpen::PortInUse
+        };
+    }
     let launch_policy = if usb_mode {
         if usb_no_sandbox_compatibility_known(&installed.version) {
             codex_win_engine::PortableLaunchPolicy::UsbCompatibleNoSandbox
@@ -3339,7 +3399,7 @@ pub fn launch_codex(settings: &AppSettings, codex_locale: Option<&str>) -> Resul
         &mut launch_environment,
     )?;
     let prepare_home = codex_home.clone();
-    let report = codex_win_engine::launch_codex_with_options_and_before_spawn(
+    let Some(report) = open_with_catalog_snapshot(
         &installed,
         codex_win_engine::LaunchOptions {
             // A program tree on removable media must never replace itself in
@@ -3349,17 +3409,21 @@ pub fn launch_codex(settings: &AppSettings, codex_locale: Option<&str>) -> Resul
             environment: launch_environment,
             usb_integrity_transaction: usb_mode,
             require_usb_entry_overlay: direct_entry_required,
-            remote_debugging_port: codex_remote_debugging_port(cfg!(
-                feature = "usb-cdp-diagnostic"
-            )),
+            remote_debugging_port: if theme == ThemeOnOpen::Restore {
+                Some(crate::app::codex_theme::THEME_CDP_PORT)
+            } else {
+                codex_remote_debugging_port(cfg!(feature = "usb-cdp-diagnostic"))
+            },
             codex_home,
             locale_override: codex_locale.map(str::to_string),
             portable_launch_policy: launch_policy,
         },
+        catalog_reload_marker.as_deref(),
+        has_saved_theme,
         move || prepare_usb_conversation_mode_for_launch(usb_mode, prepare_home.as_deref()),
-    )
-    .map_err(|e| AppError::Engine(e.to_string()))?;
-    complete_usb_model_catalog_launch(catalog_reload_marker.as_deref());
+    )? else {
+        return Ok(ThemeOnOpen::Skip);
+    };
     if usb_mode && report.no_sandbox {
         remember_usb_no_sandbox_compatibility(&installed.version);
     }
@@ -3369,7 +3433,7 @@ pub fn launch_codex(settings: &AppSettings, codex_locale: Option<&str>) -> Resul
         report.usable_window_confirmed,
         report.no_sandbox
     );
-    Ok(())
+    Ok(theme)
 }
 
 fn codex_remote_debugging_port(diagnostic_launch: bool) -> Option<u16> {
@@ -4426,6 +4490,7 @@ mod tests {
 
     fn policy_msix_fixture(drive: &str, full_name: &str) -> InstalledWindowsCodex {
         InstalledWindowsCodex {
+            app_version_unavailable: false,
             path: format!(r"{drive}\WindowsApps\{full_name}"),
             version: "1.0.0.0".into(),
             arch: None,
@@ -4819,6 +4884,7 @@ mod tests {
     #[test]
     fn cross_machine_usb_uninstall_requires_exact_current_root_after_drive_change() {
         let installed = InstalledWindowsCodex {
+            app_version_unavailable: false,
             path: r"G:\kit\apps\Codex".into(),
             version: "26.1002.7124.0".into(),
             arch: Some("x64".into()),
@@ -4848,6 +4914,7 @@ mod tests {
     #[test]
     fn cross_machine_usb_uninstall_does_not_broaden_normal_manager_or_msix() {
         let mut installed = InstalledWindowsCodex {
+            app_version_unavailable: false,
             path: r"F:\kit\apps\Codex".into(),
             version: "26.1002.7124.0".into(),
             arch: Some("x64".into()),
@@ -4876,6 +4943,7 @@ mod tests {
     #[test]
     fn cross_machine_usb_uninstall_rejects_missing_or_failed_live_authorization() {
         let installed = InstalledWindowsCodex {
+            app_version_unavailable: false,
             path: r"F:\kit\apps\Codex".into(),
             version: "26.1002.7124.0".into(),
             arch: Some("x64".into()),
@@ -4989,6 +5057,7 @@ mod tests {
         let usb_root = std::path::Path::new(r"F:\bundle\apps\codex");
         let external = WinInstallStatus {
             installed: Some(InstalledWindowsCodex {
+                app_version_unavailable: false,
                 path: r"C:\Program Files\Codex".to_string(),
                 version: "1.0.0".to_string(),
                 arch: Some("x64".to_string()),
@@ -5004,6 +5073,7 @@ mod tests {
 
         let current_usb = WinInstallStatus {
             installed: Some(InstalledWindowsCodex {
+                app_version_unavailable: false,
                 path: usb_root.to_string_lossy().into_owned(),
                 version: "1.0.0".to_string(),
                 arch: Some("x64".to_string()),
@@ -5019,6 +5089,7 @@ mod tests {
 
         let managed_elsewhere = WinInstallStatus {
             installed: Some(InstalledWindowsCodex {
+                app_version_unavailable: false,
                 path: r"C:\Codex\apps\codex".to_string(),
                 version: "1.0.0".to_string(),
                 arch: Some("x64".to_string()),
@@ -5046,6 +5117,7 @@ mod tests {
     #[test]
     fn usb_volume_verification_requires_the_registered_package_volume() {
         let installed = InstalledWindowsCodex {
+            app_version_unavailable: false,
             path: r"F:\WindowsApps\OpenAI.Codex".to_string(),
             version: "26.825.5331.0".to_string(),
             arch: Some("x64".to_string()),
@@ -5513,17 +5585,24 @@ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  OpenAI.Codex_2
     #[test]
     fn recovery_status_distinguishes_pending_from_archived_evidence() {
         let root = temp_test_dir("pending-recovery");
-        assert!(!super::appx_recovery_pending_at(&root));
+        let program = root.join("Codex");
+        let pending = || super::appx_recovery_pending_at(Some(&root), &program);
+        assert!(!pending());
         std::fs::write(root.join("recovery-123.completed.json"), "archived").unwrap();
-        assert!(!super::appx_recovery_pending_at(&root));
+        assert!(!pending());
         let primary = root.join("recovery.json");
         std::fs::write(&primary, "{invalid or interrupted}").unwrap();
-        assert!(super::appx_recovery_pending_at(&root));
+        assert!(pending());
         std::fs::rename(&primary, root.join("recovery.json.bak")).unwrap();
-        assert!(super::appx_recovery_pending_at(&root));
+        assert!(pending());
         std::fs::remove_file(root.join("recovery.json.bak")).unwrap();
         std::fs::create_dir(&primary).unwrap();
-        assert!(super::appx_recovery_pending_at(&root));
+        assert!(pending());
+        assert!(super::appx_recovery_pending_at(None, &program));
+        std::fs::create_dir(&program).unwrap();
+        write_fake_portable_install(&program, "26.1111.2228.0");
+        assert!(!pending());
+        assert!(!super::appx_recovery_pending_at(None, &program));
         std::fs::remove_dir_all(root).unwrap();
     }
 }

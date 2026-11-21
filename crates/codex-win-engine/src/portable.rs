@@ -1,10 +1,11 @@
 use std::fs;
-use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use aho_corasick::AhoCorasick;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -380,34 +381,110 @@ fn requests_chinese_codex_locale(locale: Option<&str>) -> bool {
         .is_some_and(|locale| locale.to_ascii_lowercase().starts_with("zh"))
 }
 
-fn find_bytes_in_file(path: &Path, needle: &[u8]) -> io::Result<Option<u64>> {
-    if needle.is_empty() {
-        return Ok(Some(0));
+/// One read of the archive supplies the compatibility checks and patch locations.
+/// Fixed-width writes leave all other locations valid. Re-read only the portion
+/// where a write could have changed a match, including matches across its edges.
+struct AsarPatchScan<'a> {
+    path: &'a Path,
+    matcher: AhoCorasick,
+    patterns: Vec<&'static [u8]>,
+    offsets: Vec<Vec<u64>>,
+    overlap: usize,
+}
+
+impl<'a> AsarPatchScan<'a> {
+    fn read(path: &'a Path, patterns: Vec<&'static [u8]>) -> Result<Self, EngineError> {
+        Self::read_ranges(path, patterns, None)
     }
-    let finder = memchr::memmem::Finder::new(needle);
-    let file = fs::File::open(path)?;
-    let mut reader = BufReader::with_capacity(EXTRACTION_COPY_BUFFER_BYTES, file);
-    let mut carry = Vec::with_capacity(needle.len().saturating_sub(1));
-    let mut chunk = vec![0_u8; EXTRACTION_COPY_BUFFER_BYTES];
-    let mut file_offset = 0_u64;
-    loop {
-        let read = reader.read(&mut chunk)?;
-        if read == 0 {
-            return Ok(None);
+
+    fn read_ranges(path: &'a Path, mut patterns: Vec<&'static [u8]>, ranges: Option<Vec<Range<u64>>>) -> Result<Self, EngineError> {
+        patterns.sort_unstable();
+        patterns.dedup();
+        let matcher = AhoCorasick::new(&patterns).map_err(|error| {
+            EngineError::Msix(format!("prepare Codex ASAR patch search: {error}"))
+        })?;
+        let overlap = matcher.max_pattern_len().saturating_sub(1);
+        let mut file = fs::File::open(path)
+            .map_err(|error| io_err("open Codex app.asar for startup compatibility", error))?;
+        let mut buf = vec![0; EXTRACTION_COPY_BUFFER_BYTES + overlap];
+        let mut offsets = vec![Vec::new(); patterns.len()];
+        let ranges = match ranges {
+            Some(ranges) => ranges,
+            None => vec![0..file.metadata().map_err(|e| io_err("inspect Codex app.asar", e))?.len()],
+        };
+        for range in ranges {
+            file.seek(SeekFrom::Start(range.start)).map_err(|e| io_err("seek Codex patch member", e))?;
+            let mut reader = Read::by_ref(&mut file).take(range.end - range.start);
+            let mut read_total = range.start;
+            let mut carry = 0;
+            loop {
+                let read = reader
+                    .read(&mut buf[carry..])
+                    .map_err(|error| io_err("scan Codex app.asar for startup compatibility", error))?;
+                if read == 0 {
+                    break;
+                }
+                let populated = carry + read;
+                let base = read_total - carry as u64;
+                for hit in matcher.find_overlapping_iter(&buf[..populated]) {
+                    if hit.end() > carry {
+                        offsets[hit.pattern().as_usize()].push(base + hit.start() as u64);
+                    }
+                }
+                read_total += read as u64;
+                carry = overlap.min(populated);
+                buf.copy_within(populated - carry..populated, 0);
+            }
+            if read_total != range.end {
+                return Err(io_err("read complete Codex patch member", io::ErrorKind::UnexpectedEof));
+            }
         }
-        let carry_len = carry.len();
-        let mut haystack = Vec::with_capacity(carry_len + read);
-        haystack.extend_from_slice(&carry);
-        haystack.extend_from_slice(&chunk[..read]);
-        if let Some(index) = finder.find(&haystack) {
-            return Ok(Some(
-                file_offset.saturating_sub(carry_len as u64) + index as u64,
-            ));
+        Ok(Self {
+            path,
+            matcher,
+            patterns,
+            offsets,
+            overlap,
+        })
+    }
+
+    fn offsets(&self, needle: &[u8]) -> &[u64] {
+        let pattern = self
+            .patterns
+            .binary_search(&needle)
+            .expect("startup match patterns are registered before reading the archive");
+        &self.offsets[pattern]
+    }
+
+    fn find(&self, needle: &[u8]) -> Option<u64> {
+        self.offsets(needle).first().copied()
+    }
+
+    fn patch(&mut self, offset: u64, replacement: &[u8]) -> Result<(), EngineError> {
+        patch_asar_bytes_in_place(self.path, offset, replacement)?;
+        let end = offset + replacement.len() as u64;
+        let start = offset.saturating_sub(self.overlap as u64);
+        let mut file = fs::File::open(self.path)
+            .map_err(|error| io_err("open patched Codex app.asar", error))?;
+        file.seek(SeekFrom::Start(start))
+            .map_err(|error| io_err("seek patched Codex app.asar", error))?;
+        let mut buf = Vec::new();
+        file.take(end - start + self.overlap as u64)
+            .read_to_end(&mut buf)
+            .map_err(|error| io_err("read patched Codex app.asar range", error))?;
+        for (needle, positions) in self.patterns.iter().zip(&mut self.offsets) {
+            positions
+                .retain(|&position| position >= end || position + needle.len() as u64 <= offset);
         }
-        let keep = needle.len().saturating_sub(1).min(haystack.len());
-        carry.clear();
-        carry.extend_from_slice(&haystack[haystack.len() - keep..]);
-        file_offset = file_offset.saturating_add(read as u64);
+        for hit in self.matcher.find_overlapping_iter(&buf) {
+            let position = start + hit.start() as u64;
+            if position < end && start + hit.end() as u64 > offset {
+                let positions = &mut self.offsets[hit.pattern().as_usize()];
+                let index = positions.partition_point(|&existing| existing < position);
+                positions.insert(index, position);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -887,6 +964,13 @@ fn refresh_asar_file_integrity(
     let Some(target) = asar_integrity_target(app_asar, changed_offset, changed_len)? else {
         return Ok(());
     };
+    refresh_asar_integrity_target(app_asar, &target)
+}
+
+fn refresh_asar_integrity_target(
+    app_asar: &Path,
+    target: &AsarIntegrityTarget,
+) -> Result<(), EngineError> {
     let absolute_data_offset = target
         .data_offset
         .checked_add(target.file_offset)
@@ -2066,14 +2150,12 @@ fn patch_asar_bytes_in_place(
 }
 
 fn patch_first_fixed_width_call(
-    app_asar: &Path,
+    scan: &mut AsarPatchScan<'_>,
     call: &[u8],
     replacement_prefix: &[u8],
     label: &str,
 ) -> Result<bool, EngineError> {
-    let Some(offset) = find_bytes_in_file(app_asar, call)
-        .map_err(|error| EngineError::Io(format!("scan Codex app.asar for {label}: {error}")))?
-    else {
+    let Some(offset) = scan.find(call) else {
         return Ok(false);
     };
     if replacement_prefix.len() > call.len() {
@@ -2083,17 +2165,17 @@ fn patch_first_fixed_width_call(
     }
     let mut replacement = vec![b' '; call.len()];
     replacement[..replacement_prefix.len()].copy_from_slice(replacement_prefix);
-    patch_asar_bytes_in_place(app_asar, offset, &replacement)?;
+    scan.patch(offset, &replacement)?;
     log::info!(
         "portable Codex startup compatibility patch applied path={} offset={} reason={label}",
-        app_asar.display(),
+        scan.path.display(),
         offset
     );
     Ok(true)
 }
 
 fn patch_all_fixed_width_calls(
-    app_asar: &Path,
+    scan: &mut AsarPatchScan<'_>,
     call: &[u8],
     replacement_prefix: &[u8],
     label: &str,
@@ -2105,33 +2187,214 @@ fn patch_all_fixed_width_calls(
     }
     let replacement = fixed_width_patch_bytes(call, replacement_prefix);
     let mut patched = 0usize;
-    while let Some(offset) = find_bytes_in_file(app_asar, call)
-        .map_err(|error| EngineError::Io(format!("scan Codex app.asar for {label}: {error}")))?
-    {
-        patch_asar_bytes_in_place(app_asar, offset, &replacement)?;
+    while let Some(offset) = scan.find(call) {
+        scan.patch(offset, &replacement)?;
         patched += 1;
         log::info!(
             "portable Codex startup compatibility patch applied path={} offset={} reason={label}",
-            app_asar.display(),
+            scan.path.display(),
             offset
         );
     }
     Ok(patched)
 }
 
-fn patch_usb_onboarding_detail_mode(
-    app_asar: &Path,
-    usb_integrity_transaction: bool,
-) -> Result<bool, EngineError> {
-    if !usb_integrity_transaction {
-        return Ok(false);
-    }
-    Ok(patch_all_fixed_width_calls(
-        app_asar,
+const STARTUP_ASAR_PATCHES: &[(&[u8], &[u8], &str)] = &[
+    (
+        CODEX_ASAR_CUA_HELPER_RESOLVER_CALL,
+        CODEX_ASAR_CUA_HELPER_RESOLVER_REPLACEMENT,
+        "native-pipe-cua-helper-resolver",
+    ),
+    (
+        CODEX_ASAR_CUA_NOTIFY_UNWRAP_CALL,
+        CODEX_ASAR_CUA_NOTIFY_UNWRAP_REPLACEMENT,
+        "native-pipe-cua-notify-unwrap",
+    ),
+    (
+        CODEX_ASAR_FEATURE_STATE_PUBLISH_GUARD_CALL,
+        CODEX_ASAR_FEATURE_STATE_PUBLISH_GUARD_REPLACEMENT,
+        "feature-state-publish-browser-gate",
+    ),
+];
+
+const USB_STARTUP_ASAR_PATCHES: &[(&[u8], &[u8], &str)] = &[
+    (
+        CODEX_ASAR_USB_UI_MCP_DISCOVERY_CALL,
+        CODEX_ASAR_USB_UI_MCP_DISCOVERY_REPLACEMENT,
+        "usb-ui-mcp-discovery-await-reconcile",
+    ),
+    (
+        CODEX_ASAR_USB_MCP_DISCOVERY_SYNC_CALL,
+        CODEX_ASAR_USB_MCP_DISCOVERY_SYNC_REPLACEMENT,
+        "usb-mcp-discovery-await-reconcile",
+    ),
+    (
+        CODEX_ASAR_USB_DURABLE_LOGIN_CLASSIFY_CALL,
+        CODEX_ASAR_USB_DURABLE_LOGIN_CLASSIFY_REPLACEMENT,
+        "usb-durable-login-error-classification",
+    ),
+    (
+        CODEX_ASAR_USB_DURABLE_LOGIN_RECONNECT_CALL,
+        CODEX_ASAR_USB_DURABLE_LOGIN_RECONNECT_REPLACEMENT,
+        "usb-durable-login-reconnect-pause",
+    ),
+    (
+        CODEX_ASAR_USB_GATE_DIAGNOSTIC_LOG_CALL,
+        CODEX_ASAR_USB_GATE_DIAGNOSTIC_LOG_REPLACEMENT,
+        "usb-gate-source-v1",
+    ),
+    (
+        CODEX_ASAR_USB_INIT_DIAGNOSTIC_MARKERS_V2_HOOK,
+        CODEX_ASAR_USB_INIT_DIAGNOSTIC_MARKERS_V3_HOOK,
+        "usb-sdk-stage-scope-repair-v3",
+    ),
+    (
+        CODEX_ASAR_USB_INIT_DIAGNOSTIC_WRITER_V2,
+        CODEX_ASAR_USB_INIT_DIAGNOSTIC_WRITER_REPLACEMENT,
+        "usb-sdk-stage-writer-repair-v3",
+    ),
+    (
+        CODEX_ASAR_USB_INIT_DIAGNOSTIC_MARKERS_CALL,
+        CODEX_ASAR_USB_INIT_DIAGNOSTIC_MARKERS_REPLACEMENT,
+        "usb-sdk-stage-markers-v3",
+    ),
+    (
+        CODEX_ASAR_USB_INIT_DIAGNOSTIC_WRITER_CALL,
+        CODEX_ASAR_USB_INIT_DIAGNOSTIC_WRITER_REPLACEMENT,
+        "usb-sdk-stage-writer-v3",
+    ),
+    (
+        CODEX_ASAR_USB_EMPTY_INIT_REFRESH_CALL,
+        CODEX_ASAR_USB_EMPTY_INIT_REFRESH_REPLACEMENT,
+        "usb-sdk-empty-initial-values-refresh-v1",
+    ),
+    (
+        CODEX_ASAR_WORK_ROUTE_MODE_CALL,
+        CODEX_ASAR_WORK_ROUTE_MODE_REPLACEMENT,
+        "usb-404token-work-route-mode",
+    ),
+    (
         CODEX_ASAR_ONBOARDING_DETAIL_MODE_CALL,
         CODEX_ASAR_ONBOARDING_DETAIL_MODE_REPLACEMENT,
         "usb-onboarding-default-detail-mode",
-    )? > 0)
+    ),
+];
+
+const CONSOLE_ASAR_PATCH_SENTINELS: &[&[u8]] = &[
+    CODEX_ASAR_CONSOLE_SPAWN_SENTINEL,
+    CODEX_ASAR_CONSOLE_SPAWN_CWD_SENTINEL,
+    CODEX_ASAR_GENERIC_SPAWN_SENTINEL,
+];
+
+fn startup_fixed_width_patches(
+    usb: bool,
+) -> impl Iterator<Item = &'static (&'static [u8], &'static [u8], &'static str)> {
+    let usb_patches = if usb {
+        [
+            runtime_261111::PATCHES,
+            CODEX_ASAR_USB_IAB_VISIBILITY_PATCHES,
+            USB_STARTUP_ASAR_PATCHES,
+        ]
+    } else {
+        [&[][..]; 3]
+    };
+    STARTUP_ASAR_PATCHES
+        .iter()
+        .chain(usb_patches.into_iter().flatten())
+}
+
+// All original and applied startup probe locations in the 26.1111.21308
+// distribution. Unknown layouts use the existing full-archive scan.
+fn startup_member_ranges(path: &Path) -> Option<Vec<Range<u64>>> {
+    use crate::app_version::{
+        asar_entry_offset, asar_entry_size, find_asar_entry, read_asar_header,
+    };
+    const MEMBERS: &[(&str, u64)] = &[
+        (
+            ".vite/build/early-bootstrap-331-29198f5b57adf59a.js",
+            5619467,
+        ),
+        (
+            ".vite/build/early-bootstrap-631-cdfc1944212b0139.js",
+            1387000,
+        ),
+        (
+            ".vite/build/early-bootstrap-824-ffc2ffee98291049.js",
+            290196,
+        ),
+        (".vite/build/early-bootstrap.js", 600014),
+        ("webview/assets/async/184348.785cd418c1.js", 246956),
+        ("webview/assets/async/360659.6208f19229.js", 334242),
+        ("webview/assets/async/907538.0572f09d40.js", 8405699),
+    ];
+    let (file, header, base) = read_asar_header(fs::File::open(path).ok()?).ok()?;
+    let len = file.metadata().ok()?.len();
+    let mut ranges = Vec::with_capacity(MEMBERS.len());
+    for &(name, size) in MEMBERS {
+        let components: Vec<_> = name.split('/').collect();
+        let entry = find_asar_entry(&header, &components)?;
+        if asar_entry_size(entry)? != size {
+            return None;
+        }
+        let start = base.checked_add(asar_entry_offset(entry)?)?;
+        let end = start.checked_add(size)?;
+        if end > len {
+            return None;
+        }
+        ranges.push(start..end);
+    }
+    ranges.sort_unstable_by_key(|r| r.start);
+    if ranges.windows(2).any(|w| w[0].end > w[1].start) {
+        return None;
+    }
+    Some(ranges)
+}
+
+fn startup_asar_scan<'a>(
+    path: &'a Path,
+    usb: bool,
+    chinese: bool,
+    version: Option<&str>,
+) -> Result<AsarPatchScan<'a>, EngineError> {
+    let mut patterns = vec![
+        CODEX_ASAR_UPDATER_MARKER,
+        CODEX_ASAR_UPDATER_PATCH_PREFIX,
+        CODEX_ASAR_PACKAGE_FAMILY_CALL,
+        CODEX_ASAR_PACKAGE_FAMILY_PATCH_PREFIX,
+        CODEX_ASAR_NATIVE_PACKAGE_FAMILY_CALL,
+        CODEX_ASAR_NATIVE_PACKAGE_FAMILY_PATCH_PREFIX,
+    ];
+    patterns.extend(CODEX_ASAR_UPDATER_CALLS);
+    patterns.extend(CONSOLE_ASAR_PATCH_SENTINELS);
+    patterns.extend(
+        CODEX_ASAR_CONSOLE_SPAWN_CALLS
+            .iter()
+            .chain(CODEX_ASAR_GENERIC_SPAWN_CALLS)
+            .map(|&(call, _)| call),
+    );
+    patterns.extend(startup_fixed_width_patches(usb).map(|&(call, _, _)| call));
+    if usb {
+        // Only required patches use the replacement as evidence of compatibility.
+        patterns.extend(
+            runtime_261111::PATCHES
+                .iter()
+                .chain(CODEX_ASAR_USB_IAB_VISIBILITY_PATCHES)
+                .map(|&(_, replacement, _)| replacement),
+        );
+        patterns.extend([
+            CODEX_ASAR_CUA_HELPER_RESOLVER_REPLACEMENT,
+            CODEX_ASAR_CUA_NOTIFY_UNWRAP_REPLACEMENT,
+        ]);
+    }
+    if chinese {
+        patterns.extend(
+            CODEX_ASAR_I18N_CALLS
+                .iter()
+                .flat_map(|&(call, replacement)| [call, replacement]),
+        );
+    }
+    let ranges = if usb && version == Some("26.1111.21308") { startup_member_ranges(path) } else { None };
+    AsarPatchScan::read_ranges(path, patterns, ranges)
 }
 
 fn replace_once_in_member(member: &mut Vec<u8>, call: &[u8], replacement: &[u8]) -> bool {
@@ -2152,13 +2415,8 @@ fn fixed_width_patch_bytes(call: &[u8], replacement_prefix: &[u8]) -> Vec<u8> {
     replacement
 }
 
-fn patch_codex_console_spawn(app_asar: &Path) -> Result<bool, EngineError> {
-    // Read the archive once, use fast substring searches for each known shape,
-    // collect fixed-width edits from the original bytes, then apply only the
-    // small offsets that matched.
-    let bytes = fs::read(app_asar)
-        .map_err(|error| io_err("read Codex app.asar for console-silence patch", error))?;
-    let mut edits = Vec::<(usize, Vec<u8>, &'static str)>::new();
+fn patch_codex_console_spawn(scan: &mut AsarPatchScan<'_>) -> Result<bool, EngineError> {
+    let mut edits = Vec::<(u64, Vec<u8>, &'static str)>::new();
     for (label, calls) in [
         ("app-server-console-window", CODEX_ASAR_CONSOLE_SPAWN_CALLS),
         (
@@ -2172,21 +2430,19 @@ fn patch_codex_console_spawn(app_asar: &Path) -> Result<bool, EngineError> {
                     "portable Codex console patch is wider than the original call".to_string(),
                 ));
             }
-            let mut search_from = 0_usize;
-            let finder = memchr::memmem::Finder::new(call);
-            while search_from.saturating_add(call.len()) <= bytes.len() {
-                let Some(relative) = finder.find(&bytes[search_from..]) else {
-                    break;
-                };
-                let offset = search_from + relative;
+            let mut search_from = 0;
+            for &offset in scan.offsets(call) {
+                if offset < search_from {
+                    continue;
+                }
                 // Some of the shorter `env` forms are byte prefixes of the
                 // newer `env,cwd` forms.  Keep the longest shape when their
                 // ranges overlap; otherwise the second edit would overwrite
                 // the beginning of the more specific replacement and leave
                 // the cwd call unpatched.
                 let overlaps_existing = edits.iter().any(|(existing_offset, existing, _)| {
-                    let existing_end = existing_offset.saturating_add(existing.len());
-                    let new_end = offset.saturating_add(call.len());
+                    let existing_end = existing_offset + existing.len() as u64;
+                    let new_end = offset + call.len() as u64;
                     offset < existing_end && *existing_offset < new_end
                 });
                 if !overlaps_existing {
@@ -2194,46 +2450,50 @@ fn patch_codex_console_spawn(app_asar: &Path) -> Result<bool, EngineError> {
                     fixed[..replacement.len()].copy_from_slice(replacement);
                     edits.push((offset, fixed, label));
                 }
-                search_from = offset.saturating_add(call.len());
+                search_from = offset + call.len() as u64;
             }
         }
     }
 
     if !edits.is_empty() {
         for (offset, replacement, label) in edits {
-            patch_asar_bytes_in_place(app_asar, offset as u64, &replacement)?;
+            scan.patch(offset, &replacement)?;
             log::info!(
                 "portable Codex startup compatibility patch applied path={} offset={} reason={label}",
-                app_asar.display(),
+                scan.path.display(),
                 offset
             );
         }
         return Ok(true);
     }
 
-    let known_patches = [
-        CODEX_ASAR_CONSOLE_SPAWN_SENTINEL,
-        CODEX_ASAR_CONSOLE_SPAWN_CWD_SENTINEL,
-        CODEX_ASAR_GENERIC_SPAWN_SENTINEL,
-    ];
     let mut has_known_patch = false;
-    for needle in known_patches {
-        let mut search_from = 0usize;
-        let finder = memchr::memmem::Finder::new(needle);
-        while search_from.saturating_add(needle.len()) <= bytes.len() {
-            let Some(relative) = finder.find(&bytes[search_from..]) else {
-                break;
-            };
-            let offset = search_from + relative;
-            refresh_asar_file_integrity(app_asar, offset as u64, needle.len())?;
+    let mut refreshed_members: Vec<Range<u64>> = Vec::new();
+    for needle in CONSOLE_ASAR_PATCH_SENTINELS {
+        let mut search_from = 0;
+        for &offset in scan.offsets(needle) {
+            if offset < search_from {
+                continue;
+            }
             has_known_patch = true;
-            search_from = offset.saturating_add(needle.len());
+            search_from = offset + needle.len() as u64;
+            if refreshed_members
+                .iter()
+                .any(|member| offset >= member.start && search_from <= member.end)
+            {
+                continue;
+            }
+            if let Some(target) = asar_integrity_target(scan.path, offset, needle.len())? {
+                refresh_asar_integrity_target(scan.path, &target)?;
+                let start = target.data_offset + target.file_offset;
+                refreshed_members.push(start..start + target.file_size);
+            }
         }
     }
     if !has_known_patch {
         log::warn!(
             "portable Codex console spawn did not match a known console-silence patch shape path={}",
-            app_asar.display()
+            scan.path.display()
         );
     }
     Ok(false)
@@ -2289,39 +2549,44 @@ fn patch_console_subsystem_executable(path: &Path) -> Result<(bool, Option<u16>)
     if !is_regular_non_reparse_file(path)? {
         return Ok((false, None));
     }
-    let bytes = fs::read(path).map_err(|error| io_err("read Codex console sidecar", error))?;
-    if bytes.len() < 0x40 || &bytes[..2] != b"MZ" {
+    let mut file =
+        fs::File::open(path).map_err(|error| io_err("open Codex console sidecar", error))?;
+    let file_len = file
+        .metadata()
+        .map_err(|error| io_err("inspect Codex console sidecar length", error))?
+        .len();
+    let mut dos = [0u8; 0x40];
+    if file_len >= dos.len() as u64 {
+        file.read_exact(&mut dos)
+            .map_err(|error| io_err("read Codex console sidecar DOS header", error))?;
+    }
+    if &dos[..2] != b"MZ" {
         log::warn!(
             "portable Codex sidecar is not a PE image; leaving unchanged path={}",
             path.display()
         );
         return Ok((false, None));
     }
-    let nt_offset = read_u32_le(&bytes, 0x3c).map(|value| value as usize);
-    let Some(nt_offset) = nt_offset else {
-        return Ok((false, None));
-    };
-    let Some(signature) = bytes.get(nt_offset..nt_offset.saturating_add(4)) else {
-        return Ok((false, None));
-    };
-    if signature != b"PE\0\0" {
+    let nt_offset = u64::from(read_u32_le(&dos, 0x3c).expect("DOS header is fixed width"));
+    const SUBSYSTEM_IN_PE_HEADER: usize = 24 + 68;
+    let mut pe = [0u8; SUBSYSTEM_IN_PE_HEADER + 2];
+    if nt_offset + pe.len() as u64 > file_len {
         return Ok((false, None));
     }
-    let optional_size = read_u16_le(&bytes, nt_offset.saturating_add(20))
-        .map(usize::from)
-        .unwrap_or(0);
-    let optional_offset = nt_offset.saturating_add(24);
-    let subsystem_offset = optional_offset.saturating_add(68);
-    let optional_magic = read_u16_le(&bytes, optional_offset);
-    if !matches!(optional_magic, Some(0x10b | 0x20b))
-        || optional_size < 70
-        || subsystem_offset.saturating_add(2) > bytes.len()
-        || subsystem_offset.saturating_add(2) > optional_offset.saturating_add(optional_size)
-    {
+    file.seek(SeekFrom::Start(nt_offset))
+        .and_then(|_| file.read_exact(&mut pe))
+        .map_err(|error| io_err("read Codex console sidecar PE header", error))?;
+    if &pe[..4] != b"PE\0\0" {
+        return Ok((false, None));
+    }
+    let optional_size = read_u16_le(&pe, 20).unwrap_or_default();
+    let optional_magic = read_u16_le(&pe, 24);
+    if !matches!(optional_magic, Some(0x10b | 0x20b)) || optional_size < 70 {
         return Ok((false, None));
     }
 
-    let subsystem = read_u16_le(&bytes, subsystem_offset).unwrap_or_default();
+    let subsystem = read_u16_le(&pe, SUBSYSTEM_IN_PE_HEADER).unwrap_or_default();
+    drop(file);
     match subsystem {
         2 => Ok((false, Some(2))),
         3 => {
@@ -2329,7 +2594,7 @@ fn patch_console_subsystem_executable(path: &Path) -> Result<(bool, Option<u16>)
                 .write(true)
                 .open(path)
                 .map_err(|error| io_err("open Codex console sidecar for patch", error))?;
-            file.seek(SeekFrom::Start(subsystem_offset as u64))
+            file.seek(SeekFrom::Start(nt_offset + SUBSYSTEM_IN_PE_HEADER as u64))
                 .map_err(|error| io_err("seek Codex console sidecar subsystem", error))?;
             file.write_all(&2_u16.to_le_bytes())
                 .map_err(|error| io_err("write Codex console sidecar subsystem", error))?;
@@ -2359,12 +2624,10 @@ fn patch_console_subsystem_executables(
     let mut cua_node_subsystem = None;
     for name in CODEX_CONSOLE_SUBSYSTEM_EXECUTABLES {
         let path = resources.join(name);
-        if is_regular_non_reparse_file(&path)? {
-            let (sidecar_patched, subsystem) = patch_console_subsystem_executable(&path)?;
-            patched |= sidecar_patched;
-            if *name == "cua_node/bin/node.exe" {
-                cua_node_subsystem = subsystem;
-            }
+        let (sidecar_patched, subsystem) = patch_console_subsystem_executable(&path)?;
+        patched |= sidecar_patched;
+        if *name == "cua_node/bin/node.exe" {
+            cua_node_subsystem = subsystem;
         }
     }
     Ok((patched, cua_node_subsystem))
@@ -2614,22 +2877,31 @@ fn patch_codex_app_tools_mcp_config(
 /// patch. A window surviving startup cannot establish CUA/IAB compatibility.
 fn validate_required_usb_runtime_patches(
     install_root: &Path,
+    scan: Option<&AsarPatchScan<'_>>,
+    version: &str,
     require_applied: bool,
 ) -> Result<(), EngineError> {
-    let version = read_codex_app_version_from_install_root(install_root)
-        .unwrap_or_else(|| "unknown".to_string());
-    let incompatible = |label: &str| EngineError::RuntimeCompatibility(format!(
-        "版本 {version} 的必要补丁未{}：{label}；未完成 USB 兼容适配，请使用兼容的管理器",
-        if require_applied { "生效" } else { "匹配" },
-    ));
-    let asar = install_root.join("resources/app.asar");
-    if !asar.is_file() {
+    let incompatible = |label: &str| {
+        EngineError::RuntimeCompatibility(format!(
+            "版本 {version} 的必要补丁未{}：{label}；未完成 USB 兼容适配，请使用兼容的管理器",
+            if require_applied { "生效" } else { "匹配" },
+        ))
+    };
+    let Some(scan) = scan else {
         return Err(incompatible("app.asar"));
-    }
+    };
     let mut legacy = CODEX_ASAR_USB_IAB_VISIBILITY_PATCHES.to_vec();
     legacy.extend([
-        (CODEX_ASAR_CUA_HELPER_RESOLVER_CALL, CODEX_ASAR_CUA_HELPER_RESOLVER_REPLACEMENT, "cua-helper-resolver"),
-        (CODEX_ASAR_CUA_NOTIFY_UNWRAP_CALL, CODEX_ASAR_CUA_NOTIFY_UNWRAP_REPLACEMENT, "cua-notify-unwrap"),
+        (
+            CODEX_ASAR_CUA_HELPER_RESOLVER_CALL,
+            CODEX_ASAR_CUA_HELPER_RESOLVER_REPLACEMENT,
+            "cua-helper-resolver",
+        ),
+        (
+            CODEX_ASAR_CUA_NOTIFY_UNWRAP_CALL,
+            CODEX_ASAR_CUA_NOTIFY_UNWRAP_REPLACEMENT,
+            "cua-notify-unwrap",
+        ),
     ]);
     // Each row represents an existing consumer needed for the accepted USB
     // behavior. Alternate old entries are migrations of already-patched files.
@@ -2638,15 +2910,41 @@ fn validate_required_usb_runtime_patches(
         ("cua-notify-unwrap", &["cua-notify-unwrap"]),
         ("iab-command-await", &["iab-visibility-command-await"]),
         ("iab-host-return", &["iab-visibility-host-return"]),
-        ("iab-rendered-state-waiter", &["iab-visibility-existing-waiter"]),
-        ("iab-delegate-rendered-state", &["iab-visibility-forward-wait-flag"]),
-        ("iab-delegate-rendered-state", &["iab-visibility-wait-for-state", "iab-visibility-confirm-rendered-state"]),
-        ("iab-delegate-rendered-state", &["iab-visibility-explicit-panel-selection", "iab-visibility-show-owner-window"]),
-        ("iab-explicit-route-selection", &["iab-visibility-explicit-route-selection"]),
+        (
+            "iab-rendered-state-waiter",
+            &["iab-visibility-existing-waiter"],
+        ),
+        (
+            "iab-delegate-rendered-state",
+            &["iab-visibility-forward-wait-flag"],
+        ),
+        (
+            "iab-delegate-rendered-state",
+            &[
+                "iab-visibility-wait-for-state",
+                "iab-visibility-confirm-rendered-state",
+            ],
+        ),
+        (
+            "iab-delegate-rendered-state",
+            &[
+                "iab-visibility-explicit-panel-selection",
+                "iab-visibility-show-owner-window",
+            ],
+        ),
+        (
+            "iab-explicit-route-selection",
+            &["iab-visibility-explicit-route-selection"],
+        ),
     ];
     for (label, old_labels) in groups {
-        let mut candidates: Vec<_> = legacy.iter().filter(|(_, _, name)| old_labels.contains(name)).collect();
-        let newer = runtime_261111::PATCHES.iter().filter(|(_, _, name)| name == label);
+        let mut candidates: Vec<_> = legacy
+            .iter()
+            .filter(|(_, _, name)| old_labels.contains(name))
+            .collect();
+        let newer = runtime_261111::PATCHES
+            .iter()
+            .filter(|(_, _, name)| name == label);
         if version == "26.1111.21308" {
             candidates.splice(0..0, newer);
         } else {
@@ -2654,9 +2952,7 @@ fn validate_required_usb_runtime_patches(
         }
         let mut found = false;
         for (call, replacement, _) in candidates {
-            if (!require_applied && find_bytes_in_file(&asar, call).map_err(|e| io_err("read USB runtime patch input", e))?.is_some())
-                || find_bytes_in_file(&asar, replacement).map_err(|e| io_err("read USB runtime patch result", e))?.is_some()
-            {
+            if (!require_applied && scan.find(call).is_some()) || scan.find(replacement).is_some() {
                 found = true;
                 break;
             }
@@ -2667,11 +2963,15 @@ fn validate_required_usb_runtime_patches(
     }
     if version == "26.1111.21308" {
         for required in ["bootstrap-appdata", "onboarding-default-detail-mode"] {
-            let (before, after, label) = runtime_261111::PATCHES.iter()
-                .find(|(_, _, label)| *label == required).expect("known version-specific patch");
-            let applied = find_bytes_in_file(&asar, after).map_err(|e| io_err("read USB runtime patch", e))?.is_some();
-            let original = !require_applied && find_bytes_in_file(&asar, before).map_err(|e| io_err("read USB runtime input", e))?.is_some();
-            if !applied && !original { return Err(incompatible(label)); }
+            let (before, after, label) = runtime_261111::PATCHES
+                .iter()
+                .find(|(_, _, label)| *label == required)
+                .expect("known version-specific patch");
+            let applied = scan.find(after).is_some();
+            let original = !require_applied && scan.find(before).is_some();
+            if !applied && !original {
+                return Err(incompatible(label));
+            }
         }
     }
     let client = install_root.join("resources").join(CODEX_CUA_CLIENT_BASE);
@@ -2681,9 +2981,16 @@ fn validate_required_usb_runtime_patches(
     let client = fs::read_to_string(client).map_err(|e| io_err("read USB CUA capture patch", e))?;
     let supported = [
         (CODEX_CUA_CAPTURE_CALL, CODEX_CUA_CAPTURE_REPLACEMENT),
-        (CODEX_CUA_CAPTURE_261111_CALL, CODEX_CUA_CAPTURE_261111_REPLACEMENT),
-    ].iter().any(|(before, after)| client.matches(after).count() == 1
-        || (!require_applied && client.matches(before).count() == 1));
+        (
+            CODEX_CUA_CAPTURE_261111_CALL,
+            CODEX_CUA_CAPTURE_261111_REPLACEMENT,
+        ),
+    ]
+    .iter()
+    .any(|(before, after)| {
+        client.matches(after).count() == 1
+            || (!require_applied && client.matches(before).count() == 1)
+    });
     if !supported {
         return Err(incompatible("CUA screenshot activation"));
     }
@@ -2702,9 +3009,18 @@ pub(crate) fn ensure_portable_codex_startup_compatibility_with_usb_integrity_mod
     install_root: &Path,
     usb_integrity_transaction: bool,
 ) -> Result<bool, EngineError> {
+    prepare_portable_codex_launch(install_root, None, usb_integrity_transaction)
+}
+
+pub(crate) fn prepare_portable_codex_launch(
+    install_root: &Path,
+    locale: Option<&str>,
+    usb_integrity_transaction: bool,
+) -> Result<bool, EngineError> {
     ensure_portable_codex_startup_compatibility_with_runtime_root(
         install_root,
         install_root,
+        locale,
         usb_integrity_transaction,
     )
 }
@@ -2712,18 +3028,35 @@ pub(crate) fn ensure_portable_codex_startup_compatibility_with_usb_integrity_mod
 fn ensure_portable_codex_startup_compatibility_with_runtime_root(
     install_root: &Path,
     runtime_root: &Path,
+    locale: Option<&str>,
     usb_integrity_transaction: bool,
 ) -> Result<bool, EngineError> {
-    if usb_integrity_transaction {
-        validate_required_usb_runtime_patches(install_root, false)?;
+    let app_asar = install_root.join("resources/app.asar");
+    let chinese = requests_chinese_codex_locale(locale);
+    let version = usb_integrity_transaction.then(|| {
+        read_codex_app_version_from_install_root(install_root).unwrap_or_else(|| "unknown".into())
+    });
+    let mut scan = app_asar
+        .is_file()
+        .then(|| startup_asar_scan(&app_asar, usb_integrity_transaction, chinese, version.as_deref()))
+        .transpose()?;
+    if let Some(version) = &version {
+        validate_required_usb_runtime_patches(install_root, scan.as_ref(), version, false)?;
     }
-    let patched = ensure_portable_codex_startup_compatibility_inner(
+
+    let mut patched = ensure_portable_codex_startup_compatibility_inner(
         install_root,
         runtime_root,
         usb_integrity_transaction,
+        scan.as_mut(),
     )?;
-    if usb_integrity_transaction {
-        validate_required_usb_runtime_patches(install_root, true)?;
+    if let Some(version) = &version {
+        validate_required_usb_runtime_patches(install_root, scan.as_ref(), version, true)?;
+    }
+    if chinese {
+        if let Some(scan) = scan.as_mut() {
+            patched |= patch_codex_i18n(scan)?;
+        }
     }
     let integrity_patched =
         refresh_embedded_asar_integrity(install_root, usb_integrity_transaction)?;
@@ -2734,6 +3067,7 @@ fn ensure_portable_codex_startup_compatibility_inner(
     install_root: &Path,
     runtime_root: &Path,
     usb_integrity_transaction: bool,
+    scan: Option<&mut AsarPatchScan<'_>>,
 ) -> Result<bool, EngineError> {
     // The executable edit complements the ASAR `windowsHide` patch.  Both
     // run before the first portable launch and remain safe to repeat after an
@@ -2743,115 +3077,21 @@ fn ensure_portable_codex_startup_compatibility_inner(
     if usb_integrity_transaction {
         patched |= patch_codex_cua_foreground_capture(install_root)?;
     }
-    let app_asar = install_root.join("resources").join("app.asar");
-    if !app_asar.is_file() {
+    let Some(scan) = scan else {
         return Ok(patched);
-    }
+    };
 
     // This patch is independent from the unpackaged-MSIX updater patch below:
     // newer Codex builds can change or remove the updater bootstrap while the
     // app-server spawn remains the source of a visible console window.
-    patched |= patch_codex_console_spawn(&app_asar)?;
-    patched |= patch_all_fixed_width_calls(
-        &app_asar,
-        CODEX_ASAR_CUA_HELPER_RESOLVER_CALL,
-        CODEX_ASAR_CUA_HELPER_RESOLVER_REPLACEMENT,
-        "native-pipe-cua-helper-resolver",
-    )? > 0;
-    patched |= patch_all_fixed_width_calls(
-        &app_asar,
-        CODEX_ASAR_CUA_NOTIFY_UNWRAP_CALL,
-        CODEX_ASAR_CUA_NOTIFY_UNWRAP_REPLACEMENT,
-        "native-pipe-cua-notify-unwrap",
-    )? > 0;
-    patched |= patch_all_fixed_width_calls(
-        &app_asar,
-        CODEX_ASAR_FEATURE_STATE_PUBLISH_GUARD_CALL,
-        CODEX_ASAR_FEATURE_STATE_PUBLISH_GUARD_REPLACEMENT,
-        "feature-state-publish-browser-gate",
-    )? > 0;
-    if usb_integrity_transaction {
-        for (call, replacement, label) in runtime_261111::PATCHES {
-            patched |= patch_all_fixed_width_calls(&app_asar, call, replacement, label)? > 0;
-        }
-        for (call, replacement, label) in CODEX_ASAR_USB_IAB_VISIBILITY_PATCHES {
-            patched |= patch_all_fixed_width_calls(&app_asar, call, replacement, label)? > 0;
-        }
-        patched |= patch_all_fixed_width_calls(
-            &app_asar,
-            CODEX_ASAR_USB_UI_MCP_DISCOVERY_CALL,
-            CODEX_ASAR_USB_UI_MCP_DISCOVERY_REPLACEMENT,
-            "usb-ui-mcp-discovery-await-reconcile",
-        )? > 0;
-        patched |= patch_all_fixed_width_calls(
-            &app_asar,
-            CODEX_ASAR_USB_MCP_DISCOVERY_SYNC_CALL,
-            CODEX_ASAR_USB_MCP_DISCOVERY_SYNC_REPLACEMENT,
-            "usb-mcp-discovery-await-reconcile",
-        )? > 0;
-        patched |= patch_all_fixed_width_calls(
-            &app_asar,
-            CODEX_ASAR_USB_DURABLE_LOGIN_CLASSIFY_CALL,
-            CODEX_ASAR_USB_DURABLE_LOGIN_CLASSIFY_REPLACEMENT,
-            "usb-durable-login-error-classification",
-        )? > 0;
-        patched |= patch_all_fixed_width_calls(
-            &app_asar,
-            CODEX_ASAR_USB_DURABLE_LOGIN_RECONNECT_CALL,
-            CODEX_ASAR_USB_DURABLE_LOGIN_RECONNECT_REPLACEMENT,
-            "usb-durable-login-reconnect-pause",
-        )? > 0;
-        patched |= patch_all_fixed_width_calls(
-            &app_asar,
-            CODEX_ASAR_USB_GATE_DIAGNOSTIC_LOG_CALL,
-            CODEX_ASAR_USB_GATE_DIAGNOSTIC_LOG_REPLACEMENT,
-            "usb-gate-source-v1",
-        )? > 0;
-        patched |= patch_all_fixed_width_calls(
-            &app_asar,
-            CODEX_ASAR_USB_INIT_DIAGNOSTIC_MARKERS_V2_HOOK,
-            CODEX_ASAR_USB_INIT_DIAGNOSTIC_MARKERS_V3_HOOK,
-            "usb-sdk-stage-scope-repair-v3",
-        )? > 0;
-        patched |= patch_all_fixed_width_calls(
-            &app_asar,
-            CODEX_ASAR_USB_INIT_DIAGNOSTIC_WRITER_V2,
-            CODEX_ASAR_USB_INIT_DIAGNOSTIC_WRITER_REPLACEMENT,
-            "usb-sdk-stage-writer-repair-v3",
-        )? > 0;
-        patched |= patch_all_fixed_width_calls(
-            &app_asar,
-            CODEX_ASAR_USB_INIT_DIAGNOSTIC_MARKERS_CALL,
-            CODEX_ASAR_USB_INIT_DIAGNOSTIC_MARKERS_REPLACEMENT,
-            "usb-sdk-stage-markers-v3",
-        )? > 0;
-        patched |= patch_all_fixed_width_calls(
-            &app_asar,
-            CODEX_ASAR_USB_INIT_DIAGNOSTIC_WRITER_CALL,
-            CODEX_ASAR_USB_INIT_DIAGNOSTIC_WRITER_REPLACEMENT,
-            "usb-sdk-stage-writer-v3",
-        )? > 0;
-        patched |= patch_all_fixed_width_calls(
-            &app_asar,
-            CODEX_ASAR_USB_EMPTY_INIT_REFRESH_CALL,
-            CODEX_ASAR_USB_EMPTY_INIT_REFRESH_REPLACEMENT,
-            "usb-sdk-empty-initial-values-refresh-v1",
-        )? > 0;
-        patched |= patch_all_fixed_width_calls(
-            &app_asar,
-            CODEX_ASAR_WORK_ROUTE_MODE_CALL,
-            CODEX_ASAR_WORK_ROUTE_MODE_REPLACEMENT,
-            "usb-404token-work-route-mode",
-        )? > 0;
+    patched |= patch_codex_console_spawn(scan)?;
+    for (call, replacement, label) in startup_fixed_width_patches(usb_integrity_transaction) {
+        patched |= patch_all_fixed_width_calls(scan, call, replacement, label)? > 0;
     }
-    patched |= patch_usb_onboarding_detail_mode(&app_asar, usb_integrity_transaction)?;
 
     // Only touch a Codex archive that actually contains the package-identity
     // updater.  This keeps the patch scoped to the known failure mechanism.
-    if find_bytes_in_file(&app_asar, CODEX_ASAR_UPDATER_MARKER)
-        .map_err(|error| io_err("scan Codex app.asar for portable startup marker", error))?
-        .is_none()
-    {
+    if scan.find(CODEX_ASAR_UPDATER_MARKER).is_none() {
         return Ok(patched);
     }
 
@@ -2860,25 +3100,16 @@ fn ensure_portable_codex_startup_compatibility_inner(
     // and the updater follows its existing unsupported-package early return.
     // This avoids guessing a minified initializer name or touching unrelated
     // updater code, while preserving every ASAR offset.
-    if let Some(offset) =
-        find_bytes_in_file(&app_asar, CODEX_ASAR_NATIVE_PACKAGE_FAMILY_PATCH_PREFIX).map_err(
-            |error| {
-                io_err(
-                    "scan Codex app.asar for existing native package-family patch",
-                    error,
-                )
-            },
-        )?
-    {
+    if let Some(offset) = scan.find(CODEX_ASAR_NATIVE_PACKAGE_FAMILY_PATCH_PREFIX) {
         refresh_asar_file_integrity(
-            &app_asar,
+            scan.path,
             offset,
             CODEX_ASAR_NATIVE_PACKAGE_FAMILY_PATCH_PREFIX.len(),
         )?;
         return Ok(patched);
     }
     let native_calls_patched = patch_all_fixed_width_calls(
-        &app_asar,
+        scan,
         CODEX_ASAR_NATIVE_PACKAGE_FAMILY_CALL,
         CODEX_ASAR_NATIVE_PACKAGE_FAMILY_PATCH_PREFIX,
         "unpackaged-native-package-family-query",
@@ -2887,20 +3118,9 @@ fn ensure_portable_codex_startup_compatibility_inner(
         return Ok(true);
     }
 
-    // Check the fixed-width package-query sentinel before scanning for the
-    // original call.  This keeps subsequent launches bounded to the first few
-    // megabytes of app.asar instead of repeatedly reading the whole archive
-    // from a slow removable drive.
-    if let Some(offset) = find_bytes_in_file(&app_asar, CODEX_ASAR_PACKAGE_FAMILY_PATCH_PREFIX)
-        .map_err(|error| {
-            io_err(
-                "scan Codex app.asar for existing package-family patch",
-                error,
-            )
-        })?
-    {
+    if let Some(offset) = scan.find(CODEX_ASAR_PACKAGE_FAMILY_PATCH_PREFIX) {
         refresh_asar_file_integrity(
-            &app_asar,
+            scan.path,
             offset,
             CODEX_ASAR_PACKAGE_FAMILY_PATCH_PREFIX.len(),
         )?;
@@ -2908,7 +3128,7 @@ fn ensure_portable_codex_startup_compatibility_inner(
     }
 
     let updater_patched = patch_first_fixed_width_call(
-        &app_asar,
+        scan,
         CODEX_ASAR_PACKAGE_FAMILY_CALL,
         CODEX_ASAR_PACKAGE_FAMILY_PATCH_PREFIX,
         "unpackaged-msix-package-family-query",
@@ -2917,8 +3137,7 @@ fn ensure_portable_codex_startup_compatibility_inner(
 
     // The unguarded bootstrap query is the failure that prevents an unpackaged
     // Codex process from reaching its main window. Once it is repaired there
-    // is no reason to scan the rest of a 300+ MB archive for an optional,
-    // older updater initializer.
+    // is no reason to change the optional older updater initializer.
     // Do not use the aggregate `patched` value here. Console-spawn, locale,
     // or executable-subsystem edits are independent from this updater fix;
     // an unrelated earlier edit must not skip the package-dependent bootstrap.
@@ -2926,29 +3145,18 @@ fn ensure_portable_codex_startup_compatibility_inner(
         return Ok(true);
     }
 
-    // A patched updater call is detected without rebuilding the archive on
-    // every launch; the minified bootstrap call is near the beginning of the
-    // archive and the exact sentinel is unique to this compatibility patch.
-    if let Some(offset) = find_bytes_in_file(&app_asar, b"await 0/*USB*/;")
-        .map_err(|error| io_err("scan Codex app.asar for existing startup patch", error))?
-    {
-        refresh_asar_file_integrity(&app_asar, offset, CODEX_ASAR_UPDATER_PATCH_PREFIX.len())?;
+    if let Some(offset) = scan.find(CODEX_ASAR_UPDATER_PATCH_PREFIX) {
+        refresh_asar_file_integrity(scan.path, offset, CODEX_ASAR_UPDATER_PATCH_PREFIX.len())?;
         return Ok(patched);
     }
 
-    let mut updater_call = None;
-    for call in CODEX_ASAR_UPDATER_CALLS {
-        if let Some(offset) = find_bytes_in_file(&app_asar, call)
-            .map_err(|error| io_err("scan Codex app.asar for updater initialization", error))?
-        {
-            updater_call = Some((offset, call.len()));
-            break;
-        }
-    }
+    let updater_call = CODEX_ASAR_UPDATER_CALLS
+        .iter()
+        .find_map(|call| scan.find(call).map(|offset| (offset, call.len())));
     let Some((offset, call_len)) = updater_call else {
         log::warn!(
             "portable Codex package-identity updater marker is present but the expected bootstrap call was not found path={}",
-            app_asar.display()
+            scan.path.display()
         );
         return Ok(patched);
     };
@@ -2961,11 +3169,11 @@ fn ensure_portable_codex_startup_compatibility_inner(
     let mut replacement = vec![b' '; call_len];
     replacement[..CODEX_ASAR_UPDATER_PATCH_PREFIX.len()]
         .copy_from_slice(CODEX_ASAR_UPDATER_PATCH_PREFIX);
-    patch_asar_bytes_in_place(&app_asar, offset, &replacement)?;
+    scan.patch(offset, &replacement)?;
     patched = true;
     log::info!(
         "portable Codex startup compatibility patch applied path={} offset={} reason=unpackaged-msix-updater",
-        app_asar.display(),
+        scan.path.display(),
         offset
     );
     Ok(patched)
@@ -2988,55 +3196,40 @@ pub fn ensure_portable_codex_locale_compatibility(
     if !requests_chinese_codex_locale(locale) {
         return Ok(false);
     }
-    let patched = ensure_portable_codex_locale_compatibility_inner(install_root, locale)?;
+    let app_asar = install_root.join("resources").join("app.asar");
+    if !app_asar.is_file() {
+        return Ok(false);
+    }
+    let patterns = CODEX_ASAR_I18N_CALLS
+        .iter()
+        .flat_map(|&(call, replacement)| [call, replacement])
+        .collect();
+    let mut scan = AsarPatchScan::read(&app_asar, patterns)?;
+    let patched = patch_codex_i18n(&mut scan)?;
     let integrity_patched =
         refresh_embedded_asar_integrity(install_root, usb_integrity_transaction)?;
     Ok(patched || integrity_patched)
 }
 
-fn ensure_portable_codex_locale_compatibility_inner(
-    install_root: &Path,
-    locale: Option<&str>,
-) -> Result<bool, EngineError> {
-    if !requests_chinese_codex_locale(locale) {
-        return Ok(false);
-    }
-    let app_asar = install_root.join("resources").join("app.asar");
-    if !app_asar.is_file() {
-        return Ok(false);
-    }
-
+fn patch_codex_i18n(scan: &mut AsarPatchScan<'_>) -> Result<bool, EngineError> {
     for (call, replacement) in CODEX_ASAR_I18N_CALLS {
         if call.len() != replacement.len() {
             return Err(EngineError::Msix(
                 "portable Codex i18n patch changed ASAR width".to_string(),
             ));
         }
-        if find_bytes_in_file(&app_asar, call)
-            .map_err(|error| io_err("scan Codex app.asar for i18n fallback", error))?
-            .is_some()
-        {
-            let patched = patch_first_fixed_width_call(
-                &app_asar,
-                call,
-                replacement,
-                "bundled-i18n-default-fallback",
-            )?;
-            if patched {
-                return Ok(true);
-            }
+        if patch_first_fixed_width_call(scan, call, replacement, "bundled-i18n-default-fallback")? {
+            return Ok(true);
         }
-        if let Some(offset) = find_bytes_in_file(&app_asar, replacement)
-            .map_err(|error| io_err("scan Codex app.asar for existing i18n patch", error))?
-        {
-            refresh_asar_file_integrity(&app_asar, offset, replacement.len())?;
+        if let Some(offset) = scan.find(replacement) {
+            refresh_asar_file_integrity(scan.path, offset, replacement.len())?;
             return Ok(false);
         }
     }
 
     log::warn!(
         "portable Codex Chinese locale requested but no compatible enable_i18n fallback was found path={}",
-        app_asar.display()
+        scan.path.display()
     );
     Ok(false)
 }
@@ -3657,7 +3850,7 @@ pub fn installed_usb_codex_launch_exe(install_root: &Path) -> Result<PathBuf, En
 
 /// Resolve a portable entry from a validated USB context without making the
 /// direct-entry overlay mandatory. Legacy schema 2 bundles use this path.
-pub(crate) fn installed_codex_launch_exe_for_usb_mode(
+pub fn installed_codex_launch_exe_for_usb_mode(
     install_root: &Path,
 ) -> Result<PathBuf, EngineError> {
     installed_codex_launch_exe_with_usb_gate(install_root, false, true)
@@ -4143,6 +4336,7 @@ fn prepare_portable_payload(
     if let Err(error) = ensure_portable_codex_startup_compatibility_with_runtime_root(
         &payload,
         runtime_root,
+        None,
         usb_entry_shim.is_some(),
     ) {
         // A USB install must not commit until its required runtime patches and
@@ -5590,18 +5784,41 @@ mod tests {
         dir
     }
 
+    fn patch_startup_fixture(root: &Path, usb: bool) -> Result<bool, EngineError> {
+        let path = root.join("resources/app.asar");
+        let mut scan = path
+            .is_file()
+            .then(|| startup_asar_scan(&path, usb, false, None))
+            .transpose()?;
+        ensure_portable_codex_startup_compatibility_inner(root, root, usb, scan.as_mut())
+    }
+
+    fn validate_usb_runtime_fixture(root: &Path, applied: bool) -> Result<(), EngineError> {
+        let path = root.join("resources/app.asar");
+        let scan = startup_asar_scan(&path, true, false, None)?;
+        let version =
+            read_codex_app_version_from_install_root(root).unwrap_or_else(|| "unknown".into());
+        validate_required_usb_runtime_patches(root, Some(&scan), &version, applied)
+    }
+
     #[test]
     fn byte_search_finds_matches_crossing_the_read_buffer_boundary() {
         let root = temp_test_dir("byte-search-boundary");
         let path = root.join("archive.bin");
-        let mut bytes = vec![b'x'; EXTRACTION_COPY_BUFFER_BYTES - 3];
+        let offset = (EXTRACTION_COPY_BUFFER_BYTES - 3) as u64;
+        let mut bytes = vec![b'x'; offset as usize];
+        bytes.extend_from_slice(b"boundary-marker");
+        let second = bytes.len() as u64;
         bytes.extend_from_slice(b"boundary-marker");
         fs::write(&path, bytes).unwrap();
 
-        assert_eq!(
-            find_bytes_in_file(&path, b"boundary-marker").unwrap(),
-            Some((EXTRACTION_COPY_BUFFER_BYTES - 3) as u64)
-        );
+        let mut scan =
+            AsarPatchScan::read(&path, vec![b"boundary-marker", b"marker", b"new-marker"]).unwrap();
+        assert_eq!(scan.offsets(b"boundary-marker"), &[offset, second]);
+        scan.patch(offset + 5, b"new").unwrap();
+        assert_eq!(scan.offsets(b"boundary-marker"), &[second]);
+        assert_eq!(scan.offsets(b"new-marker"), &[offset + 5]);
+        assert_eq!(scan.offsets(b"marker"), &[offset + 9, second + 9]);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -5851,6 +6068,27 @@ mod tests {
             .get_or_init(|| Mutex::new(()))
             .lock()
             .expect("test environment lock")
+    }
+
+    #[test]
+    #[ignore = "requires original and installed Windows 26.1111.21308 ASARs"]
+    fn actual_261111_member_index_matches_full_scan() {
+        for var in ["USB_TEST_ORIGINAL_ASAR", "USB_TEST_APPLIED_ASAR"] {
+            let path = PathBuf::from(std::env::var_os(var).unwrap());
+            let full = startup_asar_scan(&path, true, true, None).unwrap();
+            let ranges = startup_member_ranges(&path).unwrap();
+            let bytes: u64 = ranges.iter().map(|r| r.end - r.start).sum();
+            let start = Instant::now();
+            let scoped = startup_asar_scan(&path, true, true, Some("26.1111.21308")).unwrap();
+            assert_eq!(full.patterns, scoped.patterns);
+            assert_eq!(full.offsets, scoped.offsets);
+            println!(
+                "{var}: {} patterns, {} members, {bytes} bytes, {:?}",
+                scoped.patterns.len(),
+                ranges.len(),
+                start.elapsed()
+            );
+        }
     }
 
     #[test]
@@ -6717,12 +6955,12 @@ mod tests {
         }
         fs::write(&app_asar, &fixture).unwrap();
 
-        assert!(!ensure_portable_codex_startup_compatibility_inner(&root, &root, false).unwrap());
+        assert!(!patch_startup_fixture(&root, false).unwrap());
         assert_eq!(fs::read(&app_asar).unwrap(), fixture);
-        assert!(ensure_portable_codex_startup_compatibility_inner(&root, &root, true).unwrap());
+        assert!(patch_startup_fixture(&root, true).unwrap());
         assert_eq!(expected.len(), fixture.len());
         assert_eq!(fs::read(&app_asar).unwrap(), expected);
-        assert!(!ensure_portable_codex_startup_compatibility_inner(&root, &root, true).unwrap());
+        assert!(!patch_startup_fixture(&root, true).unwrap());
         assert_eq!(fs::read(&app_asar).unwrap(), expected);
     }
 
@@ -6740,9 +6978,9 @@ mod tests {
         fixture.extend_from_slice(CODEX_ASAR_USB_INIT_DIAGNOSTIC_WRITER_V2);
         fs::write(&app_asar, &fixture).unwrap();
 
-        assert!(!ensure_portable_codex_startup_compatibility_inner(&root, &root, false).unwrap());
+        assert!(!patch_startup_fixture(&root, false).unwrap());
         assert_eq!(fs::read(&app_asar).unwrap(), fixture);
-        assert!(ensure_portable_codex_startup_compatibility_inner(&root, &root, true).unwrap());
+        assert!(patch_startup_fixture(&root, true).unwrap());
         let repaired = fs::read(&app_asar).unwrap();
         assert_eq!(repaired.len(), fixture.len());
         assert!(!repaired.windows(b"e===n1l".len()).any(|part| part == b"e===n1l"));
@@ -6750,7 +6988,7 @@ mod tests {
             .filter(|part| *part == CODEX_ASAR_USB_INIT_DIAGNOSTIC_MARKERS_V3_HOOK).count(), 2);
         assert!(repaired.windows(CODEX_ASAR_USB_INIT_DIAGNOSTIC_WRITER_REPLACEMENT.len())
             .any(|part| part == CODEX_ASAR_USB_INIT_DIAGNOSTIC_WRITER_REPLACEMENT));
-        assert!(!ensure_portable_codex_startup_compatibility_inner(&root, &root, true).unwrap());
+        assert!(!patch_startup_fixture(&root, true).unwrap());
         assert_eq!(fs::read(&app_asar).unwrap(), repaired);
     }
 
@@ -6765,9 +7003,9 @@ mod tests {
         fixture.extend_from_slice(CODEX_ASAR_USB_EMPTY_INIT_REFRESH_CALL);
         fs::write(&app_asar, &fixture).unwrap();
 
-        assert!(!ensure_portable_codex_startup_compatibility_inner(&root, &root, false).unwrap());
+        assert!(!patch_startup_fixture(&root, false).unwrap());
         assert_eq!(fs::read(&app_asar).unwrap(), fixture);
-        assert!(ensure_portable_codex_startup_compatibility_inner(&root, &root, true).unwrap());
+        assert!(patch_startup_fixture(&root, true).unwrap());
         let patched = fs::read(&app_asar).unwrap();
         assert_eq!(patched.len(), fixture.len());
         assert_eq!(
@@ -6777,7 +7015,7 @@ mod tests {
                 .count(),
             2
         );
-        assert!(!ensure_portable_codex_startup_compatibility_inner(&root, &root, true).unwrap());
+        assert!(!patch_startup_fixture(&root, true).unwrap());
         assert_eq!(fs::read(&app_asar).unwrap(), patched);
     }
 
@@ -6844,16 +7082,17 @@ mod tests {
         }
 
         let root = temp_test_dir("codex-usb-onboarding-detail-mode-patch");
-        let app_asar = root.join("app.asar");
+        let app_asar = root.join("resources/app.asar");
+        fs::create_dir_all(app_asar.parent().unwrap()).unwrap();
         let mut fixture = b"prefix:".to_vec();
         fixture.extend_from_slice(CODEX_ASAR_ONBOARDING_DETAIL_MODE_CALL);
         fixture.extend_from_slice(b":suffix");
         fs::write(&app_asar, &fixture).unwrap();
 
-        assert!(!patch_usb_onboarding_detail_mode(&app_asar, false).unwrap());
+        assert!(!patch_startup_fixture(&root, false).unwrap());
         assert_eq!(fs::read(&app_asar).unwrap(), fixture);
 
-        assert!(patch_usb_onboarding_detail_mode(&app_asar, true).unwrap());
+        assert!(patch_startup_fixture(&root, true).unwrap());
         let patched = fs::read(&app_asar).unwrap();
         assert_eq!(patched.len(), fixture.len());
         assert!(patched
@@ -6890,14 +7129,14 @@ mod tests {
             expected.push(b'\n');
         }
         fs::write(&path, &original).unwrap();
-        assert!(!ensure_portable_codex_startup_compatibility_inner(&root, &root, false).unwrap());
+        assert!(!patch_startup_fixture(&root, false).unwrap());
         assert_eq!(fs::read(&path).unwrap(), original);
-        assert!(ensure_portable_codex_startup_compatibility_inner(&root, &root, true).unwrap());
+        assert!(patch_startup_fixture(&root, true).unwrap());
         assert_eq!(fs::read(&path).unwrap(), expected);
-        assert!(!ensure_portable_codex_startup_compatibility_inner(&root, &root, true).unwrap());
+        assert!(!patch_startup_fixture(&root, true).unwrap());
         assert_eq!(fs::read(&path).unwrap(), expected);
         fs::write(&path, b"unmatched upstream startup shape").unwrap();
-        assert!(!ensure_portable_codex_startup_compatibility_inner(&root, &root, true).unwrap());
+        assert!(!patch_startup_fixture(&root, true).unwrap());
         assert_eq!(fs::read(&path).unwrap(), b"unmatched upstream startup shape");
         let _ = fs::remove_dir_all(root);
     }
@@ -6969,8 +7208,8 @@ mod tests {
         for new_version in [false, true] {
             for applied in [false, true] {
                 let root = required_usb_patch_fixture(new_version, applied);
-                validate_required_usb_runtime_patches(&root, false).unwrap();
-                let post = validate_required_usb_runtime_patches(&root, true);
+                validate_usb_runtime_fixture(&root, false).unwrap();
+                let post = validate_usb_runtime_fixture(&root, true);
                 assert_eq!(post.is_ok(), applied);
                 fs::remove_dir_all(root).unwrap();
             }
@@ -6984,7 +7223,7 @@ mod tests {
         let bytes = fake_asar_archive_with_member(&fs::read(&asar).unwrap());
         fs::write(&asar, bytes).unwrap();
         assert!(ensure_portable_codex_startup_compatibility_with_usb_integrity_mode(&root, true).unwrap());
-        validate_required_usb_runtime_patches(&root, true).unwrap();
+        validate_usb_runtime_fixture(&root, true).unwrap();
         let once = fs::read(&asar).unwrap();
         assert!(!ensure_portable_codex_startup_compatibility_with_usb_integrity_mode(&root, true).unwrap());
         assert_eq!(fs::read(&asar).unwrap(), once);
@@ -7001,12 +7240,12 @@ mod tests {
         let mut missing = bytes.clone();
         missing.drain(offset..offset + needle.len());
         fs::write(&asar, missing).unwrap();
-        let error = validate_required_usb_runtime_patches(&root, false).unwrap_err();
+        let error = validate_usb_runtime_fixture(&root, false).unwrap_err();
         assert!(matches!(error, EngineError::RuntimeCompatibility(_)));
         assert!(error.to_string().contains("iab-command-await"));
         fs::write(&asar, bytes).unwrap();
         fs::write(root.join("resources").join(CODEX_CUA_CLIENT_BASE), "changed upstream client").unwrap();
-        assert!(validate_required_usb_runtime_patches(&root, false).unwrap_err()
+        assert!(validate_usb_runtime_fixture(&root, false).unwrap_err()
             .to_string().contains("CUA screenshot activation"));
         fs::remove_dir_all(root).unwrap();
     }
@@ -7050,9 +7289,9 @@ mod tests {
         let path = root.join("resources").join(CODEX_CUA_CLIENT_BASE);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, format!("prefix {CODEX_CUA_CAPTURE_CALL} suffix")).unwrap();
-        assert!(!ensure_portable_codex_startup_compatibility_inner(&root, &root, false).unwrap());
+        assert!(!patch_startup_fixture(&root, false).unwrap());
         assert_eq!(fs::read_to_string(&path).unwrap(), format!("prefix {CODEX_CUA_CAPTURE_CALL} suffix"));
-        assert!(ensure_portable_codex_startup_compatibility_inner(&root, &root, true).unwrap());
+        assert!(patch_startup_fixture(&root, true).unwrap());
         let patched = fs::read_to_string(&path).unwrap();
         assert_eq!(patched, format!("prefix {CODEX_CUA_CAPTURE_REPLACEMENT} suffix"));
         assert!(!patch_codex_cua_foreground_capture(&root).unwrap());
@@ -7071,8 +7310,9 @@ mod tests {
         original.extend_from_slice(CODEX_ASAR_CUA_NOTIFY_UNWRAP_CALL);
         original.extend_from_slice(b":suffix");
         fs::write(&path, &original).unwrap();
+        let mut scan = startup_asar_scan(&path, false, false, None).unwrap();
         assert_eq!(
-            patch_all_fixed_width_calls(&path, CODEX_ASAR_CUA_NOTIFY_UNWRAP_CALL,
+            patch_all_fixed_width_calls(&mut scan, CODEX_ASAR_CUA_NOTIFY_UNWRAP_CALL,
                 CODEX_ASAR_CUA_NOTIFY_UNWRAP_REPLACEMENT, "cua-notify-test").unwrap(),
             1
         );
@@ -7083,7 +7323,7 @@ mod tests {
         assert_eq!(patched, expected);
         assert_eq!(patched.len(), original.len());
         assert_eq!(
-            patch_all_fixed_width_calls(&path, CODEX_ASAR_CUA_NOTIFY_UNWRAP_CALL,
+            patch_all_fixed_width_calls(&mut scan, CODEX_ASAR_CUA_NOTIFY_UNWRAP_CALL,
                 CODEX_ASAR_CUA_NOTIFY_UNWRAP_REPLACEMENT, "cua-notify-test").unwrap(),
             0
         );
@@ -7903,6 +8143,7 @@ mod tests {
                 )
             };
             let installed = crate::InstalledWindowsCodex {
+                app_version_unavailable: false,
                 path: payload.to_string_lossy().into_owned(),
                 version: version.clone(),
                 arch: Some(processor_architecture),

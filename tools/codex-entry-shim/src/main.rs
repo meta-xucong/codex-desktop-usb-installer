@@ -43,8 +43,9 @@ fn run() -> Result<(), String> {
         .map_err(|error| format!("无法确定直接入口位置：{error}"))?
         .canonicalize()
         .map_err(|error| format!("无法规范化直接入口位置：{error}"))?;
-    let bundle_root = resolve_bundle_root(&executable)?;
     let request = build_request()?;
+    let feishu_connection = matches!(request.args.as_slice(), [arg] if arg == "--connect-feishu");
+    let bundle_root = resolve_bundle_root(&executable, feishu_connection)?;
     let request_bytes =
         serde_json::to_vec(&request).map_err(|error| format!("无法编码启动请求：{error}"))?;
     if request_bytes.is_empty() || request_bytes.len() > MAX_FRAME_BYTES {
@@ -82,28 +83,28 @@ fn run() -> Result<(), String> {
     Err(format!("无法连接 U 盘管理器；Codex 未启动。{last_error}"))
 }
 
-fn resolve_bundle_root(executable: &Path) -> Result<PathBuf, String> {
+fn resolve_bundle_root(executable: &Path, feishu_connection: bool) -> Result<PathBuf, String> {
     let codex_dir = executable
         .parent()
         .ok_or_else(|| "直接入口没有父目录".to_string())?;
-    let apps_dir = codex_dir
-        .parent()
-        .ok_or_else(|| "直接入口目录结构无效".to_string())?;
-    let root = apps_dir
-        .parent()
-        .ok_or_else(|| "无法定位 U 盘 bundle 根目录".to_string())?;
-    if !codex_dir
-        .file_name()
-        .is_some_and(|value| value.eq_ignore_ascii_case("Codex"))
-        || !apps_dir
-            .file_name()
-            .is_some_and(|value| value.eq_ignore_ascii_case("apps"))
-        || !executable.file_name().is_some_and(|value| {
-            value.eq_ignore_ascii_case("ChatGPT.exe") || value.eq_ignore_ascii_case("Codex.exe")
-        })
+    let root = if feishu_connection && executable.file_name()
+        .is_some_and(|value| value.eq_ignore_ascii_case("CodexEntryShim.exe"))
     {
-        return Err("直接入口必须位于 apps\\Codex\\ChatGPT.exe 或 Codex.exe。".to_string());
-    }
+        codex_dir
+    } else {
+        let apps_dir = codex_dir.parent().ok_or_else(|| "直接入口目录结构无效".to_string())?;
+        if !codex_dir
+            .file_name()
+            .is_some_and(|value| value.eq_ignore_ascii_case("Codex"))
+            || !apps_dir.file_name().is_some_and(|value| value.eq_ignore_ascii_case("apps"))
+            || !executable.file_name().is_some_and(|value| {
+                value.eq_ignore_ascii_case("ChatGPT.exe") || value.eq_ignore_ascii_case("Codex.exe")
+            })
+        {
+            return Err("直接入口必须位于 apps\\Codex\\ChatGPT.exe 或 Codex.exe。".to_string());
+        }
+        apps_dir.parent().ok_or_else(|| "无法定位 U 盘 bundle 根目录".to_string())?
+    };
     for name in [
         "manifest.json",
         "usb-manifest.json",

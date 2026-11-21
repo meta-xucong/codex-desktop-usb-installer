@@ -334,6 +334,7 @@ mod imp {
     use std::ffi::{c_void, OsString};
     use std::mem::size_of;
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::os::windows::io::{AsRawHandle, BorrowedHandle};
     use std::path::{Path, PathBuf};
     use std::sync::{mpsc, Mutex, OnceLock};
     use std::thread;
@@ -363,7 +364,7 @@ mod imp {
     use windows_sys::Win32::System::Threading::{
         CreateProcessAsUserW, CreateProcessW, CreateProcessWithTokenW,
         DeleteProcThreadAttributeList, GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId,
-        GetExitCodeProcess, GetProcessTimes, InitializeProcThreadAttributeList, OpenProcess,
+        GetExitCodeProcess, GetProcessId, GetProcessTimes, InitializeProcThreadAttributeList, OpenProcess,
         OpenProcessToken, QueryFullProcessImageNameW, TerminateProcess, UpdateProcThreadAttribute,
         WaitForSingleObject, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
         EXTENDED_STARTUPINFO_PRESENT, PROCESS_CREATE_PROCESS, PROCESS_INFORMATION,
@@ -599,6 +600,13 @@ mod imp {
         ((value.dwHighDateTime as u32 as u64) << 32) | value.dwLowDateTime as u64
     }
 
+    pub(crate) fn filetime_to_unix_ms(filetime: u64) -> Option<u64> {
+        const UNIX_EPOCH_FILETIME: u64 = 116_444_736_000_000_000;
+        filetime
+            .checked_sub(UNIX_EPOCH_FILETIME)
+            .map(|ticks| ticks / 10_000)
+    }
+
     pub(crate) fn query_process_times(handle: HANDLE) -> Option<ProcessTimes> {
         let mut creation = FILETIME::default();
         let mut exit = FILETIME::default();
@@ -613,6 +621,55 @@ mod imp {
             creation_time: filetime_value(creation),
             exit_time: (exit_time != 0).then_some(exit_time),
         })
+    }
+
+    pub(crate) fn wait_for_process_exit(
+        process: HANDLE,
+        timeout_ms: u32,
+    ) -> std::io::Result<Option<u32>> {
+        match unsafe { WaitForSingleObject(process, timeout_ms) } {
+            WAIT_TIMEOUT => Ok(None),
+            WAIT_OBJECT_0 => {
+                let mut exit_code = 0;
+                if unsafe { GetExitCodeProcess(process, &mut exit_code) } == 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(Some(exit_code))
+            }
+            WAIT_FAILED => Err(std::io::Error::last_os_error()),
+            status => Err(std::io::Error::other(format!(
+                "unexpected process wait status {status}"
+            ))),
+        }
+    }
+
+    pub(crate) fn start_managed_codex_exit_log(
+        process: BorrowedHandle<'_>,
+        pid: u32,
+        mode: &'static str,
+    ) -> std::io::Result<thread::JoinHandle<()>> {
+        let process = process.try_clone_to_owned()?;
+        thread::Builder::new()
+            .name("codex-exit-log".into())
+            .spawn(move || {
+                let handle = process.as_raw_handle();
+                match wait_for_process_exit(handle, u32::MAX) {
+                    Ok(Some(code)) => {
+                        let times = query_process_times(handle);
+                        let created_unix_ms =
+                            times.and_then(|times| filetime_to_unix_ms(times.creation_time));
+                        let exited_unix_ms = times
+                            .and_then(|times| times.exit_time)
+                            .and_then(filetime_to_unix_ms);
+                        log::info!(
+                            "managed portable Codex exit pid={pid} manager_pid={} mode={mode} exit_code=0x{code:08X} created_unix_ms={created_unix_ms:?} exited_unix_ms={exited_unix_ms:?}",
+                            std::process::id()
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(error) => log::warn!("could not record Codex exit pid={pid}: {error}"),
+                }
+            })
     }
 
     pub(crate) struct DesktopUserChild {
@@ -630,20 +687,7 @@ mod imp {
         }
 
         pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<u32>> {
-            match unsafe { WaitForSingleObject(self.process.raw(), 0) } {
-                WAIT_TIMEOUT => Ok(None),
-                WAIT_OBJECT_0 => {
-                    let mut exit_code = 0_u32;
-                    if unsafe { GetExitCodeProcess(self.process.raw(), &mut exit_code) } == 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(Some(exit_code))
-                }
-                WAIT_FAILED => Err(std::io::Error::last_os_error()),
-                status => Err(std::io::Error::other(format!(
-                    "unexpected process wait status {status}"
-                ))),
-            }
+            wait_for_process_exit(self.process.raw(), 0)
         }
     }
 
@@ -1370,24 +1414,19 @@ mod imp {
         if !parent_is_exited || parent_exited <= parent_created || candidates.is_empty() {
             return None;
         }
-        let mut pids = Vec::with_capacity(candidates.len());
-        for candidate in candidates {
-            let Some(candidate_created) = candidate.creation_time else {
-                return None;
-            };
-            if !candidate.exact_image
-                || candidate.parent_pid != expected_parent_pid
-                || candidate_created < parent_created
-                || candidate_created >= parent_exited
-                || !candidate.alive
-                || candidate.has_top_level_window
-                || !candidate.can_terminate
-            {
-                return None;
-            }
-            pids.push(candidate.pid);
+        candidates.iter().map(|candidate| {
+            candidate.recoverable_pid(expected_parent_pid, parent_created, parent_exited)
+        }).collect()
+    }
+
+    impl DirectChildRecoveryCandidate {
+        fn recoverable_pid(&self, parent_pid: u32, parent_created: u64, parent_exited: u64) -> Option<u32> {
+            let created = self.creation_time?;
+            (self.exact_image && self.parent_pid == parent_pid
+                && (parent_created..parent_exited).contains(&created)
+                && self.alive && !self.has_top_level_window && self.can_terminate)
+                .then_some(self.pid)
         }
-        Some(pids)
     }
 
     impl TargetProcess {
@@ -1620,6 +1659,7 @@ mod imp {
     }
 
     struct WindowSearchContext {
+        required_window_pid: Option<u32>,
         pids: *const u32,
         pid_count: usize,
         candidate: Option<WindowCandidate>,
@@ -1945,6 +1985,9 @@ mod imp {
             }
             return 1;
         }
+        if context.required_window_pid.is_some_and(|required| pid != required) {
+            return 1;
+        }
         if unsafe { IsIconic(hwnd) } != 0 {
             // Minimized windows are often reported at -32000 with a tiny icon
             // rectangle. Restore first so the real normal dimensions can be
@@ -2028,8 +2071,24 @@ mod imp {
         root: &Path,
         timeout: Duration,
     ) -> Result<Option<UsableWindowReport>, EngineError> {
+        wait_for_usable_window_for_root_with_process(root, timeout, None, None)
+    }
+
+    pub(crate) fn wait_for_usable_window_for_root_with_process(
+        root: &Path,
+        timeout: Duration,
+        process: Option<BorrowedHandle<'_>>,
+        required_window_pid: Option<u32>,
+    ) -> Result<Option<UsableWindowReport>, EngineError> {
         let deadline = Instant::now() + timeout;
         loop {
+            if let Some(process) = process {
+                let exit = wait_for_process_exit(process.as_raw_handle(), 0)
+                    .map_err(|error| EngineError::Io(format!("检查已启动的 Codex 进程失败：{error}")))?;
+                if exit.is_some() {
+                    return Ok(None);
+                }
+            }
             let pids = managed_window_pids(root)?;
             if !pids.is_empty() {
                 let hidden = hide_console_windows_for_pids(&pids);
@@ -2045,6 +2104,7 @@ mod imp {
                     );
                 }
                 let mut context = WindowSearchContext {
+                    required_window_pid,
                     pids: pids.as_ptr(),
                     pid_count: pids.len(),
                     candidate: None,
@@ -2478,27 +2538,6 @@ mod imp {
         }
     }
 
-    /// Recover an unknown Codex instance without discarding user work. Match
-    /// the exact core image, not the root: the entry shim is itself waiting for
-    /// this launch request under that root and must never be closed here.
-    pub(crate) fn close_image_gracefully_for_launch(
-        timeout_secs: u64,
-        image: &Path,
-    ) -> Result<(), EngineError> {
-        let targets = target_processes_under_root(image)?;
-        request_graceful_close(&targets);
-        if wait_until_exited(&targets, Duration::from_secs(timeout_secs))
-            && target_processes_under_root(image)?.is_empty()
-        {
-            return Ok(());
-        }
-        // Deliberately no TerminateProcess fallback. WM_CLOSE can trigger a
-        // save/cancel prompt, and cancelling must preserve the existing work.
-        Err(EngineError::Io(
-            "已有 Codex 进程尚未关闭，可能仍有无窗口的后台核心进程。请保存工作并关闭 Codex 后重试；未强制结束任何进程。".into(),
-        ))
-    }
-
     struct WindowPidSearch {
         pid: u32,
         found: bool,
@@ -2597,6 +2636,29 @@ mod imp {
         }
     }
 
+    // Only an explicit Chromium child role distinguishes a headless helper
+    // from a same-image main process starting a handoff. Return PIDs only.
+    fn confirmed_chromium_helpers(pids: &[u32]) -> Result<Vec<u32>, EngineError> {
+        let filter = pids.iter()
+            .map(|pid| format!("ProcessId={pid}"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let script = format!(r#"
+$ErrorActionPreference = 'Stop'
+$helpers = @(foreach ($p in Get-CimInstance Win32_Process -Filter '{filter}' -Property ProcessId,ExecutablePath,CommandLine) {{
+    if (!$p.ExecutablePath -or !$p.CommandLine) {{ continue }}
+    $exe = [regex]::Escape($p.ExecutablePath)
+    $prefix = '^(?i:"' + $exe + '"|' + $exe + ')\s+--type=(?:renderer|utility|gpu-process|crashpad-handler)(?:\s|$)'
+    if (($p.CommandLine -cmatch $prefix) -and ([regex]::Matches($p.CommandLine, '(?i)--type=').Count -eq 1)) {{
+        [uint32]$p.ProcessId
+    }}
+}})
+ConvertTo-Json -Compress -InputObject $helpers
+"#);
+        let json = crate::sys::run_powershell_json(&script)?;
+        serde_json::from_str(json.trim()).map_err(|_| EngineError::Io("无法确认残留 Codex 辅助进程的角色，已保留进程。".into()))
+    }
+
     /// Terminate only exact-image direct children created during the lifetime
     /// of a retained, manager-launched Core process. Callers must retain the
     /// parent's process handle until this check completes.
@@ -2649,6 +2711,19 @@ mod imp {
                 has_top_level_window: has_top_level_window(target.pid)?,
                 can_terminate: target.can_terminate,
             });
+        }
+        if wait_for_process_exit(parent_handle, 0)
+            .map_err(|error| EngineError::Io(error.to_string()))? == Some(0)
+        {
+            facts.retain(|child| child.recoverable_pid(
+                parent_pid, parent_times.creation_time, parent_exit_time,
+            ).is_some());
+            if facts.is_empty() {
+                return Ok(Vec::new());
+            }
+            let pids: Vec<_> = facts.iter().map(|child| child.pid).collect();
+            let helpers = confirmed_chromium_helpers(&pids)?;
+            facts.retain(|child| helpers.contains(&child.pid));
         }
         let Some(candidate_pids) = plan_direct_child_recovery(
             parent_pid,
@@ -2769,6 +2844,36 @@ mod imp {
         )))
     }
 
+    /// Keep the creation handle open throughout graceful close and termination.
+    /// A same-image successor is a different process object.
+    pub(crate) fn close_failed_launch_child(process: BorrowedHandle<'_>) -> Result<(), EngineError> {
+        let handle = process.as_raw_handle();
+        let exited = |ms| wait_for_process_exit(handle, ms)
+            .map(|status| status.is_some())
+            .map_err(|error| EngineError::Io(format!("检查本次启动进程失败：{error}")));
+        if exited(0)? {
+            return Ok(());
+        }
+        let pid = unsafe { GetProcessId(handle) };
+        if pid == 0 {
+            return Err(last_error("get failed launch PID"));
+        }
+        unsafe { EnumWindows(Some(post_close_to_pid), pid as LPARAM) };
+        if exited(5_000)? {
+            return Ok(());
+        }
+        if unsafe { TerminateProcess(handle, 1) } == 0 {
+            let error = last_error("close failed Codex launch");
+            if !exited(0)? {
+                return Err(error);
+            }
+        }
+        if !exited(FORCE_CLOSE_TIMEOUT.as_millis() as u32)? {
+            return Err(EngineError::Io(format!("本次启动的 Codex 进程仍在运行（PID {pid}）。")));
+        }
+        Ok(())
+    }
+
     pub(crate) fn close_codex_processes_for_root(
         timeout_secs: u64,
         root: &Path,
@@ -2778,7 +2883,9 @@ mod imp {
 
     #[cfg(test)]
     mod windows_tests {
-        use std::process::Command;
+        use std::io::{Read, Write};
+        use std::os::windows::{io::AsHandle, process::CommandExt};
+        use std::process::{Child, Command, Stdio};
 
         use windows_sys::Win32::Security::TokenElevationTypeLimited;
 
@@ -2786,6 +2893,121 @@ mod imp {
 
         const HELPER_ENV: &str = "CODEX_APP_MANAGER_PROCESS_HELPER";
         const STRICT_HELPER_ENV: &str = "CODEX_USB_REVOCATION_PROCESS_HELPER";
+        const EXIT_FIXTURE_MODE: &str = "CODEX_MANAGED_EXIT_FIXTURE_MODE";
+        const EXIT_FIXTURE_LOG: &str = "CODEX_MANAGED_EXIT_FIXTURE_LOG";
+        const EXIT_FIXTURE_TEST: &str =
+            "windows_process::imp::windows_tests::managed_exit_unblocks_window_wait";
+
+        fn start_exit_fixture() -> Child {
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", EXIT_FIXTURE_TEST])
+                .env(EXIT_FIXTURE_MODE, "core")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn()
+                .unwrap()
+        }
+
+        #[test]
+        fn managed_exit_unblocks_window_wait() {
+            if std::env::var(EXIT_FIXTURE_MODE).as_deref() == Ok("core") {
+                std::io::stdin().read_exact(&mut [0]).unwrap();
+                std::process::exit(37);
+            }
+
+            let root = std::env::temp_dir().join(format!("codex-window-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&root).unwrap();
+            let mut child = start_exit_fixture();
+            let alive_start = Instant::now();
+            let alive = wait_for_usable_window_for_root_with_process(
+                &root,
+                Duration::from_millis(300),
+                Some(child.as_handle()),
+                None,
+            )
+            .unwrap();
+            assert!(alive.is_none() && alive_start.elapsed() >= Duration::from_millis(300));
+            assert!(child.try_wait().unwrap().is_none());
+
+            child.stdin.take().unwrap().write_all(b"x").unwrap();
+            let exit_start = Instant::now();
+            let exited = wait_for_usable_window_for_root_with_process(
+                &root,
+                Duration::from_secs(8),
+                Some(child.as_handle()),
+                None,
+            )
+            .unwrap();
+            let deadline_elapsed = exit_start.elapsed();
+            assert!(exited.is_none() && deadline_elapsed < Duration::from_secs(5));
+            assert_eq!(child.wait().unwrap().code(), Some(37));
+            println!("managed exit detected in {} ms", deadline_elapsed.as_millis());
+            std::fs::remove_dir(root).unwrap();
+        }
+
+        #[test]
+        fn managed_exit_log_survives_manager_session() {
+            if std::env::var(EXIT_FIXTURE_MODE).as_deref() == Ok("manager") {
+                struct FileLogger(Mutex<std::fs::File>);
+                impl log::Log for FileLogger {
+                    fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+                        true
+                    }
+
+                    fn log(&self, record: &log::Record<'_>) {
+                        writeln!(self.0.lock().unwrap(), "{}", record.args()).unwrap();
+                    }
+
+                    fn flush(&self) {}
+                }
+
+                let file = std::fs::File::create(std::env::var_os(EXIT_FIXTURE_LOG).unwrap()).unwrap();
+                log::set_logger(Box::leak(Box::new(FileLogger(Mutex::new(file))))).unwrap();
+                log::set_max_level(log::LevelFilter::Info);
+                let mut child = start_exit_fixture();
+                let pid = child.id();
+                let log = start_managed_codex_exit_log(child.as_handle(), pid, "portable").unwrap();
+                child.stdin.take().unwrap().write_all(b"x").unwrap();
+                drop(child);
+                log.join().unwrap();
+                println!("observed_pid={pid}");
+                return;
+            }
+
+            let path = std::env::temp_dir().join(format!("codex-exit-{}.log", uuid::Uuid::new_v4()));
+            let manager = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "windows_process::imp::windows_tests::managed_exit_log_survives_manager_session",
+                    "--nocapture",
+                ])
+                .env(EXIT_FIXTURE_MODE, "manager")
+                .env(EXIT_FIXTURE_LOG, &path)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn()
+                .unwrap();
+            let manager_pid = manager.id();
+            let output = manager.wait_with_output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success(), "{stdout}");
+            let pid: u32 = stdout
+                .lines()
+                .find_map(|line| line.strip_prefix("observed_pid="))
+                .unwrap()
+                .parse()
+                .unwrap();
+            let log = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(log.lines().count(), 1);
+            assert!(log.contains(&format!("pid={pid} manager_pid={manager_pid}")));
+            assert!(log.contains("exit_code=0x00000025"));
+            assert!(log.contains("created_unix_ms=Some("));
+            assert!(log.contains("exited_unix_ms=Some("));
+            std::fs::remove_file(path).unwrap();
+        }
 
         fn candidate_fixture(pid: u32, parent_pid: u32) -> DirectChildRecoveryCandidate {
             DirectChildRecoveryCandidate {
@@ -3289,7 +3511,7 @@ mod imp {
         }
 
         #[test]
-        fn usb_launch_graceful_close_timeout_preserves_core_and_waiting_shim() {
+        fn usb_launch_preserves_unowned_core_and_waiting_shim() {
             let root = std::env::temp_dir()
                 .join(format!("codex-graceful-launch-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&root).unwrap();
@@ -3309,15 +3531,14 @@ mod imp {
                         .unwrap(),
                 );
             }
-            // Test children deliberately have no closeable window. Timeout
-            // must not enter the installer's force-terminate fallback.
-            let result = close_image_gracefully_for_launch(0, &root.join("CodexCore.dat"));
+            // A headless core still prevents a new launch. The waiting shim is separate.
+            let result = crate::sys::require_clear_usb_core(&root.join("CodexCore.dat"));
             let alive = children
                 .iter_mut()
                 .all(|child| child.try_wait().unwrap().is_none());
             // An absent core is a no-op, even while the shim under this same
             // directory is waiting for a manager response.
-            let absent = close_image_gracefully_for_launch(0, &root.join("OtherCore.dat"));
+            let absent = crate::sys::require_clear_usb_core(&root.join("OtherCore.dat"));
             for child in &mut children {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -3394,9 +3615,11 @@ pub use imp::{
 
 #[cfg(windows)]
 pub(crate) use imp::{
-    close_codex_processes_for_root, close_image_gracefully_for_launch,
-    codex_processes_running_for_root, query_process_times, recover_verified_direct_children,
-    spawn_as_desktop_user, DesktopUserChild, ProcessTimes,
+    close_codex_processes_for_root, close_failed_launch_child,
+    codex_processes_running_for_root, filetime_to_unix_ms, query_process_times,
+    recover_verified_direct_children, spawn_as_desktop_user, start_managed_codex_exit_log,
+    wait_for_process_exit, wait_for_usable_window_for_root_with_process, DesktopUserChild,
+    ProcessTimes,
 };
 
 /// Return the interactive desktop user's profile paths when this process is

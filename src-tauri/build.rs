@@ -83,6 +83,14 @@ fn main() {
     // PE resource.  The ordinary installed manager therefore remains
     // asInvoker, while the USB copy is explicitly requireAdministrator.
     println!("cargo:rerun-if-env-changed=CODEX_USB_MANAGER");
+    if env::var("CODEX_USB_MANAGER").as_deref() == Ok("1")
+        && env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+        && env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")
+    {
+        // Back the manager's image with the system page file when it is
+        // launched from removable media. Its bundle path stays on the USB.
+        println!("cargo:rustc-link-arg-bin=codex-app-manager=/SWAPRUN:CD");
+    }
     tauri_build::build();
 }
 

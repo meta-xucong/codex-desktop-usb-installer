@@ -1,8 +1,11 @@
 # Isolated real first-install regression. Uses existing integrity checks.
-param([ValidateSet('none','encoder','browser')][string]$InterruptComponent='none')
+param(
+    [ValidateSet('none','encoder','browser')][string]$InterruptComponent='none',
+    [string]$EvidenceDirectory='tmp\usb-runtime-extract-recovery-1114'
+)
 $ErrorActionPreference='Stop'
 $repo=(Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$evidenceRoot=Join-Path $repo 'tmp\usb-runtime-extract-recovery-1114'
+$evidenceRoot=Join-Path $repo $EvidenceDirectory
 $evidence=Join-Path $evidenceRoot $InterruptComponent
 New-Item -ItemType Directory -Force -Path $evidence | Out-Null
 $fixture=Join-Path $repo ('tmp\hf-first-' + [guid]::NewGuid().ToString('N').Substring(0,8))
@@ -91,6 +94,8 @@ $watch.Stop()
 $setupWatch.Stop()
 if($hyperframesHealth -ne 'passed'){throw "Real first deployment failed: $hyperframesError"}
 if($env:HYPERFRAMES_BROWSER_PATH -ne 'fixture-caller-setting'){throw 'Caller override changed'}
+if($null -eq $hyperframesBrowserCheckMs){throw 'Browser startup duration was not recorded'}
+$firstBrowserCheckMs=$hyperframesBrowserCheckMs
 $firstStages=$stages.ToArray()
 $repeatReused=$null
 if ($InterruptComponent -eq 'none') {
@@ -101,6 +106,7 @@ if ($InterruptComponent -eq 'none') {
     if($hyperframesHealth -ne 'passed' -or (Get-Item -LiteralPath $hyperframesMarker).LastWriteTimeUtc -ne $markerTime -or (Get-Item -LiteralPath $hyperframesEntry).LastWriteTimeUtc -ne $entryTime){throw 'Repeat deployment did not reuse the healthy CLI'}
     $repeatReused=$true
 }
+$env:USB_TEST_STAGE='shim-browser-selection'
 $shimOutput=& $hyperframesCmd browser ensure | Out-String
 if($LASTEXITCODE -ne 0 -or $shimOutput -notmatch 'env'){throw 'Production shim did not use bundled browser'}
 if($env:HYPERFRAMES_BROWSER_PATH -ne 'fixture-caller-setting'){throw 'Shim leaked its override'}
@@ -156,9 +162,12 @@ $video=(& $probeExe -v error -select_streams v:0 -show_entries stream=codec_name
 if($LASTEXITCODE -ne 0 -or $video.streams[0].width -ne 800 -or $video.streams[0].height -ne 450){throw 'Rendered video dimensions are incorrect'}
 if($env:HYPERFRAMES_FFMPEG_PATH -ne 'fixture-caller-ffmpeg' -or $env:HYPERFRAMES_FFPROBE_PATH -ne 'fixture-caller-ffprobe'){throw 'Production shim leaked FFmpeg overrides'}
 $network=@(if(Test-Path -LiteralPath $env:USB_TEST_NETWORK_LOG){Get-Content -LiteralPath $env:USB_TEST_NETWORK_LOG | ForEach-Object{$_ | ConvertFrom-Json}})
+if(@($network | Where-Object{$_.stage -eq 'runtime.hyperframesBrowserCheck'}).Count){throw 'Local browser startup check attempted to use the network'}
 if(@($network | Where-Object{$_.host -match 'googleapis|gvt1|googleusercontent'}).Count){throw 'Browser download attempted'}
 if(@(Get-ChildItem -LiteralPath $env:NPM_CONFIG_CACHE -Force).Count){throw 'Target installation used the npm cache'}
 $report=[ordered]@{scope='fresh private runtime from bundled media; external Node networking blocked and browser external DNS disabled; not a clean Windows VM';fixture=$fixture;interruptedState=$interruptedState;recovered=($InterruptComponent -ne 'none');firstInstallSeconds=$watch.Elapsed.TotalSeconds;sharedAndHyperframesSeconds=$setupWatch.Elapsed.TotalSeconds;sharedNodeHealth=$nodeHealth;sharedFfmpegHealth=$ffmpegHealth;firstStages=$firstStages;cliHealth=$hyperframesCliHealth;browserHealth=$hyperframesBrowserHealth;shimBrowserSource='env';repeatReused=$repeatReused;systemNodeOnPath=$false;systemChromeOnPath=$false;targetNpmCacheEmpty=$true;nativeEsbuildAndSharp='passed';realBrowserLaunch='passed';remoteSocketBoundary='passed';blockedHosts=@($network.host | Sort-Object -Unique);browserDownloadAttempts=0;renderExitCode=$exit;png=$frames[0].FullName;pngBytes=$frames[0].Length;mp4=$mp4;mp4Bytes=(Get-Item -LiteralPath $mp4).Length;videoCodec=$video.streams[0].codec_name;productionCommandPath=$true;ffmpegCallerSettingsPreserved=$true;paidCalls=0}
+$report.browserCheckMs=$firstBrowserCheckMs
+$report.browserCheckNetworkAttempts=0
 $json=$report|ConvertTo-Json -Depth 6
 [IO.File]::WriteAllText((Join-Path $evidence 'offline-install-result.json'),$json,[Text.UTF8Encoding]::new($false))
 $json

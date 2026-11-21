@@ -151,6 +151,7 @@ fn emit_shell_event(app: &tauri::AppHandle, event: &ShellEvent) {
     let result = match event {
         ShellEvent::ConfirmQuit => app.emit("app://confirm-quit", ()),
         ShellEvent::QuitBlocked(policy) => app.emit("app://quit-blocked", policy),
+        ShellEvent::OpenFeishuConnection => app.emit("app://open-feishu-connection", ()),
     };
     match result {
         Ok(()) => log::info!("shell event emitted kind={}", event.kind()),
@@ -207,6 +208,13 @@ fn show_native_shell_event(app: tauri::AppHandle, event: ShellEvent) {
     restore_main_window(&app, "native-shell-fallback");
 
     match event {
+        ShellEvent::OpenFeishuConnection => {
+            app.dialog()
+                .message("管理器界面尚未就绪。请重新打开管理器，在「连接与扩展 → 飞书」填写并保存。")
+                .title(PRODUCT_NAME)
+                .kind(MessageDialogKind::Warning)
+                .show(move |_| finish_native_shell_dialog(app));
+        }
         ShellEvent::ConfirmQuit => {
             let mut dialog = app
                 .dialog()
@@ -605,7 +613,7 @@ fn install_macos_menu(app: &tauri::AppHandle, locale: NativeLocale) -> tauri::Re
     Ok(())
 }
 
-/// The frontend calls this only after both quit listeners are registered.
+/// The frontend calls this after the native shell listeners are registered.
 /// The first handshake reveals the initially hidden window and drains any
 /// close/quit decisions queued during WebView startup. Later calls only update
 /// the native menu when the user changes the application language.

@@ -280,6 +280,7 @@ pub struct NativeMenuCopy {
 pub enum ShellEvent {
     ConfirmQuit,
     QuitBlocked(QuitPolicy),
+    OpenFeishuConnection,
 }
 
 impl ShellEvent {
@@ -287,6 +288,7 @@ impl ShellEvent {
         match self {
             Self::ConfirmQuit => "confirm-quit",
             Self::QuitBlocked(_) => "quit-blocked",
+            Self::OpenFeishuConnection => "open-feishu-connection",
         }
     }
 }

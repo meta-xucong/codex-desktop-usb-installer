@@ -12,6 +12,12 @@ const MAX_FRAME_BYTES: usize = 64 * 1024;
 const MAX_CURRENT_DIR_UTF16_UNITS: usize = 4 * 1024;
 const MANAGER_LAUNCH_TIMEOUT: Duration = Duration::from_secs(300);
 
+#[derive(Debug, PartialEq, Eq)]
+enum EntryAction {
+    Launch,
+    OpenFeishuConnection,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct EntryRequest {
@@ -156,9 +162,14 @@ fn handle_connection(
     response_cache: &mut EntryResponseCache,
 ) -> Result<(), String> {
     let response = match read_request(pipe) {
-        Ok(request) => {
-            dispatch_cached_request(request, response_cache, || launch_through_manager(app))
-        }
+        Ok(request) => dispatch_cached_request(request, response_cache, |action| match action {
+            EntryAction::Launch => launch_through_manager(app),
+            EntryAction::OpenFeishuConnection => {
+                crate::restore_main_window(&app, "feishu-connection-request");
+                crate::dispatch_shell_event(&app, crate::app::shell::ShellEvent::OpenFeishuConnection);
+                Ok(())
+            }
+        }),
         Err(error) => EntryResponse::error(error),
     };
     write_response(pipe, &response)
@@ -167,7 +178,7 @@ fn handle_connection(
 fn dispatch_cached_request(
     request: EntryRequest,
     response_cache: &mut EntryResponseCache,
-    launch: impl FnOnce() -> Result<(), String>,
+    dispatch: impl FnOnce(EntryAction) -> Result<(), String>,
 ) -> EntryResponse {
     let request_id = request.request_id.clone();
     let cacheable = valid_request_id(&request_id);
@@ -177,7 +188,7 @@ fn dispatch_cached_request(
             return response;
         }
     }
-    let response = dispatch_request(request, launch);
+    let response = dispatch_request(request, dispatch);
     if cacheable {
         response_cache.insert(request_id, response.clone());
     }
@@ -186,20 +197,22 @@ fn dispatch_cached_request(
 
 fn dispatch_request(
     request: EntryRequest,
-    launch: impl FnOnce() -> Result<(), String>,
+    dispatch: impl FnOnce(EntryAction) -> Result<(), String>,
 ) -> EntryResponse {
     if request.schema_version != 1 || !valid_request_id(&request.request_id) {
         return EntryResponse::error("U 盘直接入口请求格式无效，Codex 未启动。");
     }
-    if !request.args.is_empty() {
-        return EntryResponse::error("U 盘直接入口不支持附带启动参数，Codex 未启动。");
-    }
+    let action = match request.args.as_slice() {
+        [] => EntryAction::Launch,
+        [arg] if arg == "--connect-feishu" => EntryAction::OpenFeishuConnection,
+        _ => return EntryResponse::error("U 盘直接入口不支持附带启动参数，Codex 未启动。"),
+    };
     if request.current_dir.as_ref().is_some_and(|path| {
         path.contains('\0') || path.encode_utf16().count() > MAX_CURRENT_DIR_UTF16_UNITS
     }) {
         return EntryResponse::error("U 盘直接入口工作目录无效，Codex 未启动。");
     }
-    match launch() {
+    match dispatch(action) {
         Ok(()) => EntryResponse::ok(),
         Err(error) => EntryResponse::error(error),
     }
@@ -213,17 +226,19 @@ fn launch_through_manager(app: tauri::AppHandle) -> Result<(), String> {
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     tauri::async_runtime::spawn(async move {
         let state = app.state::<crate::state::ManagerState>();
-        let result = crate::commands::win_launch_codex(state, None)
-            .await
-            .map_err(|error| error.message);
-        if result.as_ref().err().is_some_and(|message| message.contains("USB_HOST_NOT_READY")) {
+        let result = crate::commands::win_launch_codex(app.clone(), state, None).await;
+        if result
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.code == "usb_host_not_ready")
+        {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.unminimize();
                 let _ = window.show();
                 let _ = window.set_focus();
             }
         }
-        let _ = sender.send(result);
+        let _ = sender.send(result.map_err(|error| error.message));
     });
     receiver
         .recv_timeout(MANAGER_LAUNCH_TIMEOUT)
@@ -558,7 +573,8 @@ mod tests {
     fn active_and_offline_paths_reach_the_shared_manager_launch_handler() {
         for _status in ["active", "offline"] {
             let mut called = false;
-            let response = dispatch_request(request(Vec::new()), || {
+            let response = dispatch_request(request(Vec::new()), |action| {
+                assert_eq!(action, EntryAction::Launch);
                 called = true;
                 Ok(())
             });
@@ -570,7 +586,7 @@ mod tests {
     #[test]
     fn revoked_response_is_denied_and_invalid_requests_never_reach_launch_handler() {
         let mut called = false;
-        let revoked = dispatch_request(request(Vec::new()), || {
+        let revoked = dispatch_request(request(Vec::new()), |_| {
             called = true;
             Err("已收到已验签的作废状态，Codex 已锁定。".to_string())
         });
@@ -578,7 +594,7 @@ mod tests {
         assert!(called);
 
         called = false;
-        let invalid = dispatch_request(request(vec!["--some-arg".to_string()]), || {
+        let invalid = dispatch_request(request(vec!["--some-arg".to_string()]), |_| {
             called = true;
             Ok(())
         });
@@ -590,11 +606,11 @@ mod tests {
     fn duplicate_submitted_request_reuses_response_without_launching_again() {
         let mut cache = EntryResponseCache::default();
         let calls = std::cell::Cell::new(0);
-        let first = dispatch_cached_request(request(Vec::new()), &mut cache, || {
+        let first = dispatch_cached_request(request(Vec::new()), &mut cache, |_| {
             calls.set(calls.get() + 1);
             Err("Codex 核心启动失败".to_string())
         });
-        let second = dispatch_cached_request(request(Vec::new()), &mut cache, || {
+        let second = dispatch_cached_request(request(Vec::new()), &mut cache, |_| {
             calls.set(calls.get() + 1);
             Ok(())
         });
@@ -603,6 +619,20 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(calls.get(), 1);
         assert_eq!(cache.entries.len(), 1);
+    }
+
+    #[test]
+    fn feishu_connection_action_accepts_no_credential_arguments() {
+        let connect = "--connect-feishu".to_string();
+        let opened = dispatch_request(request(vec![connect.clone()]), |action| {
+            assert_eq!(action, EntryAction::OpenFeishuConnection);
+            Ok(())
+        });
+        assert!(opened.ok);
+        let refused = dispatch_request(request(vec![connect, "unexpected".to_string()]), |_| {
+            panic!("connection form only accepts the fixed action");
+        });
+        assert!(!refused.ok);
     }
 
     #[test]
@@ -625,15 +655,19 @@ mod tests {
         let shim = std::env::var_os("CODEX_USB_ENTRY_SHIM_PATH")
             .map(PathBuf::from)
             .ok_or_else(|| "CODEX_USB_ENTRY_SHIM_PATH missing".to_string())?;
-        for entry_name in ["ChatGPT.exe", "Codex.exe"] {
-            for (mode, should_succeed) in [("active", true), ("offline", true), ("revoked", false)]
-            {
+        let launch_cases = [("active", true), ("offline", true), ("revoked", false)];
+        for (entry_name, feishu, cases) in [
+            ("ChatGPT.exe", false, &launch_cases[..]),
+            ("Codex.exe", false, &launch_cases[..]),
+            ("CodexEntryShim.exe", true, &[("active", true)][..]),
+        ] {
+            for &(mode, should_succeed) in cases {
                 let root = std::env::temp_dir().join(format!(
                     "codex-usb-entry-{entry_name}-{mode}-{}-{}",
                     std::process::id(),
                     uuid::Uuid::new_v4().simple()
                 ));
-                let entry = root.join("apps/Codex").join(entry_name);
+                let entry = if feishu { root.join(entry_name) } else { root.join("apps/Codex").join(entry_name) };
                 std::fs::create_dir_all(entry.parent().unwrap())
                     .map_err(|error| format!("create shim fixture: {error}"))?;
                 std::fs::copy(&shim, &entry)
@@ -657,14 +691,18 @@ mod tests {
                     validate_client_session(handle, session, &server_sid)?;
                     let mut stream = unsafe { std::fs::File::from_raw_handle(handle as _) };
                     let request = read_request(&mut stream)?;
-                    let result = dispatch_request(request, || match server_mode.as_str() {
-                        "active" | "offline" => Ok(()),
-                        _ => Err("已收到已验签的作废状态，Codex 已锁定。".to_string()),
+                    let result = dispatch_request(request, |action| match (feishu, action, server_mode.as_str()) {
+                        (true, EntryAction::OpenFeishuConnection, _) => Ok(()),
+                        (false, EntryAction::Launch, "active" | "offline") => Ok(()),
+                        (false, EntryAction::Launch, _) => Err("已收到已验签的作废状态，Codex 已锁定。".to_string()),
+                        _ => Err("Unexpected entry action.".to_string()),
                     });
                     write_response(&mut stream, &result)?;
                     Ok::<(), String>(())
                 });
-                let status = Command::new(&entry)
+                let mut command = Command::new(&entry);
+                if feishu { command.arg("--connect-feishu"); }
+                let status = command
                     .current_dir(&root)
                     .status()
                     .map_err(|error| format!("launch compiled shim for {mode}: {error}"))?;

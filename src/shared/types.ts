@@ -343,6 +343,7 @@ export interface NativeModelCatalogActionReport {
  * environment after a successful run. */
 export interface CapabilityPackInstallOptions {
   enableFeishu: boolean;
+  feishuAction?: "apply" | "preserve";
   persistConnections: boolean;
   feishuAppId: string;
   feishuAppSecret: string;
@@ -381,6 +382,9 @@ export interface CapabilityPackReport {
   configStatus: "merged" | "partial" | "failed" | "conflict" | "unknown" | string;
   diagnosticsPath: string | null;
   feishuEnabled: boolean;
+  feishuConfigured?: boolean;
+  feishuSavedLive?: boolean;
+  feishuRuntimeStatus?: string;
   enabledApiServices: string[];
   mediaRuntimeStatus: string;
   mediaProtocolStatus: string;
@@ -760,6 +764,7 @@ export interface InstalledWindowsCodex {
   path: string;
   /** Human-facing Codex app version; falls back to the MSIX package version when unreadable. */
   version: string;
+  appVersionUnavailable?: boolean;
   arch: string | null;
   source: "msix" | "portable" | string;
   packageFamilyName: string | null;
@@ -1116,7 +1121,6 @@ export interface UsbGuardStatus {
 }
 
 export interface UsbInstallPreflightReport {
-  internetAvailable: boolean;
   apiKeyReady: boolean;
 }
 

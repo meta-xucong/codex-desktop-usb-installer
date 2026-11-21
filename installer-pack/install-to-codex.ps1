@@ -383,6 +383,7 @@ foreach ($skillName in $skillNames) {
 
 $supportFiles = @(
     @{ source = 'mcp/start-feishu-mcp.ps1'; destination = (Join-Path $ownershipRoot 'bin\start-feishu-mcp.ps1'); kind = 'mcp-wrapper' },
+    @{ source = 'mcp/feishu-tenant-server.cjs'; destination = (Join-Path $ownershipRoot 'bin\feishu-tenant-server.cjs'); kind = 'mcp-server' },
     @{ source = 'mcp/start-media-generation-mcp.ps1'; destination = (Join-Path $ownershipRoot 'bin\start-media-generation-mcp.ps1'); kind = 'mcp-wrapper' },
     @{ source = 'mcp/media-generation-mcp.py'; destination = (Join-Path $ownershipRoot 'bin\media-generation-mcp.py'); kind = 'mcp-server' },
     @{ source = 'sync-model-catalog.ps1'; destination = (Join-Path $ownershipRoot 'bin\sync-model-catalog.ps1'); kind = 'model-sync' },
@@ -415,7 +416,9 @@ function Test-CurrentOwnership([string]$Path, [string]$Kind) {
 
 $feishuAppId = [Environment]::GetEnvironmentVariable('FEISHU_APP_ID', 'Process')
 $feishuAppSecret = [Environment]::GetEnvironmentVariable('FEISHU_APP_SECRET', 'Process')
-$feishuEnabled = if ($DisableFeishu) { $false } elseif ($EnableFeishu) { $true } else { (-not [string]::IsNullOrWhiteSpace($feishuAppId) -and $feishuAppId -match '^cli_[A-Za-z0-9_-]+$' -and -not [string]::IsNullOrWhiteSpace($feishuAppSecret) -and $feishuAppSecret.Length -ge 8) }
+$feishuHasCredentials = $feishuAppId -cmatch '^cli_[A-Za-z0-9_-]+$' -and
+    -not [string]::IsNullOrWhiteSpace($feishuAppSecret) -and $feishuAppSecret.Length -ge 8
+$feishuEnabled = -not $DisableFeishu -and ($FeishuAuthMode -eq 'tenant' -or $EnableFeishu -or $feishuHasCredentials)
 $mediaGenerationEnabled = -not [bool]$DisableMediaGeneration
 if ($mediaGenerationEnabled) {
     $mediaProfile = [Environment]::GetEnvironmentVariable('MEDIA_GENERATION_API_PROFILE', 'Process')
@@ -474,7 +477,7 @@ function Test-RuntimeReady([object]$State) {
     $hyperframes = $State.PSObject.Properties['hyperframes']
     if (-not $hyperframes -or [string]$hyperframes.Value.cliHealth -notin @('passed','requires-network','install-failed')) { return $false }
     if ([string]$hyperframes.Value.cliHealth -eq 'passed' -and [string]$hyperframes.Value.browserHealth -notin @('passed','requires-network','install-failed')) { return $false }
-    return [string]$State.feishu.health -in @('passed','disabled','skipped')
+    return [string]$State.feishu.health -in @('passed','disabled','skipped','install-failed')
 }
 
 $runtimeScript = Join-Path $PackRoot 'runtime\provision-runtime.ps1'
@@ -491,7 +494,7 @@ $runtimeState = [ordered]@{
     targetUserProfile = $userProfile
     python = [ordered]@{ executable = ''; baseInterpreter = ''; version = ''; wheelCount = 0; health = 'unknown' }
     node = [ordered]@{ executable = ''; version = ''; health = 'disabled' }
-    feishu = [ordered]@{ packageRoot = ''; package = '@larksuiteoapi/lark-mcp@0.5.1'; health = if ($feishuEnabled) { 'unknown' } else { 'disabled' } }
+    feishu = [ordered]@{ packageRoot = ''; package = '@larksuiteoapi/lark-mcp@0.5.1'; health = 'unknown' }
     mediaGeneration = [ordered]@{
         health = if ($mediaGenerationEnabled) { 'unknown' } else { 'disabled' }
         server = 'media-generation-mcp.py'
@@ -513,9 +516,9 @@ try {
     # down Windows profiles, before the provisioner emits its JSON readiness.
     # The provisioner emits one JSON document on success; native diagnostics
     # are captured in its structured component state.
-    $runtimeArguments = @{ PackRoot = $PackRoot; TargetUserProfile = $userProfile; TargetCodexHome = $codexHome }
+    # Deploy the offline runtime on first install even when the MCP still needs credentials.
+    $runtimeArguments = @{ PackRoot = $PackRoot; TargetUserProfile = $userProfile; TargetCodexHome = $codexHome; EnableFeishu = $true }
     if (-not [string]::IsNullOrWhiteSpace($ProgressFile)) { $runtimeArguments.ProgressFile = $ProgressFile }
-    if ($feishuEnabled) { $runtimeArguments.EnableFeishu = $true }
     $runtimeOutput = (& $runtimeScript @runtimeArguments | Out-String)
     $runtimeState = $runtimeOutput | ConvertFrom-Json
     $initialMediaHealth = if ($mediaGenerationEnabled) { 'unknown' } else { 'disabled' }
@@ -671,7 +674,8 @@ $renderArguments = @{
 if (-not [string]::IsNullOrWhiteSpace([string]$runtimeState.python.executable)) {
     $renderArguments.PythonExe = [string]$runtimeState.python.executable
 }
-if ($feishuEnabled) { $renderArguments.EnableFeishu = $true }
+$feishuReady = [string]$runtimeState.feishu.health -eq 'passed'
+if ($feishuEnabled -and $feishuReady) { $renderArguments.EnableFeishu = $true }
 if ($mediaGenerationEnabled) { $renderArguments.EnableMediaGeneration = $true }
 if (@($EnabledRemoteMcps).Count -gt 0) { $renderArguments.EnableRemoteMcps = @($EnabledRemoteMcps) }
 if (@($EnableSkills).Count -gt 0) { $renderArguments.EnableSkills = @($EnableSkills) }
@@ -737,7 +741,8 @@ foreach ($modelOwnedPath in @((Join-Path $ownershipRoot 'model-catalog.json'), (
 }
 $connectionStatusPath = Join-Path $ownershipRoot 'connection-status.json'
 $localMcpsEnabled = @()
-if ($feishuEnabled) { $localMcpsEnabled += 'feishu' }
+$feishuApplied = $feishuEnabled -and $feishuReady -and [bool]$renderStatus.feishuEnabled -and [bool]$configStatus.merged
+if ($feishuApplied) { $localMcpsEnabled += 'feishu' }
 if ($mediaGenerationEnabled) { $localMcpsEnabled += 'media-generation' }
 $mediaConfigPath = Join-Path $codexHome 'config.toml'
 $mediaRegistrationVerified = $false
@@ -748,7 +753,7 @@ if ($mediaGenerationEnabled -and $renderStatus.mediaGenerationEnabled -and $conf
 $mediaRegistered = [bool]($mediaGenerationEnabled -and $renderStatus.mediaGenerationEnabled -and $configStatus.merged -and $mediaRegistrationVerified)
 $connectionStatus = [ordered]@{
     schemaVersion = 1
-    feishu = if ($feishuEnabled) { 'enabled-awaiting-tenant-health' } else { 'disabled-awaiting-credentials' }
+    feishu = if (-not $feishuReady) { 'runtime-not-ready' } elseif ($feishuApplied -and -not $feishuHasCredentials) { 'enabled-awaiting-credentials' } elseif ($feishuApplied) { 'enabled-awaiting-tenant-health' } elseif ($feishuEnabled) { 'config-not-applied' } else { 'disabled' }
     mediaGeneration = [ordered]@{
         runtime = [string]$mediaHealthStatus.runtime
         protocol = [string]$mediaHealthStatus.protocol

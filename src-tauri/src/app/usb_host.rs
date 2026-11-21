@@ -148,6 +148,10 @@ pub(crate) fn account_state(
 }
 
 pub fn status() -> Result<UsbHostStatus, AppError> {
+    host_status(None, true)
+}
+
+fn host_status(config: Option<&Value>, probe_media: bool) -> Result<UsbHostStatus, AppError> {
     if !usb_guard::guard_required() {
         return Ok(UsbHostStatus {
             required: false,
@@ -158,26 +162,29 @@ pub fn status() -> Result<UsbHostStatus, AppError> {
             message: String::new(),
         });
     }
-    usb_guard::require_authorized()?;
-    let home = usb_guard::local_data_paths()?.codex_home;
     let binding = usb_guard::authorized_account_binding()?
         .ok_or_else(|| AppError::Engine("未取得当前 U 盘账号绑定".into()))?;
+    let home = usb_guard::local_data_paths()?.codex_home;
     if binding.ccswitch.provider_id != readback::USB_404TOKEN_PROVIDER_ID {
         return Err(AppError::Engine("当前 U 盘账号类型不支持本机初始化".into()));
     }
-    let config = read_config(&home)?;
+    let disk_config;
+    let config = match config {
+        Some(config) => config,
+        None => { disk_config = read_config(&home)?; &disk_config }
+    };
     let auth = read_optional(&home.join("auth.json"))?
         .map(|bytes| serde_json::from_slice::<Json>(&bytes).map_err(|_| invalid_config()))
         .transpose()?;
-    let account = account_state(&config, auth.as_ref(), &binding.ccswitch.device_api_key)?;
+    let account = account_state(config, auth.as_ref(), &binding.ccswitch.device_api_key)?;
     let media_disabled = config
         .get("mcp_servers")
         .and_then(|v| v.get("media_generation"))
         .and_then(|v| v.get("enabled"))
         .and_then(Value::as_bool)
         == Some(false);
-    let core_ready = capability_pack::host_core_ready(&home, &config)?;
-    let media_error = if core_ready && !media_disabled {
+    let core_ready = capability_pack::host_core_ready(&home, config)?;
+    let media_error = if probe_media && core_ready && !media_disabled {
         match crate::app::media_generation::verify_authorized_local_connection() {
             Err(error) => Some(error.to_string()),
             Ok(()) if capability_pack::read_media_authorization_status(&home) != "verified" =>
@@ -197,14 +204,15 @@ pub fn status() -> Result<UsbHostStatus, AppError> {
 }
 
 pub fn ensure_ready() -> Result<(), AppError> {
-    let state = status()?;
+    ensure_ready_for_open(None, true)
+}
+
+pub(crate) fn ensure_ready_for_open(config: Option<&Value>, probe_media: bool) -> Result<(), AppError> {
+    let state = host_status(config, probe_media)?;
     if state.ready {
         Ok(())
     } else {
-        Err(AppError::Engine(format!(
-            "USB_HOST_NOT_READY: {}。请打开管理器完成本机初始化后启动。",
-            state.message
-        )))
+        Err(AppError::UsbHostNotReady(state.message))
     }
 }
 

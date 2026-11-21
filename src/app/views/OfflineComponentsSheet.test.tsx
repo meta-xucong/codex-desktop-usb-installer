@@ -113,6 +113,8 @@ describe("OfflineComponentsSheet", () => {
       configStatus: "merged",
       diagnosticsPath: null,
       feishuEnabled: true,
+      feishuConfigured: true,
+      feishuRuntimeStatus: "passed",
       message: "能力包安装完成",
     });
     api.installAndLaunchCcswitch.mockResolvedValue(CCSWITCH_REPORT);
@@ -128,36 +130,109 @@ describe("OfflineComponentsSheet", () => {
     });
   });
 
-  it("loads status and submits the selected Feishu configuration", async () => {
+  it("shows two Feishu inputs and enables the installed local runtime after saving", async () => {
     const user = userEvent.setup();
+    api.capabilityPackStatus.mockResolvedValue({ ...PACK_REPORT, feishuRuntimeStatus: "passed" });
     renderSheet();
 
-    await waitFor(() => expect(api.capabilityPackStatus).toHaveBeenCalledTimes(1));
-    await user.click(screen.getByRole("checkbox", { name: "飞书 / Lark MCP" }));
+    await screen.findByText("飞书 MCP 已安装。填写应用凭据即可启用。");
+    const save = screen.getByRole("button", { name: "保存飞书连接" });
+    expect(save).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "保存其他连接" })).not.toBeInTheDocument();
+    expect(api.mediaModelCatalog).not.toHaveBeenCalled();
+    expect(screen.getByLabelText("飞书 App Secret")).toHaveAttribute("type", "password");
     await user.type(screen.getByLabelText("飞书 App ID"), "cli_test");
     await user.type(screen.getByLabelText("飞书 App Secret"), "secret_test");
-    await user.click(screen.getByRole("button", { name: "保存并应用连接" }));
+    await user.click(save);
 
     await waitFor(() => expect(api.installCapabilityPack).toHaveBeenCalledTimes(1));
     expect(api.installCapabilityPack).toHaveBeenCalledWith(
       expect.objectContaining({
         enableFeishu: true,
+        feishuAction: "apply",
         persistConnections: true,
         feishuAppId: "cli_test",
         feishuAppSecret: "secret_test",
+        feishuAuthMode: "tenant",
         enabledApiServices: [],
       }),
     );
-    expect(await screen.findByText("能力包就绪")).toBeInTheDocument();
+    expect(await screen.findByText("飞书 MCP 已配置。请重新打开 Codex，再在新会话中使用。")).toBeInTheDocument();
+    expect(screen.getByLabelText("飞书 App Secret")).toHaveValue("");
   }, 30_000);
+
+  it("preserves the existing Feishu connection when saving other integrations", async () => {
+    const user = userEvent.setup();
+    api.capabilityPackStatus.mockResolvedValue({ ...PACK_REPORT, feishuEnabled: true, feishuConfigured: true, feishuRuntimeStatus: "passed" });
+    renderSheet();
+    await user.click(screen.getByText("其他连接"));
+    await screen.findByText("飞书 MCP 已启用，凭据已保存。");
+    const save = screen.getByRole("button", { name: "保存其他连接" });
+    await waitFor(() => expect(save).toBeEnabled());
+    await user.click(save);
+    expect(api.installCapabilityPack).toHaveBeenCalledWith(expect.objectContaining({
+      feishuAction: "preserve",
+      feishuAppId: "",
+      feishuAppSecret: "",
+    }));
+  });
+
+  it("shows Feishu as enabled with blank credentials and confirms live save", async () => {
+    const user = userEvent.setup();
+    const pending = { ...PACK_REPORT, feishuEnabled: true, feishuConfigured: false, feishuRuntimeStatus: "passed" };
+    api.capabilityPackStatus.mockResolvedValue(pending);
+    api.installCapabilityPack.mockResolvedValue({
+      ...pending, coreReady: false, feishuConfigured: true, feishuSavedLive: true,
+    });
+    renderSheet();
+
+    await screen.findByText("飞书 MCP 已启用，待连接。填写 App ID 和 App Secret 后保存。");
+    const id = screen.getByLabelText("飞书 App ID");
+    const secret = screen.getByLabelText("飞书 App Secret");
+    expect(id).toHaveValue("");
+    expect(secret).toHaveValue("");
+    expect(secret).toHaveAttribute("type", "password");
+    const save = screen.getByRole("button", { name: "保存飞书连接" });
+    expect(save).toBeDisabled();
+    await user.type(id, "cli_fixture");
+    await user.type(secret, "fixture-secret");
+    await user.click(save);
+
+    expect(await screen.findByText("飞书凭据已保存，可回到当前 Codex 会话使用。")).toBeInTheDocument();
+    expect(secret).toHaveValue("");
+    expect(screen.queryByText(/请重新打开 Codex/)).not.toBeInTheDocument();
+  }, 30_000);
+
+  it("shows a Feishu save failure beside the form and keeps both inputs for retry", async () => {
+    const user = userEvent.setup();
+    api.installCapabilityPack.mockRejectedValueOnce({
+      message: "update engine error: 无法从安装包准备飞书运行时。请查看管理器日志",
+    });
+    renderSheet();
+    const id = screen.getByLabelText("飞书 App ID");
+    const secret = screen.getByLabelText("飞书 App Secret");
+    await user.type(id, "cli_fixture");
+    await user.type(secret, "fixture-secret");
+    const save = screen.getByRole("button", { name: "保存飞书连接" });
+    await user.click(save);
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("无法从安装包准备飞书运行时。请查看管理器日志");
+    expect(alert).not.toHaveTextContent("update engine error");
+    expect(save.closest("form")).toContainElement(alert);
+    expect(id).toHaveValue("cli_fixture");
+    expect(secret).toHaveValue("fixture-secret");
+    expect(api.mediaModelCatalog).not.toHaveBeenCalled();
+  });
 
   it("disables installation while status is pending and allows it after a status failure", async () => {
     const user = userEvent.setup();
     const status = deferred<CapabilityPackReport>();
     api.capabilityPackStatus.mockReturnValue(status.promise);
     renderSheet();
+    await user.click(screen.getByText("其他连接"));
 
-    const install = await screen.findByRole("button", { name: "保存并应用连接" });
+    const install = await screen.findByRole("button", { name: "保存其他连接" });
     await waitFor(() => expect(api.capabilityPackStatus).toHaveBeenCalledTimes(1));
     expect(install).toBeDisabled();
 
@@ -180,8 +255,9 @@ describe("OfflineComponentsSheet", () => {
     rendered.rerender(<SheetView open={false} />);
     rendered.rerender(<SheetView open />);
     await waitFor(() => expect(api.capabilityPackStatus).toHaveBeenCalledTimes(2));
+    await user.click(screen.getByText("其他连接"));
 
-    const install = await screen.findByRole("button", { name: "保存并应用连接" });
+    const install = await screen.findByRole("button", { name: "保存其他连接" });
     await waitFor(() => expect(install).toBeEnabled());
     await user.click(install);
     await waitFor(() => expect(api.installCapabilityPack).toHaveBeenCalledTimes(1));
@@ -203,7 +279,7 @@ describe("OfflineComponentsSheet", () => {
       configStatus: "conflict",
       message: "Codex 配置冲突",
     });
-    renderSheet();
+    renderSheet(true, "maintenance");
 
     expect(await screen.findByText("核心能力已就绪，Codex 配置存在冲突/需确认")).toBeInTheDocument();
     expect(screen.queryByText("核心能力已就绪，运行时待修复")).not.toBeInTheDocument();
@@ -220,7 +296,7 @@ describe("OfflineComponentsSheet", () => {
       configStatus: "conflict",
       message: "运行时和 Codex 配置均需处理",
     });
-    renderSheet();
+    renderSheet(true, "maintenance");
 
     expect(await screen.findByText("核心能力已就绪，运行时待修复")).toBeInTheDocument();
     expect(screen.queryByText("核心能力已就绪，Codex 配置存在冲突/需确认")).not.toBeInTheDocument();
@@ -229,10 +305,11 @@ describe("OfflineComponentsSheet", () => {
   it("installs core capabilities without optional connections when they are unchecked", async () => {
     const user = userEvent.setup();
     renderSheet();
+    await user.click(screen.getByText("其他连接"));
 
     await user.click(screen.getByRole("checkbox", { name: "图片与视频生成（本地 MCP）" }));
 
-    await user.click(screen.getByRole("button", { name: "保存并应用连接" }));
+    await user.click(screen.getByRole("button", { name: "保存其他连接" }));
 
     await waitFor(() => expect(api.installCapabilityPack).toHaveBeenCalledTimes(1));
     expect(api.installCapabilityPack).toHaveBeenCalledWith(
@@ -254,11 +331,12 @@ describe("OfflineComponentsSheet", () => {
   it("enables license-backed Image-2 by default without asking for a separate media key", async () => {
     const user = userEvent.setup();
     renderSheet();
+    await user.click(screen.getByText("其他连接"));
 
     expect(screen.getByRole("checkbox", { name: "图片与视频生成（本地 MCP）" })).toBeChecked();
     expect(screen.getByText("MiniMax 视频：暂未开放")).toBeInTheDocument();
     await user.type(screen.getByLabelText("Grok 图片模型 ID"), "grok-imagine-test");
-    await user.click(screen.getByRole("button", { name: "保存并应用连接" }));
+    await user.click(screen.getByRole("button", { name: "保存其他连接" }));
 
     await waitFor(() => expect(api.installCapabilityPack).toHaveBeenCalledTimes(1));
     const submitted = api.installCapabilityPack.mock.calls[0][0];
@@ -283,9 +361,10 @@ describe("OfflineComponentsSheet", () => {
       models: ["gpt-image-2.5", "seedance-2.0"],
     });
     renderSheet();
+    await user.click(screen.getByText("其他连接"));
 
     await waitFor(() => expect(api.mediaModelCatalog).toHaveBeenCalledTimes(1));
-    await user.click(screen.getByRole("button", { name: "保存并应用连接" }));
+    await user.click(screen.getByRole("button", { name: "保存其他连接" }));
     await waitFor(() => expect(api.installCapabilityPack).toHaveBeenCalledTimes(1));
     expect(api.installCapabilityPack.mock.calls[0]?.[0]).toMatchObject({
       enableMediaGeneration: true,
@@ -303,9 +382,10 @@ describe("OfflineComponentsSheet", () => {
       configuredAgentId: "agent-route-42",
     });
     renderSheet();
+    await user.click(screen.getByText("其他连接"));
 
     await waitFor(() => expect(api.mediaModelCatalog).toHaveBeenCalledTimes(1));
-    await user.click(screen.getByRole("button", { name: "保存并应用连接" }));
+    await user.click(screen.getByRole("button", { name: "保存其他连接" }));
     await waitFor(() => expect(api.installCapabilityPack).toHaveBeenCalledTimes(1));
     expect(api.installCapabilityPack.mock.calls[0]?.[0]).toMatchObject({
       enableMediaGeneration: true,
@@ -318,10 +398,11 @@ describe("OfflineComponentsSheet", () => {
     const user = userEvent.setup();
     api.mediaModelCatalog.mockResolvedValueOnce({ models: ["gpt-4o", "claude-opus-4-8"] });
     renderSheet();
+    await user.click(screen.getByText("其他连接"));
 
     await waitFor(() => expect(api.mediaModelCatalog).toHaveBeenCalledTimes(1));
     expect(screen.getByRole("checkbox", { name: "图片与视频生成（本地 MCP）" })).toBeChecked();
-    await user.click(screen.getByRole("button", { name: "保存并应用连接" }));
+    await user.click(screen.getByRole("button", { name: "保存其他连接" }));
     await waitFor(() => expect(api.installCapabilityPack).toHaveBeenCalledTimes(1));
     expect(api.installCapabilityPack.mock.calls[0]?.[0]).toMatchObject({
       enableMediaGeneration: true,
@@ -336,9 +417,10 @@ describe("OfflineComponentsSheet", () => {
     const user = userEvent.setup();
     api.mediaModelCatalog.mockRejectedValueOnce(new Error("offline"));
     renderSheet();
+    await user.click(screen.getByText("其他连接"));
 
     await waitFor(() => expect(api.mediaModelCatalog).toHaveBeenCalledTimes(1));
-    await user.click(screen.getByRole("button", { name: "保存并应用连接" }));
+    await user.click(screen.getByRole("button", { name: "保存其他连接" }));
     await waitFor(() => expect(api.installCapabilityPack).toHaveBeenCalledTimes(1));
     expect(api.installCapabilityPack.mock.calls[0]?.[0]).toMatchObject({
       enableMediaGeneration: true,
@@ -384,9 +466,10 @@ describe("OfflineComponentsSheet", () => {
   it("rejects an enabled service with missing required fields before IPC", async () => {
     const user = userEvent.setup();
     renderSheet();
+    await user.click(screen.getByText("其他连接"));
 
     await user.click(screen.getByRole("checkbox", { name: "DashScope 联网搜索" }));
-    await user.click(screen.getByRole("button", { name: "保存并应用连接" }));
+    await user.click(screen.getByRole("button", { name: "保存其他连接" }));
 
     expect(await screen.findByText("DashScope 的 Key、Base URL 和模型必须填写完整。")).toBeInTheDocument();
     expect(api.installCapabilityPack).not.toHaveBeenCalled();

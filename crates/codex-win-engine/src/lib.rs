@@ -62,11 +62,14 @@ pub use portable::{
     codex_running_for_root, inject_portable_fault, install_portable_from_msix,
     install_portable_from_msix_with_observer, install_portable_from_msix_with_observer_options,
     install_portable_from_msix_with_observer_options_and_progress, installed_app_exe,
-    installed_codex_launch_exe, installed_usb_codex_launch_exe, purge_codex_user_data,
+    installed_codex_launch_exe, installed_codex_launch_exe_for_usb_mode,
+    installed_usb_codex_launch_exe, purge_codex_user_data,
     remove_directory_all_with_retry, rename_directory_with_retry, uninstall_portable,
     validate_cleanup_path, PortableBoundary, PortableExtractionProgress, PortableFault,
     PortableInstallOptions, PortableInstallReport, PortableInstallStage, PortableUninstallReport,
 };
+#[cfg(windows)]
+pub use sys::focus_existing_usb_session;
 pub use sys::{
     close_msix_codex_processes, detect_installed_codex, detect_portable_install, fetch_text,
     fetch_text_with_network, fetch_text_with_network_no_redirect, launch_codex,
