@@ -736,7 +736,7 @@ fn detect_managed_codex(
     detect_installed_codex(root.as_path())
 }
 
-fn is_current_usb_portable(installed: &InstalledWindowsCodex) -> bool {
+pub(crate) fn is_current_usb_portable(installed: &InstalledWindowsCodex) -> bool {
     if installed.source != "portable" {
         return false;
     }

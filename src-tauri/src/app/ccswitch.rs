@@ -1183,6 +1183,7 @@ fn launch_with_intent(
         Vec::new()
     };
     let account_injected = !account_environment.is_empty();
+    let background = intent == CcswitchLaunchIntent::Bootstrap && account_injected;
     let handoff_request = if account_injected {
         account_environment
             .iter()
@@ -1300,7 +1301,7 @@ fn launch_with_intent(
         // manager hides the main window while leaving the tray process alive.
         .env(
             CCSWITCH_USB_BACKGROUND_ENV,
-            if intent == CcswitchLaunchIntent::Bootstrap && account_injected {
+            if background {
                 "1"
             } else {
                 "0"
@@ -1361,8 +1362,13 @@ fn launch_with_intent(
         log::warn!("CCSwitch started but USB guard registration failed: {error}");
     }
 
+    let probe = if background {
+        codex_win_engine::observe_window_for_root
+    } else {
+        codex_win_engine::wait_for_usable_window_for_root
+    };
     let window =
-        codex_win_engine::wait_for_usable_window_for_root(&working_dir, Duration::from_secs(45))
+        probe(&working_dir, Duration::from_secs(45))
             .map_err(|error| AppError::Engine(format!("检查 CCSwitch 窗口失败：{error}")))?;
     let Some(window) = window else {
         // Do not leave a headless single-instance process behind: the next
@@ -1381,7 +1387,7 @@ fn launch_with_intent(
     // fatally exits. Do not turn that transient window into a false success.
     std::thread::sleep(Duration::from_secs(3));
     let stable_window =
-        codex_win_engine::wait_for_usable_window_for_root(&working_dir, Duration::ZERO)
+        probe(&working_dir, Duration::ZERO)
             .map_err(|error| AppError::Engine(format!("复核 CCSwitch 窗口失败：{error}")))?;
     let Some(stable_window) = stable_window else {
         if codex_win_engine::processes_running_for_root(&working_dir).unwrap_or(false) {
@@ -1412,9 +1418,7 @@ fn launch_with_intent(
     // Hide only after CCSwitch confirms that the matching credential is saved
     // and 404token is the active Codex provider. Explicit user opens remain
     // visible and are never subject to the bootstrap hand-off.
-    let should_hide = intent == CcswitchLaunchIntent::Bootstrap
-        && account_injected
-        && injection_status == "verified";
+    let should_hide = background && injection_status == "verified";
     let hidden_windows = if should_hide {
         // WebView2 can hand the first top-level HWND to a renderer child a
         // fraction after the stable-window probe.  Retry the exact managed
@@ -1441,20 +1445,28 @@ fn launch_with_intent(
     } else {
         0
     };
-    let focused = stable_window;
+    // If automatic setup failed, present the configurator for manual recovery.
+    let focused = if background && !should_hide {
+        codex_win_engine::wait_for_usable_window_for_root(&working_dir, Duration::ZERO)
+            .map_err(|error| AppError::Engine(format!("无法显示 CCSwitch 配置窗口：{error}")))?
+            .ok_or_else(|| AppError::Engine("CCSwitch 配置未完成，配置窗口已关闭".into()))?
+    } else {
+        stable_window
+    };
     log::info!(
-        "CCSwitch usable window confirmed pid={} size={}x{} initially_visible={} foreground_accepted={} hidden_windows={} account_injected={} webview2_args={}",
+        "CCSwitch usable window confirmed pid={} size={}x{} initially_visible={} presentation_requested={} foreground_accepted={} hidden_windows={} account_injected={} webview2_args={}",
         focused.pid,
         focused.width,
         focused.height,
         window.was_visible,
+        !should_hide,
         focused.foreground_accepted,
         hidden_windows,
         account_injected,
         webview2_arguments
     );
 
-    if should_hide && hidden_windows > 0 && usb_mode {
+    if should_hide && usb_mode {
         if let Err(error) = write_usb_managed_marker(&source, true) {
             log::warn!("CCSwitch background hand-off completed but marker update failed: {error}");
         }
@@ -1469,7 +1481,7 @@ fn launch_with_intent(
         copied_files,
         launch_mode: launch_mode.to_string(),
         data_scope: "user-profile".to_string(),
-        usable_window_confirmed: true,
+        usable_window_confirmed: !should_hide,
         graphics_mode: "software-rendering".to_string(),
         account_injected,
         account_injection_status: injection_status.to_string(),

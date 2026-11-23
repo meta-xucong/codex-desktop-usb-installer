@@ -305,16 +305,16 @@ function programIsOnCurrentUsb(
 function currentUsbInstallMatchesPayload(
   status: WinInstallStatus | null,
   guard: UsbGuardStatus | null,
-  payload: OfflinePayloadReport | null,
+  payloadVersion: string | undefined,
 ): boolean {
   const installed = status?.installed;
   return Boolean(
-    payload &&
+    payloadVersion &&
       codexReadyOnAuthorizedUsb(guard) &&
       installed &&
       !installed.appVersionUnavailable &&
       !status?.recoveryPending &&
-      compareVersions(installed.version, payload.codexDesktopVersion) === 0 &&
+      compareVersions(installed.version, payloadVersion) === 0 &&
       programIsOnCurrentUsb(status, guard),
   );
 }
@@ -545,7 +545,7 @@ export function OfflineHome({
     };
   }, [t]);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (verifyPayload = false) => {
     const generation = loadGeneration.current + 1;
     loadGeneration.current = generation;
     setPhase("loading");
@@ -583,13 +583,18 @@ export function OfflineHome({
             : t("offline.existingOutsideUsb"),
         );
       }
-      // Let the user see the shell and the current guard state while the
-      // immutable package probe continues. Actions remain disabled until the
-      // payload is available.
+      // Show the shell while authorization and any required payload probe settle.
       setPhase("ready");
-      let nextPayload: OfflinePayloadReport;
+      const declaredVersion = nextStatus.usbPayloadVersion;
+      const installed = nextStatus.installed;
+      const useManifestVersion = !verifyPayload && declaredVersion && installed
+        && !nextStatus.recoveryPending && !nextUsbGuardResult.failed
+        && (usbGuardStartupPending(nextUsbGuard) || (codexReadyOnAuthorizedUsb(nextUsbGuard)
+          && programIsOnCurrentUsb(nextStatus, nextUsbGuard)))
+        && (installed.appVersionUnavailable || compareVersions(installed.version, declaredVersion) === 0);
+      let nextPayload: OfflinePayloadReport | null;
       try {
-        nextPayload = await managerApi.offlinePayloadProbe();
+        nextPayload = useManifestVersion ? null : await managerApi.offlinePayloadProbe();
       } catch (probeError) {
         // A revoked cleanup deliberately removes the bundle MSIX. Keep the
         // manager shell available so the signed, backend-gated payload
@@ -665,7 +670,7 @@ export function OfflineHome({
       }
       setPayload(nextPayload);
       setPayloadLoading(false);
-      if (currentUsbInstallMatchesPayload(settledStatus, settledUsbGuard, nextPayload)) {
+      if (currentUsbInstallMatchesPayload(settledStatus, settledUsbGuard, nextPayload?.codexDesktopVersion ?? settledStatus.usbPayloadVersion)) {
         // A startup snapshot can leave an "installed elsewhere" notice
         // behind while USB authorization is still settling. The proven USB
         // install must win once the path and version have been confirmed.
@@ -708,27 +713,27 @@ export function OfflineHome({
     const poll = () => {
       void managerApi
         .usbGuardStatus()
-        .then((next) => {
+        .then(async (next) => {
           if (!active) return;
+          const ready = codexReadyOnAuthorizedUsb(next);
+          const becameReady = ready && !usbGuardWasReady.current;
+          usbGuardWasReady.current = ready;
+          if (becameReady && (payload || status?.usbPayloadVersion)) {
+            try {
+              const nextStatus = await managerApi.winStatus();
+              if (!active) return;
+              setStatus(nextStatus);
+              if (currentUsbInstallMatchesPayload(nextStatus, next, payload?.codexDesktopVersion ?? nextStatus.usbPayloadVersion)) {
+                setNotice(null);
+                setPhase((previous) => previous === "ready" ? "installed" : previous);
+              }
+            } catch {
+              if (!active) return;
+              usbGuardWasReady.current = false;
+            }
+          }
           setUsbGuard(next);
           setUsbGuardQueryFailed(false);
-           const ready = codexReadyOnAuthorizedUsb(next);
-           const becameReady = ready && !usbGuardWasReady.current;
-           usbGuardWasReady.current = ready;
-           if (becameReady && payload) {
-             void managerApi.winStatus()
-               .then((nextStatus) => {
-                 if (!active) return;
-                 setStatus(nextStatus);
-                 if (currentUsbInstallMatchesPayload(nextStatus, next, payload)) {
-                   // Clear a stale startup classification once the USB
-                   // install has been proven after authorization.
-                   setNotice(null);
-                   setPhase((previous) => previous === "ready" ? "installed" : previous);
-                 }
-               })
-               .catch(() => undefined);
-           }
           if (usbGuardStartupPending(next)) {
             usbGuardStartupPolls.current += 1;
           } else {
@@ -757,7 +762,7 @@ export function OfflineHome({
       active = false;
       if (timer !== null) window.clearTimeout(timer);
     };
-  }, [componentsOpen, payload, usbGuardQueryFailed, usbGuardStatus]);
+  }, [componentsOpen, payload, status?.usbPayloadVersion, usbGuardQueryFailed, usbGuardStatus]);
 
   const performInstall = useCallback(async (
     sourcePayload: OfflinePayloadReport,
@@ -791,7 +796,7 @@ export function OfflineHome({
         throw new Error(current.status === "external" ? t("offline.external") : t("offline.existingOutsideUsb"));
       }
       if (intent === "install") {
-        if (currentUsbInstallMatchesPayload(current, currentGuard, sourcePayload)) {
+        if (currentUsbInstallMatchesPayload(current, currentGuard, sourcePayload.codexDesktopVersion)) {
           setPhase("installed");
           return true;
         }
@@ -1042,14 +1047,18 @@ export function OfflineHome({
   }, [resetStop, t, updateCcswitchInjectionIssue]);
 
   const install = useCallback(async (intent: "install" | "repair") => {
-    if (!payload || busyAction) return;
+    if (busyAction) return;
     if (!codexInstallAllowedOnCurrentRuntime(usbGuard, usbGuardQueryFailed)) {
       setNotice(t("offline.installRequiresAuthorized"));
       return;
     }
     setBusyAction("install");
     try {
-      await performInstall(payload, intent);
+      const source = payload ?? await managerApi.offlinePayloadProbe();
+      setPayload(source);
+      await performInstall(source, intent);
+    } catch (cause) {
+      setFailure(resolveFailure(cause, t));
     } finally {
       setBusyAction(null);
     }
@@ -1250,7 +1259,7 @@ export function OfflineHome({
           : "unavailable";
   const usbGuardIsStarting = usbGuardStartupPending(usbGuard);
   const usbGuardStartupFailed = usbGuard?.status === "initialization-failed";
-  const currentUsbInstalled = currentUsbInstallMatchesPayload(status, usbGuard, payload);
+  const currentUsbInstalled = currentUsbInstallMatchesPayload(status, usbGuard, payload?.codexDesktopVersion ?? status?.usbPayloadVersion);
   const showInstalled = !usbGuardQueryFailed && currentUsbInstalled;
   const versionUnavailable = codexReady && currentUsbVersionUnavailable(status, usbGuard);
   const checkingExistingInstall = payloadLoading && codexReady && programIsOnCurrentUsb(status, usbGuard);
@@ -1534,7 +1543,7 @@ export function OfflineHome({
               <Ring icon="check" variant="success" />
               <div className="headline">{t(hostPending ? "offline.host.pending" : "offline.installed")}</div>
               {hostPending ? <div className="sub" role="status">{hostStatus.message}</div> : null}
-              <div className="microcue"><Icon name="shield" />{t("offline.hashVerified")}</div>
+              <div className="microcue">{payload ? <><Icon name="shield" />{t("offline.hashVerified")}</> : displayInstalled?.version}</div>
             </>
           ) : usbInstallBlockedByExistingCodex(status, usbGuard) ? (
             <>
@@ -1695,7 +1704,7 @@ export function OfflineHome({
           <summary>{t("offline.advancedTools")}</summary>
           <div className="advanced-maintenance">
             <div className="advanced-maintenance-row">
-              <button className="btn ghost" onClick={() => void load()} disabled={disabled}>
+              <button className="btn ghost" onClick={() => void load(true)} disabled={disabled}>
                 <Icon name="refresh" />{t("offline.recheck")}
               </button>
               {showInstalled || versionUnavailable ? (

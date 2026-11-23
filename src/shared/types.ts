@@ -1062,6 +1062,8 @@ export function outcomeIsPartial(
 }
 
 export interface WinInstallStatus {
+  /** Version declared by this USB's manifest; display data only. */
+  usbPayloadVersion?: string;
   installed: InstalledWindowsCodex | null;
   status: InstallClass;
   /** Older managers omit this field; current USB builds always report it. */

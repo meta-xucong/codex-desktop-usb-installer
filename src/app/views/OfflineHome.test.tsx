@@ -362,6 +362,45 @@ describe("OfflineHome", () => {
     expect(screen.getByRole("button", { name: "检查并安装更新" })).toBeEnabled();
   });
 
+  it.each(["authorized", "starting"])("reopens the matching installed USB without probing the MSIX (%s)", async (initial) => {
+    api.winStatus.mockResolvedValue({ status: "external", installed: USB_PORTABLE_CODEX, usbPayloadVersion: PAYLOAD.codexDesktopVersion });
+    if (initial === "starting") {
+      api.usbGuardStatus.mockResolvedValueOnce({ ...USB_GUARD, status: "starting", watchdog: "not-running", codexAllowed: false });
+    }
+    renderView();
+    await waitFor(() => expect(screen.getByRole("button", { name: "启动 Codex" })).toBeEnabled());
+    expect(screen.queryByRole("button", { name: "一键安装" })).not.toBeInTheDocument();
+    expect(screen.queryByText("校验通过")).not.toBeInTheDocument();
+    expect(api.offlinePayloadProbe).not.toHaveBeenCalled();
+    expect(api.offlinePayloadStage).not.toHaveBeenCalled();
+  });
+
+  it("uses the status returned after a slow USB authorization transition", async () => {
+    const installedStatus = { status: "managed" as const, installed: USB_PORTABLE_CODEX, usbPayloadVersion: PAYLOAD.codexDesktopVersion };
+    const starting = { ...USB_GUARD, status: "starting" as const, codexAllowed: false };
+    let finish!: (value: typeof installedStatus) => void;
+    api.winStatus.mockResolvedValueOnce({ ...installedStatus, status: "external",
+      installed: { ...USB_PORTABLE_CODEX, appVersionUnavailable: true } })
+      .mockReturnValueOnce(new Promise((resolve) => { finish = resolve; }));
+    api.usbGuardStatus.mockResolvedValueOnce(starting).mockResolvedValueOnce(starting).mockResolvedValue(USB_GUARD);
+    renderView();
+    await waitFor(() => expect(api.winStatus).toHaveBeenCalledTimes(2));
+    finish(installedStatus);
+    await waitFor(() => expect(screen.getByRole("button", { name: "启动 Codex" })).toBeEnabled());
+    expect(api.offlinePayloadProbe).not.toHaveBeenCalled();
+    expect(api.offlinePayloadStage).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { usbPayloadVersion: "99.0.0" },
+    { usbPayloadVersion: PAYLOAD.codexDesktopVersion, recoveryPending: true },
+  ])("keeps the full probe for different versions and interrupted installation (%j)", async (fields) => {
+    api.winStatus.mockResolvedValue({ status: "managed", installed: USB_PORTABLE_CODEX, ...fields });
+    renderView();
+    await waitFor(() => expect(api.offlinePayloadProbe).toHaveBeenCalledTimes(1));
+    expect(api.offlinePayloadStage).not.toHaveBeenCalled();
+  });
+
   it("shows an existing program is being checked while the package probe is pending", async () => {
     api.winStatus.mockResolvedValue({ status: "managed", installed: USB_PORTABLE_CODEX });
     let finish!: (value: OfflinePayloadReport) => void;

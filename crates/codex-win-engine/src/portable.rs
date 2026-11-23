@@ -20,6 +20,8 @@ use crate::EngineError;
 
 #[path = "portable_runtime_261111.rs"]
 mod runtime_261111;
+#[path = "portable_runtime_261117.rs"]
+mod runtime_261117;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2286,12 +2288,20 @@ const CONSOLE_ASAR_PATCH_SENTINELS: &[&[u8]] = &[
     CODEX_ASAR_GENERIC_SPAWN_SENTINEL,
 ];
 
+fn versioned_usb_patches(version: Option<&str>) -> &'static [(&'static [u8], &'static [u8], &'static str)] {
+    if version.is_some_and(runtime_261117::supports) {
+        runtime_261117::PATCHES
+    } else {
+        runtime_261111::PATCHES
+    }
+}
+
 fn startup_fixed_width_patches(
-    usb: bool,
+    usb: bool, version: Option<&str>,
 ) -> impl Iterator<Item = &'static (&'static [u8], &'static [u8], &'static str)> {
     let usb_patches = if usb {
         [
-            runtime_261111::PATCHES,
+            versioned_usb_patches(version),
             CODEX_ASAR_USB_IAB_VISIBILITY_PATCHES,
             USB_STARTUP_ASAR_PATCHES,
         ]
@@ -2372,11 +2382,11 @@ fn startup_asar_scan<'a>(
             .chain(CODEX_ASAR_GENERIC_SPAWN_CALLS)
             .map(|&(call, _)| call),
     );
-    patterns.extend(startup_fixed_width_patches(usb).map(|&(call, _, _)| call));
+    patterns.extend(startup_fixed_width_patches(usb, version).map(|&(call, _, _)| call));
     if usb {
         // Only required patches use the replacement as evidence of compatibility.
         patterns.extend(
-            runtime_261111::PATCHES
+            versioned_usb_patches(version)
                 .iter()
                 .chain(CODEX_ASAR_USB_IAB_VISIBILITY_PATCHES)
                 .map(|&(_, replacement, _)| replacement),
@@ -2937,14 +2947,14 @@ fn validate_required_usb_runtime_patches(
             &["iab-visibility-explicit-route-selection"],
         ),
     ];
+    let exact_layout = runtime_261117::supports(version);
+    let versioned = versioned_usb_patches(Some(version));
     for (label, old_labels) in groups {
         let mut candidates: Vec<_> = legacy
             .iter()
-            .filter(|(_, _, name)| old_labels.contains(name))
+            .filter(|(_, _, name)| !exact_layout && old_labels.contains(name))
             .collect();
-        let newer = runtime_261111::PATCHES
-            .iter()
-            .filter(|(_, _, name)| name == label);
+        let newer = versioned.iter().filter(|(_, _, name)| name == label);
         if version == "26.1111.21308" {
             candidates.splice(0..0, newer);
         } else {
@@ -2961,9 +2971,9 @@ fn validate_required_usb_runtime_patches(
             return Err(incompatible(label));
         }
     }
-    if version == "26.1111.21308" {
+    if version == "26.1111.21308" || exact_layout {
         for required in ["bootstrap-appdata", "onboarding-default-detail-mode"] {
-            let (before, after, label) = runtime_261111::PATCHES
+            let (before, after, label) = versioned
                 .iter()
                 .find(|(_, _, label)| *label == required)
                 .expect("known version-specific patch");
@@ -3048,6 +3058,7 @@ fn ensure_portable_codex_startup_compatibility_with_runtime_root(
         install_root,
         runtime_root,
         usb_integrity_transaction,
+        version.as_deref(),
         scan.as_mut(),
     )?;
     if let Some(version) = &version {
@@ -3067,6 +3078,7 @@ fn ensure_portable_codex_startup_compatibility_inner(
     install_root: &Path,
     runtime_root: &Path,
     usb_integrity_transaction: bool,
+    version: Option<&str>,
     scan: Option<&mut AsarPatchScan<'_>>,
 ) -> Result<bool, EngineError> {
     // The executable edit complements the ASAR `windowsHide` patch.  Both
@@ -3085,7 +3097,7 @@ fn ensure_portable_codex_startup_compatibility_inner(
     // newer Codex builds can change or remove the updater bootstrap while the
     // app-server spawn remains the source of a visible console window.
     patched |= patch_codex_console_spawn(scan)?;
-    for (call, replacement, label) in startup_fixed_width_patches(usb_integrity_transaction) {
+    for (call, replacement, label) in startup_fixed_width_patches(usb_integrity_transaction, version) {
         patched |= patch_all_fixed_width_calls(scan, call, replacement, label)? > 0;
     }
 
@@ -5790,14 +5802,14 @@ mod tests {
             .is_file()
             .then(|| startup_asar_scan(&path, usb, false, None))
             .transpose()?;
-        ensure_portable_codex_startup_compatibility_inner(root, root, usb, scan.as_mut())
+        ensure_portable_codex_startup_compatibility_inner(root, root, usb, None, scan.as_mut())
     }
 
     fn validate_usb_runtime_fixture(root: &Path, applied: bool) -> Result<(), EngineError> {
         let path = root.join("resources/app.asar");
-        let scan = startup_asar_scan(&path, true, false, None)?;
         let version =
             read_codex_app_version_from_install_root(root).unwrap_or_else(|| "unknown".into());
+        let scan = startup_asar_scan(&path, true, false, Some(&version))?;
         validate_required_usb_runtime_patches(root, Some(&scan), &version, applied)
     }
 
@@ -7211,6 +7223,37 @@ mod tests {
                 validate_usb_runtime_fixture(&root, false).unwrap();
                 let post = validate_usb_runtime_fixture(&root, true);
                 assert_eq!(post.is_ok(), applied);
+                fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn required_usb_runtime_261117_checks_original_applied_and_missing_notify() {
+        for version in ["26.1117.31558", "26.1117.41037"] {
+            for applied in [false, true] {
+                let root = required_usb_patch_fixture(true, applied);
+                let asar = root.join("resources/app.asar");
+                for omit_notify in [false, true] {
+                    let mut bytes = Vec::new();
+                    for &(before, after, label) in runtime_261117::PATCHES {
+                        if omit_notify && label == "cua-notify-unwrap" {
+                            continue;
+                        }
+                        bytes.extend_from_slice(if applied { after } else { before });
+                        bytes.push(b'\n');
+                    }
+                    fs::write(&asar, bytes).unwrap();
+                    let scan = startup_asar_scan(&asar, true, false, Some(version)).unwrap();
+                    let check = |post| validate_required_usb_runtime_patches(&root, Some(&scan), version, post);
+                    if omit_notify {
+                        assert!(check(false).unwrap_err().to_string().contains("cua-notify-unwrap"));
+                        assert!(check(true).is_err());
+                    } else {
+                        check(false).unwrap();
+                        assert_eq!(check(true).is_ok(), applied);
+                    }
+                }
                 fs::remove_dir_all(root).unwrap();
             }
         }

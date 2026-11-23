@@ -7,6 +7,13 @@ const acorn = require('acorn');
 
 const source = fs.readFileSync(path.join(__dirname, '../crates/codex-win-engine/src/portable_runtime_261111.rs'), 'utf8');
 const patches = new Map([...source.matchAll(/\(br#"(.*?)"#, br#"(.*?)"#, "(.*?)"\)/gs)].map(([, before, after, label]) => [label, { before, after }]));
+const is261117 = process.env.USB_RUNTIME_TEST_LAYOUT === '261117';
+if (is261117) {
+  const current = fs.readFileSync(path.join(__dirname, '../crates/codex-win-engine/src/portable_runtime_261117.rs'), 'utf8');
+  const changed = [...current.matchAll(/\(br#"(.*?)"#, br#"(.*?)"#, "(.*?)"\)/gs)];
+  assert.equal(changed.length, 7);
+  for (const [, before, after, label] of changed) patches.set(label, { before, after });
+}
 const code = label => patches.get(label).after;
 const logger = () => ({ info() {}, warning() {} });
 
@@ -15,7 +22,7 @@ function browserFixture() {
   const window = { owner, window: { show() { this.shown++; }, shown: 0, isVisible() { return true; } }, activeConversationId: 'thread', activeBrowserTabId: 'tab', tabSourceWindow: null };
   const state = { visible: false, bounds: null, page: { view: { webContents: { id: 2, isDestroyed() { return false; }, closeExtensionActionContextMenu() {} } } } };
   const messages = [];
-  const Waiter = vm.runInNewContext(`(${code('iab-rendered-state-waiter')})`, { setTimeout, clearTimeout, en$: logger });
+  const Waiter = vm.runInNewContext(`(${code('iab-rendered-state-waiter')})`, { setTimeout, clearTimeout, [is261117 ? 'ekp' : 'en$']: logger });
   const waiter = new Waiter();
   let delegate;
   const actions = {
@@ -28,7 +35,7 @@ function browserFixture() {
     windowManager: { sendMessageToWebContents(_owner, message) { messages.push(message); } },
   };
   const routeOpen = vm.runInNewContext(`(${code('iab-explicit-route-selection')})`);
-  const context = { eiE: logger, enL: (_window, _thread, tab) => tab, eij: routeOpen };
+  const context = { [is261117 ? 'eIr' : 'eiE']: logger, [is261117 ? 'eko' : 'enL']: (_window, _thread, tab) => tab, [is261117 ? 'eIo' : 'eij']: routeOpen };
   delegate = vm.runInNewContext(`(function(){return {${code('iab-delegate-rendered-state')}}})`, context).call({ actions });
   const Host = vm.runInNewContext(`(class { ${code('iab-host-return')} })`);
   const host = new Host();
@@ -40,12 +47,14 @@ function browserFixture() {
   const commands = vm.runInNewContext(`({${code('iab-command-await')}}).handlers`, {
     e: 'tab', t: host, erN: 'set', erj: 'get', erJ: 'viewport', erV: 'reset',
     erq: schema, erU: schema, erL: schema, erB: schema, erY: schema, erZ: schema, erK: schema, erG: schema,
+    eSd: 'set', eSa: 'get', eSb: 'viewport', eSf: 'reset',
+    eSu: schema, eSh: schema, eSo: schema, eSl: schema, eSS: schema, eSk: schema, eSw: schema, eSy: schema,
   });
   const resolve = () => waiter.resolveForWindow(window, () => ({ browserTabId: 'tab', webContents: { id: 2 }, pageKey: 'page' }));
   return { commands, host, delegate, window, state, waiter, messages, resolve };
 }
 
-test('26.1111 replacements fit their real slots', () => {
+test('all replacements fit their real slots', () => {
   assert.equal(patches.size, 9);
   for (const [label, patch] of patches) assert.ok(Buffer.byteLength(patch.after) <= Buffer.byteLength(patch.before), label);
 });
@@ -54,7 +63,7 @@ test('early bootstrap uses the existing Windows roaming path and preserves an ex
   const patch = patches.get('bootstrap-appdata');
   const evaluate = (source, override) => vm.runInNewContext(source, {
     process: { env: { APPDATA: 'C:/profile/Roaming', CODEX_ELECTRON_USER_DATA_PATH: override } },
-    i: { join: (...parts) => parts.join('/') }, l: { m: () => 'Codex' }, c: { x: { resolve: () => 'prod' } },
+    i: { join: (...parts) => parts.join('/') }, [is261117 ? 'c' : 'l']: { m: () => 'Codex' }, [is261117 ? 'l' : 'c']: { x: { resolve: () => 'prod' } },
     r: { app: { getPath() { throw new Error("Failed to get 'appData' path"); } } },
   });
   assert.throws(() => evaluate(patch.before), /appData/);
@@ -65,7 +74,7 @@ test('early bootstrap uses the existing Windows roaming path and preserves an ex
 test('onboarding preserves USB COMMANDS for non-coding while retaining role-specific UI choices', () => {
   const patch = patches.get('onboarding-default-detail-mode');
   const evaluate = (source, workMode) => JSON.parse(JSON.stringify(vm.runInNewContext(source, {
-    y: { workMode }, L: { _e: 'STEPS_COMMANDS', O$: 'STEPS_PROSE' },
+    [is261117 ? 'b' : 'y']: { workMode }, [is261117 ? 'H' : 'L']: { _e: 'STEPS_COMMANDS', O$: 'STEPS_PROSE' },
   })));
   const original = evaluate(patch.before, 'non_coding');
   assert.equal(original.threadDetailLevel, 'STEPS_PROSE');
@@ -143,7 +152,7 @@ test('native CUA resolver uses the package helper and retains the original bundl
 });
 
 test('CUA notify unwrap recognizes the v3 helper but leaves unrelated commands untouched', () => {
-  const unwrap = vm.runInNewContext(`(${code('cua-notify-unwrap')})`, { s8: 'turn-ended', s5: '--previous-notify', s7: value => Array.isArray(value) && value.every(x => typeof x === 'string') });
+  const unwrap = vm.runInNewContext(`(${code('cua-notify-unwrap')})`, { [is261117 ? 'aB' : 's8']: 'turn-ended', [is261117 ? 'aL' : 's5']: '--previous-notify', [is261117 ? 'a$' : 's7']: value => Array.isArray(value) && value.every(x => typeof x === 'string') });
   const inner = ['custom-notify', 'argument'];
   const outer = ['X:\\bundle\\codex-computer-use-mta-wrapper-candidate-v3.exe', 'turn-ended', '--previous-notify', JSON.stringify(inner)];
   assert.equal(JSON.stringify(unwrap(outer)), JSON.stringify(inner));

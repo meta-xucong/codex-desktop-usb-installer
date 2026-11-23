@@ -119,37 +119,40 @@ function Get-CanonicalFileHash([string]$Path) {
         $stream.Dispose()
     }
 }
-$manifestPaths = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+$manifestHashes = [System.Collections.Generic.Dictionary[string,string]]::new([StringComparer]::OrdinalIgnoreCase)
 foreach ($entry in $manifest.files) {
-    $relativeManifestPath = ([string]$entry.path).Replace('\','/')
-    if (-not $manifestPaths.Add($relativeManifestPath)) { throw "Duplicate pack manifest path: $relativeManifestPath" }
-    $source = Resolve-PackOwnedFile ([string]$entry.path)
-    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Pack file missing: $($entry.path)" }
-    $hash = Get-CanonicalFileHash $source
-    if ($hash -ne ([string]$entry.sha256).ToLowerInvariant()) { throw "Pack hash mismatch: $($entry.path)" }
+    $relative = ([string]$entry.path).Replace('\','/')
+    $null = Resolve-PackOwnedFile $relative
+    if ($manifestHashes.ContainsKey($relative)) { throw "Duplicate pack manifest path: $relative" }
+    $manifestHashes.Add($relative, ([string]$entry.sha256).ToLowerInvariant())
 }
-$checksumPaths = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+$checksumHashes = [System.Collections.Generic.Dictionary[string,string]]::new([StringComparer]::OrdinalIgnoreCase)
 foreach ($line in Get-Content -LiteralPath $checksumFile) {
     if ([string]::IsNullOrWhiteSpace($line)) { continue }
     $match = [regex]::Match($line, '^(?<hash>[0-9a-fA-F]{64}) \*(?<path>.+)$')
     if (-not $match.Success) { throw "Invalid pack checksum line: $line" }
     $relative = $match.Groups['path'].Value.Trim()
-    if (-not $checksumPaths.Add($relative)) { throw "Duplicate pack checksum path: $relative" }
+    if ($checksumHashes.ContainsKey($relative)) { throw "Duplicate pack checksum path: $relative" }
+    $checksumHashes.Add($relative, $match.Groups['hash'].Value.ToLowerInvariant())
+}
+if ($manifestHashes.ContainsKey('file-manifest.json') -or
+    -not $checksumHashes.ContainsKey('file-manifest.json') -or
+    $checksumHashes.Count -ne ($manifestHashes.Count + 1)) {
+    throw 'Pack checksum and file manifest scopes differ.'
+}
+foreach ($relative in $manifestHashes.Keys) {
+    if (-not $checksumHashes.ContainsKey($relative)) { throw "Pack checksum is missing a manifest target: $relative" }
+    if ($manifestHashes[$relative] -ne $checksumHashes[$relative]) { throw "Pack checksum and file manifest disagree: $relative" }
+}
+foreach ($relative in $checksumHashes.Keys) {
     $source = Resolve-PackOwnedFile $relative
     if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Checksum target missing: $relative" }
-    $hash = Get-CanonicalFileHash $source
-    if ($hash -ne $match.Groups['hash'].Value.ToLowerInvariant()) { throw "Pack checksum mismatch: $relative" }
-}
-$expectedChecksumPaths = [System.Collections.Generic.HashSet[string]]::new($manifestPaths, [StringComparer]::OrdinalIgnoreCase)
-$null = $expectedChecksumPaths.Add('file-manifest.json')
-if ($checksumPaths.Count -ne $expectedChecksumPaths.Count) { throw 'Pack checksum and file manifest scopes differ.' }
-foreach ($relative in $expectedChecksumPaths) {
-    if (-not $checksumPaths.Contains($relative)) { throw "Pack checksum is missing a manifest target: $relative" }
+    if ((Get-CanonicalFileHash $source) -ne $checksumHashes[$relative]) { throw "Pack checksum mismatch: $relative" }
 }
 $actualPackFiles = @(Get-ChildItem -LiteralPath $PackRoot -Recurse -File -Force | ForEach-Object { $_.FullName.Substring($PackRoot.Length).TrimStart('\').Replace('\','/') } | Where-Object { $_ -ne 'checksums.sha256' -and -not (Test-PackTransientPath $_) })
-if ($actualPackFiles.Count -ne $checksumPaths.Count) { throw 'Capability pack contains missing or unlisted files.' }
+if ($actualPackFiles.Count -ne $checksumHashes.Count) { throw 'Capability pack contains missing or unlisted files.' }
 foreach ($relative in $actualPackFiles) {
-    if (-not $checksumPaths.Contains($relative)) { throw "Capability pack contains an unlisted file: $relative" }
+    if (-not $checksumHashes.ContainsKey($relative)) { throw "Capability pack contains an unlisted file: $relative" }
 }
 
 $userProfile = $TargetUserProfile

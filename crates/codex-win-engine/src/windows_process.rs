@@ -1659,6 +1659,7 @@ mod imp {
     }
 
     struct WindowSearchContext {
+        present: bool,
         required_window_pid: Option<u32>,
         pids: *const u32,
         pid_count: usize,
@@ -1988,7 +1989,8 @@ mod imp {
         if context.required_window_pid.is_some_and(|required| pid != required) {
             return 1;
         }
-        if unsafe { IsIconic(hwnd) } != 0 {
+        let iconic = unsafe { IsIconic(hwnd) } != 0;
+        if context.present && iconic {
             // Minimized windows are often reported at -32000 with a tiny icon
             // rectangle. Restore first so the real normal dimensions can be
             // assessed instead of misclassifying a healthy product window.
@@ -1997,7 +1999,17 @@ mod imp {
             }
         }
         let mut rect = RECT::default();
-        if unsafe { GetWindowRect(hwnd, &mut rect) } == 0 {
+        if !context.present && iconic {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowPlacement, WINDOWPLACEMENT};
+            let mut placement = WINDOWPLACEMENT {
+                length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+                ..Default::default()
+            };
+            if unsafe { GetWindowPlacement(hwnd, &mut placement) } == 0 {
+                return 1;
+            }
+            rect = placement.rcNormalPosition;
+        } else if unsafe { GetWindowRect(hwnd, &mut rect) } == 0 {
             return 1;
         }
         let width = rect.right.saturating_sub(rect.left);
@@ -2074,11 +2086,29 @@ mod imp {
         wait_for_usable_window_for_root_with_process(root, timeout, None, None)
     }
 
+    /// Check an intentionally background window without changing focus, visibility or z-order.
+    pub fn observe_window_for_root(
+        root: &Path,
+        timeout: Duration,
+    ) -> Result<Option<UsableWindowReport>, EngineError> {
+        wait_for_window(root, timeout, None, None, false)
+    }
+
     pub(crate) fn wait_for_usable_window_for_root_with_process(
         root: &Path,
         timeout: Duration,
         process: Option<BorrowedHandle<'_>>,
         required_window_pid: Option<u32>,
+    ) -> Result<Option<UsableWindowReport>, EngineError> {
+        wait_for_window(root, timeout, process, required_window_pid, true)
+    }
+
+    fn wait_for_window(
+        root: &Path,
+        timeout: Duration,
+        process: Option<BorrowedHandle<'_>>,
+        required_window_pid: Option<u32>,
+        present: bool,
     ) -> Result<Option<UsableWindowReport>, EngineError> {
         let deadline = Instant::now() + timeout;
         loop {
@@ -2091,19 +2121,22 @@ mod imp {
             }
             let pids = managed_window_pids(root)?;
             if !pids.is_empty() {
-                let hidden = hide_console_windows_for_pids(&pids);
-                if hidden > 0 {
-                    log::info!(
-                        "hidden console window(s) created by managed Codex process tree count={hidden}"
-                    );
-                }
-                let hidden_auxiliary = hide_codex_auxiliary_windows_for_pids(&pids);
-                if hidden_auxiliary > 0 {
-                    log::info!(
-                        "hidden auxiliary Chromium window(s) created by managed Codex process tree count={hidden_auxiliary}"
-                    );
+                if present {
+                    let hidden = hide_console_windows_for_pids(&pids);
+                    if hidden > 0 {
+                        log::info!(
+                            "hidden console window(s) created by managed Codex process tree count={hidden}"
+                        );
+                    }
+                    let hidden_auxiliary = hide_codex_auxiliary_windows_for_pids(&pids);
+                    if hidden_auxiliary > 0 {
+                        log::info!(
+                            "hidden auxiliary Chromium window(s) created by managed Codex process tree count={hidden_auxiliary}"
+                        );
+                    }
                 }
                 let mut context = WindowSearchContext {
+                    present,
                     required_window_pid,
                     pids: pids.as_ptr(),
                     pid_count: pids.len(),
@@ -2126,6 +2159,15 @@ mod imp {
                     )));
                 }
                 if let Some(candidate) = context.candidate {
+                    if !present {
+                        return Ok(Some(UsableWindowReport {
+                            pid: candidate.pid,
+                            width: candidate.width,
+                            height: candidate.height,
+                            was_visible: candidate.visible,
+                            foreground_accepted: false,
+                        }));
+                    }
                     // SW_RESTORE also makes a hidden/minimized explicit-launch
                     // window visible. HWND_TOP avoids a successfully-created
                     // configurator remaining completely behind the manager.
@@ -2911,6 +2953,75 @@ ConvertTo-Json -Compress -InputObject $helpers
         }
 
         #[test]
+        fn background_window_stays_hidden_or_minimized_until_explicitly_opened() {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{
+                CreateWindowExW, DestroyWindow, GetForegroundWindow, MSG, ShowWindowAsync,
+                SW_SHOWMINNOACTIVE, WS_OVERLAPPEDWINDOW,
+            };
+            const FIXTURE: &str = "CODEX_TEST_CCSWITCH_WINDOW_FILE";
+            if let Some(file) = std::env::var_os(FIXTURE) {
+                let hwnd = unsafe { CreateWindowExW(
+                    0, windows_sys::core::w!("STATIC"), windows_sys::core::w!("CCSwitch test"),
+                    WS_OVERLAPPEDWINDOW, 32, 32, 640, 480, std::ptr::null_mut(),
+                    std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(),
+                ) };
+                assert!(!hwnd.is_null());
+                let ready = PathBuf::from(file);
+                let pending = ready.with_extension("tmp");
+                std::fs::write(&pending, (hwnd as usize).to_string()).unwrap();
+                std::fs::rename(pending, ready).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while Instant::now() < deadline {
+                    let mut message = MSG::default();
+                    unsafe {
+                        while PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                            DispatchMessageW(&message);
+                        }
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                unsafe { DestroyWindow(hwnd) };
+                return;
+            }
+            let root = std::env::temp_dir().join(format!("ccswitch-window-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&root).unwrap();
+            let exe = root.join("CCSwitchFixture.exe");
+            let file = root.join("window");
+            std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+            let mut child = Command::new(exe)
+                .args(["--exact", "windows_process::imp::windows_tests::background_window_stays_hidden_or_minimized_until_explicitly_opened"])
+                .env(FIXTURE, &file).creation_flags(CREATE_NO_WINDOW).spawn().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !file.is_file() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            let first = observe_window_for_root(&root, Duration::from_secs(10)).unwrap().unwrap();
+            let hwnd = std::fs::read_to_string(file).unwrap().parse::<usize>().unwrap() as HWND;
+            assert_eq!(first.pid, child.id());
+            assert!(!first.was_visible && !first.foreground_accepted);
+            let second = observe_window_for_root(&root, Duration::ZERO).unwrap().unwrap();
+            assert!(!second.was_visible && !second.foreground_accepted);
+            assert_eq!(unsafe { IsWindowVisible(hwnd) }, 0);
+            assert_ne!(unsafe { GetForegroundWindow() }, hwnd);
+            unsafe { ShowWindowAsync(hwnd, SW_SHOWMINNOACTIVE) };
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while unsafe { IsIconic(hwnd) } == 0 && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert_ne!(unsafe { IsIconic(hwnd) }, 0);
+            let minimized = observe_window_for_root(&root, Duration::ZERO).unwrap().unwrap();
+            assert_eq!(minimized.pid, child.id());
+            assert_ne!(unsafe { IsIconic(hwnd) }, 0);
+            let opened = wait_for_usable_window_for_root(&root, Duration::from_secs(3)).unwrap().unwrap();
+            assert_eq!(opened.pid, child.id());
+            assert_eq!(unsafe { IsIconic(hwnd) }, 0);
+            assert_ne!(unsafe { IsWindowVisible(hwnd) }, 0);
+            child.kill().unwrap();
+            child.wait().unwrap();
+            std::fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
         fn managed_exit_unblocks_window_wait() {
             if std::env::var(EXIT_FIXTURE_MODE).as_deref() == Ok("core") {
                 std::io::stdin().read_exact(&mut [0]).unwrap();
@@ -3606,6 +3717,7 @@ ConvertTo-Json -Compress -InputObject $helpers
 
 #[cfg(windows)]
 pub use imp::{
+    observe_window_for_root,
     close_processes_for_root, hide_codex_auxiliary_windows_for_root, hide_console_windows_for_root,
     hide_windows_for_root, processes_running_for_executable_under_root_strict,
     processes_running_for_executables_under_root_strict, processes_running_for_root,
@@ -3712,6 +3824,9 @@ pub fn processes_running_for_executables_under_root_strict(
         "strict process image query is supported only on Windows".to_string(),
     ))
 }
+
+#[cfg(not(windows))]
+pub use wait_for_usable_window_for_root as observe_window_for_root;
 
 #[cfg(not(windows))]
 pub fn wait_for_usable_window_for_root(

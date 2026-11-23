@@ -205,7 +205,11 @@ fn require_usb_install_account_binding() -> Result<(), AppError> {
     if !crate::app::usb_guard::guard_required() {
         return Ok(());
     }
-    if !crate::app::usb_guard::signed_install_account_binding_ready()? {
+    check_install_account_binding(crate::app::usb_guard::signed_install_account_binding_ready()?)
+}
+
+fn check_install_account_binding(ready: bool) -> Result<(), AppError> {
+    if !ready {
         return Err(AppError::Engine(
             "签名 U 盘未包含可用的 404token API Key，无法完成自动配置；请先重新签名。".to_string(),
         ));
@@ -1338,8 +1342,11 @@ pub async fn offline_payload_stage(
         return Err(AppError::UnsupportedPlatform.into());
     }
     reject_uninstall_handoff(&state)?;
-    crate::app::usb_guard::require_signed_codex_install_bundle("offline-payload-stage")?;
-    require_usb_install_account_binding()?;
+    if let Some(authorization) =
+        crate::app::usb_guard::require_signed_codex_install_bundle("offline-payload-stage")?
+    {
+        check_install_account_binding(crate::app::usb_guard::install_account_binding_ready_for(&authorization)?)?;
+    }
     let executable = std::env::current_exe()
         .map_err(|error| AppError::Internal(format!("无法确定安装器路径: {error}")))?;
     let expected_architecture = state.target.arch.as_str().to_string();
@@ -3295,17 +3302,37 @@ mod open_url_tests {
     }
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WinHomeStatus {
+    #[serde(flatten)]
+    install: WinInstallStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usb_payload_version: Option<String>,
+}
+
 /// Windows-only: classify the installed Codex (managed / external / none).
 ///
 /// Async + `spawn_blocking` so AppX / PowerShell status probes cannot freeze the
 /// WebView when enterprise policy or a hung AppX service stalls detection.
 #[tauri::command]
-pub async fn win_status(state: State<'_, ManagerState>) -> Result<WinInstallStatus, CommandError> {
+pub async fn win_status(state: State<'_, ManagerState>) -> Result<WinHomeStatus, CommandError> {
     if !matches!(state.target.os, OperatingSystem::Windows) {
         return Err(AppError::UnsupportedPlatform.into());
     }
     let settings = windows_domain_settings_for_persisted(&state);
-    tauri::async_runtime::spawn_blocking(move || win_install_status(&settings))
+    tauri::async_runtime::spawn_blocking(move || {
+        let install = win_install_status(&settings);
+        let usb_payload_version = if crate::app::usb_guard::guard_required()
+            && install.installed.as_ref().is_some_and(crate::app::win_update::is_current_usb_portable)
+        {
+            std::env::current_exe().ok()
+                .and_then(|exe| crate::app::offline_payload::declared_desktop_version(&exe).ok())
+        } else {
+            None
+        };
+        WinHomeStatus { install, usb_payload_version }
+    })
         .await
         .map_err(|e| AppError::Internal(format!("join: {e}")))
         .map_err(Into::into)
@@ -3459,8 +3486,19 @@ pub fn usb_guard_status() -> UsbGuardStatus {
 
 #[tauri::command]
 pub async fn usb_host_status() -> Result<crate::app::usb_host::UsbHostStatus, CommandError> {
-    tauri::async_runtime::spawn_blocking(crate::app::usb_host::status).await
-        .map_err(|e| AppError::Internal(format!("join: {e}")))?.map_err(Into::into)
+    let result = tauri::async_runtime::spawn_blocking(crate::app::usb_host::status)
+        .await
+        .map_err(|e| AppError::Internal(format!("join: {e}")))
+        .and_then(|result| result);
+    match &result {
+        Ok(host) if host.required => log::info!(
+            "USB host status pid={} ready={} account_ready={} capabilities_ready={}",
+            std::process::id(), host.ready, host.account_ready, host.capabilities_ready
+        ),
+        Err(error) => log::warn!("USB host status failed pid={} code={}", std::process::id(), error.code()),
+        _ => {}
+    }
+    result.map_err(Into::into)
 }
 
 /// Separate from the short direct-entry launch request. One existing Install
@@ -3913,12 +3951,15 @@ pub async fn win_install_historical_release(
         install_to_usb.unwrap_or(false),
         crate::app::usb_guard::guard_required(),
     );
-    if install_to_usb {
-        crate::app::usb_guard::require_signed_codex_install_bundle("win-install-historical")?;
-        require_usb_install_account_binding()?;
+    let usb_install_authorization = if install_to_usb {
+        let authorization = crate::app::usb_guard::require_signed_codex_install_bundle("win-install-historical")?
+            .ok_or_else(|| AppError::Engine("当前进程不是 USB bundle，不能解析 USB Codex 目录".into()))?;
+        check_install_account_binding(crate::app::usb_guard::install_account_binding_ready_for(&authorization)?)?;
+        Some(authorization)
     } else {
         crate::app::usb_guard::require_signed_codex_bundle("win-install-historical")?;
-    }
+        None
+    };
     if !confirm {
         return Err(AppError::Internal(
             "拒绝执行：Windows 历史版本安装必须带显式 confirm".to_string(),
@@ -3936,10 +3977,10 @@ pub async fn win_install_historical_release(
     let mut settings = windows_domain_settings_for_persisted(&state);
     // Match the normal fresh-install flow: validate the one-shot destination
     // before use, but remember it only after the historical install succeeds.
-    let pending_install_root = if install_to_usb {
+    let pending_install_root = if let Some(authorization) = &usb_install_authorization {
         // Ignore renderer-selected destinations in USB mode. The exact target
         // is derived from the authenticated bundle and rejects reparse points.
-        let usb_root = crate::app::usb_guard::authorized_usb_codex_root()?;
+        let usb_root = crate::app::usb_guard::install_root_for(authorization)?;
         // Fail before staging a 700+ MB package if this machine redirects the
         // normal Codex profile back onto the product USB.
         crate::app::usb_guard::local_data_paths()?;

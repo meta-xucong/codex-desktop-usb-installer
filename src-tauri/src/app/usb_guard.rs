@@ -1709,8 +1709,20 @@ pub fn signed_install_account_binding_ready() -> Result<bool, AppError> {
     }
     let authorization = require_signed_codex_install_bundle("install-account-binding")?
         .ok_or_else(|| engine("当前进程不是受管 USB bundle，不能检查签名账号绑定"))?;
-    let license = read_license(&authorization.bundle_root)?
-        .ok_or_else(|| engine("usb_license_missing：当前 U 盘缺少许可证"))?;
+    install_account_binding_ready_for(&authorization)
+}
+
+pub(crate) fn install_account_binding_ready_for(
+    authorization: &SignedUsbAuthorization,
+) -> Result<bool, AppError> {
+    let bytes = fs::read(license_path(&authorization.bundle_root))
+        .map_err(|error| engine(format!("读取当前 U 盘许可证失败：{error}")))?;
+    let license = decode_usb_license(&bytes)?;
+    if license.installation_id != authorization.installation_id
+        || license_digest_from_bytes(&bytes) != authorization.license_digest
+    {
+        return Err(engine("usb_toctou_changed：安装授权后许可证已变化"));
+    }
     let signed = validate_license(&license, &authorization.fingerprint)
         .map_err(|error| engine(format!("usb_license_invalid：{error}")))?;
     if !signed {
@@ -1830,9 +1842,12 @@ pub fn authorized_account_binding() -> Result<Option<license_core::UsbAccountBin
 pub fn authorized_usb_codex_root() -> Result<PathBuf, AppError> {
     let authorization = require_signed_codex_install_bundle("codex-install-destination")?
         .ok_or_else(|| engine("当前进程不是 USB bundle，不能解析 USB Codex 目录"))?;
-    let bundle = authorization.bundle_root;
-    let apps = bundle.join(USB_APPS_DIR_NAME);
-    let codex = usb_codex_root(&bundle);
+    install_root_for(&authorization)
+}
+
+pub(crate) fn install_root_for(authorization: &SignedUsbAuthorization) -> Result<PathBuf, AppError> {
+    let apps = authorization.bundle_root.join(USB_APPS_DIR_NAME);
+    let codex = authorization.codex_root.clone();
     for candidate in [&apps, &codex] {
         if path_has_reparse_point(candidate)? {
             return Err(engine(format!(
@@ -2620,7 +2635,7 @@ fn codex_image_is_owned_by_root(codex_root: &Path, registered: &Path, actual: &P
 }
 
 #[cfg(target_os = "windows")]
-fn process_image_path(pid: u32) -> io::Result<PathBuf> {
+pub(super) fn process_image_path(pid: u32) -> io::Result<PathBuf> {
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
     use windows_sys::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW};
 
@@ -5619,6 +5634,43 @@ mod tests {
         );
         assert_eq!(bundle_relative_path("F:\\..\\other", "F:\\"), None);
         assert_eq!(bundle_relative_path("G:\\Codex", "F:\\"), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn install_account_check_rejects_license_replaced_after_authorization() {
+        let root = std::env::temp_dir().join(format!("codex-install-binding-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let fingerprint = UsbFingerprint {
+            volume_serial: 42,
+            anchor_sha256: "a".repeat(64),
+            bundle_relative_path: "codex".to_string(),
+            anchor_schema: ANCHOR_SCHEMA_V1,
+        };
+        let signing = SigningKey::from_bytes(&[17; 32]);
+        let mut license = new_unsigned_license(fingerprint.clone());
+        license.key_id = Some("install-test".to_string());
+        license.signature = Some(B64.encode(signing.sign(&unsigned_license_payload(&license).unwrap()).to_bytes()));
+        let bytes = serde_json::to_vec(&license).unwrap();
+        let path = license_path(&root);
+        fs::write(&path, &bytes).unwrap();
+        let authorization = SignedUsbAuthorization {
+            codex_root: root.join("apps").join("Codex"),
+            bundle_root: root.clone(),
+            fingerprint,
+            direct_entry_required: true,
+            installation_id: license.installation_id.clone(),
+            key_id: "install-test".to_string(),
+            license_digest: license_digest_from_bytes(&bytes),
+            checked_at_ms: 0,
+        };
+        with_test_license_public_key("install-test", &B64.encode(signing.verifying_key().to_bytes()), || {
+            assert!(!install_account_binding_ready_for(&authorization).unwrap());
+            fs::write(&path, serde_json::to_vec_pretty(&license).unwrap()).unwrap();
+            assert!(install_account_binding_ready_for(&authorization).unwrap_err().to_string().contains("usb_toctou_changed"));
+        });
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(root).unwrap();
     }
 
     #[test]

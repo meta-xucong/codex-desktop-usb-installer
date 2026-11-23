@@ -575,6 +575,11 @@ fn cleanup_package_claim_with_verifier(
     })
 }
 
+/// Version for home-screen display only. Reading the manifest does not verify the MSIX.
+pub(crate) fn declared_desktop_version(executable: &Path) -> Result<String, AppError> {
+    Ok(discover_bundle(executable, None)?.manifest.codex_desktop_version)
+}
+
 /// Verify the bundle's manifest, hash, identity and application metadata.
 /// When `enforce_authenticode` is true, also verify the source file's
 /// Authenticode signature.  The production USB preflight passes false so a

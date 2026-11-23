@@ -55,18 +55,95 @@ fn validate_usb_instance_creation(created: bool, last_error: u32) -> Result<(), 
         ));
     }
     if last_error == windows_sys::Win32::Foundation::ERROR_ALREADY_EXISTS {
-        return Err("本 Windows 会话中已有 U 盘安装器正在运行。请使用已打开的窗口；如需重新启动，请先正常退出原窗口。不会终止已有安装进程。".to_string());
+        return Err("本 Windows 会话中已有 U 盘安装器正在运行，尚未找到本安装包已就绪的窗口。若刚启动，请稍候；若正在使用另一份安装包，请先完成该次操作。".to_string());
     }
     Ok(())
 }
 
 #[cfg(target_os = "windows")]
-pub fn acquire_usb_manager_instance() -> Result<Option<UsbManagerInstance>, String> {
+pub enum UsbManagerStartup {
+    Continue(Option<UsbManagerInstance>),
+    ExistingWindow,
+}
+
+#[cfg(target_os = "windows")]
+const READY_MAIN_WINDOW: windows_sys::core::PCWSTR =
+    windows_sys::core::w!("CodexUsbInstaller.ReadyMain.v1");
+
+#[cfg(target_os = "windows")]
+pub fn mark_ready_main_window(hwnd: windows_sys::Win32::Foundation::HWND) -> std::io::Result<()> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::SetPropW;
+    // The marker is a sentinel, never a pointer to process memory.
+    if unsafe { SetPropW(hwnd, READY_MAIN_WINDOW, 1usize as _) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn restore_existing_window(expected: &std::path::Path) -> Result<bool, String> {
+    use windows_sys::Win32::Foundation::{HWND, LPARAM};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, FlashWindow, GetLastActivePopup, GetPropW, GetWindowThreadProcessId,
+        IsHungAppWindow, IsIconic, IsWindowVisible, SetForegroundWindow, ShowWindowAsync,
+        SW_RESTORE, SW_SHOW,
+    };
+    struct Search<'a> {
+        image: &'a std::path::Path,
+        window: HWND,
+    }
+    unsafe extern "system" fn find(hwnd: HWND, data: LPARAM) -> i32 {
+        if unsafe { GetPropW(hwnd, READY_MAIN_WINDOW) }.is_null() {
+            return 1;
+        }
+        // EnumWindows invokes us synchronously, while the stack context is live.
+        let search = unsafe { &mut *(data as *mut Search<'_>) };
+        let mut pid = 0;
+        unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+        if super::usb_guard::process_image_path(pid)
+            .is_ok_and(|path| codex_win_engine::same_windows_path(&path, search.image))
+        {
+            search.window = hwnd;
+            return 0;
+        }
+        1
+    }
+    let mut search = Search { image: expected, window: std::ptr::null_mut() };
+    unsafe { EnumWindows(Some(find), (&mut search as *mut Search<'_>) as LPARAM) };
+    let hwnd = search.window;
+    if hwnd.is_null() {
+        return Ok(false);
+    }
+    unsafe {
+        if IsHungAppWindow(hwnd) != 0 {
+            return Err("已找到本安装包的管理器窗口，但窗口暂时未响应。请等待当前操作完成。".into());
+        }
+        let show = if IsIconic(hwnd) != 0 {
+            Some(SW_RESTORE)
+        } else if IsWindowVisible(hwnd) == 0 {
+            Some(SW_SHOW)
+        } else {
+            None
+        };
+        if show.is_some_and(|cmd| ShowWindowAsync(hwnd, cmd) == 0) {
+            return Err("已找到本安装包的管理器，但未能显示原窗口。".into());
+        }
+        let popup = GetLastActivePopup(hwnd);
+        let target = if !popup.is_null() && IsWindowVisible(popup) != 0 { popup } else { hwnd };
+        if SetForegroundWindow(target) == 0 {
+            FlashWindow(hwnd, 1);
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(target_os = "windows")]
+pub fn acquire_usb_manager_instance() -> Result<UsbManagerStartup, String> {
     use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
     use windows_sys::Win32::System::Threading::CreateMutexW;
 
     if !crate::app::usb_guard::guard_required() {
-        return Ok(None);
+        return Ok(UsbManagerStartup::Continue(None));
     }
     if !current_process_is_elevated()? {
         return Err(
@@ -86,8 +163,14 @@ pub fn acquire_usb_manager_instance() -> Result<Option<UsbManagerInstance>, Stri
         unreachable!("null handle must be an error");
     }
     let guard = UsbManagerInstance { handle };
+    if last_error == windows_sys::Win32::Foundation::ERROR_ALREADY_EXISTS {
+        let image = std::env::current_exe().map_err(|error| error.to_string())?;
+        if restore_existing_window(&image)? {
+            return Ok(UsbManagerStartup::ExistingWindow);
+        }
+    }
     validate_usb_instance_creation(true, last_error)?;
-    Ok(Some(guard))
+    Ok(UsbManagerStartup::Continue(Some(guard)))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -504,6 +587,62 @@ mod tests {
     fn native_elevation_probe_reads_the_real_primary_token() {
         // Safe read-only probe; exercises the primary token API contract.
         super::current_process_is_elevated().expect("read primary token elevation");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn repeated_launch_restores_only_the_ready_window_of_the_same_image() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::*;
+        use std::os::windows::process::CommandExt;
+        let image = std::env::current_exe().unwrap();
+        const REOPEN: &str = "CODEX_TEST_REOPEN_USB_WINDOW";
+        if std::env::var_os(REOPEN).is_some() {
+            assert!(super::restore_existing_window(&image).unwrap());
+            return;
+        }
+        let hwnd = unsafe { CreateWindowExW(
+            0, windows_sys::core::w!("STATIC"), windows_sys::core::w!("USB manager fixture"),
+            WS_OVERLAPPEDWINDOW, 32, 32, 420, 280, std::ptr::null_mut(),
+            std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(),
+        ) };
+        assert!(!hwnd.is_null());
+        assert!(!super::restore_existing_window(&image).unwrap(), "pre-ready window selected");
+        super::mark_ready_main_window(hwnd).unwrap();
+        let other_bundle = image.with_file_name("other-bundle").join(image.file_name().unwrap());
+        assert!(!super::restore_existing_window(&other_bundle).unwrap());
+        assert_eq!(unsafe { IsWindowVisible(hwnd) }, 0);
+        let pump = || unsafe {
+            let mut message = MSG::default();
+            while PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                DispatchMessageW(&message);
+            }
+        };
+        for minimized in [false, true] {
+            if minimized {
+                unsafe { ShowWindow(hwnd, SW_MINIMIZE) };
+                assert_ne!(unsafe { IsIconic(hwnd) }, 0);
+            }
+            let mut opener = std::process::Command::new(&image)
+                .args(["--exact", "app::win_elevation::tests::repeated_launch_restores_only_the_ready_window_of_the_same_image"])
+                .env(REOPEN, "1")
+                .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+                .spawn().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while std::time::Instant::now() < deadline {
+                pump();
+                if opener.try_wait().unwrap().is_some() && unsafe { IsWindowVisible(hwnd) != 0 && IsIconic(hwnd) == 0 } { break; }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let exited = opener.try_wait().unwrap();
+            if exited.is_none() {
+                let _ = opener.kill();
+                let _ = opener.wait();
+            }
+            assert!(exited.is_some_and(|status| status.success()));
+            assert_ne!(unsafe { IsWindowVisible(hwnd) }, 0);
+            assert_eq!(unsafe { IsIconic(hwnd) }, 0);
+        }
+        unsafe { DestroyWindow(hwnd) };
     }
 
     #[cfg(target_os = "windows")]

@@ -175,8 +175,8 @@
     {
       "owned": true,
       "path": "install-to-codex.ps1",
-      "sha256": "8be31f82f075edf560e01778b68c66148a137386dc209d562753a48b7ec67e37",
-      "bytes": 58233
+      "sha256": "9cb6d71ebe77e6e1e5fdc9cf097c42c8647b193b84f6c5cb6ca94c228fd4a3bf",
+      "bytes": 58206
     },
     {
       "owned": true,
@@ -331,7 +331,7 @@
     {
       "owned": true,
       "path": "pack.json",
-      "sha256": "102cce91762643a7aeae7a60f18a8a8b8495a032ce22300e05d4e08f21c14235",
+      "sha256": "323f4158b4238dca07f34b93761a730fa781734b3040b8fc3366e7e056884075",
       "bytes": 4064
     },
     {

@@ -120,6 +120,14 @@ fn restore_main_window(app: &tauri::AppHandle, reason: &str) {
         return;
     };
 
+    #[cfg(target_os = "windows")]
+    if crate::app::usb_guard::guard_required() {
+        if let Ok(hwnd) = window.hwnd() {
+            if let Err(error) = crate::app::win_elevation::mark_ready_main_window(hwnd.0 as _) {
+                log::warn!("unable to mark ready USB manager window: {error}");
+            }
+        }
+    }
     let mut failed = false;
     for (step, result) in [
         ("unminimize", window.unminimize()),
@@ -807,7 +815,8 @@ pub fn run() {
     // execute before ManagerState exists and need startup-level exclusion.
     #[cfg(target_os = "windows")]
     let _usb_instance_guard = match crate::app::win_elevation::acquire_usb_manager_instance() {
-        Ok(guard) => guard,
+        Ok(crate::app::win_elevation::UsbManagerStartup::Continue(guard)) => guard,
+        Ok(crate::app::win_elevation::UsbManagerStartup::ExistingWindow) => return,
         Err(error) => {
             eprintln!("USB manager session lock failed: {error}");
             crate::app::runtime::show_startup_error(&error);
@@ -1085,10 +1094,12 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             install_macos_menu(app.handle(), NativeLocale::En)?;
             log::info!(
-                "Codex App Manager v{} starting (os={}, arch={})",
+                "Codex App Manager v{} starting (os={}, arch={}, pid={}, unix_ms={})",
                 app.package_info().version,
                 std::env::consts::OS,
-                std::env::consts::ARCH
+                std::env::consts::ARCH,
+                std::process::id(),
+                crate::app::usb_guard::now_ms()
             );
             if let Some(run_id) = crate::app::paths::packaged_smoke_run_id() {
                 log::info!("packaged smoke run id={run_id} data_dir_isolated=true");
@@ -1323,7 +1334,7 @@ pub fn run() {
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 let app = window.app_handle();
-                log::info!("window close requested label={}", window.label());
+                log::info!("window close requested label={} pid={}", window.label(), std::process::id());
                 let policy = quit_policy_for(app);
                 if apply_quit_policy(app, &policy) {
                     crate::app::usb_guard::stop_for_manager();
@@ -1348,13 +1359,15 @@ pub fn run() {
         // a window CloseRequested — gate it with the same phase-aware policy.
         .run(|app, event| {
             if let RunEvent::ExitRequested { api, .. } = event {
-                log::info!("application exit requested");
+                log::info!("application exit requested pid={}", std::process::id());
                 let policy = quit_policy_for(app);
                 if !apply_quit_policy(app, &policy) {
                     api.prevent_exit();
                 } else {
                     crate::app::usb_guard::stop_for_manager();
                 }
+            } else if matches!(event, RunEvent::Exit) {
+                log::info!("manager event loop exiting pid={} unix_ms={}", std::process::id(), crate::app::usb_guard::now_ms());
             }
         });
 }
